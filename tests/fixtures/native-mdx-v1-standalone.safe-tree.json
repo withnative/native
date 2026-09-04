@@ -1,0 +1,26 @@
+{
+  "children": [
+    { "children": ["Runtime pulse"], "props": {}, "type": "h1" },
+    "\n",
+    {
+      "children": [
+        { "children": [], "props": { "label": "Input mode", "value": "standalone" }, "type": "Metric" },
+        {
+          "children": [
+            {
+              "children": ["This sentence and component composition come from the artifact's genuine MDX body."],
+              "props": {},
+              "type": "p"
+            }
+          ],
+          "props": { "title": "Source authority", "tone": "info" },
+          "type": "Callout"
+        }
+      ],
+      "props": { "gap": 2 },
+      "type": "Stack"
+    }
+  ],
+  "props": {},
+  "type": "Fragment"
+}

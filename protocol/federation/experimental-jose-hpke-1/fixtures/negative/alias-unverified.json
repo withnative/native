@@ -1,0 +1,17 @@
+{
+  "scenario_type": "alias",
+  "scenario_id": "alias-unverified",
+  "profile": "native-fed/experimental-jose-hpke-1",
+  "clock": "2026-08-02T09:10:00Z",
+  "steps": [
+    {
+      "value": "unverified@example.com",
+      "verified": false,
+      "expect": {
+        "status": 409
+      }
+    }
+  ],
+  "expect_error": "alias_unverified",
+  "validation_layer": "alias"
+}

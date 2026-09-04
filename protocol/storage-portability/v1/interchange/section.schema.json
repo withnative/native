@@ -1,0 +1,89 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://withnative.com/protocol/storage-portability/v1/interchange/section.schema.json",
+  "title": "Native canonical interchange v1 section",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["format", "revision", "name", "columns", "primary_key", "rows"],
+  "properties": {
+    "format": { "const": "native.canonical-interchange.section.v1" },
+    "revision": { "const": 2 },
+    "name": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" },
+    "columns": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "declared_type"],
+        "properties": {
+          "name": { "type": "string", "minLength": 1 },
+          "declared_type": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "primary_key": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "rows": {
+      "type": "array",
+      "items": {
+        "type": "array",
+        "items": { "$ref": "#/$defs/cell" }
+      }
+    }
+  },
+  "$defs": {
+    "cell": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type"],
+          "properties": { "type": { "const": "null" } }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "value"],
+          "properties": {
+            "type": { "const": "integer" },
+            "value": { "type": "integer", "minimum": -9223372036854775808, "maximum": 9223372036854775807 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "value"],
+          "properties": {
+            "type": { "const": "real" },
+            "value": { "type": "string", "pattern": "^[0-9a-f]{16}$" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "value"],
+          "properties": {
+            "type": { "const": "text" },
+            "value": { "type": "string" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "value"],
+          "properties": {
+            "type": { "const": "blob" },
+            "value": {
+              "type": "string",
+              "contentEncoding": "base64"
+            }
+          }
+        }
+      ]
+    }
+  }
+}

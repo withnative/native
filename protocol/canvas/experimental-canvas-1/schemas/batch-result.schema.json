@@ -1,0 +1,199 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://spec.withnative.ai/canvas/experimental-canvas-1/schemas/batch-result.schema.json",
+  "title": "native.canvas-batch-result.v1",
+  "description": "The structured outcome of manage_canvas.commit_batch. Every outcome is a 200 result.",
+  "type": "object",
+  "required": [
+    "version",
+    "outcome",
+    "objects",
+    "conflicts"
+  ],
+  "properties": {
+    "version": {
+      "const": "native.canvas-batch-result.v1"
+    },
+    "action": {
+      "const": "commit_batch"
+    },
+    "outcome": {
+      "type": "string",
+      "enum": [
+        "committed",
+        "replayed",
+        "conflict",
+        "rejected"
+      ]
+    },
+    "batch_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "canvas_version": {
+      "anyOf": [
+        {
+          "type": "string",
+          "pattern": "^canvas:(0|[1-9][0-9]*)$"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "base_version": {
+      "anyOf": [
+        {
+          "type": "string",
+          "pattern": "^canvas:(0|[1-9][0-9]*)$"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "event_id": {
+      "type": "string"
+    },
+    "objects": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": [
+          "geometry",
+          "content"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "geometry": {
+            "type": "string",
+            "pattern": "^canvas:(0|[1-9][0-9]*)$"
+          },
+          "content": {
+            "type": "string",
+            "pattern": "^canvas:(0|[1-9][0-9]*)$"
+          }
+        }
+      }
+    },
+    "conflicts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "code"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "group": {
+            "type": "string",
+            "enum": [
+              "geometry",
+              "content"
+            ]
+          },
+          "code": {
+            "type": "string",
+            "enum": [
+              "version_mismatch",
+              "object_deleted"
+            ]
+          },
+          "current": {
+            "type": "object",
+            "required": [
+              "geometry",
+              "content"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "geometry": {
+                "type": "string",
+                "pattern": "^canvas:(0|[1-9][0-9]*)$"
+              },
+              "content": {
+                "type": "string",
+                "pattern": "^canvas:(0|[1-9][0-9]*)$"
+              }
+            }
+          },
+          "competing_actor": {
+            "anyOf": [
+              {
+                "type": "null"
+              },
+              {
+                "type": "object",
+                "required": [
+                  "id"
+                ],
+                "properties": {
+                  "id": {
+                    "type": "string"
+                  },
+                  "display_name": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  }
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    "error": {
+      "type": "object",
+      "required": [
+        "code",
+        "message"
+      ],
+      "properties": {
+        "code": {
+          "type": "string",
+          "enum": [
+            "invalid_envelope",
+            "invalid_precondition",
+            "invalid_geometry",
+            "limit_exceeded",
+            "duplicate_object",
+            "unknown_object",
+            "object_exists",
+            "object_deleted",
+            "record_not_visible",
+            "permission_denied",
+            "unknown_canvas",
+            "batch_id_reused",
+            "precondition_failed"
+          ]
+        },
+        "message": {
+          "type": "string"
+        },
+        "object_id": {
+          "type": "string"
+        },
+        "limit": {
+          "type": "string",
+          "enum": [
+            "ops_per_batch",
+            "batch_bytes",
+            "live_objects",
+            "note_text_bytes",
+            "stroke_points"
+          ]
+        }
+      }
+    },
+    "write_receipt": {
+      "type": "object"
+    }
+  }
+}

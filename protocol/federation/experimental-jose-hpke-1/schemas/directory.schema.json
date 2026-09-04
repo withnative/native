@@ -1,0 +1,82 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://spec.withnative.ai/federation/experimental-jose-hpke-1/schemas/directory.schema.json",
+  "title": "Native federation directory operation bodies",
+  "oneOf": [
+    { "$ref": "#/$defs/aliasResolveRequest" },
+    { "$ref": "#/$defs/aliasResolveResponse" },
+    { "$ref": "#/$defs/negotiateRequest" },
+    { "$ref": "#/$defs/negotiateResponse" },
+    { "$ref": "#/$defs/keyMutationRequest" },
+    { "$ref": "common.schema.json#/$defs/problem" }
+  ],
+  "$defs": {
+    "aliasResolveRequest": {
+      "type": "object",
+      "required": ["operation", "protocol_version", "system", "normalization", "value"],
+      "properties": {
+        "operation": { "const": "directory.alias.resolve" },
+        "protocol_version": { "$ref": "common.schema.json#/$defs/protocolVersion" },
+        "system": { "const": "email" },
+        "normalization": { "const": "native.email-ascii-v1" },
+        "value": { "type": "string", "maxLength": 254 }
+      },
+      "additionalProperties": false
+    },
+    "aliasResolveResponse": {
+      "type": "object",
+      "required": ["operation", "principal_document", "matched_alias"],
+      "properties": {
+        "operation": { "const": "directory.alias.resolve.result" },
+        "principal_document": { "$ref": "principal-document.schema.json" },
+        "matched_alias": { "type": "object" }
+      },
+      "additionalProperties": true
+    },
+    "negotiateRequest": {
+      "type": "object",
+      "required": ["operation", "protocol_version", "profiles", "capabilities", "required_capabilities"],
+      "properties": {
+        "operation": { "const": "directory.negotiate" },
+        "protocol_version": { "$ref": "common.schema.json#/$defs/protocolVersion" },
+        "profiles": { "type": "array", "minItems": 1, "maxItems": 16, "uniqueItems": true, "items": { "type": "string", "maxLength": 96 } },
+        "capabilities": { "type": "array", "maxItems": 128, "uniqueItems": true, "items": { "$ref": "common.schema.json#/$defs/capability" } },
+        "required_capabilities": { "type": "array", "maxItems": 32, "uniqueItems": true, "items": { "$ref": "common.schema.json#/$defs/capability" } }
+      },
+      "additionalProperties": false
+    },
+    "negotiateResponse": {
+      "type": "object",
+      "required": ["result", "signature"],
+      "properties": {
+        "result": {
+          "type": "object",
+          "required": ["operation", "protocol_version", "selected_profile", "capabilities", "unsupported_required_capabilities", "fresh_until"],
+          "properties": {
+            "operation": { "const": "directory.negotiate.result" },
+            "protocol_version": { "$ref": "common.schema.json#/$defs/protocolVersion" },
+            "selected_profile": { "type": "string", "maxLength": 96 },
+            "capabilities": { "type": "array", "maxItems": 128, "uniqueItems": true, "items": { "$ref": "common.schema.json#/$defs/capability" } },
+            "unsupported_required_capabilities": { "type": "array", "maxItems": 32, "uniqueItems": true, "items": { "$ref": "common.schema.json#/$defs/capability" } },
+            "fresh_until": { "$ref": "common.schema.json#/$defs/timestamp" }
+          },
+          "additionalProperties": false
+        },
+        "signature": { "$ref": "common.schema.json#/$defs/detachedJws" }
+      },
+      "additionalProperties": false
+    },
+    "keyMutationRequest": {
+      "type": "object",
+      "required": ["operation", "protocol_version", "principal", "statement", "signature"],
+      "properties": {
+        "operation": { "enum": ["directory.installation.put", "directory.key.publish", "directory.key.retire", "directory.key.revoke", "directory.root.rotate"] },
+        "protocol_version": { "$ref": "common.schema.json#/$defs/protocolVersion" },
+        "principal": { "$ref": "common.schema.json#/$defs/principalAddress" },
+        "statement": { "type": "object" },
+        "signature": { "$ref": "common.schema.json#/$defs/detachedJws" }
+      },
+      "additionalProperties": true
+    }
+  }
+}

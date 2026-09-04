@@ -1,0 +1,256 @@
+[package]
+name = "native-ce"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.98"
+description = "Native — single-player / community edition engine. Event-authoritative local knowledge store over SQLite."
+repository = "https://github.com/withnative/native"
+license = "AGPL-3.0-only"
+publish = false
+default-run = "conformance"
+
+[workspace]
+members = [
+    "crates/artifact-html",
+    "crates/artifact-runtime",
+    "crates/native-federation",
+    "crates/query-contract",
+    "crates/policy-kernel",
+    "crates/record-type-correction-kernel",
+    "crates/relationship-kernel",
+]
+# The held-private packages under held/ have their own workspace root.
+# They are not path dependencies of this package, so excluding them removes them
+# from the public workspace without changing this crate's build graph.
+exclude = ["held"]
+default-members = [
+    ".",
+    "crates/artifact-html",
+    "crates/artifact-runtime",
+    "crates/native-federation",
+    "crates/query-contract",
+    "crates/policy-kernel",
+    "crates/record-type-correction-kernel",
+    "crates/relationship-kernel",
+]
+resolver = "2"
+
+[lib]
+name = "native_ce"
+path = "src/lib.rs"
+
+[[bin]]
+name = "conformance"
+path = "src/bin/conformance.rs"
+test = false
+
+[[bin]]
+name = "mcp-stdio"
+path = "src/bin/mcp_stdio.rs"
+
+# The four binaries below are codegen checkers, not product surfaces. Each
+# [[bin]] is a separate link of the full library — the memory-heavy phase
+# sccache can never cache — so they are gated behind the empty `dev-tools`
+# feature (task 7fe5091): a plain `cargo build`/`cargo test` skips every one of
+# those links, and the lanes that need them opt in with `--features dev-tools`
+# (see .github/workflows/ci.yml and scripts/pre-push).
+# The backend attestation emitter lives in a small standalone workspace crate,
+# and the CI-evidence emitters now live in the held `native-evidence` package
+# under held/evidence — they are no longer targets of this package.
+[[bin]]
+name = "tool-types"
+path = "src/bin/tool_types.rs"
+required-features = ["dev-tools"]
+
+[[bin]]
+name = "kind-types"
+path = "src/bin/kind_types.rs"
+required-features = ["dev-tools"]
+test = false
+
+[[bin]]
+name = "tool-inventory"
+path = "src/bin/tool_inventory.rs"
+required-features = ["dev-tools"]
+
+[[bin]]
+name = "guide-corpus"
+path = "src/bin/guide_corpus.rs"
+required-features = ["dev-tools"]
+
+# Cold-open cost of one large `native.mdx.v2` board: a measurement tool, not a
+# product surface and not a test. Gated behind `dev-tools` for the same reason
+# as the codegen and evidence binaries above — it links the library, and a
+# plain `cargo build`/`cargo test` should not pay for that. Deliberately last:
+# the source-boundary manifest freezes transition debt by `bin[N]` index, so
+# inserting a target higher up renumbers entries that have nothing to do with
+# this change.
+[[bin]]
+name = "board-render-cost"
+path = "src/bin/board_render_cost.rs"
+required-features = ["dev-tools"]
+test = false
+
+[features]
+default = ["experimental-agent-intents", "mcp-executor-prototype"]
+# The selected JOSE–HPKE profile is still an Internet-Draft. This feature is a
+# compile-time acknowledgement that callers are running an interoperability
+# experiment; the default build exposes the profile boundary but returns
+# `unsupported_profile` for encryption and decryption.
+experimental-federation-hpke = ["native-federation/experimental-federation-hpke"]
+# Default-on staging probe for the context-freshness agent-intent seam. The
+# single experimental dispatcher remains outside the generated stable tool
+# surface and is advertised only by the Complete MCP profile. Builds that must
+# exclude the experiment can use `--no-default-features`.
+experimental-agent-intents = []
+# Exhaustive interruption/recovery proofs for storage migration machinery.
+# Representative journeys and cheap fail-closed invariants stay in the default
+# unit suite; CI runs this feature through a narrow dedicated authority.
+storage-recovery-tests = []
+# Production Postgres runtime adapter. Opt-in since task e8074ff: pg_query is
+# the largest single C build in the graph and sccache cannot cache build-script
+# execution, so every cold agent worktree paid it while only 7 files use it.
+# The shipped image enables it explicitly (Dockerfile FEATURES), advisory CI
+# exercises its behaviour, and local builds that touch src/postgres/ use
+# `--features postgres`. Integration tests remain separately opt-in
+# (postgres-tests) because they need a disposable server.
+postgres = [
+    "sqlx/postgres",
+    "sqlx/bigdecimal",
+    "sqlx/tls-rustls-ring-native-roots",
+    "dep:pg_query",
+    "dep:sqlx-postgres",
+]
+postgres-tests = ["postgres"]
+# Stable embedded Turso runtime and executor. The exact local topology remains
+# a spike profile rather than a support claim; cloud direct-remote and sync are
+# separate drivers and qualification tracks.
+turso-local = ["dep:turso", "dep:turso_parser"]
+# Deterministic contract harness and physical probes for the same exact local
+# driver/runtime identity.
+turso-tests = ["turso-local"]
+# Marker feature for the codegen binaries (see the gated [[bin]] sections
+# above) and for the held `native-evidence` emitters that forward to it. Empty
+# on purpose: it exists so default builds skip those full-library link steps,
+# not to gate any code.
+dev-tools = []
+# The stable permission-shaped executor is the default MCP product. The
+# internal feature name remains temporarily for explicit minimal builds and
+# focused CI, but does not pull in the heavyweight code-generation binaries.
+mcp-executor-prototype = []
+
+[dependencies]
+# Shared HTTP types for root hosting/relay surfaces. The held hosting package
+# separately owns authenticated MCP Streamable HTTP at `/mcp` and the
+# workbench's plain-JSON `/tools/:name` adapter. The MCP protocol itself is
+# hand-rolled — see docs/mcp-crate-choice.md for both decisions.
+axum = { version = "0.8.4", default-features = false, features = [
+    "http1",
+    "json",
+    "query",
+    "tokio",
+] }
+# `serde` is for the backup sweep's off-box heartbeat (RFC 3339 timestamps an
+# external monitor can age out). It adds no crates — serde is already here.
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
+futures = "0.3"
+async-stream = "0.3"
+hex = "0.4"
+hmac = "0.12"
+image = { version = "=0.25.6", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
+native-artifact-html = { path = "crates/artifact-html" }
+native-artifact-runtime = { path = "crates/artifact-runtime" }
+native-federation = { path = "crates/native-federation", default-features = false }
+native-query-contract = { path = "crates/query-contract" }
+native-policy-kernel = { path = "crates/policy-kernel" }
+native-record-type-correction-kernel = { path = "crates/record-type-correction-kernel" }
+native-relationship-kernel = { path = "crates/relationship-kernel" }
+rand = "0.9"
+pg_query = { version = "=6.1.1", optional = true }
+schemars = "0.8.22"
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order", "raw_value", "unbounded_depth"] }
+sha2 = "0.10"
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio",
+    "sqlite",
+    "macros",
+] }
+# Keep Postgres-native JSONB/TIMESTAMPTZ codecs scoped to the opt-in adapter;
+# enabling sqlx's umbrella type features would also activate its MySQL driver.
+sqlx-postgres = { version = "0.8", default-features = false, features = ["chrono", "json"], optional = true }
+syn = { version = "2", features = ["full", "parsing"] }
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1", features = [
+    "rt",
+    "rt-multi-thread",
+    "macros",
+    "sync",
+    "time",
+    "fs",
+    # stdio transport (src/mcp/stdio.rs) + the HTTP transport's listener.
+    "io-util",
+    "io-std",
+    "net",
+    # SIGTERM, so `serve` releases the volume before a redeploy remounts it
+    # rather than being SIGKILLed mid-write (task 46c7705).
+    "signal",
+] }
+uuid = { version = "1", features = ["v4"] }
+# Pinned alongside sqlx's SQLite build; the bundled amalgamation compiles with
+# SQLITE_ENABLE_FTS5, which the frozen DDL's records_fts virtual table needs
+# (verified by test/engine FTS coverage and the conformance self-check).
+libsqlite3-sys = { version = "0.30", features = ["bundled"] }
+base64 = "0.23.0"
+fs2 = "0.4"
+serde_jcs = "0.1"
+zeroize = { version = "1", features = ["derive"] }
+rusqlite = { version = "0.32", features = ["hooks"] }
+jsonschema = { version = "0.49.3", default-features = false }
+turso = { version = "=0.7.2", default-features = false, features = ["fts"], optional = true }
+turso_parser = { version = "=0.7.2", optional = true }
+# HTTP client for tool 23 (`attach_from_url`), chosen for SSRF-guard control
+# (docs/tool-surface.md): redirects are DISABLED (`redirect::Policy::none()`)
+# and re-driven per hop by `mcp::fetch`, and DNS is pinned per host via
+# `resolve_to_addrs` — resolve once, connect to exactly those addresses.
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "rustls-tls",
+] }
+rust-embed = "8.7"
+percent-encoding = "2"
+regex = "1"
+# URL parsing for the fetch guard (already in the tree via reqwest/sqlx).
+url = "2"
+
+[dev-dependencies]
+flate2 = "1"
+native-artifact-runtime = { path = "crates/artifact-runtime", features = ["test-support"] }
+rmcp = { version = "0.8.5", features = ["client", "transport-streamable-http-client-reqwest"] }
+sse-stream = "0.2.5"
+tower = { version = "0.5", features = ["util"] }
+
+[profile.dev]
+# Workspace code compiles at O0: it is the code that rebuilds on every edit,
+# and O0 is the fastest way through rustc. Dependencies stay at O1 below —
+# including the bundled SQLite C library, whose unoptimized runtime dominated
+# test time when the whole profile sat at O0, which is why this used to be a
+# blanket `opt-level = 1`. The blanket form taxed every recompile of the crate
+# that actually changes; the split keeps the runtime win without that tax.
+# Transition cost, measured 13 Aug 2026: cargo re-fingerprints dependencies
+# once (the emitted rustc flags are unchanged, so sccache serves the compiles
+# — 59 units in 37s on the html member's graph), and it is one-time.
+opt-level = 0
+
+[profile.dev.package."*"]
+# Dependencies: the SQLite amalgamation (via the cc OPT_LEVEL passthrough) and
+# the crypto stack (sha2, ed25519, chacha20poly1305, ring) do the heavy runtime
+# work in tests, and they rarely rebuild — optimizing them is nearly free.
+opt-level = 1
+
+[patch.crates-io]
+# mdxjs 1.0.4 resolves SWC 12.0.1, whose serde facade predates serde's
+# versioned-private-module change.  The vendored source is byte-for-byte the
+# released crate except for that compatibility path (`__private228`).
+swc_common = { path = "vendor/swc_common-12.0.1" }

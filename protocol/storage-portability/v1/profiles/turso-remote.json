@@ -1,0 +1,71 @@
+{
+  "$schema": "../profile.schema.json",
+  "format": "native.storage-profile.v1",
+  "id": "turso-remote",
+  "revision": 1,
+  "status": "research",
+  "engine": {
+    "family": "turso",
+    "implementation": "turso-cloud-remote",
+    "version_requirement": "no direct-remote Native adapter selected"
+  },
+  "frontend": {
+    "dialect": "sqlite",
+    "protocol": "credentialed Turso remote service"
+  },
+  "connection": {
+    "modes": ["network"],
+    "driver": "future direct-remote Turso SDK adapter"
+  },
+  "topology": {
+    "kind": "remote-database-per-logical-database",
+    "logical_database_isolation": "requires one verified remote namespace per Native logical database"
+  },
+  "contracts": {
+    "logical": "native.logical.v1",
+    "event_positions": "gapless",
+    "json": "native.canonical-json.v1",
+    "timestamps": "utc-rfc3339-milliseconds",
+    "ordering": "explicit-total-order"
+  },
+  "capabilities": {
+    "native.domain-mcp.v1": {
+      "support": "planned",
+      "portability": "portable",
+      "notes": "The local TursoHarness is not evidence for a direct-remote execution path."
+    },
+    "native.guarded-write.v1": {
+      "support": "planned",
+      "portability": "portable"
+    },
+    "native.canonical-interchange.v1": {
+      "support": "planned",
+      "portability": "portable"
+    },
+    "native.search.lexical.v1": {
+      "support": "planned",
+      "portability": "portable"
+    },
+    "native.search.semantic.v1": {
+      "support": "planned",
+      "portability": "portable"
+    },
+    "native.search.sqlite-fts5-exact": {
+      "support": "unsupported",
+      "portability": "blocking"
+    },
+    "native.raw-sql": {
+      "support": "unsupported",
+      "portability": "blocking",
+      "notes": "No reviewed authorization boundary exists for direct remote SQL."
+    },
+    "native.describe-physical-schema": {
+      "support": "planned",
+      "portability": "profile-specific"
+    },
+    "native.sqlite-file-fast-path": {
+      "support": "unsupported",
+      "portability": "blocking"
+    }
+  }
+}

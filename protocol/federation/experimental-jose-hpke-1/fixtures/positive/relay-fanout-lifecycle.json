@@ -1,0 +1,32 @@
+{
+  "scenario_type": "relay",
+  "scenario_id": "relay-fanout-lifecycle",
+  "profile": "native-fed/experimental-jose-hpke-1",
+  "clock": "2026-08-02T09:10:00Z",
+  "steps": [
+    {
+      "operation": "relay.submit",
+      "recipients": 2,
+      "expect": {
+        "state": "queued",
+        "independent_results": 2
+      }
+    },
+    {
+      "operation": "relay.collect",
+      "expect": {
+        "state": "collected",
+        "attempt": 1,
+        "lease_seconds": 300
+      }
+    },
+    {
+      "operation": "relay.acknowledge",
+      "disposition": "received",
+      "expect": {
+        "state": "acknowledged",
+        "stable_receipt": true
+      }
+    }
+  ]
+}

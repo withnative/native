@@ -1,0 +1,15 @@
+{
+  "scenario_type": "relay",
+  "scenario_id": "relay-ack-wrong-lease",
+  "profile": "native-fed/experimental-jose-hpke-1",
+  "clock": "2026-08-02T09:10:00Z",
+  "steps": [
+    {
+      "state": "collected",
+      "lease_token": "wrong",
+      "expected_lease_token": "expected"
+    }
+  ],
+  "expect_error": "conflict",
+  "validation_layer": "lease"
+}

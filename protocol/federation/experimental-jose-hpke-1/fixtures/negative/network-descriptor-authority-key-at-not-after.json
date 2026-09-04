@@ -1,0 +1,65 @@
+{
+  "descriptor": {
+    "descriptor_type": "native.federation.network",
+    "protocol_version": "1.0",
+    "network_id": "native",
+    "descriptor_version": 1,
+    "issued_at": "2026-08-02T09:00:00Z",
+    "fresh_until": "2026-08-02T09:15:00Z",
+    "hard_expires_at": "2026-08-03T09:00:00Z",
+    "directory_base_url": "https://directory.withnative.example",
+    "relay_base_urls": [
+      "https://relay.withnative.example"
+    ],
+    "authority_keys": [
+      {
+        "jwk": {
+          "kty": "OKP",
+          "crv": "Ed25519",
+          "x": "hN0G44wXooayFgeF428YA0Npl7k3T2ZwZtFs0Vu4KTE",
+          "alg": "EdDSA",
+          "use": "sig",
+          "kid": "n1.authority.d8Cguci8jvgmsPcM06Nhpie0Fg9RuIbZuvXsoBaF_5w"
+        },
+        "status": "active",
+        "not_before": "2026-08-02T09:00:00Z",
+        "not_after": "2026-08-02T09:10:00Z"
+      }
+    ],
+    "relay_keys": [
+      {
+        "jwk": {
+          "kty": "OKP",
+          "crv": "Ed25519",
+          "x": "vs8XqY3iAccz6UbtyvKDDZu6YI9EXKWRnahMHLR0gAQ",
+          "alg": "EdDSA",
+          "use": "sig",
+          "kid": "n1.relay.eX9XNZ8up0LUK8m95_iBaDwaPkLT2AKK8rX7LM8yV_M"
+        },
+        "status": "active",
+        "not_before": "2026-08-02T09:00:00Z",
+        "not_after": "2027-08-02T09:00:00Z"
+      }
+    ],
+    "supported_profiles": [
+      "native-fed/experimental-jose-hpke-1"
+    ],
+    "profile_preference": [
+      "native-fed/experimental-jose-hpke-1"
+    ],
+    "capabilities": [
+      "native.relay.receipts"
+    ],
+    "limits": {
+      "max_envelope_bytes": 1048576,
+      "max_recipients": 128,
+      "default_retention_seconds": 604800,
+      "max_retention_seconds": 2592000,
+      "collection_limit": 100,
+      "lease_seconds": 300
+    },
+    "historical_verification_seconds": 315576000,
+    "extensions": {}
+  },
+  "signature": "eyJhbGciOiJFZERTQSIsImtpZCI6Im4xLmF1dGhvcml0eS5kOENndWNpOGp2Z21zUGNNMDZOaHBpZTBGZzlSdUliWnV2WHNvQmFGXzV3IiwidHlwIjoibmF0aXZlLW5ldHdvcmstZGVzY3JpcHRvcitqd3MifQ..q-RRhZkpOcX-Nx8VfOYWIJ2JFJOAmen0DqBifM8UsaC_409U33aMwiJPU3Svgz2VGAbAmPTAkrYwr7UZwp6wDA"
+}

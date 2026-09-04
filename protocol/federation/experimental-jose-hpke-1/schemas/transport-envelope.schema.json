@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://spec.withnative.ai/federation/experimental-jose-hpke-1/schemas/transport-envelope.schema.json",
+  "title": "Signed Native federation transport envelope",
+  "type": "object",
+  "required": ["envelope", "signature"],
+  "properties": {
+    "envelope": { "$ref": "#/$defs/envelope" },
+    "signature": { "$ref": "common.schema.json#/$defs/detachedJws" }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "recipient": {
+      "type": "object",
+      "required": ["principal", "encryption_key_id"],
+      "properties": {
+        "principal": { "$ref": "common.schema.json#/$defs/principalAddress" },
+        "encryption_key_id": { "type": "string", "pattern": "^n1\\.encryption\\.[A-Za-z0-9_-]{43}$" }
+      },
+      "additionalProperties": false
+    },
+    "jweRecipient": {
+      "type": "object",
+      "required": ["header", "encrypted_key"],
+      "properties": {
+        "header": {
+          "type": "object",
+          "required": ["kid", "ek"],
+          "properties": {
+            "kid": { "type": "string", "pattern": "^n1\\.encryption\\.[A-Za-z0-9_-]{43}$" },
+            "ek": { "type": "string", "pattern": "^[A-Za-z0-9_-]{43}$", "$comment": "FINAL-RFC: provisional draft-ietf-jose-hpke-encrypt-22 header" }
+          },
+          "additionalProperties": false
+        },
+        "encrypted_key": { "type": "string", "pattern": "^[A-Za-z0-9_-]{64}$", "$comment": "FINAL-RFC: provisional 32-byte CEK plus 16-byte HPKE AEAD tag" }
+      },
+      "additionalProperties": false
+    },
+    "jwe": {
+      "type": "object",
+      "required": ["protected", "aad", "recipients", "iv", "ciphertext", "tag"],
+      "properties": {
+        "protected": { "$ref": "common.schema.json#/$defs/base64url" },
+        "aad": { "$ref": "common.schema.json#/$defs/base64url" },
+        "recipients": { "type": "array", "minItems": 1, "maxItems": 128, "items": { "$ref": "#/$defs/jweRecipient" } },
+        "iv": { "type": "string", "pattern": "^[A-Za-z0-9_-]{16}$" },
+        "ciphertext": { "$ref": "common.schema.json#/$defs/base64url" },
+        "tag": { "type": "string", "pattern": "^[A-Za-z0-9_-]{22}$" }
+      },
+      "additionalProperties": false
+    },
+    "envelope": {
+      "type": "object",
+      "required": ["envelope_type", "protocol_version", "profile", "envelope_id", "sender_principal", "sender_key_id", "recipients", "created_at", "content_type", "content_version", "required_capabilities", "extensions", "jwe", "ciphertext_digest"],
+      "properties": {
+        "envelope_type": { "const": "native.federation.transport" },
+        "protocol_version": { "$ref": "common.schema.json#/$defs/protocolVersion" },
+        "profile": { "$ref": "common.schema.json#/$defs/profile" },
+        "envelope_id": { "$ref": "common.schema.json#/$defs/uuidV4" },
+        "sender_principal": { "$ref": "common.schema.json#/$defs/principalAddress" },
+        "sender_key_id": { "type": "string", "pattern": "^n1\\.signing\\.[A-Za-z0-9_-]{43}$" },
+        "recipients": { "type": "array", "minItems": 1, "maxItems": 128, "items": { "$ref": "#/$defs/recipient" } },
+        "created_at": { "$ref": "common.schema.json#/$defs/timestamp" },
+        "expires_at": { "$ref": "common.schema.json#/$defs/timestamp" },
+        "content_type": { "type": "string", "maxLength": 127, "pattern": "^[a-z0-9!#$&^_.+-]+/[a-z0-9!#$&^_.+-]+$" },
+        "content_version": { "type": "string", "pattern": "^(?:0|[1-9][0-9]{0,4})\\.(?:0|[1-9][0-9]{0,4})$" },
+        "required_capabilities": { "type": "array", "maxItems": 32, "uniqueItems": true, "items": { "$ref": "common.schema.json#/$defs/capability" } },
+        "extensions": { "$ref": "common.schema.json#/$defs/extensions" },
+        "jwe": { "$ref": "#/$defs/jwe" },
+        "ciphertext_digest": { "$ref": "common.schema.json#/$defs/digest" }
+      },
+      "additionalProperties": true
+    }
+  }
+}

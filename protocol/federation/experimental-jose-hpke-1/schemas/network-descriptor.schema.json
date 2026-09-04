@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://spec.withnative.ai/federation/experimental-jose-hpke-1/schemas/network-descriptor.schema.json",
+  "title": "Signed Native federation network descriptor",
+  "type": "object",
+  "required": ["descriptor", "signature"],
+  "properties": {
+    "descriptor": {
+      "type": "object",
+      "required": ["descriptor_type", "protocol_version", "network_id", "descriptor_version", "issued_at", "fresh_until", "hard_expires_at", "directory_base_url", "relay_base_urls", "authority_keys", "relay_keys", "supported_profiles", "profile_preference", "capabilities", "limits", "historical_verification_seconds", "extensions"],
+      "properties": {
+        "descriptor_type": { "const": "native.federation.network" },
+        "protocol_version": { "$ref": "common.schema.json#/$defs/protocolVersion" },
+        "network_id": { "$ref": "common.schema.json#/$defs/networkId" },
+        "descriptor_version": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "issued_at": { "$ref": "common.schema.json#/$defs/timestamp" },
+        "fresh_until": { "$ref": "common.schema.json#/$defs/timestamp" },
+        "hard_expires_at": { "$ref": "common.schema.json#/$defs/timestamp" },
+        "directory_base_url": { "type": "string", "format": "uri", "maxLength": 2048 },
+        "relay_base_urls": { "type": "array", "maxItems": 16, "uniqueItems": true, "items": { "type": "string", "format": "uri", "maxLength": 2048 } },
+        "authority_keys": { "type": "array", "minItems": 1, "maxItems": 8, "items": { "$ref": "#/$defs/authorityServiceKey" } },
+        "relay_keys": { "type": "array", "minItems": 1, "maxItems": 16, "items": { "$ref": "#/$defs/relayServiceKey" } },
+        "supported_profiles": { "type": "array", "minItems": 1, "maxItems": 16, "uniqueItems": true, "items": { "type": "string", "maxLength": 96 } },
+        "profile_preference": { "type": "array", "minItems": 1, "maxItems": 16, "uniqueItems": true, "items": { "type": "string", "maxLength": 96 } },
+        "capabilities": { "type": "array", "maxItems": 128, "uniqueItems": true, "items": { "$ref": "common.schema.json#/$defs/capability" } },
+        "limits": {
+          "type": "object",
+          "required": ["max_envelope_bytes", "max_recipients", "default_retention_seconds", "max_retention_seconds", "collection_limit", "lease_seconds"],
+          "properties": {
+            "max_envelope_bytes": { "type": "integer", "minimum": 262144, "maximum": 1048576 },
+            "max_recipients": { "type": "integer", "minimum": 16, "maximum": 128 },
+            "default_retention_seconds": { "type": "integer", "minimum": 86400, "maximum": 604800 },
+            "max_retention_seconds": { "type": "integer", "minimum": 86400, "maximum": 2592000 },
+            "collection_limit": { "type": "integer", "minimum": 1, "maximum": 100 },
+            "lease_seconds": { "type": "integer", "minimum": 30, "maximum": 900 }
+          },
+          "additionalProperties": false
+        },
+        "historical_verification_seconds": { "type": "integer", "minimum": 315576000, "maximum": 9007199254740991 },
+        "extensions": { "$ref": "common.schema.json#/$defs/extensions" }
+      },
+      "additionalProperties": true
+    },
+    "signature": { "$ref": "common.schema.json#/$defs/detachedJws" }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "serviceKey": {
+      "type": "object",
+      "required": ["jwk", "status", "not_before"],
+      "properties": {
+        "jwk": { "$ref": "common.schema.json#/$defs/ed25519Jwk" },
+        "status": { "enum": ["active", "retired", "revoked"] },
+        "not_before": { "$ref": "common.schema.json#/$defs/timestamp" },
+        "not_after": { "$ref": "common.schema.json#/$defs/timestamp" }
+      },
+      "additionalProperties": false
+    },
+    "authorityServiceKey": {
+      "allOf": [
+        { "$ref": "#/$defs/serviceKey" },
+        { "type": "object", "properties": { "jwk": { "$ref": "common.schema.json#/$defs/authorityJwk" } } }
+      ]
+    },
+    "relayServiceKey": {
+      "allOf": [
+        { "$ref": "#/$defs/serviceKey" },
+        { "type": "object", "properties": { "jwk": { "$ref": "common.schema.json#/$defs/relayJwk" } } }
+      ]
+    }
+  }
+}

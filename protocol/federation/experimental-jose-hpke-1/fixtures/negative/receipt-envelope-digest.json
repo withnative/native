@@ -1,0 +1,20 @@
+{
+  "receipt": {
+    "receipt_type": "native.relay.delivery-receipt",
+    "protocol_version": "1.0",
+    "profile": "native-fed/experimental-jose-hpke-1",
+    "receipt_id": "00000000-0000-4000-8000-000000000301",
+    "relay_id": "native-default-relay",
+    "relay_key_id": "n1.relay.eX9XNZ8up0LUK8m95_iBaDwaPkLT2AKK8rX7LM8yV_M",
+    "delivery_id": "00000000-0000-4000-8000-000000000201",
+    "envelope_id": "00000000-0000-4000-8000-000000000001",
+    "envelope_digest": "sha-256:quU2RcMbqqNrJT6QQ8nbk5jqMx7hvD8UyYLfrrfLnAE",
+    "recipient": {
+      "network_id": "native",
+      "principal_id": "bob00001"
+    },
+    "state": "queued",
+    "observed_at": "2026-08-02T09:05:01Z"
+  },
+  "signature": "eyJhbGciOiJFZERTQSIsImtpZCI6Im4xLnJlbGF5LmVYOVhOWjh1cDBMVUs4bTk1X2lCYUR3YVBrTFQyQUtLOHJYN0xNOHlWX00iLCJ0eXAiOiJuYXRpdmUtcmVsYXktcmVjZWlwdCtqd3MifQ..Fp07FVQl7yl-aMtwQtqBGBUREwOZ1l2rv8N38D_a-QbVENjAwEqaLQGw-zhM8_Yd4l0AVR80SCZwv-r8rfqVDg"
+}

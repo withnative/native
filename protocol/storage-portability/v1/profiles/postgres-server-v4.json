@@ -1,0 +1,104 @@
+{
+  "$schema": "../profile.schema.json",
+  "format": "native.storage-profile.v1",
+  "id": "postgres-server",
+  "revision": 4,
+  "status": "spike",
+  "engine": {
+    "family": "postgresql",
+    "implementation": "postgresql",
+    "version_requirement": "PostgreSQL 16+ for the current contract-spike CI"
+  },
+  "frontend": {
+    "dialect": "postgres",
+    "protocol": "postgres-wire"
+  },
+  "connection": {
+    "modes": ["network"],
+    "driver": "sqlx-postgres"
+  },
+  "topology": {
+    "kind": "schema-per-logical-database",
+    "logical_database_isolation": "one generated schema per Native logical database in the bounded spike"
+  },
+  "contracts": {
+    "logical": "native.logical.v1",
+    "event_positions": "gapless",
+    "json": "native.canonical-json.v1",
+    "timestamps": "utc-rfc3339-milliseconds",
+    "ordering": "explicit-total-order"
+  },
+  "capabilities": {
+    "native.domain-mcp.v1": {
+      "support": "partial",
+      "portability": "portable",
+      "contract": "lifecycle, visibility, history, identity resolution and binding, replay, guarded-write, and isolation slice",
+      "notes": "Revision 4 requires the combined delete substrate and append-only, gapless binding_audit substrate. Partial aggregate claims are advisory only and never admit a strict operation without a full operation-scoped capability."
+    },
+    "native.operation.record-read.v1": {
+      "support": "partial",
+      "portability": "portable",
+      "contract": "ids-only GetArgs visibility scenario",
+      "notes": "SQLite get_record enrichments and optional argument semantics are not implemented by the bounded Postgres handler."
+    },
+    "native.operation.record-history.v1": {
+      "support": "partial",
+      "portability": "portable",
+      "contract": "record_id, after_seq, and limit storage slice",
+      "notes": "Global and authenticated history visibility plus run/order selectors are not contract-proven."
+    },
+    "native.operation.link-add.v1": {
+      "support": "unsupported",
+      "portability": "portable",
+      "notes": "The profile does not use this coarse capability for its separately qualified manage_links cell."
+    },
+    "native.operation.snapshot-export.v1": {
+      "support": "unsupported",
+      "portability": "blocking",
+      "notes": "A Postgres logical schema cannot consume a SQLite physical snapshot."
+    },
+    "native.interaction-log.v1": {
+      "support": "unsupported",
+      "portability": "portable",
+      "notes": "The Postgres registry does not materialize SQLite read_log_calls/read_log_touches; the optional tap must be suppressed."
+    },
+    "native.guarded-write.v1": {
+      "support": "full",
+      "portability": "portable",
+      "provider": "row and advisory locks plus transactional digest and gapless audit guards"
+    },
+    "native.canonical-interchange.v1": {
+      "support": "partial",
+      "portability": "portable",
+      "provider": "validated content-event import with event-cursor and records/facet projection rebuild plus canonical verification",
+      "notes": "The bounded spike verifies content_events fields seq/id/record_id/type/payload/actor/created_at (timestamps normalized to UTC microseconds), derived event_cursor.last_seq, records fields id/type/kind/name/body/home_id/summary/lifecycle/owner_id/persistence/maturity/deleted_at presence plus archived derived from facet presence, and facet_values fields record_id/key/value. It does not claim whole-section verification. Non-empty unmaterialized sections are returned in a structured report. Unsupported event types and non-null SQLite-only event annotations fail closed. TIMESTAMPTZ and JSONB normalize timestamp and JSON text; policy, meta, links, and Message audience state are not yet materialized by interchange."
+    },
+    "native.search.lexical.v1": {
+      "support": "planned",
+      "portability": "portable"
+    },
+    "native.search.semantic.v1": {
+      "support": "planned",
+      "portability": "portable",
+      "notes": "No semantic query adapter is part of the bounded Postgres spike."
+    },
+    "native.search.sqlite-fts5-exact": {
+      "support": "unsupported",
+      "portability": "blocking"
+    },
+    "native.raw-sql": {
+      "support": "full",
+      "portability": "profile-specific",
+      "provider": "pinned exhaustive PostgreSQL AST validation, caller-scoped security-barrier logical projections, typed binds, a dedicated SET-only least-privilege role, read-only transactions, bounded execution, and physical connection discard"
+    },
+    "native.describe-physical-schema": {
+      "support": "partial",
+      "portability": "profile-specific",
+      "provider": "backend-owned spike DDL and schema_migrations table"
+    },
+    "native.sqlite-file-fast-path": {
+      "support": "unsupported",
+      "portability": "blocking"
+    }
+  }
+}

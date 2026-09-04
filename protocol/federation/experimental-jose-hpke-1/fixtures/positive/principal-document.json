@@ -1,0 +1,209 @@
+{
+  "document": {
+    "document_type": "native.federation.principal",
+    "protocol_version": "1.0",
+    "profile": "native-fed/experimental-jose-hpke-1",
+    "network_id": "native",
+    "principal_id": "alice0001",
+    "document_version": 1,
+    "issued_at": "2026-08-02T09:00:00Z",
+    "fresh_until": "2026-08-02T09:15:00Z",
+    "hard_expires_at": "2026-08-03T09:00:00Z",
+    "continuity": "continuous",
+    "root_keys": [
+      {
+        "jwk": {
+          "kty": "OKP",
+          "crv": "Ed25519",
+          "x": "gLJnfi4-eyU3HwIhoc8ra8y0f0vcGLQXKMd3e8dZ3qs",
+          "alg": "EdDSA",
+          "use": "sig",
+          "kid": "n1.root.YRrk_EIEYBCsPYEPGK9blrsjZw7r5N3TQp_xCdawQ3g"
+        },
+        "status": "active",
+        "not_before": "2026-08-02T09:00:00Z",
+        "not_after": "2036-08-02T09:00:00Z"
+      }
+    ],
+    "operational_keys": [
+      {
+        "purpose": "signing",
+        "jwk": {
+          "kty": "OKP",
+          "crv": "Ed25519",
+          "x": "u53MhXD8IEfIq_sv04YOg56prAOxviBORfMXo_HqlDw",
+          "alg": "EdDSA",
+          "use": "sig",
+          "kid": "n1.signing.Gjl4ccI6MF2tlN6xClEu06TjLV2amB4Lmnq-g4rnC4M"
+        },
+        "status": "active",
+        "not_before": "2026-08-02T09:00:00Z",
+        "not_after": "2027-08-02T09:00:00Z",
+        "authorization": {
+          "statement": {
+            "statement_type": "native.operational-key-authorization",
+            "protocol_version": "1.0",
+            "principal": {
+              "network_id": "native",
+              "principal_id": "alice0001"
+            },
+            "key": {
+              "purpose": "signing",
+              "jwk": {
+                "kty": "OKP",
+                "crv": "Ed25519",
+                "x": "u53MhXD8IEfIq_sv04YOg56prAOxviBORfMXo_HqlDw",
+                "alg": "EdDSA",
+                "use": "sig",
+                "kid": "n1.signing.Gjl4ccI6MF2tlN6xClEu06TjLV2amB4Lmnq-g4rnC4M"
+              },
+              "status": "active",
+              "not_before": "2026-08-02T09:00:00Z",
+              "not_after": "2027-08-02T09:00:00Z"
+            },
+            "issued_at": "2026-08-02T09:00:00Z"
+          },
+          "signature": "eyJhbGciOiJFZERTQSIsImtpZCI6Im4xLnJvb3QuWVJya19FSUVZQkNzUFlFUEdLOWJscnNqWnc3cjVOM1RRcF94Q2Rhd1EzZyIsInR5cCI6Im5hdGl2ZS1rZXktYXV0aG9yaXphdGlvbitqd3MifQ..WxBidgAA8hOoGzemqoszfic-v-_53ryZ8kUseMqRXykQLFw7Xf_M53ReETPZY0SkxfMBIqPoODnBKGmCYIv0BQ"
+        }
+      },
+      {
+        "purpose": "encryption",
+        "jwk": {
+          "kty": "OKP",
+          "crv": "X25519",
+          "x": "nLX0IKJrdNnECZ9HB_RmGmgVMm70eLVWIVM30J7_Njc",
+          "alg": "HPKE-3-KE",
+          "use": "enc",
+          "kid": "n1.encryption.WzGSuABqsoFrrsaEgKtrygB2JhuLCJuvPqqDobYZWDc"
+        },
+        "status": "active",
+        "not_before": "2026-08-02T09:00:00Z",
+        "not_after": "2027-08-02T09:00:00Z",
+        "authorization": {
+          "statement": {
+            "statement_type": "native.operational-key-authorization",
+            "protocol_version": "1.0",
+            "principal": {
+              "network_id": "native",
+              "principal_id": "alice0001"
+            },
+            "key": {
+              "purpose": "encryption",
+              "jwk": {
+                "kty": "OKP",
+                "crv": "X25519",
+                "x": "nLX0IKJrdNnECZ9HB_RmGmgVMm70eLVWIVM30J7_Njc",
+                "alg": "HPKE-3-KE",
+                "use": "enc",
+                "kid": "n1.encryption.WzGSuABqsoFrrsaEgKtrygB2JhuLCJuvPqqDobYZWDc"
+              },
+              "status": "active",
+              "not_before": "2026-08-02T09:00:00Z",
+              "not_after": "2027-08-02T09:00:00Z"
+            },
+            "issued_at": "2026-08-02T09:00:00Z"
+          },
+          "signature": "eyJhbGciOiJFZERTQSIsImtpZCI6Im4xLnJvb3QuWVJya19FSUVZQkNzUFlFUEdLOWJscnNqWnc3cjVOM1RRcF94Q2Rhd1EzZyIsInR5cCI6Im5hdGl2ZS1rZXktYXV0aG9yaXphdGlvbitqd3MifQ..XqCMbYmeNmQWxtVys_qJS2FHMCtvzy49EsipyIWVzji24WJBkmiQ5CvtQLbLKHKAykIzLF80Wt3wpabdU7c8Dg"
+        }
+      }
+    ],
+    "installations": [
+      {
+        "installation_id": "00000000-0000-4000-8000-000000000101",
+        "jwk": {
+          "kty": "OKP",
+          "crv": "Ed25519",
+          "x": "LAJI5zFw1H25VNIYGbJMw2mf8EBFdU6qys-n0yDnARM",
+          "alg": "EdDSA",
+          "use": "sig",
+          "kid": "n1.installation.Cf_V_UWFoYOXL1sNlrh4OnBmuy4iVkKyvgcAGIWDevE"
+        },
+        "status": "active",
+        "endpoint_origin": "https://node.alice.example",
+        "scopes": [
+          "directory.endpoint.update",
+          "relay.acknowledge",
+          "relay.collect"
+        ],
+        "authorization": {
+          "statement": {
+            "statement_type": "native.installation-key-authorization",
+            "protocol_version": "1.0",
+            "principal": {
+              "network_id": "native",
+              "principal_id": "alice0001"
+            },
+            "installation": {
+              "installation_id": "00000000-0000-4000-8000-000000000101",
+              "jwk": {
+                "kty": "OKP",
+                "crv": "Ed25519",
+                "x": "LAJI5zFw1H25VNIYGbJMw2mf8EBFdU6qys-n0yDnARM",
+                "alg": "EdDSA",
+                "use": "sig",
+                "kid": "n1.installation.Cf_V_UWFoYOXL1sNlrh4OnBmuy4iVkKyvgcAGIWDevE"
+              },
+              "status": "active",
+              "endpoint_origin": "https://node.alice.example",
+              "scopes": [
+                "directory.endpoint.update",
+                "relay.acknowledge",
+                "relay.collect"
+              ]
+            },
+            "issued_at": "2026-08-02T09:00:00Z"
+          },
+          "signature": "eyJhbGciOiJFZERTQSIsImtpZCI6Im4xLnNpZ25pbmcuR2psNGNjSTZNRjJ0bE42eENsRXUwNlRqTFYyYW1CNExtbnEtZzRybkM0TSIsInR5cCI6Im5hdGl2ZS1rZXktYXV0aG9yaXphdGlvbitqd3MifQ..hGsPttwJwLXdXEebk7ji8BwSiXFeg_qybmzgahPjuWSAdBrHW-3vc3VD-H90D91yvHkBNjuLUWft17SNamSYCw"
+        }
+      }
+    ],
+    "verified_aliases": [
+      {
+        "system": "email",
+        "value": "Alice@example.com",
+        "normalization": "native.email-ascii-v1",
+        "verified_at": "2026-08-02T09:00:00Z",
+        "fresh_until": "2026-09-01T09:00:00Z",
+        "verifier": "native",
+        "method": "email-otp"
+      }
+    ],
+    "delivery_endpoints": [
+      {
+        "kind": "relay",
+        "url": "https://relay.withnative.example/v1",
+        "priority": 0
+      }
+    ],
+    "supported_profiles": [
+      "native-fed/experimental-jose-hpke-1"
+    ],
+    "capabilities": [
+      "native.relay.receipts"
+    ],
+    "required_capabilities": [],
+    "extensions": {}
+  },
+  "principal_signature": "eyJhbGciOiJFZERTQSIsImtpZCI6Im4xLnNpZ25pbmcuR2psNGNjSTZNRjJ0bE42eENsRXUwNlRqTFYyYW1CNExtbnEtZzRybkM0TSIsInR5cCI6Im5hdGl2ZS1wcmluY2lwYWwrandzIn0..upyT0Q4lVV_04s2rPFF9WaZSD8QvnoxY1E3pVnyoxwot6I7l0tv14dTaIWlkft0x2MfSOW6affHf9e-qnhqMDQ",
+  "authority_attestation": {
+    "statement": {
+      "statement_type": "native.authority.principal-attestation",
+      "protocol_version": "1.0",
+      "network_id": "native",
+      "principal": {
+        "network_id": "native",
+        "principal_id": "alice0001"
+      },
+      "document_version": 1,
+      "document_digest": "sha-256:PHamFCwtv4bODv7ENsSCd5A1TXRUXIAGVAJov-GsL1s",
+      "root_kids": [
+        "n1.root.YRrk_EIEYBCsPYEPGK9blrsjZw7r5N3TQp_xCdawQ3g"
+      ],
+      "issued_at": "2026-08-02T09:00:00Z",
+      "fresh_until": "2026-08-02T09:15:00Z",
+      "hard_expires_at": "2026-08-03T09:00:00Z",
+      "directory_base_url": "https://directory.withnative.example"
+    },
+    "signature": "eyJhbGciOiJFZERTQSIsImtpZCI6Im4xLmF1dGhvcml0eS5kOENndWNpOGp2Z21zUGNNMDZOaHBpZTBGZzlSdUliWnV2WHNvQmFGXzV3IiwidHlwIjoibmF0aXZlLXByaW5jaXBhbC1hdHRlc3RhdGlvbitqd3MifQ..pyhYOoHScF1erYEoqbZNejOsPKRE5nH7BGvwxMszoa3Bbq-1RmxNc3AGoJ-1saqdEYW-v8nB8SPDc5ag2-86Aw"
+  }
+}

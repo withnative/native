@@ -1,0 +1,19 @@
+{
+  "scenario_type": "directory",
+  "scenario_id": "directory-profile-negotiate",
+  "profile": "native-fed/experimental-jose-hpke-1",
+  "clock": "2026-08-02T09:10:00Z",
+  "steps": [
+    {
+      "request": "POST /v1/profiles:negotiate",
+      "profiles": [
+        "native-fed/experimental-jose-hpke-1"
+      ],
+      "expect": {
+        "status": 200,
+        "selected_profile": "native-fed/experimental-jose-hpke-1",
+        "signed": true
+      }
+    }
+  ]
+}

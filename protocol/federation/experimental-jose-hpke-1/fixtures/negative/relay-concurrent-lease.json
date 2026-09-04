@@ -1,0 +1,14 @@
+{
+  "scenario_type": "relay",
+  "scenario_id": "relay-concurrent-lease",
+  "profile": "native-fed/experimental-jose-hpke-1",
+  "clock": "2026-08-02T09:10:00Z",
+  "steps": [
+    {
+      "collectors": 2,
+      "live_lease_holders": 2
+    }
+  ],
+  "expect_error": "conflict",
+  "validation_layer": "lease"
+}

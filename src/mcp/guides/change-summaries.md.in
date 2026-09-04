@@ -1,0 +1,22 @@
+# Confirmed change summaries
+
+A change summary is an ordinary `Document kind:note` whose body is governed by a stable derivation series. Native recognizes it only through the active `change_summary` role, the exact `native.change-summary.markdown` output contract rendered from a `native.change-summary.v1` structured result, and an explicit confirmation of one immutable revision. A title, kind, timestamp, or body phrase never makes a note a change summary.
+
+## Author and ship
+
+1. Inspect or publish the packaged `Program kind:recipe` release and retain its publication id, descriptor SHA-256, and status event sequence.
+2. Call `manage_change_summaries` with `action:"create_or_reuse"`, a durable semantic `workflow_key`, a display name, the exact recipe pin, and a reason. Repeating this action reuses the same private note, series, binding, and role assignment.
+3. Call `action:"derive"` with exactly three authoritative content-event ids, relevant WorkItem/Outcome/decision record ids, the structured `native.change-summary.v1` result, the current recipe status fence, and a reason. Three runs can therefore become one candidate while remaining individually inspectable.
+4. Inspect the candidate and explicitly call `action:"confirm"` with its exact selected revision id. Confirmation is the shipping decision. A later correction is only a draft until someone confirms that new revision; use `revoke` when the prior confirmation should no longer appear.
+
+The authenticated server credential is always the event actor. `run_key` is lifted from standard call context. The role, query contract, and output contract cannot be supplied or changed by tool arguments.
+
+## Retrieve and drill down
+
+Call `query_change_summaries` with `action:"list"` for a bounded page of confirmed, current, visible summaries. `action:"get"` opens one exact assignment and includes its first evidence page. `action:"drill"` continues through source and context evidence using the returned opaque cursor. Source events the caller cannot view remain present as redacted slots, preserving grouping without disclosing their ids, hashes, or run keys.
+
+Reads revalidate recipe, series, target binding, role assignment, confirmation, current source/scope basis, complete audience, and carrier visibility in one snapshot. Stale, revoked, unauthorized, malformed, and nonexistent results all remain absent or unavailable.
+
+## Hosted and standalone membership
+
+Hosted ingress supplies a caller only after checking current catalog membership. Standalone stdio selects one account from the local file. The packaged workflow has an exact one-account audience, so the public query path answers membership only for that authenticated account and fails closed for every other audience principal. It never trusts a stored membership bit or a caller-supplied membership claim.

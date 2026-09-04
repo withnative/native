@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://spec.withnative.ai/federation/experimental-jose-hpke-1/schemas/scenario.schema.json",
+  "title": "Native federation deterministic conformance scenario",
+  "type": "object",
+  "required": ["scenario_type", "scenario_id", "profile", "clock", "steps"],
+  "properties": {
+    "scenario_type": { "enum": ["alias", "directory", "envelope", "idempotency", "principal", "relay"] },
+    "scenario_id": { "type": "string", "pattern": "^[a-z0-9-]+$" },
+    "profile": { "$ref": "common.schema.json#/$defs/profile" },
+    "clock": { "$ref": "common.schema.json#/$defs/timestamp" },
+    "steps": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "object", "minProperties": 1 }
+    },
+    "expect_error": { "type": "string", "pattern": "^[a-z_]+$" },
+    "validation_layer": { "type": "string", "pattern": "^[a-z][a-z-]*$" }
+  },
+  "additionalProperties": true
+}

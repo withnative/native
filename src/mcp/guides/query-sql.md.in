@@ -1,0 +1,105 @@
+# Engine-native read-only SQL
+
+`query_sql` accepts one read-only statement in the active engine's native dialect. Native does not translate SQL between engines. Call `engine_info` first and inspect its `query_sql` object: it is the admission truth for availability, immutable profile revision, dialect, parameter convention, limits, and any fail-closed reason.
+
+## Parameters
+
+Parameters are optional and positional. Every supplied item requires both a `type` tag and an explicit `value`; `value: null` is a typed SQL NULL, while the string `"null"` is a JSON null for the `json` tag. Use the active profile's generated placeholder and encoding metadata below.
+
+```json
+{
+  "sql": "SELECT id, name FROM records WHERE updated_at >= ?1 ORDER BY updated_at, id",
+  "parameters": [
+    {"type":"timestamp","value":"2026-08-10T12:00:00Z"}
+  ]
+}
+```
+
+Queries are not portable merely because their parameter values are.
+
+Rows and relations are caller-filtered. Physical policy, principal, catalog, FTS, embedding, job, metadata, and introspection relations are not part of the logical catalog. A read-only transaction alone is not authorization.
+
+SQLite retains its established normalization: SQL NULL to JSON null, INTEGER to a JSON integer, REAL to a finite JSON number, BLOB to base64 text, and other values to text. Engines with distinct boolean, arbitrary numeric, JSON, or timestamp types must follow the generated encoding contract. Ordering, collation, null placement, and timestamp precision remain dialect-specific.
+
+## Saved governed SQL
+
+A string-valued `query` facet may retain legacy saved-query v0.2 or a
+`governed_sql` v1.0 envelope. V1.0 pins one active engine profile, logical
+catalog revision, every referenced relation's semantic version, positional
+typed parameter values, a declared output schema and digest, stable row
+identity, total order, and a row bound. Saving validates this contract;
+execution validates it again and runs through the same caller-filtered
+`query_sql` path. An envelope is derived computation, never authority.
+
+```json
+{
+  "v":"1.1",
+  "kind":"governed_sql",
+  "profile":{"id":"sqlite-local","revision":2},
+  "catalog_revision":3,
+  "relations":{"records":{"identity":"native.query-sql.records","semantic_version":1}},
+  "sql":"SELECT name,id FROM records WHERE type=?1",
+  "parameters":[{"type":"text","value":"WorkItem"}],
+  "output":{
+    "columns":[
+      {"name":"name","type":"text","nullable":false},
+      {"name":"id","type":"identifier","nullable":false}
+    ],
+    "schema_sha256":"e3cc6f2fcb66f5098e2b517084eb72a42cf9412cb46b8d1f651f8d5b63a08548",
+    "row_identity":["id"],
+    "order":[{"column":"name","direction":"asc"},{"column":"id","direction":"asc"}]
+  },
+  "bounds":{"rows":1000}
+}
+```
+
+`identifier` is a semantic promise of globally stable application identity;
+V1 requires exactly one non-null identifier in `row_identity`, and the final
+order key must be that identity column. A Collection query requires exactly
+`["id"]`. The engine imposes the declared outer
+order and checks identity uniqueness and output types at execution. Local
+event sequences and timestamps therefore cannot masquerade as tie-breakers.
+At the saved-envelope boundary, declared boolean columns normalize SQLite's
+exact integer encodings `0` and `1` to JSON booleans before schema validation.
+
+Each execution returns `native.governed-sql-receipt.v1` separately from the
+durable definition. Its `snapshot` is an opaque issuer-scoped observation
+token, not a sequence, ordering key, or portable resume handle. V1 is one
+bounded unpaged execution: `cursor` is null, truncation is explicit, and no
+resume contract is offered. `agent_activity` and `agent_activity_claims` make
+receipt completeness `best_effort`: durable lifecycle and claim history remain
+available, while a receipt explicitly reports whether disposable activity
+capture contributed to the observation. Both relations use the receipt's one
+`observed_at`, a fixed 24-hour window, and non-replayable semantics.
+Claim history returns claims created inside that window plus an older claim
+while it remains current and its run remains in-window. Releasing an old claim
+does not reopen an otherwise expired historical row.
+Zero activity rows means only that this bounded execution observed no rows the
+current caller was authorized to receive; it never proves the absence of
+hidden, expired, or uncaptured activity.
+
+`agent_activity.run_key` is the visible identity and continuity handle for one
+logical run across stateless calls. It is useful for grouping and recognizing
+that run, but it is not authentication, proof of exclusive possession, or a
+persistent identity for the actor behind the calls. `activity_id` remains the
+opaque relational key used to join activity with `agent_activity_claims`.
+
+`native.relation-envelope.v1` artifact ports may bind a governed SQL
+Collection when the port declares the exact `schema_sha256` expected from its
+output. Rendering reruns the saved query under the viewer's current authority
+and supplies its declared typed columns, row identity, schema digest, and rows;
+legacy query Collections continue to supply canonical artifact-record rows.
+A saved-query definition mutation that changes the schema is incompatible with
+the attested port until the artifact is updated. The binding stores the
+saved-query record identity; typed parameter values remain in that record's
+durable envelope. It stores no receipt, cursor, snapshot token, authority, or
+materialized rows. Historical saved-SQL execution is unsupported in v1. The
+relation envelope reuses the execution receipt's opaque snapshot and reports
+both row truncation and source completeness; a truncated extent never claims a
+known total.
+
+<!-- GENERATED:QUERY_SQL_CONTRACT -->
+
+The front-door scanner rejects multiple statements and obvious writes, DDL, transaction control, mutable pragmas, attachment/extension operations, and copy/export forms. Its lexical rules follow the active profile: SQLite/Turso understand their quoted forms and `$name` parameters but never PostgreSQL dollar quoting; PostgreSQL additionally understands escape strings, nested block comments, quoted identifiers, and dollar quoting. This remains defence in depth. The qualified backend parser, authorization provider, read-only controls, and function/catalog restrictions remain authoritative.
+
+Never infer availability from dialect similarity. Use `engine_info.query_sql.available` for the active profile.

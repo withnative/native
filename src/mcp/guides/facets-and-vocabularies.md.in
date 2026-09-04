@@ -1,0 +1,61 @@
+# Facets and vocabularies
+
+Facets add typed or governed attributes without widening the closed record-type spine. General facet reads and writes resolve the effective shape through the global closest-wins pack → user cascade. Resolve that shape before choosing governed values.
+
+Record-anchored shape rows exist for narrower consumers such as message expectations; they do not govern general `resolve_facets`, suggestion, create, or update paths. A record's filing home also does not contribute general facet schema.
+
+## Spine facet keys
+
+<!-- GENERATED:SPINE_FACET_KEYS -->
+
+### `lifecycle`
+
+An open coordination/status token promoted onto the record row. The engine does not impose one universal future state machine.
+
+### `owner`
+
+The portable record identity accountable for the record, stored through the first-class owner lane.
+
+### `persistence`
+
+Whether the record represents something durable or something event-like. Its closed values are generated below.
+
+### `maturity`
+
+An open token describing confidence or development maturity without conflating it with lifecycle.
+
+## Persistence values
+
+<!-- GENERATED:PERSISTENCE_VALUES -->
+
+### `enduring`
+
+The record represents a continuing thing whose identity should persist as its content changes.
+
+### `occurrent`
+
+The record represents an occurrence or bounded event rather than a continuing entity.
+
+## Engine-reserved facet keys
+
+<!-- GENERATED:ENGINE_RESERVED_FACET_KEYS -->
+
+### `archived`
+
+Owned by `archive_record`. Presence with value `true` means archived; restoration unsets the key. User facet writes and schema configuration cannot redefine it.
+
+### `blob_ref`
+
+Owned by the attachment seam and points an attachment record at immutable blob bytes. It is not a caller-editable open facet.
+
+### `canvas.promoted_from`
+
+Owned by `manage_canvas.promote` and records that a record was minted by promoting an object on a canvas. Its value is an object: `{canvas_id, object_id, batch_event_id, attestation_id}`. It is reserved rather than a governed namespaced facet precisely so that it cannot be forged: a facet any Edit holder could set through `create_record` or `update_record` would make canvas provenance a claim rather than evidence. Promotion writes it inside the same transaction that mints the record, under the same action attestation, so the facet, the `derived_from` link and the canvas batch all share one identity.
+
+## Safe read and write path
+
+Call `resolve_facets` with exactly one record or type context to see spine values, the effective shape, pack floor, provenance, and current values. For a governed facet, take its resolved vocabulary identity and call `manage_vocabularies` with `action:"list_values"`, `status:"active"`, and `resolve_aliases:true` before writing. Skipping resolution can select a same-named or stale vocabulary under the cascade.
+
+`create_record` and `update_record` accept open facet values and enforce the resolved predicates in the write transaction. JSON numbers must stay numbers for facets declared `type: "number"`. Atomic JSON objects require `type: "object"`; an optional self-contained `json_schema` is enforced with format checking, and `temporal_order` can require one dotted ISO full-date or RFC3339 date-time path not to follow another. Object facets remain single-valued and are stored through the ordinary facet event/history path. `$ref` is refused so record writes never fetch mutable external schemas. `manage_schema_config` reads the pack and resolved views and writes only the user layer; engine-reserved keys are never configurable, and user shapes may not loosen the pack interoperability floor.
+
+Use `update_record.facets` when the current projected facet should change. Its bounded `ids` form applies one shared current-state patch atomically to an explicit cohort. `manage_facet_observations.set` is different: it records what was observed over valid time and does not replace the record's current projected facet. Do not use an observation write as a current-state update.

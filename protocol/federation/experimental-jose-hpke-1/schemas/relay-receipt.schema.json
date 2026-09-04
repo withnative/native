@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://spec.withnative.ai/federation/experimental-jose-hpke-1/schemas/relay-receipt.schema.json",
+  "title": "Signed Native federation relay receipt",
+  "type": "object",
+  "required": ["receipt", "signature"],
+  "properties": {
+    "receipt": {
+      "type": "object",
+      "required": ["receipt_type", "protocol_version", "profile", "receipt_id", "relay_id", "relay_key_id", "delivery_id", "envelope_id", "envelope_digest", "recipient", "state", "observed_at"],
+      "properties": {
+        "receipt_type": { "const": "native.relay.delivery-receipt" },
+        "protocol_version": { "$ref": "common.schema.json#/$defs/protocolVersion" },
+        "profile": { "$ref": "common.schema.json#/$defs/profile" },
+        "receipt_id": { "$ref": "common.schema.json#/$defs/uuidV4" },
+        "relay_id": { "type": "string", "minLength": 1, "maxLength": 257 },
+        "relay_key_id": { "type": "string", "pattern": "^n1\\.relay\\.[A-Za-z0-9_-]{43}$" },
+        "delivery_id": { "$ref": "common.schema.json#/$defs/uuidV4" },
+        "envelope_id": { "$ref": "common.schema.json#/$defs/uuidV4" },
+        "envelope_digest": { "$ref": "common.schema.json#/$defs/digest" },
+        "recipient": { "$ref": "common.schema.json#/$defs/principalAddress" },
+        "previous_state": { "enum": ["queued", "collected"] },
+        "state": { "enum": ["rejected", "queued", "collected", "acknowledged"] },
+        "observed_at": { "$ref": "common.schema.json#/$defs/timestamp" },
+        "collector_installation_id": { "$ref": "common.schema.json#/$defs/uuidV4" },
+        "reason_code": { "enum": ["invalid_recipient", "principal_revoked", "key_revoked", "expired", "policy_rejected"] }
+      },
+      "oneOf": [
+        {
+          "properties": { "state": { "const": "queued" } },
+          "required": ["state"],
+          "not": { "anyOf": [{ "required": ["previous_state"] }, { "required": ["collector_installation_id"] }, { "required": ["reason_code"] }] }
+        },
+        {
+          "properties": { "state": { "const": "collected" }, "previous_state": { "const": "queued" } },
+          "required": ["state", "previous_state", "collector_installation_id"],
+          "not": { "required": ["reason_code"] }
+        },
+        {
+          "properties": { "state": { "const": "acknowledged" }, "previous_state": { "const": "collected" } },
+          "required": ["state", "previous_state", "collector_installation_id"],
+          "not": { "required": ["reason_code"] }
+        },
+        {
+          "properties": { "state": { "const": "rejected" } },
+          "required": ["state", "reason_code"],
+          "not": { "required": ["collector_installation_id"] }
+        }
+      ],
+      "additionalProperties": true
+    },
+    "signature": { "$ref": "common.schema.json#/$defs/detachedJws" }
+  },
+  "additionalProperties": false
+}

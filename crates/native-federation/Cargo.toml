@@ -1,0 +1,49 @@
+[package]
+name = "native-federation"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.98"
+description = "Native experimental federation identity, custody and relay runtime."
+repository = "https://github.com/withnative/native"
+license = "AGPL-3.0-only"
+publish = false
+
+[lib]
+name = "native_federation"
+path = "src/lib.rs"
+
+[[bin]]
+name = "relay"
+path = "src/bin/relay.rs"
+test = false
+
+[features]
+default = []
+experimental-federation-hpke = []
+
+[dependencies]
+age = { version = "0.11", default-features = false, features = ["armor"] }
+axum = { version = "0.8.4", default-features = false, features = ["http1", "json", "tokio"] }
+base64 = "0.23.0"
+chacha20poly1305 = "0.10"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
+ed25519-dalek = "2.2"
+fs2 = "0.4"
+hmac = "0.12"
+rand = "0.9"
+rusqlite = { version = "0.32", features = ["hooks"] }
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_jcs = "0.1"
+serde_json = { version = "1", features = ["preserve_order", "raw_value", "unbounded_depth"] }
+sha2 = "0.10"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "macros"] }
+thiserror = "2"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "net", "signal"] }
+url = "2"
+uuid = { version = "1", features = ["v4"] }
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+zeroize = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }

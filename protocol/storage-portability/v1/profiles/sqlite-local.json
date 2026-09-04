@@ -1,0 +1,102 @@
+{
+  "$schema": "../profile.schema.json",
+  "format": "native.storage-profile.v1",
+  "id": "sqlite-local",
+  "revision": 1,
+  "status": "reference",
+  "engine": {
+    "family": "sqlite",
+    "implementation": "bundled-sqlite",
+    "version_requirement": "native-ce bundled SQLite build"
+  },
+  "frontend": {
+    "dialect": "sqlite",
+    "protocol": "in-process-c-api"
+  },
+  "connection": {
+    "modes": ["embedded"],
+    "driver": "sqlx-sqlite"
+  },
+  "topology": {
+    "kind": "single-file",
+    "logical_database_isolation": "one file per Native logical database"
+  },
+  "contracts": {
+    "logical": "native.logical.v1",
+    "event_positions": "gapless",
+    "json": "native.canonical-json.v1",
+    "timestamps": "utc-rfc3339-milliseconds",
+    "ordering": "explicit-total-order"
+  },
+  "capabilities": {
+    "native.domain-mcp.v1": {
+      "support": "full",
+      "portability": "portable",
+      "contract": "backend-neutral MCP contract corpus"
+    },
+    "native.operation.record-read.v1": {
+      "support": "full",
+      "portability": "portable",
+      "contract": "get_record visibility-filtered read contract"
+    },
+    "native.operation.record-history.v1": {
+      "support": "full",
+      "portability": "portable",
+      "contract": "get_history visibility-filtered event history contract"
+    },
+    "native.operation.link-add.v1": {
+      "support": "full",
+      "portability": "portable",
+      "contract": "manage_links action=add contract"
+    },
+    "native.operation.snapshot-export.v1": {
+      "support": "full",
+      "portability": "portable",
+      "contract": "export_snapshot physical SQLite snapshot contract"
+    },
+    "native.interaction-log.v1": {
+      "support": "full",
+      "portability": "portable",
+      "contract": "optional read_log_calls and read_log_touches interaction tap"
+    },
+    "native.guarded-write.v1": {
+      "support": "full",
+      "portability": "portable",
+      "provider": "BEGIN IMMEDIATE plus digest guard"
+    },
+    "native.canonical-interchange.v1": {
+      "support": "full",
+      "portability": "portable",
+      "contract": "canonical manifest and ordered section schemas with verified transactional SQLite round-trip"
+    },
+    "native.search.lexical.v1": {
+      "support": "full",
+      "portability": "portable",
+      "provider": "SQLite FTS5 plus Native ranking"
+    },
+    "native.search.semantic.v1": {
+      "support": "planned",
+      "portability": "portable",
+      "notes": "The embedding write seam is dormant and no semantic query adapter ships yet."
+    },
+    "native.search.sqlite-fts5-exact": {
+      "support": "full",
+      "portability": "profile-specific"
+    },
+    "native.raw-sql": {
+      "support": "full",
+      "portability": "profile-specific",
+      "contract": "SQLite SELECT dialect with SQLite authorizer"
+    },
+    "native.describe-physical-schema": {
+      "support": "full",
+      "portability": "profile-specific",
+      "provider": "frozen SQLite DDL v19"
+    },
+    "native.sqlite-file-fast-path": {
+      "support": "full",
+      "portability": "convertible",
+      "provider": "verified VACUUM INTO artifact"
+    }
+  }
+}

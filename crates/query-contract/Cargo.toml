@@ -1,0 +1,19 @@
+[package]
+name = "native-query-contract"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.98"
+description = "Pure query identity, SQL, error, and invalidation contracts for native-ce."
+repository = "https://github.com/withnative/native"
+license = "AGPL-3.0-only"
+publish = false
+
+[features]
+default = []
+
+[dependencies]
+base64 = "0.23.0"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+thiserror = "2"

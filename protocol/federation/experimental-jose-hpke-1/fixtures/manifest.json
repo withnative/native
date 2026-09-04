@@ -1,0 +1,625 @@
+{
+  "profile": "native-fed/experimental-jose-hpke-1",
+  "protocol_version": "1.0",
+  "jose_hpke_basis": "draft-ietf-jose-hpke-encrypt-22",
+  "jose_hpke_status": "work-in-progress",
+  "verification_keys": "fixtures/verification-keys.json",
+  "request_proof_signing": "fixtures/request-proof-signing.json",
+  "cases": [
+    {
+      "id": "network-descriptor",
+      "path": "fixtures/positive/network-descriptor.json",
+      "schema": "schemas/network-descriptor.schema.json",
+      "expect": "valid",
+      "validation_layers": [
+        "schema",
+        "jws",
+        "kid"
+      ],
+      "crypto_status": "not-applicable"
+    },
+    {
+      "id": "profile-negotiation-response",
+      "path": "fixtures/positive/profile-negotiation-response.json",
+      "schema": "schemas/directory.schema.json#/$defs/negotiateResponse",
+      "expect": "valid",
+      "validation_layers": [
+        "schema",
+        "jws",
+        "negotiation"
+      ],
+      "crypto_status": "not-applicable"
+    },
+    {
+      "id": "network-descriptor-authority-key-at-not-after",
+      "path": "fixtures/negative/network-descriptor-authority-key-at-not-after.json",
+      "schema": "schemas/network-descriptor.schema.json",
+      "expect": "invalid",
+      "error": "signature_invalid",
+      "validation_layers": [
+        "trust-binding"
+      ],
+      "crypto_status": "not-applicable"
+    },
+    {
+      "id": "principal-document",
+      "path": "fixtures/positive/principal-document.json",
+      "schema": "schemas/principal-document.schema.json",
+      "expect": "valid",
+      "validation_layers": [
+        "schema",
+        "jws",
+        "kid",
+        "authority-digest"
+      ],
+      "crypto_status": "not-applicable"
+    },
+    {
+      "id": "envelope-one-recipient",
+      "path": "fixtures/positive/envelope-one-recipient.json",
+      "schema": "schemas/transport-envelope.schema.json",
+      "expect": "valid",
+      "validation_layers": [
+        "schema",
+        "jws",
+        "context",
+        "recipient-mapping"
+      ],
+      "crypto_status": "FINAL-RFC-structural-placeholder"
+    },
+    {
+      "id": "envelope-many-recipients",
+      "path": "fixtures/positive/envelope-many-recipients.json",
+      "schema": "schemas/transport-envelope.schema.json",
+      "expect": "valid",
+      "validation_layers": [
+        "schema",
+        "jws",
+        "context",
+        "recipient-order",
+        "recipient-mapping"
+      ],
+      "crypto_status": "FINAL-RFC-structural-placeholder"
+    },
+    {
+      "id": "receipt-queued",
+      "path": "fixtures/positive/receipt-queued.json",
+      "schema": "schemas/relay-receipt.schema.json",
+      "expect": "valid",
+      "validation_layers": [
+        "schema",
+        "jws",
+        "envelope-digest"
+      ],
+      "crypto_status": "not-applicable"
+    },
+    {
+      "id": "error-rate-limited",
+      "path": "fixtures/positive/error-rate-limited.json",
+      "schema": "schemas/common.schema.json#/$defs/problem",
+      "expect": "valid",
+      "validation_layers": [
+        "schema",
+        "error-registry"
+      ],
+      "crypto_status": "not-applicable"
+    },
+    {
+      "id": "principal-document-rotated",
+      "path": "fixtures/positive/principal-document-rotated.json",
+      "schema": "schemas/principal-document.schema.json",
+      "expect": "valid",
+      "validation_layers": [
+        "schema",
+        "jws",
+        "kid",
+        "key-state",
+        "authority-digest"
+      ],
+      "crypto_status": "not-applicable"
+    },
+    {
+      "id": "envelope-unknown-optional",
+      "path": "fixtures/positive/envelope-unknown-optional.json",
+      "schema": "schemas/transport-envelope.schema.json",
+      "expect": "valid",
+      "validation_layers": [
+        "schema",
+        "jws",
+        "context",
+        "version"
+      ],
+      "crypto_status": "FINAL-RFC-structural-placeholder"
+    },
+    {
+      "id": "directory-etag-revalidation",
+      "path": "fixtures/positive/directory-etag-revalidation.json",
+      "schema": "schemas/scenario.schema.json",
+      "expect": "valid",
+      "validation_layers": [
+        "etag",
+        "freshness",
+        "service-behaviour"
+      ],
+      "crypto_status": "not-applicable"
+    },
+    {
+      "id": "directory-alias-resolve",
+      "path": "fixtures/positive/directory-alias-resolve.json",
+      "schema": "schemas/scenario.schema.json",
+      "expect": "valid",
+      "validation_layers": [
+        "alias",
+        "authorization",
+        "service-behaviour"
+      ],
+      "crypto_status": "not-applicable"
+    },
+    {
+      "id": "directory-profile-negotiate",
+      "path": "fixtures/positive/directory-profile-negotiate.json",
+      "schema": "schemas/scenario.schema.json",
+      "expect": "valid",
+      "validation_layers": [
+        "negotiation",
+        "capability",
+        "jws"
+      ],
+      "crypto_status": "not-applicable"
+    },
+    {
+      "id": "envelope-replay-identical",
+      "path": "fixtures/positive/envelope-replay-identical.json",
+      "schema": "schemas/scenario.schema.json",
+      "expect": "valid",
+      "validation_layers": [
+        "replay",
+        "idempotency"
+      ],
+      "crypto_status": "FINAL-RFC-structural-placeholder"
+    },
+    {
+      "id": "relay-fanout-lifecycle",
+      "path": "fixtures/positive/relay-fanout-lifecycle.json",
+      "schema": "schemas/scenario.schema.json",
+      "expect": "valid",
+      "validation_layers": [
+        "fan-out",
+        "lease",
+        "protocol-state",
+        "receipt"
+      ],
+      "crypto_status": "FINAL-RFC-structural-placeholder"
+    },
+    {
+      "id": "relay-ack-retry",
+      "path": "fixtures/positive/relay-ack-retry.json",
+      "schema": "schemas/scenario.schema.json",
+      "expect": "valid",
+      "validation_layers": [
+        "acknowledgement",
+        "idempotency",
+        "receipt"
+      ],
+      "crypto_status": "not-applicable"
+    },
+    {
+      "id": "relay-lease-redelivery",
+      "path": "fixtures/positive/relay-lease-redelivery.json",
+      "schema": "schemas/scenario.schema.json",
+      "expect": "valid",
+      "validation_layers": [
+        "lease",
+        "retry",
+        "protocol-state"
+      ],
+      "crypto_status": "not-applicable"
+    },
+    {
+      "id": "principal-address-uppercase-dns",
+      "path": "fixtures/negative/principal-address-invalid.json",
+      "schema": "schemas/common.schema.json#/$defs/principalAddress",
+      "expect": "invalid",
+      "error": "invalid_request",
+      "validation_layers": [
+        "schema",
+        "address"
+      ],
+      "crypto_status": "not-applicable"
+    },
+    {
+      "id": "principal-document-bad-kid",
+      "path": "fixtures/negative/principal-document-bad-kid.json",
+      "schema": "schemas/principal-document.schema.json",
+      "expect": "invalid",
+      "error": "invalid_request",
+      "validation_layers": [
+        "jws",
+        "kid"
+      ],
+      "crypto_status": "not-applicable"
+    },
+    {
+      "id": "principal-document-purpose-confusion",
+      "path": "fixtures/negative/principal-document-purpose-confusion.json",
+      "schema": "schemas/principal-document.schema.json",
+      "expect": "invalid",
+      "error": "invalid_request",
+      "validation_layers": [
+        "schema",
+        "key-purpose"
+      ],
+      "crypto_status": "not-applicable"
+    },
+    {
+      "id": "envelope-recipient-order",
+      "path": "fixtures/negative/envelope-recipient-order.json",
+      "schema": "schemas/transport-envelope.schema.json",
+      "expect": "invalid",
+      "error": "invalid_request",
+      "validation_layers": [
+        "jws",
+        "recipient-order"
+      ],
+      "crypto_status": "FINAL-RFC-structural-placeholder"
+    },
+    {
+      "id": "envelope-recipient-mismatch",
+      "path": "fixtures/negative/envelope-recipient-mismatch.json",
+      "schema": "schemas/transport-envelope.schema.json",
+      "expect": "invalid",
+      "error": "recipient_mismatch",
+      "validation_layers": [
+        "jws",
+        "recipient-mapping"
+      ],
+      "crypto_status": "FINAL-RFC-structural-placeholder"
+    },
+    {
+      "id": "envelope-protected-header",
+      "path": "fixtures/negative/envelope-protected-header.json",
+      "schema": "schemas/transport-envelope.schema.json",
+      "expect": "invalid",
+      "error": "malformed_envelope",
+      "validation_layers": [
+        "jws",
+        "protected-header"
+      ],
+      "crypto_status": "FINAL-RFC-structural-placeholder"
+    },
+    {
+      "id": "envelope-sender-key-mismatch",
+      "path": "fixtures/negative/envelope-sender-key-mismatch.json",
+      "schema": "schemas/transport-envelope.schema.json",
+      "expect": "invalid",
+      "error": "signature_invalid",
+      "validation_layers": [
+        "jws",
+        "sender-key-binding"
+      ],
+      "crypto_status": "FINAL-RFC-structural-placeholder"
+    },
+    {
+      "id": "envelope-required-capability",
+      "path": "fixtures/negative/envelope-required-capability.json",
+      "schema": "schemas/transport-envelope.schema.json",
+      "expect": "invalid",
+      "error": "required_capability_unsupported",
+      "validation_layers": [
+        "jws",
+        "context",
+        "capability"
+      ],
+      "crypto_status": "FINAL-RFC-structural-placeholder"
+    },
+    {
+      "id": "receipt-envelope-digest",
+      "path": "fixtures/negative/receipt-envelope-digest.json",
+      "schema": "schemas/relay-receipt.schema.json",
+      "expect": "invalid",
+      "error": "conflict",
+      "validation_layers": [
+        "jws",
+        "envelope-digest"
+      ],
+      "crypto_status": "not-applicable"
+    },
+    {
+      "id": "receipt-queued-fields",
+      "path": "fixtures/negative/receipt-queued-fields.json",
+      "schema": "schemas/relay-receipt.schema.json",
+      "expect": "invalid",
+      "error": "invalid_request",
+      "validation_layers": [
+        "schema",
+        "receipt-state"
+      ],
+      "crypto_status": "not-applicable"
+    },
+    {
+      "id": "receipt-invalid-transition",
+      "path": "fixtures/negative/receipt-invalid-transition.json",
+      "schema": "schemas/relay-receipt.schema.json",
+      "expect": "invalid",
+      "error": "invalid_request",
+      "validation_layers": [
+        "schema",
+        "receipt-state"
+      ],
+      "crypto_status": "not-applicable"
+    },
+    {
+      "id": "receipt-relay-key-mismatch",
+      "path": "fixtures/negative/receipt-relay-key-mismatch.json",
+      "schema": "schemas/relay-receipt.schema.json",
+      "expect": "invalid",
+      "error": "signature_invalid",
+      "validation_layers": [
+        "jws",
+        "relay-key-binding"
+      ],
+      "crypto_status": "not-applicable"
+    },
+    {
+      "id": "idempotency-conflict",
+      "path": "fixtures/negative/idempotency-conflict.json",
+      "schema": "schemas/scenario.schema.json",
+      "expect": "invalid",
+      "error": "idempotency_conflict",
+      "validation_layers": [
+        "jws",
+        "idempotency"
+      ],
+      "crypto_status": "FINAL-RFC-structural-placeholder"
+    },
+    {
+      "id": "principal-document-stale",
+      "path": "fixtures/negative/principal-document-stale.json",
+      "schema": "schemas/principal-document.schema.json",
+      "expect": "invalid",
+      "error": "stale_document",
+      "validation_layers": [
+        "freshness"
+      ],
+      "crypto_status": "not-applicable"
+    },
+    {
+      "id": "principal-document-expired",
+      "path": "fixtures/negative/principal-document-expired.json",
+      "schema": "schemas/principal-document.schema.json",
+      "expect": "invalid",
+      "error": "expired",
+      "validation_layers": [
+        "freshness"
+      ],
+      "crypto_status": "not-applicable"
+    },
+    {
+      "id": "principal-document-revoked-signing-key",
+      "path": "fixtures/negative/principal-document-revoked-signing-key.json",
+      "schema": "schemas/principal-document.schema.json",
+      "expect": "invalid",
+      "error": "key_revoked",
+      "validation_layers": [
+        "key-state"
+      ],
+      "crypto_status": "not-applicable"
+    },
+    {
+      "id": "installation-authorization-at-signing-not-after",
+      "path": "fixtures/negative/installation-authorization-at-signing-not-after.json",
+      "schema": "schemas/principal-document.schema.json",
+      "expect": "invalid",
+      "error": "signature_invalid",
+      "validation_layers": [
+        "authorization-binding",
+        "key-state"
+      ],
+      "crypto_status": "not-applicable"
+    },
+    {
+      "id": "principal-document-rollback",
+      "path": "fixtures/negative/principal-document-rollback.json",
+      "schema": "schemas/scenario.schema.json",
+      "expect": "invalid",
+      "error": "conflict",
+      "validation_layers": [
+        "rollback"
+      ],
+      "crypto_status": "not-applicable"
+    },
+    {
+      "id": "alias-unverified",
+      "path": "fixtures/negative/alias-unverified.json",
+      "schema": "schemas/scenario.schema.json",
+      "expect": "invalid",
+      "error": "alias_unverified",
+      "validation_layers": [
+        "alias"
+      ],
+      "crypto_status": "not-applicable"
+    },
+    {
+      "id": "alias-collision",
+      "path": "fixtures/negative/alias-collision.json",
+      "schema": "schemas/scenario.schema.json",
+      "expect": "invalid",
+      "error": "conflict",
+      "validation_layers": [
+        "alias"
+      ],
+      "crypto_status": "not-applicable"
+    },
+    {
+      "id": "alias-reassignment-stale",
+      "path": "fixtures/negative/alias-reassignment-stale.json",
+      "schema": "schemas/scenario.schema.json",
+      "expect": "invalid",
+      "error": "stale_document",
+      "validation_layers": [
+        "alias",
+        "freshness"
+      ],
+      "crypto_status": "not-applicable"
+    },
+    {
+      "id": "alias-local-part-case-mismatch",
+      "path": "fixtures/negative/alias-local-part-case-mismatch.json",
+      "schema": "schemas/scenario.schema.json",
+      "expect": "invalid",
+      "error": "unknown_alias",
+      "validation_layers": [
+        "alias"
+      ],
+      "crypto_status": "not-applicable"
+    },
+    {
+      "id": "directory-mutation-unauthorized",
+      "path": "fixtures/negative/directory-mutation-unauthorized.json",
+      "schema": "schemas/scenario.schema.json",
+      "expect": "invalid",
+      "error": "unauthorized",
+      "validation_layers": [
+        "authorization"
+      ],
+      "crypto_status": "not-applicable"
+    },
+    {
+      "id": "directory-precondition-failed",
+      "path": "fixtures/negative/directory-precondition-failed.json",
+      "schema": "schemas/scenario.schema.json",
+      "expect": "invalid",
+      "error": "precondition_failed",
+      "validation_layers": [
+        "etag"
+      ],
+      "crypto_status": "not-applicable"
+    },
+    {
+      "id": "directory-unsupported-profile",
+      "path": "fixtures/negative/directory-unsupported-profile.json",
+      "schema": "schemas/scenario.schema.json",
+      "expect": "invalid",
+      "error": "unsupported_profile",
+      "validation_layers": [
+        "negotiation"
+      ],
+      "crypto_status": "not-applicable"
+    },
+    {
+      "id": "directory-required-capability",
+      "path": "fixtures/negative/directory-required-capability.json",
+      "schema": "schemas/scenario.schema.json",
+      "expect": "invalid",
+      "error": "required_capability_unsupported",
+      "validation_layers": [
+        "capability"
+      ],
+      "crypto_status": "not-applicable"
+    },
+    {
+      "id": "envelope-expired",
+      "path": "fixtures/negative/envelope-expired.json",
+      "schema": "schemas/transport-envelope.schema.json",
+      "expect": "invalid",
+      "error": "expired",
+      "validation_layers": [
+        "expiry"
+      ],
+      "crypto_status": "FINAL-RFC-structural-placeholder"
+    },
+    {
+      "id": "envelope-unsupported-version",
+      "path": "fixtures/negative/envelope-unsupported-version.json",
+      "schema": "schemas/transport-envelope.schema.json",
+      "expect": "invalid",
+      "error": "invalid_request",
+      "validation_layers": [
+        "schema",
+        "version"
+      ],
+      "crypto_status": "FINAL-RFC-structural-placeholder"
+    },
+    {
+      "id": "envelope-profile-downgrade",
+      "path": "fixtures/negative/envelope-profile-downgrade.json",
+      "schema": "schemas/transport-envelope.schema.json",
+      "expect": "invalid",
+      "error": "invalid_request",
+      "validation_layers": [
+        "schema",
+        "profile",
+        "downgrade"
+      ],
+      "crypto_status": "FINAL-RFC-structural-placeholder"
+    },
+    {
+      "id": "envelope-duplicate-recipient",
+      "path": "fixtures/negative/envelope-duplicate-recipient.json",
+      "schema": "schemas/transport-envelope.schema.json",
+      "expect": "invalid",
+      "error": "invalid_request",
+      "validation_layers": [
+        "recipient-order",
+        "replay"
+      ],
+      "crypto_status": "FINAL-RFC-structural-placeholder"
+    },
+    {
+      "id": "relay-concurrent-lease",
+      "path": "fixtures/negative/relay-concurrent-lease.json",
+      "schema": "schemas/scenario.schema.json",
+      "expect": "invalid",
+      "error": "conflict",
+      "validation_layers": [
+        "lease"
+      ],
+      "crypto_status": "not-applicable"
+    },
+    {
+      "id": "relay-ack-digest-mismatch",
+      "path": "fixtures/negative/relay-ack-digest-mismatch.json",
+      "schema": "schemas/scenario.schema.json",
+      "expect": "invalid",
+      "error": "conflict",
+      "validation_layers": [
+        "acknowledgement"
+      ],
+      "crypto_status": "not-applicable"
+    },
+    {
+      "id": "relay-ack-wrong-lease",
+      "path": "fixtures/negative/relay-ack-wrong-lease.json",
+      "schema": "schemas/scenario.schema.json",
+      "expect": "invalid",
+      "error": "conflict",
+      "validation_layers": [
+        "lease"
+      ],
+      "crypto_status": "not-applicable"
+    },
+    {
+      "id": "relay-quota-exceeded",
+      "path": "fixtures/negative/relay-quota-exceeded.json",
+      "schema": "schemas/scenario.schema.json",
+      "expect": "invalid",
+      "error": "quota_exceeded",
+      "validation_layers": [
+        "quota",
+        "service-behaviour"
+      ],
+      "crypto_status": "not-applicable"
+    },
+    {
+      "id": "relay-terminal-transition",
+      "path": "fixtures/negative/relay-terminal-transition.json",
+      "schema": "schemas/scenario.schema.json",
+      "expect": "invalid",
+      "error": "delivery_terminal",
+      "validation_layers": [
+        "protocol-state"
+      ],
+      "crypto_status": "not-applicable"
+    }
+  ]
+}

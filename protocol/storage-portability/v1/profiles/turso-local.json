@@ -1,0 +1,106 @@
+{
+  "$schema": "../profile.schema.json",
+  "format": "native.storage-profile.v1",
+  "id": "turso-local",
+  "revision": 1,
+  "status": "spike",
+  "engine": {
+    "family": "turso",
+    "implementation": "turso-database",
+    "version_requirement": "Turso Rust API 0.8.0-pre.2"
+  },
+  "frontend": {
+    "dialect": "sqlite",
+    "protocol": "in-process Turso SQLite frontend"
+  },
+  "connection": {
+    "modes": ["embedded"],
+    "driver": "turso-rust"
+  },
+  "topology": {
+    "kind": "file-per-logical-database",
+    "logical_database_isolation": "one local Turso database file per Native logical database"
+  },
+  "contracts": {
+    "logical": "native.logical.v1",
+    "event_positions": "gapless",
+    "json": "native.canonical-json.v1",
+    "timestamps": "utc-rfc3339-milliseconds",
+    "ordering": "explicit-total-order"
+  },
+  "capabilities": {
+    "native.domain-mcp.v1": {
+      "support": "partial",
+      "portability": "portable",
+      "contract": "deterministic TursoHarness lifecycle, link add and outbound listing, visibility, authorized history, event-chain replay, guarded-write, and isolation slice",
+      "notes": "Partial aggregate claims are advisory only and never admit a strict operation without a full operation-scoped capability. Lifecycle and link-add mutations are proven only for the trusted local caller; link removal and inbound listing are not proven. Member coverage is limited to message delivery, visibility, and visibility-gated history. The harness is test-only and no production Turso storage route ships."
+    },
+    "native.operation.record-read.v1": {
+      "support": "partial",
+      "portability": "portable",
+      "contract": "ids-only get_record visibility scenario",
+      "notes": "Historical and enrichment selector parity is not proven."
+    },
+    "native.operation.record-history.v1": {
+      "support": "partial",
+      "portability": "portable",
+      "contract": "record-local visibility-gated history scenario",
+      "notes": "Global history, run/order selectors, and every caller mode are not proven."
+    },
+    "native.operation.link-add.v1": {
+      "support": "full",
+      "portability": "portable",
+      "contract": "trusted-local manage_links action=add scenario"
+    },
+    "native.operation.snapshot-export.v1": {
+      "support": "full",
+      "portability": "convertible",
+      "contract": "quiesced local unencrypted export_snapshot with mandatory canonical verification",
+      "notes": "This exact operation scope is narrower than the aggregate native.sqlite-file-fast-path claim."
+    },
+    "native.interaction-log.v1": {
+      "support": "unsupported",
+      "portability": "portable",
+      "notes": "The deterministic Turso harness does not materialize SQLite read_log_calls/read_log_touches; the optional tap must be suppressed."
+    },
+    "native.guarded-write.v1": {
+      "support": "full",
+      "portability": "portable",
+      "provider": "per-logical-database admission gate plus Turso IMMEDIATE transaction and digest re-check"
+    },
+    "native.canonical-interchange.v1": {
+      "support": "planned",
+      "portability": "portable"
+    },
+    "native.search.lexical.v1": {
+      "support": "partial",
+      "portability": "portable",
+      "provider": "Turso FTS (Tantivy) probe; Native ranking adapter not implemented"
+    },
+    "native.search.semantic.v1": {
+      "support": "planned",
+      "portability": "portable",
+      "notes": "The embedding write seam is dormant and no semantic query adapter ships yet."
+    },
+    "native.search.sqlite-fts5-exact": {
+      "support": "unsupported",
+      "portability": "blocking",
+      "notes": "Turso FTS is not SQLite FTS3/4/5."
+    },
+    "native.raw-sql": {
+      "support": "unsupported",
+      "portability": "blocking",
+      "notes": "Native query_sql requires sqlite3_set_authorizer, which the Turso API does not expose."
+    },
+    "native.describe-physical-schema": {
+      "support": "partial",
+      "portability": "profile-specific",
+      "provider": "TursoHarness-owned DDL plus explicit generated-column and search overlays"
+    },
+    "native.sqlite-file-fast-path": {
+      "support": "partial",
+      "portability": "convertible",
+      "notes": "A quiesced, local, unencrypted file round-trips with stock SQLite; canonical verification is still mandatory."
+    }
+  }
+}

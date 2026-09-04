@@ -1,0 +1,14 @@
+{
+  "scenario_type": "principal",
+  "scenario_id": "principal-document-rollback",
+  "profile": "native-fed/experimental-jose-hpke-1",
+  "clock": "2026-08-02T09:10:00Z",
+  "steps": [
+    {
+      "cached_version": 2,
+      "received_version": 1
+    }
+  ],
+  "expect_error": "conflict",
+  "validation_layer": "rollback"
+}

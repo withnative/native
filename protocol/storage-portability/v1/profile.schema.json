@@ -1,0 +1,179 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://native.dev/protocol/storage-portability/v1/profile.schema.json",
+  "title": "Native storage target profile v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "$schema",
+    "format",
+    "id",
+    "revision",
+    "status",
+    "engine",
+    "frontend",
+    "connection",
+    "topology",
+    "contracts",
+    "capabilities"
+  ],
+  "properties": {
+    "$schema": { "const": "../profile.schema.json" },
+    "format": { "const": "native.storage-profile.v1" },
+    "id": { "type": "string", "pattern": "^[a-z][a-z0-9-]*$" },
+    "revision": { "type": "integer", "minimum": 1 },
+    "status": {
+      "enum": ["reference", "supported", "spike", "research", "retired"]
+    },
+    "engine": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["family", "implementation", "version_requirement"],
+      "properties": {
+        "family": { "type": "string", "minLength": 1 },
+        "implementation": { "type": "string", "minLength": 1 },
+        "version_requirement": { "type": "string", "minLength": 1 }
+      }
+    },
+    "frontend": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["dialect", "protocol"],
+      "properties": {
+        "dialect": { "type": "string", "minLength": 1 },
+        "protocol": { "type": "string", "minLength": 1 }
+      }
+    },
+    "connection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["modes", "driver"],
+      "properties": {
+        "modes": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "enum": ["embedded", "network", "sync", "embedded-replica"] }
+        },
+        "driver": { "type": "string", "minLength": 1 }
+      }
+    },
+    "topology": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "logical_database_isolation"],
+      "properties": {
+        "kind": { "type": "string", "minLength": 1 },
+        "logical_database_isolation": { "type": "string", "minLength": 1 }
+      }
+    },
+    "operational_identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "write_authority",
+        "consistency",
+        "file_semantics",
+        "provider_dependencies",
+        "promotion_rules",
+        "upstream_sources"
+      ],
+      "properties": {
+        "write_authority": { "type": "string", "minLength": 1 },
+        "consistency": { "type": "string", "minLength": 1 },
+        "file_semantics": { "type": "string", "minLength": 1 },
+        "provider_dependencies": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "promotion_rules": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "upstream_sources": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string", "format": "uri" }
+        }
+      }
+    },
+    "contracts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "logical",
+        "event_positions",
+        "json",
+        "timestamps",
+        "ordering"
+      ],
+      "properties": {
+        "logical": { "const": "native.logical.v1" },
+        "event_positions": { "enum": ["gapless", "monotonic-with-gaps"] },
+        "json": { "const": "native.canonical-json.v1" },
+        "timestamps": { "const": "utc-rfc3339-milliseconds" },
+        "ordering": { "const": "explicit-total-order" }
+      }
+    },
+    "capabilities": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["support", "portability"],
+        "properties": {
+          "support": { "enum": ["full", "partial", "unsupported", "planned"] },
+          "portability": {
+            "enum": ["portable", "convertible", "profile-specific", "blocking"]
+          },
+          "mode_support": {
+            "type": "object",
+            "minProperties": 1,
+            "additionalProperties": false,
+            "properties": {
+              "embedded": { "enum": ["full", "partial", "unsupported", "planned"] },
+              "network": { "enum": ["full", "partial", "unsupported", "planned"] },
+              "sync": { "enum": ["full", "partial", "unsupported", "planned"] },
+              "embedded-replica": { "enum": ["full", "partial", "unsupported", "planned"] }
+            }
+          },
+          "contract": { "type": "string" },
+          "provider": { "type": "string" },
+          "notes": { "type": "string" }
+        },
+        "allOf": [
+          {
+            "if": { "required": ["mode_support"] },
+            "then": { "properties": { "support": { "const": "partial" } } }
+          }
+        ]
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "required": ["id", "revision"],
+        "properties": {
+          "id": { "pattern": "^turso-" },
+          "revision": { "minimum": 2 }
+        }
+      },
+      "then": { "required": ["operational_identity"] }
+    },
+    {
+      "if": {
+        "required": ["id"],
+        "properties": {
+          "id": { "const": "libsql-embedded-replica" }
+        }
+      },
+      "then": { "required": ["operational_identity"] }
+    }
+  ]
+}

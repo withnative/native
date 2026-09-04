@@ -1,0 +1,14 @@
+{
+  "scenario_type": "relay",
+  "scenario_id": "relay-terminal-transition",
+  "profile": "native-fed/experimental-jose-hpke-1",
+  "clock": "2026-08-02T09:10:00Z",
+  "steps": [
+    {
+      "from": "acknowledged",
+      "operation": "relay.collect"
+    }
+  ],
+  "expect_error": "delivery_terminal",
+  "validation_layer": "protocol-state"
+}

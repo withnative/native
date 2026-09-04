@@ -1,0 +1,690 @@
+{
+  "warning": "FIXTURE PRIVATE KEYS ONLY - public deterministic labels provide no secrecy",
+  "principals": {
+    "alice": {
+      "document": {
+        "document_type": "native.federation.principal",
+        "protocol_version": "1.0",
+        "profile": "native-fed/experimental-jose-hpke-1",
+        "network_id": "native",
+        "principal_id": "alice0001",
+        "document_version": 1,
+        "issued_at": "2026-08-02T09:00:00Z",
+        "fresh_until": "2026-08-02T09:15:00Z",
+        "hard_expires_at": "2026-08-03T09:00:00Z",
+        "continuity": "continuous",
+        "root_keys": [
+          {
+            "jwk": {
+              "kty": "OKP",
+              "crv": "Ed25519",
+              "x": "gLJnfi4-eyU3HwIhoc8ra8y0f0vcGLQXKMd3e8dZ3qs",
+              "alg": "EdDSA",
+              "use": "sig",
+              "kid": "n1.root.YRrk_EIEYBCsPYEPGK9blrsjZw7r5N3TQp_xCdawQ3g"
+            },
+            "status": "active",
+            "not_before": "2026-08-02T09:00:00Z",
+            "not_after": "2036-08-02T09:00:00Z"
+          }
+        ],
+        "operational_keys": [
+          {
+            "purpose": "signing",
+            "jwk": {
+              "kty": "OKP",
+              "crv": "Ed25519",
+              "x": "u53MhXD8IEfIq_sv04YOg56prAOxviBORfMXo_HqlDw",
+              "alg": "EdDSA",
+              "use": "sig",
+              "kid": "n1.signing.Gjl4ccI6MF2tlN6xClEu06TjLV2amB4Lmnq-g4rnC4M"
+            },
+            "status": "active",
+            "not_before": "2026-08-02T09:00:00Z",
+            "not_after": "2027-08-02T09:00:00Z",
+            "authorization": {
+              "statement": {
+                "statement_type": "native.operational-key-authorization",
+                "protocol_version": "1.0",
+                "principal": {
+                  "network_id": "native",
+                  "principal_id": "alice0001"
+                },
+                "key": {
+                  "purpose": "signing",
+                  "jwk": {
+                    "kty": "OKP",
+                    "crv": "Ed25519",
+                    "x": "u53MhXD8IEfIq_sv04YOg56prAOxviBORfMXo_HqlDw",
+                    "alg": "EdDSA",
+                    "use": "sig",
+                    "kid": "n1.signing.Gjl4ccI6MF2tlN6xClEu06TjLV2amB4Lmnq-g4rnC4M"
+                  },
+                  "status": "active",
+                  "not_before": "2026-08-02T09:00:00Z",
+                  "not_after": "2027-08-02T09:00:00Z"
+                },
+                "issued_at": "2026-08-02T09:00:00Z"
+              },
+              "signature": "eyJhbGciOiJFZERTQSIsImtpZCI6Im4xLnJvb3QuWVJya19FSUVZQkNzUFlFUEdLOWJscnNqWnc3cjVOM1RRcF94Q2Rhd1EzZyIsInR5cCI6Im5hdGl2ZS1rZXktYXV0aG9yaXphdGlvbitqd3MifQ..WxBidgAA8hOoGzemqoszfic-v-_53ryZ8kUseMqRXykQLFw7Xf_M53ReETPZY0SkxfMBIqPoODnBKGmCYIv0BQ"
+            }
+          },
+          {
+            "purpose": "encryption",
+            "jwk": {
+              "kty": "OKP",
+              "crv": "X25519",
+              "x": "nLX0IKJrdNnECZ9HB_RmGmgVMm70eLVWIVM30J7_Njc",
+              "alg": "HPKE-3-KE",
+              "use": "enc",
+              "kid": "n1.encryption.WzGSuABqsoFrrsaEgKtrygB2JhuLCJuvPqqDobYZWDc"
+            },
+            "status": "active",
+            "not_before": "2026-08-02T09:00:00Z",
+            "not_after": "2027-08-02T09:00:00Z",
+            "authorization": {
+              "statement": {
+                "statement_type": "native.operational-key-authorization",
+                "protocol_version": "1.0",
+                "principal": {
+                  "network_id": "native",
+                  "principal_id": "alice0001"
+                },
+                "key": {
+                  "purpose": "encryption",
+                  "jwk": {
+                    "kty": "OKP",
+                    "crv": "X25519",
+                    "x": "nLX0IKJrdNnECZ9HB_RmGmgVMm70eLVWIVM30J7_Njc",
+                    "alg": "HPKE-3-KE",
+                    "use": "enc",
+                    "kid": "n1.encryption.WzGSuABqsoFrrsaEgKtrygB2JhuLCJuvPqqDobYZWDc"
+                  },
+                  "status": "active",
+                  "not_before": "2026-08-02T09:00:00Z",
+                  "not_after": "2027-08-02T09:00:00Z"
+                },
+                "issued_at": "2026-08-02T09:00:00Z"
+              },
+              "signature": "eyJhbGciOiJFZERTQSIsImtpZCI6Im4xLnJvb3QuWVJya19FSUVZQkNzUFlFUEdLOWJscnNqWnc3cjVOM1RRcF94Q2Rhd1EzZyIsInR5cCI6Im5hdGl2ZS1rZXktYXV0aG9yaXphdGlvbitqd3MifQ..XqCMbYmeNmQWxtVys_qJS2FHMCtvzy49EsipyIWVzji24WJBkmiQ5CvtQLbLKHKAykIzLF80Wt3wpabdU7c8Dg"
+            }
+          }
+        ],
+        "installations": [
+          {
+            "installation_id": "00000000-0000-4000-8000-000000000101",
+            "jwk": {
+              "kty": "OKP",
+              "crv": "Ed25519",
+              "x": "LAJI5zFw1H25VNIYGbJMw2mf8EBFdU6qys-n0yDnARM",
+              "alg": "EdDSA",
+              "use": "sig",
+              "kid": "n1.installation.Cf_V_UWFoYOXL1sNlrh4OnBmuy4iVkKyvgcAGIWDevE"
+            },
+            "status": "active",
+            "endpoint_origin": "https://node.alice.example",
+            "scopes": [
+              "directory.endpoint.update",
+              "relay.acknowledge",
+              "relay.collect"
+            ],
+            "authorization": {
+              "statement": {
+                "statement_type": "native.installation-key-authorization",
+                "protocol_version": "1.0",
+                "principal": {
+                  "network_id": "native",
+                  "principal_id": "alice0001"
+                },
+                "installation": {
+                  "installation_id": "00000000-0000-4000-8000-000000000101",
+                  "jwk": {
+                    "kty": "OKP",
+                    "crv": "Ed25519",
+                    "x": "LAJI5zFw1H25VNIYGbJMw2mf8EBFdU6qys-n0yDnARM",
+                    "alg": "EdDSA",
+                    "use": "sig",
+                    "kid": "n1.installation.Cf_V_UWFoYOXL1sNlrh4OnBmuy4iVkKyvgcAGIWDevE"
+                  },
+                  "status": "active",
+                  "endpoint_origin": "https://node.alice.example",
+                  "scopes": [
+                    "directory.endpoint.update",
+                    "relay.acknowledge",
+                    "relay.collect"
+                  ]
+                },
+                "issued_at": "2026-08-02T09:00:00Z"
+              },
+              "signature": "eyJhbGciOiJFZERTQSIsImtpZCI6Im4xLnNpZ25pbmcuR2psNGNjSTZNRjJ0bE42eENsRXUwNlRqTFYyYW1CNExtbnEtZzRybkM0TSIsInR5cCI6Im5hdGl2ZS1rZXktYXV0aG9yaXphdGlvbitqd3MifQ..hGsPttwJwLXdXEebk7ji8BwSiXFeg_qybmzgahPjuWSAdBrHW-3vc3VD-H90D91yvHkBNjuLUWft17SNamSYCw"
+            }
+          }
+        ],
+        "verified_aliases": [
+          {
+            "system": "email",
+            "value": "Alice@example.com",
+            "normalization": "native.email-ascii-v1",
+            "verified_at": "2026-08-02T09:00:00Z",
+            "fresh_until": "2026-09-01T09:00:00Z",
+            "verifier": "native",
+            "method": "email-otp"
+          }
+        ],
+        "delivery_endpoints": [
+          {
+            "kind": "relay",
+            "url": "https://relay.withnative.example/v1",
+            "priority": 0
+          }
+        ],
+        "supported_profiles": [
+          "native-fed/experimental-jose-hpke-1"
+        ],
+        "capabilities": [
+          "native.relay.receipts"
+        ],
+        "required_capabilities": [],
+        "extensions": {}
+      },
+      "principal_signature": "eyJhbGciOiJFZERTQSIsImtpZCI6Im4xLnNpZ25pbmcuR2psNGNjSTZNRjJ0bE42eENsRXUwNlRqTFYyYW1CNExtbnEtZzRybkM0TSIsInR5cCI6Im5hdGl2ZS1wcmluY2lwYWwrandzIn0..upyT0Q4lVV_04s2rPFF9WaZSD8QvnoxY1E3pVnyoxwot6I7l0tv14dTaIWlkft0x2MfSOW6affHf9e-qnhqMDQ",
+      "authority_attestation": {
+        "statement": {
+          "statement_type": "native.authority.principal-attestation",
+          "protocol_version": "1.0",
+          "network_id": "native",
+          "principal": {
+            "network_id": "native",
+            "principal_id": "alice0001"
+          },
+          "document_version": 1,
+          "document_digest": "sha-256:PHamFCwtv4bODv7ENsSCd5A1TXRUXIAGVAJov-GsL1s",
+          "root_kids": [
+            "n1.root.YRrk_EIEYBCsPYEPGK9blrsjZw7r5N3TQp_xCdawQ3g"
+          ],
+          "issued_at": "2026-08-02T09:00:00Z",
+          "fresh_until": "2026-08-02T09:15:00Z",
+          "hard_expires_at": "2026-08-03T09:00:00Z",
+          "directory_base_url": "https://directory.withnative.example"
+        },
+        "signature": "eyJhbGciOiJFZERTQSIsImtpZCI6Im4xLmF1dGhvcml0eS5kOENndWNpOGp2Z21zUGNNMDZOaHBpZTBGZzlSdUliWnV2WHNvQmFGXzV3IiwidHlwIjoibmF0aXZlLXByaW5jaXBhbC1hdHRlc3RhdGlvbitqd3MifQ..pyhYOoHScF1erYEoqbZNejOsPKRE5nH7BGvwxMszoa3Bbq-1RmxNc3AGoJ-1saqdEYW-v8nB8SPDc5ag2-86Aw"
+      }
+    },
+    "bob": {
+      "document": {
+        "document_type": "native.federation.principal",
+        "protocol_version": "1.0",
+        "profile": "native-fed/experimental-jose-hpke-1",
+        "network_id": "native",
+        "principal_id": "bob00001",
+        "document_version": 1,
+        "issued_at": "2026-08-02T09:00:00Z",
+        "fresh_until": "2026-08-02T09:15:00Z",
+        "hard_expires_at": "2026-08-03T09:00:00Z",
+        "continuity": "continuous",
+        "root_keys": [
+          {
+            "jwk": {
+              "kty": "OKP",
+              "crv": "Ed25519",
+              "x": "TKMiqvUFgnp7PK-Zov4mUxuJNkuTkPkdtXCTQZ86xgU",
+              "alg": "EdDSA",
+              "use": "sig",
+              "kid": "n1.root.GBViI9tkq4AnPmMS_tZj_s0ZJq0IR1W1t9yXNv2C050"
+            },
+            "status": "active",
+            "not_before": "2026-08-02T09:00:00Z",
+            "not_after": "2036-08-02T09:00:00Z"
+          }
+        ],
+        "operational_keys": [
+          {
+            "purpose": "signing",
+            "jwk": {
+              "kty": "OKP",
+              "crv": "Ed25519",
+              "x": "cokJUc35IrSy2udvXgrvCD9wlb-B2eP-qvVA3CqwAxw",
+              "alg": "EdDSA",
+              "use": "sig",
+              "kid": "n1.signing.lzS9Xf61eyGXvtdIWnx9y_7YO-gIoiJIzgh93ca74xk"
+            },
+            "status": "active",
+            "not_before": "2026-08-02T09:00:00Z",
+            "not_after": "2027-08-02T09:00:00Z",
+            "authorization": {
+              "statement": {
+                "statement_type": "native.operational-key-authorization",
+                "protocol_version": "1.0",
+                "principal": {
+                  "network_id": "native",
+                  "principal_id": "bob00001"
+                },
+                "key": {
+                  "purpose": "signing",
+                  "jwk": {
+                    "kty": "OKP",
+                    "crv": "Ed25519",
+                    "x": "cokJUc35IrSy2udvXgrvCD9wlb-B2eP-qvVA3CqwAxw",
+                    "alg": "EdDSA",
+                    "use": "sig",
+                    "kid": "n1.signing.lzS9Xf61eyGXvtdIWnx9y_7YO-gIoiJIzgh93ca74xk"
+                  },
+                  "status": "active",
+                  "not_before": "2026-08-02T09:00:00Z",
+                  "not_after": "2027-08-02T09:00:00Z"
+                },
+                "issued_at": "2026-08-02T09:00:00Z"
+              },
+              "signature": "eyJhbGciOiJFZERTQSIsImtpZCI6Im4xLnJvb3QuR0JWaUk5dGtxNEFuUG1NU190WmpfczBaSnEwSVIxVzF0OXlYTnYyQzA1MCIsInR5cCI6Im5hdGl2ZS1rZXktYXV0aG9yaXphdGlvbitqd3MifQ..rUU6nhEabSVEK-nKsdNUMB3FvgvgdXQeMnX56k_dl_A5j53YcDVmp8QiAo04D1ApJ6OOhhb-h11Ch8FeDIAvAQ"
+            }
+          },
+          {
+            "purpose": "encryption",
+            "jwk": {
+              "kty": "OKP",
+              "crv": "X25519",
+              "x": "PhyHvNVbJCxGLY3Nt7kMlY1dHgdKtV432ys1-8iX41Q",
+              "alg": "HPKE-3-KE",
+              "use": "enc",
+              "kid": "n1.encryption.b1xKhr72_QTzJjpSay9jqZTcetG32cchdd0RMLj7pLE"
+            },
+            "status": "active",
+            "not_before": "2026-08-02T09:00:00Z",
+            "not_after": "2027-08-02T09:00:00Z",
+            "authorization": {
+              "statement": {
+                "statement_type": "native.operational-key-authorization",
+                "protocol_version": "1.0",
+                "principal": {
+                  "network_id": "native",
+                  "principal_id": "bob00001"
+                },
+                "key": {
+                  "purpose": "encryption",
+                  "jwk": {
+                    "kty": "OKP",
+                    "crv": "X25519",
+                    "x": "PhyHvNVbJCxGLY3Nt7kMlY1dHgdKtV432ys1-8iX41Q",
+                    "alg": "HPKE-3-KE",
+                    "use": "enc",
+                    "kid": "n1.encryption.b1xKhr72_QTzJjpSay9jqZTcetG32cchdd0RMLj7pLE"
+                  },
+                  "status": "active",
+                  "not_before": "2026-08-02T09:00:00Z",
+                  "not_after": "2027-08-02T09:00:00Z"
+                },
+                "issued_at": "2026-08-02T09:00:00Z"
+              },
+              "signature": "eyJhbGciOiJFZERTQSIsImtpZCI6Im4xLnJvb3QuR0JWaUk5dGtxNEFuUG1NU190WmpfczBaSnEwSVIxVzF0OXlYTnYyQzA1MCIsInR5cCI6Im5hdGl2ZS1rZXktYXV0aG9yaXphdGlvbitqd3MifQ..I-I3sY0JeAYg8F8zmE7NqgvSbver-z5dS-fALat79p17z_jK2UZt-onNX6Q_pvIVzl2y09K-EkzRHzQShjhxBw"
+            }
+          }
+        ],
+        "installations": [
+          {
+            "installation_id": "00000000-0000-4000-8000-000000000201",
+            "jwk": {
+              "kty": "OKP",
+              "crv": "Ed25519",
+              "x": "g9V1pO5UNooBw70xnx64ySWumwd6kiAFo3igFqv50AE",
+              "alg": "EdDSA",
+              "use": "sig",
+              "kid": "n1.installation.Kf9tMnOkuumkQggAg1bN24tbYLZkWqL38_hx5YmmYEQ"
+            },
+            "status": "active",
+            "endpoint_origin": "https://node.bob.example",
+            "scopes": [
+              "relay.acknowledge",
+              "relay.collect"
+            ],
+            "authorization": {
+              "statement": {
+                "statement_type": "native.installation-key-authorization",
+                "protocol_version": "1.0",
+                "principal": {
+                  "network_id": "native",
+                  "principal_id": "bob00001"
+                },
+                "installation": {
+                  "installation_id": "00000000-0000-4000-8000-000000000201",
+                  "jwk": {
+                    "kty": "OKP",
+                    "crv": "Ed25519",
+                    "x": "g9V1pO5UNooBw70xnx64ySWumwd6kiAFo3igFqv50AE",
+                    "alg": "EdDSA",
+                    "use": "sig",
+                    "kid": "n1.installation.Kf9tMnOkuumkQggAg1bN24tbYLZkWqL38_hx5YmmYEQ"
+                  },
+                  "status": "active",
+                  "endpoint_origin": "https://node.bob.example",
+                  "scopes": [
+                    "relay.acknowledge",
+                    "relay.collect"
+                  ]
+                },
+                "issued_at": "2026-08-02T09:00:00Z"
+              },
+              "signature": "eyJhbGciOiJFZERTQSIsImtpZCI6Im4xLnNpZ25pbmcubHpTOVhmNjFleUdYdnRkSVdueDl5XzdZTy1nSW9pSkl6Z2g5M2NhNzR4ayIsInR5cCI6Im5hdGl2ZS1rZXktYXV0aG9yaXphdGlvbitqd3MifQ..PX4f_euS0POh2Xx4zVYQ0SVCo63_nW9v7GRZmyCWEcmsCaKXihwKXGEhmY4uzQTtNoJaHVZ_OMh0VcUOodm5AA"
+            }
+          }
+        ],
+        "verified_aliases": [],
+        "delivery_endpoints": [
+          {
+            "kind": "relay",
+            "url": "https://relay.withnative.example/v1",
+            "priority": 0
+          }
+        ],
+        "supported_profiles": [
+          "native-fed/experimental-jose-hpke-1"
+        ],
+        "capabilities": [
+          "native.relay.receipts"
+        ],
+        "required_capabilities": [],
+        "extensions": {}
+      },
+      "principal_signature": "eyJhbGciOiJFZERTQSIsImtpZCI6Im4xLnNpZ25pbmcubHpTOVhmNjFleUdYdnRkSVdueDl5XzdZTy1nSW9pSkl6Z2g5M2NhNzR4ayIsInR5cCI6Im5hdGl2ZS1wcmluY2lwYWwrandzIn0..z_aL0XMw_krZVUXs1ksc1kwbahx8SgyyyboAdRn1GaE5GJ7zSb-W2B2oL8ze_3niOrJaojHmseP4vsDU1owACQ",
+      "authority_attestation": {
+        "statement": {
+          "statement_type": "native.authority.principal-attestation",
+          "protocol_version": "1.0",
+          "network_id": "native",
+          "principal": {
+            "network_id": "native",
+            "principal_id": "bob00001"
+          },
+          "document_version": 1,
+          "document_digest": "sha-256:MHzjraSohgw-68x0l5zgo7_ZnjxH4Bdl-WE_bDcVQh0",
+          "root_kids": [
+            "n1.root.GBViI9tkq4AnPmMS_tZj_s0ZJq0IR1W1t9yXNv2C050"
+          ],
+          "issued_at": "2026-08-02T09:00:00Z",
+          "fresh_until": "2026-08-02T09:15:00Z",
+          "hard_expires_at": "2026-08-03T09:00:00Z",
+          "directory_base_url": "https://directory.withnative.example"
+        },
+        "signature": "eyJhbGciOiJFZERTQSIsImtpZCI6Im4xLmF1dGhvcml0eS5kOENndWNpOGp2Z21zUGNNMDZOaHBpZTBGZzlSdUliWnV2WHNvQmFGXzV3IiwidHlwIjoibmF0aXZlLXByaW5jaXBhbC1hdHRlc3RhdGlvbitqd3MifQ..0X3c0WONtdpIGoQXW_Jsgr8K_2TeX2zzQvceDQVlIhMCmASzi1V6h6Vv_q3JjcA-igDYKDpN_CjpVw-dJQfIBg"
+      }
+    },
+    "carol": {
+      "document": {
+        "document_type": "native.federation.principal",
+        "protocol_version": "1.0",
+        "profile": "native-fed/experimental-jose-hpke-1",
+        "network_id": "native",
+        "principal_id": "carol001",
+        "document_version": 1,
+        "issued_at": "2026-08-02T09:00:00Z",
+        "fresh_until": "2026-08-02T09:15:00Z",
+        "hard_expires_at": "2026-08-03T09:00:00Z",
+        "continuity": "continuous",
+        "root_keys": [
+          {
+            "jwk": {
+              "kty": "OKP",
+              "crv": "Ed25519",
+              "x": "93u7_-UVslo0CprO26KQ_asBLrewFF7v8t4dc2-Pj2U",
+              "alg": "EdDSA",
+              "use": "sig",
+              "kid": "n1.root.z8IsilZluwLctQnx7kmbXAtaeKmVh99qmYEfABeRJt8"
+            },
+            "status": "active",
+            "not_before": "2026-08-02T09:00:00Z",
+            "not_after": "2036-08-02T09:00:00Z"
+          }
+        ],
+        "operational_keys": [
+          {
+            "purpose": "signing",
+            "jwk": {
+              "kty": "OKP",
+              "crv": "Ed25519",
+              "x": "bb4vvZxWcb-o2mpqlrewDdqNkZLsxaX-UjPvETEGF7w",
+              "alg": "EdDSA",
+              "use": "sig",
+              "kid": "n1.signing.mxyrY65RRR74nJ0TZ_Vms5cqmdK_nkyEX8Z1Hs9JBzo"
+            },
+            "status": "active",
+            "not_before": "2026-08-02T09:00:00Z",
+            "not_after": "2027-08-02T09:00:00Z",
+            "authorization": {
+              "statement": {
+                "statement_type": "native.operational-key-authorization",
+                "protocol_version": "1.0",
+                "principal": {
+                  "network_id": "native",
+                  "principal_id": "carol001"
+                },
+                "key": {
+                  "purpose": "signing",
+                  "jwk": {
+                    "kty": "OKP",
+                    "crv": "Ed25519",
+                    "x": "bb4vvZxWcb-o2mpqlrewDdqNkZLsxaX-UjPvETEGF7w",
+                    "alg": "EdDSA",
+                    "use": "sig",
+                    "kid": "n1.signing.mxyrY65RRR74nJ0TZ_Vms5cqmdK_nkyEX8Z1Hs9JBzo"
+                  },
+                  "status": "active",
+                  "not_before": "2026-08-02T09:00:00Z",
+                  "not_after": "2027-08-02T09:00:00Z"
+                },
+                "issued_at": "2026-08-02T09:00:00Z"
+              },
+              "signature": "eyJhbGciOiJFZERTQSIsImtpZCI6Im4xLnJvb3QuejhJc2lsWmx1d0xjdFFueDdrbWJYQXRhZUttVmg5OXFtWUVmQUJlUkp0OCIsInR5cCI6Im5hdGl2ZS1rZXktYXV0aG9yaXphdGlvbitqd3MifQ..EE4Eakti2XTh6lq0CT-KGQ9NWlSopPMcwxhGEqQ9wEdT-1GcgWxtFioBU8FGa3sUE5UrqUVVgPvvvNOeUXOqBQ"
+            }
+          },
+          {
+            "purpose": "encryption",
+            "jwk": {
+              "kty": "OKP",
+              "crv": "X25519",
+              "x": "XYsXM9pWSzw8NbpAZbtXdCh7AVxc21_BLgnf_Rjwaig",
+              "alg": "HPKE-3-KE",
+              "use": "enc",
+              "kid": "n1.encryption.-CUQ_C_UiScy24YlmovZypFEt7u5g-qWMTOiXFXyiHQ"
+            },
+            "status": "active",
+            "not_before": "2026-08-02T09:00:00Z",
+            "not_after": "2027-08-02T09:00:00Z",
+            "authorization": {
+              "statement": {
+                "statement_type": "native.operational-key-authorization",
+                "protocol_version": "1.0",
+                "principal": {
+                  "network_id": "native",
+                  "principal_id": "carol001"
+                },
+                "key": {
+                  "purpose": "encryption",
+                  "jwk": {
+                    "kty": "OKP",
+                    "crv": "X25519",
+                    "x": "XYsXM9pWSzw8NbpAZbtXdCh7AVxc21_BLgnf_Rjwaig",
+                    "alg": "HPKE-3-KE",
+                    "use": "enc",
+                    "kid": "n1.encryption.-CUQ_C_UiScy24YlmovZypFEt7u5g-qWMTOiXFXyiHQ"
+                  },
+                  "status": "active",
+                  "not_before": "2026-08-02T09:00:00Z",
+                  "not_after": "2027-08-02T09:00:00Z"
+                },
+                "issued_at": "2026-08-02T09:00:00Z"
+              },
+              "signature": "eyJhbGciOiJFZERTQSIsImtpZCI6Im4xLnJvb3QuejhJc2lsWmx1d0xjdFFueDdrbWJYQXRhZUttVmg5OXFtWUVmQUJlUkp0OCIsInR5cCI6Im5hdGl2ZS1rZXktYXV0aG9yaXphdGlvbitqd3MifQ..BsearzgBZfLTzGFoniM_8hMONSumjBVRdnnWQDsg9heyNqmyokyZOB1Zp0OFMQ-RmGV-nDOwaLcdb5icVQzCAQ"
+            }
+          }
+        ],
+        "installations": [
+          {
+            "installation_id": "00000000-0000-4000-8000-000000000202",
+            "jwk": {
+              "kty": "OKP",
+              "crv": "Ed25519",
+              "x": "Jj2ZcSbc2zuS2PeQNXKh33Wehr0rIWl51THAENs3ylk",
+              "alg": "EdDSA",
+              "use": "sig",
+              "kid": "n1.installation.u9B8mD2AgAHOo-K7_Njr-zIcPCuyzCXKyC8f7jSxc4U"
+            },
+            "status": "active",
+            "endpoint_origin": "https://node.carol.example",
+            "scopes": [
+              "relay.acknowledge",
+              "relay.collect"
+            ],
+            "authorization": {
+              "statement": {
+                "statement_type": "native.installation-key-authorization",
+                "protocol_version": "1.0",
+                "principal": {
+                  "network_id": "native",
+                  "principal_id": "carol001"
+                },
+                "installation": {
+                  "installation_id": "00000000-0000-4000-8000-000000000202",
+                  "jwk": {
+                    "kty": "OKP",
+                    "crv": "Ed25519",
+                    "x": "Jj2ZcSbc2zuS2PeQNXKh33Wehr0rIWl51THAENs3ylk",
+                    "alg": "EdDSA",
+                    "use": "sig",
+                    "kid": "n1.installation.u9B8mD2AgAHOo-K7_Njr-zIcPCuyzCXKyC8f7jSxc4U"
+                  },
+                  "status": "active",
+                  "endpoint_origin": "https://node.carol.example",
+                  "scopes": [
+                    "relay.acknowledge",
+                    "relay.collect"
+                  ]
+                },
+                "issued_at": "2026-08-02T09:00:00Z"
+              },
+              "signature": "eyJhbGciOiJFZERTQSIsImtpZCI6Im4xLnNpZ25pbmcubXh5clk2NVJSUjc0bkowVFpfVm1zNWNxbWRLX25reUVYOFoxSHM5SkJ6byIsInR5cCI6Im5hdGl2ZS1rZXktYXV0aG9yaXphdGlvbitqd3MifQ..MNU6RHaJpXfAQ9ke-mDZowzgZygjVmAkXvdV_9xt15Q4HIBpRvkhHwOQn_qKPg5WNSoesuDV-C3ihh0M8YcsBQ"
+            }
+          }
+        ],
+        "verified_aliases": [],
+        "delivery_endpoints": [
+          {
+            "kind": "relay",
+            "url": "https://relay.withnative.example/v1",
+            "priority": 0
+          }
+        ],
+        "supported_profiles": [
+          "native-fed/experimental-jose-hpke-1"
+        ],
+        "capabilities": [
+          "native.relay.receipts"
+        ],
+        "required_capabilities": [],
+        "extensions": {}
+      },
+      "principal_signature": "eyJhbGciOiJFZERTQSIsImtpZCI6Im4xLnNpZ25pbmcubXh5clk2NVJSUjc0bkowVFpfVm1zNWNxbWRLX25reUVYOFoxSHM5SkJ6byIsInR5cCI6Im5hdGl2ZS1wcmluY2lwYWwrandzIn0..XD_jMY9rSI_jG60FzBZ_OtsZwkwqxSao_XnDwgUSMbKFb1UrDJwJZcfePE5NLX1kirq3WocCryJqv0NZ97muDg",
+      "authority_attestation": {
+        "statement": {
+          "statement_type": "native.authority.principal-attestation",
+          "protocol_version": "1.0",
+          "network_id": "native",
+          "principal": {
+            "network_id": "native",
+            "principal_id": "carol001"
+          },
+          "document_version": 1,
+          "document_digest": "sha-256:skqVD8xoFr1CNvoJmLXfj5OyJKPnctXHWyjL3t94CKI",
+          "root_kids": [
+            "n1.root.z8IsilZluwLctQnx7kmbXAtaeKmVh99qmYEfABeRJt8"
+          ],
+          "issued_at": "2026-08-02T09:00:00Z",
+          "fresh_until": "2026-08-02T09:15:00Z",
+          "hard_expires_at": "2026-08-03T09:00:00Z",
+          "directory_base_url": "https://directory.withnative.example"
+        },
+        "signature": "eyJhbGciOiJFZERTQSIsImtpZCI6Im4xLmF1dGhvcml0eS5kOENndWNpOGp2Z21zUGNNMDZOaHBpZTBGZzlSdUliWnV2WHNvQmFGXzV3IiwidHlwIjoibmF0aXZlLXByaW5jaXBhbC1hdHRlc3RhdGlvbitqd3MifQ..Xs5YjLU_66Gg7hTSJM6qzqnvW3_i0wEGhXDZvwq1gz-kNY6tix3xjBHmFAElphvTWzX2YJ8SfXq7VAxlTs9oCg"
+      }
+    }
+  },
+  "signers": {
+    "alice_signing": {
+      "principal": {
+        "network_id": "native",
+        "principal_id": "alice0001"
+      },
+      "installation_id": null,
+      "jwk": {
+        "crv": "Ed25519",
+        "d": "NAlemIhwEjQt-BIWik4z4UghxyI7ZyiX4Udcbux-_io",
+        "x": "u53MhXD8IEfIq_sv04YOg56prAOxviBORfMXo_HqlDw",
+        "kty": "OKP",
+        "alg": "EdDSA",
+        "use": "sig",
+        "kid": "n1.signing.Gjl4ccI6MF2tlN6xClEu06TjLV2amB4Lmnq-g4rnC4M"
+      }
+    },
+    "alice_root": {
+      "principal": {
+        "network_id": "native",
+        "principal_id": "alice0001"
+      },
+      "installation_id": null,
+      "jwk": {
+        "crv": "Ed25519",
+        "d": "-PBOZwZ3qGfhcOy4c4zcfqw-7JjF3k38CRhDo2OWboo",
+        "x": "gLJnfi4-eyU3HwIhoc8ra8y0f0vcGLQXKMd3e8dZ3qs",
+        "kty": "OKP",
+        "alg": "EdDSA",
+        "use": "sig",
+        "kid": "n1.root.YRrk_EIEYBCsPYEPGK9blrsjZw7r5N3TQp_xCdawQ3g"
+      }
+    },
+    "alice_installation": {
+      "principal": {
+        "network_id": "native",
+        "principal_id": "alice0001"
+      },
+      "installation_id": "00000000-0000-4000-8000-000000000101",
+      "jwk": {
+        "crv": "Ed25519",
+        "d": "yO6GBsncF-Od_Z6ErIDDPgQAdj9FUDbNb9qgjNXxblw",
+        "x": "LAJI5zFw1H25VNIYGbJMw2mf8EBFdU6qys-n0yDnARM",
+        "kty": "OKP",
+        "alg": "EdDSA",
+        "use": "sig",
+        "kid": "n1.installation.Cf_V_UWFoYOXL1sNlrh4OnBmuy4iVkKyvgcAGIWDevE"
+      }
+    },
+    "bob_installation": {
+      "principal": {
+        "network_id": "native",
+        "principal_id": "bob00001"
+      },
+      "installation_id": "00000000-0000-4000-8000-000000000201",
+      "jwk": {
+        "crv": "Ed25519",
+        "d": "PLuWyurZBV6QgO-6F82SUhVZOM39D6ZgNZN6OrYJESk",
+        "x": "g9V1pO5UNooBw70xnx64ySWumwd6kiAFo3igFqv50AE",
+        "kty": "OKP",
+        "alg": "EdDSA",
+        "use": "sig",
+        "kid": "n1.installation.Kf9tMnOkuumkQggAg1bN24tbYLZkWqL38_hx5YmmYEQ"
+      }
+    },
+    "carol_installation": {
+      "principal": {
+        "network_id": "native",
+        "principal_id": "carol001"
+      },
+      "installation_id": "00000000-0000-4000-8000-000000000202",
+      "jwk": {
+        "crv": "Ed25519",
+        "d": "m3lcIxb3yQjeIDkQ7dHMvXBv7OwUeCSKL0yxVDbP4Wk",
+        "x": "Jj2ZcSbc2zuS2PeQNXKh33Wehr0rIWl51THAENs3ylk",
+        "kty": "OKP",
+        "alg": "EdDSA",
+        "use": "sig",
+        "kid": "n1.installation.u9B8mD2AgAHOo-K7_Njr-zIcPCuyzCXKyC8f7jSxc4U"
+      }
+    }
+  }
+}

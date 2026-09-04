@@ -1,0 +1,15 @@
+{
+  "scenario_type": "relay",
+  "scenario_id": "relay-ack-digest-mismatch",
+  "profile": "native-fed/experimental-jose-hpke-1",
+  "clock": "2026-08-02T09:10:00Z",
+  "steps": [
+    {
+      "state": "collected",
+      "envelope_digest": "sha-256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "acknowledgement_digest": "sha-256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+    }
+  ],
+  "expect_error": "conflict",
+  "validation_layer": "acknowledgement"
+}

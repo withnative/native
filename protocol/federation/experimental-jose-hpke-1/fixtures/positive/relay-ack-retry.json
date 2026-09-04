@@ -1,0 +1,23 @@
+{
+  "scenario_type": "relay",
+  "scenario_id": "relay-ack-retry",
+  "profile": "native-fed/experimental-jose-hpke-1",
+  "clock": "2026-08-02T09:10:00Z",
+  "steps": [
+    {
+      "operation": "relay.acknowledge",
+      "expect": {
+        "state": "acknowledged",
+        "receipt_id": "stable"
+      }
+    },
+    {
+      "operation": "relay.acknowledge",
+      "retry": true,
+      "expect": {
+        "state": "acknowledged",
+        "same_receipt_bytes": true
+      }
+    }
+  ]
+}

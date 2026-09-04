@@ -1,0 +1,27 @@
+{
+  "scenario_type": "relay",
+  "scenario_id": "relay-lease-redelivery",
+  "profile": "native-fed/experimental-jose-hpke-1",
+  "clock": "2026-08-02T09:10:00Z",
+  "steps": [
+    {
+      "operation": "relay.collect",
+      "expect": {
+        "state": "collected",
+        "attempt": 1
+      }
+    },
+    {
+      "advance_seconds": 301
+    },
+    {
+      "operation": "relay.collect",
+      "expect": {
+        "state": "collected",
+        "attempt": 2,
+        "new_lease": true,
+        "no_new_transition_receipt": true
+      }
+    }
+  ]
+}

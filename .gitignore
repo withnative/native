@@ -1,0 +1,34 @@
+# Local agent worktrees
+.worktrees/
+
+# Local libSQL/SQLite scratch databases produced while exercising the schema
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Environment
+.env
+.env.local
+
+# Editor / OS cruft
+.DS_Store
+.idea/
+*.local
+
+# Rust build output
+/target/
+**/node_modules/
+**/test-results/
+**/playwright-report/
+
+# Coverage instrumentation (cargo llvm-cov)
+*.profraw
+
+# Default local data directory (`NATIVE_CE_DATA_DIR`)
+/data/
+
+# Python bytecode
+__pycache__/
+*.pyc

@@ -1,0 +1,121 @@
+{
+  "$schema": "../profile.schema.json",
+  "format": "native.storage-profile.v1",
+  "id": "turso-local",
+  "revision": 4,
+  "status": "spike",
+  "engine": {
+    "family": "turso",
+    "implementation": "Turso Database embedded engine",
+    "version_requirement": "turso crate =0.7.2"
+  },
+  "frontend": {
+    "dialect": "sqlite",
+    "protocol": "in-process Turso Database Rust API"
+  },
+  "connection": {
+    "modes": ["embedded"],
+    "driver": "turso 0.7.2 (default-features=false, features=[fts]); turso::Builder::new_local"
+  },
+  "topology": {
+    "kind": "authoritative-local-file-per-logical-database",
+    "logical_database_isolation": "one local Turso Database file owned by one Native runtime process per Native logical database"
+  },
+  "operational_identity": {
+    "write_authority": "A successful local Turso Database transaction commit in the single owning Native runtime is authoritative; no remote acknowledgement exists.",
+    "consistency": "Local transaction visibility only. Intra-process concurrent tasks require operation-level proof; multi-process writers are unsupported.",
+    "file_semantics": "The local Turso Database file is authoritative for this profile. SQLite dialect and compatibility do not make it a stock SQLite ownership artifact; only a quiesced unencrypted file may be treated as a convertible fast path after canonical verification.",
+    "provider_dependencies": [],
+    "promotion_rules": [
+      "Vendor beta or production claims are not Native support evidence.",
+      "A supported revision must use a stable non-prerelease turso crate and pin its exact qualified engine and driver range.",
+      "Promotion requires the full Native logical, physical, operational, migration, backup, restore, and recovery suites for this exact topology.",
+      "Any engine, driver, connection-mode, topology, write-authority, consistency, or file-semantics change creates a new immutable profile revision."
+    ],
+    "upstream_sources": [
+      "https://docs.turso.tech/sdk/introduction",
+      "https://docs.turso.tech/sdk/rust/quickstart",
+      "https://crates.io/crates/turso/0.7.2"
+    ]
+  },
+  "contracts": {
+    "logical": "native.logical.v1",
+    "event_positions": "gapless",
+    "json": "native.canonical-json.v1",
+    "timestamps": "utc-rfc3339-milliseconds",
+    "ordering": "explicit-total-order"
+  },
+  "capabilities": {
+    "native.domain-mcp.v1": {
+      "support": "partial",
+      "portability": "portable",
+      "contract": "bounded Turso EngineHandle lifecycle, attachment/blob, link, visibility, authorized history, event-chain replay, guarded-write, request-wrapper, logical-database isolation, live structured query and rollup evaluation, backend-native lexical search, and non-lexical scan slice",
+      "notes": "No revision 1 or prerelease-driver evidence is inherited. The turso-local feature uses the shared backend-neutral domain transaction seam for the exact operations classified partial in backend-contract-classifications.json. query_record excludes historical projection, activity terminals, interpretation and federated-Message provenance enrichment, and governed comments; resolve_rollup excludes revision receipts plus revision-keyed caching and fencing; lexical search retains explicit tokenizer/stemmer, fragment-snippet, and physical prefix-index residuals; scan excludes its lexical axis. The profile remains a spike and does not imply migration, backup/recovery, cloud, sync, or operational support qualification."
+    },
+    "native.operation.record-read.v1": {
+      "support": "partial",
+      "portability": "portable",
+      "contract": "ids-only get_record visibility scenario",
+      "notes": "Historical and enrichment selector parity is not proven."
+    },
+    "native.operation.record-history.v1": {
+      "support": "partial",
+      "portability": "portable",
+      "contract": "record-local visibility-gated history scenario",
+      "notes": "Global history, run/order selectors, and every caller mode are not proven."
+    },
+    "native.operation.link-add.v1": {
+      "support": "full",
+      "portability": "portable",
+      "contract": "trusted-local manage_links action=add scenario"
+    },
+    "native.operation.snapshot-export.v1": {
+      "support": "unsupported",
+      "portability": "convertible",
+      "notes": "A physical file round-trip probe is not an export_snapshot runtime operation. No Turso-local snapshot handler or canonical verification path is implemented."
+    },
+    "native.interaction-log.v1": {
+      "support": "unsupported",
+      "portability": "portable",
+      "notes": "The deterministic Turso harness does not materialize SQLite read_log_calls/read_log_touches; the optional tap is not runtime evidence."
+    },
+    "native.guarded-write.v1": {
+      "support": "full",
+      "portability": "portable",
+      "provider": "deterministic harness admission gate plus Turso IMMEDIATE transaction and digest re-check"
+    },
+    "native.canonical-interchange.v1": { "support": "planned", "portability": "portable" },
+    "native.search.lexical.v1": {
+      "support": "partial",
+      "portability": "portable",
+      "provider": "Turso FTS (Tantivy) candidate selection with shared Native authorization, ranking, shaping, and bounded near-miss fold",
+      "notes": "Turso tokenization/stemming is not proven identical to SQLite Porter; snippets are shared deterministic match windows and prefix/infix/sibling near misses are not executed on a proved physical prefix index."
+    },
+    "native.search.semantic.v1": {
+      "support": "planned",
+      "portability": "portable",
+      "notes": "The embedding write seam is dormant and no semantic query adapter ships yet."
+    },
+    "native.search.sqlite-fts5-exact": {
+      "support": "unsupported",
+      "portability": "blocking",
+      "notes": "Turso FTS is not SQLite FTS3/4/5."
+    },
+    "native.raw-sql": {
+      "support": "full",
+      "portability": "profile-specific",
+      "provider": "Exact-parser-qualified SELECTs over a fresh caller-visible Turso core MemoryIO projection with no authoritative database path, ATTACH capability, or source-file access; core query-only, progress, deadline, interrupt, and bounded-result controls are mandatory",
+      "notes": "query_sql never executes caller SQL against the authoritative Turso-local file; Native materializes only the authorized ten-relation logical projection and rejects atomically at source, projection, execution, or result limits."
+    },
+    "native.describe-physical-schema": {
+      "support": "partial",
+      "portability": "profile-specific",
+      "provider": "Runtime-owned canonical DDL with an exact ordinary value_num column maintained atomically by the shared projector, exact Turso FTS index definitions, and fail-closed schema/seed validation"
+    },
+    "native.sqlite-file-fast-path": {
+      "support": "partial",
+      "portability": "convertible",
+      "notes": "A quiesced, local, unencrypted file round-trips with stock SQLite; canonical verification is still mandatory."
+    }
+  }
+}

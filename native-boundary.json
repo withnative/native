@@ -1,0 +1,740 @@
+{
+  "format": "native.source-boundary/v2",
+  "manifest_version": 2,
+  "selection": "public",
+  "components": [
+    {
+      "id": "tier-1-node",
+      "classification": "tier-1-node",
+      "paths": [
+        {
+          "kind": "file",
+          "source": ".gitignore"
+        },
+        {
+          "kind": "file",
+          "source": ".nvmrc"
+        },
+        {
+          "kind": "file",
+          "source": "ARCHITECTURE.md"
+        },
+        {
+          "kind": "file",
+          "source": "BUILDING.md"
+        },
+        {
+          "kind": "file",
+          "source": "Cargo.lock"
+        },
+        {
+          "kind": "file",
+          "source": "Cargo.toml"
+        },
+        {
+          "kind": "file",
+          "source": "CONTRIBUTING.md"
+        },
+        {
+          "kind": "file",
+          "source": "LICENSE.md"
+        },
+        {
+          "kind": "file",
+          "source": "README.md"
+        },
+        {
+          "kind": "file",
+          "source": "RELEASE_NOTES.md"
+        },
+        {
+          "kind": "file",
+          "source": "rust-toolchain.toml"
+        },
+        {
+          "kind": "file",
+          "source": "build.rs"
+        },
+        {
+          "kind": "tree",
+          "source": "crates/artifact-html"
+        },
+        {
+          "kind": "tree",
+          "source": "crates/artifact-runtime"
+        },
+        {
+          "kind": "tree",
+          "source": "crates/policy-kernel"
+        },
+        {
+          "kind": "tree",
+          "source": "crates/record-type-correction-kernel"
+        },
+        {
+          "kind": "tree",
+          "source": "crates/query-contract"
+        },
+        {
+          "kind": "tree",
+          "source": "crates/relationship-kernel"
+        },
+        {
+          "kind": "tree",
+          "source": "src/change_summary"
+        },
+        {
+          "kind": "tree",
+          "source": "src/conformance"
+        },
+        {
+          "kind": "tree",
+          "source": "src/derivation"
+        },
+        {
+          "kind": "tree",
+          "source": "src/domain_transaction"
+        },
+        {
+          "kind": "tree",
+          "source": "src/export"
+        },
+        {
+          "kind": "tree",
+          "source": "src/freshness"
+        },
+        {
+          "kind": "tree",
+          "source": "src/generated"
+        },
+        {
+          "kind": "tree",
+          "source": "src/mcp"
+        },
+        {
+          "kind": "tree",
+          "source": "src/meta"
+        },
+        {
+          "kind": "tree",
+          "source": "src/postgres"
+        },
+        {
+          "kind": "tree",
+          "source": "src/projector"
+        },
+        {
+          "kind": "tree",
+          "source": "src/query"
+        },
+        {
+          "kind": "tree",
+          "source": "src/relationship"
+        },
+        {
+          "kind": "tree",
+          "source": "src/schema"
+        },
+        {
+          "kind": "tree",
+          "source": "src/turso_local"
+        },
+        {
+          "kind": "file",
+          "source": "src/attribution.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/authorization.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/authorization_revision.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/awareness.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/backup.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/blob.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/canonical_json.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/canvas.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/citations.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/comments.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/contribution.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/control.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/control_tests.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/db.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/domain_transaction.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/embed.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/error.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/events.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/export.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/identity.rs"
+        },
+        {
+          "kind": "tree",
+          "source": "src/identity"
+        },
+        {
+          "kind": "file",
+          "source": "src/instruction_templates.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/instructions.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/interchange.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/interpretation.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/interventions.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/lib.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/message_expectation.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/migrations.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/policy.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/portable_sql.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/postgres.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/provenance.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/realtime.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/record_images.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/recipe.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/replication.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/replication_v1.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/route_error.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/runkey.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/standby_snapshot.rs"
+        },
+        {
+          "kind": "tree",
+          "source": "src/standby"
+        },
+        {
+          "kind": "file",
+          "source": "src/storage_migration.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/storage_profile.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/store.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/suggestion_lifecycle.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/turso_local.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/wordlist.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/bin/board_render_cost.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/bin/conformance.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/bin/guide_corpus.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/bin/kind_types.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/bin/mcp_stdio.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/bin/tool_inventory.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/bin/tool_types.rs"
+        },
+        {
+          "kind": "tree",
+          "source": "web/generated"
+        },
+        {
+          "kind": "tree",
+          "source": "tests/contract"
+        },
+        {
+          "kind": "tree",
+          "source": "tests/fixtures"
+        },
+        {
+          "kind": "tree",
+          "source": "tests/governance"
+        },
+        {
+          "kind": "file",
+          "source": "tests/governance.rs"
+        },
+        {
+          "kind": "tree",
+          "source": "tests/freshness_contract"
+        },
+        {
+          "kind": "tree",
+          "source": "tests/kernel"
+        },
+        {
+          "kind": "tree",
+          "source": "tests/records"
+        },
+        {
+          "kind": "tree",
+          "source": "tests/postgres"
+        },
+        {
+          "kind": "file",
+          "source": "tests/postgres.rs"
+        },
+        {
+          "kind": "tree",
+          "source": "tests/turso"
+        },
+        {
+          "kind": "file",
+          "source": "tests/turso.rs"
+        },
+        {
+          "kind": "tree",
+          "source": "tests/tools"
+        },
+        {
+          "kind": "file",
+          "source": "tests/common/mod.rs"
+        },
+        {
+          "kind": "file",
+          "source": "tests/federation_clean_room_interop.mjs"
+        },
+        {
+          "kind": "file",
+          "source": "tests/federation_conformance_runner.mjs"
+        },
+        {
+          "kind": "file",
+          "source": "tests/kernel.rs"
+        },
+        {
+          "kind": "file",
+          "source": "tests/records.rs"
+        },
+        {
+          "kind": "file",
+          "source": "tests/tools.rs"
+        },
+        {
+          "kind": "tree",
+          "source": "vendor"
+        }
+      ],
+      "binaries": [
+        "conformance",
+        "mcp-stdio"
+      ],
+      "features": [
+        "experimental-agent-intents",
+        "mcp-executor-prototype"
+      ],
+      "runtime_services": [
+        {
+          "id": "conformance",
+          "kind": "binary",
+          "entrypoint": "src/bin/conformance.rs",
+          "support": "reference"
+        },
+        {
+          "id": "mcp-stdio",
+          "kind": "binary",
+          "entrypoint": "src/bin/mcp_stdio.rs",
+          "support": "standalone"
+        }
+      ],
+      "maturity": "experimental",
+      "generated_artifacts": [],
+      "permitted_dependencies": [
+        "tier-2-wire",
+        "mcp-apps",
+        "public-documentation"
+      ]
+    },
+    {
+      "id": "tier-2-wire",
+      "classification": "tier-2-protocol-reference",
+      "paths": [
+        {
+          "kind": "file",
+          "source": "scripts/federation-conformance.mjs"
+        },
+        {
+          "kind": "file",
+          "source": "scripts/generate-federation-fixtures.mjs"
+        },
+        {
+          "kind": "tree",
+          "source": "crates/native-federation"
+        },
+        {
+          "kind": "tree",
+          "source": "protocol"
+        }
+      ],
+      "binaries": [
+        "relay"
+      ],
+      "features": [
+        "experimental-federation-hpke"
+      ],
+      "runtime_services": [
+        {
+          "id": "relay",
+          "kind": "binary",
+          "entrypoint": "crates/native-federation/src/bin/relay.rs",
+          "support": "reference"
+        }
+      ],
+      "maturity": "experimental",
+      "generated_artifacts": [],
+      "permitted_dependencies": []
+    },
+    {
+      "id": "mcp-apps",
+      "classification": "public-optional-extension",
+      "paths": [
+        {
+          "kind": "tree",
+          "source": "web/mcp-apps"
+        }
+      ],
+      "binaries": [],
+      "features": [],
+      "runtime_services": [
+        {
+          "id": "record-version-diff",
+          "kind": "static-extension",
+          "entrypoint": "web/mcp-apps/dist/record-version-diff.html",
+          "support": "optional"
+        },
+        {
+          "id": "suggestion-review",
+          "kind": "static-extension",
+          "entrypoint": "web/mcp-apps/dist/suggestion-review.html",
+          "support": "optional"
+        }
+      ],
+      "maturity": "experimental",
+      "generated_artifacts": [
+        {
+          "producer": "npm run build",
+          "drift_check": "npm run build",
+          "path": "web/mcp-apps/dist/record-version-diff.html"
+        },
+        {
+          "producer": "npm run build",
+          "drift_check": "npm run build",
+          "path": "web/mcp-apps/dist/suggestion-review.html"
+        }
+      ],
+      "permitted_dependencies": []
+    },
+    {
+      "id": "public-documentation",
+      "classification": "public-documentation",
+      "paths": [
+        {
+          "kind": "file",
+          "source": "docs/activity-query.md"
+        },
+        {
+          "kind": "file",
+          "source": "docs/agent-interventions.md"
+        },
+        {
+          "kind": "file",
+          "source": "docs/artifact-runtimes.md"
+        },
+        {
+          "kind": "file",
+          "source": "docs/authorization-contract.md"
+        },
+        {
+          "kind": "file",
+          "source": "docs/capability-map.md"
+        },
+        {
+          "kind": "file",
+          "source": "docs/context-freshness-kernel.md"
+        },
+        {
+          "kind": "file",
+          "source": "docs/context-freshness-runtime-implementation.md"
+        },
+        {
+          "kind": "file",
+          "source": "docs/context-freshness-runtime-proof.md"
+        },
+        {
+          "kind": "file",
+          "source": "docs/cross-database-lenses.md"
+        },
+        {
+          "kind": "file",
+          "source": "docs/experimental-agent-intents.md"
+        },
+        {
+          "kind": "file",
+          "source": "docs/federated-message-content-v1.md"
+        },
+        {
+          "kind": "file",
+          "source": "docs/canvas-protocol-v1.md"
+        },
+        {
+          "kind": "file",
+          "source": "docs/federation-relay.md"
+        },
+        {
+          "kind": "file",
+          "source": "docs/federation-transport-v1.md"
+        },
+        {
+          "kind": "file",
+          "source": "docs/for-agents.md"
+        },
+        {
+          "kind": "file",
+          "source": "docs/interpretive-claims-adoption.md"
+        },
+        {
+          "kind": "file",
+          "source": "docs/interpretive-claims-conformance.md"
+        },
+        {
+          "kind": "file",
+          "source": "docs/local-standby.md"
+        },
+        {
+          "kind": "file",
+          "source": "docs/mcp-crate-choice.md"
+        },
+        {
+          "kind": "file",
+          "source": "docs/message-first-conversations.md"
+        },
+        {
+          "kind": "file",
+          "source": "docs/postgres-runtime.md"
+        },
+        {
+          "kind": "file",
+          "source": "docs/README.md"
+        },
+        {
+          "kind": "file",
+          "source": "docs/testing-strategy-policy-pilot-measurements.md"
+        },
+        {
+          "kind": "file",
+          "source": "docs/testing-strategy-relationship-pilot-measurements.md"
+        },
+        {
+          "kind": "file",
+          "source": "docs/testing-strategy.md"
+        },
+        {
+          "kind": "file",
+          "source": "docs/source-boundary.md"
+        },
+        {
+          "kind": "file",
+          "source": "docs/temporal-reads.md"
+        },
+        {
+          "kind": "file",
+          "source": "docs/tool-surface.generated.md"
+        },
+        {
+          "kind": "file",
+          "source": "docs/tool-surface.md"
+        },
+        {
+          "kind": "file",
+          "source": "docs/turso-local-runtime.md"
+        },
+        {
+          "kind": "file",
+          "source": "docs/whats-changed.md"
+        }
+      ],
+      "binaries": [],
+      "features": [],
+      "runtime_services": [],
+      "maturity": "experimental",
+      "generated_artifacts": [],
+      "permitted_dependencies": []
+    },
+    {
+      "id": "source-boundary",
+      "classification": "boundary-governance",
+      "paths": [
+        {
+          "kind": "file",
+          "source": "scripts/release/check_public_candidate.py"
+        },
+        {
+          "kind": "file",
+          "source": "native-boundary.json"
+        },
+        {
+          "kind": "file",
+          "source": "scripts/release/compile_public_selection.py"
+        },
+        {
+          "kind": "file",
+          "source": "scripts/release/prepare_private_preview.py"
+        },
+        {
+          "kind": "file",
+          "source": "scripts/release/test_compile_public_selection.py"
+        },
+        {
+          "kind": "file",
+          "source": "scripts/release/test_check_public_candidate.py"
+        },
+        {
+          "kind": "file",
+          "source": "scripts/release/test_prepare_private_preview.py"
+        },
+        {
+          "kind": "file",
+          "source": "scripts/release/test_source_boundary.py"
+        },
+        {
+          "kind": "file",
+          "source": "scripts/release/validate_source_boundary.py"
+        }
+      ],
+      "binaries": [],
+      "features": [],
+      "runtime_services": [],
+      "maturity": "governance",
+      "generated_artifacts": [],
+      "permitted_dependencies": []
+    }
+  ],
+  "exclusions": [],
+  "transition_debt": [],
+  "transition_debt_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+}

@@ -1,0 +1,163 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://spec.withnative.ai/federation/experimental-jose-hpke-1/schemas/principal-document.schema.json",
+  "title": "Signed Native federation principal document",
+  "type": "object",
+  "required": ["document", "principal_signature", "authority_attestation"],
+  "properties": {
+    "document": { "$ref": "#/$defs/document" },
+    "principal_signature": { "$ref": "common.schema.json#/$defs/detachedJws" },
+    "authority_attestation": { "$ref": "#/$defs/authorityAttestation" }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "keyStatus": { "enum": ["active", "retired", "revoked"] },
+    "revocation": {
+      "type": "object",
+      "required": ["revoked_at", "effective_at", "reason"],
+      "properties": {
+        "revoked_at": { "$ref": "common.schema.json#/$defs/timestamp" },
+        "effective_at": { "$ref": "common.schema.json#/$defs/timestamp" },
+        "reason": { "enum": ["compromised", "cessation", "authorization_withdrawn"] },
+        "replacement_kid": { "$ref": "common.schema.json#/$defs/kid" }
+      },
+      "additionalProperties": false
+    },
+    "rootKey": {
+      "type": "object",
+      "required": ["jwk", "status", "not_before"],
+      "properties": {
+        "jwk": { "$ref": "common.schema.json#/$defs/rootJwk" },
+        "status": { "$ref": "#/$defs/keyStatus" },
+        "not_before": { "$ref": "common.schema.json#/$defs/timestamp" },
+        "not_after": { "$ref": "common.schema.json#/$defs/timestamp" },
+        "revocation": { "$ref": "#/$defs/revocation" }
+      },
+      "additionalProperties": false
+    },
+    "operationalKey": {
+      "type": "object",
+      "required": ["purpose", "jwk", "status", "not_before", "authorization"],
+      "properties": {
+        "purpose": { "enum": ["signing", "encryption"] },
+        "jwk": { "oneOf": [{ "$ref": "common.schema.json#/$defs/ed25519Jwk" }, { "$ref": "common.schema.json#/$defs/x25519Jwk" }] },
+        "status": { "$ref": "#/$defs/keyStatus" },
+        "not_before": { "$ref": "common.schema.json#/$defs/timestamp" },
+        "not_after": { "$ref": "common.schema.json#/$defs/timestamp" },
+        "authorization": { "$ref": "#/$defs/signedStatement" },
+        "revocation": { "$ref": "#/$defs/revocation" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "purpose": { "const": "signing" } }, "required": ["purpose"] },
+          "then": { "type": "object", "properties": { "jwk": { "$ref": "common.schema.json#/$defs/signingJwk" } } }
+        },
+        {
+          "if": { "properties": { "purpose": { "const": "encryption" } }, "required": ["purpose"] },
+          "then": { "type": "object", "properties": { "jwk": { "$ref": "common.schema.json#/$defs/encryptionJwk" } } }
+        }
+      ],
+      "additionalProperties": false
+    },
+    "signedStatement": {
+      "type": "object",
+      "required": ["statement", "signature"],
+      "properties": {
+        "statement": { "type": "object" },
+        "signature": { "$ref": "common.schema.json#/$defs/detachedJws" }
+      },
+      "additionalProperties": false
+    },
+    "installation": {
+      "type": "object",
+      "required": ["installation_id", "jwk", "status", "endpoint_origin", "scopes", "authorization"],
+      "properties": {
+        "installation_id": { "$ref": "common.schema.json#/$defs/uuidV4" },
+        "jwk": { "$ref": "common.schema.json#/$defs/installationJwk" },
+        "status": { "$ref": "#/$defs/keyStatus" },
+        "endpoint_origin": { "type": "string", "format": "uri", "maxLength": 2048 },
+        "scopes": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "enum": ["directory.endpoint.update", "relay.collect", "relay.acknowledge"] } },
+        "authorization": { "$ref": "#/$defs/signedStatement" },
+        "revocation": { "$ref": "#/$defs/revocation" }
+      },
+      "additionalProperties": false
+    },
+    "alias": {
+      "type": "object",
+      "required": ["system", "value", "normalization", "verified_at", "fresh_until", "verifier", "method"],
+      "properties": {
+        "system": { "const": "email" },
+        "value": { "type": "string", "maxLength": 254 },
+        "normalization": { "const": "native.email-ascii-v1" },
+        "verified_at": { "$ref": "common.schema.json#/$defs/timestamp" },
+        "fresh_until": { "$ref": "common.schema.json#/$defs/timestamp" },
+        "verifier": { "type": "string", "maxLength": 257 },
+        "method": { "type": "string", "maxLength": 96 },
+        "proof_ref": { "type": "string", "format": "uri", "maxLength": 2048 }
+      },
+      "additionalProperties": false
+    },
+    "endpoint": {
+      "type": "object",
+      "required": ["kind", "url", "priority"],
+      "properties": {
+        "kind": { "enum": ["relay", "direct"] },
+        "url": { "type": "string", "format": "uri", "maxLength": 2048 },
+        "priority": { "type": "integer", "minimum": 0, "maximum": 65535 }
+      },
+      "additionalProperties": false
+    },
+    "document": {
+      "type": "object",
+      "required": ["document_type", "protocol_version", "profile", "network_id", "principal_id", "document_version", "issued_at", "fresh_until", "hard_expires_at", "continuity", "root_keys", "operational_keys", "installations", "verified_aliases", "delivery_endpoints", "supported_profiles", "capabilities", "required_capabilities", "extensions"],
+      "properties": {
+        "document_type": { "const": "native.federation.principal" },
+        "protocol_version": { "$ref": "common.schema.json#/$defs/protocolVersion" },
+        "profile": { "$ref": "common.schema.json#/$defs/profile" },
+        "network_id": { "$ref": "common.schema.json#/$defs/networkId" },
+        "principal_id": { "$ref": "common.schema.json#/$defs/principalId" },
+        "document_version": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "issued_at": { "$ref": "common.schema.json#/$defs/timestamp" },
+        "fresh_until": { "$ref": "common.schema.json#/$defs/timestamp" },
+        "hard_expires_at": { "$ref": "common.schema.json#/$defs/timestamp" },
+        "continuity": { "enum": ["continuous", "authority_recovered"] },
+        "root_keys": { "type": "array", "minItems": 1, "maxItems": 8, "items": { "$ref": "#/$defs/rootKey" } },
+        "operational_keys": { "type": "array", "minItems": 2, "maxItems": 32, "items": { "$ref": "#/$defs/operationalKey" } },
+        "installations": { "type": "array", "maxItems": 128, "items": { "$ref": "#/$defs/installation" } },
+        "verified_aliases": { "type": "array", "maxItems": 64, "items": { "$ref": "#/$defs/alias" } },
+        "delivery_endpoints": { "type": "array", "minItems": 1, "maxItems": 16, "items": { "$ref": "#/$defs/endpoint" } },
+        "supported_profiles": { "type": "array", "minItems": 1, "maxItems": 16, "uniqueItems": true, "items": { "type": "string", "maxLength": 96 } },
+        "capabilities": { "type": "array", "maxItems": 128, "uniqueItems": true, "items": { "$ref": "common.schema.json#/$defs/capability" } },
+        "required_capabilities": { "type": "array", "maxItems": 32, "uniqueItems": true, "items": { "$ref": "common.schema.json#/$defs/capability" } },
+        "extensions": { "$ref": "common.schema.json#/$defs/extensions" }
+      },
+      "additionalProperties": true
+    },
+    "authorityAttestation": {
+      "type": "object",
+      "required": ["statement", "signature"],
+      "properties": {
+        "statement": {
+          "type": "object",
+          "required": ["statement_type", "protocol_version", "network_id", "principal", "document_version", "document_digest", "root_kids", "issued_at", "fresh_until", "hard_expires_at", "directory_base_url"],
+          "properties": {
+            "statement_type": { "const": "native.authority.principal-attestation" },
+            "protocol_version": { "$ref": "common.schema.json#/$defs/protocolVersion" },
+            "network_id": { "$ref": "common.schema.json#/$defs/networkId" },
+            "principal": { "$ref": "common.schema.json#/$defs/principalAddress" },
+            "document_version": { "type": "integer", "minimum": 1 },
+            "document_digest": { "$ref": "common.schema.json#/$defs/digest" },
+            "root_kids": { "type": "array", "minItems": 1, "maxItems": 8, "uniqueItems": true, "items": { "$ref": "common.schema.json#/$defs/kid" } },
+            "issued_at": { "$ref": "common.schema.json#/$defs/timestamp" },
+            "fresh_until": { "$ref": "common.schema.json#/$defs/timestamp" },
+            "hard_expires_at": { "$ref": "common.schema.json#/$defs/timestamp" },
+            "directory_base_url": { "type": "string", "format": "uri", "maxLength": 2048 }
+          },
+          "additionalProperties": false
+        },
+        "signature": { "$ref": "common.schema.json#/$defs/detachedJws" }
+      },
+      "additionalProperties": false
+    }
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "authority": {
+    "kty": "OKP",
+    "crv": "Ed25519",
+    "x": "hN0G44wXooayFgeF428YA0Npl7k3T2ZwZtFs0Vu4KTE",
+    "alg": "EdDSA",
+    "use": "sig",
+    "kid": "n1.authority.d8Cguci8jvgmsPcM06Nhpie0Fg9RuIbZuvXsoBaF_5w"
+  },
+  "relay": {
+    "kty": "OKP",
+    "crv": "Ed25519",
+    "x": "vs8XqY3iAccz6UbtyvKDDZu6YI9EXKWRnahMHLR0gAQ",
+    "alg": "EdDSA",
+    "use": "sig",
+    "kid": "n1.relay.eX9XNZ8up0LUK8m95_iBaDwaPkLT2AKK8rX7LM8yV_M"
+  }
+}

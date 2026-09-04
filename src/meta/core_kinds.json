@@ -1,0 +1,457 @@
+{
+  "schema_version": 1,
+  "kinds": [
+    {
+      "type": "Annotation",
+      "token": "comment",
+      "value_id": "vv:voc:kind:Annotation:comment",
+      "metadata": {
+        "schema_version": 1,
+        "provenance_ref": "rec:8a6d01d",
+        "definition": "An authored comment attached to exactly one bearer; roots annotate an ordinary record and replies attach directly to the root comment.",
+        "identity": {
+          "criterion": "Each comment record is a distinct authored utterance even when its body matches another comment.",
+          "dedup": { "mode": "record_id", "keys": [] }
+        },
+        "declared_capabilities": []
+      }
+    },
+    {
+      "type": "Annotation",
+      "token": "citation",
+      "value_id": "vv:voc:kind:Annotation:citation",
+      "metadata": {
+        "schema_version": 1,
+        "provenance_ref": "rec:4195a46",
+        "definition": "An annotation that preserves an independently addressable, integrity-checked citation target for its bearer.",
+        "identity": {
+          "criterion": "Each citation record is a distinct annotation even when it targets the same selected evidence as another citation.",
+          "dedup": { "mode": "record_id", "keys": [] }
+        },
+        "declared_capabilities": []
+      }
+    },
+    {
+      "type": "Annotation",
+      "token": "attribution",
+      "value_id": "vv:voc:kind:Annotation:attribution",
+      "metadata": {
+        "schema_version": 1,
+        "provenance_ref": "rec:30f4972",
+        "definition": "An independently authored, time-qualified declaration or assessment about whose stance an exact body revision or passage expresses or endorses.",
+        "identity": {
+          "criterion": "Each attribution is one immutable assertion by one claimant about one subject and one exact target state; corrections create successor records.",
+          "dedup": { "mode": "record_id", "keys": [] }
+        },
+        "declared_capabilities": []
+      }
+    },
+    {
+      "type": "Annotation",
+      "token": "acknowledgement",
+      "value_id": "vv:voc:kind:Annotation:acknowledgement",
+      "metadata": {
+        "schema_version": 1,
+        "provenance_ref": "rec:9f38b4d",
+        "definition": "Durable recipient-authored evidence that explicitly satisfies an acknowledgement expectation without changing Message attention state.",
+        "identity": {
+          "criterion": "Each acknowledgement evidence record is distinct by record id; the specialized Message operation deterministically reuses one record id for the same recipient and Message.",
+          "dedup": { "mode": "record_id", "keys": [] }
+        },
+        "declared_capabilities": []
+      }
+    },
+    {
+      "type": "Collection",
+      "token": "folder",
+      "value_id": "vv:voc:kind:Collection:folder",
+      "metadata": {
+        "schema_version": 1,
+        "provenance_ref": "rec:7e6ce57",
+        "definition": "A collection whose membership is constituted by records being homed beneath it.",
+        "identity": {
+          "criterion": "Each folder record is a distinct collection; membership is constituted by a record being homed there.",
+          "dedup": { "mode": "record_id", "keys": [] }
+        },
+        "declared_capabilities": []
+      }
+    },
+    {
+      "type": "Collection",
+      "token": "selection",
+      "value_id": "vv:voc:kind:Collection:selection",
+      "metadata": {
+        "schema_version": 1,
+        "provenance_ref": "rec:7e6ce57",
+        "definition": "A collection whose membership is constituted by records explicitly added to it.",
+        "identity": {
+          "criterion": "Each selection record is a distinct collection; membership is constituted by a record being explicitly added.",
+          "dedup": { "mode": "record_id", "keys": [] }
+        },
+        "declared_capabilities": []
+      }
+    },
+    {
+      "type": "Collection",
+      "token": "query",
+      "value_id": "vv:voc:kind:Collection:query",
+      "metadata": {
+        "schema_version": 1,
+        "provenance_ref": "rec:c362d12",
+        "definition": "A collection whose membership is computed live from its stored, versioned query over existing records.",
+        "identity": {
+          "criterion": "Continuity of the same stored query that intensionally defines membership; replacing the query establishes a different collection.",
+          "dedup": { "mode": "record_id", "keys": [] }
+        },
+        "declared_capabilities": []
+      }
+    },
+    {
+      "type": "Document",
+      "token": "attachment",
+      "value_id": "vv:voc:kind:Document:attachment",
+      "metadata": {
+        "schema_version": 1,
+        "provenance_ref": "rec:a978c23",
+        "definition": "A document that captures immutable bytes or text as provenance for another record.",
+        "identity": {
+          "criterion": "Attachment identity is the external blob binding plus its containing record context.",
+          "dedup": { "mode": "external_binding", "keys": [] }
+        },
+        "declared_capabilities": []
+      }
+    },
+    {
+      "type": "Document",
+      "token": "artifact",
+      "value_id": "vv:voc:kind:Document:artifact",
+      "metadata": {
+        "schema_version": 1,
+        "provenance_ref": "rec:c24498e",
+        "definition": "A saved presentation whose opaque source body is interpreted by its declared versioned runtime adapter.",
+        "identity": {
+          "criterion": "Each artifact record is a distinct saved presentation; runtime source changes preserve the record's durable identity.",
+          "dedup": { "mode": "record_id", "keys": [] }
+        },
+        "declared_capabilities": ["artifact_runtime"]
+      }
+    },
+    {
+      "type": "Document",
+      "token": "canvas",
+      "value_id": "vv:voc:kind:Document:canvas",
+      "gloss": "Shared sketch surface whose scene is an append-only batch stream.",
+      "metadata": {
+        "schema_version": 1,
+        "provenance_ref": "rec:97b5cb2",
+        "definition": "A document whose scene of notes, shapes, strokes, connectors and record cards is an append-only stream of typed operation batches projected into a current scene.",
+        "identity": {
+          "criterion": "Each canvas record is a distinct sketch surface; matching titles or scenes do not establish identity.",
+          "dedup": { "mode": "record_id", "keys": [] }
+        },
+        "declared_capabilities": ["canvas_scene"]
+      }
+    },
+    {
+      "type": "Program",
+      "token": "module",
+      "value_id": "vv:voc:kind:Document:module",
+      "metadata": {
+        "schema_version": 1,
+        "provenance_ref": "rec:7b65368",
+        "definition": "An authored native.mdx.v2 operational definition whose consumers use explicit immutable publication snapshots.",
+        "identity": {
+          "criterion": "Each module record is a stable authored source identity; publication events attest immutable releases without becoming records.",
+          "dedup": { "mode": "record_id", "keys": [] }
+        },
+        "declared_capabilities": ["module_source", "module_publication"]
+      }
+    },
+    {
+      "type": "Program",
+      "token": "recipe",
+      "value_id": "vv:voc:kind:Program:recipe",
+      "metadata": {
+        "schema_version": 1,
+        "provenance_ref": "rec:3810ef8",
+        "definition": "An authored operational recipe interpreted by native.recipe.v1; immutable publications, executions, and derived outputs remain separate identities.",
+        "identity": {
+          "criterion": "Each recipe record is one governed authored lineage under the declared recipe interpreter; behaviour-changing publications remain revisions of that Program.",
+          "dedup": { "mode": "record_id", "keys": [] }
+        },
+        "declared_capabilities": ["recipe_definition"]
+      }
+    },
+    {
+      "type": "Document",
+      "token": "definition",
+      "value_id": "vv:voc:kind:Document:definition",
+      "metadata": {
+        "schema_version": 1,
+        "provenance_ref": "rec:d90dee1",
+        "definition": "A document that states the current governed meaning of one glossary term.",
+        "identity": {
+          "criterion": "A current agreed definition is identified by its canonical glossary term.",
+          "dedup": { "mode": "facet_tuple", "keys": ["term"] }
+        },
+        "declared_capabilities": []
+      }
+    },
+    {
+      "type": "Document",
+      "token": "handoff",
+      "value_id": "vv:voc:kind:Document:handoff",
+      "gloss": "Session-continuity briefing for a later inhabitant.",
+      "metadata": {
+        "schema_version": 1,
+        "provenance_ref": "rec:e4a92a9",
+        "definition": "An authored session-continuity briefing whose body states live position, boundaries, and working instructions for a later inhabitant.",
+        "identity": {
+          "criterion": "Each handoff record is a distinct session-continuity briefing; matching titles or content do not establish identity.",
+          "dedup": { "mode": "record_id", "keys": [] }
+        },
+        "declared_capabilities": []
+      }
+    },
+    {
+      "type": "Document",
+      "token": "note",
+      "value_id": "vv:voc:kind:Document:note",
+      "metadata": {
+        "schema_version": 1,
+        "provenance_ref": "rec:761ffae",
+        "definition": "An ordinary authored prose or capture document.",
+        "identity": {
+          "criterion": "Each note record is a distinct document; matching titles or content do not establish identity.",
+          "dedup": { "mode": "record_id", "keys": [] }
+        },
+        "declared_capabilities": []
+      }
+    },
+    {
+      "type": "Document",
+      "token": "sheet",
+      "value_id": "vv:voc:kind:Document:sheet",
+      "metadata": {
+        "schema_version": 1,
+        "provenance_ref": "rec:8c2eea0",
+        "definition": "A document whose attachment payload is interpreted as tabular data.",
+        "identity": {
+          "criterion": "Sheet identity remains the record identity unless explicitly related otherwise.",
+          "dedup": { "mode": "record_id", "keys": [] }
+        },
+        "declared_capabilities": []
+      }
+    },
+    {
+      "type": "Document",
+      "token": "slides",
+      "value_id": "vv:voc:kind:Document:slides",
+      "metadata": {
+        "schema_version": 1,
+        "provenance_ref": "rec:761ffae",
+        "definition": "A document whose content is organized as a presentation or slide deck.",
+        "identity": {
+          "criterion": "Each slides record is a distinct document; matching titles or content do not establish identity.",
+          "dedup": { "mode": "record_id", "keys": [] }
+        },
+        "declared_capabilities": []
+      }
+    },
+    {
+      "type": "Entity",
+      "token": "person",
+      "value_id": "vv:voc:kind:Entity:person",
+      "metadata": {
+        "schema_version": 1,
+        "provenance_ref": "rec:761ffae",
+        "definition": "A human individual represented as an enduring referent.",
+        "identity": {
+          "criterion": "Continuity of the same human individual across changes of name, employment, account or contact details.",
+          "dedup": { "mode": "external_binding", "keys": [] }
+        },
+        "declared_capabilities": []
+      }
+    },
+    {
+      "type": "Entity",
+      "token": "organization",
+      "value_id": "vv:voc:kind:Entity:organization",
+      "metadata": {
+        "schema_version": 1,
+        "provenance_ref": "rec:761ffae",
+        "definition": "An organized institution or legal body represented as an enduring referent.",
+        "identity": {
+          "criterion": "Continuity of the same organized body across changes of name, branding, domain or representation.",
+          "dedup": { "mode": "external_binding", "keys": [] }
+        },
+        "declared_capabilities": []
+      }
+    },
+    {
+      "type": "Message",
+      "token": "text",
+      "value_id": "vv:voc:kind:Message:text",
+      "metadata": {
+        "schema_version": 1,
+        "provenance_ref": "rec:f297950",
+        "definition": "An addressed Message whose canonical semantic payload conforms to the plain textual-body contract. Channel and physical media are represented separately; richer Message kinds identify additional semantic payload schemas.",
+        "identity": {
+          "criterion": "Each text message is a distinct message occurrence; matching payloads or subjects do not establish identity.",
+          "dedup": { "mode": "record_id", "keys": [] }
+        },
+        "declared_capabilities": []
+      }
+    },
+    {
+      "type": "Outcome",
+      "token": "impact",
+      "value_id": "vv:voc:kind:Outcome:impact",
+      "metadata": {
+        "schema_version": 1,
+        "provenance_ref": "rec:f8db3a5",
+        "definition": "One claimed realised effect for a particular subject and effective period, represented by the governed atomic impact facet.",
+        "identity": {
+          "criterion": "Each impact record denotes one claimed realised effect for one effective occurrence or period; corrections to the same claim preserve record identity.",
+          "dedup": { "mode": "record_id", "keys": [] }
+        },
+        "declared_capabilities": []
+      }
+    },
+    {
+      "type": "Outcome",
+      "token": "milestone",
+      "value_id": "vv:voc:kind:Outcome:milestone",
+      "metadata": {
+        "schema_version": 1,
+        "provenance_ref": "rec:3b8a090",
+        "definition": "An outcome intended to become true once and remain durably true thereafter.",
+        "identity": {
+          "criterion": "Each milestone record denotes one desired durable achievement; matching measures, dates or wording do not establish identity.",
+          "dedup": { "mode": "record_id", "keys": [] }
+        },
+        "declared_capabilities": []
+      }
+    },
+    {
+      "type": "Outcome",
+      "token": "target",
+      "value_id": "vv:voc:kind:Outcome:target",
+      "metadata": {
+        "schema_version": 1,
+        "provenance_ref": "rec:3b8a090",
+        "definition": "An outcome intended to be true at a specified observation time.",
+        "identity": {
+          "criterion": "Each target record denotes one desired time-bound state; matching measures, dates or wording do not establish identity.",
+          "dedup": { "mode": "record_id", "keys": [] }
+        },
+        "declared_capabilities": []
+      }
+    },
+    {
+      "type": "Resolution",
+      "token": "decision",
+      "value_id": "vv:voc:kind:Resolution:decision",
+      "metadata": {
+        "schema_version": 1,
+        "provenance_ref": "rec:c850e0f",
+        "definition": "An authorised settled choice or commitment among live alternatives.",
+        "identity": {
+          "criterion": "Continuity of the same authorised choice or commitment across rewrites of its documentation; withdrawal occurs through supersession, revocation or rescission.",
+          "dedup": { "mode": "record_id", "keys": [] }
+        },
+        "declared_capabilities": []
+      }
+    },
+    {
+      "type": "Resolution",
+      "token": "rule",
+      "value_id": "vv:voc:kind:Resolution:rule",
+      "metadata": {
+        "schema_version": 1,
+        "provenance_ref": "rec:c850e0f",
+        "definition": "An instituted norm that governs conduct because an authorised actor or process laid it down.",
+        "identity": {
+          "criterion": "Continuity of the same instituted norm across rewrites of its documentation; withdrawal occurs through supersession, repeal, revocation or rescission.",
+          "dedup": { "mode": "record_id", "keys": [] }
+        },
+        "declared_capabilities": []
+      }
+    },
+    {
+      "type": "WorkItem",
+      "token": "task",
+      "value_id": "vv:voc:kind:WorkItem:task",
+      "metadata": {
+        "schema_version": 1,
+        "provenance_ref": "rec:40384f2",
+        "definition": "An ordinary work item whose completion directly discharges the commitment it records.",
+        "identity": {
+          "criterion": "Each task record is a distinct commitment to work; matching titles, descriptions or placement do not establish identity.",
+          "dedup": { "mode": "record_id", "keys": [] }
+        },
+        "declared_capabilities": []
+      }
+    },
+    {
+      "type": "WorkItem",
+      "token": "epic",
+      "value_id": "vv:voc:kind:WorkItem:epic",
+      "metadata": {
+        "schema_version": 1,
+        "provenance_ref": "rec:40384f2",
+        "definition": "A work item whose achievement is entailed by completion of its constituent child work.",
+        "identity": {
+          "criterion": "Each epic record is a distinct commitment to a whole body of work discharged by its parts; magnitude, titles or placement do not establish identity.",
+          "dedup": { "mode": "record_id", "keys": [] }
+        },
+        "declared_capabilities": []
+      }
+    },
+    {
+      "type": "Conversation",
+      "token": "discussion",
+      "value_id": "vv:voc:kind:Conversation:discussion",
+      "metadata": {
+        "schema_version": 1,
+        "provenance_ref": "rec:761ffae",
+        "definition": "A continuing authored exchange classified by its messages and distinct from any Message reply chain.",
+        "identity": {
+          "criterion": "Continuity of the same authored exchange across its classified messages; classification does not make member content referentially dependent or grant access.",
+          "dedup": { "mode": "external_binding", "keys": [] }
+        },
+        "declared_capabilities": []
+      }
+    },
+    {
+      "type": "Conversation",
+      "token": "transcript",
+      "value_id": "vv:voc:kind:Conversation:transcript",
+      "metadata": {
+        "schema_version": 1,
+        "provenance_ref": "rec:761ffae",
+        "definition": "A bounded capture of one exchange whose sequence or utterances may be addressed, cited or acted upon.",
+        "identity": {
+          "criterion": "Continuity of the same meeting, session or exchange occurrence across exports or representations.",
+          "dedup": { "mode": "external_binding", "keys": [] }
+        },
+        "declared_capabilities": []
+      }
+    },
+    {
+      "type": "Annotation",
+      "token": "suggestion",
+      "value_id": "vv:voc:kind:Annotation:suggestion",
+      "metadata": {
+        "schema_version": 1,
+        "provenance_ref": "rec:8c2eea0",
+        "definition": "An annotation that escrows a proposed edit to the record named by its single outgoing part_of link until resolution.",
+        "identity": {
+          "criterion": "Each suggestion record is a distinct proposal even when its proposed text matches another.",
+          "dedup": { "mode": "record_id", "keys": [] }
+        },
+        "declared_capabilities": []
+      }
+    }
+  ]
+}

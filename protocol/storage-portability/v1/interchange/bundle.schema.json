@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://withnative.com/protocol/storage-portability/v1/interchange/bundle.schema.json",
+  "title": "Native canonical interchange v1 bundle",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["manifest", "sections"],
+  "properties": {
+    "manifest": { "$ref": "manifest.schema.json" },
+    "sections": {
+      "type": "array",
+      "minItems": 97,
+      "maxItems": 97,
+      "items": { "$ref": "section.schema.json" }
+    }
+  }
+}

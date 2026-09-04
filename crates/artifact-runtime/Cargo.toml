@@ -1,0 +1,34 @@
+[package]
+name = "native-artifact-runtime"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.98"
+description = "Internal deterministic MDX compiler and sandbox runtime for native-ce."
+repository = "https://github.com/withnative/native"
+license = "AGPL-3.0-only"
+publish = false
+
+[features]
+default = []
+test-support = []
+
+[dependencies]
+base64 = "0.23.0"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+hex = "0.4"
+markdown = "=1.0.0"
+# The genuine-MDX adapter is deliberately pinned as one runtime contract. A
+# compiler or executor upgrade changes observable syntax/sandbox semantics and
+# therefore requires the adapter revision/cache namespace to move in lockstep.
+mdxjs = "=1.0.4"
+rquickjs = { version = "=0.11.0", default-features = false, features = ["std", "loader"] }
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order", "unbounded_depth"] }
+sha2 = "0.10"
+swc_common = "=12.0.1"
+swc_ecma_ast = "=12.0.0"
+swc_ecma_parser = "=15.0.2"
+swc_ecma_visit = "=12.0.0"
+tokio = { version = "1", features = ["sync"] }
+url = "2"
+uuid = { version = "1", features = ["v4"] }

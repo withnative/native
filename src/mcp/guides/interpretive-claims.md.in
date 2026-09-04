@@ -1,0 +1,98 @@
+# Interpretive claims
+
+Interpretive claims let Native preserve who said or assessed what about exact content without turning an interpretation into provenance, endorsement, truth, consensus, or permission. Use them when attributed stance matters after the current session; leave content unclaimed when it does not.
+
+## Three layers that must remain separate
+
+1. **Content** is the ordinary record and its immutable content-event history. It is what a claim targets.
+2. **Attribution** is an authored `Annotation kind:attribution` with an immutable exact target and assertion. It records a declaration or assessment; retraction, later evidence, and successors are append-only lifecycle facts.
+3. **Provenance** is Native-issued action-attestation evidence about accepted writes and verified interactions. The registry automatically returns `action_attestation_ids` for qualifying accepted actions. Do not create provenance-shaped records or infer a person's stance from physical authorship.
+
+An action attestation can be cited as `basis` or `counterevidence`. Native alone may attach `exact_target_confirmation`, and only while accepting the exact trusted human declaration gesture. Evidence strengthens the explanation chain; it never rewrites the claim.
+
+For a qualifying accepted write, Native reserves the attestation identity before appending, then finalizes it over the accepted tool scope and ordered event membership in the same transaction. A rejected or rolled-back write leaves no trusted partial attestation. Replay and integrity checks validate those memberships; callers consume the returned identifier rather than manufacturing one.
+
+## Choose deliberately: no claim, assessment, or declaration
+
+No claim is a first-class, honest state. Existing and imported content is not backfilled with guessed subjects, authors, views, or endorsements. Generic reads hide interpretation by default; when explicitly requested, unclaimed content reports `status: none` and zero caller-visible claims.
+
+Use `create_attribution` for a durable claim over a whole body revision or passage:
+
+- An **assessment** is the ordinary path. Attribute `person_record`, `agent_execution`, or `self_agent_execution`; choose `expresses_view` or `endorses`, `affirmed` or `denied`, an ordinal confidence, and the honest transformation: `none`, `selection`, `paraphrase`, `summary`, or `synthesis`. Explain the rationale. Delegation or credential ownership does not convert this into a declaration.
+- A **direct declaration** is accepted only for the authenticated person's exact `self_person` gesture, `transformation:"none"`, exact target, relation, and polarity, through trusted declaration interaction capture. Supplying the same JSON without that ingress remains an assessment or fails validation. Agents cannot add `exact_target_confirmation` themselves.
+
+Claims about agent executions are `agent_opinion`; assessments of a person remain `assessed_human_stance`. Neither class is silently upgraded by confidence, repetition, delegation, or evidence count.
+
+## Bind an exact target
+
+Read the current record and its history, select the exact content event, and calculate SHA-256 over the target body's UTF-8 bytes. Send `source_event_id`, `source_body_sha256`, and `scope:"whole_revision"`, or add canonical selectors with `scope:"passage"`. Do not target a record name, mutable latest state, field, or proposition as though it were supported.
+
+After content changes, the original target remains inspectable. It may be `relocated`, `stale`, or `conflict`; an active claim does not become historical merely because its target moved. Ambiguous passages never silently re-anchor. If a changed stance supersedes an earlier claim, create a new claim with `successor_of`; do not mutate the old assertion.
+
+## Write and lifecycle recipes
+
+1. Retain the `action_attestation_ids` returned by relevant accepted actions such as creating a source, comment, or suggestion.
+2. Call `create_attribution` with a durable non-blank `idempotency_key`, bearer, exact target, subject, relation, polarity, transformation, rationale, and—except for an exact declaration—confidence. Add visible action attestations as `basis` or `counterevidence` when they genuinely support the claim.
+3. To correct stance, create a successor. To withdraw an assertion, call `manage_attributions` with `action:"retract"` and a reason. To append later evidence, use `action:"add_evidence"`. Targets and assertions never change in place.
+4. Read the result before presenting it. Preserve target state, lifecycle, frontier conflict, evidence class, exact-review status, and limitations rather than flattening them into a winner.
+
+A minimal assessment call has this shape (replace placeholders with values obtained from the authorized live record and history):
+
+```json
+{
+  "idempotency_key": "decision-42-stance-v1",
+  "bearer_id": "<record-id>",
+  "target": {
+    "source_event_id": "<content-event-id>",
+    "source_body_sha256": "<64-lowercase-hex>",
+    "scope": "whole_revision"
+  },
+  "subject": { "kind": "person_record", "record_id": "<person-id>" },
+  "relation": "expresses_view",
+  "polarity": "affirmed",
+  "confidence": "likely",
+  "transformation": "summary",
+  "rationale": "The cited meeting action and decision text support this assessment.",
+  "evidence": [
+    { "role": "basis", "action_attestation_id": "<attestation-id>" }
+  ]
+}
+```
+
+Call `read_attributions {"bearer_id":"<record-id>"}` to inspect it. Use `manage_attributions {"action":"retract","annotation_id":"<claim-id>","reason":"<correction>"}` to withdraw the assertion, or create a new claim with `successor_of:"<claim-id>"` when the attributed stance changes.
+
+Writes are atomic. A failed claim or evidence append leaves no partial attribution aggregate. Retrying the same accepted create with its idempotency key returns the durable result rather than adding another claim.
+
+## Read, explain, and render within bounds
+
+Use `read_attributions` for raw authorized claims, the conservative typed projection, and optionally one claim-specific Why chain via `explain_annotation_id`. The raw page limit is at most 100; evidence is bounded to 32 rows per claim. Projection is bounded to 100 claims, 256 total evidence rows, 256 distinct inspections, and 256 inspection-output records.
+
+Use `include_interpretation:true` on live direct `get_record`, record-producing `query_record`, or `render_record` for presentation without raw claims or claim-specific Why. It is opt-in, supports at most 50 returned bearers, and applies request-wide caps of 100 claims, 32 evidence rows per claim, and 256 total evidence rows, inspections, and inspection-output records. It is not part of saved-query v0.2; historical generic reads, non-record query terminals, federated query fan-out, and unqualified backends reject it rather than silently omitting semantics. `query_sql` remains attribution-blind.
+
+When bounds, authorization, or inspection prevent a complete answer, expect `unavailable` or `unknown_or_withheld`, a false completeness signal, and omitted caller-inaccessible identifiers or cardinalities. Absence, hidden evidence, sealed evidence, and invalid evidence are not interchangeable. A sealed reference is reported only as recorded; its URI is not disclosed. Do not recover missing detail through another caller, raw SQL, counts, logs, or error differences.
+
+Historical `read_attributions` uses `as_of_event_seq` for claim, lifecycle, successor, evidence, and target-applicability history while receiver-local authority and evidence invalidation remain current. History can reconstruct an earlier conflict; it cannot time-travel invalid evidence back into trust.
+
+## Interpret conservatively
+
+Groups are organized by exact target, subject, and relation. Opposing active claims at the same latest stance frontier are `conflicted`; older, retracted, and superseded claims remain historical evidence rather than votes. Preserve the projection headline and its limitations in text or machine output.
+
+The following boundaries are invariant:
+
+- delegation does not establish endorsement;
+- confidence does not establish truth;
+- claim counts do not establish consensus;
+- a standing-guidance or rule record is interpretable content, not behavioural authority;
+- an external-facing draft does not authorize publication, sending, or representation; and
+- imported, invalidated, hidden, sealed, or foreign evidence cannot become receiver-local confirmation by omission.
+
+Behavioural-policy integration is deliberately deferred. Nothing in this guide or the interpretation projection instructs an agent to act, changes record authorization, grants a capability, satisfies an approval, or substitutes for the user's current direction.
+
+## Troubleshooting
+
+- **Expected a declaration, got an assessment:** confirm a canonical person binding, the exact trusted declaration interaction, `subject.kind:"self_person"`, `transformation:"none"`, and exact target/relation/polarity scope. Do not repair it by raising confidence.
+- **Target is stale or conflicted:** inspect the bound source event and selectors. Create a successor over the intended new revision; never edit or silently re-anchor the old claim.
+- **Projection is unavailable or incomplete:** reduce the authorized bearer window or use bounded dedicated pages. Do not treat unavailable counts as zero or split requests to infer hidden cardinality.
+- **Evidence is withheld, foreign, or invalidated:** present that state. Re-importing, adding an inaccessible identifier, or relying on a sealed URI does not create local trust.
+- **No claim appears after migration:** this is correct unless someone authors one. Preserve the honest no-claim state; do not infer or bulk-backfill interpretation from content, authorship, credentials, links, or prior prose.
+- **Need an instruction or approval:** use the applicable authorization, policy, coordination, or user-interaction mechanism. An interpretive claim is evidence about stance, never the authority to act.

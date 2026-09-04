@@ -1,0 +1,34 @@
+{
+  "children": [
+    { "children": ["Delivery"], "props": {}, "type": "h1" },
+    "\n",
+    { "children": [], "props": { "label": "Active records", "value": 1 }, "type": "Metric" },
+    "\n",
+    {
+      "children": [],
+      "props": {
+        "columns": ["name", "type", "kind", "lifecycle", "status"],
+        "records": [
+          {
+            "facets": { "status": "doing" },
+            "id": "a7710000-0000-4000-8000-000000000001",
+            "kind": "task",
+            "lifecycle_interpretation": {
+              "raw": "active",
+              "reason": "unknown_or_inactive_value",
+              "status": "unclassified"
+            },
+            "maturity": null,
+            "name": "Active item",
+            "persistence": "enduring",
+            "summary": null,
+            "type": "WorkItem"
+          }
+        ]
+      },
+      "type": "RecordTable"
+    }
+  ],
+  "props": {},
+  "type": "Fragment"
+}

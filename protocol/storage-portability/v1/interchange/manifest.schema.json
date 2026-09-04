@@ -1,0 +1,61 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://withnative.com/protocol/storage-portability/v1/interchange/manifest.schema.json",
+  "title": "Native canonical interchange v1 manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "format",
+    "revision",
+    "source_profile",
+    "source_engine_schema",
+    "logical_contract",
+    "encoding",
+    "ordering",
+    "sections",
+    "content_sha256"
+  ],
+  "properties": {
+    "format": { "const": "native.canonical-interchange.v1" },
+    "revision": { "const": 2 },
+    "source_profile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "revision"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "revision": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "source_engine_schema": { "type": "integer", "minimum": 1 },
+    "logical_contract": { "const": "native.logical.v1" },
+    "encoding": { "const": "utf-8-json" },
+    "ordering": {
+      "const": "sections-by-contract;rows-by-primary-key;columns-by-schema"
+    },
+    "sections": {
+      "type": "array",
+      "minItems": 97,
+      "maxItems": 97,
+      "items": { "$ref": "#/$defs/sectionDescriptor" }
+    },
+    "content_sha256": { "$ref": "#/$defs/sha256" }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "sectionDescriptor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "revision", "row_count", "sha256"],
+      "properties": {
+        "name": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" },
+        "revision": { "const": 2 },
+        "row_count": { "type": "integer", "minimum": 0 },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    }
+  }
+}

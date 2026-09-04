@@ -1,0 +1,30 @@
+# Curated cross-tool compositions
+
+This guide contains only non-obvious focused-profile recipes whose limitations matter. It is not an exhaustive history of tool names or a promise that every hidden or retired capability has a faithful composition.
+
+## Attention and dashboard view with bounded queries
+
+Build an attention view with bounded, valid `query_record` calls:
+
+1. Query the installation's known active lifecycle tokens, for example `{"steps":[{"step":"filter","types":["WorkItem"],"lifecycle":["active","claimed"]}],"order":"last_activity_desc","limit":50}`. Lifecycle is open, so the caller must supply the tokens that mean active locally.
+2. Find stale candidates by paging the same scope with `order:"last_activity_desc"`, a bounded `limit`, and increasing `offset`. Compare each returned `last_activity_at` with the cutoff client-side. `query_record` has inclusive `last_activity_since` but no before predicate, so the stale set is incomplete until paging reaches the cutoff or exhausts the match set; disclose any earlier stop. For the built-in faithful bounded view, call the hidden-by-profile `get_dashboard` by exact name with `stale_after_days`.
+3. From a bounded work-ID seed, traverse outgoing dependencies with `{"steps":[{"step":"filter","ids":["work-id"]},{"step":"traverse","target":"links","relationship":"depends_on","direction":"out"}],"limit":50}`. Run a separate traversal for `blocks` or the reverse direction when the installation uses that edge convention; each traversal replaces the working set.
+4. Request the lifecycle census with `{"steps":[{"step":"filter","types":["WorkItem"]}],"count_by":"lifecycle"}`. Keep the filter aligned with the visible dashboard scope.
+
+Keep scope and `include_archived` policy identical across calls and report each window's limits. These calls are **not one atomic snapshot**: writes may land between them, so rows and buckets can describe slightly different revisions. A shared supported `as_of` boundary pins content for each `query_record` call, but schema and governed-kind metadata remain live; otherwise disclose the skew.
+
+## Governed facet selection
+
+First call `resolve_facets` for the exact record or type/kind context. Read the effective facet shape and the governing vocabulary identity from the resolved pack → user cascade. Then call `manage_vocabularies` with `action:"list_values"`, that vocabulary, `status:"active"`, and `resolve_aliases:true`. Write the selected canonical value through `create_record` or `update_record` with its vocabulary reference.
+
+Do not skip resolution and guess a vocabulary by name. The cascade can change which vocabulary governs the same facet key, and aliases or deprecated values can make an apparently plausible token wrong. The write path will enforce the effective contract, but resolving first avoids a preventable failed or misdirected choice.
+
+## Semantic bulk operations
+
+Use a bulk operation only when it supplies semantics beyond scheduling the same call repeatedly:
+
+- `records_read.resolve_many` resolves a bounded, ordered list of exact names and reports unique, absent, and ambiguous outcomes without exposing hidden candidates. Use it for deterministic deduplication; use `search` for exploratory lexical recall.
+- `records_write.create_many` creates a bounded graph. Batch-local `ref` values can be used by `parent_ref`, link `target_ref`, and `[[ref]]` body mentions. The server validates the whole dependency graph before writing, then returns positional receipts; one failed record prevents its dependants but not independent branches.
+- `access_admin.manage_record_policy.set_many` converges each `(record, subject)` pair on an exact capability or on absence. It is one plan-required, all-or-nothing effect: prepare it first, review the complete target/effect summary, and execute only that returned plan.
+
+For independent ordinary calls with no shared lookup, graph, or convergence semantics, pipeline the singular operations instead. A generic heterogeneous batch does not reduce response payload and does not provide cross-operation atomicity. Prefer compact response/receipt modes when payload size is the actual cost.

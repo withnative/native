@@ -1,0 +1,138 @@
+# Messaging
+
+Every send is one call: `manage_messages.send` delivers a new message, a
+reply, or a correction. The `messaging_write` executor description names that
+reply capability; the exact `manage_messages.send` operation contract carries
+the creation-time `reply_to` shape and mention span units; this guide carries
+the cross-operation model and worked examples. Load the contract with
+`describe_operation` before constructing a send.
+
+## Origin, home, audience: three different places
+
+A message stands in three places at once. Confusing them is the usual failure.
+
+- **Communication origin** (`origin`) is the immutable context the message is
+  authored in: either a Collection venue
+  (`{"type":"collection","collection_id":"<collection-id>"}`) or an exact
+  direct participant set
+  (`{"type":"direct","participant_ids":["<person-a>","<person-b>"]}`). It
+  decides which conversation the message belongs to. A reply or correction
+  must repeat its target's origin exactly.
+- **Filing home** (`home_id`) is where the message is filed and browsed. It is
+  never context: filing a direct message under a Collection does not put it in
+  that Collection's conversation, and a Collection-origin send must file in
+  that same Collection.
+- **Addressed audience** (`addressed_to`) is who carries the obligation: the
+  recipient Person ids. It is neither venue nor filing.
+
+## Addressed audience and expectation
+
+`expectation` names the obligation a send places: `none`, `ack`, `reply`,
+`action`, or `decision`. Addressing carries expectation, origin carries venue,
+so an empty `addressed_to` is valid only with expectation `'none'` — an
+unaddressed channel post puts an obligation on nobody and inherits the
+Collection's audience. A non-`none` expectation with nobody addressed is
+rejected: nobody carries the obligation.
+
+## New messages, replies, corrections
+
+- **New message.** Supply `body`, `origin`, `addressed_to`, `expectation`,
+  `idempotency_key`, and `reason`. `idempotency_key` is unique per distinct
+  send intent; reuse with a different intent is rejected.
+- **Reply.** A new message plus one creation-time link:
+  `links:[{"target_id":"<message-id>","relationship":"reply_to"}]`. The reply
+  must retain the target message's communication origin, and at most one
+  `reply_to` target is allowed. There is no dedicated reply action and no
+  `reply_to_id` field: the generic creation-time link is the whole primitive.
+- **Correction.** Same shape with `"relationship":"supersedes"`: the source
+  replaces the target while preserving an explicit historical trail. Same
+  single-target and same-origin rules as a reply.
+
+## Immutable contextual links
+
+`reply_to` and `supersedes` links are immutable Message content, authored at
+creation. They cannot be added after creation — not by a second send, not by
+`manage_links`, not by editing the record. A message sent flat stays
+unthreaded; the only repair is a new, correctly threaded message. Post-send
+threading repair is rejected because the reply context is part of what the
+message *is*: silently re-parenting it would rewrite conversation history
+under every reader who already saw the flat message.
+
+## Principal and record mentions
+
+`mentions` point at immutable prose from inside the same send.
+
+- `target_kind` is `principal` (a person) or `record` (any record).
+- A principal mention target must already be addressed in `addressed_to`.
+- Each span is zero-based and half-open over UTF-8 bytes:
+  `[span_start, span_end)` into `body`. Byte offsets, not character counts:
+  both ends must be UTF-8 character boundaries and
+  `body[span_start..span_end]` must equal `authored_label` byte-for-byte,
+  including multibyte text. `span_end` must be greater than `span_start`, and
+  `mention_id` values must be non-empty and unique within the send.
+
+## Complete examples
+
+A direct-message reply with a mention after multibyte prose. `é` is two UTF-8
+bytes, so in `"Héllo recipient"` the word `recipient` spans bytes 7..16:
+
+```json
+{
+  "action": "send",
+  "body": "Héllo recipient",
+  "origin": {"type": "direct", "participant_ids": ["<person-a>", "<person-b>"]},
+  "addressed_to": ["<person-b>"],
+  "expectation": "reply",
+  "links": [{"target_id": "<root-message-id>", "relationship": "reply_to"}],
+  "mentions": [{"mention_id": "mention-1", "target_kind": "principal", "target_id": "<person-b>", "span_start": 7, "span_end": 16, "authored_label": "recipient"}],
+  "idempotency_key": "dm-reply-1",
+  "reason": "Reply to <person-b> in our direct context"
+}
+```
+
+A Collection channel post and a reply to it. `✓` is three UTF-8 bytes, so in
+`"✓ recipient confirmed"` the word `recipient` spans bytes 4..13:
+
+```json
+{
+  "action": "send",
+  "body": "Weekly notes are up",
+  "origin": {"type": "collection", "collection_id": "<collection-id>"},
+  "addressed_to": [],
+  "expectation": "none",
+  "home_id": "<collection-id>",
+  "idempotency_key": "channel-root-1",
+  "reason": "Post the weekly notes to the project channel"
+}
+```
+
+```json
+{
+  "action": "send",
+  "body": "✓ recipient confirmed",
+  "origin": {"type": "collection", "collection_id": "<collection-id>"},
+  "addressed_to": ["<person-b>"],
+  "expectation": "ack",
+  "home_id": "<collection-id>",
+  "links": [{"target_id": "<channel-post-id>", "relationship": "reply_to"}],
+  "mentions": [{"mention_id": "mention-1", "target_kind": "principal", "target_id": "<person-b>", "span_start": 4, "span_end": 13, "authored_label": "recipient"}],
+  "idempotency_key": "channel-reply-1",
+  "reason": "Confirm the notes to <person-b> in the project channel"
+}
+```
+
+## Failure modes
+
+- **Cross-context reply.** A `reply_to` target from another origin is refused:
+  replies must retain the communication origin in which they are authored.
+  Re-address the send into the target's origin.
+- **Two `reply_to` targets.** At most one canonical `reply_to` (and at most
+  one `supersedes`) target per message. Split the intent across messages.
+- **Mention span mismatch.** Offsets past the body end, ends that split a
+  multibyte character, or a slice that differs from `authored_label` are
+  refused. Count bytes, not characters, and copy the slice exactly.
+- **Unaddressed principal mention.** A principal mention whose target is not
+  in `addressed_to` is refused. Address them or drop the mention.
+- **Flat send sent by mistake.** The message cannot be re-parented. Send a new
+  reply with a creation-time `reply_to` link; the flat message remains as
+  authored history.

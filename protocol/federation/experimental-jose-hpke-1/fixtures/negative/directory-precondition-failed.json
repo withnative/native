@@ -1,0 +1,18 @@
+{
+  "scenario_type": "directory",
+  "scenario_id": "directory-precondition-failed",
+  "profile": "native-fed/experimental-jose-hpke-1",
+  "clock": "2026-08-02T09:10:00Z",
+  "steps": [
+    {
+      "request": "POST /v1/principals/alice0001/keys",
+      "if_match": "stale",
+      "expect": {
+        "status": 412,
+        "retryable": true
+      }
+    }
+  ],
+  "expect_error": "precondition_failed",
+  "validation_layer": "etag"
+}

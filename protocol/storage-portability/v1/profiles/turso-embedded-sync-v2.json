@@ -1,0 +1,65 @@
+{
+  "$schema": "../profile.schema.json",
+  "format": "native.storage-profile.v1",
+  "id": "turso-embedded-sync",
+  "revision": 2,
+  "status": "research",
+  "engine": {
+    "family": "turso",
+    "implementation": "Turso Database local-first sync engine",
+    "version_requirement": "turso crate =0.8.0-pre.2 with sync feature"
+  },
+  "frontend": {
+    "dialect": "sqlite",
+    "protocol": "in-process turso::sync Rust API with explicit push and pull"
+  },
+  "connection": {
+    "modes": ["sync"],
+    "driver": "turso 0.8.0-pre.2 (default-features=false, features=[sync]); turso::sync::Builder::new_remote"
+  },
+  "topology": {
+    "kind": "single-writer-authoritative-local-file-with-explicit-cloud-sync",
+    "logical_database_isolation": "one authoritative local Turso Database file plus one remote sync namespace per Native logical database; Native v1 permits exactly one active writable replica"
+  },
+  "operational_identity": {
+    "write_authority": "A successful local transaction commit is authoritative for an MCP write. Push acknowledgement, remote durability, and pull visibility are separate states; sync never changes a committed MCP result into failure.",
+    "consistency": "Local read-your-writes with explicit eventual remote visibility after push and pull. Exactly one active writable replica is permitted by Native v1; multiple writable replicas and conflict resolution are unsupported regardless of broader vendor capability.",
+    "file_semantics": "The local file is authoritative for ordinary Native MCP operations but is only one side of recovery. It is not a quiesced cross-profile snapshot while pushes are pending, failed, or remotely divergent.",
+    "provider_dependencies": [
+      "Turso Cloud sync namespace",
+      "remote sync URL and scoped authentication token",
+      "TLS-capable network path for push and pull",
+      "separate local and remote backup, restore, divergence, and credential-rotation procedures"
+    ],
+    "promotion_rules": [
+      "Vendor beta, production, offline, or multi-writer claims are not Native support evidence.",
+      "Promotion requires a stable non-prerelease turso sync driver and credentialed single-writer Native suites for local commit, push, remote verification, pull, partition, divergence, dirty shutdown, local loss, remote loss, migration, backup, and restore.",
+      "Multiple active writable replicas remain unsupported until Native ratifies conflict semantics in a new profile revision.",
+      "No deterministic local, direct-remote, or legacy libSQL embedded-replica result transfers to this profile.",
+      "Any engine, driver, sync protocol, topology, write-authority, consistency, file-semantics, or provider assumption change creates a new immutable profile revision."
+    ],
+    "upstream_sources": [
+      "https://docs.turso.tech/sdk/introduction",
+      "https://docs.turso.tech/sdk/rust/quickstart",
+      "https://crates.io/crates/turso/0.8.0-pre.2"
+    ]
+  },
+  "contracts": {
+    "logical": "native.logical.v1",
+    "event_positions": "gapless",
+    "json": "native.canonical-json.v1",
+    "timestamps": "utc-rfc3339-milliseconds",
+    "ordering": "explicit-total-order"
+  },
+  "capabilities": {
+    "native.domain-mcp.v1": { "support": "planned", "portability": "portable", "notes": "Credentialed sync probes are not a shared-contract implementation." },
+    "native.guarded-write.v1": { "support": "planned", "portability": "portable", "notes": "A single-writer probe plan does not prove the complete Native guarded-write contract." },
+    "native.canonical-interchange.v1": { "support": "planned", "portability": "portable" },
+    "native.search.lexical.v1": { "support": "planned", "portability": "portable" },
+    "native.search.semantic.v1": { "support": "planned", "portability": "portable" },
+    "native.search.sqlite-fts5-exact": { "support": "unsupported", "portability": "blocking" },
+    "native.raw-sql": { "support": "unsupported", "portability": "blocking", "notes": "No reviewed authorization boundary exists for synchronized remote state." },
+    "native.describe-physical-schema": { "support": "planned", "portability": "profile-specific" },
+    "native.sqlite-file-fast-path": { "support": "unsupported", "portability": "blocking", "notes": "A replica with unconfirmed or divergent sync state is not a quiesced cross-profile artifact." }
+  }
+}

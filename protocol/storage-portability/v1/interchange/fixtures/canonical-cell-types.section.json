@@ -1,0 +1,24 @@
+{
+  "format": "native.canonical-interchange.section.v1",
+  "revision": 2,
+  "name": "representative_values",
+  "columns": [
+    { "name": "id", "declared_type": "TEXT" },
+    { "name": "nullable", "declared_type": "TEXT" },
+    { "name": "integer_value", "declared_type": "INTEGER" },
+    { "name": "real_value", "declared_type": "REAL" },
+    { "name": "text_value", "declared_type": "TEXT" },
+    { "name": "blob_value", "declared_type": "BLOB" }
+  ],
+  "primary_key": ["id"],
+  "rows": [
+    [
+      { "type": "text", "value": "representative" },
+      { "type": "null" },
+      { "type": "integer", "value": -42 },
+      { "type": "real", "value": "3ff0000000000000" },
+      { "type": "text", "value": "Native 📦" },
+      { "type": "blob", "value": "AAEC/w==" }
+    ]
+  ]
+}

@@ -1,0 +1,6 @@
+{
+  "git": {
+    "sha1": "1b7dfc9299257b1acbb1a675ae2f6cc8ff0dc6ca"
+  },
+  "path_in_vcs": "crates/swc_common"
+}

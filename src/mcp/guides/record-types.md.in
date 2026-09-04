@@ -1,0 +1,11 @@
+# Record types
+
+The closed spine-type vocabulary is generated from the engine contract:
+
+<!-- GENERATED:SPINE_TYPES -->
+
+`type` chooses a stable storage and interoperability category. `kind` is the required open-additive extension point: use the governed kind registry when one applies, or an honest novel non-empty token when it does not. Do not invent a new top-level type for a subtype.
+
+Call `schema_read.preview_record_shape` before committing a candidate type and kind. It returns deterministic live meanings, governed kinds, exact cross-type matches, effective facets and novelty consequences without inferring from prose or gating `create_record`. Type cannot change through ordinary update; correction uses the separately governed repair operation. Kind is interpreted relative to type, so do not silently move an exact kind match across types or replace an honest novel kind. Keep any client interpretation separate, with its evidence and uncertainty.
+
+<!-- GENERATED:SPINE_TYPE_MEANINGS -->

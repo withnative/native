@@ -1,0 +1,24 @@
+{
+  "scenario_type": "envelope",
+  "scenario_id": "envelope-replay-identical",
+  "profile": "native-fed/experimental-jose-hpke-1",
+  "clock": "2026-08-02T09:10:00Z",
+  "steps": [
+    {
+      "operation": "relay.submit",
+      "digest": "sha-256:z0gRoPRc8jr1LM6YuvgTONZHI-eA6zndM3iGLHdPhik",
+      "expect": {
+        "state": "queued"
+      }
+    },
+    {
+      "operation": "relay.submit",
+      "digest": "sha-256:z0gRoPRc8jr1LM6YuvgTONZHI-eA6zndM3iGLHdPhik",
+      "expect": {
+        "state": "queued",
+        "same_delivery_id": true,
+        "same_receipt_bytes": true
+      }
+    }
+  ]
+}

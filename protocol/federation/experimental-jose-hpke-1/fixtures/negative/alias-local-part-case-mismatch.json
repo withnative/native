@@ -1,0 +1,17 @@
+{
+  "scenario_type": "alias",
+  "scenario_id": "alias-local-part-case-mismatch",
+  "profile": "native-fed/experimental-jose-hpke-1",
+  "clock": "2026-08-02T09:10:00Z",
+  "steps": [
+    {
+      "stored": "Alice@example.com",
+      "query": "alice@EXAMPLE.COM",
+      "expect": {
+        "status": 404
+      }
+    }
+  ],
+  "expect_error": "unknown_alias",
+  "validation_layer": "alias"
+}

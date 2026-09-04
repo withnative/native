@@ -1,0 +1,116 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://spec.withnative.ai/federation/experimental-jose-hpke-1/schemas/relay.schema.json",
+  "title": "Native federation relay operation bodies",
+  "oneOf": [
+    { "$ref": "#/$defs/submissionRequest" },
+    { "$ref": "#/$defs/submissionResponse" },
+    { "$ref": "#/$defs/collectRequest" },
+    { "$ref": "#/$defs/collectResponse" },
+    { "$ref": "#/$defs/ackRequest" },
+    { "$ref": "#/$defs/ackResponse" },
+    { "$ref": "common.schema.json#/$defs/problem" }
+  ],
+  "$defs": {
+    "submissionRequest": {
+      "type": "object",
+      "required": ["operation", "envelope"],
+      "properties": {
+        "operation": { "const": "relay.submit" },
+        "envelope": { "$ref": "transport-envelope.schema.json" }
+      },
+      "additionalProperties": false
+    },
+    "recipientResult": {
+      "type": "object",
+      "required": ["recipient", "outcome"],
+      "properties": {
+        "recipient": { "$ref": "common.schema.json#/$defs/principalAddress" },
+        "outcome": { "enum": ["queued", "rejected", "error"] },
+        "delivery_id": { "$ref": "common.schema.json#/$defs/uuidV4" },
+        "code": { "type": "string", "pattern": "^[a-z_]+$" },
+        "retry_after": { "type": "integer", "minimum": 0, "maximum": 86400 },
+        "receipt": { "$ref": "relay-receipt.schema.json" }
+      },
+      "additionalProperties": false
+    },
+    "submissionResponse": {
+      "type": "object",
+      "required": ["operation", "envelope_id", "envelope_digest", "results"],
+      "properties": {
+        "operation": { "const": "relay.submit.result" },
+        "envelope_id": { "$ref": "common.schema.json#/$defs/uuidV4" },
+        "envelope_digest": { "$ref": "common.schema.json#/$defs/digest" },
+        "results": { "type": "array", "minItems": 1, "maxItems": 128, "items": { "$ref": "#/$defs/recipientResult" } }
+      },
+      "additionalProperties": true
+    },
+    "collectRequest": {
+      "type": "object",
+      "required": ["operation", "limit", "wait_seconds"],
+      "properties": {
+        "operation": { "const": "relay.collect" },
+        "cursor": { "type": "string", "maxLength": 512 },
+        "limit": { "type": "integer", "minimum": 1, "maximum": 100 },
+        "wait_seconds": { "type": "integer", "minimum": 0, "maximum": 30 }
+      },
+      "additionalProperties": false
+    },
+    "delivery": {
+      "type": "object",
+      "required": ["delivery_id", "envelope_digest", "envelope", "state", "attempt", "lease_token", "lease_expires_at", "queued_receipt"],
+      "properties": {
+        "delivery_id": { "$ref": "common.schema.json#/$defs/uuidV4" },
+        "envelope_digest": { "$ref": "common.schema.json#/$defs/digest" },
+        "envelope": { "$ref": "transport-envelope.schema.json" },
+        "state": { "enum": ["collected"] },
+        "attempt": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "lease_token": { "type": "string", "minLength": 22, "maxLength": 256, "pattern": "^[A-Za-z0-9_-]+$" },
+        "lease_expires_at": { "$ref": "common.schema.json#/$defs/timestamp" },
+        "queued_receipt": { "$ref": "relay-receipt.schema.json" },
+        "collected_receipt": { "$ref": "relay-receipt.schema.json" }
+      },
+      "additionalProperties": false
+    },
+    "collectResponse": {
+      "type": "object",
+      "required": ["operation", "cursor", "deliveries"],
+      "properties": {
+        "operation": { "const": "relay.collect.result" },
+        "cursor": { "type": "string", "maxLength": 512 },
+        "deliveries": { "type": "array", "maxItems": 100, "items": { "$ref": "#/$defs/delivery" } }
+      },
+      "additionalProperties": true
+    },
+    "ackEntry": {
+      "type": "object",
+      "required": ["delivery_id", "envelope_id", "envelope_digest", "lease_token", "disposition"],
+      "properties": {
+        "delivery_id": { "$ref": "common.schema.json#/$defs/uuidV4" },
+        "envelope_id": { "$ref": "common.schema.json#/$defs/uuidV4" },
+        "envelope_digest": { "$ref": "common.schema.json#/$defs/digest" },
+        "lease_token": { "type": "string", "minLength": 22, "maxLength": 256, "pattern": "^[A-Za-z0-9_-]+$" },
+        "disposition": { "const": "received" }
+      },
+      "additionalProperties": false
+    },
+    "ackRequest": {
+      "type": "object",
+      "required": ["operation", "acknowledgements"],
+      "properties": {
+        "operation": { "const": "relay.acknowledge" },
+        "acknowledgements": { "type": "array", "minItems": 1, "maxItems": 100, "items": { "$ref": "#/$defs/ackEntry" } }
+      },
+      "additionalProperties": false
+    },
+    "ackResponse": {
+      "type": "object",
+      "required": ["operation", "receipts"],
+      "properties": {
+        "operation": { "const": "relay.acknowledge.result" },
+        "receipts": { "type": "array", "minItems": 1, "maxItems": 100, "items": { "$ref": "relay-receipt.schema.json" } }
+      },
+      "additionalProperties": true
+    }
+  }
+}

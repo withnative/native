@@ -1,0 +1,44 @@
+{
+  "content_version": "native.message.v2",
+  "origin_db_id": "ndb_11111111111111111111111111111111",
+  "participants": [
+    {
+      "principal": "native/alice",
+      "origin_database_id": "ndb_11111111111111111111111111111111",
+      "origin_account_token": "acct_remote_alice"
+    },
+    {
+      "principal": "native/bob",
+      "origin_database_id": "ndb_22222222222222222222222222222222"
+    }
+  ],
+  "messages": [
+    {
+      "message_record_id": "20000000-0000-4000-8000-000000000002",
+      "source_event": {
+        "id": "10000000-0000-4000-8000-000000000002",
+        "source_seq": 2,
+        "created_at": "2026-09-01T12:34:56.789Z",
+        "source_account_token": "acct_remote_alice",
+        "operation": "message.created",
+        "causal_envelope": {
+          "version": "v1",
+          "status": "complete",
+          "frontier": [
+            "10000000-0000-4000-8000-000000000001"
+          ]
+        }
+      },
+      "sender": 0,
+      "audience": [1],
+      "kind": "text",
+      "prose": "Causal v2 fixture",
+      "expectation": "none",
+      "references": [],
+      "required_capabilities": []
+    }
+  ],
+  "required_capabilities": [
+    "message.created"
+  ]
+}

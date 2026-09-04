@@ -1,0 +1,11 @@
+# Delivery
+
+<Metric
+  label="Active records"
+  value={props.input.records.filter((record) => record.lifecycle_interpretation.status === 'unclassified' && record.lifecycle_interpretation.raw === 'active').length}
+/>
+
+<RecordTable
+  records={props.input.records.filter((record) => record.lifecycle_interpretation.status === 'unclassified' && record.lifecycle_interpretation.raw === 'active')}
+  columns={['name', 'type', 'kind', 'lifecycle', 'status']}
+/>

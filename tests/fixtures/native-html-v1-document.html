@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="native-artifact-profile" content="document">
+  <title>Decision brief</title>
+  <style>
+    :root { color-scheme: light; --ink:#172033; --muted:#5b6475; --paper:#f6f3ec; --card:#fff; --accent:#2357d9; }
+    * { box-sizing:border-box; }
+    body { margin:0; color:var(--ink); background:var(--paper); font:16px/1.6 system-ui,-apple-system,sans-serif; }
+    main { width:min(72rem,100%); margin:auto; padding:clamp(1.25rem,4vw,4rem); }
+    header { max-width:52rem; margin-bottom:2rem; }
+    .eyebrow { color:var(--accent); font-weight:750; letter-spacing:.08em; text-transform:uppercase; }
+    h1 { margin:.25rem 0; font-size:clamp(2.25rem,7vw,5rem); line-height:1; }
+    .lede { color:var(--muted); font-size:clamp(1.05rem,2vw,1.35rem); }
+    .grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:1rem; }
+    article { background:var(--card); border:1px solid #d8d3c8; border-radius:1rem; padding:1.25rem; box-shadow:0 .5rem 2rem #17203312; }
+    article strong { display:block; font-size:2rem; }
+    button { border:0; border-radius:999px; padding:.75rem 1rem; color:white; background:var(--accent); font:inherit; font-weight:700; }
+    button:focus-visible { outline:4px solid #f0a500; outline-offset:3px; }
+    #detail[hidden] { display:none; }
+    @media (max-width:700px) { .grid { grid-template-columns:1fr; } }
+    @media (prefers-reduced-motion:no-preference) { article { transition:transform .18s ease; } article:hover { transform:translateY(-2px); } }
+    @media print { body { background:#fff; } button { display:none; } article { break-inside:avoid; box-shadow:none; } }
+  </style>
+</head>
+<body>
+<main>
+  <header><p class="eyebrow">Native HTML fixture</p><h1>Readable by design.</h1><p class="lede">A responsive decision brief with deliberate hierarchy, semantic structure and no external resources.</p></header>
+  <section class="grid" aria-label="Decision measures">
+    <article><h2>Clarity</h2><strong>3 paths</strong><p>One selected opening surface, with the alternatives kept visible.</p></article>
+    <article><h2>Authority</h2><strong>0 ambient</strong><p>The frame receives exact input, not a database or tool handle.</p></article>
+    <article><h2>Portability</h2><strong>1 source</strong><p>The complete UTF-8 document remains the canonical body.</p></article>
+  </section>
+  <section aria-labelledby="why"><h2 id="why">Why this matters</h2><p>Visual reading can improve comprehension without turning the artifact into a stateful application.</p><button id="toggle" type="button" aria-expanded="false" aria-controls="detail">Show implementation note</button><p id="detail" hidden>The host supplies isolation and verification; the source supplies meaning and design.</p></section>
+</main>
+<script>
+  const button = document.getElementById('toggle');
+  const detail = document.getElementById('detail');
+  button.addEventListener('click', () => {
+    const open = button.getAttribute('aria-expanded') === 'true';
+    button.setAttribute('aria-expanded', String(!open));
+    button.textContent = open ? 'Show implementation note' : 'Hide implementation note';
+    detail.hidden = open;
+  });
+</script>
+</body>
+</html>

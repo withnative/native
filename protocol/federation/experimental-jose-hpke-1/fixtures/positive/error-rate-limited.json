@@ -1,0 +1,9 @@
+{
+  "type": "urn:native:federation:error:rate_limited",
+  "title": "Submission rate exceeded",
+  "status": 429,
+  "code": "rate_limited",
+  "request_id": "00000000-0000-4000-8000-000000000401",
+  "retryable": true,
+  "retry_after": 30
+}

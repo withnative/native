@@ -1,0 +1,73 @@
+export const nativeArtifact = {
+  schema: "native.mdx.artifact.v2",
+  inputs: {
+    presence: {
+      envelope: "native.relation-envelope.v1",
+      required: true,
+      expose_to_root: true,
+      schema_sha256: "8d6517ffb73621e26c4ed8b2ae06a67b8ca4dd964298308c418e31d6bdb1d81f",
+      relations: {
+        agent_activity: {
+          identity: "native.semantic.agent_activity",
+          semantic_version: 2
+        }
+      }
+    },
+    claims: {
+      envelope: "native.relation-envelope.v1",
+      required: true,
+      expose_to_root: true,
+      schema_sha256: "17aadd275405361aee430ddbf210a565c1a9a55ba923f6e2f36f9c52f0105d3b",
+      relations: {
+        agent_activity_claims: {
+          identity: "native.semantic.agent_activity_claims",
+          semantic_version: 1
+        }
+      }
+    }
+  },
+  module_inputs: {},
+  capability_requests: [
+    { capability: "input.read", scope: { port: "presence" } },
+    { capability: "input.read", scope: { port: "claims" } }
+  ]
+}
+
+<Stack gap={3}>
+  <section>
+    <h1>Agents</h1>
+    <p>Recent activity is a bounded observation, not proof that a provider is online. Refresh this view to re-evaluate the five-minute recent-signal window.</p>
+  </section>
+  <Grid columns={2} gap={2}>
+    <Metric label="Activity observed" value={native.inputs.presence.source.execution_receipt.observed_at} />
+    <Metric label="Activity completeness" value={native.inputs.presence.source.execution_receipt.completeness} detail={native.inputs.presence.source.execution_receipt.truncated ? "truncated" : "within bound"} />
+    <Metric label="Claims observed" value={native.inputs.claims.source.execution_receipt.observed_at} />
+    <Metric label="Claims completeness" value={native.inputs.claims.source.execution_receipt.completeness} detail={native.inputs.claims.source.execution_receipt.truncated ? "truncated" : "within bound"} />
+    <Metric label="Activity contract" value={native.inputs.presence.source.execution_receipt.relations[0].identity} detail={native.inputs.presence.relation.schema_sha256} />
+    <Metric label="Claims contract" value={native.inputs.claims.source.execution_receipt.relations[0].identity} detail={native.inputs.claims.relation.schema_sha256} />
+  </Grid>
+  <Callout tone={native.inputs.presence.source.execution_receipt.degraded_sources.length || native.inputs.claims.source.execution_receipt.degraded_sources.length ? "warning" : "neutral"} title="Observation quality">
+    {native.inputs.presence.source.execution_receipt.degraded_sources.length || native.inputs.claims.source.execution_receipt.degraded_sources.length ? "Transient activity capture was unavailable. Durable lifecycle and visible claim history may still appear, but this observation can be incomplete." : "No known degradation in this observation"}
+  </Callout>
+  {native.inputs.presence.relation.rows.length ?
+    <section>
+      <h2>Observed agent activity</h2>
+      <table>
+      <thead>
+        <tr><th>Run</th><th>Status</th><th>Last activity</th><th>Claims</th></tr>
+      </thead>
+      <tbody>
+        {native.inputs.presence.relation.rows.map(activity => {
+          const activityClaims = native.inputs.claims.relation.rows.filter(claim => claim.activity_id === activity.activity_id)
+          return <tr>
+            <td><p>{activity.run_key}</p><p>{activity.principal_display_name || activity.principal_ref}</p></td>
+            <td><Badge tone={activity.appears_active ? "success" : "neutral"}>{activity.appears_active ? "Observed recently" : "No recent signal"}</Badge></td>
+            <td>{activity.last_observed_activity_at}</td>
+            <td>{activityClaims.length ? <ul>{activityClaims.map(claim => <li>{claim.record_id}{claim.is_current ? " · current" : " · released"}</li>)}</ul> : "No visible claims"}</td>
+          </tr>
+        })}
+      </tbody>
+      </table>
+    </section>
+    : <EmptyState title="No agent activity is visible in this bounded observation">Recent-window, authority, and capture limits can all affect what appears here.</EmptyState>}
+</Stack>

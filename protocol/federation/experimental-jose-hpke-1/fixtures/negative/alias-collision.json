@@ -1,0 +1,17 @@
+{
+  "scenario_type": "alias",
+  "scenario_id": "alias-collision",
+  "profile": "native-fed/experimental-jose-hpke-1",
+  "clock": "2026-08-02T09:10:00Z",
+  "steps": [
+    {
+      "normalized_value": "collision@example.com",
+      "active_principals": [
+        "native/alice0001",
+        "native/bob00001"
+      ]
+    }
+  ],
+  "expect_error": "conflict",
+  "validation_layer": "alias"
+}

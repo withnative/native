@@ -1,0 +1,64 @@
+{
+  "$schema": "../profile.schema.json",
+  "format": "native.storage-profile.v1",
+  "id": "turso-remote",
+  "revision": 2,
+  "status": "research",
+  "engine": {
+    "family": "turso",
+    "implementation": "Turso Database remote service",
+    "version_requirement": "turso_serverless crate =0.1.0 and the credentialed Turso Database service API qualified by release evidence"
+  },
+  "frontend": {
+    "dialect": "sqlite",
+    "protocol": "Turso Database SQL over HTTP"
+  },
+  "connection": {
+    "modes": ["network"],
+    "driver": "turso_serverless 0.1.0; turso_serverless::Builder::new_remote"
+  },
+  "topology": {
+    "kind": "remote-turso-database-per-logical-database",
+    "logical_database_isolation": "one credentialed Turso Database cloud namespace per Native logical database; no local replica"
+  },
+  "operational_identity": {
+    "write_authority": "Only a successful acknowledgement from the remote Turso Database service can make a write authoritative; transport failure after dispatch may be outcome-unknown until independently resolved.",
+    "consistency": "Network-required remote service visibility. No local fallback or stale local reads are permitted; concurrent-write and transaction semantics remain unproven for Native.",
+    "file_semantics": "There is no local database file or offline authority in this profile. Provider backup and canonical interchange are the only candidate recovery artifacts.",
+    "provider_dependencies": [
+      "Turso Database cloud namespace",
+      "turso:// database URL and scoped authentication token",
+      "TLS-capable network path",
+      "explicitly qualified provider plan, region, limits, durability, backup, and restore behavior"
+    ],
+    "promotion_rules": [
+      "Vendor beta or production claims are not Native support evidence.",
+      "Promotion requires credentialed Native logical, transaction, concurrency, failure-boundary, migration, backup, restore, and disaster-recovery suites for this exact driver and service identity.",
+      "No deterministic local or turso::sync result transfers to this profile.",
+      "Any engine, driver, protocol, topology, write-authority, consistency, provider-plan, or provider-region assumption change creates a new immutable profile revision."
+    ],
+    "upstream_sources": [
+      "https://docs.turso.tech/sdk/introduction",
+      "https://docs.turso.tech/sdk/rust/quickstart",
+      "https://crates.io/crates/turso_serverless/0.1.0"
+    ]
+  },
+  "contracts": {
+    "logical": "native.logical.v1",
+    "event_positions": "gapless",
+    "json": "native.canonical-json.v1",
+    "timestamps": "utc-rfc3339-milliseconds",
+    "ordering": "explicit-total-order"
+  },
+  "capabilities": {
+    "native.domain-mcp.v1": { "support": "planned", "portability": "portable", "notes": "Local and sync evidence do not prove direct remote execution." },
+    "native.guarded-write.v1": { "support": "planned", "portability": "portable" },
+    "native.canonical-interchange.v1": { "support": "planned", "portability": "portable" },
+    "native.search.lexical.v1": { "support": "planned", "portability": "portable" },
+    "native.search.semantic.v1": { "support": "planned", "portability": "portable" },
+    "native.search.sqlite-fts5-exact": { "support": "unsupported", "portability": "blocking" },
+    "native.raw-sql": { "support": "unsupported", "portability": "blocking", "notes": "No reviewed caller-row authorization boundary exists for direct remote SQL." },
+    "native.describe-physical-schema": { "support": "planned", "portability": "profile-specific" },
+    "native.sqlite-file-fast-path": { "support": "unsupported", "portability": "blocking" }
+  }
+}

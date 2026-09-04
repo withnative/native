@@ -1,0 +1,17 @@
+{
+  "scenario_type": "directory",
+  "scenario_id": "directory-mutation-unauthorized",
+  "profile": "native-fed/experimental-jose-hpke-1",
+  "clock": "2026-08-02T09:10:00Z",
+  "steps": [
+    {
+      "request": "POST /v1/principals/alice0001/keys",
+      "request_proof": null,
+      "expect": {
+        "status": 401
+      }
+    }
+  ],
+  "expect_error": "unauthorized",
+  "validation_layer": "authorization"
+}

@@ -1,0 +1,11 @@
+[
+  {"name":"external-script","source":"<script src=\"https://evil.example/x.js\"></script>"},
+  {"name":"nested-frame","source":"<iframe src=\"https://evil.example\"></iframe>"},
+  {"name":"external-link","source":"<a href=\"https://evil.example\">leave</a>"},
+  {"name":"refresh","source":"<meta http-equiv=\"refresh\" content=\"0;url=https://evil.example\">"},
+  {"name":"form-action","source":"<form action=\"https://evil.example\"></form>"},
+  {"name":"svg-data","source":"<img alt=\"x\" src=\"data:image/svg+xml,%3Csvg/%3E\">"},
+  {"name":"inline-style-authority","source":"<p style=\"background-image:url(https://evil.example/pixel)\">probe</p>"},
+  {"name":"css-image-set-authority","source":"<style>main{background-image:image-set(\"https://evil.example/a.png\" 1x)}</style>"},
+  {"name":"obfuscated-import","source":"<style>@im/**/port \"https://evil.example/x.css\";</style>"}
+]

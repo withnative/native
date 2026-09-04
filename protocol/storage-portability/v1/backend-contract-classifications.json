@@ -1,0 +1,1652 @@
+{
+  "format": "native.backend-contract-classifications.v1",
+  "revision": 18,
+  "profiles": [
+    {
+      "id": "sqlite-local",
+      "revision": 2,
+      "mode": "embedded",
+      "status": "reference",
+      "required_evidence": [
+        "shared logical corpus",
+        "SQLite physical suite",
+        "migration and restore checks"
+      ],
+      "release_policy": {
+        "required_tiers": [
+          0,
+          1,
+          4
+        ],
+        "credentialed_tiers": [],
+        "required_secrets": [],
+        "restore_required": true,
+        "approval_required": true
+      }
+    },
+    {
+      "id": "postgres-server",
+      "revision": 5,
+      "mode": "network",
+      "status": "spike",
+      "required_evidence": [
+        "shared logical corpus",
+        "containerized Postgres physical suite",
+        "operational and recovery gates"
+      ],
+      "release_policy": {
+        "required_tiers": [
+          0,
+          1,
+          2,
+          4
+        ],
+        "credentialed_tiers": [],
+        "required_secrets": [],
+        "restore_required": true,
+        "approval_required": true
+      }
+    },
+    {
+      "id": "turso-local",
+      "revision": 4,
+      "mode": "embedded",
+      "status": "spike",
+      "required_evidence": [
+        "shared logical corpus",
+        "deterministic Turso local suite",
+        "local backup and recovery gates"
+      ],
+      "release_policy": {
+        "required_tiers": [
+          0,
+          1,
+          4
+        ],
+        "credentialed_tiers": [],
+        "required_secrets": [],
+        "restore_required": true,
+        "approval_required": true
+      }
+    },
+    {
+      "id": "turso-remote",
+      "revision": 2,
+      "mode": "network",
+      "status": "research",
+      "required_evidence": [
+        "shared logical corpus",
+        "credentialed direct-remote suite",
+        "provider backup and recovery gates"
+      ],
+      "release_policy": {
+        "required_tiers": [
+          0,
+          1,
+          3,
+          4
+        ],
+        "credentialed_tiers": [
+          3
+        ],
+        "required_secrets": [
+          "NATIVE_CE_TURSO_ORGANIZATION",
+          "NATIVE_CE_TURSO_GROUP",
+          "NATIVE_CE_TURSO_PLATFORM_API_TOKEN"
+        ],
+        "restore_required": true,
+        "approval_required": true
+      }
+    },
+    {
+      "id": "turso-embedded-sync",
+      "revision": 2,
+      "mode": "sync",
+      "status": "research",
+      "required_evidence": [
+        "shared logical corpus",
+        "credentialed single-writer sync suite",
+        "partition, divergence, and dual-recovery gates"
+      ],
+      "release_policy": {
+        "required_tiers": [
+          0,
+          1,
+          3,
+          4
+        ],
+        "credentialed_tiers": [
+          3
+        ],
+        "required_secrets": [
+          "NATIVE_CE_TURSO_ORGANIZATION",
+          "NATIVE_CE_TURSO_GROUP",
+          "NATIVE_CE_TURSO_PLATFORM_API_TOKEN"
+        ],
+        "restore_required": true,
+        "approval_required": true
+      }
+    },
+    {
+      "id": "libsql-embedded-replica",
+      "revision": 1,
+      "mode": "embedded-replica",
+      "status": "retired",
+      "required_evidence": [
+        "explicit unsupported exact-name behavior",
+        "no evidence transfer from Turso Database profiles"
+      ],
+      "release_policy": {
+        "required_tiers": [
+          0
+        ],
+        "credentialed_tiers": [],
+        "required_secrets": [],
+        "restore_required": false,
+        "approval_required": false
+      }
+    }
+  ],
+  "operations": [
+    {
+      "id": "ping",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:ping",
+        "postgres-server": "N",
+        "turso-local": "N",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "engine_info",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:engine_info",
+        "postgres-server": "N",
+        "turso-local": "N",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "bootstrap",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:bootstrap",
+        "postgres-server": "N",
+        "turso-local": "N",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "quickstart",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:quickstart",
+        "postgres-server": "N",
+        "turso-local": "N",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "get_structure",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:get_structure",
+        "postgres-server": "P|postgres-contract-ci:get_structure",
+        "turso-local": "P|turso-local-contract-ci:get_structure",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "get_dashboard",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:get_dashboard",
+        "postgres-server": "F|postgres-contract-ci:get_dashboard",
+        "turso-local": "F|turso-local-contract-ci:get_dashboard",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "describe_schema",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:describe_schema",
+        "postgres-server": "F|postgres-contract-ci:describe_schema",
+        "turso-local": "F|turso-local-contract-ci:describe_schema",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "read_guide",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:read_guide",
+        "postgres-server": "N",
+        "turso-local": "N",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "create_record",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:create_record",
+        "postgres-server": "F|postgres-contract-ci:create_record",
+        "turso-local": "F|turso-local-contract-ci:create_record",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "create_many",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:create_many",
+        "postgres-server": "N",
+        "turso-local": "N",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      },
+      "notes": "The v1 graph orchestrator is qualified only on SQLite; other backends do not register an implementation."
+    },
+    {
+      "id": "create_exploration",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:create_exploration",
+        "postgres-server": "N",
+        "turso-local": "N",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "get_record",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:get_record",
+        "postgres-server": "F|postgres-contract-ci:get_record",
+        "turso-local": "F|turso-local-contract-ci:get_record",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "update_record",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:update_record",
+        "postgres-server": "F|postgres-contract-ci:update_record",
+        "turso-local": "F|turso-local-contract-ci:update_record",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "claim_unowned_record",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:claim_unowned_record",
+        "postgres-server": "N",
+        "turso-local": "N",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      },
+      "notes": "Ownership recovery is currently implemented only by the SQLite/default MCP runtime."
+    },
+    {
+      "id": "correct_record_type",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:correct_record_type",
+        "postgres-server": "P|postgres-contract-ci:correct_record_type",
+        "turso-local": "P|turso-local-contract-ci:correct_record_type",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "delete_record",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:delete_record",
+        "postgres-server": "F|postgres-contract-ci:delete_record",
+        "turso-local": "F|turso-local-contract-ci:delete_record",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "archive_record",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:archive_record",
+        "postgres-server": "F|postgres-contract-ci:archive_record",
+        "turso-local": "F|turso-local-contract-ci:archive_record",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "render_record",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:render_record",
+        "postgres-server": "F|postgres-contract-ci:render_record",
+        "turso-local": "F|turso-local-contract-ci:render_record",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "get_history",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:get_history",
+        "postgres-server": "F|postgres-contract-ci:get_history",
+        "turso-local": "F|turso-local-contract-ci:get_history",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "whats_changed",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:whats_changed",
+        "postgres-server": "N",
+        "turso-local": "N",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "get_run_activity",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:get_run_activity",
+        "postgres-server": "N",
+        "turso-local": "N",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "get_event_context",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:get_event_context",
+        "postgres-server": "N",
+        "turso-local": "N",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "resolve_external",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:resolve_external",
+        "postgres-server": "F|postgres-contract-ci:resolve_external",
+        "turso-local": "F|turso-local-contract-ci:resolve_external",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "manage_bindings",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:manage_bindings",
+        "postgres-server": "P|postgres-contract-ci:manage_bindings",
+        "turso-local": "P|turso-local-contract-ci:manage_bindings",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "observe_external",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:observe_external",
+        "postgres-server": "N",
+        "turso-local": "N",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "manage_record_policy",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:manage_record_policy",
+        "postgres-server": "N",
+        "turso-local": "N",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "manage_instructions",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:manage_instructions",
+        "postgres-server": "N",
+        "turso-local": "N",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "manage_onboarding",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:manage_onboarding",
+        "postgres-server": "N",
+        "turso-local": "N",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "render_record_version_diff",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:render_record_version_diff",
+        "postgres-server": "N",
+        "turso-local": "N",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "manage_links",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:manage_links",
+        "postgres-server": "P|postgres-contract-ci:manage_links",
+        "turso-local": "P|turso-local-contract-ci:manage_links",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "manage_relationships",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:manage_relationships",
+        "postgres-server": "N",
+        "turso-local": "N",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "manage_messages",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:manage_messages",
+        "postgres-server": "N",
+        "turso-local": "N",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "manage_interventions",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:manage_interventions",
+        "postgres-server": "N",
+        "turso-local": "N",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "instantiate_artifact",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:instantiate_artifact",
+        "postgres-server": "N",
+        "turso-local": "N",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "manage_renderer_binding",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:manage_renderer_binding",
+        "postgres-server": "N",
+        "turso-local": "N",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "manage_mdx_modules",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:manage_mdx_modules",
+        "postgres-server": "N",
+        "turso-local": "N",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "manage_artifact_inputs",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:manage_artifact_inputs",
+        "postgres-server": "N",
+        "turso-local": "N",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "manage_artifact_module_grants",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:manage_artifact_module_grants",
+        "postgres-server": "N",
+        "turso-local": "N",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "render_artifact",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:render_artifact",
+        "postgres-server": "N",
+        "turso-local": "N",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "verify_artifact",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:verify_artifact",
+        "postgres-server": "N",
+        "turso-local": "N",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "open_collection",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:open_collection",
+        "postgres-server": "N",
+        "turso-local": "N",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "invoke_artifact_interaction",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:invoke_artifact_interaction",
+        "postgres-server": "N",
+        "turso-local": "N",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "manage_facet_observations",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:manage_facet_observations",
+        "postgres-server": "F|postgres-contract-ci:manage_facet_observations",
+        "turso-local": "F|turso-local-contract-ci:manage_facet_observations",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "preview_record_shape",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "N",
+        "postgres-server": "N",
+        "turso-local": "N",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      },
+      "notes": "The advisory preflight is implemented through backend-owned read snapshots and exercised by the shared portable facet scenario on supported physical adapters, but remains intentionally unqualified until backend full-proof declarations and receipts land."
+    },
+    {
+      "id": "resolve_facets",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:resolve_facets",
+        "postgres-server": "F|postgres-contract-ci:resolve_facets",
+        "turso-local": "F|turso-local-contract-ci:resolve_facets",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "suggest_facet_values",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:suggest_facet_values",
+        "postgres-server": "F|postgres-contract-ci:suggest_facet_values",
+        "turso-local": "F|turso-local-contract-ci:suggest_facet_values",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "query_record",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:query_record",
+        "postgres-server": "P|postgres-contract-ci:query_record",
+        "turso-local": "P|turso-local-contract-ci:query_record",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      },
+      "notes": "Postgres and Turso-local share the bounded live structured pipeline. Historical projection, activity terminals, interpretation and federated-Message provenance enrichment, and governed comments fail closed."
+    },
+    {
+      "id": "resolve_many",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:resolve_many",
+        "postgres-server": "N",
+        "turso-local": "N",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      },
+      "notes": "Exact-name batch resolution is qualified only on SQLite; other backends withhold the operation."
+    },
+    {
+      "id": "resolve_rollup",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:resolve_rollup",
+        "postgres-server": "P|postgres-contract-ci:resolve_rollup",
+        "turso-local": "P|turso-local-contract-ci:resolve_rollup",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      },
+      "notes": "Postgres and Turso-local evaluate stored live rollups in the admitted read snapshot and report cache_hit=false; revision receipts, revision-keyed caching, and fencing are not claimed."
+    },
+    {
+      "id": "search",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:search",
+        "postgres-server": "P|postgres-contract-ci:search",
+        "turso-local": "P|turso-local-contract-ci:search",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      },
+      "notes": "Postgres and Turso-local execute backend-native lexical candidate selection in the admitted snapshot, then share caller/no-oracle filtering, scopes, ranking/ties, shaping, caps, freshness, and replay semantics. They remain Partial because English/Porter/Turso tokenization and stemming are not implementation-identical, snippets are shared deterministic match windows rather than engine-native fragments, and prefix/infix/sibling near misses use the bounded authorized catalogue rather than a proved physical prefix index."
+    },
+    {
+      "id": "query_sql",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:query_sql",
+        "postgres-server": "F|postgres-contract-ci:query_sql",
+        "turso-local": "F|turso-local-contract-ci:query_sql",
+        "turso-remote": "U",
+        "turso-embedded-sync": "U",
+        "libsql-embedded-replica": "U"
+      },
+      "notes": "Postgres uses a pinned exhaustive AST validator, a per-call discarded least-privilege role session, and caller-filtered security-barrier projections. Turso local executes exact-parser-qualified SELECTs only against a bounded caller-visible MemoryIO projection, with core query-only, progress, deadline, and interrupt controls."
+    },
+    {
+      "id": "scan",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:scan",
+        "postgres-server": "P|postgres-contract-ci:scan",
+        "turso-local": "P|turso-local-contract-ci:scan",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      },
+      "notes": "Postgres and Turso-local implement census, provenance, authorship, recent, relationship, container, and convergence axes; lexical scan fails closed and remains a search qualification."
+    },
+    {
+      "id": "manage_vocabularies",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:manage_vocabularies",
+        "postgres-server": "N",
+        "turso-local": "N",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "manage_schema_config",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:manage_schema_config",
+        "postgres-server": "N",
+        "turso-local": "N",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "attach_text",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:attach_text",
+        "postgres-server": "F|postgres-contract-ci:attach_text",
+        "turso-local": "F|turso-local-contract-ci:attach_text",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "attach_from_url",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:attach_from_url",
+        "postgres-server": "F|postgres-contract-ci:attach_from_url",
+        "turso-local": "F|turso-local-contract-ci:attach_from_url",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "read_attachment",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:read_attachment",
+        "postgres-server": "F|postgres-contract-ci:read_attachment",
+        "turso-local": "F|turso-local-contract-ci:read_attachment",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "manage_attachments",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:manage_attachments",
+        "postgres-server": "F|postgres-contract-ci:manage_attachments",
+        "turso-local": "F|turso-local-contract-ci:manage_attachments",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "start_work",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:start_work",
+        "postgres-server": "N",
+        "turso-local": "N",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "resolve_suggestions",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:resolve_suggestions",
+        "postgres-server": "N",
+        "turso-local": "N",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "render_suggestion_review",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:render_suggestion_review",
+        "postgres-server": "N",
+        "turso-local": "N",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "resolve_citation",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:resolve_citation",
+        "postgres-server": "N",
+        "turso-local": "N",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "manage_citations",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:manage_citations",
+        "postgres-server": "N",
+        "turso-local": "N",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "create_attribution",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:create_attribution",
+        "postgres-server": "N",
+        "turso-local": "N",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "read_attributions",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:read_attributions",
+        "postgres-server": "N",
+        "turso-local": "N",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "manage_attributions",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:manage_attributions",
+        "postgres-server": "N",
+        "turso-local": "N",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "manage_change_summaries",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:manage_change_summaries",
+        "postgres-server": "N",
+        "turso-local": "N",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "query_change_summaries",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:query_change_summaries",
+        "postgres-server": "N",
+        "turso-local": "N",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "set_intent",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:set_intent",
+        "postgres-server": "N",
+        "turso-local": "N",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "close_run",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:close_run",
+        "postgres-server": "N",
+        "turso-local": "N",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      },
+      "notes": "SQLite owns the append-authoritative durable activity lifecycle. Other request adapters do not advertise closure parity."
+    },
+    {
+      "id": "export_snapshot",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:export_snapshot",
+        "postgres-server": "U",
+        "turso-local": "V",
+        "turso-remote": "U",
+        "turso-embedded-sync": "U",
+        "libsql-embedded-replica": "U"
+      },
+      "notes": "Physical SQLite snapshots do not cross profiles; Turso local is conversion-intended but has no current proof or qualified file fast path."
+    },
+    {
+      "id": "manage_memberships",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:manage_memberships",
+        "postgres-server": "A",
+        "turso-local": "A",
+        "turso-remote": "A",
+        "turso-embedded-sync": "A",
+        "libsql-embedded-replica": "U"
+      },
+      "notes": "Hosted membership administration belongs to the host catalog plane, not the selected content backend."
+    },
+    {
+      "id": "materialize_record",
+      "kind": "tool",
+      "surface": "federated-lens",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:materialize_record",
+        "postgres-server": "N",
+        "turso-local": "N",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      },
+      "notes": "The federated gateway owns this tool; destination writes still require a separately qualified backend route."
+    },
+    {
+      "id": "request.authorization",
+      "kind": "cross-cutting",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:request.authorization",
+        "postgres-server": "F|postgres-contract-ci:request.authorization",
+        "turso-local": "F|turso-local-contract-ci:request.authorization",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "request.interaction-capture",
+      "kind": "cross-cutting",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:request.interaction-capture",
+        "postgres-server": "U",
+        "turso-local": "U",
+        "turso-remote": "U",
+        "turso-embedded-sync": "U",
+        "libsql-embedded-replica": "U"
+      },
+      "notes": "The interaction tap is optional and must be explicitly suppressed when unsupported."
+    },
+    {
+      "id": "request.realtime-wakeup",
+      "kind": "cross-cutting",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:request.realtime-wakeup",
+        "postgres-server": "F|postgres-contract-ci:request.realtime-wakeup",
+        "turso-local": "F|turso-local-contract-ci:request.realtime-wakeup",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "request.run-context",
+      "kind": "cross-cutting",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:request.run-context",
+        "postgres-server": "F|postgres-contract-ci:request.run-context",
+        "turso-local": "F|turso-local-contract-ci:request.run-context",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "request.stable-errors",
+      "kind": "cross-cutting",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:request.stable-errors",
+        "postgres-server": "F|postgres-contract-ci:request.stable-errors",
+        "turso-local": "F|turso-local-contract-ci:request.stable-errors",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "request.strict-portability",
+      "kind": "cross-cutting",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:request.strict-portability",
+        "postgres-server": "F|postgres-contract-ci:request.strict-portability",
+        "turso-local": "F|turso-local-contract-ci:request.strict-portability",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "request.transient-evidence",
+      "kind": "cross-cutting",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:request.transient-evidence",
+        "postgres-server": "F|postgres-contract-ci:request.transient-evidence",
+        "turso-local": "F|turso-local-contract-ci:request.transient-evidence",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "backup.canary",
+      "kind": "operator",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:backup.canary",
+        "postgres-server": "N",
+        "turso-local": "N",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "backup.canary-cleanup",
+      "kind": "operator",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:backup.canary-cleanup",
+        "postgres-server": "N",
+        "turso-local": "N",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "backup.list",
+      "kind": "operator",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:backup.list",
+        "postgres-server": "N",
+        "turso-local": "V",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "backup.restore",
+      "kind": "operator",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:backup.restore",
+        "postgres-server": "N",
+        "turso-local": "V",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "backup.status",
+      "kind": "operator",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:backup.status",
+        "postgres-server": "N",
+        "turso-local": "N",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "backup.sweep",
+      "kind": "operator",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:backup.sweep",
+        "postgres-server": "N",
+        "turso-local": "V",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "operator.adoption.apply",
+      "kind": "operator",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:operator.adoption.apply",
+        "postgres-server": "N",
+        "turso-local": "N",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "operator.adoption.cancel",
+      "kind": "operator",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:operator.adoption.cancel",
+        "postgres-server": "N",
+        "turso-local": "N",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "operator.adoption.inspect",
+      "kind": "operator",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:operator.adoption.inspect",
+        "postgres-server": "N",
+        "turso-local": "N",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "operator.adoption.plan",
+      "kind": "operator",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:operator.adoption.plan",
+        "postgres-server": "N",
+        "turso-local": "N",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "operator.federation-custody.initialize",
+      "kind": "operator",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:operator.federation-custody.initialize",
+        "postgres-server": "N",
+        "turso-local": "N",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      },
+      "notes": "Account-scoped custody is currently an owner-controlled local filesystem store outside workspace databases."
+    },
+    {
+      "id": "operator.federation-identities.backfill",
+      "kind": "operator",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:operator.federation-identities.backfill",
+        "postgres-server": "N",
+        "turso-local": "N",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      },
+      "notes": "The reconciler joins the SQLite catalog membership plane to workspace-local bindings and account-scoped custody."
+    },
+    {
+      "id": "operator.migrate-db",
+      "kind": "operator",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:operator.migrate-db",
+        "postgres-server": "N",
+        "turso-local": "N",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "operator.migrations.plan",
+      "kind": "operator",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:operator.migrations.plan",
+        "postgres-server": "N",
+        "turso-local": "N",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      },
+      "notes": "Fleet migration planning currently enumerates managed SQLite database files only."
+    },
+    {
+      "id": "operator.migrations.run",
+      "kind": "operator",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:operator.migrations.run",
+        "postgres-server": "N",
+        "turso-local": "N",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      },
+      "notes": "Fleet migration execution currently operates on managed SQLite database files only."
+    },
+    {
+      "id": "operator.migrations.status",
+      "kind": "operator",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:operator.migrations.status",
+        "postgres-server": "N",
+        "turso-local": "N",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      },
+      "notes": "Fleet migration status currently scans managed SQLite database files only."
+    },
+    {
+      "id": "operator.rekey-db",
+      "kind": "operator",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:operator.rekey-db",
+        "postgres-server": "U",
+        "turso-local": "N",
+        "turso-remote": "U",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "operator.snapshot",
+      "kind": "operator",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:operator.snapshot",
+        "postgres-server": "U",
+        "turso-local": "V",
+        "turso-remote": "U",
+        "turso-embedded-sync": "U",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "operator.reset-test-tenants",
+      "kind": "operator",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:operator.reset-test-tenants",
+        "postgres-server": "N",
+        "turso-local": "N",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      },
+      "notes": "The reset path currently removes explicitly named managed SQLite tenant files under hosting-catalog safeguards."
+    },
+    {
+      "id": "operator.reset-disposable-tenant",
+      "kind": "operator",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:operator.reset-disposable-tenant",
+        "postgres-server": "N",
+        "turso-local": "N",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      },
+      "notes": "The disposable-tenant reset currently targets one managed SQLite tenant file."
+    },
+    {
+      "id": "operator.reset-disposable-fleet",
+      "kind": "operator",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:operator.reset-disposable-fleet",
+        "postgres-server": "N",
+        "turso-local": "N",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      },
+      "notes": "The disposable-fleet reset currently targets three managed SQLite tenant files."
+    },
+    {
+      "id": "operator.purge-orphaned-challenges",
+      "kind": "operator",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:operator.purge-orphaned-challenges",
+        "postgres-server": "A",
+        "turso-local": "A",
+        "turso-remote": "A",
+        "turso-embedded-sync": "A",
+        "libsql-embedded-replica": "U"
+      },
+      "notes": "Challenge purge is a hosting-catalog operation rather than a selected content-backend operation."
+    },
+    {
+      "id": "operator.assert-empty",
+      "kind": "operator",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:operator.assert-empty",
+        "postgres-server": "A",
+        "turso-local": "A",
+        "turso-remote": "A",
+        "turso-embedded-sync": "A",
+        "libsql-embedded-replica": "U"
+      },
+      "notes": "Empty-state verification is owned by the SQLite hosting catalog and managed database directory."
+    },
+    {
+      "id": "operator.staging-release.preflight",
+      "kind": "operator",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:operator.staging-release.preflight",
+        "postgres-server": "N",
+        "turso-local": "N",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "operator.staging-disposable.bootstrap-volume",
+      "kind": "operator",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:operator.staging-disposable.bootstrap-volume",
+        "postgres-server": "N",
+        "turso-local": "N",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      },
+      "notes": "The exact-release staging bootstrap initializes only an empty local SQLite catalog and authorizes no deployment, migration, reset, or production operation."
+    },
+    {
+      "id": "operator.storage-migration.init-target",
+      "kind": "operator",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:operator.storage-migration.init-target",
+        "postgres-server": "N",
+        "turso-local": "N",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "operator.storage-migration.rollback",
+      "kind": "operator",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:operator.storage-migration.rollback",
+        "postgres-server": "N",
+        "turso-local": "N",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "operator.storage-migration.run",
+      "kind": "operator",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:operator.storage-migration.run",
+        "postgres-server": "N",
+        "turso-local": "N",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "operator.delete-account",
+      "kind": "operator",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:operator.delete-account",
+        "postgres-server": "A",
+        "turso-local": "A",
+        "turso-remote": "A",
+        "turso-embedded-sync": "A",
+        "libsql-embedded-replica": "U"
+      },
+      "notes": "Fencing an account for deletion is a hosting-catalog transaction over accounts, memberships and credentials rather than a selected content-backend operation."
+    },
+    {
+      "id": "operator.purge-due",
+      "kind": "operator",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:operator.purge-due",
+        "postgres-server": "N",
+        "turso-local": "N",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      },
+      "notes": "The purge destroys managed SQLite database files on the local volume and their backup generations before tombstoning the catalog identity."
+    },
+    {
+      "id": "operator.cancel-deletion",
+      "kind": "operator",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:operator.cancel-deletion",
+        "postgres-server": "N",
+        "turso-local": "N",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      },
+      "notes": "Cancelling a fenced deletion restores a managed SQLite database file from the configured backup sink."
+    },
+    {
+      "id": "operator.retire-workspace",
+      "kind": "operator",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:operator.retire-workspace",
+        "postgres-server": "A",
+        "turso-local": "A",
+        "turso-remote": "A",
+        "turso-embedded-sync": "A",
+        "libsql-embedded-replica": "U"
+      },
+      "notes": "Fencing an owner-created workspace is a hosting-catalog authority transition; the selected content backend is not touched until purge."
+    },
+    {
+      "id": "operator.purge-due-workspaces",
+      "kind": "operator",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:operator.purge-due-workspaces",
+        "postgres-server": "N",
+        "turso-local": "N",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      },
+      "notes": "Workspace purge destroys managed SQLite database files, backup generations and local routing handles after the recovery window."
+    },
+    {
+      "id": "operator.cancel-workspace-retirement",
+      "kind": "operator",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:operator.cancel-workspace-retirement",
+        "postgres-server": "N",
+        "turso-local": "N",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      },
+      "notes": "Cancelling workspace retirement returns a managed SQLite database to service and repairs a missing file only from the configured backup sink."
+    },
+    {
+      "id": "read_canvas",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "N",
+        "postgres-server": "U",
+        "turso-local": "U",
+        "turso-remote": "U",
+        "turso-embedded-sync": "U",
+        "libsql-embedded-replica": "U"
+      },
+      "notes": "Native Canvas v1 scene, change and describe reads are implemented on the reference SQLite engine and exercised by tests/tools/canvas.rs, but not yet declared into the sqlite-reference-ci evidence suite. Declared unsupported on Postgres by decision 97b5cb2; Turso projectors refuse extended content events in v1."
+    },
+    {
+      "id": "manage_canvas",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "N",
+        "postgres-server": "U",
+        "turso-local": "U",
+        "turso-remote": "U",
+        "turso-embedded-sync": "U",
+        "libsql-embedded-replica": "U"
+      },
+      "notes": "Native Canvas v1 batch commits and connector assertions are implemented on the reference SQLite engine and exercised by tests/tools/canvas.rs, but not yet declared into the sqlite-reference-ci evidence suite. Declared unsupported on Postgres by decision 97b5cb2; Turso projectors refuse extended content events in v1."
+    }
+  ]
+}

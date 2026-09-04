@@ -1,0 +1,41 @@
+[package]
+name = "native-artifact-html"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.98"
+description = "Internal HTML artifact sanitizer, launch surface, and external verifier client for native-ce."
+repository = "https://github.com/withnative/native"
+license = "AGPL-3.0-only"
+publish = false
+
+[dependencies]
+# The HTML parser/DOM pair is deliberately pinned: sanitizer semantics are a
+# security contract, and a parser upgrade changes what survives
+# sanitization. These two dependencies are exclusive to this crate — they
+# left the root manifest when the modules moved here.
+html5ever = "=0.39.0"
+markup5ever_rcdom = "=0.39.0"
+
+axum = { version = "0.8.4", default-features = false, features = [
+    "http1",
+    "json",
+    "query",
+    "tokio",
+] }
+base64 = "0.23.0"
+hex = "0.4"
+percent-encoding = "2"
+rand = "0.9"
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "rustls-tls",
+] }
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order", "raw_value", "unbounded_depth"] }
+sha2 = "0.10"
+url = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tower = { version = "0.5", features = ["util"] }

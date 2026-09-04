@@ -1,0 +1,17 @@
+{
+  "scenario_type": "directory",
+  "scenario_id": "directory-alias-resolve",
+  "profile": "native-fed/experimental-jose-hpke-1",
+  "clock": "2026-08-02T09:10:00Z",
+  "steps": [
+    {
+      "request": "POST /v1/aliases:resolve",
+      "value": "Alice@example.com",
+      "expect": {
+        "status": 200,
+        "principal": "native/alice0001",
+        "cache_control": "no-store"
+      }
+    }
+  ]
+}

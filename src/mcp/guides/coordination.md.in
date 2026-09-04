@@ -1,0 +1,19 @@
+# Coordination and concurrency
+
+Use a run key consistently so writes, reads, and intent can be reconstructed as one activity. `set_intent` records the purpose of the run; it is context, not a lock.
+
+## Run correlation and lineage
+
+`bootstrap` returns the run correlation handle. Reuse that same `run_key` on every subsequent call, reads included, so one activity remains reconstructable across compaction and handoffs. Use `"new"` or `"new:<agent_key>"` only when a new run must be minted; do not rotate the key mid-run. Runtime admission remains fail-open for compatibility, but that tolerance is not permission to omit or replace a valid handle.
+
+`parent_key` is optional. When one run spawns another, set it to the spawning run's existing `run_key`. It is an unverified lineage hint rather than identity or authority, and minting sentinels such as `"new"` are invalid in this field.
+
+`start_work` owns the claim protocol. Its default action claims a record, `preview` returns working context without writing, and `release` hands back a claim. Claim and release each append one ordinary `record.updated` event that projects an engine-owned account/run/timestamp tuple. The record's lifecycle is unchanged.
+
+Claims do not expire and are not auto-released when a client disconnects. The exact stored account-and-run holder must call `release`; run context is optional, so an account-only holder is valid. The trusted-local operator is the recovery path for a stuck current claim.
+
+The claim path checks `claimed_by_account IS NULL` inside one write transaction. A second claimant is refused rather than queued. Release checks the current stored account/run tuple in that same transaction, so a stale or non-holder release cannot clear a later claim.
+
+A conflict means another holder owns the claim. Nothing from the losing conditional write landed. Re-read or call `start_work` with `preview`, then retry only if the fresh state makes the action valid. Ordinary record updates remain independent of claim occupancy.
+
+Working context interprets each visible, live `depends_on` target through its effective governed lifecycle. Terminal-positive targets appear under `satisfied` and do not make `dependencies.ready` false. Governed open, terminal-negative and uninterpretable targets remain under `waiting_on`; each carries its full `lifecycle_interpretation` and a `satisfaction` value of `waiting`, `unsatisfied` or `ambiguous`. An incoming `blocks` edge remains an explicit statement of current prevention and is not satisfied implicitly from lifecycle. Readiness is advisory context: claim does not gate on it.

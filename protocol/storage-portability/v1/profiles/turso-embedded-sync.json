@@ -1,0 +1,73 @@
+{
+  "$schema": "../profile.schema.json",
+  "format": "native.storage-profile.v1",
+  "id": "turso-embedded-sync",
+  "revision": 1,
+  "status": "research",
+  "engine": {
+    "family": "turso",
+    "implementation": "turso-database-sync",
+    "version_requirement": "Turso Rust API 0.8.0-pre.2 sync feature"
+  },
+  "frontend": {
+    "dialect": "sqlite",
+    "protocol": "embedded Turso frontend with credentialed remote synchronization"
+  },
+  "connection": {
+    "modes": ["sync"],
+    "driver": "turso-rust sync module"
+  },
+  "topology": {
+    "kind": "local-replica-synchronized-to-remote",
+    "logical_database_isolation": "requires a distinct local replica and verified remote namespace per Native logical database"
+  },
+  "contracts": {
+    "logical": "native.logical.v1",
+    "event_positions": "gapless",
+    "json": "native.canonical-json.v1",
+    "timestamps": "utc-rfc3339-milliseconds",
+    "ordering": "explicit-total-order"
+  },
+  "capabilities": {
+    "native.domain-mcp.v1": {
+      "support": "planned",
+      "portability": "portable",
+      "notes": "Credentialed sync smoke coverage is not a shared-contract implementation."
+    },
+    "native.guarded-write.v1": {
+      "support": "planned",
+      "portability": "portable",
+      "notes": "Local transaction evidence does not prove multi-replica conflict behavior."
+    },
+    "native.canonical-interchange.v1": {
+      "support": "planned",
+      "portability": "portable"
+    },
+    "native.search.lexical.v1": {
+      "support": "planned",
+      "portability": "portable"
+    },
+    "native.search.semantic.v1": {
+      "support": "planned",
+      "portability": "portable"
+    },
+    "native.search.sqlite-fts5-exact": {
+      "support": "unsupported",
+      "portability": "blocking"
+    },
+    "native.raw-sql": {
+      "support": "unsupported",
+      "portability": "blocking",
+      "notes": "No reviewed authorization boundary exists for synced remote state."
+    },
+    "native.describe-physical-schema": {
+      "support": "planned",
+      "portability": "profile-specific"
+    },
+    "native.sqlite-file-fast-path": {
+      "support": "unsupported",
+      "portability": "blocking",
+      "notes": "A replica file is not a quiesced authoritative source artifact."
+    }
+  }
+}

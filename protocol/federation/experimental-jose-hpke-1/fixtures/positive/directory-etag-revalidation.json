@@ -1,0 +1,24 @@
+{
+  "scenario_type": "directory",
+  "scenario_id": "directory-etag-revalidation",
+  "profile": "native-fed/experimental-jose-hpke-1",
+  "clock": "2026-08-02T09:10:00Z",
+  "steps": [
+    {
+      "request": "GET /v1/principals/alice0001",
+      "expect": {
+        "status": 200,
+        "etag": "strong",
+        "cache_control": "must-revalidate"
+      }
+    },
+    {
+      "request": "GET /v1/principals/alice0001",
+      "if_none_match": "previous",
+      "expect": {
+        "status": 304,
+        "cache_control": "must-revalidate"
+      }
+    }
+  ]
+}

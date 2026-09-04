@@ -1,0 +1,1 @@
+{"version":"native.artifact-input.v1","mode":"bound","collection":{"id":"fixture-collection","kind":"selection"},"records":[{"id":"record-a","type":"Document","kind":"note","name":"First exact record","summary":"Delivered once through the frozen bridge.","lifecycle":"active","maturity":"decided","persistence":"enduring","facets":{"priority":"high"}}]}

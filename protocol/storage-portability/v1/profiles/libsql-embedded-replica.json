@@ -1,0 +1,66 @@
+{
+  "$schema": "../profile.schema.json",
+  "format": "native.storage-profile.v1",
+  "id": "libsql-embedded-replica",
+  "revision": 1,
+  "status": "retired",
+  "engine": {
+    "family": "libsql",
+    "implementation": "legacy libSQL embedded replica",
+    "version_requirement": "No Native version selected; libsql 0.10.0-pre.4 is an upstream observed excluded specimen, not a Native dependency or support pin"
+  },
+  "frontend": {
+    "dialect": "sqlite",
+    "protocol": "libSQL embedded-replica page replication with remote-primary writes"
+  },
+  "connection": {
+    "modes": ["embedded-replica"],
+    "driver": "no Native driver selected; excluded entry point libsql::Builder::new_remote_replica (upstream specimen 0.10.0-pre.4)"
+  },
+  "topology": {
+    "kind": "legacy-local-read-replica-with-remote-primary-writes",
+    "logical_database_isolation": "one local read replica and one authoritative remote libSQL namespace per logical database"
+  },
+  "operational_identity": {
+    "write_authority": "By default writes execute on and become authoritative at the remote libSQL primary, then reflect to the local replica; this is not Turso Database local-first push/pull authority.",
+    "consistency": "Reads are local; default writes require the network and remote primary. Read-your-writes reflection and periodic/manual page sync do not make the local file authoritative.",
+    "file_semantics": "The local file is a replaceable page-level read replica, not a Native source-of-truth artifact. Opening it independently while replication is active risks corruption and it is never a qualified Native snapshot.",
+    "provider_dependencies": [
+      "remote libSQL primary",
+      "libsql:// or https:// database URL and scoped authentication token",
+      "TLS-capable network path for writes and replica sync",
+      "provider page-replication, durability, backup, and restore behavior"
+    ],
+    "promotion_rules": [
+      "This legacy topology is deliberately excluded from the Turso local-first sync v1 support path.",
+      "The observed libsql 0.10.0-pre.4 API is recorded only to make the excluded constructor and topology concrete; it is not selected in Native's Cargo graph.",
+      "Vendor production support is not Native parity and creates no transferable evidence.",
+      "Any future Native use requires a separate decision, a new non-retired profile revision, and its own full logical, physical, operational, migration, backup, restore, and recovery evidence.",
+      "No local, direct-remote, or turso::sync evidence transfers to this profile."
+    ],
+    "upstream_sources": [
+      "https://docs.turso.tech/sdk/introduction",
+      "https://docs.turso.tech/sdk/rust/quickstart",
+      "https://docs.turso.tech/features/embedded-replicas/introduction",
+      "https://crates.io/crates/libsql/0.10.0-pre.4"
+    ]
+  },
+  "contracts": {
+    "logical": "native.logical.v1",
+    "event_positions": "gapless",
+    "json": "native.canonical-json.v1",
+    "timestamps": "utc-rfc3339-milliseconds",
+    "ordering": "explicit-total-order"
+  },
+  "capabilities": {
+    "native.domain-mcp.v1": { "support": "unsupported", "portability": "blocking", "notes": "Excluded legacy topology; no Native adapter or transferable evidence." },
+    "native.guarded-write.v1": { "support": "unsupported", "portability": "blocking" },
+    "native.canonical-interchange.v1": { "support": "unsupported", "portability": "portable", "notes": "Portable intent does not imply an implementation plan for this retired profile." },
+    "native.search.lexical.v1": { "support": "unsupported", "portability": "blocking" },
+    "native.search.semantic.v1": { "support": "unsupported", "portability": "blocking" },
+    "native.search.sqlite-fts5-exact": { "support": "unsupported", "portability": "blocking" },
+    "native.raw-sql": { "support": "unsupported", "portability": "blocking" },
+    "native.describe-physical-schema": { "support": "unsupported", "portability": "blocking" },
+    "native.sqlite-file-fast-path": { "support": "unsupported", "portability": "blocking" }
+  }
+}

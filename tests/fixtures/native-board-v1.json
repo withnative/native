@@ -1,0 +1,10 @@
+{
+  "v": "1",
+  "title": "Delivery board",
+  "group_by": "status",
+  "lanes": [
+    { "title": "To do", "value": "todo" },
+    { "title": "Done", "value": "done" }
+  ],
+  "unmatched_lane": "Unsorted"
+}

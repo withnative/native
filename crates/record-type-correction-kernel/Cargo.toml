@@ -1,0 +1,19 @@
+[package]
+name = "native-record-type-correction-kernel"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.98"
+description = "Storage-free classification for governed same-bearer record type correction."
+repository = "https://github.com/withnative/native"
+license = "AGPL-3.0-only"
+publish = false
+
+# Narrow, storage-free dependencies only. The kernel now owns the canonical
+# evidence and digest shapes as well as classification, which needs JSON
+# canonicalization and hashing; it must never gain SQL, sqlx or adapter types.
+[dependencies]
+hex = "0.4"
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_jcs = "0.1"
+serde_json = "1"
+sha2 = "0.10"

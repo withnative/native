@@ -1,0 +1,81 @@
+{
+  "schema_version": 1,
+  "relationship_types": [
+    {
+      "schema_version": 1,
+      "id": "relates_to.v1",
+      "relationship_type": "relates_to",
+      "endpoint_semantics": "symmetric",
+      "endpoints": [{"role":"participant","minimum":2,"maximum":2,"allowed_record_kinds":[{"record_type":"*","kind":"*"}]}],
+      "identity_bearing_qualifiers": [],
+      "assertion_admission_classes": [
+        {"id":"anchor_authorised_support","stance":"support","route":"edit_either_anchor_view_both","authority_anchor":"either_endpoint"},
+        {"id":"endpoint_bound_contest","stance":"contest","route":"verified_endpoint_binding","authority_anchor":"bound_endpoint"}
+      ],
+      "reducer": {"id":"default","version":1},
+      "labels": {"forward":"relates to","inverse":"relates to","proposition":"related to"}
+    },
+    {
+      "schema_version": 1,
+      "id": "depends_on.v1",
+      "relationship_type": "depends_on",
+      "endpoint_semantics": "directed",
+      "endpoints": [
+        {"role":"subject","minimum":1,"maximum":1,"allowed_record_kinds":[{"record_type":"*","kind":"*"}]},
+        {"role":"object","minimum":1,"maximum":1,"allowed_record_kinds":[{"record_type":"*","kind":"*"}]}
+      ],
+      "identity_bearing_qualifiers": [],
+      "assertion_admission_classes": [{"id":"subject_authorised_support","stance":"support","route":"edit_subject_view_object","authority_anchor":"subject"}],
+      "reducer": {"id":"default","version":1},
+      "labels": {"forward":"depends on","inverse":"is a dependency of","proposition":"depends on"}
+    },
+    {
+      "schema_version": 1,
+      "id": "blocks.v1",
+      "relationship_type": "blocks",
+      "endpoint_semantics": "directed",
+      "endpoints": [
+        {"role":"subject","minimum":1,"maximum":1,"allowed_record_kinds":[{"record_type":"*","kind":"*"}]},
+        {"role":"object","minimum":1,"maximum":1,"allowed_record_kinds":[{"record_type":"*","kind":"*"}]}
+      ],
+      "identity_bearing_qualifiers": [],
+      "assertion_admission_classes": [{"id":"subject_authorised_support","stance":"support","route":"edit_subject_view_object","authority_anchor":"subject"}],
+      "reducer": {"id":"default","version":1},
+      "labels": {"forward":"blocks","inverse":"is blocked by","proposition":"blocks"}
+    },
+    {
+      "schema_version": 1,
+      "id": "assigned_to.v1",
+      "relationship_type": "assigned_to",
+      "endpoint_semantics": "directed",
+      "endpoints": [
+        {"role":"subject","minimum":1,"maximum":1,"allowed_record_kinds":[{"record_type":"WorkItem","kind":"task"}]},
+        {"role":"object","minimum":1,"maximum":1,"allowed_record_kinds":[{"record_type":"Entity","kind":"person"}]}
+      ],
+      "identity_bearing_qualifiers": [],
+      "assertion_admission_classes": [
+        {"id":"task_authorised_support","stance":"support","route":"edit_subject_view_object","authority_anchor":"subject"},
+        {"id":"assignee_bound_contest","stance":"contest","route":"verified_endpoint_binding","authority_anchor":"bound_endpoint"}
+      ],
+      "reducer": {"id":"assigned_to","version":1},
+      "labels": {"forward":"is assigned to","inverse":"is assigned","proposition":"assigned to"}
+    },
+    {
+      "schema_version": 1,
+      "id": "answerable_by.v1",
+      "relationship_type": "answerable_by",
+      "endpoint_semantics": "directed",
+      "endpoints": [
+        {"role":"subject","minimum":1,"maximum":1,"allowed_record_kinds":[{"record_type":"WorkItem","kind":"task"}]},
+        {"role":"object","minimum":1,"maximum":1,"allowed_record_kinds":[{"record_type":"Entity","kind":"person"}]}
+      ],
+      "identity_bearing_qualifiers": [],
+      "assertion_admission_classes": [
+        {"id":"task_authorised_support","stance":"support","route":"edit_subject_view_object","authority_anchor":"subject"},
+        {"id":"accountable_bound_contest","stance":"contest","route":"verified_endpoint_binding","authority_anchor":"bound_endpoint"}
+      ],
+      "reducer": {"id":"answerable_by","version":1},
+      "labels": {"forward":"is answerable by","inverse":"is answerable for","proposition":"answerable by"}
+    }
+  ]
+}

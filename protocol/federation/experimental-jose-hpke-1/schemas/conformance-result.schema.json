@@ -1,0 +1,81 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://spec.withnative.ai/federation/experimental-jose-hpke-1/schemas/conformance-result.schema.json",
+  "title": "Native federation conformance report",
+  "type": "object",
+  "required": ["schema_version", "profile", "protocol_version", "clock", "jose_hpke_status", "warning", "summary", "cases"],
+  "properties": {
+    "schema_version": { "const": "1.0" },
+    "profile": { "$ref": "common.schema.json#/$defs/profile" },
+    "protocol_version": { "$ref": "common.schema.json#/$defs/protocolVersion" },
+    "clock": { "$ref": "common.schema.json#/$defs/timestamp" },
+    "jose_hpke_status": { "const": "work-in-progress" },
+    "warning": { "type": "string", "minLength": 1 },
+    "summary": {
+      "type": "object",
+      "required": ["total", "passed", "failed", "status"],
+      "properties": {
+        "total": { "type": "integer", "minimum": 0 },
+        "passed": { "type": "integer", "minimum": 0 },
+        "failed": { "type": "integer", "minimum": 0 },
+        "status": { "enum": ["pass", "fail", "error"] }
+      },
+      "additionalProperties": false
+    },
+    "cases": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "status", "expected", "observed", "duration_ms", "crypto_status"],
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "status": { "enum": ["pass", "fail"] },
+          "expected": { "$ref": "#/$defs/outcome" },
+          "observed": { "$ref": "#/$defs/outcome" },
+          "duration_ms": { "type": "number", "minimum": 0 },
+          "crypto_status": { "enum": ["not-applicable", "FINAL-RFC-structural-placeholder"] }
+        },
+        "additionalProperties": false
+      }
+    },
+    "harness_error": {
+      "type": "object",
+      "required": ["code", "message"],
+      "properties": {
+        "code": { "type": "string", "minLength": 1 },
+        "message": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "summary": { "type": "object", "properties": { "status": { "const": "error" } }, "required": ["status"] } } },
+      "then": {
+        "required": ["harness_error"],
+        "properties": { "harness_error": {}, "cases": { "type": "array", "maxItems": 0 } }
+      },
+      "else": {
+        "properties": { "cases": { "type": "array", "minItems": 1 } },
+        "not": { "required": ["harness_error"] }
+      }
+    }
+  ],
+  "$defs": {
+    "outcome": {
+      "type": "object",
+      "required": ["result"],
+      "properties": {
+        "result": { "enum": ["valid", "invalid"] },
+        "error": { "type": "string" },
+        "layer": { "type": "string" },
+        "layers": { "type": "array", "items": { "type": "string" } },
+        "exit_code": { "type": ["integer", "null"] },
+        "report": {},
+        "stderr": { "type": "string" }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

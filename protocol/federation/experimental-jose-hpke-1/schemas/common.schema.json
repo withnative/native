@@ -1,0 +1,159 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://spec.withnative.ai/federation/experimental-jose-hpke-1/schemas/common.schema.json",
+  "title": "Native federation common values",
+  "$defs": {
+    "protocolVersion": { "const": "1.0" },
+    "profile": { "const": "native-fed/experimental-jose-hpke-1" },
+    "timestamp": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12][0-9]|3[01])T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]Z$"
+    },
+    "uuidV4": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "networkId": {
+      "type": "string",
+      "maxLength": 257,
+      "oneOf": [
+        { "const": "native" },
+        { "pattern": "^dns:(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)(?:\\.(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?))*$" },
+        { "pattern": "^key:[A-Za-z0-9_-]{43}$" }
+      ]
+    },
+    "principalId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._~-]{0,62}[A-Za-z0-9])?$"
+    },
+    "principalAddress": {
+      "type": "object",
+      "required": ["network_id", "principal_id"],
+      "properties": {
+        "network_id": { "$ref": "#/$defs/networkId" },
+        "principal_id": { "$ref": "#/$defs/principalId" }
+      },
+      "additionalProperties": false
+    },
+    "kid": {
+      "type": "string",
+      "pattern": "^n1\\.(?:root|signing|encryption|installation|authority|relay)\\.[A-Za-z0-9_-]{43}$"
+    },
+    "digest": {
+      "type": "string",
+      "pattern": "^sha-256:[A-Za-z0-9_-]{43}$"
+    },
+    "base64url": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]*$"
+    },
+    "detachedJws": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]+\\.\\.[A-Za-z0-9_-]{86}$"
+    },
+    "jwsTyp": {
+      "enum": [
+        "native-network-descriptor+jws",
+        "native-principal+jws",
+        "native-principal-attestation+jws",
+        "native-key-authorization+jws",
+        "native-root-transition+jws",
+        "native-envelope+jws",
+        "native-relay-receipt+jws",
+        "native-profile-negotiation+jws",
+        "native-request-proof+jws"
+      ]
+    },
+    "capability": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 96,
+      "pattern": "^[a-z][a-z0-9]*(?:[._:-][a-z0-9]+)*$"
+    },
+    "extensions": {
+      "type": "object",
+      "maxProperties": 64,
+      "propertyNames": { "$ref": "#/$defs/capability" }
+    },
+    "ed25519Jwk": {
+      "type": "object",
+      "required": ["kty", "crv", "x", "alg", "use", "kid"],
+      "properties": {
+        "kty": { "const": "OKP" },
+        "crv": { "const": "Ed25519" },
+        "x": { "type": "string", "pattern": "^[A-Za-z0-9_-]{43}$" },
+        "alg": { "const": "EdDSA" },
+        "use": { "const": "sig" },
+        "kid": { "$ref": "#/$defs/kid" }
+      },
+      "additionalProperties": false
+    },
+    "rootJwk": {
+      "allOf": [
+        { "$ref": "#/$defs/ed25519Jwk" },
+        { "type": "object", "properties": { "kid": { "type": "string", "pattern": "^n1\\.root\\.[A-Za-z0-9_-]{43}$" } } }
+      ]
+    },
+    "signingJwk": {
+      "allOf": [
+        { "$ref": "#/$defs/ed25519Jwk" },
+        { "type": "object", "properties": { "kid": { "type": "string", "pattern": "^n1\\.signing\\.[A-Za-z0-9_-]{43}$" } } }
+      ]
+    },
+    "installationJwk": {
+      "allOf": [
+        { "$ref": "#/$defs/ed25519Jwk" },
+        { "type": "object", "properties": { "kid": { "type": "string", "pattern": "^n1\\.installation\\.[A-Za-z0-9_-]{43}$" } } }
+      ]
+    },
+    "authorityJwk": {
+      "allOf": [
+        { "$ref": "#/$defs/ed25519Jwk" },
+        { "type": "object", "properties": { "kid": { "type": "string", "pattern": "^n1\\.authority\\.[A-Za-z0-9_-]{43}$" } } }
+      ]
+    },
+    "relayJwk": {
+      "allOf": [
+        { "$ref": "#/$defs/ed25519Jwk" },
+        { "type": "object", "properties": { "kid": { "type": "string", "pattern": "^n1\\.relay\\.[A-Za-z0-9_-]{43}$" } } }
+      ]
+    },
+    "x25519Jwk": {
+      "type": "object",
+      "required": ["kty", "crv", "x", "alg", "use", "kid"],
+      "properties": {
+        "kty": { "const": "OKP" },
+        "crv": { "const": "X25519" },
+        "x": { "type": "string", "pattern": "^[A-Za-z0-9_-]{43}$" },
+        "alg": { "const": "HPKE-3-KE", "$comment": "FINAL-RFC: provisional draft-ietf-jose-hpke-encrypt-22 token" },
+        "use": { "const": "enc" },
+        "kid": { "$ref": "#/$defs/kid" }
+      },
+      "additionalProperties": false
+    },
+    "encryptionJwk": {
+      "allOf": [
+        { "$ref": "#/$defs/x25519Jwk" },
+        { "type": "object", "properties": { "kid": { "type": "string", "pattern": "^n1\\.encryption\\.[A-Za-z0-9_-]{43}$" } } }
+      ]
+    },
+    "problem": {
+      "type": "object",
+      "required": ["type", "title", "status", "code", "request_id", "retryable"],
+      "properties": {
+        "type": { "type": "string", "pattern": "^urn:native:federation:error:[a-z_]+$" },
+        "title": { "type": "string", "maxLength": 200 },
+        "status": { "type": "integer", "minimum": 400, "maximum": 599 },
+        "detail": { "type": "string", "maxLength": 1024 },
+        "code": {
+          "enum": ["invalid_request", "invalid_principal_address", "malformed_envelope", "signature_invalid", "recipient_mismatch", "unknown_principal", "unknown_alias", "alias_unverified", "principal_revoked", "key_revoked", "stale_document", "unsupported_profile", "required_capability_unsupported", "unknown_content_type", "unauthorized", "forbidden", "precondition_failed", "conflict", "idempotency_conflict", "delivery_unknown", "delivery_terminal", "expired", "payload_too_large", "rate_limited", "quota_exceeded", "directory_unavailable", "relay_unavailable", "internal"]
+        },
+        "request_id": { "$ref": "#/$defs/uuidV4" },
+        "retryable": { "type": "boolean" },
+        "retry_after": { "type": "integer", "minimum": 0, "maximum": 86400 }
+      }
+    }
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "scenario_type": "directory",
+  "scenario_id": "directory-required-capability",
+  "profile": "native-fed/experimental-jose-hpke-1",
+  "clock": "2026-08-02T09:10:00Z",
+  "steps": [
+    {
+      "required_capabilities": [
+        "example.net:required"
+      ],
+      "expect": {
+        "status": 422
+      }
+    }
+  ],
+  "expect_error": "required_capability_unsupported",
+  "validation_layer": "capability"
+}

@@ -1,0 +1,46 @@
+{
+  "envelope": {
+    "envelope_type": "native.federation.transport",
+    "protocol_version": "1.0",
+    "profile": "native-fed/experimental-jose-hpke-1",
+    "envelope_id": "00000000-0000-4000-8000-000000000001",
+    "sender_principal": {
+      "network_id": "native",
+      "principal_id": "alice0001"
+    },
+    "sender_key_id": "n1.signing.Gjl4ccI6MF2tlN6xClEu06TjLV2amB4Lmnq-g4rnC4M",
+    "recipients": [
+      {
+        "principal": {
+          "network_id": "native",
+          "principal_id": "bob00001"
+        },
+        "encryption_key_id": "n1.encryption.b1xKhr72_QTzJjpSay9jqZTcetG32cchdd0RMLj7pLE"
+      }
+    ],
+    "created_at": "2026-08-02T09:05:00Z",
+    "expires_at": "2026-08-09T09:05:00Z",
+    "content_type": "application/vnd.native.message+json",
+    "content_version": "1.0",
+    "required_capabilities": [],
+    "extensions": {},
+    "jwe": {
+      "protected": "eyJhbGciOiJIUEtFLTMtS0UiLCJjcml0IjpbIm5hdGl2ZV9wcm9maWxlIl0sImN0eSI6ImFwcGxpY2F0aW9uL3ZuZC5uYXRpdmUubWVzc2FnZStqc29uIiwiZW5jIjoiQTI1NkdDTSIsIm5hdGl2ZV9wcm9maWxlIjoibmF0aXZlLWZlZC9leHBlcmltZW50YWwtam9zZS1ocGtlLTEiLCJ0eXAiOiJuYXRpdmUtZmVkZXJhdGlvbitqd2UifQ",
+      "aad": "eyJjb250ZW50X3R5cGUiOiJhcHBsaWNhdGlvbi92bmQubmF0aXZlLm1lc3NhZ2UranNvbiIsImNvbnRlbnRfdmVyc2lvbiI6IjEuMCIsImNyZWF0ZWRfYXQiOiIyMDI2LTA4LTAyVDA5OjA1OjAwWiIsImVudmVsb3BlX2lkIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDAxIiwiZW52ZWxvcGVfdHlwZSI6Im5hdGl2ZS5mZWRlcmF0aW9uLnRyYW5zcG9ydCIsImV4cGlyZXNfYXQiOiIyMDI2LTA4LTA5VDA5OjA1OjAwWiIsImV4dGVuc2lvbnMiOnt9LCJwcm9maWxlIjoibmF0aXZlLWZlZC9leHBlcmltZW50YWwtam9zZS1ocGtlLTEiLCJwcm90b2NvbF92ZXJzaW9uIjoiMS4wIiwicmVjaXBpZW50cyI6W3siZW5jcnlwdGlvbl9rZXlfaWQiOiJuMS5lbmNyeXB0aW9uLmIxeEtocjcyX1FUekpqcFNheTlqcVpUY2V0RzMyY2NoZGQwUk1MajdwTEUiLCJwcmluY2lwYWwiOnsibmV0d29ya19pZCI6Im5hdGl2ZSIsInByaW5jaXBhbF9pZCI6ImJvYjAwMDAxIn19XSwicmVxdWlyZWRfY2FwYWJpbGl0aWVzIjpbXSwic2VuZGVyX2tleV9pZCI6Im4xLnNpZ25pbmcuR2psNGNjSTZNRjJ0bE42eENsRXUwNlRqTFYyYW1CNExtbnEtZzRybkM0TSIsInNlbmRlcl9wcmluY2lwYWwiOnsibmV0d29ya19pZCI6Im5hdGl2ZSIsInByaW5jaXBhbF9pZCI6ImFsaWNlMDAwMSJ9fQ",
+      "recipients": [
+        {
+          "header": {
+            "kid": "n1.encryption.-CUQ_C_UiScy24YlmovZypFEt7u5g-qWMTOiXFXyiHQ",
+            "ek": "ZvJ2mpe7fx6Uhtpx7jP0sFVTIgZtWtom5uAJ6M8kbEQ"
+          },
+          "encrypted_key": "xAxe1nFbU9JBN8e57N6Ny3riPOYqRLI2VqOFUNVm5F5NooaKpC8ViKa4yd-mqx15"
+        }
+      ],
+      "iv": "8xT5t7My32HtfzJG",
+      "ciphertext": "RklOQUwtUkZDOm9uZTpvcGFxdWUtY2lwaGVydGV4dA",
+      "tag": "XCPvdtapAAUq8AiIcPUcRQ"
+    },
+    "ciphertext_digest": "sha-256:OLcFlDWpkHj_a15dpOXY8yAFyKJ_cOrXnUzm4K9rH0c"
+  },
+  "signature": "eyJhbGciOiJFZERTQSIsImtpZCI6Im4xLnNpZ25pbmcuR2psNGNjSTZNRjJ0bE42eENsRXUwNlRqTFYyYW1CNExtbnEtZzRybkM0TSIsInR5cCI6Im5hdGl2ZS1lbnZlbG9wZStqd3MifQ..OHKRgOlJo4ZssRidLxdpBbha5s5TArkCKbOlnrlcUTEglk1jMg5AA0XA3vYbqAQ68ChuKSVICVFIslUFOIOaAQ"
+}
