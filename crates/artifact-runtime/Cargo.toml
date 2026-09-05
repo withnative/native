@@ -31,4 +31,4 @@ swc_ecma_parser = "=15.0.2"
 swc_ecma_visit = "=12.0.0"
 tokio = { version = "1", features = ["sync"] }
 url = "2"
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1" }

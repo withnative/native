@@ -19,6 +19,69 @@ to record a correction or supersession. The improvement is that the correction
 can travel with the work and remain discoverable instead of being trapped in a
 person's head or a detached conversation.
 
+## What Native makes possible
+
+**A shared world, not another context file.** When people and agents work
+through Native, their records, reads, changes, tool use, run intent, and
+activity contribute context to the same inspectable world. That makes later
+work easier to recover and continue across sessions and agents. Bringing
+external material into that world still has a real acquisition cost, and the
+result still needs smaller ongoing acts of semantic stewardship: recording a
+correction, marking a decision, or closing work when reality changes.
+
+**Software that can take the shape of the work.** Native separates governed
+data from its presentation. The same authorized records can be deliberately
+bound into an authored dashboard, project Kanban, canvas, or visual bookshelf
+without turning the view into a new silo. Shipped artifact runtimes support
+editable MDX source with named inputs, components, and mediated interactions,
+or self-contained HTML over exact read-only inputs. The host continues to own
+authorization, writes, provenance, and audit. “All your data” here means all
+data the caller may access and the artifact explicitly binds—not ambient
+access to a workspace or the network. See [Artifact runtimes](docs/artifact-runtimes.md)
+for the concrete contract and limits.
+
+This is part of context ownership too: the freedom to reshape how a person or
+group sees and acts through its working world, so software can fit the work
+rather than the reverse. Portable context, claims, provenance, and authority
+also create a basis for new forms of delegation and coordination between
+participants who do not need to share a single owner. Replacing the whole
+Workbench shell is a direction, not a capability claimed by this snapshot.
+
+## Start with Native
+
+The easiest route today is the first-party
+[`withnative/native-plugin`](https://github.com/withnative/native-plugin). It
+connects supported agent clients to Native's hosted MCP service; the client
+handles OAuth sign-in and the hosted service remains the authority for your
+workspace.
+
+You can simply give your AI agent this prompt:
+```
+Use the install guide at https://github.com/withnative/native-plugin to help me get started with Native.
+```
+
+If you want to run the commands yourself:
+
+Claude Code CLI:
+```sh
+claude plugin marketplace add withnative/plugins
+claude plugin install native@withnative
+```
+
+Codex CLI:
+```sh
+codex plugin marketplace add withnative/plugins
+codex plugin add native@withnative
+```
+
+Adding the marketplace only makes its packages available; the second command
+installs Native.
+
+After installation, restart or reload if prompted and ask the agent to help
+you finish Native setup. This hosted-first route is the practical way to begin;
+the source snapshot below supports inspection and exploration, not turnkey
+meaningful self-hosting today.
+
 > **Public source snapshot.** `withnative/native` publishes selected source for
 > Native's node and federation protocol work. It is published so people and
 > agents can inspect the implementation, architecture, evidence, and the

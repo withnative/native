@@ -2398,3 +2398,122 @@ async fn find_access_path_uses_indexes_and_scans_nothing() {
         "no step of the find access path may be a table scan: {plan}"
     );
 }
+
+#[tokio::test]
+async fn relationship_rebuild_ignores_stale_admission_timestamp_but_detects_semantic_drift() {
+    let db = db().await;
+    let registry = registry();
+    let subject = create_record(
+        &db,
+        json!({"type":"WorkItem","kind":"task","name":"Admission subject"}),
+    )
+    .await
+    .unwrap();
+    let object = create_record(
+        &db,
+        json!({"type":"Outcome","kind":"target","name":"Admission object"}),
+    )
+    .await
+    .unwrap();
+    let evidence = create_record(
+        &db,
+        json!({"type":"Document","kind":"note","name":"Admission evidence"}),
+    )
+    .await
+    .unwrap();
+
+    let asserted = call(
+        &registry,
+        &db,
+        Caller::local(),
+        json!({"action":"assert","relationship_type":"depends_on",
+            "endpoints":[{"role":"subject","record_id":subject},{"role":"object","record_id":object}],
+            "idempotency_key":"admission-timestamp-ordering"}),
+    )
+    .await
+    .unwrap();
+
+    // `occurred_at` has millisecond resolution, so wait for the clock to move
+    // before advancing the head — otherwise the two events can share a stamp
+    // and the production ordering does not reproduce.
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+    // Advance the assertion head after the last admission refresh. Evidence
+    // updates `relationship_assertion_heads.occurred_at` without refreshing
+    // `relationship_local_admissions`, which is exactly the production
+    // ordering: the live admission keeps the creation-time stamp while a full
+    // replay derives it from the final head.
+    call(
+        &registry,
+        &db,
+        Caller::local(),
+        json!({"action":"add_evidence",
+            "assertion_issuer_origin_db_id":asserted["assertion_issuer_origin_db_id"],
+            "assertion_id":asserted["assertion_id"],
+            "evidence_id":evidence,
+            "reason":"production ordering probe",
+            "idempotency_key":"admission-timestamp-evidence"}),
+    )
+    .await
+    .unwrap();
+
+    let issuer = asserted["assertion_issuer_origin_db_id"].as_str().unwrap();
+    let assertion_id = asserted["assertion_id"].as_str().unwrap();
+    let live_recomputed_at: String = sqlx::query_scalar(
+        "SELECT recomputed_at FROM relationship_local_admissions
+          WHERE issuer_origin_db_id=?1 AND assertion_id=?2",
+    )
+    .bind(issuer)
+    .bind(assertion_id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    let head_occurred_at: String = sqlx::query_scalar(
+        "SELECT occurred_at FROM relationship_assertion_heads
+          WHERE issuer_origin_db_id=?1 AND assertion_id=?2",
+    )
+    .bind(issuer)
+    .bind(assertion_id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    // The rebuild re-derives `recomputed_at` from the final head
+    // (`set_receiver_local_admission_in` reads `occurred_at` from
+    // `relationship_assertion_heads`), so the live stamp and the rebuilt one
+    // are drawn from different heads. Asserting the live stamp is behind the
+    // head is what proves the production ordering reproduced; this test pins
+    // the exclusion, not the rebuild's choice of stamp.
+    assert!(
+        head_occurred_at > live_recomputed_at,
+        "production ordering did not reproduce: head={head_occurred_at} admission={live_recomputed_at}"
+    );
+
+    let rebuilt = native_ce::conformance::rebuild_and_diff_relationship(&db)
+        .await
+        .unwrap();
+    assert!(rebuilt.equal, "{rebuilt:#?}");
+
+    // Corrupting a semantic admission field must still fail conformance.
+    // The live admission is 'admitted' (receiver-verified); flipping it to a
+    // different legal state keeps the row constraint-valid while diverging
+    // from what a replay re-derives.
+    sqlx::query(
+        "UPDATE relationship_local_admissions SET local_admission_state='unresolved'
+          WHERE issuer_origin_db_id=?1 AND assertion_id=?2",
+    )
+    .bind(issuer)
+    .bind(assertion_id)
+    .execute(&crate::common::fixture_write_pool(&db).await)
+    .await
+    .unwrap();
+    let drifted = native_ce::conformance::rebuild_and_diff_relationship(&db)
+        .await
+        .unwrap();
+    assert!(!drifted.equal, "{drifted:#?}");
+    let admissions = drifted
+        .tables
+        .iter()
+        .find(|table| table.table == "relationship_local_admissions")
+        .unwrap();
+    assert!(!admissions.mismatches.is_empty(), "{drifted:#?}");
+}

@@ -5,6 +5,34 @@ binding, Collection resolution, and `native.artifact-diagnostic.v1`. Runtime
 adapters see only a resolved input envelope and return inert render plans. A
 runtime failure never selects a fallback surface.
 
+## Malleability model
+
+An artifact separates three things that conventional applications often bind
+together: durable data, authored presentation, and host authority. An author
+can therefore present the same governed record world as a project Kanban, a
+dashboard, or a visual bookshelf without copying those records into a
+view-specific database. The artifact controls the bounded presentation; the
+host resolves its deliberately named inputs and continues to mediate
+authorization, writes, provenance, and audit.
+
+This is a concrete capability rather than permission for an artifact to read
+or change anything it can name:
+
+- `native.mdx.v2` keeps the authored MDX as editable record text. It admits a
+  closed component and interaction vocabulary over named inputs, including
+  reusable exact-pinned modules. The host validates source and inputs, renders
+  a safe tree, and reauthorizes mediated interactions when they are invoked.
+- `native.html.v1` renders a self-contained HTML document over exact named,
+  read-only inputs. It has no ambient network access, module import, or
+  mutation surface.
+
+In both runtimes, “all your data” can only mean records the caller is
+authorized to read and has deliberately bound into that artifact. Input
+bindings are explicit and source-pinned; presentation authority never becomes
+workspace authority. A future system could use this separation to make larger
+parts of the product shell user-authored, but whole-Workbench replacement is
+directional rather than a shipped promise.
+
 ## `native.html.v1`
 
 `native.html.v1` accepts a complete, self-contained authored HTML document and

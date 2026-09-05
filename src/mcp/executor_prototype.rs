@@ -7464,8 +7464,18 @@ mod tests {
             .unwrap();
         assert_eq!(created["result"]["isError"], false, "{created}");
         let created_text = created["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(created_text.starts_with("Created\n"), "{created_text}");
+        // The verb line names the record it wrote. The confirmation no longer
+        // echoes the post-write record, so this line plus the receipt is the
+        // whole answer the caller gets without a second read.
+        assert!(
+            created_text.starts_with(&format!("Created {id}\n")),
+            "{created_text}"
+        );
         assert!(created_text.contains("Write receipt:"), "{created_text}");
+        assert!(
+            !created_text.contains("first body"),
+            "the confirmation must not echo the body it was handed: {created_text}"
+        );
         assert!(created_text.contains("body_digest: \""), "{created_text}");
         assert!(created["result"].get("structuredContent").is_none());
 
@@ -7491,7 +7501,10 @@ mod tests {
             .unwrap();
         assert_eq!(updated["result"]["isError"], false, "{updated}");
         let updated_text = updated["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(updated_text.starts_with("Updated\n"), "{updated_text}");
+        assert!(
+            updated_text.starts_with(&format!("Updated {id}\n")),
+            "{updated_text}"
+        );
         assert!(updated_text.contains("Write receipt:"), "{updated_text}");
         assert!(updated["result"].get("structuredContent").is_none());
 

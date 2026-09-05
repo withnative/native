@@ -850,7 +850,14 @@ fn relationship_columns_for(table: &str) -> &'static [&'static str] {
             "local_policy_version",
             "local_reason",
             "local_evidence_digest",
-            "recomputed_at",
+            // `recomputed_at` is deliberately excluded: this table is
+            // receiver-local and absent from canonical interchange, and the
+            // timestamp records when the receiver last refreshed the admission
+            // (derived from the assertion head at refresh time) rather than
+            // portable deterministic state. Later assertion events advance the
+            // head without refreshing the admission, so live projection and
+            // full replay legitimately disagree on it while every semantic
+            // admission field matches.
         ],
         "effective_relationships" => &[
             "relationship_origin_db_id",

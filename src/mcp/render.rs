@@ -6566,31 +6566,65 @@ fn render_search(value: &Value) -> String {
 // Record lifecycle and history
 // ---------------------------------------------------------------------------
 
-/// `create_record` and `update_record` return the same flattened enriched
-/// record as a one-id `get_record`. Reuse that rendering rather than letting
-/// three presentations of one shape drift. The write handlers use the read
-/// layer's default windows (200, offset 0).
+/// `create_record`, singular `update_record` and `instantiate_artifact` answer
+/// with a compact write confirmation, not the record.
+///
+/// A guarded `body_replace` that succeeded first time used to answer with the
+/// whole post-write record — envelope, links, ancestor chain and body — because
+/// this shared the `render_get_record` presentation with the read layer's
+/// default 200-item windows. The caller had supplied the only text that changed
+/// and could not use the echo without a second read to compare against. The
+/// trimmed shape keeps identity (id, short reference, type, lifecycle, title),
+/// one modest effect line, the pre-write handle and the write receipt;
+/// post-write state stays one `get_record` away. The multi-target
+/// `update_record` patch already returns a per-target status list and keeps
+/// that shape.
 fn render_enriched_write(verb: &str, value: &Value) -> String {
-    let mut out = format!("{verb}\n");
+    // Identity first, so the caller can confirm it hit the right record
+    // without the body. `record_id` is a fallback for handler shapes that name
+    // the key that way; `claimed_string` keeps a missing id visible as missing
+    // rather than asserting an empty one.
+    let id = value.get("id").or_else(|| value.get("record_id"));
+    let mut out = format!("{} {}\n", verb, claimed_string(id, "id"));
+    if let Some(reference) = string(value, "display_reference") {
+        let _ = writeln!(out, "Short reference: {}", display_inline(&reference));
+    }
+    let label = type_label(value);
+    if !label.is_empty() {
+        let _ = writeln!(out, "Record: {}", display_inline(&label));
+    }
+    if let Some(lifecycle) = lifecycle_display(value) {
+        let _ = writeln!(out, "Lifecycle: {}", display_inline(&lifecycle));
+    }
+    if let Some(name) = string(value, "name") {
+        let _ = writeln!(out, "Title: {}", display_inline(&name));
+    }
+    // Effect: the singular payload reports post-state, not what changed, so
+    // claim only the verb plus the one derivation the payload supports — the
+    // artifact source for instantiation.
+    match verb {
+        "Instantiated" => match string(value, "source_id") {
+            Some(source) => {
+                let _ = writeln!(
+                    out,
+                    "Effect: artifact instantiated from {}",
+                    display_inline(&source)
+                );
+            }
+            None => {
+                let _ = writeln!(out, "Effect: artifact instantiated");
+            }
+        },
+        "Created" => {
+            let _ = writeln!(out, "Effect: record created");
+        }
+        _ => {
+            let _ = writeln!(out, "Effect: record updated");
+        }
+    }
     render_previous_seq(&mut out, value);
     render_write_receipt(&mut out, value);
-    let mut record = value.clone();
-    if let Some(object) = record.as_object_mut() {
-        object.retain(|key, _| is_record_render_field(key));
-        // A digest on a write is an operation receipt as well as record
-        // metadata. Keep it in the receipt above without printing it twice.
-        object.remove("body_digest");
-    }
-    out.push_str(&render_get_record(
-        &json!({
-            "records": [record],
-            "children_limit": 200,
-            "children_offset": 0,
-            "links_limit": 200,
-            "links_offset": 0,
-        }),
-        false,
-    ));
+    out.push_str("Call get_record for post-write state.\n");
     out
 }
 

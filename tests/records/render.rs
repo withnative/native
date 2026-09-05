@@ -244,6 +244,136 @@ fn multi_update_rendering_distinguishes_missing_claims_from_zero_and_unknown() {
 }
 
 #[test]
+fn write_confirmation_is_compact_and_keeps_receipt() {
+    // A successful singular write used to re-render the whole post-write
+    // record with default windows, echoing body, ancestors and links. The
+    // trimmed shape keeps identity, one effect line and the receipt; callers
+    // re-read with `get_record` for post-write state.
+    let big_body = format!("SENTINEL-BODY-TRIMMED {}", "x".repeat(16_000));
+    let base = json!({
+        "id": "write-trimmed-id",
+        "type": "Document",
+        "kind": "note",
+        "name": "Trimmed title",
+        // No `display_reference`: the write handlers do not annotate one.
+        // `enriched_or_error` returns the plain enriched record, and short
+        // references are minted on the batch `get_record` path only. The
+        // confirmation renders the line when a payload carries it and stays
+        // silent otherwise, which is what the assertions below pin.
+        "lifecycle_interpretation": {"status": "governed", "value": {"canonical": "open"}},
+        "body": big_body,
+        "ancestors": [{"id": "ancestor-trimmed-id", "name": "SENTINEL-ANCESTOR-TRIMMED"}],
+        "links_out": [{"id": "link-trimmed-id", "note": "SENTINEL-LINK-TRIMMED"}],
+        "links_in": [],
+        "kind_governance": {"sentinel": "SENTINEL-KIND-GOVERNANCE-TRIMMED"},
+        "contribution": {"interpretation_limits": ["SENTINEL-INTERP-LIMIT-TRIMMED"]},
+        "body_digest": "trimmed-body-digest",
+    });
+
+    let mut update_payload = base.clone();
+    update_payload["previous_seq"] = json!(41);
+    // Obligations ride the receipt, not the record echo. They must outlive the
+    // trim: a dropped warning is a silently withheld disclosure.
+    update_payload["warnings"] = json!([{"code": "SENTINEL-WARNING-KEPT", "message": "kept"}]);
+    let updated = render::render("update_record", &update_payload).unwrap();
+    for expected in [
+        "Updated",
+        "write-trimmed-id",
+        "Trimmed title",
+        "open",
+        "Effect:",
+        "previous_seq",
+        "trimmed-body-digest",
+        "SENTINEL-WARNING-KEPT",
+        "get_record",
+    ] {
+        assert!(updated.contains(expected), "missing {expected}: {updated}");
+    }
+    for forbidden in [
+        "SENTINEL-BODY-TRIMMED",
+        "SENTINEL-ANCESTOR-TRIMMED",
+        "SENTINEL-LINK-TRIMMED",
+        "SENTINEL-KIND-GOVERNANCE-TRIMMED",
+        "SENTINEL-INTERP-LIMIT-TRIMMED",
+    ] {
+        assert!(
+            !updated.contains(forbidden),
+            "echoed {forbidden}: {updated}"
+        );
+    }
+    assert_eq!(
+        updated.matches("trimmed-body-digest").count(),
+        1,
+        "the guard token must print once, not once per presentation: {updated}"
+    );
+    assert!(
+        !updated.contains("Short reference:"),
+        "a payload without a short reference must not claim one: {updated}"
+    );
+    assert!(
+        updated.len() < 1024,
+        "singular update confirmation must stay under about 1 KB, was {} bytes: {updated}",
+        updated.len()
+    );
+
+    let mut create_payload = base.clone();
+    create_payload["previous_seq"] = Value::Null;
+    let created = render::render("create_record", &create_payload).unwrap();
+    for expected in [
+        "Created",
+        "write-trimmed-id",
+        "Trimmed title",
+        "previous_seq",
+        "trimmed-body-digest",
+    ] {
+        assert!(created.contains(expected), "missing {expected}: {created}");
+    }
+    for forbidden in [
+        "SENTINEL-BODY-TRIMMED",
+        "SENTINEL-ANCESTOR-TRIMMED",
+        "SENTINEL-LINK-TRIMMED",
+    ] {
+        assert!(
+            !created.contains(forbidden),
+            "echoed {forbidden}: {created}"
+        );
+    }
+
+    let mut instantiated_payload = base.clone();
+    instantiated_payload["previous_seq"] = Value::Null;
+    instantiated_payload["source_id"] = json!("source-trimmed-id");
+    // `instantiate_artifact` does not stamp a digest — `annotate_body_digest`
+    // is documented as applying at `get_record` and the create/update success
+    // responses only. The fixture must not mint one the handler never sends,
+    // so this asserts the renderer omits the receipt token rather than
+    // inventing it. Guarded follow-up work after an instantiate still costs a
+    // read; that gap predates the trim.
+    instantiated_payload
+        .as_object_mut()
+        .expect("fixture is an object")
+        .remove("body_digest");
+    let instantiated = render::render("instantiate_artifact", &instantiated_payload).unwrap();
+    for expected in ["Instantiated", "write-trimmed-id", "source-trimmed-id"] {
+        assert!(
+            instantiated.contains(expected),
+            "missing {expected}: {instantiated}"
+        );
+    }
+    assert!(
+        !instantiated.contains("SENTINEL-BODY-TRIMMED"),
+        "echoed body: {instantiated}"
+    );
+    assert!(
+        !instantiated.contains("SENTINEL-ANCESTOR-TRIMMED"),
+        "echoed ancestors: {instantiated}"
+    );
+    assert!(
+        !instantiated.contains("body_digest"),
+        "claimed a guard token the handler never mints: {instantiated}"
+    );
+}
+
+#[test]
 fn citation_rendering_preserves_resolution_evidence_and_write_receipts() {
     let resolved = render::render(
         "resolve_citation",
