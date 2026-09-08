@@ -44,7 +44,39 @@ use crate::domain_transaction::request::{
 };
 
 /// Exact compact `result.tools` byte ceilings decided for the named profiles.
-pub const FOCUSED_PROFILE_MAX_BYTES: usize = 65_536;
+///
+/// Raised from 64 KiB to 68 KiB on 5 Sep 2026, deliberately, to admit `661d915`.
+///
+/// `manage_links` advertised a flat union schema against a discriminated-union
+/// handler, so the server could reject a field it had just disclosed. The fix
+/// is `oneOf` branches matching the handler's variants, and an honest branched
+/// contract costs 957 bytes on the federated-lens Focused projection, taking
+/// that tool from 1,392 to 2,349. The projection had 82 bytes free before
+/// `#1071` and 676 after it, so the fix did not fit and the ceiling was the
+/// only thing standing in its way.
+///
+/// This constant governs the ordinary Focused profile as well, and that one did
+/// not need the raise: it lands at 64,702, inside the old 64 KiB. The lens
+/// projection is structurally the hotter of the two, so a shared ceiling is
+/// lens-bound by construction and the ordinary profile gains room it did not
+/// ask for. That is accepted rather than overlooked; splitting the constant
+/// would produce two numbers drifting toward the same argument.
+///
+/// Richard directed the raise rather than paring the surface back in the same
+/// change. It is justified under the spending rule `cc34ddc` proposes — bytes
+/// that remove a round trip are worth buying, bytes that only restate are not.
+/// These bytes remove one: per `#1063` an operation whose source tool declares
+/// no branches cannot advertise its field names and defers every first caller
+/// to `describe_operation`, so branching `manage_links` retires that round trip
+/// for three operations.
+///
+/// The new margin is 3,815 bytes. That is enough that an unrelated merge does
+/// not take the surface down, and deliberately not enough to absorb the rest of
+/// the sweep in `a193c01` — nine or so more tools in the same state, at roughly
+/// the same price each, so on the order of 8 KiB. Those do not fit, and should
+/// not be made to fit by arriving here again. Treat another approach to this ceiling as a signal to
+/// settle `cc34ddc` instead: what the tool surface may cost an agent's context.
+pub const FOCUSED_PROFILE_MAX_BYTES: usize = 69_632;
 /// Raised from 192 KiB to 224 KiB on 3 Sep 2026, deliberately and as a stopgap.
 ///
 /// The federated-lens Complete projection reached 196,637 bytes against the
@@ -3031,6 +3063,153 @@ pub fn register_membership_tool_schema(registry: &mut ToolRegistry) -> Result<()
         .mark_engine_operations_unavailable(ToolKind::ManageMemberships.name(), EngineKind::Sqlite)
 }
 
+/// Hosted external-source discovery. Only registered when the deployment
+/// configures the reach sidecar (`NATIVE_CE_REACH_URL` / `NATIVE_CE_REACH_SECRET`);
+/// otherwise the tool is absent, never an erroring stub.
+///
+/// Read-only: returns short pointers (title, snippet of at most 300
+/// characters, provider URL), never full content. Keeping a result means
+/// creating a short authored stub under the working record or folder and
+/// adding its provider URL through `manage_bindings` — never pasting snippets
+/// automatically. Log a worthwhile pass (question, source, time, hit count,
+/// including zero) as a note under the existing working record. First run has
+/// no working record: offer two or three `recent_activity` candidates and
+/// create NOTHING before the person ratifies. `search_notion` is title search,
+/// not full text; `recent_activity` is Notion-only in this version.
+const REACH_READ_DESCRIPTION: &str = "Hosted Slack/Notion/Linear discovery through the reach sidecar (absent unless configured). Returns short pointers only. source_status lists connected providers without minting consent URLs. search_slack requires a query; search_notion does optional title-only search; both take limit 1-20. recent_activity takes source=notion, window_days 1-30 and limit 1-5; it lists accessible last-edited pages and does not prove the person edited them. list_linear_projects takes limit 1-50. On first run, offer two or three recent candidates and create nothing until the person chooses. Keeping a result means authoring a short stub with a source facet and manage_bindings provider URL under the working record; never copy the returned snippet automatically. Log a worthwhile pass, including zero hits, under an existing working record only.";
+
+/// Mint a one-use provider consent URL. This creates consent-ticket state on
+/// the reach sidecar, so it is classified as a mutation even though it creates
+/// no Native record. Show the URL to the person; they complete authorization
+/// in the browser, then the agent proceeds with source_status or search.
+const REACH_CONNECT_DESCRIPTION: &str = "Hosted provider consent (absent unless the deployment configures reach). Mints a one-use consent URL for one supported provider (slack, notion, linear); the ticket expires after ten minutes. Show the consent_url to the person and wait for them to complete authorization in the browser before searching.";
+
+fn reach_read_schema() -> Value {
+    serde_json::json!({
+        "type":"object",
+        "oneOf":[
+            {
+                "type":"object",
+                "required":["action"],
+                "properties":{
+                    "action":{"const":"source_status"}
+                },
+                "additionalProperties":false
+            },
+            {
+                "type":"object",
+                "required":["action","query"],
+                "properties":{
+                    "action":{"const":"search_slack"},
+                    "query":{"type":"string","minLength":1,"maxLength":200},
+                    "limit":{"type":"integer","minimum":1,"maximum":20}
+                },
+                "additionalProperties":false
+            },
+            {
+                "type":"object",
+                "required":["action"],
+                "properties":{
+                    "action":{"const":"search_notion"},
+                    "query":{"type":"string","minLength":1,"maxLength":200},
+                    "limit":{"type":"integer","minimum":1,"maximum":20}
+                },
+                "additionalProperties":false
+            },
+            {
+                "type":"object",
+                "required":["action","source","window_days"],
+                "properties":{
+                    "action":{"const":"recent_activity"},
+                    "source":{"const":"notion","description":"Notion-only in this version; other sources are rejected."},
+                    "window_days":{"type":"integer","minimum":1,"maximum":30},
+                    "limit":{"type":"integer","minimum":1,"maximum":5}
+                },
+                "additionalProperties":false
+            },
+            {
+                "type":"object",
+                "required":["action"],
+                "properties":{
+                    "action":{"const":"list_linear_projects"},
+                    "limit":{"type":"integer","minimum":1,"maximum":50}
+                },
+                "additionalProperties":false
+            }
+        ]
+    })
+}
+
+fn reach_connect_schema() -> Value {
+    serde_json::json!({
+        "type":"object",
+        "required":["provider"],
+        "properties":{
+            "provider":{"type":"string","enum":["slack","notion","linear"]}
+        },
+        "additionalProperties":false
+    })
+}
+
+/// Register the hosted reach discovery descriptor against one narrow execution
+/// delegate. stdio never calls this; serve calls it only when the reach
+/// sidecar is configured.
+#[doc(hidden)]
+pub fn register_reach_read_tool_with<F, Fut>(registry: &mut ToolRegistry, handler: F) -> Result<()>
+where
+    F: Fn(Db, Caller, Value) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<Value>> + Send + 'static,
+{
+    registry.register(
+        ToolKind::ReachRead,
+        REACH_READ_DESCRIPTION,
+        reach_read_schema(),
+        handler,
+    )
+}
+
+/// Register the hosted reach consent descriptor against one narrow execution
+/// delegate. stdio never calls this; serve calls it only when the reach
+/// sidecar is configured.
+#[doc(hidden)]
+pub fn register_reach_connect_tool_with<F, Fut>(
+    registry: &mut ToolRegistry,
+    handler: F,
+) -> Result<()>
+where
+    F: Fn(Db, Caller, Value) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<Value>> + Send + 'static,
+{
+    registry.register(
+        ToolKind::ReachConnect,
+        REACH_CONNECT_DESCRIPTION,
+        reach_connect_schema(),
+        handler,
+    )
+}
+
+/// Register only the maximal-hosted reach descriptors for deterministic
+/// generators.
+///
+/// Generated registries are never dispatched; hosted composition must use a
+/// concrete handler through [`register_reach_read_tool_with`] and
+/// [`register_reach_connect_tool_with`].
+#[doc(hidden)]
+pub fn register_reach_tool_schema(registry: &mut ToolRegistry) -> Result<()> {
+    register_reach_read_tool_with(registry, |_db, _caller, _arguments| async {
+        Err(Error::engine(
+            "reach_read schema-only delegate cannot be dispatched",
+        ))
+    })?;
+    registry.mark_engine_operations_unavailable(ToolKind::ReachRead.name(), EngineKind::Sqlite)?;
+    register_reach_connect_tool_with(registry, |_db, _caller, _arguments| async {
+        Err(Error::engine(
+            "reach_connect schema-only delegate cannot be dispatched",
+        ))
+    })?;
+    registry.mark_engine_operations_unavailable(ToolKind::ReachConnect.name(), EngineKind::Sqlite)
+}
+
 #[cfg(test)]
 mod hosting_context_tests {
     use std::sync::Arc;
@@ -3039,6 +3218,33 @@ mod hosting_context_tests {
     use serde_json::json;
 
     use super::{Caller, ToolRegistry};
+
+    #[test]
+    fn reach_executor_access_derives_from_registered_dispositions() {
+        let mut registry = ToolRegistry::new();
+        super::register_reach_tool_schema(&mut registry).unwrap();
+        for action in [
+            "source_status",
+            "search_slack",
+            "search_notion",
+            "recent_activity",
+            "list_linear_projects",
+        ] {
+            assert_eq!(
+                registry
+                    .registered_operation_access("reach_read", &json!({"action": action}))
+                    .unwrap(),
+                super::OperationAccess::Read,
+                "{action}"
+            );
+        }
+        assert_eq!(
+            registry
+                .registered_operation_access("reach_connect", &json!({"provider": "slack"}))
+                .unwrap(),
+            super::OperationAccess::Mutation
+        );
+    }
 
     #[tokio::test]
     async fn standby_discovery_and_dispatch_share_one_fail_closed_policy() {
@@ -3054,10 +3260,11 @@ mod hosting_context_tests {
             .iter()
             .find(|tool| tool.name == "manage_links")
             .expect("mixed read tool stays discoverable");
-        assert_eq!(
-            links.descriptor["inputSchema"]["properties"]["action"]["enum"],
-            json!(["list"])
-        );
+        let branches = links.descriptor["inputSchema"]["oneOf"]
+            .as_array()
+            .expect("branched standby manage_links schema");
+        assert_eq!(branches.len(), 1);
+        assert_eq!(branches[0]["properties"]["action"]["const"], json!("list"));
         assert!(!links.descriptor["inputSchema"]["required"]
             .as_array()
             .unwrap()

@@ -7,7 +7,7 @@
   "candidate_surfaces": {
     "stable": {
       "ordinary": {
-        "descriptor_bytes": 39871,
+        "descriptor_bytes": 41262,
         "descriptors": [
           {
             "name": "bootstrap",
@@ -66,7 +66,9 @@
                     "membership_remove",
                     "export",
                     "canvas_read",
-                    "canvas_write"
+                    "canvas_write",
+                    "reach_read",
+                    "reach_connect"
                   ]
                 },
                 "operation": {
@@ -2110,6 +2112,7 @@
                   "enum": [
                     "read_canvas.changes",
                     "read_canvas.describe",
+                    "read_canvas.export",
                     "read_canvas.get_scene"
                   ]
                 },
@@ -2273,11 +2276,87 @@
               "idempotentHint": true,
               "openWorldHint": false
             }
+          },
+          {
+            "name": "reach_read",
+            "title": "Reach read",
+            "description": "Inspect connected providers and discover bounded pointers from hosted external work sources.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "operation": {
+                  "type": "string",
+                  "enum": [
+                    "reach_read.list_linear_projects",
+                    "reach_read.recent_activity",
+                    "reach_read.search_notion",
+                    "reach_read.search_slack",
+                    "reach_read.source_status"
+                  ]
+                },
+                "arguments": {
+                  "type": "object",
+                  "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                },
+                "run_key": {
+                  "type": "string"
+                },
+                "parent_key": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "operation"
+              ],
+              "additionalProperties": false
+            },
+            "annotations": {
+              "readOnlyHint": true,
+              "destructiveHint": false,
+              "idempotentHint": true,
+              "openWorldHint": true
+            }
+          },
+          {
+            "name": "reach_connect",
+            "title": "Reach connect",
+            "description": "Mint a one-use browser consent URL for a hosted external work source.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "operation": {
+                  "type": "string",
+                  "enum": [
+                    "connect_source"
+                  ]
+                },
+                "arguments": {
+                  "type": "object",
+                  "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                },
+                "run_key": {
+                  "type": "string"
+                },
+                "parent_key": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "operation"
+              ],
+              "additionalProperties": false
+            },
+            "annotations": {
+              "readOnlyHint": false,
+              "destructiveHint": false,
+              "idempotentHint": false,
+              "openWorldHint": true
+            }
           }
         ]
       },
       "lens": {
-        "descriptor_bytes": 47272,
+        "descriptor_bytes": 47293,
         "descriptors": [
           {
             "name": "bootstrap",
@@ -4645,6 +4724,7 @@
                   "enum": [
                     "read_canvas.changes",
                     "read_canvas.describe",
+                    "read_canvas.export",
                     "read_canvas.get_scene"
                   ]
                 },
@@ -6892,6 +6972,18 @@
     },
     {
       "legacy_tool": "read_canvas",
+      "legacy_action": "export",
+      "stability": "stable",
+      "availability": [
+        "ordinary",
+        "lens"
+      ],
+      "candidate_executor": "canvas_read",
+      "candidate_operation": "read_canvas.export",
+      "candidate_plan_policy": "direct"
+    },
+    {
+      "legacy_tool": "read_canvas",
       "legacy_action": "get_scene",
       "stability": "stable",
       "availability": [
@@ -7057,6 +7149,72 @@
       "candidate_executor": "membership_admin",
       "candidate_operation": "manage_memberships.set_role",
       "candidate_plan_policy": "plan_required"
+    },
+    {
+      "legacy_tool": "reach_read",
+      "legacy_action": "list_linear_projects",
+      "stability": "stable",
+      "availability": [
+        "ordinary"
+      ],
+      "candidate_executor": "reach_read",
+      "candidate_operation": "reach_read.list_linear_projects",
+      "candidate_plan_policy": "direct"
+    },
+    {
+      "legacy_tool": "reach_read",
+      "legacy_action": "recent_activity",
+      "stability": "stable",
+      "availability": [
+        "ordinary"
+      ],
+      "candidate_executor": "reach_read",
+      "candidate_operation": "reach_read.recent_activity",
+      "candidate_plan_policy": "direct"
+    },
+    {
+      "legacy_tool": "reach_read",
+      "legacy_action": "search_notion",
+      "stability": "stable",
+      "availability": [
+        "ordinary"
+      ],
+      "candidate_executor": "reach_read",
+      "candidate_operation": "reach_read.search_notion",
+      "candidate_plan_policy": "direct"
+    },
+    {
+      "legacy_tool": "reach_read",
+      "legacy_action": "search_slack",
+      "stability": "stable",
+      "availability": [
+        "ordinary"
+      ],
+      "candidate_executor": "reach_read",
+      "candidate_operation": "reach_read.search_slack",
+      "candidate_plan_policy": "direct"
+    },
+    {
+      "legacy_tool": "reach_read",
+      "legacy_action": "source_status",
+      "stability": "stable",
+      "availability": [
+        "ordinary"
+      ],
+      "candidate_executor": "reach_read",
+      "candidate_operation": "reach_read.source_status",
+      "candidate_plan_policy": "direct"
+    },
+    {
+      "legacy_tool": "reach_connect",
+      "legacy_action": "call",
+      "stability": "stable",
+      "availability": [
+        "ordinary"
+      ],
+      "candidate_executor": "reach_connect",
+      "candidate_operation": "connect_source",
+      "candidate_plan_policy": "direct"
     },
     {
       "legacy_tool": "experimental_freshness_agent_intent",

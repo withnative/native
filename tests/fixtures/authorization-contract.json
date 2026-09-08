@@ -3892,6 +3892,150 @@
       "rationale": "Revocation terminates a live join route and is hosted control-plane authority."
     },
     {
+      "tool": "reach_read",
+      "action": "source_status",
+      "disposition": "specialized",
+      "risk_tier": "high",
+      "fixture": "hosted-reach",
+      "expected_threshold": "hosted-member-with-configured-reach",
+      "access": "read",
+      "non_disclosure": true,
+      "no_write_on_deny": false,
+      "positive_evidence": {
+        "status": "test",
+        "file": "held/hosting/src/hosting/reach_tools.rs",
+        "test": "every_discovery_operation_round_trips_its_result_shape",
+        "claim": "Authorized reach_read.source_status succeeds at threshold hosted-member-with-configured-reach and reports connected providers."
+      },
+      "negative_evidence": {
+        "status": "test",
+        "file": "held/hosting/src/hosting/reach_tools.rs",
+        "test": "stdio_caller_is_refused_before_any_network",
+        "claim": "reach_read.source_status rejects a caller without hosted database context before any service call."
+      },
+      "rationale": "Hosted external-source discovery acts on one account's provider connections; only a hosted member of the selected database may invoke it."
+    },
+    {
+      "tool": "reach_read",
+      "action": "search_slack",
+      "disposition": "specialized",
+      "risk_tier": "high",
+      "fixture": "hosted-reach",
+      "expected_threshold": "hosted-member-with-configured-reach",
+      "access": "read",
+      "non_disclosure": true,
+      "no_write_on_deny": false,
+      "positive_evidence": {
+        "status": "test",
+        "file": "held/hosting/src/hosting/reach_tools.rs",
+        "test": "reach_read_forwards_hosted_identity_and_returns_results",
+        "claim": "Authorized reach_read.search_slack succeeds at threshold hosted-member-with-configured-reach and returns bounded pointers."
+      },
+      "negative_evidence": {
+        "status": "test",
+        "file": "held/hosting/src/hosting/reach_tools.rs",
+        "test": "argument_bounds_fail_before_any_network",
+        "claim": "reach_read.search_slack rejects empty, overlong, or out-of-range arguments before any service call."
+      },
+      "rationale": "Hosted external-source discovery acts on one account's provider connections; only a hosted member of the selected database may invoke it."
+    },
+    {
+      "tool": "reach_read",
+      "action": "search_notion",
+      "disposition": "specialized",
+      "risk_tier": "high",
+      "fixture": "hosted-reach",
+      "expected_threshold": "hosted-member-with-configured-reach",
+      "access": "read",
+      "non_disclosure": true,
+      "no_write_on_deny": false,
+      "positive_evidence": {
+        "status": "test",
+        "file": "held/hosting/src/hosting/reach_tools.rs",
+        "test": "every_discovery_operation_round_trips_its_result_shape",
+        "claim": "Authorized reach_read.search_notion succeeds at threshold hosted-member-with-configured-reach and returns bounded title pointers."
+      },
+      "negative_evidence": {
+        "status": "test",
+        "file": "held/hosting/src/hosting/reach_tools.rs",
+        "test": "argument_bounds_fail_before_any_network",
+        "claim": "reach_read.search_notion rejects overlong or out-of-range arguments before any service call."
+      },
+      "rationale": "Hosted external-source discovery acts on one account's provider connections; only a hosted member of the selected database may invoke it."
+    },
+    {
+      "tool": "reach_read",
+      "action": "recent_activity",
+      "disposition": "specialized",
+      "risk_tier": "high",
+      "fixture": "hosted-reach",
+      "expected_threshold": "hosted-member-with-configured-reach",
+      "access": "read",
+      "non_disclosure": true,
+      "no_write_on_deny": false,
+      "positive_evidence": {
+        "status": "test",
+        "file": "held/hosting/src/hosting/reach_tools.rs",
+        "test": "every_discovery_operation_round_trips_its_result_shape",
+        "claim": "Authorized reach_read.recent_activity succeeds at threshold hosted-member-with-configured-reach and returns bounded candidates."
+      },
+      "negative_evidence": {
+        "status": "test",
+        "file": "held/hosting/src/hosting/reach_tools.rs",
+        "test": "argument_bounds_fail_before_any_network",
+        "claim": "reach_read.recent_activity rejects non-Notion sources and out-of-range windows before any service call."
+      },
+      "rationale": "Hosted external-source discovery acts on one account's provider connections; only a hosted member of the selected database may invoke it."
+    },
+    {
+      "tool": "reach_read",
+      "action": "list_linear_projects",
+      "disposition": "specialized",
+      "risk_tier": "high",
+      "fixture": "hosted-reach",
+      "expected_threshold": "hosted-member-with-configured-reach",
+      "access": "read",
+      "non_disclosure": true,
+      "no_write_on_deny": false,
+      "positive_evidence": {
+        "status": "test",
+        "file": "held/hosting/src/hosting/reach_tools.rs",
+        "test": "every_discovery_operation_round_trips_its_result_shape",
+        "claim": "Authorized reach_read.list_linear_projects succeeds at threshold hosted-member-with-configured-reach and returns bounded projects."
+      },
+      "negative_evidence": {
+        "status": "test",
+        "file": "held/hosting/src/hosting/reach_tools.rs",
+        "test": "argument_bounds_fail_before_any_network",
+        "claim": "reach_read.list_linear_projects rejects out-of-range limits before any service call."
+      },
+      "rationale": "Hosted external-source discovery acts on one account's provider connections; only a hosted member of the selected database may invoke it."
+    },
+    {
+      "tool": "reach_connect",
+      "action": "$tool",
+      "disposition": "specialized",
+      "risk_tier": "high",
+      "fixture": "hosted-reach",
+      "expected_threshold": "hosted-member-with-configured-reach",
+      "access": "mutation",
+      "non_disclosure": true,
+      "no_write_on_deny": true,
+      "positive_evidence": {
+        "status": "test",
+        "file": "held/hosting/src/hosting/reach_tools.rs",
+        "test": "every_discovery_operation_round_trips_its_result_shape",
+        "claim": "Authorized reach_connect.$tool succeeds at threshold hosted-member-with-configured-reach and returns a one-use consent URL."
+      },
+      "negative_evidence": {
+        "status": "test",
+        "file": "held/hosting/src/hosting/reach_tools.rs",
+        "test": "stdio_caller_is_refused_before_any_network",
+        "claim": "reach_connect.$tool rejects a caller without hosted database context and mints no ticket."
+      },
+      "rationale": "Consent-ticket minting creates credential-adjacent state on the reach sidecar; only a hosted member of the selected database may invoke it."
+    },
+    {
       "tool": "manage_change_summaries",
       "action": "create_or_reuse",
       "disposition": "specialized",
@@ -4322,6 +4466,30 @@
         "claim": "read_canvas.describe counts a card on a record below the threshold without naming it or its record."
       },
       "rationale": "The outline is built from the redacted scene get_scene returns, so a card the caller may not see is counted but never named."
+    },
+    {
+      "tool": "read_canvas",
+      "action": "export",
+      "disposition": "record_view",
+      "risk_tier": "high",
+      "fixture": "canvas",
+      "expected_threshold": "view-canvas-and-visible-card-records",
+      "access": "read",
+      "non_disclosure": true,
+      "no_write_on_deny": false,
+      "positive_evidence": {
+        "status": "test",
+        "file": "tests/tools/canvas.rs",
+        "test": "export_bundles_scene_and_full_history_with_complete_true_for_the_owner",
+        "claim": "Authorized read_canvas.export succeeds at threshold view-canvas-and-visible-card-records."
+      },
+      "negative_evidence": {
+        "status": "test",
+        "file": "tests/tools/canvas.rs",
+        "test": "export_without_view_fails_like_get_scene",
+        "claim": "read_canvas.export rejects a caller below view-canvas-and-visible-card-records as a non-existent record."
+      },
+      "rationale": "The bundle needs View on the canvas; its scene and history sections are built by calling get_scene and changes on one snapshot transaction, so it inherits their per-caller redaction rather than restating it, and disclosure.complete reports whether anything was withheld."
     },
     {
       "tool": "manage_canvas",

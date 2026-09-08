@@ -445,18 +445,42 @@ pub fn register_link_tools(registry: &mut ToolRegistry) -> Result<()> {
          viewer-relative live page. {PREVIOUS_SEQ_DESCRIPTION}"),
         json!({
             "type": "object",
-            "properties": {
-                "action": { "type": "string", "enum": ["add", "remove", "list"] },
-                "source_id": { "type": "string" },
-                "target_id": { "type": "string" },
-                "relationship": { "type": "string" },
-                "note": { "type": "string", "description": "add: optional link note." },
-                "record_id": { "type": "string", "description": "list: record to page." },
-                "limit": { "type": "integer", "minimum": 1, "maximum": 200, "default": 50, "description": "list: bounded live-page work." },
-                "cursor": { "type": "string", "description": "list: opaque prior-page continuation." }
-            },
-            "required": ["action"],
-            "additionalProperties": false
+            "oneOf": [
+                {
+                    "type": "object",
+                    "properties": {
+                        "action": { "const": "add" },
+                        "source_id": { "type": "string" },
+                        "target_id": { "type": "string" },
+                        "relationship": { "type": "string" },
+                        "note": { "type": "string", "description": "Optional link note." }
+                    },
+                    "required": ["action", "source_id", "target_id", "relationship"],
+                    "additionalProperties": false
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "action": { "const": "remove" },
+                        "source_id": { "type": "string" },
+                        "target_id": { "type": "string" },
+                        "relationship": { "type": "string" }
+                    },
+                    "required": ["action", "source_id", "target_id", "relationship"],
+                    "additionalProperties": false
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "action": { "const": "list" },
+                        "record_id": { "type": "string", "description": "Record to page." },
+                        "limit": { "type": "integer", "minimum": 1, "maximum": 200, "default": 50, "description": "Bounded live-page work." },
+                        "cursor": { "type": "string", "description": "Opaque prior-page continuation." }
+                    },
+                    "required": ["action", "record_id"],
+                    "additionalProperties": false
+                }
+            ]
         }),
         manage_links,
     )?;

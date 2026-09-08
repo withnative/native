@@ -23,7 +23,7 @@ pub const INVOCATION_VERSION: &str = "native.artifact-invocation.v1";
 pub const INTENT_RESULT_VERSION: &str = "native.artifact-intent-result.v2";
 
 const RESULT_CHANGE_LIMIT: usize = 100;
-const RESULT_REFRESH_JSON_LIMIT: usize = 1_048_576;
+pub const RESULT_REFRESH_JSON_LIMIT: usize = 1_048_576;
 const MAX_SLOTS: usize = 32;
 const MAX_INVOCATION_VALUE_BYTES: usize = 262_144;
 const MAX_INVOCATION_VALUE_DEPTH: usize = 8;
@@ -55,6 +55,14 @@ pub struct ArtifactInvocation {
     pub idempotency_key: String,
     #[serde(default)]
     pub gesture: Option<String>,
+    /// Opt-in: when true and the invocation commits, the host attaches the
+    /// next authoritative render plan under `refresh.plan`, so one exchange
+    /// covers both the write and the re-render. Omitted (false) is the fast
+    /// receipt: no render, no plan. This flag changes nothing about the
+    /// committed effect, so it is deliberately NOT part of the idempotency
+    /// digest — a retry with the flag flipped replays the same commit.
+    #[serde(default)]
+    pub include_next_plan: bool,
 }
 
 /// An authoritative host response. Each status carries only the fields
@@ -474,6 +482,7 @@ mod tests {
             )]),
             idempotency_key: "k".into(),
             gesture: Some("click".into()),
+            include_next_plan: false,
         }
     }
 
@@ -724,6 +733,37 @@ mod tests {
         assert_eq!(
             forged.validate_shape(),
             Err("result facet version is not a host-issued token")
+        );
+    }
+
+    /// The next-plan opt-in is additive: an older caller that never heard of
+    /// it omits the field and gets the fast receipt, while a newer caller can
+    /// round-trip it. It needs no shape validation of its own — it is a bool,
+    /// and it changes nothing about the committed effect.
+    #[test]
+    fn the_next_plan_opt_in_defaults_off_and_round_trips() {
+        // Omitted on the wire means false: current behaviour is unchanged.
+        let legacy = serde_json::json!({
+            "version": INVOCATION_VERSION,
+            "artifact_id": "a",
+            "entry_id": "mark_triaged",
+            "source_digest": "a".repeat(64),
+            "slots": { "record": "r" },
+            "observed": { "r": { "triage": "obs:12" } },
+            "idempotency_key": "k",
+        });
+        let decoded: ArtifactInvocation = serde_json::from_value(legacy).unwrap();
+        assert!(!decoded.include_next_plan);
+        assert!(decoded.validate_shape().is_ok());
+
+        let mut opted_in = invocation();
+        opted_in.include_next_plan = true;
+        assert!(opted_in.validate_shape().is_ok());
+        let encoded = serde_json::to_value(&opted_in).unwrap();
+        assert_eq!(encoded["include_next_plan"], true);
+        assert_eq!(
+            serde_json::from_value::<ArtifactInvocation>(encoded).unwrap(),
+            opted_in
         );
     }
 }

@@ -33,6 +33,119 @@ workspace authority. A future system could use this separation to make larger
 parts of the product shell user-authored, but whole-Workbench replacement is
 directional rather than a shipped promise.
 
+## One Collection, two authored views
+
+Suppose a governed Collection contains the tasks for a launch. Create
+two `Document kind:artifact` records with `facets.runtime: "native.mdx.v2"`.
+Each body starts with this same declaration, followed by one of the view
+fragments below:
+
+```mdx
+export const nativeArtifact = {
+  schema: "native.mdx.artifact.v2",
+  inputs: {
+    items: {
+      envelope: "native.collection-envelope.v1",
+      required: true,
+      expose_to_root: true
+    }
+  },
+  module_inputs: {},
+  capability_requests: [
+    { capability: "input.read", scope: { port: "items" } },
+    { capability: "navigation.record.user_gesture", scope: {} }
+  ]
+}
+```
+
+The first body presents a compact table:
+
+```mdx
+# Launch tasks
+
+{native.inputs.items.records.length
+  ? <RecordTable records={native.inputs.items.records} columns={["name", "summary"]} />
+  : <EmptyState title="No visible items" />}
+```
+
+The second presents the same records as a grid of cards:
+
+```mdx
+# Launch overview
+
+{native.inputs.items.records.length
+  ? <Grid columns={3} gap={3}>
+      {native.inputs.items.records.map(item =>
+        <RecordCard record={item} fields={["name", "summary"]} />)}
+    </Grid>
+  : <EmptyState title="No visible items" />}
+```
+
+For **each artifact**, call `manage_artifact_inputs` with the following
+arguments, substituting its artifact ID and the same Collection ID:
+
+```json
+{
+  "action": "bind",
+  "artifact_id": "<artifact UUID>",
+  "port_name": "items",
+  "collection_id": "<launch Collection UUID>"
+}
+```
+
+Then call `manage_artifact_module_grants` with
+`{ "action": "read", "artifact_id": "<artifact UUID>" }` to inspect that
+artifact's exact source subject. For its `input.read` request, grant using the
+returned `subject_event_id` and `source_sha256`:
+
+```json
+{
+  "action": "grant",
+  "artifact_id": "<artifact UUID>",
+  "subject_kind": "artifact_source",
+  "subject_record_id": "<artifact UUID>",
+  "subject_event_id": "<source event UUID from read>",
+  "source_sha256": "<source digest from read>",
+  "capability": "input.read",
+  "scope": { "artifact_port": "items" }
+}
+```
+
+Issue a second grant against the same subject with
+`"capability": "navigation.record.user_gesture"` and `"scope": {}`.
+The record components require this declared and granted navigation capability;
+it lets the host open a record on a person's click. Finally, call
+`render_artifact` with `{ "id": "<artifact UUID>" }` for each artifact.
+The placeholders above stand for actual IDs and digests, not literal values.
+
+Both views read canonical objects from `native.inputs.items.records`. Neither
+stores its own copy of the launch tasks. Given the same content snapshot and
+caller authority, both resolve the same cohort; later opens reflect changes to
+the governed records. Different callers can see different authorized subsets,
+and separate live renders can observe different revisions.
+
+The presentation is reusable because it names the `items` contract, not the
+launch Collection ID. To show another project, bind an artifact's
+`items` port to an authorized project Collection that resolves the same
+`native.collection-envelope.v1` contract. These fragments use only the standard
+`name` and `summary` fields, so they do not depend on a launch-specific facet.
+A view that uses custom facets also depends on those facets being present in
+the relevant record scope. A governed-SQL relation is a different contract:
+changing the bound Collection does not turn these `.records` expressions into
+`.relation.rows`, or satisfy a relation's declared schema and semantic versions.
+
+Reuse does not share authority: a second artifact needs its own bindings and
+exact-source grants. Reusable MDX modules apply the same idea to shared
+presentation code through exact publication pins and explicit port mappings,
+as described below. Adding editing controls requires a declared, supported MDX
+interaction that the host validates and reauthorizes on invocation. An HTML
+version can present the named read-only input but cannot acquire that mutation
+surface.
+
+The [artifact row of the capability map](capability-map.md) links the selected
+runtime policy and executable evidence for named inputs, exact-source grants,
+record components and compatible input resolution.
+
 ## `native.html.v1`
 
 `native.html.v1` accepts a complete, self-contained authored HTML document and
@@ -74,7 +187,13 @@ closed before hashing or delivery when any integer is outside
 `[-9007199254740991, 9007199254740991]`; this applies to collection facets and
 governed-SQL rows alike. HTML has no module imports, mutation surface, or
 network authority. Historical governed-SQL relation execution is explicitly
-unsupported and fails closed until a portable replay contract exists.
+unsupported and fails closed until a portable replay contract exists. The host
+performs no wall-clock liveness polling of the frame: it arms only a
+bootstrap-handshake timeout. The frame announces a non-persisted `pagehide`
+over the bridge, and the host answers that announcement by requesting a fresh
+launch, because a reloaded frame lands on a consumed one-use ticket and can
+neither bootstrap again nor be observed by any host-side timer; only repeated
+reloads fail shut with a diagnostic.
 
 ## `native.mdx.v1`
 

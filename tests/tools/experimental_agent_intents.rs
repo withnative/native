@@ -228,11 +228,24 @@ fn descriptor_exposes_closed_nested_contracts_and_run_correlation() {
     register_surface_tools(&mut registry).unwrap();
     assert!(registry.get(TOOL).is_none());
     let stable_count = registry.specs().count();
-    assert_eq!(stable_count, ToolKind::ALL.len() - 3);
+    let separately_registered = [
+        ToolKind::StandbyStatus,
+        ToolKind::ExportSnapshot,
+        ToolKind::ManageMemberships,
+        ToolKind::ReachRead,
+        ToolKind::ReachConnect,
+    ];
+    assert_eq!(
+        stable_count,
+        ToolKind::ALL.len() - separately_registered.len()
+    );
+    for kind in separately_registered {
+        assert!(registry.get(kind.name()).is_none(), "{}", kind.name());
+    }
     assert!(registry.specs().all(|spec| spec.kind.is_some()));
     register_experimental_agent_intent_tool(&mut registry).unwrap();
     register_snapshot_tool(&mut registry, Arc::new(LocalSnapshotSource::new())).unwrap();
-    assert_eq!(registry.specs().count(), ToolKind::ALL.len() - 1);
+    assert_eq!(registry.specs().count(), stable_count + 2);
     assert!(registry.get(TOOL).unwrap().kind.is_none());
     assert!(!registry
         .specs_for_profile(ExposureProfile::Focused)

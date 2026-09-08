@@ -807,25 +807,24 @@ fn preflight_read_only_call(
     registry.preflight_deployment_call(name, arguments)
 }
 
-/// Legacy `tools/call`: Ok is a full MCP call-tool result (success or
-/// `isError: true`); Err is a JSON-RPC-level failure.
-async fn legacy_tools_call_result(
+/// The `tools/call` stages both protocol eras share: Ok is a full MCP
+/// call-tool result (success or `isError: true`); Err is a JSON-RPC-level
+/// failure. Era-specific framing stays with the callers.
+async fn tools_call_kernel(
     registry: &ToolRegistry,
     engine: EngineHandle,
     caller: Caller,
-    params: &Value,
+    name: Option<&str>,
+    arguments: Option<&Value>,
     persistence_lease: Option<DeploymentPersistenceLease>,
 ) -> std::result::Result<Value, (i64, String)> {
-    let Some(name) = params.get("name").and_then(Value::as_str) else {
+    let Some(name) = name else {
         return Err((INVALID_PARAMS, "invalid params: missing tool name".into()));
     };
     let Some(tool) = registry.get(name) else {
         return Err((INVALID_PARAMS, format!("unknown tool: {name}")));
     };
-    let mut arguments = params
-        .get("arguments")
-        .cloned()
-        .unwrap_or_else(|| json!({}));
+    let mut arguments = arguments.cloned().unwrap_or_else(|| json!({}));
     if let Err(error) =
         preflight_read_only_call(registry, name, &arguments, persistence_lease.as_ref())
     {
@@ -908,6 +907,26 @@ async fn legacy_tools_call_result(
         }
         Err(err) => Err((INTERNAL_ERROR, err.to_string())),
     }
+}
+
+/// Legacy `tools/call`: Ok is a full MCP call-tool result (success or
+/// `isError: true`); Err is a JSON-RPC-level failure.
+async fn legacy_tools_call_result(
+    registry: &ToolRegistry,
+    engine: EngineHandle,
+    caller: Caller,
+    params: &Value,
+    persistence_lease: Option<DeploymentPersistenceLease>,
+) -> std::result::Result<Value, (i64, String)> {
+    tools_call_kernel(
+        registry,
+        engine,
+        caller,
+        params.get("name").and_then(Value::as_str),
+        params.get("arguments"),
+        persistence_lease,
+    )
+    .await
 }
 
 pub(crate) fn validate_implementation(value: &Value) -> std::result::Result<(), String> {
@@ -1180,104 +1199,21 @@ async fn tools_call_result(
     params: &serde_json::Map<String, Value>,
     persistence_lease: Option<DeploymentPersistenceLease>,
 ) -> std::result::Result<Value, (i64, String)> {
-    let Some(name) = params.get("name").and_then(Value::as_str) else {
-        return Err((INVALID_PARAMS, "invalid params: missing tool name".into()));
-    };
-    let Some(tool) = registry.get(name) else {
-        return Err((INVALID_PARAMS, format!("unknown tool: {name}")));
-    };
-    let mut arguments = params
-        .get("arguments")
-        .cloned()
-        .unwrap_or_else(|| json!({}));
-    if let Err(error) =
-        preflight_read_only_call(registry, name, &arguments, persistence_lease.as_ref())
-    {
-        let mut result = call_error_content(
-            &error,
-            Value::Null,
-            tool.ui.as_ref().map(|ui| ui.resource_uri),
-        );
+    let result = tools_call_kernel(
+        registry,
+        engine,
+        caller,
+        params.get("name").and_then(Value::as_str),
+        params.get("arguments"),
+        persistence_lease,
+    )
+    .await;
+    // The era's own envelope fields wrap the shared framing, so the
+    // text/JSON decision lives in exactly one place.
+    result.map(|mut result| {
         add_modern_result_fields(&mut result);
-        return Ok(result);
-    }
-    let format = if tool.ui.is_some() {
-        if let Err(message) = render::reject_format(&arguments, "MCP App tool") {
-            let run_context = registry
-                .run_context_for_engine(&engine, caller, &arguments)
-                .await;
-            let mut result = call_error_content(
-                &Error::engine(message),
-                run_context,
-                tool.ui.as_ref().map(|ui| ui.resource_uri),
-            );
-            add_modern_result_fields(&mut result);
-            return Ok(result);
-        }
-        render::Format::App
-    } else {
-        match render::take_format(name, &mut arguments) {
-            Ok(format) => format,
-            Err(message) => {
-                let run_context = registry
-                    .run_context_for_engine(&engine, caller, &arguments)
-                    .await;
-                let mut result = call_error_content(&Error::engine(message), run_context, None);
-                add_modern_result_fields(&mut result);
-                return Ok(result);
-            }
-        }
-    };
-    let dispatched = match persistence_lease {
-        Some(lease) => {
-            registry
-                .call_engine_detailed_with_persistence(engine, caller, name, arguments, lease)
-                .await
-        }
-        None => {
-            registry
-                .call_engine_detailed(engine, caller, name, arguments)
-                .await
-        }
-    };
-    let call = match dispatched {
-        Ok(call) => call,
-        Err(error @ Error::DeploymentReadOnly(_)) => {
-            let mut result = call_error_content(
-                &error,
-                Value::Null,
-                tool.ui.as_ref().map(|ui| ui.resource_uri),
-            );
-            add_modern_result_fields(&mut result);
-            return Ok(result);
-        }
-        Err(error) => return Err((INTERNAL_ERROR, error.to_string())),
-    };
-    match call.outcome {
-        Ok(mut value) => {
-            // The era's own envelope fields wrap the shared framing, so the
-            // text/JSON decision lives in exactly one place.
-            value.structured = attach_run_context(value.structured, call.run_context);
-            let mut result = call_result_content(
-                name,
-                format,
-                value,
-                tool.ui.as_ref().map(|ui| ui.resource_uri),
-            );
-            add_modern_result_fields(&mut result);
-            Ok(result)
-        }
-        Err(err @ (Error::Engine(_) | Error::Conflict(_) | Error::Auth(_))) => {
-            let mut result = call_error_content(
-                &err,
-                call.run_context,
-                tool.ui.as_ref().map(|ui| ui.resource_uri),
-            );
-            add_modern_result_fields(&mut result);
-            Ok(result)
-        }
-        Err(err) => Err((INTERNAL_ERROR, err.to_string())),
-    }
+        result
+    })
 }
 
 pub(crate) fn add_modern_result_fields(result: &mut Value) {
@@ -1682,10 +1618,11 @@ mod tests {
                 .iter()
                 .find(|tool| tool["name"] == "manage_links")
                 .unwrap();
-            assert_eq!(
-                links["inputSchema"]["properties"]["action"]["enum"],
-                json!(["list"])
-            );
+            let branches = links["inputSchema"]["oneOf"]
+                .as_array()
+                .expect("branched standby manage_links schema");
+            assert_eq!(branches.len(), 1);
+            assert_eq!(branches[0]["properties"]["action"]["const"], json!("list"));
 
             // The capability boundary wins over renderer and handler argument
             // parsing, so deliberately malformed write arguments still return

@@ -4867,6 +4867,70 @@ fn render_read_canvas(value: &Value) -> String {
                 let _ = writeln!(out, "Continue with after: {next}");
             }
         }
+        Some("describe") => {
+            let _ = writeln!(
+                out,
+                "Canvas {canvas} at {version}: {} live object(s)",
+                claimed_integer(value.get("live_objects"), "live object count"),
+            );
+            // The outline is multi-line prose, so it is emitted verbatim:
+            // `claimed_string` would route it through `display_inline` and
+            // escape its newlines into literal `\n` sequences.
+            match value.get("outline").and_then(Value::as_str) {
+                Some(outline) => {
+                    let _ = writeln!(out, "{outline}");
+                }
+                _ => {
+                    let _ = writeln!(
+                        out,
+                        "Outline: {}",
+                        claimed_string(value.get("outline"), "outline"),
+                    );
+                }
+            }
+        }
+        Some("export") => {
+            // An export bundle is the full scene plus history plus references
+            // (bounded only by `export_bytes`), so rendering it as prose would
+            // either silently discard most of it or flood the model context.
+            // Summarise the shell honestly and point at the exact payload.
+            let id = claimed_string(
+                value.pointer("/canvas/id").or(value.get("canvas_id")),
+                "canvas id",
+            );
+            let objects = value
+                .pointer("/scene/objects")
+                .and_then(Value::as_array)
+                .map_or("(scene objects not reported)".to_string(), |objects| {
+                    format!("{} scene object(s)", objects.len())
+                });
+            let history = match value.get("history") {
+                None | Some(Value::Null) => "history excluded".to_string(),
+                Some(history) => match history.get("batches").and_then(Value::as_array) {
+                    Some(batches) => format!("{} history batch(es)", batches.len()),
+                    None => "(history batches not reported)".to_string(),
+                },
+            };
+            let _ = writeln!(
+                out,
+                "Canvas {id} at {version}: export bundle with {objects}, {history}."
+            );
+            if value.pointer("/disclosure/complete") == Some(&Value::Bool(false)) {
+                let _ = writeln!(
+                    out,
+                    "Note: this export withholds {} record(s) and {} assertion(s); see disclosure in structuredContent.",
+                    claimed_integer(
+                        value.pointer("/disclosure/withheld_records"),
+                        "withheld record count"
+                    ),
+                    claimed_integer(
+                        value.pointer("/disclosure/withheld_assertions"),
+                        "withheld assertion count"
+                    ),
+                );
+            }
+            out.push_str("Re-issue read_canvas export with format:\"json\" for the full bundle.\n");
+        }
         _ => {
             let _ = writeln!(
                 out,
@@ -4882,6 +4946,88 @@ fn batch_next_after(value: &Value) -> Option<String> {
         .get("next_after")
         .and_then(Value::as_str)
         .map(display_inline)
+}
+
+#[cfg(test)]
+mod read_canvas_tests {
+    use super::*;
+
+    #[test]
+    fn describe_renders_outline_verbatim_with_header() {
+        let outline = "This canvas holds 2 live objects: 1 sticky and 1 frame.\n\nNear (10, 20): a sticky saying hi.";
+        let rendered = render_read_canvas(&json!({
+            "action": "describe",
+            "canvas_id": "canvas-1",
+            "canvas_version": "7",
+            "outline": outline,
+            "live_objects": 2,
+        }));
+        assert!(
+            rendered.contains("Canvas canvas-1 at 7: 2 live object(s)"),
+            "{rendered}"
+        );
+        assert!(rendered.contains(outline), "{rendered}");
+        assert!(!rendered.contains("was not interpreted"), "{rendered}");
+    }
+
+    #[test]
+    fn describe_without_outline_is_honest_not_empty() {
+        let rendered = render_read_canvas(&json!({
+            "action": "describe",
+            "canvas_id": "canvas-1",
+            "canvas_version": "7",
+            "live_objects": 2,
+        }));
+        assert!(
+            rendered.contains("Canvas canvas-1 at 7: 2 live object(s)"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("(outline not reported)"), "{rendered}");
+        assert!(!rendered.contains("was not interpreted"), "{rendered}");
+    }
+
+    #[test]
+    fn export_summarises_shell_and_points_at_json() {
+        let rendered = render_read_canvas(&json!({
+            "action": "export",
+            "canvas": { "id": "canvas-9" },
+            "canvas_version": "12",
+            "scene": { "objects": [{}, {}] },
+            "history": { "batches": [{}] },
+            "disclosure": {
+                "complete": true,
+                "withheld_records": 0,
+                "withheld_assertions": 0,
+            },
+        }));
+        assert!(
+            rendered.contains(
+                "Canvas canvas-9 at 12: export bundle with 2 scene object(s), 1 history batch(es)."
+            ),
+            "{rendered}"
+        );
+        assert!(rendered.contains("format:\"json\""), "{rendered}");
+        assert!(!rendered.contains("was not interpreted"), "{rendered}");
+    }
+
+    #[test]
+    fn export_without_history_and_with_withholding_stays_honest() {
+        let rendered = render_read_canvas(&json!({
+            "action": "export",
+            "canvas": { "id": "canvas-9" },
+            "canvas_version": "12",
+            "scene": { "objects": [] },
+            "history": null,
+            "disclosure": {
+                "complete": false,
+                "withheld_records": 1,
+                "withheld_assertions": 2,
+            },
+        }));
+        assert!(rendered.contains("history excluded"), "{rendered}");
+        assert!(rendered.contains("withholds 1 record(s)"), "{rendered}");
+        assert!(rendered.contains("format:\"json\""), "{rendered}");
+    }
 }
 
 fn render_manage_canvas(value: &Value) -> String {

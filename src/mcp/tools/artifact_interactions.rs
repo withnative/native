@@ -55,7 +55,7 @@ use crate::store::{append_in, AppendSpec};
 
 use native_artifact_runtime::artifact_intents::{
     ArtifactIntentResult, ArtifactInvocation, CompetingActor, FacetVersion, IntentChange,
-    IntentError,
+    IntentError, RESULT_REFRESH_JSON_LIMIT,
 };
 use native_artifact_runtime::mdx_v2::{
     self, InteractionEffect, RecordCreateDestination, RecordCreateValue, RecordCreateValueDomain,
@@ -65,8 +65,8 @@ use native_artifact_runtime::mdx_v2::{
 use super::super::registry::{Caller, ToolRegistry};
 use super::super::ToolKind;
 use super::artifacts::{
-    resolve_artifact, resolve_bound_input_ports, resolve_bound_input_records, BoundPort,
-    V2SnapshotMode,
+    resolve_artifact, resolve_bound_input_ports, resolve_bound_input_records,
+    try_render_live_mdx_v2, BoundPort, V2SnapshotMode,
 };
 use super::lifecycle::{assert_required_not_worsened, parse_facet_entry, required_violations_in};
 use super::{can_record, can_record_in, parse_args, require_record};
@@ -135,6 +135,11 @@ fn encode(result: ArtifactIntentResult) -> Value {
 }
 
 fn invocation_digest(invocation: &ArtifactInvocation) -> Result<String> {
+    // `include_next_plan` is deliberately NOT part of this digest: it changes
+    // nothing about the committed effect, so a retry with the flag flipped
+    // replays the same commit rather than conflicting with it. The plan, if
+    // asked for, is attached after the replay resolves, per the current
+    // request.
     Ok(hex::encode(Sha256::digest(serde_jcs::to_vec(&json!({
         "version": invocation.version,
         "artifact_id": invocation.artifact_id,
@@ -165,6 +170,102 @@ fn committed_creation(invocation: &ArtifactInvocation, created: Value) -> Value 
         }],
         refresh: Some(json!({ "record": created })),
     })
+}
+
+/// Merge a bonus plan into a committed `refresh`, shaped like the existing
+/// `{ "record": ... }` convention (`{ "plan": ... }`, or both keys together
+/// when a creation already refreshed the created record). Returns `None`
+/// when the merged candidate would breach the refresh size cap or the
+/// existing refresh is not an object — the caller then keeps whatever refresh
+/// the commit produced, never an invalid result.
+fn refresh_with_next_plan(current: Option<&Value>, plan: Value) -> Option<Value> {
+    let mut merged = match current {
+        Some(Value::Object(existing)) => existing.clone(),
+        Some(_) => return None,
+        None => serde_json::Map::new(),
+    };
+    merged.insert("plan".into(), plan);
+    let candidate = Value::Object(merged);
+    match serde_json::to_vec(&candidate) {
+        Ok(bytes) if bytes.len() <= RESULT_REFRESH_JSON_LIMIT => Some(candidate),
+        _ => None,
+    }
+}
+
+/// The next-plan bonus: when the caller opted in with `include_next_plan`
+/// and the invocation committed, attach the fresh authoritative plan under
+/// `refresh.plan`, collapsing the commit and the re-render into one exchange.
+///
+/// Only `Committed` results ever carry a plan. A conflict names exactly what
+/// moved — `current_version`, the conflicting event, the competing actor —
+/// so the caller can decide whether retrying is even right, and a retry
+/// starts with a fresh render for new preconditions anyway. Rendering eagerly
+/// on the failure path would spend a full render (and an admission permit) at
+/// the moment of contention for bytes the caller usually discards: unlike a
+/// commit, whose next step is unconditionally "continue with fresh state", a
+/// conflict's next step is conditional. Rejections and invalid invocations
+/// change nothing durable and ask the caller to fix the request rather than
+/// re-read state, so there is nothing new for a plan to reflect there
+/// either. So the plan stays a commit-only bonus. Replays are `Committed`,
+/// so a replay with the flag set gets a plan too: it describes durable state
+/// either way.
+///
+/// THE WRITE HAS ALREADY SUCCEEDED. The plan is a bonus and must never turn
+/// a successful commit into a failure, so nothing here propagates: a render
+/// error, a diagnostic without a plan, or a plan that would breach the
+/// refresh size cap all degrade to the ordinary committed result. A caller
+/// that asked for a plan and did not get one falls back to `render_artifact`
+/// — which is exactly today's behaviour, so the fallback is already proven.
+async fn maybe_include_next_plan(
+    db: &Db,
+    caller: &Caller,
+    invocation: &ArtifactInvocation,
+    mut result: Value,
+) -> Value {
+    if !invocation.include_next_plan
+        || result.get("status").and_then(Value::as_str) != Some("committed")
+    {
+        return result;
+    }
+    // The commit is durable by the time any caller reaches this helper: both
+    // `commit_declared_write` (after `db.commit_content`) and
+    // `invoke_record_create` (after the governed create returns `Created`)
+    // resolve only once the event log holds the write, and the write
+    // transaction is closed — there is nothing left to conflict with the
+    // render's own reads, so the plan below describes post-write state.
+    //
+    // The render takes the same live path `render_artifact` takes for an
+    // mdx_v2 artifact — `try_render_live_mdx_v2`, one transaction on the live
+    // write pool — never the `render_artifact_at(.., Materialize)` cold
+    // fallback that replays the whole event log into scratch SQLite. The
+    // invoke path admits mdx_v2 artifacts only, so the fast path is the whole
+    // story: a `None`, a diagnostic, or anything but a rendered plan degrades
+    // to no plan, and the caller falls back to `render_artifact` exactly as
+    // with every other degradation here. (The fallback's scratch replay is
+    // unreachable for this runtime, so reaching for it would buy nothing and
+    // cost a full log replay per write.)
+    //
+    // Admission is safe by construction: the invoke path holds no mdx permit
+    // when this runs — permits are taken only inside render functions via the
+    // non-blocking `try_admit`, and the write transaction above is already
+    // closed — so the bonus render contends exactly like one concurrent
+    // `render_artifact` call. Saturation never waits: it surfaces as a
+    // diagnostic, which the status check below turns into no plan.
+    let rendered = match try_render_live_mdx_v2(db, caller, &invocation.artifact_id, false).await {
+        Ok(Some(rendered)) => rendered,
+        Ok(None) | Err(_) => return result,
+    };
+    if rendered.get("status").and_then(Value::as_str) != Some("rendered") {
+        return result;
+    }
+    let Some(plan) = rendered.get("plan").cloned() else {
+        return result;
+    };
+    let current = result.get("refresh").filter(|value| !value.is_null());
+    if let Some(merged) = refresh_with_next_plan(current, plan) {
+        result["refresh"] = merged;
+    }
+    result
 }
 
 async fn replayed_creation(
@@ -715,7 +816,7 @@ async fn invoke_artifact_interaction(db: Db, caller: Caller, arguments: Value) -
     .await?;
     if let Some(replayed) = replayed_creation(&db, &caller, &invocation, &invocation_digest).await?
     {
-        return Ok(replayed);
+        return Ok(maybe_include_next_plan(&db, &caller, &invocation, replayed).await);
     }
     let read_lens = lens::ReadLens::live(&db);
     let resolved = match resolve_artifact(
@@ -785,7 +886,7 @@ async fn invoke_artifact_interaction(db: Db, caller: Caller, arguments: Value) -
         ));
     };
     if entry.effect == InteractionEffect::RecordCreate {
-        return invoke_record_create(
+        let created = invoke_record_create(
             &db,
             &caller,
             &invocation,
@@ -794,7 +895,8 @@ async fn invoke_artifact_interaction(db: Db, caller: Caller, arguments: Value) -
             &source_event_id,
             &invocation_digest,
         )
-        .await;
+        .await?;
+        return Ok(maybe_include_next_plan(&db, &caller, &invocation, created).await);
     }
     // 3. Every declared slot filled; the record slot resolved inside the
     //    binding. The host derives scope from the binding — the artifact never
@@ -981,9 +1083,8 @@ async fn invoke_artifact_interaction(db: Db, caller: Caller, arguments: Value) -
         value,
         before: None,
     };
-    Ok(encode(
-        commit_declared_write(&db, &caller, entry, write, &invocation).await?,
-    ))
+    let committed = commit_declared_write(&db, &caller, entry, write, &invocation).await?;
+    Ok(maybe_include_next_plan(&db, &caller, &invocation, encode(committed)).await)
 }
 
 /// The one function in this module that appends, and it cannot be called
@@ -1505,6 +1606,10 @@ pub fn register_artifact_interaction_tool(registry: &mut ToolRegistry) -> Result
                 "gesture": {
                     "type": "string",
                     "description": "What the person did, for provenance only."
+                },
+                "include_next_plan": {
+                    "type": "boolean",
+                    "description": "Opt-in: when true and the invocation commits, the result carries the next authoritative render plan under refresh.plan. Omit for the fast receipt."
                 }
             },
             "required": ["version", "artifact_id", "entry_id", "source_digest", "idempotency_key"],
@@ -1517,6 +1622,8 @@ pub fn register_artifact_interaction_tool(registry: &mut ToolRegistry) -> Result
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     const SOURCE: &str = include_str!("artifact_interactions.rs");
 
     /// The artifact-runtime crate cannot depend on the engine, so it carries
@@ -1617,5 +1724,35 @@ mod tests {
                 "this module must not reach the store any other way"
             );
         }
+    }
+
+    /// The bonus plan rides under `refresh.plan`, beside the created record a
+    /// creation already refreshed — never in place of it.
+    #[test]
+    fn next_plan_merges_with_an_existing_record_refresh() {
+        let plan = json!({ "kind": "safe_tree" });
+        assert_eq!(
+            refresh_with_next_plan(None, plan.clone()),
+            Some(json!({ "plan": { "kind": "safe_tree" } }))
+        );
+        let record = json!({ "record": { "id": "r" } });
+        assert_eq!(
+            refresh_with_next_plan(Some(&record), plan),
+            Some(json!({ "record": { "id": "r" }, "plan": { "kind": "safe_tree" } }))
+        );
+        // A non-object refresh is never produced by this module; if one ever
+        // arrives the plan is dropped rather than mangling it.
+        let scalar = json!("already-there");
+        assert_eq!(refresh_with_next_plan(Some(&scalar), json!({})), None);
+    }
+
+    /// An oversized plan degrades to the refresh the commit produced on its
+    /// own — `None` here means "keep the original", never an invalid result.
+    #[test]
+    fn an_oversized_next_plan_degrades_to_the_commit_refresh() {
+        let oversized = json!({ "tree": "x".repeat(RESULT_REFRESH_JSON_LIMIT) });
+        assert!(refresh_with_next_plan(None, oversized.clone()).is_none());
+        let record = json!({ "record": { "id": "r" } });
+        assert!(refresh_with_next_plan(Some(&record), oversized).is_none());
     }
 }

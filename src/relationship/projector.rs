@@ -923,30 +923,53 @@ pub(crate) async fn read_all_relationship_events(
     )
     .fetch_all(conn)
     .await?;
-    rows.into_iter()
-        .map(|row| {
-            let event_type: String = row.try_get("type")?;
-            let stream_version: i64 = row.try_get("stream_version")?;
-            Ok(RelationshipEventSpec {
-                event_id: row.try_get("id")?,
-                stream_id: row.try_get("stream_id")?,
-                expected_stream_version: stream_version - 1,
-                relationship: super::RelationshipCoordinate {
-                    relationship_origin_db_id: row.try_get("relationship_origin_db_id")?,
-                    relationship_id: row.try_get("relationship_id")?,
-                    relationship_revision: 1,
-                },
-                payload: super::parse_event_payload(
-                    &event_type,
-                    serde_json::from_str(&row.try_get::<String, _>("payload")?)?,
-                )?,
-                actor: row.try_get("actor")?,
-                issuer_origin_db_id: row.try_get("issuer_origin_db_id")?,
-                occurred_at: row.try_get("occurred_at")?,
-                ingested_at: row.try_get("ingested_at")?,
-            })
-        })
-        .collect()
+    rows.iter().map(relationship_event_spec_from_row).collect()
+}
+
+/// Read the relationship log prefix at or before `max_seq`, in commit order.
+/// Idempotent receipt reconstruction replays exactly this prefix into a
+/// scratch projection so the rebuilt receipt reflects the attested command,
+/// not later stream writes. Prefix-closure is what makes the replay's stream
+/// CAS succeed: versions are assigned in commit order, so every replayed
+/// event's predecessors are in the prefix too.
+pub(crate) async fn read_relationship_event_prefix(
+    conn: &mut SqliteConnection,
+    max_seq: i64,
+) -> Result<Vec<RelationshipEventSpec>> {
+    let rows = sqlx::query(
+        "SELECT id,stream_id,stream_version,relationship_origin_db_id,relationship_id,
+                type,payload,actor,issuer_origin_db_id,occurred_at,ingested_at
+           FROM relationship_events WHERE seq <= ? ORDER BY seq",
+    )
+    .bind(max_seq)
+    .fetch_all(conn)
+    .await?;
+    rows.iter().map(relationship_event_spec_from_row).collect()
+}
+
+fn relationship_event_spec_from_row(
+    row: &sqlx::sqlite::SqliteRow,
+) -> Result<RelationshipEventSpec> {
+    let event_type: String = row.try_get("type")?;
+    let stream_version: i64 = row.try_get("stream_version")?;
+    Ok(RelationshipEventSpec {
+        event_id: row.try_get("id")?,
+        stream_id: row.try_get("stream_id")?,
+        expected_stream_version: stream_version - 1,
+        relationship: super::RelationshipCoordinate {
+            relationship_origin_db_id: row.try_get("relationship_origin_db_id")?,
+            relationship_id: row.try_get("relationship_id")?,
+            relationship_revision: 1,
+        },
+        payload: super::parse_event_payload(
+            &event_type,
+            serde_json::from_str(&row.try_get::<String, _>("payload")?)?,
+        )?,
+        actor: row.try_get("actor")?,
+        issuer_origin_db_id: row.try_get("issuer_origin_db_id")?,
+        occurred_at: row.try_get("occurred_at")?,
+        ingested_at: row.try_get("ingested_at")?,
+    })
 }
 
 pub(crate) async fn replay_relationship_events(

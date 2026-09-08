@@ -4,5 +4,6 @@ Status: Experimental. Public wire schemas for the Native Canvas v1 batch protoco
 
 - `schemas/batch.schema.json` — `native.canvas-batch.v1`, the envelope `manage_canvas.commit_batch` accepts.
 - `schemas/batch-result.schema.json` — `native.canvas-batch-result.v1`, the structured outcome it returns.
+- `schemas/export.schema.json` — `native.canvas-export.v1`, the caller-redacted bundle `read_canvas.export` returns. Its history entries reuse the batch `origin` and `ops` shapes above by reference; the scene objects follow the protocol note and are not frozen as a schema.
 
 Per-kind `props` contracts (note, shape, stroke, connector, frame, record_card) are documented in the protocol note and enforced by the engine; they are deliberately not frozen as schemas while the protocol is experimental. No conformance fixtures exist yet.

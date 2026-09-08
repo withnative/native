@@ -5762,7 +5762,7 @@ async fn materialize_live_mdx_v2(
     }))
 }
 
-async fn try_render_live_mdx_v2(
+pub(crate) async fn try_render_live_mdx_v2(
     db: &Db,
     caller: &Caller,
     artifact_id: &str,

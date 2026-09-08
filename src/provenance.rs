@@ -582,6 +582,27 @@ fn action_arguments(operation: &str, arguments: &Value) -> Value {
                 }
             }
         }
+        if operation == "create_record"
+            || operation == "create_exploration"
+            || operation == "attach_text"
+        {
+            // Same two cosmetic normalizations the conflict detector needs and
+            // nothing more: the caller key is lookup-scoped trimmed, so the
+            // digest must compare trimmed too; explicit nulls parse to the same
+            // absent option as an omitted field, so they must not conflict.
+            // Collection-shaped fields (facets, links, mentions, addressed_to;
+            // exploration candidates in request order) are left byte-exact:
+            // for Message, `addressed_to: []` versus an absent audience is a
+            // material admission difference, not cosmetic, and candidate order
+            // is echoed in the exploration receipt, so a reordered set is a
+            // different request.
+            if let Some(key) = object.get_mut("idempotency_key") {
+                if let Some(value) = key.as_str() {
+                    *key = Value::String(value.trim().to_string());
+                }
+            }
+            object.retain(|_, value| !value.is_null());
+        }
     }
     value
 }

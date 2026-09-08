@@ -1,51 +1,131 @@
 # Native
 
-Native is a connected, inspectable context system for people and AI agents
-working together over time.
+Native gives people and AI agents a shared working world where deliberately
+recorded work can accumulate beyond any conversation.
 
-Context goes stale when its correction lives somewhere else. A file can remain
-plausible after the answer changed, and a later person or agent has no in-band
-way to see what superseded it.
+Decisions, evidence, tasks, messages, documents, artifacts and corrections
+remain connected, inspectable and available to later contributors. People can
+bring different agents to the same work, inspect its history and attribution,
+and correct what the workspace holds.
 
-It keeps the people, conversations, messages, work, decisions, documents,
-collections, and artifacts around a project in one connected, inspectable
-world. Records carry their history, placement, relationships, attribution, and
-governed state. For example, a message can become accountable work without
-losing its origin; later readers can search, traverse, and reconstruct what
-changed.
+That shared state is the basis for work that continues across agents and
+sessions, views shaped around different questions, and feedback that helps
+agents repair some proposed contributions. The sections below distinguish
+current foundations from further possibilities.
 
-Native does not make context maintain itself. Someone or something still has
-to record a correction or supersession. The improvement is that the correction
-can travel with the work and remain discoverable instead of being trapped in a
-person's head or a detached conversation.
+You work with Native through a connected agent and the browser app. An agent
+can retrieve project context, record a decision, update a task or leave a
+handoff; people can inspect and correct those contributions. For example, a
+changed decision can live beside the work it affects, so a later contributor
+can discover what superseded the old answer and why. Someone or something
+still has to record the correction, and the next contributor still has to
+retrieve and assess it.
 
 ## What Native makes possible
 
-**A shared world, not another context file.** When people and agents work
-through Native, their records, reads, changes, tool use, run intent, and
-activity contribute context to the same inspectable world. That makes later
-work easier to recover and continue across sessions and agents. Bringing
-external material into that world still has a real acquisition cost, and the
-result still needs smaller ongoing acts of semantic stewardship: recording a
-correction, marking a decision, or closing work when reality changes.
+The three scenes below follow an imagined launch team through adaptable views,
+useful workspace feedback and a correction recovered by a later agent. They
+connect that intended experience to mechanisms you can inspect in this
+repository; they are illustrations, not product demonstrations.
 
-**Software that can take the shape of the work.** Native separates governed
-data from its presentation. The same authorized records can be deliberately
-bound into an authored dashboard, project Kanban, canvas, or visual bookshelf
-without turning the view into a new silo. Shipped artifact runtimes support
-editable MDX source with named inputs, components, and mediated interactions,
-or self-contained HTML over exact read-only inputs. The host continues to own
-authorization, writes, provenance, and audit. “All your data” here means all
-data the caller may access and the artifact explicitly binds—not ambient
-access to a workspace or the network. See [Artifact runtimes](docs/artifact-runtimes.md)
-for the concrete contract and limits.
+### Shape the view around the question
 
-This is part of context ownership too: the freedom to reshape how a person or
-group sees and acts through its working world, so software can fit the work
-rather than the reverse. Portable context, claims, provenance, and authority
-also create a basis for new forms of delegation and coordination between
-participants who do not need to share a single owner. Replacing the whole
-Workbench shell is a direction, not a capability claimed by this snapshot.
+You want to know what could delay a launch. A colleague wants to plan the week.
+An agent is preparing a briefing for the decision meeting. The task “Resolve
+onboarding problems” belongs in all three views: connected to the release
+decision in a dependency map, scheduled before the next trial in a timeline,
+and presented beside customer evidence in the briefing.
+
+![One launch, three views: a dependency map, a timeline and a briefing each read the same tasks, decisions and evidence.](docs/figures/workspace-companion/shared-views.svg)
+
+*The views ask different questions of the same records. A changed record can
+be read again by each view; an earlier rendering still needs its version
+identified.*
+
+**Current foundation.** Native's authored views bind named inputs to shared
+records. The [worked example](docs/artifact-runtimes.md#one-collection-two-authored-views)
+uses a table and a grid of cards over the same launch Collection. Changing the
+presentation preserves the underlying records and their history; a compatible
+Collection can supply another dataset to the same view. Separate renders can
+observe different revisions or caller-authorized subsets.
+
+MDX provides bounded components and mediated interactions; HTML consumes
+read-only inputs. The host owns authorization, writes, provenance and audit.
+These mechanisms support adaptable tools. They do not demonstrate the imagined
+launch tools or effortless replacement of the whole Workbench shell.
+
+**Further possibility.** Ask an agent to adapt a tool around your working
+habits, then carry the useful presentation into another project. A timeline
+still needs dates, and a reusable view still needs compatible inputs. The
+ambition is room to shape how you work while the shared records remain
+intelligible to other people and agents.
+
+### Give the agent useful feedback
+
+The team decides to postpone the launch. Your agent proposes recording a
+`Document` of kind `decision`. A preview identifies `decision` as a governed
+kind under `Resolution`. The agent can inspect the distinction, revise the
+candidate and write it. The feedback supplies a precise mismatch and a route
+to repair.
+
+![An agent proposes Document/decision; the preview names Resolution as the governed type; the agent can revise to Resolution/decision before writing.](docs/figures/workspace-companion/useful-feedback.svg)
+
+*An illustration of the advisory preview. No authoritative write occurs during
+the check; the agent still has to choose and submit its revision.*
+
+**Current foundation.** This pairing is covered by the implementation and
+tests in the [workspace feedback evidence](docs/capability-map.md#workspace-feedback).
+Preview makes no authoritative write. If the agent writes the unknown
+combination anyway, Native stores it with a quarantine warning naming the
+governed alternative; it does not silently reclassify it. This checks the
+structure of the contribution, not whether postponement is a good decision.
+
+**Further possibility — Directional.** A workspace should also bring evidence
+to bear on reasoning. If an agent recommends a broad launch despite recorded
+onboarding failures, a review could point to the trial and ask how the plan
+accounts for it. The agent might revise the recommendation, supply newer
+evidence or explain why the finding does not apply. General substantive review
+is an ambition, not a capability established by the type/kind check.
+
+Feedback should be dependable and contestable. A correction, justified
+exception or unresolved disagreement should leave useful context for future
+work. New evidence should be able to challenge the workspace's old assumptions
+too.
+
+### Let the correction reach the next contributor
+
+Two weeks later, you open a different agent and ask it to continue the launch
+work. The original release decision remains. So does the postponement that
+superseded it, connected to the trial findings and the task opened in response.
+The agent can follow those connections and read why the plan changed without
+you reconstructing the previous conversation.
+
+![The original release decision is superseded by a recorded postponement linked to trial evidence; a later agent reads that correction and continues the work.](docs/figures/workspace-companion/continuing-work.svg)
+
+*Continuity depends on someone recording the changed decision and its
+relationship to the old one. The later agent must still retrieve and inspect
+them.*
+
+**Current foundation.** Recorded supersession, incoming-link traversal,
+history and temporal reads keep a correction discoverable from the earlier
+work. The [capability map](docs/capability-map.md#claims-and-evidence) names the
+source and tests; the [agent evaluation guide](docs/for-agents.md#recover-a-correction-in-a-later-session)
+sets out what to inspect. This is continuity of deliberately recorded state
+across sessions and models. It does not recover hidden model memory or
+guarantee useful retrieval.
+
+**Further possibility — Directional.** Corrections could improve future
+reviews as well as future answers: a resolved concern need not be raised
+without its explanation, and new evidence could prompt another look at an old
+conclusion. The record and history mechanisms give such a loop somewhere to
+live; they do not establish automatic detection of every changed premise or a
+measured improvement in agent judgement.
+
+The same launch records support all three scenes. People can inspect,
+correct and contest that context, choose the agents they bring to it, and
+reshape its presentation. Movement between storage backends and cooperation
+across independently governed workspaces have distinct, narrower maturity
+boundaries in the capability map.
 
 ## Start with Native
 
@@ -81,6 +161,19 @@ After installation, restart or reload if prompted and ask the agent to help
 you finish Native setup. This hosted-first route is the practical way to begin;
 the source snapshot below supports inspection and exploration, not turnkey
 meaningful self-hosting today.
+
+### Try continuity with one piece of work
+
+Choose a real task and ask the connected agent to record its current state,
+an important decision and what comes next. Use the
+[browser app](https://app.withnative.ai) to inspect the records. When the plan
+changes, record the correction and its relationship to the earlier decision.
+In a later session, ask an agent to find that work, explain what changed and
+continue. Check which records it used and correct anything it misunderstood.
+
+This is a small evaluation of recorded continuity. Preserving records is the
+foundation; useful retrieval and a good handoff still require judgement. For
+setup details, use the [plugin installation guide](https://github.com/withnative/native-plugin/blob/main/docs/plugin-installation.md).
 
 > **Public source snapshot.** `withnative/native` publishes selected source for
 > Native's node and federation protocol work. It is published so people and
@@ -193,17 +286,17 @@ and the evidence routes in [`docs/capability-map.md`](docs/capability-map.md).
 
 ## Further context
 
-The public essay [*Distributed Context*](https://writings.withnative.ai/distributed-context)
+The public essay [*Distributed Context*](https://withnative.ai/writings/distributed-context)
 gives the architectural context: durable, connected, governed state shared by
 people and agents across applications, sessions, organisations and time.
-Agents can use the [plain-text edition](https://writings.withnative.ai/distributed-context.txt).
+Agents can use the [plain-text edition](https://withnative.ai/writings/distributed-context.txt).
 Use the capability map and the included/held snapshot above as the evidence
 boundary for which parts of that picture are Current, Partial, Experimental,
 Directional, or Held here.
 
-The essay [*Freedom in the age of intelligence*](https://writings.withnative.ai/freedom-in-the-age-of-intelligence)
+The essay [*Freedom in the age of intelligence*](https://withnative.ai/writings/freedom-in-the-age-of-intelligence)
 and its Superagency Charter offer normative context for evaluating Native.
-Agents can use the [plain-text edition](https://writings.withnative.ai/freedom-in-the-age-of-intelligence.txt).
+Agents can use the [plain-text edition](https://withnative.ai/writings/freedom-in-the-age-of-intelligence.txt).
 Treat the Charter as a standard to apply to Native too, not as proof of its
 claims. Ask which rights matter here, which mechanisms and evidence implement
 them, and where Native falls short.

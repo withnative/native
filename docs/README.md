@@ -13,6 +13,12 @@ with selected evidence, **Partial** is a real bounded implementation,
 
 ## Start here
 
+- [What Native makes possible](../README.md#what-native-makes-possible) — three
+  scenes from one imagined launch: adaptable views, useful feedback and a
+  correction recovered by a later contributor. Current foundations and further
+  possibilities are distinguished beside each scene. The
+  [hosted starting route](../README.md#start-with-native) includes a small
+  continuity exercise.
 - [Architecture map](../ARCHITECTURE.md) — **Current:** the main write and read
   paths, subsystem invariants, executable evidence, and change-routing table.
 - [Capability and evidence map](capability-map.md) — **Current**, **Partial**,
@@ -79,6 +85,22 @@ For governed record shapes, facets, and vocabularies, start with the selected
 [facets and vocabularies](../src/mcp/guides/facets-and-vocabularies.md), and
 [lifecycle](../src/mcp/guides/lifecycle.md) guides.
 
+## What feedback can an agent receive, and how can it respond?
+
+- [Workspace feedback evidence](capability-map.md#workspace-feedback) —
+  **Current:** shape preview, wrong-type/kind guidance and guarded-update
+  conflicts, with source and executable tests. Semantic placement checks,
+  conditional repository obligations and general substantive review are
+  **Directional**.
+- [Native for agents](for-agents.md#a-contribution-that-can-improve-through-feedback)
+  — evaluation examples: revise a candidate using shape guidance, or reread
+  and reconcile a conflicting edit.
+- [Record types](../src/mcp/guides/record-types.md) and
+  [facets and vocabularies](../src/mcp/guides/facets-and-vocabularies.md) —
+  **Current:** operational guidance for interpreting governed meanings and
+  responding to quarantine. A warning is information to assess; it does not
+  establish that a contribution is substantively wrong.
+
 ## How do storage and portability work?
 
 - [Full-owner local standby contract](local-standby.md) — **Directional:** the
@@ -100,10 +122,12 @@ SQLite is the complete reference node in this snapshot. Postgres and
 Turso-local exercise bounded slices. Postgres-to-SQLite movement, Turso
 import/export, and cross-backend round trips are not current capabilities.
 
-## What visual and interactive forms exist?
+## How can I reshape the interface around shared data?
 
 - [Artifact runtimes](artifact-runtimes.md) — **Current:** durable artifact
-  identity, runtime dispatch, governed inputs, and isolation boundaries.
+  identity, runtime dispatch, governed inputs, and isolation boundaries. The
+  [worked example](artifact-runtimes.md#one-collection-two-authored-views) follows
+  one Collection through two authored views and explains compatible reuse.
 - [`web/mcp-apps`](../web/mcp-apps/) — **Experimental:** two selected optional
   MCP App views for record-version differences and suggestion review.
 
@@ -142,8 +166,9 @@ and generated backend attestations are **Held** outside this snapshot.
   test loop and how to choose optional features.
 - The root README gives optional source-exploration entrypoints, the inspection
   snapshot's runtime-qualification boundary, and the license boundary.
-- [`CONTRIBUTING.md`](../CONTRIBUTING.md) states the closed-development policy
-  and the routes that this public mirror does not accept.
+- [`CONTRIBUTING.md`](../CONTRIBUTING.md) explains how development works here: a
+  private upstream, contribution by invitation after a conversation, and the
+  routes this public mirror does not use.
 
 Hosted deployment, account authentication, the HTTP gateway, the commercial
 Workbench, and operated backup/release procedures are **Held** outside this

@@ -1097,6 +1097,34 @@
       "notes": "Hosted membership administration belongs to the host catalog plane, not the selected content backend."
     },
     {
+      "id": "reach_read",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "A",
+        "postgres-server": "A",
+        "turso-local": "A",
+        "turso-remote": "A",
+        "turso-embedded-sync": "A",
+        "libsql-embedded-replica": "A"
+      },
+      "notes": "Hosted reach discovery is served by the reach sidecar over HTTPS, never by the selected content backend."
+    },
+    {
+      "id": "reach_connect",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "A",
+        "postgres-server": "A",
+        "turso-local": "A",
+        "turso-remote": "A",
+        "turso-embedded-sync": "A",
+        "libsql-embedded-replica": "A"
+      },
+      "notes": "Hosted provider consent mints ticket state on the reach sidecar; it creates no content-backend write."
+    },
+    {
       "id": "materialize_record",
       "kind": "tool",
       "surface": "federated-lens",

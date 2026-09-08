@@ -5686,6 +5686,70 @@ fn artifact_renderers_preserve_html_launch_verification_and_interaction_receipts
     }
 }
 
+/// The bonus next-plan must not turn the text rendering into a megabyte-long
+/// line: the created record keeps its inline receipt, while the plan is
+/// summarised with the same bounded walk `render_artifact` uses.
+#[test]
+fn committed_text_summarises_the_bonus_plan_instead_of_inlining_it() {
+    let blob = "y".repeat(100_000);
+    let interactions: Vec<Value> = (0..1_000)
+        .map(|index| {
+            json!({"id": format!("entry-{index}"), "label": "Do it",
+                   "effect": "facet.set", "facet": "triage"})
+        })
+        .collect();
+    let text = render::render(
+        "invoke_artifact_interaction",
+        &json!({
+            "status":"committed",
+            "version":"native.artifact-intent-result.v2",
+            "idempotency_key":"gesture-9",
+            "changes":[{"record_id":"record-two","key":"triage","before":"open","after":"done","version":"obs:44"}],
+            "refresh":{
+                "record":{"id":"record-two","name":"A created record"},
+                "plan":{
+                    "kind":"safe_tree","version":"1",
+                    "tree":{"type":"Fragment","props":{"note": blob.clone()},"children":[]},
+                    "interactions": interactions,
+                },
+            },
+        }),
+    )
+    .unwrap();
+    // The creation receipt reads as it always has.
+    for expected in ["record-two", "A created record", "obs:44"] {
+        assert!(text.contains(expected), "missing {expected}: {text}");
+    }
+    // The plan is a summary, not an inline dump.
+    for expected in ["safe_tree", "summarised", "structuredContent"] {
+        assert!(text.contains(expected), "missing {expected}: {text}");
+    }
+    assert!(
+        !text.contains(&blob),
+        "the bonus plan leaked into the text rendering"
+    );
+    assert!(
+        text.len() < 20_000,
+        "text rendering grew with the plan: {} bytes",
+        text.len()
+    );
+
+    // An unknown plan kind is named, never inlined.
+    let unknown = render::render(
+        "invoke_artifact_interaction",
+        &json!({
+            "status":"committed",
+            "version":"native.artifact-intent-result.v2",
+            "idempotency_key":"gesture-10",
+            "changes":[{"record_id":"record-three","key":"triage","after":"done","version":"obs:45"}],
+            "refresh":{"plan":{"kind":"future-kind","payload": blob}},
+        }),
+    )
+    .unwrap();
+    assert!(unknown.contains("future-kind"), "{unknown}");
+    assert!(!unknown.contains(&blob), "{unknown}");
+}
+
 #[test]
 fn artifact_renderers_fail_closed_on_unknown_or_malformed_outcomes() {
     for (tool, payload) in [

@@ -22,6 +22,8 @@ mod canvas;
 mod capability_dispatch;
 #[path = "tools/conformance.rs"]
 mod conformance;
+#[path = "tools/create_idempotency.rs"]
+mod create_idempotency;
 #[path = "tools/create_many.rs"]
 mod create_many;
 #[path = "tools/event_context.rs"]

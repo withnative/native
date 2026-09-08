@@ -3168,7 +3168,7 @@ async fn diagnostics_scan_facets_and_work_context_use_only_visible_related_rows(
 
 #[test]
 fn every_registered_tool_kind_has_an_authorization_disposition() {
-    assert_eq!(ToolKind::ALL.len(), 75);
+    assert_eq!(ToolKind::ALL.len(), 77);
     let mut registry = ToolRegistry::new();
     register_builtin_tools(&mut registry).unwrap();
     register_surface_tools(&mut registry).unwrap();
@@ -3186,6 +3186,8 @@ fn every_registered_tool_kind_has_an_authorization_disposition() {
             ToolKind::StandbyStatus,
             ToolKind::ExportSnapshot,
             ToolKind::ManageMemberships,
+            ToolKind::ReachRead,
+            ToolKind::ReachConnect,
         ]
     );
     assert_eq!(
@@ -3214,6 +3216,14 @@ fn every_registered_tool_kind_has_an_authorization_disposition() {
     );
     assert_eq!(
         ToolKind::ManageInterventions.authorization(),
+        AuthorizationDisposition::Specialized
+    );
+    assert_eq!(
+        ToolKind::ReachRead.authorization(),
+        AuthorizationDisposition::Specialized
+    );
+    assert_eq!(
+        ToolKind::ReachConnect.authorization(),
         AuthorizationDisposition::Specialized
     );
     for kind in [

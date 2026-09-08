@@ -11,6 +11,7 @@ use std::sync::Arc;
 use native_ce::authorization::{replace_explicit_policy, AllowEntry, Capability};
 use native_ce::export::LocalSnapshotSource;
 use native_ce::mcp::register_membership_tool_schema;
+use native_ce::mcp::register_reach_tool_schema;
 use native_ce::mcp::{
     register_builtin_tools, register_snapshot_tool, register_surface_tools,
     AuthorizationDisposition, Caller, ToolKind, ToolRegistry,
@@ -133,6 +134,7 @@ fn production_registry() -> ToolRegistry {
     register_surface_tools(&mut registry).unwrap();
     register_snapshot_tool(&mut registry, Arc::new(LocalSnapshotSource::new())).unwrap();
     register_membership_tool_schema(&mut registry).unwrap();
+    register_reach_tool_schema(&mut registry).unwrap();
     registry
 }
 

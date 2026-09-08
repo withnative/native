@@ -1827,6 +1827,13 @@ fn set_mode(path: &Path, mode: u32) -> Result<()> {
 }
 
 fn inventory_sqlite_files(database: &Path) -> Result<Vec<SealedFile>> {
+    inventory_sqlite_files_with_identity(database, file_identity)
+}
+
+fn inventory_sqlite_files_with_identity(
+    database: &Path,
+    mut identify: impl FnMut(&Path) -> Result<FileIdentity>,
+) -> Result<Vec<SealedFile>> {
     let mut files = Vec::new();
     for (index, path) in sqlite_file_set(database).into_iter().enumerate() {
         match fs::symlink_metadata(&path) {
@@ -1838,8 +1845,15 @@ fn inventory_sqlite_files(database: &Path) -> Result<Vec<SealedFile>> {
             }
             Ok(metadata) => {
                 let mode = file_mode(&metadata);
+                let identity = match identify(&path) {
+                    Ok(identity) => identity,
+                    Err(error) if is_disappeared_sqlite_sidecar(&error, database, &path) => {
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
                 files.push(SealedFile {
-                    identity: file_identity(&path)?,
+                    identity,
                     path,
                     original_mode: mode,
                 });
@@ -1868,6 +1882,13 @@ fn inventory_sqlite_files(database: &Path) -> Result<Vec<SealedFile>> {
 /// materialized sidecars are admitted only from the same three-path SQLite set
 /// and are sealed before the refreshed journal is persisted.
 fn refresh_sealed_file_identities(files: &[SealedFile]) -> Result<Vec<SealedFile>> {
+    refresh_sealed_file_identities_with_identity(files, file_identity)
+}
+
+fn refresh_sealed_file_identities_with_identity(
+    files: &[SealedFile],
+    mut identify: impl FnMut(&Path) -> Result<FileIdentity>,
+) -> Result<Vec<SealedFile>> {
     let database = files
         .first()
         .ok_or_else(|| Error::engine("SQLite file mode inventory is empty"))?
@@ -1886,7 +1907,11 @@ fn refresh_sealed_file_identities(files: &[SealedFile]) -> Result<Vec<SealedFile
                 path.display()
             )));
         }
-        let identity = file_identity(&path)?;
+        let identity = match identify(&path) {
+            Ok(identity) => identity,
+            Err(error) if is_disappeared_sqlite_sidecar(&error, &database, &path) => continue,
+            Err(error) => return Err(error),
+        };
         let original_mode = if let Some(previous) = files.iter().find(|file| file.path == path) {
             if !same_file_identity(&previous.identity, &identity) {
                 return Err(Error::engine(format!(
@@ -2280,6 +2305,132 @@ mod tests {
             rollback_window: Duration::from_secs(3600),
         };
         (directory, options)
+    }
+
+    #[cfg(feature = "storage-recovery-tests")]
+    fn identity_race_fixture(name: &str) -> (tempfile::TempDir, PathBuf, [PathBuf; 2]) {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join(name);
+        let sqlite_files = sqlite_file_set(&database);
+        fs::write(&database, b"database").unwrap();
+        fs::write(&sqlite_files[1], b"wal").unwrap();
+        fs::write(&sqlite_files[2], b"shm").unwrap();
+        (
+            directory,
+            database,
+            [sqlite_files[1].clone(), sqlite_files[2].clone()],
+        )
+    }
+
+    #[cfg(feature = "storage-recovery-tests")]
+    #[test]
+    fn inventory_tolerates_sidecars_disappearing_during_identity_measurement() {
+        let (_directory, database, sidecars) = identity_race_fixture("inventory-race.db");
+
+        let inventory = inventory_sqlite_files_with_identity(&database, |path| {
+            if sidecars.iter().any(|sidecar| sidecar == path) {
+                fs::remove_file(path).unwrap();
+            }
+            file_identity(path)
+        })
+        .unwrap();
+
+        assert_eq!(inventory.len(), 1);
+        assert_eq!(inventory[0].path, database);
+    }
+
+    #[cfg(feature = "storage-recovery-tests")]
+    #[test]
+    fn refresh_tolerates_sidecars_disappearing_during_identity_measurement() {
+        let (_directory, database, sidecars) = identity_race_fixture("refresh-race.db");
+        let inventory = inventory_sqlite_files(&database).unwrap();
+
+        let refreshed = refresh_sealed_file_identities_with_identity(&inventory, |path| {
+            if sidecars.iter().any(|sidecar| sidecar == path) {
+                fs::remove_file(path).unwrap();
+            }
+            file_identity(path)
+        })
+        .unwrap();
+
+        assert_eq!(refreshed.len(), 1);
+        assert_eq!(refreshed[0].path, database);
+    }
+
+    #[cfg(feature = "storage-recovery-tests")]
+    #[test]
+    fn identity_measurement_does_not_tolerate_database_disappearance() {
+        let (_directory, database, _sidecars) = identity_race_fixture("inventory-base-race.db");
+
+        let error = inventory_sqlite_files_with_identity(&database, |path| {
+            if path == database {
+                fs::remove_file(path).unwrap();
+            }
+            file_identity(path)
+        })
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            Error::Io(error) if error.kind() == std::io::ErrorKind::NotFound
+        ));
+
+        let (_directory, database, _sidecars) = identity_race_fixture("refresh-base-race.db");
+        let inventory = inventory_sqlite_files(&database).unwrap();
+        let error = refresh_sealed_file_identities_with_identity(&inventory, |path| {
+            if path == database {
+                fs::remove_file(path).unwrap();
+            }
+            file_identity(path)
+        })
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            Error::Io(error) if error.kind() == std::io::ErrorKind::NotFound
+        ));
+    }
+
+    #[cfg(feature = "storage-recovery-tests")]
+    #[test]
+    fn identity_measurement_does_not_tolerate_other_sidecar_io_errors() {
+        let (_directory, database, sidecars) = identity_race_fixture("sidecar-io-error.db");
+
+        let error = inventory_sqlite_files_with_identity(&database, |path| {
+            if path == sidecars[0] {
+                return Err(Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "injected identity read refusal",
+                )));
+            }
+            file_identity(path)
+        })
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            Error::Io(error) if error.kind() == std::io::ErrorKind::PermissionDenied
+        ));
+    }
+
+    #[cfg(feature = "storage-recovery-tests")]
+    #[test]
+    fn refresh_still_refuses_a_replaced_sidecar_identity() {
+        let (_directory, database, sidecars) = identity_race_fixture("refresh-replaced.db");
+        let inventory = inventory_sqlite_files(&database).unwrap();
+
+        let error = refresh_sealed_file_identities_with_identity(&inventory, |path| {
+            let mut identity = file_identity(path)?;
+            if path == sidecars[0] {
+                identity.inode = identity.inode.map(|inode| inode.wrapping_add(1));
+            }
+            Ok(identity)
+        })
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("refusing to refresh replaced SQLite file"));
     }
 
     #[cfg(feature = "storage-recovery-tests")]

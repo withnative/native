@@ -1309,6 +1309,156 @@ impl FileFederationCustody {
             .map_err(|_| Error::engine("federation custody vault integrity check failed"))
     }
 
+    /// Capture every byte of custody state under the exclusive custody lock.
+    ///
+    /// This is the snapshot the off-volume backup is built from, and the lock
+    /// is the whole point of it existing here rather than in the backup sweep.
+    /// `write_vault` publishes a vault by writing a synced temporary beside the
+    /// destination and renaming it into place; a copier that walked the
+    /// directory without the lock could observe a half-written temporary, or a
+    /// principals set that changed underneath it mid-walk, and would produce an
+    /// archive that restores as corrupt. Taking the same lock every mutation
+    /// takes makes the capture atomic with respect to all of them.
+    ///
+    /// Every vault is HMAC-verified as it is read. A vault that is already
+    /// corrupt on the volume fails the capture rather than being faithfully
+    /// copied off-box: propagating corruption into the one copy that exists to
+    /// survive a disaster would turn a detectable local fault into an
+    /// undetectable remote one.
+    ///
+    /// The archive holds ciphertext only. Wrapped secrets stay wrapped and the
+    /// master key is never part of it, so the archive is safe to store
+    /// somewhere the key is not.
+    pub fn capture_archive(&self, captured_at: &str) -> Result<CustodyArchive> {
+        let _guard = self.lock()?;
+
+        let sentinel_path = self.root.join(STORE_SENTINEL);
+        let sentinel = std::fs::read_to_string(&sentinel_path).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                Error::engine("federation custody store is not initialized; refusing to archive it")
+            } else {
+                error.into()
+            }
+        })?;
+
+        let principals = self.root.join("principals");
+        let mut entries = Vec::new();
+        let mut vault_tokens = BTreeSet::new();
+        let mut marker_tokens = BTreeSet::new();
+        for entry in std::fs::read_dir(&principals)? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let metadata = entry.metadata()?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                // A symlink in the principals directory is not custody state
+                // and must not be dereferenced into the archive.
+                return Err(Error::engine(format!(
+                    "federation custody principals directory holds a non-regular entry: {name}"
+                )));
+            }
+            if name.ends_with(".vault.json") {
+                let bytes = std::fs::read(entry.path())?;
+                let vault: VaultFile = serde_json::from_slice(&bytes).map_err(|error| {
+                    Error::engine(format!(
+                        "federation custody vault {name} is not readable for archive: {error}"
+                    ))
+                })?;
+                validate_archived_vault(self, &name, vault)?;
+                vault_tokens.insert(name.trim_end_matches(".vault.json").to_owned());
+                entries.push(CustodyArchiveEntry {
+                    name,
+                    contents: URL_SAFE_NO_PAD.encode(&bytes),
+                });
+            } else if name.ends_with(".provisioned") {
+                let bytes = std::fs::read(entry.path())?;
+                marker_tokens.insert(name.trim_end_matches(".provisioned").to_owned());
+                entries.push(CustodyArchiveEntry {
+                    name,
+                    contents: URL_SAFE_NO_PAD.encode(&bytes),
+                });
+            } else if name.contains(".tmp-") {
+                // An in-flight or crash-left `write_vault` temporary. It is not
+                // published state, and the lock we hold means no rename is
+                // racing us, so leaving it out is correct rather than lossy.
+                continue;
+            } else {
+                return Err(Error::engine(format!(
+                    "federation custody principals directory holds an unrecognised file: {name}"
+                )));
+            }
+        }
+
+        check_marker_pairing(&vault_tokens, &marker_tokens)?;
+
+        // `read_dir` order is unspecified. Sort so the same custody state always
+        // produces the same archive bytes, which is what lets the sweep's
+        // digest comparison mean anything.
+        entries.sort_by(|left, right| left.name.cmp(&right.name));
+
+        let mut archive = CustodyArchive {
+            version: CUSTODY_ARCHIVE_VERSION,
+            captured_at: captured_at.to_owned(),
+            sentinel,
+            entries,
+            integrity: String::new(),
+        };
+        archive.integrity = self.archive_integrity(&archive)?;
+        Ok(archive)
+    }
+
+    /// Capture the archive and write it to `destination` as a single file.
+    ///
+    /// Written through the same synced-temporary-then-rename discipline the
+    /// vault itself uses, so a crash mid-write cannot leave a truncated archive
+    /// wearing a complete archive's name.
+    pub fn write_archive(
+        &self,
+        destination: &Path,
+        captured_at: &str,
+    ) -> Result<CustodyArchiveSummary> {
+        let archive = self.capture_archive(captured_at)?;
+        let summary = archive.summary();
+        let bytes = serde_json::to_vec(&archive)?;
+
+        let temporary = destination.with_extension(format!("tmp-{}", Uuid::new_v4()));
+        let written = (|| -> Result<()> {
+            let mut file = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&temporary)?;
+            set_owner_only_file(&file)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            Ok(())
+        })();
+        if let Err(error) = written {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(error);
+        }
+        if let Err(error) = std::fs::rename(&temporary, destination) {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(error.into());
+        }
+        sync_parent(destination)?;
+        Ok(summary)
+    }
+
+    fn archive_integrity(&self, archive: &CustodyArchive) -> Result<String> {
+        let payload = archive_integrity_payload(archive);
+        let key = derive_custody_key(
+            &self.master_key,
+            b"native-federation-custody-archive-key-v1",
+        );
+        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&key)
+            .map_err(|_| Error::engine("federation custody archive integrity key is invalid"))?;
+        mac.update(b"native-federation-custody-archive-payload-v1\0");
+        mac.update(&payload);
+        Ok(format!(
+            "{CUSTODY_ARCHIVE_INTEGRITY_PREFIX}{}",
+            URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
+        ))
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn generate_stored_key(
         &self,
@@ -1401,6 +1551,354 @@ impl FileFederationCustody {
         plaintext.zeroize();
         Ok(secret)
     }
+}
+
+const CUSTODY_ARCHIVE_VERSION: u32 = 1;
+const CUSTODY_ARCHIVE_INTEGRITY_PREFIX: &str = "hmac-sha-256:";
+
+/// A complete, self-describing copy of a custody store's published state.
+///
+/// Object storage is flat-key shaped, so the whole store travels as one object
+/// rather than a directory of them: a per-file upload could half-succeed and
+/// leave a remote store that looks complete and is not. The contents are the
+/// vault files verbatim, which keeps the archive honest — it cannot silently
+/// re-encode a vault into something that no longer verifies under its own HMAC.
+///
+/// This is ciphertext plus public metadata. The wrapping key is not in it and
+/// cannot be derived from it, so possession of an archive alone does not yield
+/// anybody's federation identity.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct CustodyArchive {
+    version: u32,
+    captured_at: String,
+    sentinel: String,
+    entries: Vec<CustodyArchiveEntry>,
+    integrity: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct CustodyArchiveEntry {
+    /// File name within the custody store's `principals/` directory. Never a
+    /// path: see [`CustodyArchive::materialize`], which refuses separators.
+    name: String,
+    /// The file's bytes, verbatim, base64url-unpadded.
+    contents: String,
+}
+
+/// What an archive turned out to contain, for reporting and for the sweep.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CustodyArchiveSummary {
+    pub captured_at: String,
+    pub principal_count: usize,
+    pub marker_count: usize,
+}
+
+impl fmt::Debug for CustodyArchive {
+    /// Shape only. The entries are vault ciphertext and there is no reason to
+    /// let a stray `{:?}` spill a store's contents into a log.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CustodyArchive")
+            .field("version", &self.version)
+            .field("captured_at", &self.captured_at)
+            .field("entries", &self.entries.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl CustodyArchive {
+    pub fn summary(&self) -> CustodyArchiveSummary {
+        CustodyArchiveSummary {
+            captured_at: self.captured_at.clone(),
+            principal_count: self
+                .entries
+                .iter()
+                .filter(|entry| entry.name.ends_with(".vault.json"))
+                .count(),
+            marker_count: self
+                .entries
+                .iter()
+                .filter(|entry| entry.name.ends_with(".provisioned"))
+                .count(),
+        }
+    }
+
+    pub fn captured_at(&self) -> &str {
+        &self.captured_at
+    }
+
+    /// Parse and fully verify an archive's bytes against `master_key`.
+    ///
+    /// This is the restore-side proof the backup exists for, and it deliberately
+    /// does more than check that the download arrived intact. It verifies the
+    /// archive's own HMAC — which covers the sentinel, every entry name and
+    /// every entry's bytes, so neither a dropped principal nor a swapped vault
+    /// survives it — and then re-verifies each individual vault's HMAC, so a
+    /// vault that was corrupt before it was ever archived is caught here rather
+    /// than at the moment somebody is relying on it.
+    ///
+    /// Both HMACs are keyed from the custody master key, so verification is
+    /// something only the key holder can do. An archive that fails is not
+    /// repaired or partially accepted; it is refused.
+    pub fn verify(bytes: &[u8], master_key: &CustodyMasterKey) -> Result<CustodyArchive> {
+        let archive: CustodyArchive = serde_json::from_slice(bytes)
+            .map_err(|error| Error::engine(format!("custody archive is not readable: {error}")))?;
+        if archive.version != CUSTODY_ARCHIVE_VERSION {
+            return Err(Error::engine(format!(
+                "custody archive version {} is not supported",
+                archive.version
+            )));
+        }
+
+        let encoded = archive
+            .integrity
+            .strip_prefix(CUSTODY_ARCHIVE_INTEGRITY_PREFIX)
+            .ok_or_else(|| Error::engine("custody archive integrity metadata is missing"))?;
+        let supplied = URL_SAFE_NO_PAD
+            .decode(encoded)
+            .map_err(|_| Error::engine("custody archive integrity is malformed"))?;
+        if supplied.len() != 32 {
+            return Err(Error::engine(
+                "custody archive integrity has the wrong length",
+            ));
+        }
+        let key = derive_custody_key(master_key, b"native-federation-custody-archive-key-v1");
+        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&key)
+            .map_err(|_| Error::engine("federation custody archive integrity key is invalid"))?;
+        mac.update(b"native-federation-custody-archive-payload-v1\0");
+        mac.update(&archive_integrity_payload(&archive));
+        mac.verify_slice(&supplied)
+            .map_err(|_| Error::engine("custody archive integrity check failed"))?;
+
+        // The archive HMAC proves the bytes are the ones that were captured.
+        // It does not prove those bytes were sound when captured, so each
+        // vault is re-checked against its own independent HMAC.
+        let verifier = FileFederationCustody {
+            root: Arc::new(PathBuf::new()),
+            master_key: master_key.clone(),
+        };
+        let mut vault_tokens = BTreeSet::new();
+        let mut marker_tokens = BTreeSet::new();
+        for entry in &archive.entries {
+            if entry.name.ends_with(".provisioned") {
+                marker_tokens.insert(entry.name.trim_end_matches(".provisioned").to_owned());
+                continue;
+            }
+            if !entry.name.ends_with(".vault.json") {
+                continue;
+            }
+            let bytes = URL_SAFE_NO_PAD.decode(&entry.contents).map_err(|_| {
+                Error::engine(format!(
+                    "custody archive entry {} is not decodable",
+                    entry.name
+                ))
+            })?;
+            let vault: VaultFile = serde_json::from_slice(&bytes).map_err(|error| {
+                Error::engine(format!(
+                    "custody archive entry {} is not a readable vault: {error}",
+                    entry.name
+                ))
+            })?;
+            validate_archived_vault(&verifier, &entry.name, vault)?;
+            vault_tokens.insert(entry.name.trim_end_matches(".vault.json").to_owned());
+        }
+        check_marker_pairing(&vault_tokens, &marker_tokens)?;
+        Ok(archive)
+    }
+
+    /// Write a verified archive out as a real custody store at `root`.
+    ///
+    /// `root` must not already exist or must be empty: this restores a lost
+    /// store, it does not merge into a live one, and quietly overwriting
+    /// principals that a running deployment is serving from is exactly the
+    /// accident worth making impossible.
+    pub fn materialize(
+        &self,
+        root: &Path,
+        master_key: &CustodyMasterKey,
+    ) -> Result<CustodyArchiveSummary> {
+        // Re-verify rather than trusting that this value came from `verify`.
+        // The type is public and constructible by deserialization, so the
+        // check belongs at the point of use.
+        let bytes = serde_json::to_vec(self)?;
+        CustodyArchive::verify(&bytes, master_key)?;
+
+        match std::fs::symlink_metadata(root) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+                if std::fs::read_dir(root)?.next().is_some() {
+                    // Entries are written with `create_new`, so a crash
+                    // part-way through leaves a non-empty target that refuses
+                    // its own retry. Say what to do about it: this fires
+                    // during a recovery, when guessing is expensive.
+                    return Err(Error::engine(format!(
+                        "refusing to restore a custody archive over the non-empty directory {}. \
+                         If a previous restore crashed part-way, remove that directory and retry; \
+                         if it is a live custody store, restore somewhere else — this would not \
+                         merge into it",
+                        root.display()
+                    )));
+                }
+            }
+            Ok(_) => {
+                return Err(Error::engine(
+                    "custody restore target must be a real directory",
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir_all(root)?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+        set_owner_only(root, true)?;
+
+        let principals = root.join("principals");
+        std::fs::create_dir_all(&principals)?;
+        set_owner_only(&principals, true)?;
+
+        for entry in &self.entries {
+            // Entry names come from a `read_dir` file name at capture, but an
+            // archive is an off-box artifact that can be replaced by whoever
+            // reaches the bucket. Treat the name as untrusted input.
+            if entry.name.is_empty()
+                || entry.name.contains('/')
+                || entry.name.contains('\\')
+                || entry.name.starts_with('.')
+            {
+                return Err(Error::engine(format!(
+                    "custody archive entry name is not a plain file name: {}",
+                    entry.name
+                )));
+            }
+            let bytes = URL_SAFE_NO_PAD.decode(&entry.contents).map_err(|_| {
+                Error::engine(format!(
+                    "custody archive entry {} is not decodable",
+                    entry.name
+                ))
+            })?;
+            let path = principals.join(&entry.name);
+            let mut file = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&path)?;
+            set_owner_only_file(&file)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+        }
+
+        let sentinel = root.join(STORE_SENTINEL);
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&sentinel)?;
+        set_owner_only_file(&file)?;
+        file.write_all(self.sentinel.as_bytes())?;
+        file.sync_all()?;
+        sync_parent(&sentinel)?;
+        // Durably record the principal entries themselves, not just the root.
+        File::open(&principals)?.sync_all()?;
+
+        // Proof the restore is usable, not merely written: opening runs the
+        // store's own sentinel check against the key.
+        FileFederationCustody::open(root, master_key.clone())?;
+        Ok(self.summary())
+    }
+}
+
+/// Prove an archived vault is *usable*, not merely intact.
+///
+/// The HMAC alone only says the bytes are the ones that were sealed. It says
+/// nothing about whether the wrapped secrets still unwrap under this master
+/// key, whether the key metadata is coherent, or whether the file is even
+/// filed under the account it claims. `validate_vault` unwraps every key and
+/// checks the derived public JWK matches the recorded one, so a vault that
+/// would fail on first use fails here instead — while there are still good
+/// generations in the sink that retention has not yet aged out.
+///
+/// The filename binding is checked separately because `validate_vault` sees
+/// only the contents: a vault filed under another account's token verifies
+/// perfectly and leaves both accounts unreadable after a restore.
+fn validate_archived_vault(
+    custody: &FileFederationCustody,
+    name: &str,
+    vault: VaultFile,
+) -> Result<()> {
+    let account_id = vault.account_id.clone();
+    let vault = custody.validate_vault(vault).map_err(|error| {
+        Error::engine(format!(
+            "federation custody vault {name} is not usable: {error}"
+        ))
+    })?;
+    let expected = format!("{}.vault.json", account_token(&vault.account_id));
+    if name != expected {
+        return Err(Error::engine(format!(
+            "federation custody vault {name} is filed under the wrong account token; \
+             its contents claim {account_id}, which belongs in {expected}"
+        )));
+    }
+    Ok(())
+}
+
+/// Refuse a store that remembers an account it can no longer serve.
+///
+/// `provision` writes the `.provisioned` marker durably *before* generating
+/// keys, deliberately, so that a lost vault can never look like a first
+/// provisioning and mint a second principal for someone who already has one.
+/// The cost of that ordering is a crash window in which a marker exists with
+/// no vault — a durable, already-broken state that `inspect` reports as
+/// corrupt and that the next `provision` refuses.
+///
+/// Archiving it green would be the worst outcome available: the sweep would
+/// report healthy, and retention would age out the last generations that still
+/// contain the account's real vault. Both directions are not symmetric — a
+/// vault with no marker is a legitimate legacy store that `provision` heals by
+/// backfilling the marker — so only the marker-without-vault direction fails.
+///
+/// This cannot fire on a merely in-flight provision: `provision` holds the
+/// custody lock across both writes, and the capture holds the same lock, so
+/// the intermediate state is never observable except after a crash.
+fn check_marker_pairing(
+    vault_tokens: &BTreeSet<String>,
+    marker_tokens: &BTreeSet<String>,
+) -> Result<()> {
+    let orphaned: Vec<&str> = marker_tokens
+        .difference(vault_tokens)
+        .map(String::as_str)
+        .collect();
+    if !orphaned.is_empty() {
+        return Err(Error::engine(format!(
+            "federation custody has {} provisioning marker(s) with no vault ({}); the store is \
+             already corrupt for those accounts, and archiving it would let retention age out \
+             the last generations that still hold their vaults",
+            orphaned.len(),
+            orphaned.join(", ")
+        )));
+    }
+    Ok(())
+}
+
+/// Length-prefixed, domain-separated payload for the archive HMAC.
+///
+/// Every variable-length field is length-prefixed so that no rearrangement of
+/// contents can produce the same byte stream — without it, moving a character
+/// between two adjacent fields would go unnoticed. `version` and the entry
+/// count are fixed-width and need no prefix. The count is included so that
+/// truncating the archive to a subset of principals is a detectable change
+/// rather than a shorter valid archive.
+fn archive_integrity_payload(archive: &CustodyArchive) -> Vec<u8> {
+    fn push(payload: &mut Vec<u8>, bytes: &[u8]) {
+        payload.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+        payload.extend_from_slice(bytes);
+    }
+
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&archive.version.to_be_bytes());
+    push(&mut payload, archive.captured_at.as_bytes());
+    push(&mut payload, archive.sentinel.as_bytes());
+    payload.extend_from_slice(&(archive.entries.len() as u64).to_be_bytes());
+    for entry in &archive.entries {
+        push(&mut payload, entry.name.as_bytes());
+        push(&mut payload, entry.contents.as_bytes());
+    }
+    payload
 }
 
 struct CustodyLock(File);
@@ -3379,4 +3877,508 @@ fn read_component(path: &Path, offset: u64, size: u64, maximum: u64) -> Result<V
     let mut bytes = vec![0u8; size as usize];
     file.read_exact(&mut bytes)?;
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod custody_archive {
+    use super::*;
+    use serde_json::{json, Value};
+    use tempfile::TempDir;
+
+    const CAPTURED_AT: &str = "2026-08-03T12:00:00Z";
+    const PROVISION_AT: &str = "2026-08-03T12:00:00Z";
+    const INSTALLATION_ALICE: &str = "00000000-0000-4000-8000-000000000101";
+    const INSTALLATION_BOB: &str = "00000000-0000-4000-8000-000000000202";
+
+    fn test_key(byte: u8) -> CustodyMasterKey {
+        CustodyMasterKey::from_bytes([byte; 32])
+    }
+
+    fn test_custody(directory: &TempDir, byte: u8) -> FileFederationCustody {
+        FileFederationCustody::initialize(directory.path().join("custody"), test_key(byte)).unwrap()
+    }
+
+    fn provision_alice(custody: &FileFederationCustody) {
+        custody
+            .provision(
+                "account-alice",
+                "native",
+                INSTALLATION_ALICE,
+                "https://node.example",
+                "account-alice",
+                PROVISION_AT,
+            )
+            .unwrap();
+    }
+
+    fn provision_bob(custody: &FileFederationCustody) {
+        custody
+            .provision(
+                "account-bob",
+                "native",
+                INSTALLATION_BOB,
+                "https://bob.example",
+                "account-bob",
+                PROVISION_AT,
+            )
+            .unwrap();
+    }
+
+    fn archive_bytes(custody: &FileFederationCustody) -> Vec<u8> {
+        let archive = custody.capture_archive(CAPTURED_AT).unwrap();
+        serde_json::to_vec(&archive).unwrap()
+    }
+
+    fn archive_value(bytes: &[u8]) -> Value {
+        serde_json::from_slice(bytes).unwrap()
+    }
+
+    fn vault_entry_index(value: &Value) -> usize {
+        value["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .position(|entry| {
+                entry["name"]
+                    .as_str()
+                    .is_some_and(|name| name.ends_with(".vault.json"))
+            })
+            .unwrap()
+    }
+
+    fn sorted_kids(principal: &FederationPrincipal) -> Vec<String> {
+        let mut kids = principal
+            .keys
+            .iter()
+            .map(|key| key.jwk.kid.clone())
+            .collect::<Vec<_>>();
+        kids.sort();
+        kids
+    }
+
+    #[test]
+    fn round_trip_restores_principals_with_same_versions() {
+        let directory = TempDir::new().unwrap();
+        let key = test_key(7);
+        let custody =
+            FileFederationCustody::initialize(directory.path().join("custody"), key.clone())
+                .unwrap();
+        provision_alice(&custody);
+        provision_bob(&custody);
+        let before_alice = custody.inspect("account-alice");
+        let before_bob = custody.inspect("account-bob");
+        assert_eq!(before_alice.keys.len(), 4);
+        assert_eq!(before_bob.keys.len(), 4);
+
+        let bytes = archive_bytes(&custody);
+        let verified = CustodyArchive::verify(&bytes, &key).unwrap();
+
+        let restore = TempDir::new().unwrap();
+        let root = restore.path().join("restored");
+        let summary = verified.materialize(&root, &key).unwrap();
+        assert_eq!(summary.principal_count, 2);
+        assert_eq!(summary.marker_count, 2);
+        assert_eq!(summary.captured_at, CAPTURED_AT);
+
+        let restored = FileFederationCustody::open(&root, key).unwrap();
+        for account in ["account-alice", "account-bob"] {
+            let before = if account == "account-alice" {
+                &before_alice
+            } else {
+                &before_bob
+            };
+            let after = restored.inspect(account);
+            assert_eq!(after.state, PrincipalState::Active);
+            assert_eq!(after.principal_id, before.principal_id);
+            assert_eq!(after.document_version, before.document_version);
+            assert_eq!(sorted_kids(&after), sorted_kids(before));
+        }
+    }
+
+    #[test]
+    fn write_archive_file_verifies_and_reports_summary() {
+        let directory = TempDir::new().unwrap();
+        let key = test_key(9);
+        let custody =
+            FileFederationCustody::initialize(directory.path().join("custody"), key.clone())
+                .unwrap();
+        provision_alice(&custody);
+        provision_bob(&custody);
+
+        let destination = directory.path().join("backup.custody-archive");
+        let summary = custody.write_archive(&destination, CAPTURED_AT).unwrap();
+        assert_eq!(summary.captured_at, CAPTURED_AT);
+        assert_eq!(summary.principal_count, 2);
+        assert_eq!(summary.marker_count, 2);
+
+        let bytes = std::fs::read(&destination).unwrap();
+        assert!(!bytes.is_empty());
+        let verified = CustodyArchive::verify(&bytes, &key).unwrap();
+        assert_eq!(verified.summary(), summary);
+        assert_eq!(verified.captured_at(), CAPTURED_AT);
+    }
+
+    #[test]
+    fn summary_counts_principals_and_markers() {
+        let directory = TempDir::new().unwrap();
+        let custody = test_custody(&directory, 11);
+        provision_alice(&custody);
+        provision_bob(&custody);
+
+        let archive = custody.capture_archive(CAPTURED_AT).unwrap();
+        let summary = archive.summary();
+        assert_eq!(summary.captured_at, CAPTURED_AT);
+        assert_eq!(summary.principal_count, 2);
+        assert_eq!(summary.marker_count, 2);
+        assert_eq!(archive.captured_at(), CAPTURED_AT);
+
+        let empty_dir = TempDir::new().unwrap();
+        let empty = test_custody(&empty_dir, 12);
+        let empty_summary = empty.capture_archive(CAPTURED_AT).unwrap().summary();
+        assert_eq!(empty_summary.principal_count, 0);
+        assert_eq!(empty_summary.marker_count, 0);
+    }
+
+    #[test]
+    fn captures_of_unchanged_store_are_byte_identical() {
+        let directory = TempDir::new().unwrap();
+        let custody = test_custody(&directory, 13);
+        provision_alice(&custody);
+        provision_bob(&custody);
+
+        let first = archive_bytes(&custody);
+        let second = archive_bytes(&custody);
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn verify_rejects_wrong_master_key() {
+        let directory = TempDir::new().unwrap();
+        let custody = test_custody(&directory, 17);
+        provision_alice(&custody);
+
+        let bytes = archive_bytes(&custody);
+        let error = CustodyArchive::verify(&bytes, &test_key(0xff))
+            .expect_err("wrong-key archive must fail verification");
+        assert!(error.to_string().contains("integrity"), "{error}");
+    }
+
+    #[test]
+    fn verify_rejects_tampered_entry_contents() {
+        let directory = TempDir::new().unwrap();
+        let key = test_key(19);
+        let custody =
+            FileFederationCustody::initialize(directory.path().join("custody"), key.clone())
+                .unwrap();
+        provision_alice(&custody);
+
+        let bytes = archive_bytes(&custody);
+        let mut value = archive_value(&bytes);
+        let index = vault_entry_index(&value);
+        let contents = value["entries"][index]["contents"].as_str().unwrap();
+        assert!(!contents.is_empty());
+        let mut tampered = contents.to_owned();
+        tampered.replace_range(0..1, if tampered.starts_with('A') { "B" } else { "A" });
+        value["entries"][index]["contents"] = json!(tampered);
+        let tampered_bytes = serde_json::to_vec(&value).unwrap();
+        assert_ne!(tampered_bytes, bytes);
+        let error = CustodyArchive::verify(&tampered_bytes, &key)
+            .expect_err("tampered archive must fail verification");
+        assert!(error.to_string().contains("integrity"), "{error}");
+    }
+
+    #[test]
+    fn verify_rejects_renamed_entry() {
+        let directory = TempDir::new().unwrap();
+        let key = test_key(21);
+        let custody =
+            FileFederationCustody::initialize(directory.path().join("custody"), key.clone())
+                .unwrap();
+        provision_alice(&custody);
+
+        let bytes = archive_bytes(&custody);
+        let mut value = archive_value(&bytes);
+        let index = vault_entry_index(&value);
+        let original = value["entries"][index]["name"].as_str().unwrap().to_owned();
+        value["entries"][index]["name"] = json!(format!("tampered-{original}"));
+        let renamed_bytes = serde_json::to_vec(&value).unwrap();
+        let error = CustodyArchive::verify(&renamed_bytes, &key)
+            .expect_err("renamed-entry archive must fail verification");
+        assert!(error.to_string().contains("integrity"), "{error}");
+    }
+
+    #[test]
+    fn verify_rejects_deleted_entry_truncation() {
+        let directory = TempDir::new().unwrap();
+        let key = test_key(23);
+        let custody =
+            FileFederationCustody::initialize(directory.path().join("custody"), key.clone())
+                .unwrap();
+        provision_alice(&custody);
+        provision_bob(&custody);
+
+        let bytes = archive_bytes(&custody);
+        let before: CustodyArchive = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(before.summary().principal_count, 2);
+        let mut value = archive_value(&bytes);
+        let removed = value["entries"].as_array_mut().unwrap().pop();
+        assert!(removed.is_some());
+        let truncated_bytes = serde_json::to_vec(&value).unwrap();
+        let error = CustodyArchive::verify(&truncated_bytes, &key)
+            .expect_err("truncated archive must fail verification");
+        assert!(error.to_string().contains("integrity"), "{error}");
+    }
+
+    #[test]
+    fn verify_rejects_unsupported_version() {
+        let directory = TempDir::new().unwrap();
+        let key = test_key(29);
+        let custody =
+            FileFederationCustody::initialize(directory.path().join("custody"), key.clone())
+                .unwrap();
+        provision_alice(&custody);
+
+        let bytes = archive_bytes(&custody);
+        let mut value = archive_value(&bytes);
+        value["version"] = json!(2);
+        let versioned_bytes = serde_json::to_vec(&value).unwrap();
+        let error = CustodyArchive::verify(&versioned_bytes, &key)
+            .expect_err("wrong-version archive must fail verification");
+        assert!(error.to_string().contains("not supported"), "{error}");
+    }
+
+    #[test]
+    fn materialize_refuses_non_empty_target() {
+        let directory = TempDir::new().unwrap();
+        let key = test_key(31);
+        let custody =
+            FileFederationCustody::initialize(directory.path().join("custody"), key.clone())
+                .unwrap();
+        provision_alice(&custody);
+
+        let bytes = archive_bytes(&custody);
+        let archive = CustodyArchive::verify(&bytes, &key).unwrap();
+
+        let target = TempDir::new().unwrap();
+        std::fs::write(target.path().join("existing.txt"), b"live data").unwrap();
+        let error = archive.materialize(target.path(), &key).unwrap_err();
+        assert!(error.to_string().contains("non-empty"), "{error}");
+        assert_eq!(
+            std::fs::read(target.path().join("existing.txt")).unwrap(),
+            b"live data"
+        );
+    }
+
+    #[test]
+    fn tampered_entry_name_fails_verify_before_materialize_name_check() {
+        // Entry names are covered by the archive HMAC, so a name mutated without
+        // the master key cannot reach `materialize`'s path-traversal refusal with
+        // a valid HMAC: `verify` (which `materialize` runs first) rejects it.
+        // A valid-HMAC archive carrying `../evil` or `.hidden` names is therefore
+        // not constructible through the public API; what is asserted here is that
+        // both traversal-shaped renames fail closed at verification, and that
+        // `materialize` refuses them as well rather than writing anything.
+        let directory = TempDir::new().unwrap();
+        let key = test_key(37);
+        let custody =
+            FileFederationCustody::initialize(directory.path().join("custody"), key.clone())
+                .unwrap();
+        provision_alice(&custody);
+
+        let bytes = archive_bytes(&custody);
+        for hostile in [
+            "../evil.vault.json",
+            ".hidden.vault.json",
+            "sub\\evil.vault.json",
+        ] {
+            let mut value = archive_value(&bytes);
+            let index = vault_entry_index(&value);
+            value["entries"][index]["name"] = json!(hostile);
+            let hostile_bytes = serde_json::to_vec(&value).unwrap();
+            let error = CustodyArchive::verify(&hostile_bytes, &key)
+                .expect_err("traversal-named archive must fail verification");
+            assert!(
+                error.to_string().contains("integrity"),
+                "{hostile}: {error}"
+            );
+
+            let archive: CustodyArchive = serde_json::from_slice(&hostile_bytes).unwrap();
+            let restore = TempDir::new().unwrap();
+            assert!(
+                archive
+                    .materialize(&restore.path().join("restored"), &key)
+                    .is_err(),
+                "{hostile} must not materialize"
+            );
+            assert!(
+                !restore.path().join("restored").exists(),
+                "{hostile} must not leave a restored store behind"
+            );
+        }
+    }
+
+    #[test]
+    fn capture_skips_leftover_tmp_files() {
+        let directory = TempDir::new().unwrap();
+        let custody = test_custody(&directory, 41);
+        provision_alice(&custody);
+
+        let leftover = directory
+            .path()
+            .join("custody/principals/stale.tmp-00000000-0000-4000-8000-000000000001");
+        std::fs::write(&leftover, b"crash-left write_vault temporary").unwrap();
+
+        let archive = custody.capture_archive(CAPTURED_AT).unwrap();
+        let summary = archive.summary();
+        assert_eq!(summary.principal_count, 1);
+        assert_eq!(summary.marker_count, 1);
+        let bytes = serde_json::to_vec(&archive).unwrap();
+        let value = archive_value(&bytes);
+        assert!(value["entries"].as_array().unwrap().iter().all(|entry| {
+            entry["name"]
+                .as_str()
+                .is_some_and(|name| !name.contains(".tmp-"))
+        }));
+    }
+
+    #[test]
+    fn capture_fails_closed_on_corrupt_vault() {
+        let directory = TempDir::new().unwrap();
+        let custody = test_custody(&directory, 43);
+        provision_alice(&custody);
+
+        let vault_path = std::fs::read_dir(directory.path().join("custody/principals"))
+            .unwrap()
+            .filter_map(|entry| {
+                let path = entry.unwrap().path();
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with(".vault.json"))
+                    .then_some(path)
+            })
+            .next()
+            .unwrap();
+        let mut vault: Value =
+            serde_json::from_slice(&std::fs::read(&vault_path).unwrap()).unwrap();
+        vault["document_version"] = json!(999);
+        std::fs::write(&vault_path, serde_json::to_vec(&vault).unwrap()).unwrap();
+
+        let error = custody
+            .capture_archive(CAPTURED_AT)
+            .expect_err("capture of corrupt custody must fail");
+        assert!(error.to_string().contains("integrity"), "{error}");
+    }
+
+    /// The crash window in `provision`: the marker is durable before the vault
+    /// exists. Archiving that state green would let retention age out the last
+    /// generations that still hold the account's real vault.
+    #[test]
+    fn capture_fails_closed_on_a_marker_with_no_vault() {
+        let directory = TempDir::new().unwrap();
+        let custody = test_custody(&directory, 3);
+        provision_alice(&custody);
+        provision_bob(&custody);
+
+        // Simulate the crash: the vault never landed, the marker did.
+        let principals = directory.path().join("custody").join("principals");
+        let alice_vault = principals.join(format!("{}.vault.json", account_token("account-alice")));
+        assert!(alice_vault.exists(), "fixture must start from a real vault");
+        std::fs::remove_file(&alice_vault).unwrap();
+        assert!(
+            principals
+                .join(format!("{}.provisioned", account_token("account-alice")))
+                .exists(),
+            "the marker is what makes this state corrupt rather than unprovisioned"
+        );
+
+        let error = custody
+            .capture_archive(CAPTURED_AT)
+            .expect_err("a marker with no vault must fail the capture, not be archived as healthy");
+        let message = error.to_string();
+        assert!(message.contains("marker"), "{message}");
+        assert!(message.contains("no vault"), "{message}");
+    }
+
+    /// A vault whose contents claim a different account than its filename.
+    /// It verifies perfectly under its own HMAC and leaves both accounts
+    /// unreadable after a restore.
+    #[test]
+    fn capture_fails_closed_on_a_vault_filed_under_the_wrong_token() {
+        let directory = TempDir::new().unwrap();
+        let custody = test_custody(&directory, 4);
+        provision_alice(&custody);
+        provision_bob(&custody);
+
+        let principals = directory.path().join("custody").join("principals");
+        let alice = principals.join(format!("{}.vault.json", account_token("account-alice")));
+        let bob = principals.join(format!("{}.vault.json", account_token("account-bob")));
+        // Alice's bytes, intact and correctly HMAC'd, filed as Bob.
+        let alice_bytes = std::fs::read(&alice).unwrap();
+        std::fs::write(&bob, &alice_bytes).unwrap();
+
+        let error = custody
+            .capture_archive(CAPTURED_AT)
+            .expect_err("a vault filed under the wrong token must fail the capture");
+        let message = error.to_string();
+        assert!(message.contains("wrong account token"), "{message}");
+    }
+
+    /// The HMAC only proves the bytes are the ones that were sealed. A vault
+    /// that cannot be unwrapped under the master key is intact and unusable,
+    /// and must not become the copy a recovery depends on.
+    #[test]
+    fn capture_fails_closed_on_a_vault_that_does_not_unwrap() {
+        let directory = TempDir::new().unwrap();
+        let custody = test_custody(&directory, 5);
+        provision_alice(&custody);
+
+        // Corrupt one wrapped secret, then re-seal the file under a valid
+        // archive-visible HMAC so only the deeper check can catch it.
+        let principals = directory.path().join("custody").join("principals");
+        let path = principals.join(format!("{}.vault.json", account_token("account-alice")));
+        let mut vault: VaultFile = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let ciphertext = &mut vault.keys[0].wrapped.ciphertext;
+        let flipped = if ciphertext.starts_with('A') {
+            'B'
+        } else {
+            'A'
+        };
+        ciphertext.replace_range(0..1, &flipped.to_string());
+        custody.write_vault(&vault).unwrap();
+
+        // Precondition: the file is internally consistent, so an HMAC-only
+        // check would wave it through.
+        let resealed: VaultFile = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        custody
+            .verify_vault_integrity(&resealed)
+            .expect("the re-sealed vault must pass the HMAC check this test is going past");
+
+        let error = custody
+            .capture_archive(CAPTURED_AT)
+            .expect_err("a vault that cannot be unwrapped must fail the capture");
+        assert!(error.to_string().contains("not usable"), "{error}");
+    }
+
+    /// A vault with no marker is a legitimate legacy store that `provision`
+    /// heals by backfilling the marker, so the pairing check must not be
+    /// symmetric.
+    #[test]
+    fn capture_allows_a_vault_with_no_marker() {
+        let directory = TempDir::new().unwrap();
+        let custody = test_custody(&directory, 6);
+        provision_alice(&custody);
+
+        let principals = directory.path().join("custody").join("principals");
+        std::fs::remove_file(
+            principals.join(format!("{}.provisioned", account_token("account-alice"))),
+        )
+        .unwrap();
+
+        let summary = custody
+            .capture_archive(CAPTURED_AT)
+            .expect("a vault without its marker is legacy state, not corruption")
+            .summary();
+        assert_eq!(summary.principal_count, 1);
+        assert_eq!(summary.marker_count, 0);
+    }
 }

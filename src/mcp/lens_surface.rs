@@ -289,7 +289,9 @@ pub fn lens_tool_policy(kind: Option<ToolKind>, name: &str) -> LensToolPolicy {
             | ManageMemberships
             | QueryChangeSummaries
             | ResolveMany
-            | ReadCanvas,
+            | ReadCanvas
+            | ReachRead
+            | ReachConnect,
         ) => UnsupportedRead,
         // Embedding-only custom tools have no mutation policy. They remain
         // routable only when the caller explicitly names one lens source.

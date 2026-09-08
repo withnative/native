@@ -108,6 +108,8 @@ pub enum ToolKind {
     QueryChangeSummaries,
     ReadCanvas,
     ManageCanvas,
+    ReachRead,
+    ReachConnect,
 }
 
 /// Whether one registered operation is observational or mutating.
@@ -376,7 +378,7 @@ pub enum AuthorizationDisposition {
 }
 
 impl ToolKind {
-    pub const ALL: [ToolKind; 75] = [
+    pub const ALL: [ToolKind; 77] = [
         ToolKind::Ping,
         ToolKind::EngineInfo,
         ToolKind::StandbyStatus,
@@ -452,6 +454,8 @@ impl ToolKind {
         ToolKind::PreviewRecordShape,
         ToolKind::ReadCanvas,
         ToolKind::ManageCanvas,
+        ToolKind::ReachRead,
+        ToolKind::ReachConnect,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -531,6 +535,8 @@ impl ToolKind {
             ToolKind::QueryChangeSummaries => "query_change_summaries",
             ToolKind::ReadCanvas => "read_canvas",
             ToolKind::ManageCanvas => "manage_canvas",
+            ToolKind::ReachRead => "reach_read",
+            ToolKind::ReachConnect => "reach_connect",
         }
     }
 
@@ -591,7 +597,8 @@ impl ToolKind {
             | Self::RenderSuggestionReview
             | Self::ResolveCitation
             | Self::ReadCanvas
-            | Self::ReadAttributions => Read,
+            | Self::ReadAttributions
+            | Self::ReachRead => Read,
             Self::ManageBindings => Actions(&["list", "observations"]),
             Self::ManageRecordPolicy => Actions(&["inspect", "list"]),
             Self::ManageLinks => Actions(&["list"]),
@@ -645,7 +652,8 @@ impl ToolKind {
             | Self::ManageCitations
             | Self::CreateAttribution
             | Self::ManageCanvas
-            | Self::ManageAttributions => Mutation,
+            | Self::ManageAttributions
+            | Self::ReachConnect => Mutation,
         }
     }
 
@@ -788,6 +796,12 @@ impl ToolKind {
             // record page or an agent that already knows it exists.
             ToolKind::ReadCanvas => ToolExposure::new(Records, false, BoundedContextOrCalls),
             ToolKind::ManageCanvas => ToolExposure::new(Records, false, Atomicity),
+            // Hosted-only, like membership: undiscoverable under focused
+            // filtering, present in the complete default, callable by exact
+            // name. ReachConnect mints consent-ticket state, so it shares the
+            // membership admission reason even though it writes no records.
+            ToolKind::ReachRead => ToolExposure::new(Identity, false, BoundedContextOrCalls),
+            ToolKind::ReachConnect => ToolExposure::new(Identity, false, Atomicity),
         }
     }
 
@@ -864,7 +878,9 @@ impl ToolKind {
             | ToolKind::ManageAttributions
             | ToolKind::ManageInstructions
             | ToolKind::ManageOnboarding
-            | ToolKind::ManageMemberships => Specialized,
+            | ToolKind::ManageMemberships
+            | ToolKind::ReachRead
+            | ToolKind::ReachConnect => Specialized,
             ToolKind::ManageChangeSummaries | ToolKind::QueryChangeSummaries => Specialized,
             // Edit on the canvas plus View on every record a card names.
             ToolKind::ManageCanvas => Specialized,
@@ -1773,6 +1789,20 @@ fn extract(kind: ToolKind, arguments: &Value, result: &Value) -> Extraction {
             Some("set_role" | "remove") => extraction.count(1),
             Some(_) | None => extraction.count(0),
         },
+        // Provider identifiers are external pointers, never Native record
+        // ids: count only, so read-log capture can never mistake a Slack
+        // timestamp or Notion page id for a surfaced record.
+        ToolKind::ReachRead => match string_at(arguments, "action") {
+            Some("search_slack" | "search_notion" | "list_linear_projects") => {
+                extraction.count(array_at(result, "results").len())
+            }
+            Some("recent_activity") => extraction.count(array_at(result, "candidates").len()),
+            Some("source_status") => extraction.count(array_at(result, "sources").len()),
+            Some(_) | None => extraction.count(0),
+        },
+        ToolKind::ReachConnect => {
+            extraction.count(usize::from(string_at(result, "consent_url").is_some()))
+        }
         ToolKind::ManageChangeSummaries => {
             if string_at(arguments, "action") == Some("inspect") {
                 extraction.opened(string_at(result, "carrier_id"));
@@ -1829,6 +1859,40 @@ fn response_bytes(
     serde_json::to_vec(&response)
         .ok()
         .and_then(|bytes| i64::try_from(bytes.len()).ok())
+}
+
+/// Persist only bounded operational routing for Reach. Provider search text
+/// is deliberately outside Native's interaction log, and invalid direct calls
+/// must not smuggle arbitrary fields into it before schema validation fails.
+fn captured_arguments(extractor: Extractor, original: &Value) -> Value {
+    match extractor {
+        Extractor::Shipped(ToolKind::ReachRead) => original
+            .get("action")
+            .and_then(Value::as_str)
+            .filter(|action| {
+                matches!(
+                    *action,
+                    "source_status"
+                        | "search_slack"
+                        | "search_notion"
+                        | "recent_activity"
+                        | "list_linear_projects"
+                )
+            })
+            .map_or_else(
+                || serde_json::json!({}),
+                |action| serde_json::json!({"action": action}),
+            ),
+        Extractor::Shipped(ToolKind::ReachConnect) => original
+            .get("provider")
+            .and_then(Value::as_str)
+            .filter(|provider| matches!(*provider, "slack" | "notion" | "linear"))
+            .map_or_else(
+                || serde_json::json!({}),
+                |provider| serde_json::json!({"provider": provider}),
+            ),
+        _ => original.clone(),
+    }
 }
 
 struct PendingCapture {
@@ -1916,7 +1980,8 @@ pub(crate) fn spawn_record_call(
         // turn an attempt into an interaction that did not happen.
         (_, Err(_)) => Extraction::default(),
     };
-    let arguments = serde_json::to_string(original_arguments).ok()?;
+    let arguments =
+        serde_json::to_string(&captured_arguments(extractor, original_arguments)).ok()?;
     // Only a successfully handled `set_intent` call is a declaration. Other
     // tools may happen to have an argument named `intent`, and a rejected
     // declaration must remain an attempt rather than becoming current state.
@@ -2000,18 +2065,29 @@ async fn record_call(capture: PendingCapture) -> Result<()> {
     .execute(&mut *tx)
     .await?;
     let call_seq = inserted.last_insert_rowid();
-    for touch in capture.extraction.touches {
-        sqlx::query(
+    // Multi-row inserts: a read that surfaces a large folder records one touch
+    // per child, and one statement round trip per touch held the write lock
+    // for the whole walk. Chunked so the bind count stays well inside every
+    // SQLite build's parameter limit.
+    const TOUCH_INSERT_CHUNK: usize = 200;
+    for chunk in capture.extraction.touches.chunks(TOUCH_INSERT_CHUNK) {
+        let placeholders = std::iter::repeat_n("(?, ?, ?, ?)", chunk.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
             "INSERT INTO read_log_touches
              (call_seq, record_id, interaction, result_rank)
-             VALUES (?, ?, ?, ?)",
-        )
-        .bind(call_seq)
-        .bind(touch.record_id)
-        .bind(touch.interaction.as_str())
-        .bind(touch.result_rank)
-        .execute(&mut *tx)
-        .await?;
+             VALUES {placeholders}"
+        );
+        let mut statement = sqlx::query(&sql);
+        for touch in chunk {
+            statement = statement
+                .bind(call_seq)
+                .bind(&touch.record_id)
+                .bind(touch.interaction.as_str())
+                .bind(touch.result_rank);
+        }
+        statement.execute(&mut *tx).await?;
     }
     tx.commit().await?;
     Ok(())
@@ -2021,6 +2097,43 @@ async fn record_call(capture: PendingCapture) -> Result<()> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn reach_capture_keeps_only_valid_routing_metadata() {
+        assert_eq!(
+            captured_arguments(
+                Extractor::Shipped(ToolKind::ReachRead),
+                &json!({
+                    "action":"search_slack",
+                    "query":"private query",
+                    "token":"private token",
+                    "limit":5
+                })
+            ),
+            json!({"action":"search_slack"})
+        );
+        assert_eq!(
+            captured_arguments(
+                Extractor::Shipped(ToolKind::ReachRead),
+                &json!({"action":"private invalid action", "query":"private query"})
+            ),
+            json!({})
+        );
+        assert_eq!(
+            captured_arguments(
+                Extractor::Shipped(ToolKind::ReachConnect),
+                &json!({"provider":"slack", "token":"private token"})
+            ),
+            json!({"provider":"slack"})
+        );
+        assert_eq!(
+            captured_arguments(
+                Extractor::Shipped(ToolKind::ReachConnect),
+                &json!({"provider":"private invalid provider", "token":"private token"})
+            ),
+            json!({})
+        );
+    }
 
     #[test]
     fn authoritative_policy_is_exhaustive_and_mixed_actions_fail_closed() {
@@ -2048,6 +2161,29 @@ mod tests {
         assert!(!ToolKind::CreateRecord
             .standby_disposition()
             .admits(&json!({"malformed":"arguments never reach parsing"})));
+    }
+
+    #[test]
+    fn reach_read_is_observational_and_reach_connect_is_a_mutation() {
+        assert_eq!(
+            ToolKind::ReachRead.authoritative_disposition(),
+            AuthoritativeDisposition::Read
+        );
+        assert_eq!(
+            ToolKind::ReachConnect.authoritative_disposition(),
+            AuthoritativeDisposition::Mutation
+        );
+        // Consent-ticket minting must never ride the read executor, even
+        // though both tools are hosted-only and undiscoverable when focused.
+        assert!(!ToolKind::ReachRead
+            .exposure()
+            .shown_in(ExposureProfile::Focused));
+        assert!(!ToolKind::ReachConnect
+            .exposure()
+            .shown_in(ExposureProfile::Focused));
+        assert!(ToolKind::ReachRead
+            .exposure()
+            .shown_in(ExposureProfile::Complete));
     }
 
     fn surfaced(id: &str, rank: i64) -> Touch {
@@ -2227,6 +2363,38 @@ mod tests {
                 result: json!({ "export_id": "opaque", "data_base64": "AA==" }),
                 touches: vec![],
                 result_count: Some(0),
+            },
+            Case {
+                name: "reach search counts provider results without Native record touches",
+                kind: ToolKind::ReachRead,
+                arguments: json!({ "action": "search_slack", "query": "release" }),
+                result: json!({ "results": [{ "id": "external-message", "record_id": "not-native" }] }),
+                touches: vec![],
+                result_count: Some(1),
+            },
+            Case {
+                name: "reach recency counts external candidates without Native record touches",
+                kind: ToolKind::ReachRead,
+                arguments: json!({ "action": "recent_activity", "source": "notion" }),
+                result: json!({ "candidates": [{ "id": "external-page" }] }),
+                touches: vec![],
+                result_count: Some(1),
+            },
+            Case {
+                name: "reach status counts sources without Native record touches",
+                kind: ToolKind::ReachRead,
+                arguments: json!({ "action": "source_status" }),
+                result: json!({ "sources": [{ "provider": "slack" }, { "provider": "notion" }, { "provider": "linear" }] }),
+                touches: vec![],
+                result_count: Some(3),
+            },
+            Case {
+                name: "reach consent counts the ticket without Native record touches",
+                kind: ToolKind::ReachConnect,
+                arguments: json!({ "provider": "notion" }),
+                result: json!({ "provider": "notion", "consent_url": "https://reach.example/connect/notion?ticket=fixture" }),
+                touches: vec![],
+                result_count: Some(1),
             },
             Case {
                 name: "bootstrap surfaces roots and opens fully inlined instruction sources",

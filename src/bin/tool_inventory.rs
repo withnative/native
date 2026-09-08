@@ -22,6 +22,7 @@ use serde_json::{Map, Value};
 
 use native_ce::export::LocalSnapshotSource;
 use native_ce::mcp::register_membership_tool_schema;
+use native_ce::mcp::register_reach_tool_schema;
 use native_ce::mcp::render::has_renderer;
 use native_ce::mcp::{
     descriptor_projection_bytes, lens_descriptor_projection, register_builtin_tools,
@@ -131,6 +132,7 @@ fn registry() -> Result<ToolRegistry> {
         std::sync::Arc::new(LocalSnapshotSource::new()),
     )?;
     register_membership_tool_schema(&mut registry)?;
+    register_reach_tool_schema(&mut registry)?;
     Ok(registry)
 }
 
@@ -679,11 +681,11 @@ mod tests {
         // pair of strings for both sections — as this test used to — passes on
         // whichever section happens to match and checks neither deliberately.
         assert!(rendered.contains("- **focused**: 27 tools,"));
-        assert!(rendered.contains("- **complete**: 74 tools,"));
+        assert!(rendered.contains("- **complete**: 76 tools,"));
         assert!(rendered.contains("| `manage_memberships` | identity | atomicity | — |"));
         assert!(rendered.contains("## Federated lens projection"));
         assert!(rendered.contains("- **focused**: 28 tools,"));
-        assert!(rendered.contains("- **complete**: 75 tools,"));
+        assert!(rendered.contains("- **complete**: 77 tools,"));
         assert!(rendered.contains("| `materialize_record` | identity | atomicity | yes |"));
     }
 }

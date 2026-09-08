@@ -9,6 +9,7 @@
 //! agree byte for byte.
 
 use native_ce::authorization::{replace_explicit_policy, AllowEntry, Capability};
+use native_ce::canvas::{apply_batch, Op, OriginKind, PropsAuthority};
 use native_ce::conformance::rebuild_and_diff;
 use native_ce::mcp::{
     register_builtin_tools, register_snapshot_tool, register_surface_tools, Caller,
@@ -16,6 +17,7 @@ use native_ce::mcp::{
 };
 use native_ce::{create_database, Db};
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 
 const BATCH_VERSION: &str = "native.canvas-batch.v1";
 
@@ -1767,4 +1769,909 @@ async fn the_plan_digest_binds_the_reason() {
     );
 
     assert!(rebuild_and_diff(&fx.db).await.unwrap().equal);
+}
+
+// ---------------------------------------------------------------------------
+// Milestone 3, PR A, CHUNK 1: the export bundle (`read_canvas.export`).
+// ---------------------------------------------------------------------------
+
+async fn export_as(fx: &Fixture, caller: Caller, arguments: Value) -> Value {
+    fx.registry
+        .call(fx.db.clone(), caller, "read_canvas", arguments)
+        .await
+        .unwrap()
+}
+
+/// F.1: export of a seeded canvas has `complete: true` for the owner,
+/// carries every batch from `canvas:0` in order, and its `scene` equals
+/// `get_scene { include_deleted: true }`.
+#[tokio::test]
+async fn export_bundles_scene_and_full_history_with_complete_true_for_the_owner() {
+    let fx = seeded().await;
+
+    let bundle = export_as(
+        &fx,
+        alice(),
+        json!({ "action": "export", "canvas_id": fx.canvas }),
+    )
+    .await;
+    assert_eq!(bundle["action"], json!("export"));
+    assert_eq!(bundle["version"], json!("native.canvas-export.v1"));
+    assert!(bundle["exported_at"].is_string(), "{bundle:#}");
+    assert_eq!(bundle["exported_by"]["id"], json!("acct:alice"));
+    assert_eq!(bundle["exported_by"]["display_name"], json!("Alice"));
+
+    // The scene section is get_scene with tombstones, byte for byte.
+    let live = scene(&fx, alice()).await;
+    assert_eq!(bundle["scene"]["version"], json!("native.canvas-scene.v1"));
+    assert_eq!(bundle["scene"]["objects"], live["objects"]);
+    assert_eq!(bundle["canvas_version"], live["canvas_version"]);
+
+    // The history carries every batch from canvas:0 in order.
+    let feed = changes(&fx, alice(), "canvas:0").await;
+    assert_eq!(feed["more"], false);
+    assert_eq!(
+        bundle["history"]["version"],
+        json!("native.canvas-changes.v1")
+    );
+    assert_eq!(bundle["history"]["batches"], feed["batches"]);
+    assert_eq!(bundle["history"]["batches"][0]["batch_id"], json!("seed"));
+    let versions: Vec<String> = bundle["history"]["batches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|batch| batch["canvas_version"].as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        versions.windows(2).all(|pair| pair[0] < pair[1]),
+        "batches in order: {versions:?}"
+    );
+
+    // The shell names the canvas record.
+    assert_eq!(bundle["canvas"]["id"], json!(fx.canvas));
+    assert_eq!(bundle["canvas"]["type"], json!("Document"));
+    assert_eq!(bundle["canvas"]["kind"], json!("canvas"));
+    assert_eq!(bundle["canvas"]["name"], json!("Sprint sketch"));
+    // The fixture canvas carries the default home, which Alice may see.
+    assert_eq!(bundle["canvas"]["home_id"], json!("native:unfiled"));
+    assert_eq!(bundle["canvas"]["archived"], json!(false));
+    assert!(
+        bundle["canvas"]["record_version"]
+            .as_str()
+            .is_some_and(|version| version.starts_with("rec:")),
+        "{bundle:#}"
+    );
+
+    // Nothing withheld for the owner on a canvas with no assertions.
+    assert_eq!(bundle["disclosure"]["withheld_records"], json!(0));
+    assert_eq!(bundle["disclosure"]["withheld_assertions"], json!(0));
+    assert_eq!(bundle["disclosure"]["complete"], json!(true));
+
+    // References are derived: both cards by face name, no links yet (the
+    // seed connector is unasserted) and no attestations (nothing promoted).
+    let records = bundle["references"]["records"].as_array().unwrap();
+    assert_eq!(records.len(), 2, "{bundle:#}");
+    for (id, name) in [
+        (&fx.shared, "Ship the canvas"),
+        (&fx.private, "Salary bands"),
+    ] {
+        let entry = records
+            .iter()
+            .find(|entry| entry["id"] == *id)
+            .unwrap_or_else(|| panic!("record {id} in {bundle:#}"));
+        assert_eq!(entry["name"], json!(name));
+    }
+    assert_eq!(bundle["references"]["links"], json!([]));
+    assert_eq!(bundle["references"]["attestations"], json!([]));
+
+    assert_eq!(bundle["limits"]["ops_per_batch"], json!(200));
+    assert_eq!(bundle["limits"]["batch_bytes"], json!(256 * 1024));
+    assert_eq!(bundle["limits"]["live_objects"], json!(5000));
+    assert_eq!(bundle["limits"]["export_bytes"], json!(8 * 1024 * 1024));
+    assert_eq!(bundle["limits"]["export_batches"], json!(10_000));
+
+    // After an assertion the visible link is listed and the owner's bundle
+    // stays complete: the `changes` feed withholds a connector `semantic`
+    // whole and unconditionally for every caller (an op carries no endpoint
+    // context on which to resolve View), so that withholding is a uniform
+    // property of the feed rather than redaction of this caller. Counting
+    // it would make the flag false for the owner of any canvas that has
+    // ever had a connector asserted, which discriminates nothing. Replay
+    // is not free of it, though: an assertion batch cannot be re-folded
+    // verbatim, and a replayer restores `semantic` from the bundle's own
+    // scene first (see the replay recipe in docs/canvas-protocol-v1.md).
+    let asserted = assert_connector(&fx, alice(), "k1", "relates_to").await;
+    assert_eq!(asserted["outcome"], json!("committed"));
+    let bundle = export_as(
+        &fx,
+        alice(),
+        json!({ "action": "export", "canvas_id": fx.canvas }),
+    )
+    .await;
+    let links = bundle["references"]["links"].as_array().unwrap();
+    assert_eq!(links.len(), 1, "{bundle:#}");
+    assert_eq!(links[0]["relationship"], json!("relates_to"));
+    assert!(links[0]["id"].is_string(), "{bundle:#}");
+    assert_eq!(bundle["disclosure"]["complete"], json!(true));
+    assert_eq!(bundle["limits"]["export_batches"], json!(10_000));
+    let scene_after = scene(&fx, alice()).await;
+    assert_eq!(bundle["scene"]["objects"], scene_after["objects"]);
+    let feed = changes(&fx, alice(), "canvas:0").await;
+    assert_eq!(bundle["history"]["batches"], feed["batches"]);
+
+    // The other direction of the distinction: Bea cannot see the private
+    // end, so the SCENE withholds the assertion from her — and that one IS
+    // caller-specific, hence counted and completeness-falsifying.
+    let bundle = export_as(
+        &fx,
+        bea(),
+        json!({ "action": "export", "canvas_id": fx.canvas }),
+    )
+    .await;
+    assert_eq!(bundle["disclosure"]["complete"], json!(false));
+    assert_eq!(bundle["disclosure"]["withheld_records"], json!(1));
+    assert_eq!(bundle["disclosure"]["withheld_assertions"], json!(1));
+    assert_eq!(bundle["references"]["links"], json!([]));
+    let records = bundle["references"]["records"].as_array().unwrap();
+    assert_eq!(records.len(), 1, "{bundle:#}");
+    assert_eq!(records[0]["id"], json!(fx.shared));
+    let scene_bea = scene(&fx, bea()).await;
+    assert_eq!(bundle["scene"]["objects"], scene_bea["objects"]);
+
+    assert_replay_exact(&fx.db).await;
+}
+
+/// Insert `count` minimal, well-formed canvas batches straight into the
+/// ledger. The projector never ran for these rows, so this helper is only
+/// for export size-cap tests that must never call `rebuild_and_diff`.
+async fn stuff_batches(fx: &Fixture, count: usize, payload: &Value) {
+    let pool = crate::common::fixture_write_pool(&fx.db).await;
+    let base: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(seq),0) FROM content_events")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let payload = serde_json::to_string(payload).unwrap();
+    sqlx::query("BEGIN").execute(&pool).await.unwrap();
+    for i in 0..count {
+        let seq = base + i as i64 + 1;
+        let event_id = format!("cap-evt-{seq}");
+        sqlx::query(
+            "INSERT INTO content_events(seq,id,record_id,type,payload,actor,\
+             causal_envelope_version,causal_status) \
+             VALUES (?,?,?,?,?,?,1,'complete')",
+        )
+        .bind(seq)
+        .bind(&event_id)
+        .bind(&fx.canvas)
+        .bind("canvas.batch.committed.v1")
+        .bind(&payload)
+        .bind("acct:alice")
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO canvas_batches(canvas_id,batch_id,actor,event_id,event_seq,\
+             ops_sha256,origin_kind) VALUES (?,?,?,?,?,?,?)",
+        )
+        .bind(&fx.canvas)
+        .bind(format!("cap-{seq}"))
+        .bind("acct:alice")
+        .bind(&event_id)
+        .bind(seq)
+        .bind("0".repeat(64))
+        .bind("agent")
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    sqlx::query("COMMIT").execute(&pool).await.unwrap();
+}
+
+fn minimal_batch_payload() -> Value {
+    json!({
+        "version": BATCH_VERSION,
+        "batch_id": "cap",
+        "origin": { "kind": "agent" },
+        "ops": [],
+        "ops_sha256": "0".repeat(64),
+    })
+}
+
+/// F.5: export refuses `as_of`; refuses over the byte and batch caps naming
+/// the limit; `include_history: false` returns `history: null`.
+#[tokio::test]
+async fn export_refuses_as_of_and_caps_while_shell_mode_returns_null_history() {
+    let fx = fixture().await;
+
+    // `as_of` is refused for export, as it is for `changes` and `describe`.
+    let refused = fx
+        .registry
+        .call(
+            fx.db.clone(),
+            alice(),
+            "read_canvas",
+            json!({ "action": "export", "canvas_id": fx.canvas, "as_of": { "content_seq": 1 } }),
+        )
+        .await
+        .expect_err("export must refuse as_of");
+    assert!(refused.to_string().contains("as_of"), "{refused}");
+
+    // Over the batch cap the export names `export_batches` and points at
+    // `changes` paging; the shell fallback still works on the same canvas.
+    stuff_batches(&fx, 10_001, &minimal_batch_payload()).await;
+    let refused = fx
+        .registry
+        .call(
+            fx.db.clone(),
+            alice(),
+            "read_canvas",
+            json!({ "action": "export", "canvas_id": fx.canvas }),
+        )
+        .await
+        .expect_err("history over the batch cap must refuse");
+    assert!(refused.to_string().contains("export_batches"), "{refused}");
+    assert!(refused.to_string().contains("changes"), "{refused}");
+    let shell = export_as(
+        &fx,
+        alice(),
+        json!({ "action": "export", "canvas_id": fx.canvas, "include_history": false }),
+    )
+    .await;
+    assert_eq!(shell["history"], Value::Null);
+    assert_eq!(shell["scene"]["version"], json!("native.canvas-scene.v1"));
+    assert_eq!(shell["limits"]["export_batches"], json!(10_000));
+
+    // Over the byte cap the export names `export_bytes`. One huge but
+    // well-formed batch is enough: the scene stays empty (only the history
+    // carries it), so `include_history: false` is the fallback again.
+    let fx = fixture().await;
+    let big = "x".repeat(9 * 1024 * 1024);
+    stuff_batches(
+        &fx,
+        1,
+        &json!({
+            "version": BATCH_VERSION,
+            "batch_id": "big-1",
+            "origin": { "kind": "agent" },
+            "ops": [{ "op": "create", "object": {
+                "id": "big", "kind": "note", "x": 0, "y": 0, "w": 1, "h": 1, "z": "a",
+                "props": { "text": big, "color": "yellow" },
+            } }],
+            "ops_sha256": "0".repeat(64),
+        }),
+    )
+    .await;
+    let refused = fx
+        .registry
+        .call(
+            fx.db.clone(),
+            alice(),
+            "read_canvas",
+            json!({ "action": "export", "canvas_id": fx.canvas }),
+        )
+        .await
+        .expect_err("an export over the byte cap must refuse");
+    assert!(refused.to_string().contains("export_bytes"), "{refused}");
+    assert!(refused.to_string().contains("changes"), "{refused}");
+    let shell = export_as(
+        &fx,
+        alice(),
+        json!({ "action": "export", "canvas_id": fx.canvas, "include_history": false }),
+    )
+    .await;
+    assert_eq!(shell["history"], Value::Null);
+}
+
+/// F.6: a caller without View gets the same non-existent-record refusal
+/// `get_scene` gives.
+#[tokio::test]
+async fn export_without_view_fails_like_get_scene() {
+    let fx = fixture().await;
+    commit(
+        &fx,
+        alice(),
+        batch(&fx.canvas, "b-1", json!([note("n1", 0.0, "a")])),
+    )
+    .await;
+    replace_explicit_policy(
+        &fx.db,
+        "test:canvas-policy",
+        &fx.canvas,
+        vec![AllowEntry::account("acct:alice", Capability::Manage)],
+    )
+    .await
+    .unwrap();
+
+    let scene_err = fx
+        .registry
+        .call(
+            fx.db.clone(),
+            bea(),
+            "read_canvas",
+            json!({ "action": "get_scene", "canvas_id": fx.canvas }),
+        )
+        .await
+        .expect_err("get_scene without View must refuse")
+        .to_string();
+    let export_err = fx
+        .registry
+        .call(
+            fx.db.clone(),
+            bea(),
+            "read_canvas",
+            json!({ "action": "export", "canvas_id": fx.canvas }),
+        )
+        .await
+        .expect_err("export without View must refuse")
+        .to_string();
+    assert!(export_err.contains("does not exist"), "{export_err}");
+    assert_eq!(export_err, scene_err);
+    assert!(!export_err.contains("Sprint sketch"));
+    assert_replay_exact(&fx.db).await;
+}
+
+// ---------------------------------------------------------------------------
+// Milestone 3, PR A, CHUNK 2: replay proofs.
+// ---------------------------------------------------------------------------
+
+/// Map each batch's `canvas_version` token to its 1-based ordinal, so two
+/// scenes folded at different absolute `content_events.seq` values can be
+/// compared. Absolute `canvas:N` tokens cannot survive a move between
+/// databases; the ordinal of the batch that stamped them can.
+fn replay_ordinal_map(batches: &[Value]) -> BTreeMap<String, u64> {
+    batches
+        .iter()
+        .enumerate()
+        .map(|(index, batch)| {
+            (
+                batch["canvas_version"].as_str().unwrap_or("").to_string(),
+                (index + 1) as u64,
+            )
+        })
+        .collect()
+}
+
+/// Clone scene objects with `versions.geometry`/`versions.content` replaced
+/// by batch ordinals, sorted by id so fold order cannot matter.
+fn normalised_scene(objects: &[Value], ordinals: &BTreeMap<String, u64>) -> Vec<Value> {
+    let mut out: Vec<Value> = objects
+        .iter()
+        .map(|object| {
+            let mut object = object.clone();
+            for group in ["geometry", "content"] {
+                let token = object
+                    .pointer(&format!("/versions/{group}"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let ordinal = ordinals
+                    .get(&token)
+                    .copied()
+                    .unwrap_or_else(|| panic!("version token {token} names no batch in {object}"));
+                *object
+                    .pointer_mut(&format!("/versions/{group}"))
+                    .expect("versions group") = json!(ordinal);
+            }
+            object
+        })
+        .collect();
+    out.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+    out
+}
+
+async fn scene_versions(fx: &Fixture, caller: Caller) -> BTreeMap<String, (String, String)> {
+    scene(fx, caller).await["objects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|object| {
+            (
+                object["id"].as_str().unwrap().to_string(),
+                (
+                    object["versions"]["geometry"].as_str().unwrap().to_string(),
+                    object["versions"]["content"].as_str().unwrap().to_string(),
+                ),
+            )
+        })
+        .collect()
+}
+
+/// F.2: engine replay. Fold every exported batch's ops, in order, into a
+/// fresh canvas in a fresh database through `canvas::apply_batch` with
+/// `PropsAuthority::of(origin.kind)`, in one transaction, and compare the
+/// scene modulo version ordinals.
+///
+/// No production-code change was needed for this: the authority already
+/// travels with the batch through the public, pure `PropsAuthority::of`,
+/// and `apply_batch` never consults `validate_envelope` — the PR #997
+/// client seam (engine origins refused at submission) is untouched, since
+/// the test folds stored/exported ops directly and never submits an
+/// engine origin through `commit_batch`.
+///
+/// Two honest normalisations apply, both asserted rather than hidden:
+/// - The feed withholds a connector `semantic` unconditionally, so the
+///   exported assertion op carries `"semantic": "withheld"`, which even the
+///   Engine fold refuses. It is repaired from the bundle's own scene, which
+///   carries the owner's visible assertion. (A promotion patch's
+///   `record_id`/`promoted_from` needed the same repair until the feed
+///   learned to harvest patch ids and spare null placeholders; the feed
+///   now carries them for a caller who may see the record, so that repair
+///   is gone.)
+/// - Record cards name records absent from the fresh database, so they
+///   read back `record_id: "withheld"` with no face (B3). The pre-redaction
+///   props are verified straight from `canvas_objects` instead.
+#[tokio::test]
+async fn engine_replay_through_apply_batch_reproduces_the_scene_modulo_remapping() {
+    let fx = fixture().await;
+    // A stream with every op kind, a frame delete that detaches a child, an
+    // assertion and a promotion — so engine-authored origins are in it.
+    let first = commit(
+        &fx,
+        alice(),
+        batch(
+            &fx.canvas,
+            "f2-seed",
+            json!([
+                frame("f1", 0.0, "Plan"),
+                { "op": "create", "object": { "id": "n1", "kind": "note", "x": 40, "y": 10, "w": 100, "h": 100, "z": "b", "parent": "f1", "props": { "text": "child" } } },
+                { "op": "create", "object": { "id": "s1", "kind": "shape", "x": 300, "y": 20, "w": 80, "h": 80, "z": "c", "props": { "shape": "rect" } } },
+                { "op": "create", "object": { "id": "t1", "kind": "stroke", "x": 0, "y": 0, "w": 10, "h": 10, "z": "d", "props": { "points": [[0, 0], [5, 5]], "width": 2 } } },
+                card("c-shared", 400.0, &fx.shared),
+                card("c-private", 700.0, &fx.private),
+                // The connector carries a `label` so the replay comparison
+                // below exercises it rather than merely listing it: a fold
+                // that dropped `label` must fail.
+                { "op": "create", "object": { "id": "k1", "kind": "connector", "x": 0, "y": 0, "w": 0, "h": 0, "z": "ak1", "props": { "from": { "object": "c-shared" }, "to": { "object": "c-private" }, "style": "arrow", "label": "ships it" } } },
+                note("n2", 900.0, "to be promoted"),
+            ]),
+        ),
+    )
+    .await;
+    assert_eq!(first["outcome"], json!("committed"), "{first:#}");
+    let v1 = first["canvas_version"].as_str().unwrap().to_string();
+    let moved = commit(
+        &fx,
+        alice(),
+        batch(
+            &fx.canvas,
+            "f2-touch",
+            json!([
+                { "op": "patch", "id": "n1", "expected": { "geometry": v1 }, "set": { "x": 60 } },
+                { "op": "patch", "id": "n2", "expected": { "content": v1 }, "set": { "props": { "text": "edited" } } },
+            ]),
+        ),
+    )
+    .await;
+    assert_eq!(moved["outcome"], json!("committed"), "{moved:#}");
+    let asserted = assert_connector(&fx, alice(), "k1", "relates_to").await;
+    assert_eq!(asserted["outcome"], json!("committed"));
+    let planned = commit(
+        &fx,
+        alice(),
+        json!({
+            "action": "promote",
+            "canvas_id": fx.canvas,
+            "reason": "f.2 replay seed",
+            "dry_run": true,
+            "items": [{ "object_id": "n2", "type": "WorkItem", "kind": "task", "name": "Promoted in F.2" }],
+        }),
+    )
+    .await;
+    assert_eq!(planned["outcome"], json!("planned"), "{planned:#}");
+    let done = commit(
+        &fx,
+        alice(),
+        json!({
+            "action": "promote",
+            "canvas_id": fx.canvas,
+            "reason": "f.2 replay seed",
+            "dry_run": false,
+            "plan_digest": planned["plan_digest"],
+            "items": [{ "object_id": "n2", "type": "WorkItem", "kind": "task", "name": "Promoted in F.2" }],
+        }),
+    )
+    .await;
+    assert_eq!(done["outcome"], json!("committed"), "{done:#}");
+    let versions = scene_versions(&fx, alice()).await;
+    let dropped = commit(
+        &fx,
+        alice(),
+        batch(
+            &fx.canvas,
+            "f2-drop",
+            json!([{ "op": "delete", "id": "f1",
+                "expected": { "geometry": versions["f1"].0, "content": versions["f1"].1 } }]),
+        ),
+    )
+    .await;
+    assert_eq!(dropped["outcome"], json!("committed"), "{dropped:#}");
+    let versions = scene_versions(&fx, alice()).await;
+    let restored = commit(
+        &fx,
+        alice(),
+        batch(
+            &fx.canvas,
+            "f2-back",
+            json!([{ "op": "restore", "id": "f1",
+                "expected": { "geometry": versions["f1"].0, "content": versions["f1"].1 } }]),
+        ),
+    )
+    .await;
+    assert_eq!(restored["outcome"], json!("committed"), "{restored:#}");
+
+    let bundle = export_as(
+        &fx,
+        alice(),
+        json!({ "action": "export", "canvas_id": fx.canvas }),
+    )
+    .await;
+    // The promotion's record and `promoted_from` survive the feed for a
+    // caller who may see them (patch-id harvesting, null placeholders
+    // spared), so the owner's bundle is complete.
+    assert_eq!(bundle["disclosure"]["withheld_records"], json!(0));
+    assert_eq!(bundle["disclosure"]["withheld_assertions"], json!(0));
+    assert_eq!(bundle["disclosure"]["complete"], json!(true));
+    let batches = bundle["history"]["batches"].as_array().unwrap().clone();
+    assert_eq!(batches.len(), 6, "{bundle:#}");
+    let exp_objects = bundle["scene"]["objects"].as_array().unwrap().clone();
+
+    // Semantic repair from the bundle's own scene: the feed's uniform
+    // withholding does not re-fold, but the owner's scene carries the
+    // visible assertion the stored batch wrote.
+    let mut semantics = BTreeMap::new();
+    for object in &exp_objects {
+        let id = object["id"].as_str().unwrap().to_string();
+        if object["kind"] == json!("connector") && object["props"]["semantic"].is_object() {
+            semantics.insert(id, object["props"]["semantic"].clone());
+        }
+    }
+
+    let fresh = create_database(":memory:").await.unwrap();
+    let fresh_registry = registry();
+    let fresh_canvas = create_local(
+        &fresh_registry,
+        &fresh,
+        json!({ "type": "Document", "kind": "canvas", "name": "Replay" }),
+    )
+    .await;
+    let pool = crate::common::fixture_write_pool(&fresh).await;
+    let mut conn = pool.acquire().await.unwrap();
+    sqlx::query("BEGIN").execute(&mut *conn).await.unwrap();
+    for (index, batch) in batches.iter().enumerate() {
+        let kind: OriginKind = serde_json::from_value(batch["origin"]["kind"].clone()).unwrap();
+        let mut ops: Vec<Op> = serde_json::from_value(batch["ops"].clone()).unwrap();
+        for op in &mut ops {
+            if let Op::Patch { id, set, .. } = op {
+                if let Some(props) = set.props.as_mut() {
+                    if props.get("semantic") == Some(&Value::String("withheld".into())) {
+                        let restored = semantics.get(id.as_str()).unwrap_or_else(|| {
+                            panic!("no visible semantic to restore for connector {id}")
+                        });
+                        props.insert("semantic".into(), restored.clone());
+                    }
+                }
+            }
+        }
+        if let Err(error) = apply_batch(
+            &mut conn,
+            &fresh_canvas,
+            (index + 1) as i64,
+            &ops,
+            PropsAuthority::of(kind),
+        )
+        .await
+        {
+            panic!("replay of batch {} failed: {:?}", batch["batch_id"], error);
+        }
+    }
+    sqlx::query("COMMIT").execute(&mut *conn).await.unwrap();
+    drop(conn);
+
+    let rep_scene = fresh_registry
+        .call(
+            fresh.clone(),
+            Caller::local(),
+            "read_canvas",
+            json!({ "action": "get_scene", "canvas_id": fresh_canvas, "include_deleted": true }),
+        )
+        .await
+        .unwrap();
+    let rep_objects = rep_scene["objects"].as_array().unwrap().clone();
+    let exp_map = replay_ordinal_map(&batches);
+    let rep_versions: Vec<Value> = (1..=batches.len())
+        .map(|seq| json!({ "canvas_version": format!("canvas:{seq}") }))
+        .collect();
+    let rep_map = replay_ordinal_map(&rep_versions);
+    let exp = normalised_scene(&exp_objects, &exp_map);
+    let rep = normalised_scene(&rep_objects, &rep_map);
+    assert_eq!(exp.len(), rep.len(), "object count survives replay");
+    for (e, r) in exp.iter().zip(rep.iter()) {
+        let id = e["id"].as_str().unwrap();
+        assert_eq!(r["id"], e["id"], "stable object id");
+        for field in [
+            "kind", "x", "y", "w", "h", "z", "parent", "deleted", "versions",
+        ] {
+            assert_eq!(&r[field], &e[field], "object {id} field {field}");
+        }
+        if e["kind"] == json!("record_card") {
+            // B3: the records live only in the source database, so the
+            // replayed faces resolve to nothing — and with the record
+            // wholly absent (not merely deleted) the id itself withholds.
+            assert_eq!(r["props"]["record_id"], json!("withheld"), "card {id}");
+            assert!(r.get("record").is_none(), "card {id} face");
+            assert_eq!(r["props"].as_object().unwrap().len(), 1, "card {id}");
+            assert_ne!(e["props"]["record_id"], json!("withheld"));
+            assert!(e["record"].is_object(), "exported card {id} face");
+        } else if e["kind"] == json!("connector") {
+            // Pinned so the loop below exercises `label` rather than
+            // merely listing it: both sides must carry the seeded value.
+            assert_eq!(e["props"]["label"], json!("ships it"), "seed carries label");
+            for field in ["from", "to", "style", "label"] {
+                assert_eq!(&r["props"][field], &e["props"][field], "connector {id}");
+            }
+            assert_eq!(e["props"]["semantic"]["status"], json!("asserted"));
+            // In the fresh database neither endpoint record exists, so the
+            // scene withholds the whole assertion — the same caller-specific
+            // rule that hides it from anyone who cannot see both ends. The
+            // stored assertion itself is verified below straight from
+            // `canvas_objects`, where redaction cannot reach it.
+            assert_eq!(r["props"]["semantic"], json!("withheld"));
+        } else {
+            assert_eq!(r["props"], e["props"], "object {id} props");
+        }
+    }
+
+    // Beneath redaction the engine transitions landed verbatim.
+    let props_n2: String =
+        sqlx::query_scalar("SELECT props FROM canvas_objects WHERE canvas_id=? AND object_id='n2'")
+            .bind(&fresh_canvas)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let props_n2: Value = serde_json::from_str(&props_n2).unwrap();
+    let exported_n2 = exp.iter().find(|o| o["id"] == json!("n2")).unwrap();
+    assert_eq!(props_n2["record_id"], exported_n2["props"]["record_id"]);
+    assert_eq!(
+        props_n2["promoted_from"],
+        exported_n2["props"]["promoted_from"]
+    );
+    let props_k1: String =
+        sqlx::query_scalar("SELECT props FROM canvas_objects WHERE canvas_id=? AND object_id='k1'")
+            .bind(&fresh_canvas)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let props_k1: Value = serde_json::from_str(&props_k1).unwrap();
+    assert_eq!(props_k1["semantic"], semantics["k1"]);
+
+    // The source log is internally consistent. The fresh database gets no
+    // rebuild check: its projections were written directly by the test fold
+    // and it carries no event log to rebuild from — there is nothing for
+    // `rebuild_and_diff` to replay there.
+    assert!(rebuild_and_diff(&fx.db).await.unwrap().equal);
+}
+
+/// F.3: protocol replay — the recipe an agent can actually run today. For a
+/// bundle whose batches are all client-authored, re-submit each batch
+/// through `manage_canvas.commit_batch` into a new canvas as a new `agent`
+/// batch, rewriting every `expected` token from the previous result's
+/// `objects` map, and compare the scenes modulo ordinals. Same database,
+/// so the records behind the cards resolve identically on both sides and
+/// the comparison is strict.
+#[tokio::test]
+async fn protocol_replay_through_commit_batch_reproduces_the_scene_modulo_remapping() {
+    let fx = fixture().await;
+    let first = commit(
+        &fx,
+        alice(),
+        batch(
+            &fx.canvas,
+            "f3-seed",
+            json!([
+                frame("f1", 0.0, "Plan"),
+                { "op": "create", "object": { "id": "n1", "kind": "note", "x": 40, "y": 10, "w": 100, "h": 100, "z": "b", "parent": "f1", "props": { "text": "child" } } },
+                { "op": "create", "object": { "id": "s1", "kind": "shape", "x": 300, "y": 20, "w": 80, "h": 80, "z": "c", "props": { "shape": "rect" } } },
+                { "op": "create", "object": { "id": "t1", "kind": "stroke", "x": 0, "y": 0, "w": 10, "h": 10, "z": "d", "props": { "points": [[0, 0], [5, 5]], "width": 2 } } },
+                card("c-shared", 400.0, &fx.shared),
+                card("c-private", 700.0, &fx.private),
+                note("n9", 900.0, "doomed"),
+            ]),
+        ),
+    )
+    .await;
+    assert_eq!(first["outcome"], json!("committed"), "{first:#}");
+    let v1 = first["canvas_version"].as_str().unwrap().to_string();
+    let touched = commit(
+        &fx,
+        alice(),
+        batch(
+            &fx.canvas,
+            "f3-touch",
+            json!([
+                { "op": "patch", "id": "n1", "expected": { "geometry": v1 }, "set": { "x": 60 } },
+                { "op": "patch", "id": "n9", "expected": { "content": v1 }, "set": { "props": { "text": "edited" } } },
+            ]),
+        ),
+    )
+    .await;
+    assert_eq!(touched["outcome"], json!("committed"), "{touched:#}");
+    let versions = scene_versions(&fx, alice()).await;
+    let dropped = commit(
+        &fx,
+        alice(),
+        batch(
+            &fx.canvas,
+            "f3-drop",
+            json!([{ "op": "delete", "id": "f1",
+                "expected": { "geometry": versions["f1"].0, "content": versions["f1"].1 } }]),
+        ),
+    )
+    .await;
+    assert_eq!(dropped["outcome"], json!("committed"), "{dropped:#}");
+    let versions = scene_versions(&fx, alice()).await;
+    let restored = commit(
+        &fx,
+        alice(),
+        batch(
+            &fx.canvas,
+            "f3-back",
+            json!([{ "op": "restore", "id": "f1",
+                "expected": { "geometry": versions["f1"].0, "content": versions["f1"].1 } }]),
+        ),
+    )
+    .await;
+    assert_eq!(restored["outcome"], json!("committed"), "{restored:#}");
+    let versions = scene_versions(&fx, alice()).await;
+    let tombstoned = commit(
+        &fx,
+        alice(),
+        batch(
+            &fx.canvas,
+            "f3-tomb",
+            json!([{ "op": "delete", "id": "n9",
+                "expected": { "geometry": versions["n9"].0, "content": versions["n9"].1 } }]),
+        ),
+    )
+    .await;
+    assert_eq!(tombstoned["outcome"], json!("committed"), "{tombstoned:#}");
+
+    let bundle = export_as(
+        &fx,
+        alice(),
+        json!({ "action": "export", "canvas_id": fx.canvas }),
+    )
+    .await;
+    // Client-authored throughout, fully visible to the owner: complete.
+    assert_eq!(bundle["disclosure"]["complete"], json!(true));
+    let batches = bundle["history"]["batches"].as_array().unwrap().clone();
+    assert_eq!(batches.len(), 5, "{bundle:#}");
+    let exp_objects = bundle["scene"]["objects"].as_array().unwrap().clone();
+
+    let target = create_local(
+        &fx.registry,
+        &fx.db,
+        json!({ "type": "Document", "kind": "canvas", "name": "Replay target" }),
+    )
+    .await;
+    replace_explicit_policy(
+        &fx.db,
+        "test:canvas-replay",
+        &target,
+        vec![AllowEntry::account("acct:alice", Capability::Manage)],
+    )
+    .await
+    .unwrap();
+    // Batch ids are namespaced per canvas by the idempotency ledger, so the
+    // exported ids are safe to reuse on the new canvas.
+    let mut versions: BTreeMap<String, Value> = BTreeMap::new();
+    let mut rep_versions = Vec::new();
+    for batch in &batches {
+        let mut ops = batch["ops"].clone();
+        for op in ops.as_array_mut().unwrap() {
+            if let Some(id) = op.get("id").and_then(Value::as_str) {
+                let current = versions
+                    .get(id)
+                    .unwrap_or_else(|| panic!("no committed versions yet for {id}"));
+                op["expected"] =
+                    json!({ "geometry": current["geometry"], "content": current["content"] });
+            }
+        }
+        let result = commit(
+            &fx,
+            alice(),
+            json!({ "action": "commit_batch", "batch": {
+                "version": BATCH_VERSION,
+                "canvas_id": target,
+                "batch_id": batch["batch_id"],
+                "origin": { "kind": "agent" },
+                "ops": ops,
+            }}),
+        )
+        .await;
+        assert_eq!(result["outcome"], json!("committed"), "{result:#}");
+        rep_versions.push(json!({ "canvas_version": result["canvas_version"] }));
+        for (id, tokens) in result["objects"].as_object().unwrap() {
+            versions.insert(id.clone(), tokens.clone());
+        }
+    }
+
+    let rep_objects = fx
+        .registry
+        .call(
+            fx.db.clone(),
+            alice(),
+            "read_canvas",
+            json!({ "action": "get_scene", "canvas_id": target, "include_deleted": true }),
+        )
+        .await
+        .unwrap()["objects"]
+        .as_array()
+        .unwrap()
+        .clone();
+    let exp = normalised_scene(&exp_objects, &replay_ordinal_map(&batches));
+    let rep = normalised_scene(&rep_objects, &replay_ordinal_map(&rep_versions));
+    assert_eq!(
+        exp, rep,
+        "protocol replay reproduces the scene modulo ordinals"
+    );
+
+    assert_replay_exact(&fx.db).await;
+}
+
+/// F.4: `export` is the seventh disclosure path. Structured exactly like
+/// the six-path test above (`a_record_the_caller_may_not_see_appears_on_no_read_path`):
+/// Alice summons both records as cards; Bea holds View on the shared one
+/// only. As Bea, the whole bundle never contains the hidden record's id,
+/// `disclosure.complete` is false, and `disclosure.withheld_records`
+/// counts it. (F.1 already shows the withheld side counts on an asserted
+/// canvas; this test pins the full-string absence the other tests assert
+/// per read path.)
+#[tokio::test]
+async fn export_never_names_a_record_the_caller_may_not_see() {
+    let fx = fixture().await;
+    let created = commit(
+        &fx,
+        alice(),
+        batch(
+            &fx.canvas,
+            "b-1",
+            json!([
+                card("c-shared", 0.0, &fx.shared),
+                card("c-private", 300.0, &fx.private),
+            ]),
+        ),
+    )
+    .await;
+    assert_eq!(created["outcome"], json!("committed"), "{created:#}");
+
+    // Control: Alice's bundle names both records and is complete.
+    let mine = export_as(
+        &fx,
+        alice(),
+        json!({ "action": "export", "canvas_id": fx.canvas }),
+    )
+    .await;
+    let body = serde_json::to_string(&mine).unwrap();
+    assert!(body.contains(&fx.shared), "the visible card is named");
+    assert!(body.contains(&fx.private), "Alice may see both records");
+    assert_eq!(mine["disclosure"]["complete"], json!(true));
+
+    // Bea's bundle: no hidden id anywhere — scene, history, references —
+    // counted once and marked incomplete.
+    let theirs = export_as(
+        &fx,
+        bea(),
+        json!({ "action": "export", "canvas_id": fx.canvas }),
+    )
+    .await;
+    let body = serde_json::to_string(&theirs).unwrap();
+    assert!(
+        !body.contains(&fx.private),
+        "export is a read path like any other: {body:#}"
+    );
+    assert!(body.contains(&fx.shared), "the visible card is still named");
+    assert_eq!(theirs["disclosure"]["complete"], json!(false));
+    assert_eq!(theirs["disclosure"]["withheld_records"], json!(1));
+
+    assert_replay_exact(&fx.db).await;
 }

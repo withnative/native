@@ -39,8 +39,8 @@ PUBLIC_RELEASE = "public-release"
 SCANNER = "native-ce-private-preview-credential-scan/v1"
 EXPECTED_LICENSE_SHA256 = "40e38d978117d3ea0b1925acb7fa8b1dbd0955671050ee1051fdaec277486f8a"
 EXPECTED_PUBLIC_FILE_SHA256 = {
-    "CONTRIBUTING.md": "0f0d98d65dd8568943db51762b2452d5160e6e33d9135e6aa8c82856c47f9e68",
-    "RELEASE_NOTES.md": "ba43c67347f6fdeac04dc714d73d73209e10fa25cebd6925f827e1b1c6e00686",
+    "CONTRIBUTING.md": "0266b07cd70ed1db6f8b3c6fc75f4313195382bbc75198769e958f12ea033efa",
+    "RELEASE_NOTES.md": "b070bc18a5529291c803e717c72a3d808aaceeccb10b00bff81d94f22c2a5138",
 }
 OBJECT_ID = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 RFC3339_TIMESTAMP = re.compile(
@@ -76,11 +76,12 @@ PUBLIC_RELEASE_REQUIRED_PATHS = {
 }
 PUBLIC_CONTENT_MARKERS = {
     "CONTRIBUTING.md": (
-        "Native is developed privately",
-        "curated, read-only source release",
-        "We do not accept external code",
-        "Please do not open pull requests",
-        "GitHub Issues and Discussions are not supported feedback or support routes",
+        "Native is developed in a private upstream",
+        "read-only snapshot",
+        "contribution here happens by invitation, after a conversation",
+        "Please don't open unsolicited pull requests",
+        "GitHub Issues and Discussions are turned off here",
+        "contributor licence agreement before anything is merged",
         "https://www.withnative.ai/",
         "AGPL-3.0-only",
     ),
@@ -89,8 +90,8 @@ PUBLIC_CONTENT_MARKERS = {
         "Hosted control-plane composition",
         "outside this snapshot",
         "private upstream",
-        "External contributions are not accepted",
-        "Issues, Discussions, and pull requests are not supported feedback or support routes",
+        "Contributions to this repository are by invitation",
+        "Issues, Discussions, and pull requests are not feedback or support routes",
         "https://www.withnative.ai/",
         "AGPL-3.0-only",
         "meaningful self-hosting",

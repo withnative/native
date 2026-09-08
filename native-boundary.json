@@ -611,6 +611,18 @@
         },
         {
           "kind": "file",
+          "source": "docs/figures/workspace-companion/continuing-work.svg"
+        },
+        {
+          "kind": "file",
+          "source": "docs/figures/workspace-companion/shared-views.svg"
+        },
+        {
+          "kind": "file",
+          "source": "docs/figures/workspace-companion/useful-feedback.svg"
+        },
+        {
+          "kind": "file",
           "source": "docs/for-agents.md"
         },
         {

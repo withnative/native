@@ -214,6 +214,9 @@ struct OperationContract {
     selector: Option<Selector>,
     input_schema: Value,
     selector_specific_schema: bool,
+    /// Whether `input_schema` describes this action alone, decided where the
+    /// projection happens rather than inferred from the result.
+    action_specific_projection: bool,
     /// Server-derived access classification for deployment persistence
     /// admission. Missing/custom source kinds and ambiguous selectors remain
     /// mutations until a registered exhaustive classification proves read.
@@ -294,6 +297,7 @@ fn build_ordinary_catalogue(
     let mut descriptors =
         executable_descriptors(source_surface.descriptors, &operations_by_executor)?;
     add_ordinary_executor_format_contracts(&mut descriptors, &contracts)?;
+    add_operation_field_listings(&mut descriptors, &contracts)?;
     let descriptor_bytes = serde_json::to_vec(&descriptors)?.len();
     let manifest_digest = jcs_sha256(&Value::Array(descriptors.clone()))?;
     Ok(PinnedExecutorCatalogue {
@@ -1784,8 +1788,9 @@ impl ExecutorPrototypeLensServer {
                 "audited lens executor descriptor byte count drifted",
             ));
         }
-        let descriptors =
+        let mut descriptors =
             executable_descriptors(source_surface.descriptors, &operations_by_executor)?;
+        add_operation_field_listings(&mut descriptors, &contracts)?;
         let descriptor_bytes = serde_json::to_vec(&descriptors)?.len();
         let manifest_digest = jcs_sha256(&Value::Array(descriptors.clone()))?;
         Ok(Arc::new(PinnedLensExecutorCatalogue {
@@ -2618,6 +2623,11 @@ fn operation_contract(
         operation: row.candidate_operation.clone(),
         source_tool: row.legacy_tool.clone(),
         tool_description: source_description.to_owned(),
+        action_specific_projection: projection_is_action_specific(
+            source_schema,
+            selector.as_ref(),
+            selector_specific_schema.is_some(),
+        ),
         selector,
         input_schema,
         selector_specific_schema: selector_specific_schema.is_some(),
@@ -2783,6 +2793,200 @@ fn add_ordinary_executor_format_contracts(
     Ok(())
 }
 
+/// Advertise each operation's accepted field names on its executor descriptor,
+/// with unconditionally required fields starred, so a caller can construct a
+/// first call to an unfamiliar operation without a preparatory
+/// `describe_operation`.
+///
+/// Decision `e9ecb98` (5 Sep 2026): names travel in the descriptor, types and
+/// prose stay behind `describe_operation`. Projecting the full per-operation
+/// schemas instead was measured at ~300 KB against a ~197 KB legacy Complete
+/// profile — more than the surface this facade replaced — so the facade pays a
+/// bounded price in bytes for the common question (which fields does this
+/// operation take, and which must I supply) and keeps the round trip for the
+/// uncommon one.
+///
+/// The contracts are already projected at boot, so this derives nothing at
+/// request time.
+fn add_operation_field_listings(
+    descriptors: &mut [Value],
+    contracts: &OperationContracts,
+) -> Result<()> {
+    for descriptor in descriptors {
+        let name = descriptor
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::engine("executor descriptor has no name"))?
+            .to_string();
+        if name == "bootstrap" || name == "describe_operation" {
+            continue;
+        }
+        // Advertise only what this environment actually routes: the enum was
+        // already narrowed by `executable_descriptors`, so an environment-gated
+        // operation that received no advertised value receives no listing.
+        let Some(operations) = descriptor
+            .pointer("/inputSchema/properties/operation/enum")
+            .and_then(Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+        else {
+            continue;
+        };
+        let routed = operations
+            .iter()
+            .filter_map(|operation| contracts.get(&(name.clone(), operation.clone())))
+            .collect::<Vec<_>>();
+        if routed.is_empty() {
+            continue;
+        }
+        let listings = routed
+            .iter()
+            .filter(|contract| contract.action_specific_projection)
+            .map(|contract| operation_field_listing(&contract.operation, &contract.input_schema))
+            .collect::<Vec<_>>();
+        // An operation absent from the listing shares one projected contract
+        // with its sibling actions, so naming its fields would name theirs too.
+        // Say that once, rather than restating the operation enum the caller
+        // already has.
+        let deferred = routed.len() > listings.len();
+        let mut clause = String::new();
+        if !listings.is_empty() {
+            clause.push_str(&format!(
+                "Fields by operation, * = required (describe_operation carries \
+                 types, prose and conditional requirements): {}.",
+                listings.join("; ")
+            ));
+        }
+        if deferred {
+            // Said even when nothing could be listed, so an executor that
+            // discloses no fields says so rather than saying nothing.
+            if !clause.is_empty() {
+                clause.push(' ');
+            }
+            clause.push_str(
+                "An operation not listed here shares one contract with its \
+                 sibling actions, so its own fields are only available from \
+                 describe_operation.",
+            );
+        }
+        if clause.is_empty() {
+            continue;
+        }
+        // Plan-carrying descriptors redeclare `arguments` inside their `oneOf`
+        // branches as a byte-identical copy of the top-level description, and
+        // the branch that actually requires `arguments` is one of those. Writing
+        // only the top level would leave that branch advertising a contract
+        // without its fields, so every copy carries the listing. It costs about
+        // 3.3 KB to keep one field from describing itself two ways.
+        append_to_argument_descriptions(&mut descriptor["inputSchema"], &clause);
+    }
+    Ok(())
+}
+
+/// Add `addition` to every `arguments` description in this schema, including
+/// the byte-identical copies inside conditional branches.
+fn append_to_argument_descriptions(schema: &mut Value, addition: &str) {
+    let Some(object) = schema.as_object_mut() else {
+        return;
+    };
+    if let Some(arguments) = object
+        .get_mut("properties")
+        .and_then(Value::as_object_mut)
+        .and_then(|properties| properties.get_mut("arguments"))
+        .and_then(Value::as_object_mut)
+    {
+        let existing = arguments
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim_end()
+            .to_string();
+        let separator = if existing.is_empty() { "" } else { " " };
+        arguments.insert(
+            "description".into(),
+            json!(format!("{existing}{separator}{addition}")),
+        );
+    }
+    for keyword in ["oneOf", "anyOf", "allOf"] {
+        if let Some(branches) = object.get_mut(keyword).and_then(Value::as_array_mut) {
+            for branch in branches {
+                append_to_argument_descriptions(branch, addition);
+            }
+        }
+    }
+}
+
+/// `operation: field*, field` — every accepted property name for one operation,
+/// with required ones starred.
+fn operation_field_listing(operation: &str, schema: &Value) -> String {
+    let mut required = Vec::new();
+    collect_required_names(schema, &mut required);
+    let required = required.into_iter().collect::<HashSet<_>>();
+    let mut names = Vec::new();
+    collect_property_names(schema, &mut names);
+    names.sort();
+    names.dedup();
+    if names.is_empty() {
+        return format!("{operation}: (no arguments)");
+    }
+    let rendered = names
+        .into_iter()
+        .map(|name| {
+            if required.contains(&name) {
+                format!("{name}*")
+            } else {
+                name
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{operation}: {rendered}")
+}
+
+/// Every property name an operation accepts, including those reachable only
+/// through a conditional branch. A caller needs the whole vocabulary; which
+/// combination is legal is what `describe_operation` is for.
+fn collect_property_names(schema: &Value, into: &mut Vec<String>) {
+    if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
+        into.extend(properties.keys().cloned());
+    }
+    for keyword in ["allOf", "anyOf", "oneOf"] {
+        if let Some(branches) = schema.get(keyword).and_then(Value::as_array) {
+            for branch in branches {
+                collect_property_names(branch, into);
+            }
+        }
+    }
+    if let Some(then) = schema.get("then") {
+        collect_property_names(then, into);
+    }
+}
+
+/// Only *unconditionally* required names: the top level and `allOf`, which
+/// every valid envelope must satisfy. A field required inside one `oneOf`
+/// branch is not required of the operation, and starring it would trade one
+/// misleading contract for another.
+fn collect_required_names(schema: &Value, into: &mut Vec<String>) {
+    if let Some(required) = schema.get("required").and_then(Value::as_array) {
+        into.extend(
+            required
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string),
+        );
+    }
+    if let Some(branches) = schema.get("allOf").and_then(Value::as_array) {
+        for branch in branches {
+            collect_required_names(branch, into);
+        }
+    }
+}
+
 fn update_executor_argument_descriptions(schema: &mut Value) {
     let Some(object) = schema.as_object_mut() else {
         return;
@@ -2878,6 +3082,63 @@ fn find_selector(schema: &Value, action: &str) -> Option<Selector> {
         }
     }
     None
+}
+
+/// Whether projecting this action yields a schema describing that action alone.
+///
+/// `project_operation_schema` narrows to a `oneOf` branch when the source tool
+/// declares one. A tool that hand-declares a flat properties bag with an action
+/// enum declares no branches, so its "projection" is the whole union of every
+/// action's fields — `manage_attachments` is the specimen, see `a193c01` — and
+/// a branch whose selector enum lists several actions is shared by all of them.
+///
+/// Naming a shared schema's fields as one action's own would advertise
+/// `manage_attachments.detach` as accepting `record_id`, which its
+/// `deny_unknown_fields` handler rejects, and would star nothing on an action
+/// that has required fields. Deciding it here, from the source schema, rather
+/// than by comparing projected results, keeps the answer independent of which
+/// operations a given surface happens to route.
+fn projection_is_action_specific(
+    schema: &Value,
+    selector: Option<&Selector>,
+    selector_specific_schema: bool,
+) -> bool {
+    // A registered per-operation schema is action-specific by construction, and
+    // a single-operation source tool has no siblings to be confused with.
+    if selector_specific_schema {
+        return true;
+    }
+    let Some(selector) = selector else {
+        return true;
+    };
+    let Some(branches) = schema.get("oneOf").and_then(Value::as_array) else {
+        return false;
+    };
+    branches.iter().any(|branch| {
+        let Some(property) = branch
+            .get("properties")
+            .and_then(|properties| properties.get(&selector.field))
+        else {
+            return false;
+        };
+        if property.get("const").and_then(Value::as_str) == Some(selector.value.as_str()) {
+            return true;
+        }
+        // A branch whose selector enum names several actions is a declaration
+        // that those actions share one contract — `manage_relationships` groups
+        // `read` and `why` this way, and the branch is exactly each one's
+        // fields. That is not the flat-bag case: there the tool declares no
+        // branches at all, so the projection is the union of actions whose
+        // contracts genuinely differ.
+        property
+            .get("enum")
+            .and_then(Value::as_array)
+            .is_some_and(|values| {
+                values
+                    .iter()
+                    .any(|value| value.as_str() == Some(selector.value.as_str()))
+            })
+    })
 }
 
 fn project_operation_schema(
@@ -3078,6 +3339,320 @@ fn attach_repair(
     }
 }
 
+/// Bound on any caller-supplied value echoed in a repair block, in
+/// characters. Rejections stay proportional to the mistake, never to the
+/// payload that carried it.
+const REPAIR_VALUE_CHAR_LIMIT: usize = 200;
+
+/// The offending value at `failing_pointer` within `envelope`, bounded to
+/// [`REPAIR_VALUE_CHAR_LIMIT`] characters. Strings truncate to that many
+/// chars (char boundaries, never mid-codepoint); non-strings serialise
+/// compactly and either travel as-is when the serialisation already fits or
+/// travel as the truncated serialisation string. Returns `None` when the
+/// pointer does not resolve — the expected case for a required-field-missing
+/// failure, which names a field that is absent.
+fn repair_failing_value(failing_pointer: &str, envelope: &Value) -> Option<Value> {
+    let value = envelope.pointer(failing_pointer)?;
+    let (value, length, truncated) = match value {
+        Value::String(text) => {
+            let length = text.chars().count();
+            if length <= REPAIR_VALUE_CHAR_LIMIT {
+                (json!(text), length, false)
+            } else {
+                let truncated_text: String = text.chars().take(REPAIR_VALUE_CHAR_LIMIT).collect();
+                (json!(truncated_text), length, true)
+            }
+        }
+        _ => {
+            let serialised = serde_json::to_string(value).unwrap_or_default();
+            let length = serialised.chars().count();
+            if length <= REPAIR_VALUE_CHAR_LIMIT {
+                (value.clone(), length, false)
+            } else {
+                let truncated_text: String =
+                    serialised.chars().take(REPAIR_VALUE_CHAR_LIMIT).collect();
+                (json!(truncated_text), length, true)
+            }
+        }
+    };
+    Some(json!({
+        "pointer": failing_pointer,
+        "value": value,
+        "length": length,
+        "truncated": truncated,
+    }))
+}
+
+fn escape_repair_pointer_segment(segment: &str) -> String {
+    segment.replace('~', "~0").replace('/', "~1")
+}
+
+fn unescape_repair_pointer_segment(segment: &str) -> String {
+    segment.replace("~1", "/").replace("~0", "~")
+}
+
+fn split_repair_pointer(pointer: &str) -> Vec<String> {
+    pointer
+        .split('/')
+        .skip(1)
+        .map(unescape_repair_pointer_segment)
+        .collect()
+}
+
+/// Cap on correction entries in one repair block; overflow states its total
+/// beside the list instead of growing it.
+const REPAIR_MAX_CORRECTIONS: usize = 20;
+
+/// One raw diff output: a leaf to set, or a pointer to delete.
+enum RawCorrection {
+    Set { pointer: String, value: Value },
+    Remove { pointer: String },
+}
+
+/// One leaf of `corrected` that is new or changed becomes one raw `Set`;
+/// objects and arrays always expand to their scalar leaves, so no entry ever
+/// carries a subtree — including across a type change, where the old and new
+/// shapes share no structure to diff.
+fn push_repair_correction_leaf(pointer: String, value: &Value, out: &mut Vec<RawCorrection>) {
+    match value {
+        Value::Object(map) => {
+            if map.is_empty() {
+                out.push(RawCorrection::Set {
+                    pointer,
+                    value: value.clone(),
+                });
+            } else {
+                for (key, child) in map {
+                    push_repair_correction_leaf(
+                        format!("{pointer}/{}", escape_repair_pointer_segment(key)),
+                        child,
+                        out,
+                    );
+                }
+            }
+        }
+        Value::Array(items) => {
+            if items.is_empty() {
+                out.push(RawCorrection::Set {
+                    pointer,
+                    value: value.clone(),
+                });
+            } else {
+                for (index, child) in items.iter().enumerate() {
+                    push_repair_correction_leaf(format!("{pointer}/{index}"), child, out);
+                }
+            }
+        }
+        _ => out.push(RawCorrection::Set {
+            pointer,
+            value: value.clone(),
+        }),
+    }
+}
+
+/// Diff `corrected` against the caller's `envelope`: one raw entry per leaf
+/// that differs or is newly present in the corrected version, plus one
+/// removal per deleted pointer.
+fn diff_repair_envelopes(
+    envelope: &Value,
+    corrected: &Value,
+    pointer: String,
+    out: &mut Vec<RawCorrection>,
+) {
+    match (envelope, corrected) {
+        (Value::Object(previous), Value::Object(next)) => {
+            for (key, next_value) in next {
+                let child = format!("{pointer}/{}", escape_repair_pointer_segment(key));
+                match previous.get(key) {
+                    Some(previous_value) => {
+                        diff_repair_envelopes(previous_value, next_value, child, out);
+                    }
+                    None => push_repair_correction_leaf(child, next_value, out),
+                }
+            }
+            for key in previous.keys() {
+                if !next.contains_key(key) {
+                    out.push(RawCorrection::Remove {
+                        pointer: format!("{pointer}/{}", escape_repair_pointer_segment(key)),
+                    });
+                }
+            }
+        }
+        (Value::Array(previous), Value::Array(next)) => {
+            let shared = previous.len().min(next.len());
+            for (index, (previous_item, next_item)) in
+                previous.iter().zip(next.iter()).enumerate().take(shared)
+            {
+                diff_repair_envelopes(previous_item, next_item, format!("{pointer}/{index}"), out);
+            }
+            for (index, next_item) in next.iter().enumerate().skip(shared) {
+                push_repair_correction_leaf(format!("{pointer}/{index}"), next_item, out);
+            }
+            for index in next.len()..previous.len() {
+                out.push(RawCorrection::Remove {
+                    pointer: format!("{pointer}/{index}"),
+                });
+            }
+        }
+        _ => {
+            if envelope != corrected {
+                push_repair_correction_leaf(pointer, corrected, out);
+            }
+        }
+    }
+}
+
+/// Index every value the caller's own envelope carries (compact
+/// serialisation to pointer, first wins) so a correction whose value already
+/// exists in the envelope can be emitted as a move by reference instead of an
+/// echo. Deterministic: object keys iterate sorted, arrays in order.
+fn index_envelope_values(envelope: &Value) -> std::collections::BTreeMap<String, String> {
+    fn walk(node: &Value, pointer: String, out: &mut std::collections::BTreeMap<String, String>) {
+        if !pointer.is_empty() {
+            out.entry(serde_json::to_string(node).unwrap_or_default())
+                .or_insert(pointer.clone());
+        }
+        match node {
+            Value::Object(map) => {
+                for (key, child) in map {
+                    walk(
+                        child,
+                        format!("{pointer}/{}", escape_repair_pointer_segment(key)),
+                        out,
+                    );
+                }
+            }
+            Value::Array(items) => {
+                for (index, child) in items.iter().enumerate() {
+                    walk(child, format!("{pointer}/{index}"), out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut index = std::collections::BTreeMap::new();
+    walk(envelope, String::new(), &mut index);
+    index
+}
+
+/// Order correction entries for a stable shape and safe application.
+/// Segments compare numerically when both sides parse as indices
+/// (`/arr/10` sorts after `/arr/2`); removals off the same array sort
+/// descending by index so applying them in order never shifts a later
+/// target.
+fn compare_correction_entries(left: &Value, right: &Value) -> std::cmp::Ordering {
+    let left_pointer = left.get("pointer").and_then(Value::as_str).unwrap_or("");
+    let right_pointer = right.get("pointer").and_then(Value::as_str).unwrap_or("");
+    let left_segments = split_repair_pointer(left_pointer);
+    let right_segments = split_repair_pointer(right_pointer);
+    let shared = left_segments.len().min(right_segments.len());
+    for (index, (left_segment, right_segment)) in left_segments
+        .iter()
+        .zip(right_segments.iter())
+        .enumerate()
+        .take(shared)
+    {
+        let last = index + 1 == left_segments.len() && index + 1 == right_segments.len();
+        if last {
+            let both_remove = left.get("remove").and_then(Value::as_bool) == Some(true)
+                && right.get("remove").and_then(Value::as_bool) == Some(true);
+            if let (Ok(left_index), Ok(right_index)) = (
+                left_segment.parse::<usize>(),
+                right_segment.parse::<usize>(),
+            ) {
+                if both_remove && left_index != right_index {
+                    return right_index.cmp(&left_index);
+                }
+                if left_index != right_index {
+                    return left_index.cmp(&right_index);
+                }
+                continue;
+            }
+        } else if let (Ok(left_index), Ok(right_index)) = (
+            left_segment.parse::<usize>(),
+            right_segment.parse::<usize>(),
+        ) {
+            if left_index != right_index {
+                return left_index.cmp(&right_index);
+            }
+            continue;
+        }
+        if left_segment != right_segment {
+            return left_segment.cmp(right_segment);
+        }
+    }
+    left_segments.len().cmp(&right_segments.len())
+}
+
+/// A built correction list: the entries, whether any value had to be
+/// truncated to the bound (which demotes `retry_ready`), and the pre-cap
+/// entry count.
+struct BuiltCorrections {
+    entries: Vec<Value>,
+    truncated: bool,
+    total: usize,
+}
+
+/// The minimal patch list that turns the caller's own envelope into the
+/// corrected one. Moves — values the caller already sent at another pointer —
+/// travel as `{"pointer", "from"}` with no value at all; `from` always resolves
+/// against the envelope the caller submitted, never against the partially
+/// patched result, so a move whose source is also removed still resolves; genuinely new values
+/// travel literally up to [`REPAIR_VALUE_CHAR_LIMIT`] serialised chars and as
+/// a disclosed truncation beyond it; removals travel as
+/// `{"pointer", "value": null, "remove": true}`. Capped at
+/// [`REPAIR_MAX_CORRECTIONS`] entries.
+fn repair_corrections(envelope: &Value, corrected: &Value) -> BuiltCorrections {
+    let mut raw = Vec::new();
+    diff_repair_envelopes(envelope, corrected, String::new(), &mut raw);
+    let sources = index_envelope_values(envelope);
+    let mut truncated = false;
+    let mut entries = Vec::with_capacity(raw.len());
+    for correction in raw {
+        match correction {
+            RawCorrection::Remove { pointer } => {
+                entries.push(json!({"pointer": pointer, "value": Value::Null, "remove": true}));
+            }
+            RawCorrection::Set { pointer, value } => {
+                let serialised = serde_json::to_string(&value).unwrap_or_default();
+                let moved = sources
+                    .get(&serialised)
+                    .filter(|source| *source != &pointer);
+                if let Some(source) = moved {
+                    entries.push(json!({"pointer": pointer, "from": source}));
+                } else if serialised.chars().count() <= REPAIR_VALUE_CHAR_LIMIT {
+                    entries.push(json!({"pointer": pointer, "value": value}));
+                } else {
+                    truncated = true;
+                    entries.push(json!({
+                        "pointer": pointer,
+                        "value": serialised.chars().take(REPAIR_VALUE_CHAR_LIMIT).collect::<String>(),
+                        "length": serialised.chars().count(),
+                        "truncated": true,
+                    }));
+                }
+            }
+        }
+    }
+    entries.sort_by(compare_correction_entries);
+    let total = entries.len();
+    entries.truncate(REPAIR_MAX_CORRECTIONS);
+    BuiltCorrections {
+        entries,
+        truncated,
+        total,
+    }
+}
+
+/// Whether a built patch list can be applied mechanically to reproduce the
+/// corrected envelope, and so whether the repair may advertise `retry_ready`.
+/// A truncated value cannot be written back, and a capped list omits entries
+/// the caller would need; in both cases the corrections still describe the
+/// fault but no longer constitute an automatic fix.
+fn corrections_are_applicable(built: &BuiltCorrections) -> bool {
+    !built.truncated && built.total <= REPAIR_MAX_CORRECTIONS
+}
+
 fn attach_repair_result(
     result: &mut Value,
     contract: &OperationContract,
@@ -3095,12 +3670,17 @@ fn attach_repair_result(
     let corrected_envelope = cue
         .corrected_envelope
         .filter(|corrected| is_validation_error && corrected != envelope);
-    let retry = corrected_envelope.as_ref().map(|corrected| {
-        json!({
-            "tool": contract.executor,
-            "arguments": corrected,
-        })
-    });
+    // A patch list that was truncated or capped still describes the fault, but
+    // it is no longer mechanically applicable — a truncated value cannot be
+    // written back, and a capped list omits entries the caller would need — so
+    // it must not advertise an automatic fix in either case.
+    let mut retry_ready = false;
+    let mut built_corrections: Option<BuiltCorrections> = None;
+    if let Some(corrected) = corrected_envelope.as_ref() {
+        let built = repair_corrections(envelope, corrected);
+        retry_ready = corrections_are_applicable(&built);
+        built_corrections = Some(built);
+    }
     let code = if is_execution_error {
         "operation_execution_diagnostic"
     } else {
@@ -3138,7 +3718,17 @@ fn attach_repair_result(
     // `contract_digest`. When the failure is not localised the caller has not
     // been told how to fix it, so the full document still travels with the
     // repair.
-    let localised = !is_execution_error && cue.localised;
+    //
+    // An execution error is never one of those cases. Its `expected_shape`
+    // says in as many words that the envelope matched the disclosed contract,
+    // and the source rejected state, authorization or runtime semantics
+    // instead — so the caller cannot repair it by reshaping the envelope, and
+    // the schema it already satisfied tells it nothing. Sending the full
+    // document there contradicts the sentence beside it and, on a stale-write
+    // conflict, made the rejection several times the size of the request that
+    // provoked it. Point at `describe_operation` like any other localised
+    // failure.
+    let localised = is_execution_error || cue.localised;
     let mut repair = json!({
         "code": code,
         "reason_code": reason_code,
@@ -3152,8 +3742,13 @@ fn attach_repair_result(
         "contract_digest": contract.digest,
     });
     if localised {
+        let reason = if is_execution_error {
+            "the envelope matched the disclosed contract, so the contract cannot explain this failure; the full operation contract is omitted here"
+        } else {
+            "expected_shape names the failing constraint and the correction it admits; the full operation contract is omitted here"
+        };
         repair["contract_reference"] = json!({
-            "reason":"expected_shape names the failing constraint and the correction it admits; the full operation contract is omitted here",
+            "reason": reason,
             "tool":"describe_operation",
             "arguments":{
                 "executor": contract.executor,
@@ -3164,10 +3759,26 @@ fn attach_repair_result(
     } else {
         repair["input_schema"] = contract.input_schema.clone();
     }
-    repair["preserved_intent"] = envelope.clone();
-    repair["retry_ready"] = json!(corrected_envelope.is_some());
-    repair["corrected_envelope"] = json!(corrected_envelope);
-    repair["retry"] = json!(retry);
+    repair["retry_ready"] = json!(retry_ready);
+    // The caller holds the request it just sent, so the repair never echoes
+    // the payload back: no `preserved_intent`, no `corrected_envelope`, no
+    // `retry`. What travels instead is bounded by the mistake, not the
+    // payload: the offending value at `failing_pointer` (capped at
+    // `REPAIR_VALUE_CHAR_LIMIT` chars) and the minimal patch list that turns
+    // the caller's own envelope into the corrected one. Moves travel by
+    // reference (`from`); genuinely new values travel literally up to the
+    // same bound, disclosed when truncated.
+    if !is_execution_error {
+        if let Some(failing_value) = repair_failing_value(&cue.failing_pointer, envelope) {
+            repair["failing_value"] = failing_value;
+        }
+    }
+    if let Some(built) = built_corrections {
+        if built.total > REPAIR_MAX_CORRECTIONS {
+            repair["corrections_total"] = json!(built.total);
+        }
+        repair["corrections"] = Value::Array(built.entries);
+    }
     repair["guidance"] = json!(guidance);
     result["structuredContent"]["repair"] = repair;
     let repair_text = result["structuredContent"]["repair"].to_string();
@@ -3715,6 +4326,373 @@ mod tests {
         Arc::new(registry)
     }
 
+    /// The registry the hosted deployment actually serves, mirrored from the
+    /// composition in `held/runtime/src/serve.rs`: builtin + surface +
+    /// build-enabled experimental + snapshot + membership + reach (when the
+    /// reach sidecar is configured). The snapshot source
+    /// is the in-crate `LocalSnapshotSource` and the membership delegate is
+    /// non-dispatchable; neither substitution matters here because the
+    /// executor catalogue is built from descriptors, never by dispatching.
+    /// What must match the shipped shape is engine-availability, so the
+    /// membership tool is registered with `register_membership_tool_with`
+    /// (which leaves the Sqlite operations executable) and NOT with the
+    /// generator-only `register_membership_tool_schema` (whose Sqlite
+    /// unavailable marking filters the membership executors out of the
+    /// catalogue before the hosted flag is consulted).
+    fn hosted_registry() -> Arc<ToolRegistry> {
+        let mut registry = ToolRegistry::new();
+        register_builtin_tools(&mut registry).unwrap();
+        register_surface_tools(&mut registry).unwrap();
+        crate::mcp::register_build_enabled_experimental_tools(&mut registry).unwrap();
+        crate::mcp::register_snapshot_tool(
+            &mut registry,
+            Arc::new(crate::export::LocalSnapshotSource::new()),
+        )
+        .unwrap();
+        crate::mcp::register_membership_tool_with(
+            &mut registry,
+            |_db, _caller, _arguments| async {
+                Err(Error::engine(
+                    "manage_memberships fixture delegate cannot be dispatched",
+                ))
+            },
+        )
+        .unwrap();
+        // Hosted-only reach tools, registered executable (not schema-only) so
+        // the audit drift guard sees the same actions serve exposes once the
+        // reach sidecar is configured.
+        crate::mcp::register_reach_read_tool_with(
+            &mut registry,
+            |_db, _caller, _arguments| async {
+                Err(Error::engine(
+                    "reach_read fixture delegate cannot be dispatched",
+                ))
+            },
+        )
+        .unwrap();
+        crate::mcp::register_reach_connect_tool_with(
+            &mut registry,
+            |_db, _caller, _arguments| async {
+                Err(Error::engine(
+                    "reach_connect fixture delegate cannot be dispatched",
+                ))
+            },
+        )
+        .unwrap();
+        Arc::new(registry)
+    }
+
+    /// Drift guard for the executor operation catalogue.
+    ///
+    /// `build_contracts_for_hosting` can only select operations with a row in
+    /// the committed audit projection (`AUDIT`), while dispatch serves
+    /// whatever the live `ToolRegistry` registers. Before this guard, any
+    /// action added to an existing tool after the baseline freeze — e.g.
+    /// `read_canvas.export`, registered 5 Sep 2026 but unfrozen until the
+    /// re-freeze that landed alongside this guard — was silently unreachable
+    /// over the executor facade: no generation step failed and no test
+    /// noticed.
+    ///
+    /// The check is one-directional on purpose: audit rows with no registered
+    /// tool (notably the synthetic lens-only `materialize_record` the
+    /// candidate generator injects) are allowed, because an unregistered row
+    /// advertises nothing. A registered action with no audit row is the exact
+    /// condition that made an implemented capability unselectable, so it
+    /// fails, naming the missing `tool.action` and the regeneration commands.
+    fn selector_action_values(schema: &Value, into: &mut Vec<String>) {
+        // The frozen inventory evidences exactly two selector fields across
+        // every registered tool (`action` everywhere, plus `intention` on the
+        // experimental agent-intent tool). Anything else shaped like a string
+        // enum — a value enum such as messaging `expectation`, or a type enum
+        // such as `SPINE_TYPES` — is an argument of one operation, not a
+        // sub-operation address, and must not be collected here.
+        if let Some(object) = schema.as_object() {
+            if let Some(properties) = object.get("properties").and_then(Value::as_object) {
+                for field in ["action", "intention"] {
+                    if let Some(property) = properties.get(field) {
+                        if let Some(values) = property.get("enum").and_then(Value::as_array) {
+                            into.extend(
+                                values.iter().filter_map(Value::as_str).map(str::to_string),
+                            );
+                        }
+                        if let Some(value) = property.get("const").and_then(Value::as_str) {
+                            into.push(value.to_string());
+                        }
+                    }
+                }
+            }
+            for keyword in ["oneOf", "anyOf", "allOf"] {
+                if let Some(branches) = object.get(keyword).and_then(Value::as_array) {
+                    for branch in branches {
+                        selector_action_values(branch, into);
+                    }
+                }
+            }
+        } else if let Some(branches) = schema.as_array() {
+            for branch in branches {
+                selector_action_values(branch, into);
+            }
+        }
+    }
+
+    fn registered_selector_actions(registry: &ToolRegistry) -> Vec<(String, Vec<String>)> {
+        let mut tools = Vec::new();
+        for spec in registry.specs() {
+            let mut actions = Vec::new();
+            selector_action_values(&spec.input_schema, &mut actions);
+            actions.sort();
+            actions.dedup();
+            if !actions.is_empty() {
+                tools.push((spec.name.clone(), actions));
+            }
+        }
+        tools
+    }
+
+    fn missing_audit_rows(
+        tools: &[(String, Vec<String>)],
+        audited: &std::collections::BTreeSet<(String, String)>,
+    ) -> Vec<String> {
+        let mut missing = Vec::new();
+        for (tool, actions) in tools {
+            for action in actions {
+                if !audited.contains(&(tool.clone(), action.clone())) {
+                    missing.push(format!("{tool}.{action}"));
+                }
+            }
+        }
+        missing.sort();
+        missing
+    }
+
+    fn audit_projection_rows() -> std::collections::BTreeSet<(String, String)> {
+        let audit: Audit =
+            serde_json::from_str(AUDIT).expect("committed audit projection must parse");
+        audit
+            .audit_rows
+            .into_iter()
+            .map(|row| (row.legacy_tool, row.legacy_action))
+            .collect()
+    }
+
+    #[test]
+    fn every_registered_toolspec_action_has_an_audit_row() {
+        // The hosted composition is the fullest registry the facade serves:
+        // builtin + surface + build-enabled experimental + snapshot +
+        // membership. A selector action missing from the committed projection
+        // is implemented but unselectable over every hosted MCP client.
+        let tools = registered_selector_actions(&hosted_registry());
+        assert!(
+            !tools.is_empty(),
+            "the hosted registry must contain selector tools"
+        );
+        let missing = missing_audit_rows(&tools, &audit_projection_rows());
+        assert!(
+            missing.is_empty(),
+            "registered ToolSpec action(s) with no row in the committed executor audit \
+             — implemented but unreachable over the facade: {}. \
+             Re-freeze with `cargo run --manifest-path held/Cargo.toml -p native-evidence \
+             --features dev-tools --bin mcp-executor-evidence -- --revision <40-hex> \
+             --output docs/evals/mcp-executors/frozen-baseline-inventory.generated.json`, \
+             map the new action in scripts/mcp-executor-candidate.mjs `byAction`, \
+             then `node scripts/mcp-executor-candidate.mjs <baseline> <audit>` and \
+             `node scripts/mcp-executor-audit-projection.mjs`",
+            missing.join(", ")
+        );
+    }
+
+    #[test]
+    fn audit_drift_guard_names_a_seeded_gap() {
+        // Reproduces the 5 Sep 2026 condition against the live tree: the
+        // registry knows `read_canvas.export` but the audit does not. The
+        // guard must name the missing action rather than fail opaquely.
+        let tools = registered_selector_actions(&hosted_registry());
+        assert!(
+            tools.iter().any(|(tool, actions)| tool == "read_canvas"
+                && actions.iter().any(|action| action == "export")),
+            "seed assumption: the live registry must advertise read_canvas.export"
+        );
+        let mut audited = audit_projection_rows();
+        assert!(
+            audited.remove(&("read_canvas".to_string(), "export".to_string())),
+            "seed assumption: the committed audit must contain read_canvas|export to remove"
+        );
+        let missing = missing_audit_rows(&tools, &audited);
+        assert_eq!(missing, vec!["read_canvas.export".to_string()]);
+    }
+
+    #[test]
+    fn audit_only_synthetic_tools_need_no_registry_tool() {
+        // The candidate generator injects lens-only `materialize_record` rows
+        // with no registered ToolKind; the guard direction (registry ->
+        // audit) tolerates that by construction. This pins the tolerance so a
+        // future refactor cannot silently flip it.
+        let registry = hosted_registry();
+        assert!(
+            audit_projection_rows()
+                .contains(&("materialize_record".to_string(), "call".to_string())),
+            "the committed audit must retain the synthetic materialize_record row"
+        );
+        assert!(
+            registry.get("materialize_record").is_none(),
+            "materialize_record must stay a synthetic audit row, not a registered tool"
+        );
+    }
+
+    #[test]
+    fn read_canvas_export_is_selectable_on_the_ordinary_facade() {
+        // End-to-end selectability, not just row presence: the ordinary
+        // catalogue the facade serves must route `canvas_read` /
+        // `read_canvas.export` to a contract.
+        let registry = hosted_registry();
+        let catalogue =
+            build_ordinary_catalogue(&registry, super::super::registry::EngineKind::Sqlite, true)
+                .unwrap();
+        let operations_by_executor = &catalogue.operations_by_executor;
+        let contracts = &catalogue.contracts;
+        let operations = operations_by_executor
+            .get("canvas_read")
+            .expect("the ordinary facade must advertise canvas_read");
+        assert!(
+            operations
+                .iter()
+                .any(|operation| operation == "read_canvas.export"),
+            "canvas_read must select read_canvas.export, selecting only: {}",
+            operations.join(", ")
+        );
+        assert!(
+            contracts.contains_key(&("canvas_read".to_string(), "read_canvas.export".to_string())),
+            "read_canvas.export must have an ordinary operation contract"
+        );
+    }
+
+    #[test]
+    fn reach_operations_are_selectable_only_on_the_ordinary_facade() {
+        let registry = hosted_registry();
+        let catalogue =
+            build_ordinary_catalogue(&registry, super::super::registry::EngineKind::Sqlite, true)
+                .unwrap();
+        let reads = catalogue
+            .operations_by_executor
+            .get("reach_read")
+            .expect("configured hosted reach must advertise reach_read");
+        assert_eq!(
+            reads,
+            &[
+                "reach_read.list_linear_projects".to_string(),
+                "reach_read.recent_activity".to_string(),
+                "reach_read.search_notion".to_string(),
+                "reach_read.search_slack".to_string(),
+                "reach_read.source_status".to_string(),
+            ]
+        );
+        assert_eq!(
+            catalogue.operations_by_executor.get("reach_connect"),
+            Some(&vec!["connect_source".to_string()])
+        );
+        assert_eq!(
+            catalogue
+                .contracts
+                .get(&("reach_connect".to_string(), "connect_source".to_string()))
+                .expect("reach connect contract")
+                .access,
+            OperationAccess::Mutation
+        );
+
+        let audit: Audit = serde_json::from_str(AUDIT).unwrap();
+        assert!(audit
+            .audit_rows
+            .iter()
+            .filter(|row| row.legacy_tool.starts_with("reach_"))
+            .all(|row| row.availability == ["ordinary"] && row.candidate_plan_policy == "direct"));
+        assert!(audit.candidate_surfaces.stable.lens.descriptors.iter().all(
+            |descriptor| !matches!(
+                descriptor["name"].as_str(),
+                Some("reach_read" | "reach_connect")
+            )
+        ));
+    }
+
+    /// Applies a repair `corrections` list to the caller's own envelope, the
+    /// way a caller patches its payload locally. Entries with `"remove": true`
+    /// delete the pointer; entries with `"from"` copy the value the caller
+    /// already sent at that source pointer; every other entry sets its value.
+    /// `from` sources resolve against the submitted envelope, not the
+    /// half-patched one, so a move followed by its source removal still copies
+    /// the original bytes. Test-only mirror of the documented patch semantics.
+    fn apply_test_corrections(envelope: &Value, corrections: &[Value]) -> Value {
+        fn unescape(segment: &str) -> String {
+            segment.replace("~1", "/").replace("~0", "~")
+        }
+        fn resolve<'a>(root: &'a Value, pointer: &str) -> &'a Value {
+            let mut target = root;
+            for segment in pointer.split('/').skip(1).map(unescape) {
+                target = match segment.parse::<usize>() {
+                    Ok(index) => &target.as_array().unwrap()[index],
+                    Err(_) => &target.as_object().unwrap()[&segment],
+                };
+            }
+            target
+        }
+        fn descend<'a>(target: &'a mut Value, segment: &'a str) -> &'a mut Value {
+            if let Ok(index) = segment.parse::<usize>() {
+                if !target.is_array() {
+                    *target = Value::Array(Vec::new());
+                }
+                let items = target.as_array_mut().unwrap();
+                while items.len() <= index {
+                    items.push(Value::Null);
+                }
+                return &mut items[index];
+            }
+            if !target.is_object() {
+                *target = Value::Object(serde_json::Map::new());
+            }
+            target
+                .as_object_mut()
+                .unwrap()
+                .entry(segment.to_string())
+                .or_insert(Value::Null)
+        }
+        let original = envelope.clone();
+        let mut patched = envelope.clone();
+        for correction in corrections {
+            let pointer = correction["pointer"].as_str().unwrap();
+            let mut segments = pointer.split('/').skip(1).map(unescape).collect::<Vec<_>>();
+            let leaf = segments.pop().unwrap();
+            let mut target = &mut patched;
+            for segment in &segments {
+                target = descend(target, segment);
+            }
+            // The final segment lands on the same upsert-or-delete semantics:
+            // descend creates it, then a removal deletes what was created.
+            target = descend(target, &leaf);
+            if correction.get("remove").and_then(Value::as_bool) == Some(true) {
+                let mut target = &mut patched;
+                for segment in &segments {
+                    target = match segment.parse::<usize>() {
+                        Ok(index) => &mut target.as_array_mut().unwrap()[index],
+                        Err(_) => &mut target.as_object_mut().unwrap()[segment],
+                    };
+                }
+                match target {
+                    Value::Object(map) => {
+                        map.remove(&leaf);
+                    }
+                    Value::Array(items) => {
+                        items.remove(leaf.parse::<usize>().unwrap());
+                    }
+                    _ => panic!("correction pointer escapes the envelope: {pointer}"),
+                }
+            } else if let Some(source) = correction.get("from").and_then(Value::as_str) {
+                *target = resolve(&original, source).clone();
+            } else {
+                *target = correction["value"].clone();
+            }
+        }
+        patched
+    }
+
     struct BootstrapLensDispatch;
 
     impl LensDispatch for BootstrapLensDispatch {
@@ -3997,11 +4975,11 @@ mod tests {
         let audit: Audit = serde_json::from_str(AUDIT).unwrap();
         assert_eq!(
             audit.candidate_surfaces.stable.ordinary.descriptors.len(),
-            32
+            34
         );
         assert_eq!(
             audit.candidate_surfaces.stable.ordinary.descriptor_bytes,
-            39_871
+            41_262
         );
         assert_eq!(
             serde_json::to_vec(&audit.candidate_surfaces.stable.ordinary.descriptors)
@@ -4018,7 +4996,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             audit.candidate_surfaces.stable.lens.descriptor_bytes,
-            47_272
+            47_293
         );
         assert_eq!(
             serde_json::to_vec(&audit.candidate_surfaces.stable.lens.descriptors)
@@ -4108,6 +5086,442 @@ mod tests {
                 "the create_record gloss for {record_type} must stay synchronized with the record-types guide"
             );
         }
+    }
+
+    /// Decision `e9ecb98`: a caller must be able to name an operation's fields
+    /// without a preparatory `describe_operation`.
+    #[test]
+    fn executor_descriptors_advertise_each_operations_field_names() {
+        let registry = registry();
+        let catalogue =
+            build_ordinary_catalogue(&registry, super::super::registry::EngineKind::Sqlite, false)
+                .unwrap();
+        let descriptor = catalogue
+            .descriptors
+            .iter()
+            .find(|descriptor| descriptor["name"] == "records_write")
+            .expect("records_write descriptor");
+        let description = descriptor["inputSchema"]["properties"]["arguments"]["description"]
+            .as_str()
+            .expect("arguments description");
+
+        // The incident that opened the investigation: `create_record` rejected
+        // for a `reason` the advertised contract never mentioned.
+        assert!(
+            description.contains("create_record: "),
+            "operation listing missing: {description}"
+        );
+        assert!(
+            description.contains("reason*"),
+            "required field must be starred: {description}"
+        );
+        // The prose stays behind describe_operation, and the caller is told so.
+        assert!(
+            description.contains("describe_operation"),
+            "listing must name the depth call: {description}"
+        );
+        assert!(
+            !description.contains("Why this change: reasoning and alternatives"),
+            "field prose must not travel in the descriptor: {description}"
+        );
+
+        // An absence is explained rather than silent: the deferral sentence
+        // tells the caller that anything unlisted shares a contract, so
+        // "not there" cannot be misread as "takes no arguments".
+        assert!(
+            description.contains("An operation not listed here")
+                || descriptor["inputSchema"]["properties"]["operation"]["enum"]
+                    .as_array()
+                    .expect("operation enum")
+                    .iter()
+                    .all(|operation| description
+                        .contains(&format!("{}: ", operation.as_str().unwrap()))),
+            "unlisted operations must be explained: {description}"
+        );
+
+        // Routing executors carry no operation vocabulary of their own.
+        for name in ["bootstrap", "describe_operation"] {
+            let descriptor = catalogue
+                .descriptors
+                .iter()
+                .find(|descriptor| descriptor["name"] == name)
+                .expect("descriptor");
+            let carried = serde_json::to_string(descriptor).unwrap();
+            assert!(
+                !carried.contains("Fields by operation"),
+                "{name} must not carry an operation listing"
+            );
+        }
+    }
+
+    /// Only unconditionally required fields are starred. `update_record` needs
+    /// `id` in its singular branch and `ids` in its batch branch, and neither
+    /// is required of the operation, so starring either would trade one
+    /// misleading contract for another.
+    #[test]
+    fn only_unconditionally_required_fields_are_starred() {
+        let schema = json!({
+            "type": "object",
+            "properties": {"reason": {}},
+            "required": ["reason"],
+            "oneOf": [
+                {"properties": {"id": {}}, "required": ["id", "reason"]},
+                {"properties": {"ids": {}}, "required": ["ids", "reason"]}
+            ]
+        });
+        assert_eq!(
+            operation_field_listing("update_record", &schema),
+            "update_record: id, ids, reason*"
+        );
+    }
+
+    /// `cc34ddc`: the descriptor surface is a real constraint on a real
+    /// resource, and without a legible guard it is enforced by a server that
+    /// will not boot, several CI jobs away from the cause. This asserts the
+    /// budget where the failure names itself.
+    ///
+    /// The ceiling is deliberately not tight. `e9ecb98` decided to spend ~30 KB
+    /// here; this exists to catch the *next* unbudgeted spend, not to relitigate
+    /// that one.
+    ///
+    /// This measures the shipped registry, not the test registry: the hosted
+    /// fixture mirrors the composition in `held/runtime/src/serve.rs`
+    /// (builtin + surface + build-enabled experimental + snapshot +
+    /// membership), built here as the hosted catalogue plus the lens surface.
+    /// The membership delegate is non-dispatchable on purpose. This test
+    /// measures descriptor bytes and never dispatches, so what it must
+    /// reproduce is the shipped descriptor shape, not execution semantics —
+    /// and the generator-only schema registrar would be the wrong fixture
+    /// precisely because its Sqlite unavailable marking filters the
+    /// membership executors out before the hosted flag is consulted, leaving
+    /// a hosted-looking assertion with nothing hosted inside. The
+    /// executor-name assertions below are the guard against that
+    /// going-blind-again failure. Drift risk runs the other way too: if
+    /// `serve.rs` gains a registrar, this fixture must gain it as well, or
+    /// the gate measures a surface smaller than what ships.
+    #[test]
+    fn executor_catalogue_stays_within_its_descriptor_budget() {
+        const EXECUTOR_DESCRIPTOR_MAX_BYTES: usize = 96 * 1024;
+        let registry = hosted_registry();
+        let ordinary = ExecutorPrototypeStdioServer::pin_hosted_catalogue(&registry).unwrap();
+        let lens = ExecutorPrototypeLensServer::pin_catalogue(&registry).unwrap();
+        let ordinary_names: Vec<&str> = ordinary
+            .descriptors
+            .iter()
+            .filter_map(|descriptor| descriptor.get("name").and_then(Value::as_str))
+            .collect();
+        for executor in [
+            "membership_read",
+            "membership_admin",
+            "membership_remove",
+            "export",
+        ] {
+            assert!(
+                ordinary_names.contains(&executor),
+                "hosted ordinary catalogue is missing {executor}; the budget \
+                 measurement is blind to the shipped surface it claims to guard: \
+                 {ordinary_names:?}"
+            );
+        }
+        let lens_names: Vec<&str> = lens
+            .descriptors
+            .iter()
+            .filter_map(|descriptor| descriptor.get("name").and_then(Value::as_str))
+            .collect();
+        for executor in ["membership_read", "export"] {
+            assert!(
+                lens_names.contains(&executor),
+                "hosted lens catalogue is missing {executor}; the budget \
+                 measurement is blind to the shipped surface it claims to guard: \
+                 {lens_names:?}"
+            );
+        }
+        for (surface, bytes) in [
+            ("ordinary", ordinary.descriptor_bytes()),
+            ("lens", lens.descriptor_bytes()),
+        ] {
+            assert!(
+                bytes <= EXECUTOR_DESCRIPTOR_MAX_BYTES,
+                "{surface} executor descriptors are {bytes} bytes against a \
+                 {EXECUTOR_DESCRIPTOR_MAX_BYTES} ceiling. Raising the ceiling \
+                 is a decision, not a fix: see cc34ddc, where a 657-byte \
+                 documentation change took production offline because the \
+                 margin had already been spent."
+            );
+        }
+    }
+
+    /// The listing must not name a shared contract's fields as one operation's
+    /// own. `manage_attachments` hand-declares a flat properties bag against a
+    /// `deny_unknown_fields` handler (`a193c01`), so its actions defer.
+    #[test]
+    fn operations_sharing_a_contract_defer_instead_of_advertising_the_union() {
+        let registry = registry();
+        let catalogue =
+            build_ordinary_catalogue(&registry, super::super::registry::EngineKind::Sqlite, false)
+                .unwrap();
+        let description = catalogue
+            .descriptors
+            .iter()
+            .find(|descriptor| descriptor["name"] == "records_delete")
+            .expect("records_delete descriptor")["inputSchema"]["properties"]["arguments"]
+            ["description"]
+            .as_str()
+            .expect("arguments description")
+            .to_string();
+
+        assert!(
+            !description.contains("manage_attachments.detach"),
+            "a shared contract must not be listed as the operation's own fields: {description}"
+        );
+        assert!(
+            description.contains("shares one contract with its sibling actions"),
+            "the deferral must explain the absence: {description}"
+        );
+
+        // A single-operation source tool has no siblings, so it still lists.
+        assert!(
+            description.contains("delete_record: "),
+            "an unshared contract must still list: {description}"
+        );
+    }
+
+    /// Every `arguments` copy in one descriptor carries the same listing.
+    /// Plan-carrying descriptors duplicate the description into their `oneOf`
+    /// branches, and the branch that requires `arguments` is one of them, so a
+    /// top-level-only write would leave the operative branch without fields.
+    #[test]
+    fn every_arguments_copy_carries_the_same_listing() {
+        let registry = registry();
+        let catalogue =
+            build_ordinary_catalogue(&registry, super::super::registry::EngineKind::Sqlite, false)
+                .unwrap();
+        fn argument_descriptions(schema: &Value, into: &mut Vec<String>) {
+            if let Some(description) = schema
+                .pointer("/properties/arguments/description")
+                .and_then(Value::as_str)
+            {
+                into.push(description.to_string());
+            }
+            for keyword in ["oneOf", "anyOf", "allOf"] {
+                let Some(branches) = schema.get(keyword).and_then(Value::as_array) else {
+                    continue;
+                };
+                for branch in branches {
+                    argument_descriptions(branch, into);
+                }
+            }
+        }
+        let mut branched = 0;
+        for descriptor in &catalogue.descriptors {
+            let name = descriptor["name"].as_str().unwrap();
+            let mut descriptions = Vec::new();
+            argument_descriptions(&descriptor["inputSchema"], &mut descriptions);
+            if descriptions.len() < 2 {
+                continue;
+            }
+            branched += 1;
+            let (first, rest) = descriptions.split_first().expect("checked above");
+            for other in rest {
+                assert_eq!(
+                    first, other,
+                    "{name} advertises two different argument contracts"
+                );
+            }
+        }
+        assert!(
+            branched > 0,
+            "no descriptor carried a branched arguments copy, so this proves nothing"
+        );
+    }
+
+    /// An operation whose source tool declares real per-action branches must be
+    /// named, not deferred. Checked on both surfaces: the lens routes a
+    /// different subset, and a rule that depends on what a surface happens to
+    /// route is the defect this test exists to catch.
+    #[test]
+    fn operations_with_action_specific_schemas_are_named_not_deferred() {
+        let registry = registry();
+        let ordinary =
+            build_ordinary_catalogue(&registry, super::super::registry::EngineKind::Sqlite, false)
+                .unwrap();
+        let lens = ExecutorPrototypeLensServer::pin_catalogue(&registry).unwrap();
+        let mut named = 0;
+        let mut deferred = 0;
+        for (surface, descriptors, contracts) in [
+            ("ordinary", &ordinary.descriptors, &ordinary.contracts),
+            ("lens", &lens.descriptors, &lens.contracts),
+        ] {
+            for descriptor in descriptors {
+                let name = descriptor["name"].as_str().unwrap();
+                if name == "bootstrap" || name == "describe_operation" {
+                    continue;
+                }
+                let operations = descriptor["inputSchema"]["properties"]["operation"]["enum"]
+                    .as_array()
+                    .expect("operation enum");
+                if operations.is_empty() {
+                    continue;
+                }
+                let description = descriptor
+                    .pointer("/inputSchema/properties/arguments/description")
+                    .and_then(Value::as_str)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "{surface} {name} routes operations but carries no arguments \
+                                description"
+                        )
+                    });
+                for operation in operations {
+                    let operation = operation.as_str().unwrap();
+                    let contract = contracts
+                        .get(&(name.to_string(), operation.to_string()))
+                        .expect("contract");
+                    if contract.action_specific_projection {
+                        named += 1;
+                        assert!(
+                            description.contains(&format!("{operation}: ")),
+                            "{surface} {name}.{operation} has a schema of its own but was \
+                             not named"
+                        );
+                    } else {
+                        deferred += 1;
+                        assert!(
+                            !description.contains(&format!("{operation}: ")),
+                            "{surface} {name}.{operation} shares a contract but its fields \
+                             were advertised as its own"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(named > 20, "expected many named operations, got {named}");
+        assert!(deferred > 0, "expected some deferrals, got {deferred}");
+    }
+
+    /// The specimens the reviews found, pinned by name so a future change to the
+    /// discriminator cannot quietly reintroduce either direction of the bug.
+    #[test]
+    fn shared_and_branched_contracts_are_each_classified_correctly() {
+        let registry = registry();
+        let catalogue =
+            build_ordinary_catalogue(&registry, super::super::registry::EngineKind::Sqlite, false)
+                .unwrap();
+        let classified = |executor: &str, operation: &str| {
+            catalogue
+                .contracts
+                .get(&(executor.to_string(), operation.to_string()))
+                .unwrap_or_else(|| panic!("{executor}.{operation} contract"))
+                .action_specific_projection
+        };
+
+        // Flat properties bag against a deny_unknown_fields handler: shared.
+        assert!(!classified("records_delete", "manage_attachments.detach"));
+        assert!(!classified("records_read", "manage_attachments.list"));
+
+        // Declared branches whose projected schemas are byte-identical to a
+        // sibling's. Comparing projected results deferred these; the source
+        // schema does not. `read` and `why` share one branch by declaration,
+        // and that branch is exactly each one's contract.
+        assert!(classified("records_read", "manage_relationships.read"));
+        assert!(classified("records_read", "manage_relationships.why"));
+        assert!(classified("records_write", "manage_relationships.assert"));
+
+        // Single-operation source tools have no siblings at all.
+        assert!(classified("records_write", "create_record"));
+        assert!(classified("records_read", "search"));
+    }
+
+    /// `manage_links` declares one `oneOf` branch per action, so each
+    /// operation advertises its own fields and rejects its siblings'. The
+    /// flat-bag declaration accepted `note` on `remove` at discovery while the
+    /// `deny_unknown_fields` handler rejected it at dispatch; the branch
+    /// structure carries that meaning now.
+    #[test]
+    fn manage_links_operations_advertise_only_their_own_fields() {
+        let registry = registry();
+        let audit: Audit = serde_json::from_str(AUDIT).unwrap();
+        let BuiltContracts { contracts, .. } = build_contracts(
+            &registry,
+            super::super::registry::EngineKind::Sqlite,
+            &audit.audit_rows,
+            ExecutorSurface::Ordinary,
+        )
+        .unwrap();
+        let add = contracts
+            .get(&("records_write".into(), "manage_links.add".into()))
+            .expect("manage_links.add contract");
+        let remove = contracts
+            .get(&("records_write".into(), "manage_links.remove".into()))
+            .expect("manage_links.remove contract");
+        let list = contracts
+            .get(&("records_read".into(), "manage_links.list".into()))
+            .expect("manage_links.list contract");
+        for contract in [add, remove, list] {
+            assert!(
+                contract.action_specific_projection,
+                "{}.{} must project to its own branch",
+                contract.executor, contract.operation
+            );
+        }
+        fn properties_of(contract: &OperationContract) -> HashSet<&str> {
+            contract.input_schema["properties"]
+                .as_object()
+                .unwrap_or_else(|| {
+                    panic!("{}.{} properties", contract.executor, contract.operation)
+                })
+                .keys()
+                .map(String::as_str)
+                .collect::<HashSet<_>>()
+        }
+        assert_eq!(
+            properties_of(add),
+            HashSet::from(["source_id", "target_id", "relationship", "note"])
+        );
+        assert_eq!(
+            properties_of(remove),
+            HashSet::from(["source_id", "target_id", "relationship"])
+        );
+        assert_eq!(
+            properties_of(list),
+            HashSet::from(["record_id", "limit", "cursor"])
+        );
+        // The exact sets above already exclude every sibling field. This one
+        // is named anyway because it is the defect: the flat bag disclosed
+        // `note` to `remove`, and the handler rejected the caller who sent it.
+        assert!(
+            !properties_of(remove).contains("note"),
+            "remove must not disclose note"
+        );
+
+        let add_validator = jsonschema::validator_for(&add.input_schema).unwrap();
+        let remove_validator = jsonschema::validator_for(&remove.input_schema).unwrap();
+        let list_validator = jsonschema::validator_for(&list.input_schema).unwrap();
+        assert!(add_validator.is_valid(&json!({
+            "source_id": "rec-a", "target_id": "rec-b",
+            "relationship": "relates_to", "note": "why"
+        })));
+        assert!(!add_validator.is_valid(&json!({
+            "source_id": "rec-a", "target_id": "rec-b",
+            "relationship": "relates_to", "record_id": "rec-a"
+        })));
+        assert!(remove_validator.is_valid(&json!({
+            "source_id": "rec-a", "target_id": "rec-b",
+            "relationship": "relates_to"
+        })));
+        assert!(!remove_validator.is_valid(&json!({
+            "source_id": "rec-a", "target_id": "rec-b",
+            "relationship": "relates_to", "note": "why"
+        })));
+        assert!(list_validator.is_valid(&json!({
+            "record_id": "rec-a"
+        })));
+        assert!(!list_validator.is_valid(&json!({
+            "record_id": "rec-a", "note": "why"
+        })));
+        assert!(!list_validator.is_valid(&json!({
+            "record_id": "rec-a", "source_id": "rec-a"
+        })));
     }
 
     #[test]
@@ -5631,13 +7045,85 @@ mod tests {
                     describe["result"]["structuredContent"]["input_schema"]
                 );
             }
-            assert_eq!(repair["preserved_intent"]["run_key"], run_key);
+            // The repair never echoes the payload: no `preserved_intent`, no
+            // `corrected_envelope`, no `retry`. The caller holds the request
+            // it just sent; the repair carries the bounded offending value
+            // and the minimal patch list instead.
+            assert!(repair.get("preserved_intent").is_none(), "{repair}");
+            assert!(repair.get("corrected_envelope").is_none(), "{repair}");
+            assert!(repair.get("retry").is_none(), "{repair}");
+            let envelope = json!({
+                "operation": "query_record",
+                "arguments": invalid_arguments,
+                "run_key": run_key,
+            });
+            let failing_pointer = repair["failing_pointer"].as_str().unwrap();
+            match envelope.pointer(failing_pointer) {
+                Some(offending) => {
+                    let failing_value = &repair["failing_value"];
+                    assert_eq!(failing_value["pointer"], failing_pointer, "{repair}");
+                    let length = failing_value["length"].as_u64().unwrap() as usize;
+                    let truncated = failing_value["truncated"].as_bool().unwrap();
+                    match offending {
+                        Value::String(text) => {
+                            assert_eq!(length, text.chars().count(), "{repair}");
+                            let echoed = failing_value["value"].as_str().unwrap();
+                            assert!(echoed.chars().count() <= 200, "{repair}");
+                            assert_eq!(truncated, length > 200, "{repair}");
+                            if truncated {
+                                assert_eq!(
+                                    echoed,
+                                    text.chars().take(200).collect::<String>(),
+                                    "{repair}"
+                                );
+                            } else {
+                                assert_eq!(echoed, text, "{repair}");
+                            }
+                        }
+                        _ => {
+                            let serialised = serde_json::to_string(offending).unwrap();
+                            assert_eq!(length, serialised.chars().count(), "{repair}");
+                            assert_eq!(truncated, length > 200, "{repair}");
+                            if truncated {
+                                assert_eq!(
+                                    failing_value["value"].as_str().unwrap(),
+                                    serialised.chars().take(200).collect::<String>(),
+                                    "{repair}"
+                                );
+                            } else {
+                                assert_eq!(failing_value["value"], *offending, "{repair}");
+                            }
+                        }
+                    }
+                }
+                // A required-field-missing failure names a field that is
+                // absent, so the pointer cannot resolve — omitting the field
+                // is the expected case.
+                None => assert!(repair.get("failing_value").is_none(), "{repair}"),
+            }
             let retry_ready = id == 72;
             assert_eq!(repair["retry_ready"], retry_ready, "{repair}");
             if retry_ready {
-                assert_eq!(repair["retry"]["tool"], "records_read");
-                assert_eq!(repair["retry"]["arguments"], repair["corrected_envelope"]);
-                assert_ne!(repair["corrected_envelope"], repair["preserved_intent"]);
+                let corrections = repair["corrections"].as_array().unwrap();
+                assert!(!corrections.is_empty(), "{repair}");
+                for correction in corrections {
+                    assert!(correction["pointer"].as_str().is_some(), "{repair}");
+                    // A set carries either a literal `value` or a `from`
+                    // reference into the caller's own envelope — never both,
+                    // and a removal carries neither of the two.
+                    let is_remove = correction.get("remove").and_then(Value::as_bool) == Some(true);
+                    assert_eq!(
+                        correction.get("value").is_some(),
+                        !is_remove && correction.get("from").is_none(),
+                        "{repair}"
+                    );
+                    assert_eq!(
+                        correction.get("from").and_then(Value::as_str).is_some(),
+                        !is_remove && correction.get("value").is_none(),
+                        "{repair}"
+                    );
+                }
+                let corrected = apply_test_corrections(&envelope, corrections);
                 let callable_schema = tools
                     .iter()
                     .find(|tool| tool["name"] == "records_read")
@@ -5645,19 +7131,19 @@ mod tests {
                     .clone();
                 let callable_validator = jsonschema::validator_for(&callable_schema).unwrap();
                 assert!(
-                    callable_validator.is_valid(&repair["corrected_envelope"]),
-                    "repair must emit an envelope accepted by tools/list: {repair}"
+                    callable_validator.is_valid(&corrected),
+                    "applying the corrections must yield an envelope accepted by tools/list: {repair}"
                 );
-                let corrected = repair["corrected_envelope"]["arguments"].clone();
+                let corrected_arguments = corrected["arguments"].clone();
                 let validator = jsonschema::validator_for(
                     &describe["result"]["structuredContent"]["input_schema"],
                 )
                 .unwrap();
-                assert!(validator.is_valid(&corrected), "{repair}");
-                super::super::tools::querying::validate_query_record_operation(corrected).unwrap();
+                assert!(validator.is_valid(&corrected_arguments), "{repair}");
+                super::super::tools::querying::validate_query_record_operation(corrected_arguments)
+                    .unwrap();
             } else {
-                assert!(repair["corrected_envelope"].is_null());
-                assert!(repair["retry"].is_null());
+                assert!(repair.get("corrections").is_none(), "{repair}");
             }
         }
         assert!(
@@ -5716,6 +7202,24 @@ mod tests {
             misspelled["expected_shape"]["required_properties"].is_array(),
             "{misspelled}"
         );
+        // The offending value travels bounded: the misspelled field resolves
+        // in the caller's own envelope, so it is echoed at most at 200 chars.
+        assert_eq!(
+            misspelled["failing_value"],
+            json!({
+                "pointer": "/arguments/record_id",
+                "value": "read-fixture-a748b2",
+                "length": 19,
+                "truncated": false,
+            }),
+            "{misspelled}"
+        );
+        assert!(misspelled.get("preserved_intent").is_none(), "{misspelled}");
+        assert!(
+            misspelled.get("corrected_envelope").is_none(),
+            "{misspelled}"
+        );
+        assert!(misspelled.get("retry").is_none(), "{misspelled}");
         // The disclosure stays cheap: names only, never their subschemas.
         assert!(
             misspelled["expected_shape"]["accepted_properties"]
@@ -5746,13 +7250,33 @@ mod tests {
         let repair = &routing_confusion["result"]["structuredContent"]["repair"];
         assert_eq!(repair["failing_pointer"], "/arguments/steps");
         assert_eq!(repair["retry_ready"], true);
-        assert_ne!(repair["corrected_envelope"], repair["preserved_intent"]);
-        assert_eq!(
-            repair["corrected_envelope"]["arguments"]["steps"][0]["types"],
-            json!(["task"])
+        assert!(repair.get("preserved_intent").is_none(), "{repair}");
+        assert!(repair.get("corrected_envelope").is_none(), "{repair}");
+        assert!(repair.get("retry").is_none(), "{repair}");
+        // `/arguments/steps` names a field the envelope never had — the steps
+        // sat at the top level — so the pointer cannot resolve and the field
+        // is omitted rather than nulled.
+        assert!(repair.get("failing_value").is_none(), "{repair}");
+        let envelope = json!({
+            "operation": "query_record",
+            "steps": [{"step": "filter", "types": ["task"]}],
+            "limit": 10,
+            "run_key": "read-routing-a748b2",
+        });
+        let corrections = repair["corrections"].as_array().unwrap();
+        assert!(!corrections.is_empty(), "{repair}");
+        // A removal must be distinguishable from an explicit null.
+        assert!(
+            corrections
+                .iter()
+                .any(|correction| correction.get("remove") == Some(&json!(true))),
+            "moved fields must leave explicit removals behind: {repair}"
         );
-        assert_eq!(repair["corrected_envelope"]["arguments"]["limit"], 10);
-        assert!(repair["corrected_envelope"].get("steps").is_none());
+        let corrected = apply_test_corrections(&envelope, corrections);
+        assert_eq!(corrected["arguments"]["steps"][0]["types"], json!(["task"]));
+        assert_eq!(corrected["arguments"]["limit"], 10);
+        assert!(corrected.get("steps").is_none());
+        assert!(corrected.get("limit").is_none());
 
         let valid = server
             .handle_message(json!({
@@ -5882,8 +7406,13 @@ mod tests {
         assert_eq!(diagnostic["reason_code"], "authoritative_source_rejected");
         assert_eq!(diagnostic["diagnostic"], source_error);
         assert_eq!(diagnostic["retry_ready"], false);
-        assert!(diagnostic["corrected_envelope"].is_null());
-        assert!(diagnostic["retry"].is_null());
+        assert!(diagnostic.get("corrected_envelope").is_none());
+        assert!(diagnostic.get("retry").is_none());
+        assert!(diagnostic.get("preserved_intent").is_none());
+        assert!(diagnostic.get("corrections").is_none());
+        // Execution diagnostics never name a failing envelope field, so
+        // there is no offending value to bound.
+        assert!(diagnostic.get("failing_value").is_none());
         assert_eq!(
             diagnostic["guidance"]["action"],
             "inspect_authoritative_source_error"
@@ -5895,8 +7424,8 @@ mod tests {
     /// The guard refusals must never travel as contract repairs. Synthesising
     /// `if_body_digest` from current state would hand the caller a token it
     /// never read and silently reproduce the lost update the guard exists to
-    /// prevent, so both codes stay ordinary execution diagnostics with a null
-    /// `corrected_envelope`.
+    /// prevent, so both codes stay ordinary execution diagnostics with no
+    /// `corrections`.
     #[tokio::test]
     async fn guarded_body_refusals_are_diagnostic_and_never_synthesise_a_token() {
         let db = create_database(":memory:").await.unwrap();
@@ -5965,9 +7494,11 @@ mod tests {
             assert_eq!(repair["code"], "operation_execution_diagnostic", "{repair}");
             assert_eq!(repair["reason_code"], "authoritative_source_rejected");
             assert_eq!(repair["retry_ready"], false, "{repair}");
-            assert!(repair["corrected_envelope"].is_null(), "{repair}");
-            assert!(repair["retry"].is_null(), "{repair}");
-            assert_eq!(repair["preserved_intent"], envelope);
+            assert!(repair.get("corrected_envelope").is_none(), "{repair}");
+            assert!(repair.get("retry").is_none(), "{repair}");
+            assert!(repair.get("preserved_intent").is_none(), "{repair}");
+            assert!(repair.get("corrections").is_none(), "{repair}");
+            assert!(repair.get("failing_value").is_none(), "{repair}");
             let error = response["result"]["structuredContent"]["error"]
                 .as_str()
                 .unwrap();
@@ -6028,9 +7559,490 @@ mod tests {
         assert_eq!(diagnostic["diagnostic"], source_error);
         assert_eq!(diagnostic["error_class"], "execution_error");
         assert_eq!(diagnostic["retry_ready"], false);
-        assert!(diagnostic["corrected_envelope"].is_null());
-        assert!(diagnostic["retry"].is_null());
-        assert_eq!(diagnostic["preserved_intent"], envelope);
+        assert!(diagnostic.get("corrected_envelope").is_none());
+        assert!(diagnostic.get("retry").is_none());
+        assert!(diagnostic.get("preserved_intent").is_none());
+        assert!(diagnostic.get("corrections").is_none());
+        assert!(diagnostic.get("failing_value").is_none());
+        // The envelope matched the contract, so the contract cannot explain
+        // this failure and must not be shipped alongside a message saying so.
+        assert!(diagnostic.get("input_schema").is_none(), "{diagnostic}");
+        assert!(diagnostic["contract_reference"].is_object(), "{diagnostic}");
+    }
+
+    /// A digest conflict must not cost more than the write it refused. It is
+    /// an execution error, so it carries no echo of the payload and no
+    /// correction — and, because the envelope matched the contract, no
+    /// `input_schema` either. What remains is fixed scaffolding: the source's
+    /// own message, the guidance, the digest, and the pointer to
+    /// `describe_operation`.
+    ///
+    /// So the property is constancy, not a bare byte comparison. A rejection
+    /// that is 1.1KB whatever you send is cheap on the four-anchor patch this
+    /// task was written about — where the payload is roughly double the edited
+    /// text — and cannot be made arbitrarily expensive by making the request
+    /// bigger. Before the `input_schema` came off this path it was 3,179 bytes,
+    /// 2,352 of which were the schema the caller had already satisfied.
+    #[tokio::test]
+    async fn digest_conflict_repair_does_not_scale_with_the_patch() {
+        let db = create_database(":memory:").await.unwrap();
+        let server =
+            ExecutorPrototypeStdioServer::new(registry(), db.clone(), Caller::local(), None)
+                .await
+                .unwrap();
+        let contract = server
+            .contracts
+            .get(&("records_write".into(), "update_record".into()))
+            .unwrap()
+            .clone();
+        // Anchors the length of real prose, which is what a four-anchor patch
+        // on a real record looks like.
+        let envelope_for = |anchor_chars: usize| {
+            let anchor = |seed: char| "x".repeat(anchor_chars).replace('x', &seed.to_string());
+            json!({
+                "operation": "update_record",
+                "arguments": {
+                    "id": "digest-conflict-record",
+                    "reason": "Exercise a four-anchor stale write",
+                    "if_body_digest": "a-digest-the-caller-read-earlier",
+                    "body_replace": [
+                        {"old": anchor('a'), "new": anchor('b')},
+                        {"old": anchor('c'), "new": anchor('d')},
+                        {"old": anchor('e'), "new": anchor('f')},
+                        {"old": anchor('g'), "new": anchor('h')},
+                    ],
+                },
+                "run_key": "digest-conflict-4f21ab",
+            })
+        };
+        let repair_for = |envelope: &Value| {
+            let mut result = json!({"structuredContent": {}});
+            attach_repair_result(
+                &mut result,
+                &contract,
+                "execution_error",
+                Some(
+                    "update_record: stale write conflict — the body changed since the caller read it",
+                ),
+                envelope,
+                None,
+            );
+            result["structuredContent"]["repair"].take()
+        };
+
+        let modest = envelope_for(80);
+        let large = envelope_for(4_000);
+        let modest_repair = repair_for(&modest);
+        let large_repair = repair_for(&large);
+        assert!(
+            modest_repair.get("input_schema").is_none(),
+            "the schema the caller already satisfied must not travel: {modest_repair}"
+        );
+        let modest_bytes = serde_json::to_string(&modest_repair).unwrap().len();
+        let large_bytes = serde_json::to_string(&large_repair).unwrap().len();
+
+        // Constant: a bigger patch does not buy a bigger rejection.
+        assert_eq!(
+            modest_bytes, large_bytes,
+            "a digest conflict must cost the same whatever the patch: \
+             {modest_bytes} vs {large_bytes}"
+        );
+        // Bounded by a small absolute ceiling, so the constancy above is
+        // constancy at a cheap value rather than at an expensive one. The
+        // remainder is the source's message, the guidance, the digest and the
+        // `describe_operation` pointer — all worth their bytes. It crosses
+        // below the size of the request itself once the patch exceeds ~1.2KB,
+        // which a four-anchor patch on real prose does.
+        assert!(
+            modest_bytes < 1_536,
+            "a digest conflict must stay near its fixed scaffolding, \
+             was {modest_bytes}: {modest_repair}"
+        );
+    }
+
+    /// A rejection's size must not scale with the size of the submitted body.
+    /// Two envelopes failing the same way — one with a small body, one with a
+    /// ~20KB body — must produce repair blocks within a small constant of
+    /// each other. The old shape echoed the whole payload three times over
+    /// (`preserved_intent`, `corrected_envelope`, `retry.arguments`); the new
+    /// shape carries only the bounded offending value.
+    #[tokio::test]
+    async fn repair_size_does_not_scale_with_submitted_body() {
+        let db = create_database(":memory:").await.unwrap();
+        let server =
+            ExecutorPrototypeStdioServer::new(registry(), db.clone(), Caller::local(), None)
+                .await
+                .unwrap();
+        let contract = server
+            .contracts
+            .get(&("records_write".into(), "update_record".into()))
+            .unwrap()
+            .clone();
+        let envelope_for = |body: String| {
+            json!({
+                "operation": "update_record",
+                "arguments": {
+                    "id": "repair-size-record",
+                    "reason": "Exercise bounded rejection size",
+                    "body": body,
+                    "bogus_field": true,
+                },
+                "run_key": "repair-size-a748b2",
+            })
+        };
+        let repair_for = |envelope: &Value| {
+            let mut result = json!({"structuredContent": {}});
+            attach_repair_result(
+                &mut result,
+                &contract,
+                "validation_failure",
+                Some("test diagnostic"),
+                envelope,
+                None,
+            );
+            result["structuredContent"]["repair"].take()
+        };
+        let small = envelope_for("small body".into());
+        // The marker sits past the truncation bound: if any part of the large
+        // body leaks into the repair beyond the 200-char window, it shows up.
+        let large_body = format!("{}TAIL-MARKER", "y".repeat(20_000));
+        let large = envelope_for(large_body);
+        assert!(
+            serde_json::to_string(&large).unwrap().len()
+                - serde_json::to_string(&small).unwrap().len()
+                > 19_000,
+            "the test is vacuous unless the envelopes differ hugely"
+        );
+        let small_repair = repair_for(&small);
+        let large_repair = repair_for(&large);
+        // The `update_record` contract wraps its variants in `oneOf`, so the
+        // validator's first error is the whole-arguments constraint — the
+        // offending value is the arguments object itself, large body included.
+        for repair in [&small_repair, &large_repair] {
+            assert_eq!(
+                repair["reason_code"], "schema_constraint_failed",
+                "{repair}"
+            );
+            assert_eq!(repair["failing_pointer"], "/arguments", "{repair}");
+            assert_eq!(repair["retry_ready"], false, "{repair}");
+            assert!(repair.get("preserved_intent").is_none(), "{repair}");
+            assert!(repair.get("corrected_envelope").is_none(), "{repair}");
+            assert!(repair.get("retry").is_none(), "{repair}");
+            assert!(repair.get("corrections").is_none(), "{repair}");
+        }
+        // The small arguments travel whole; the large ones are cut to the
+        // 200-char bound with their original length disclosed.
+        let small_args = serde_json::to_string(&small["arguments"]).unwrap();
+        assert_eq!(
+            small_repair["failing_value"],
+            json!({
+                "pointer": "/arguments",
+                "value": small["arguments"],
+                "length": small_args.chars().count(),
+                "truncated": false,
+            })
+        );
+        let large_args = serde_json::to_string(&large["arguments"]).unwrap();
+        assert_eq!(large_repair["failing_value"]["pointer"], "/arguments");
+        assert_eq!(
+            large_repair["failing_value"]["length"],
+            large_args.chars().count()
+        );
+        assert_eq!(large_repair["failing_value"]["truncated"], true);
+        assert_eq!(
+            large_repair["failing_value"]["value"]
+                .as_str()
+                .unwrap()
+                .chars()
+                .count(),
+            200
+        );
+        let small_text = serde_json::to_string(&small_repair).unwrap();
+        let large_text = serde_json::to_string(&large_repair).unwrap();
+        assert!(
+            !large_text.contains("TAIL-MARKER"),
+            "the large body leaked into the repair"
+        );
+        let gap = (large_text.len() as i64 - small_text.len() as i64).abs();
+        // The window itself is 200 chars, so the two repairs may differ by up
+        // to ~that plus serialisation slack — and by never more, however large
+        // the payload grows.
+        assert!(
+            gap <= 256,
+            "same failure, ~20KB apart in payload, {gap} bytes apart in repair"
+        );
+        db.close().await;
+    }
+
+    /// The boundedness guarantee on the path that actually moves bytes: the
+    /// probe envelope carries a ~20KB body at the top level (misplaced routing
+    /// the repair corrects by moving it under `arguments`), so the old shape
+    /// echoed 21KB and `corrections` naively would too. Moves must travel by
+    /// reference, keeping the repair small while `retry_ready` stays true.
+    #[tokio::test]
+    async fn repair_with_retry_ready_does_not_scale_with_submitted_body() {
+        let db = create_database(":memory:").await.unwrap();
+        let server =
+            ExecutorPrototypeStdioServer::new(registry(), db.clone(), Caller::local(), None)
+                .await
+                .unwrap();
+        let contract = server
+            .contracts
+            .get(&("records_write".into(), "update_record".into()))
+            .unwrap()
+            .clone();
+        let envelope = json!({
+            "operation": "update_record",
+            "id": "probe-record",
+            "reason": "Exercise move-by-reference corrections",
+            "body": format!("{}TAIL-MARKER", "y".repeat(20_000)),
+            "run_key": "repair-probe-a748b2",
+        });
+        let mut result = json!({"structuredContent": {}});
+        attach_repair_result(
+            &mut result,
+            &contract,
+            "validation_failure",
+            Some("test diagnostic"),
+            &envelope,
+            None,
+        );
+        let repair = &result["structuredContent"]["repair"];
+        // With no `arguments` key the validator reports the missing required
+        // field of the singular variant first; it names an absent field, so
+        // there is no offending value to bound.
+        assert_eq!(repair["reason_code"], "required_field_missing", "{repair}");
+        assert_eq!(repair["failing_pointer"], "/arguments/reason", "{repair}");
+        assert_eq!(repair["retry_ready"], true, "{repair}");
+        assert!(repair.get("failing_value").is_none(), "{repair}");
+        let corrections = repair["corrections"].as_array().unwrap();
+        assert!(!corrections.is_empty(), "{repair}");
+        // Every set is a move by reference: no `value`, so no body bytes.
+        for correction in corrections {
+            if correction.get("remove").and_then(Value::as_bool) == Some(true) {
+                assert!(correction.get("value").is_some(), "{repair}");
+            } else {
+                assert!(
+                    correction.get("from").and_then(Value::as_str).is_some(),
+                    "{repair}"
+                );
+                assert!(correction.get("value").is_none(), "{repair}");
+            }
+        }
+        assert!(
+            corrections
+                .iter()
+                .any(|correction| correction["from"] == "/body"),
+            "the 20KB body must move by reference: {repair}"
+        );
+        assert!(repair.get("corrections_total").is_none(), "{repair}");
+        let text = serde_json::to_string(repair).unwrap();
+        assert!(
+            !text.contains("TAIL-MARKER"),
+            "the large body leaked into the repair"
+        );
+        assert!(
+            text.len() < 4096,
+            "repair with retry_ready=true must stay small, was {} bytes",
+            text.len()
+        );
+        // The reference patch list still applies: resolving `from` against the
+        // submitted envelope reproduces the corrected shape.
+        let corrected = apply_test_corrections(&envelope, corrections);
+        assert_eq!(
+            corrected,
+            json!({
+                "operation": "update_record",
+                "arguments": {
+                    "id": "probe-record",
+                    "reason": "Exercise move-by-reference corrections",
+                    "body": envelope["body"],
+                },
+                "run_key": "repair-probe-a748b2",
+            })
+        );
+        db.close().await;
+    }
+
+    #[test]
+    fn repair_failing_value_truncates_at_char_boundaries() {
+        // Multi-byte content: 300 `é` chars must truncate to exactly 200
+        // chars without slicing a codepoint.
+        let text = "é".repeat(300);
+        let envelope = json!({"arguments": {"body": text}});
+        let failing = repair_failing_value("/arguments/body", &envelope).unwrap();
+        assert_eq!(failing["pointer"], "/arguments/body");
+        assert_eq!(failing["length"], 300);
+        assert_eq!(failing["truncated"], true);
+        let echoed = failing["value"].as_str().unwrap();
+        assert_eq!(echoed.chars().count(), 200);
+        assert_eq!(echoed, "é".repeat(200));
+        // Short strings travel whole.
+        let envelope = json!({"arguments": {"body": "small"}});
+        let failing = repair_failing_value("/arguments/body", &envelope).unwrap();
+        assert_eq!(
+            failing,
+            json!({
+                "pointer": "/arguments/body",
+                "value": "small",
+                "length": 5,
+                "truncated": false,
+            })
+        );
+        // Non-strings serialise compactly; over the bound they travel as the
+        // truncated serialisation string, under it as the value itself.
+        let big = json!({"arguments": {"ids": vec!["x".repeat(300)]}});
+        let failing = repair_failing_value("/arguments/ids", &big).unwrap();
+        assert_eq!(failing["truncated"], true);
+        assert_eq!(failing["value"].as_str().unwrap().chars().count(), 200);
+        assert_eq!(
+            failing["length"],
+            serde_json::to_string(&big["arguments"]["ids"])
+                .unwrap()
+                .chars()
+                .count()
+        );
+        let small = json!({"arguments": {"limit": 10}});
+        let failing = repair_failing_value("/arguments/limit", &small).unwrap();
+        assert_eq!(
+            failing,
+            json!({
+                "pointer": "/arguments/limit",
+                "value": 10,
+                "length": 2,
+                "truncated": false,
+            })
+        );
+        // A required-field-missing pointer names an absent field.
+        let envelope = json!({"arguments": {}});
+        assert!(repair_failing_value("/arguments/id", &envelope).is_none());
+    }
+
+    #[test]
+    fn repair_corrections_diff_leaves_and_marks_removals() {
+        let envelope = json!({
+            "operation": "query_record",
+            "arguments": {"steps": [{"step": "filter"}], "limit": 1},
+            "stale": "drop me",
+            "run_key": "k",
+        });
+        let corrected = json!({
+            "operation": "query_record",
+            "arguments": {"steps": [{"step": "filter", "types": ["task"]}], "limit": 2},
+            "run_key": "k",
+        });
+        let built = repair_corrections(&envelope, &corrected);
+        assert!(!built.truncated);
+        assert_eq!(built.total, 3);
+        let corrections = built.entries;
+        // Changed leaves only: the untouched `step` and `run_key` appear
+        // nowhere; the dropped top-level field is an explicit removal. A
+        // newly present array expands to its scalar leaves. Both new values
+        // are small and genuinely new, so they travel literally.
+        assert_eq!(
+            corrections,
+            vec![
+                json!({"pointer": "/arguments/limit", "value": 2}),
+                json!({
+                    "pointer": "/arguments/steps/0/types/0",
+                    "value": "task",
+                }),
+                json!({"pointer": "/stale", "value": null, "remove": true}),
+            ]
+        );
+        // The documented round trip: patching the caller's own envelope with
+        // the corrections reproduces the corrected one.
+        assert_eq!(apply_test_corrections(&envelope, &corrections), corrected);
+        // Identical envelopes diff to nothing.
+        let built = repair_corrections(&envelope, &envelope);
+        assert!(!built.truncated);
+        assert_eq!(built.total, 0);
+        assert_eq!(built.entries, Vec::<Value>::new());
+    }
+
+    #[test]
+    fn repair_corrections_type_change_expands_and_stays_bounded() {
+        // A scalar-to-object change shares no structure to diff: the fallback
+        // must expand to leaves, and the genuinely new 20KB leaf must travel
+        // truncated — never whole.
+        let big = format!("{}TAIL-MARKER", "x".repeat(20_000));
+        let envelope = json!({"a": 1});
+        let corrected = json!({"a": {"x": big}});
+        let built = repair_corrections(&envelope, &corrected);
+        assert!(built.truncated);
+        assert_eq!(built.total, 1);
+        let entry = &built.entries[0];
+        assert_eq!(entry["pointer"], "/a/x");
+        assert_eq!(entry["truncated"], true);
+        assert_eq!(
+            entry["value"].as_str().unwrap().chars().count(),
+            REPAIR_VALUE_CHAR_LIMIT
+        );
+        let text = serde_json::to_string(&built.entries).unwrap();
+        assert!(!text.contains("TAIL-MARKER"));
+        assert!(text.len() < 1024);
+    }
+
+    #[test]
+    fn repair_corrections_array_shrink_removes_descending() {
+        // Twelve elements down to two: removals must come out numerically
+        // descending (`/arr/11` … `/arr/2`), or applying them in order shifts
+        // every later index — and lexicographic sorting would put `/arr/10`
+        // before `/arr/2`.
+        let envelope = json!({"arr": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]});
+        let corrected = json!({"arr": [0, 1]});
+        let built = repair_corrections(&envelope, &corrected);
+        assert!(!built.truncated);
+        let pointers = built
+            .entries
+            .iter()
+            .map(|entry| entry["pointer"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            pointers,
+            vec![
+                "/arr/11", "/arr/10", "/arr/9", "/arr/8", "/arr/7", "/arr/6", "/arr/5", "/arr/4",
+                "/arr/3", "/arr/2",
+            ]
+        );
+        assert!(
+            built.entries.iter().all(|entry| entry["remove"] == true),
+            "shrinks are removals only: {:?}",
+            built.entries
+        );
+        assert_eq!(apply_test_corrections(&envelope, &built.entries), corrected);
+    }
+
+    #[test]
+    fn repair_corrections_cap_states_total() {
+        // Twenty-five new leaves: only the first 20 travel, with the total
+        // stated so the caller knows entries were withheld.
+        let mut corrected_map = serde_json::Map::new();
+        for index in 0..25 {
+            corrected_map.insert(format!("k{index:02}"), json!(index));
+        }
+        let built = repair_corrections(&json!({}), &Value::Object(corrected_map));
+        assert!(!built.truncated);
+        assert_eq!(built.total, 25);
+        assert_eq!(built.entries.len(), REPAIR_MAX_CORRECTIONS);
+        // A capped list is incomplete, so applying it would not reproduce the
+        // corrected envelope. It must not advertise an automatic fix, for the
+        // same reason a truncated value must not.
+        assert!(
+            !corrections_are_applicable(&built),
+            "a capped patch list is not mechanically applicable"
+        );
+    }
+
+    #[test]
+    fn repair_corrections_under_the_cap_stay_applicable() {
+        let mut corrected_map = serde_json::Map::new();
+        for index in 0..REPAIR_MAX_CORRECTIONS {
+            corrected_map.insert(format!("k{index:02}"), json!(index));
+        }
+        let built = repair_corrections(&json!({}), &Value::Object(corrected_map));
+        assert_eq!(built.total, REPAIR_MAX_CORRECTIONS);
+        assert!(corrections_are_applicable(&built));
     }
 
     #[test]

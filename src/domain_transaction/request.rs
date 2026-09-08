@@ -259,7 +259,19 @@ impl GovernedRequestTrace {
 const RUN_KEY_ARG: &str = "run_key";
 const PARENT_KEY_ARG: &str = "parent_key";
 
+/// Inject the canonical correlation arguments into one registered schema.
+///
+/// Branch copies are bare (`{"type": "string"}`, no `description`). They exist
+/// only so a branch's `additionalProperties: false` admits a caller who passes
+/// `run_key`/`parent_key`; the prose is read once from the top level.
+/// Duplicating the full descriptions into every `oneOf`/`allOf` branch costs
+/// the lens descriptor budget real bytes on every branched tool, so branches
+/// declare the fields without repeating them.
 pub(crate) fn add_run_context_arguments(schema: &mut Value, kind: Option<ToolKind>) {
+    add_run_context_arguments_inner(schema, kind, true);
+}
+
+fn add_run_context_arguments_inner(schema: &mut Value, kind: Option<ToolKind>, describe: bool) {
     if kind.is_some_and(ToolKind::ignores_run_context_arguments) {
         return;
     }
@@ -268,7 +280,7 @@ pub(crate) fn add_run_context_arguments(schema: &mut Value, kind: Option<ToolKin
     };
     if let Some(branches) = object.get_mut("oneOf").and_then(Value::as_array_mut) {
         for branch in branches.iter_mut() {
-            add_run_context_arguments(branch, kind);
+            add_run_context_arguments_inner(branch, kind, false);
         }
         object
             .entry("properties")
@@ -276,26 +288,30 @@ pub(crate) fn add_run_context_arguments(schema: &mut Value, kind: Option<ToolKin
     }
     if let Some(branches) = object.get_mut("allOf").and_then(Value::as_array_mut) {
         for branch in branches.iter_mut() {
-            add_run_context_arguments(branch, kind);
+            add_run_context_arguments_inner(branch, kind, false);
         }
     }
     let Some(properties) = object.get_mut("properties").and_then(Value::as_object_mut) else {
         return;
     };
-    properties.insert(
-        RUN_KEY_ARG.into(),
+    let run_key_schema = if describe {
         serde_json::json!({
             "type": "string",
             "description": "Run correlation handle from bootstrap. Reuse the same key on every call, reads included. Mint with \"new\" or \"new:<agent_key>\". See coordination guide."
-        }),
-    );
-    properties.insert(
-        PARENT_KEY_ARG.into(),
+        })
+    } else {
+        serde_json::json!({"type": "string"})
+    };
+    let parent_key_schema = if describe {
         serde_json::json!({
             "type": "string",
             "description": "Optional spawning run_key; an unverified lineage hint. Minting sentinels are invalid. See coordination guide."
-        }),
-    );
+        })
+    } else {
+        serde_json::json!({"type": "string"})
+    };
+    properties.insert(RUN_KEY_ARG.into(), run_key_schema);
+    properties.insert(PARENT_KEY_ARG.into(), parent_key_schema);
     if !kind.is_some_and(ToolKind::callable_without_run_key) {
         let required = object
             .entry("required")
@@ -732,6 +748,84 @@ mod tests {
             .as_array()
             .unwrap()
             .contains(&json!("run_key")));
+    }
+
+    #[test]
+    fn run_context_branches_declare_bare_keys_while_top_level_keeps_prose() {
+        let mut schema = json!({
+            "type": "object",
+            "oneOf": [
+                {"type":"object","properties":{"action":{"const":"add"}},"required":["action"],"additionalProperties":false},
+                {"type":"object","properties":{"action":{"const":"list"}},"required":["action"],"additionalProperties":false}
+            ]
+        });
+
+        add_run_context_arguments(&mut schema, Some(ToolKind::UpdateRecord));
+
+        // Top level carries the prose a caller reads once.
+        assert!(schema["properties"]["run_key"]
+            .get("description")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|description| !description.is_empty()));
+        assert!(schema["properties"]["parent_key"]
+            .get("description")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|description| !description.is_empty()));
+        // Branches declare the fields so additionalProperties:false admits
+        // them, but without repeating the prose into every branch.
+        for branch in schema["oneOf"].as_array().unwrap() {
+            assert_eq!(branch["properties"]["run_key"], json!({"type": "string"}));
+            assert_eq!(
+                branch["properties"]["parent_key"],
+                json!({"type": "string"})
+            );
+            assert!(branch["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("run_key")));
+        }
+
+        // A schema with no branches is unaffected: described as before.
+        let mut flat = json!({"type":"object","properties":{"id":{"type":"string"}}});
+        add_run_context_arguments(&mut flat, Some(ToolKind::UpdateRecord));
+        assert!(flat["properties"]["run_key"]
+            .get("description")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|description| !description.is_empty()));
+
+        assert!(flat["properties"]["parent_key"]
+            .get("description")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|description| !description.is_empty()));
+
+        // A branch that only wraps an `allOf` gains nothing: it has no
+        // `properties` of its own, so the early return leaves it alone and its
+        // inner branches carry the bare copies. `update_record`'s multi-record
+        // branch is exactly this shape, and injecting a bag here would add a
+        // `required: ["run_key"]` it never had.
+        let mut wrapper = json!({
+            "type": "object",
+            "properties": {"reason": {"type": "string"}},
+            "oneOf": [
+                {"type":"object","properties":{"id":{"type":"string"}},"additionalProperties":false},
+                {"allOf": [
+                    {"type":"object","properties":{"ids":{"type":"array"}},"additionalProperties":false}
+                ]}
+            ]
+        });
+        add_run_context_arguments(&mut wrapper, Some(ToolKind::UpdateRecord));
+        assert_eq!(
+            wrapper["oneOf"][1]
+                .as_object()
+                .unwrap()
+                .keys()
+                .collect::<Vec<_>>(),
+            vec!["allOf"]
+        );
+        assert_eq!(
+            wrapper["oneOf"][1]["allOf"][0]["properties"]["run_key"],
+            json!({"type": "string"})
+        );
     }
 
     #[tokio::test]

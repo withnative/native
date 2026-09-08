@@ -20,8 +20,8 @@ The direct query flag is not part of saved-query v0.2 and rejects non-record ter
 
 Exact compact UTF-8 `result.tools` descriptor arrays:
 
-- `focused`: 27 tools, 64648 bytes
-- `complete`: 73 tools, 175007 bytes
+- `focused`: 27 tools, 65053 bytes
+- `complete`: 73 tools, 168387 bytes
 
 ## Complete production registry
 
@@ -35,9 +35,9 @@ Exact compact UTF-8 `result.tools` descriptor arrays:
 | `describe_schema` | `schema` | yes | no | yes | `correctness-under-ignorance` | 1034 |
 | `quickstart` | `guidance` | no | no | yes | `correctness-under-ignorance` | 594 |
 | `read_guide` | `guidance` | yes | yes | yes | `correctness-under-ignorance` | 1309 |
-| `create_record` | `records` | yes | no | yes | `atomicity` | 5315 |
+| `create_record` | `records` | yes | no | yes | `atomicity` | 5630 |
 | `get_record` | `records` | yes | no | yes | `discoverability` | 3853 |
-| `update_record` | `records` | yes | no | yes | `atomicity` | 4442 |
+| `update_record` | `records` | yes | no | yes | `atomicity` | 3848 |
 | `claim_unowned_record` | `records` | no | no | yes | `atomicity` | 1631 |
 | `correct_record_type` | `records` | no | no | yes | `atomicity` | 1597 |
 | `delete_record` | `records` | yes | no | yes | `atomicity` | 1238 |
@@ -50,12 +50,12 @@ Exact compact UTF-8 `result.tools` descriptor arrays:
 | `resolve_external` | `identity` | no | no | yes | `correctness-under-ignorance` | 1673 |
 | `manage_bindings` | `identity` | no | no | yes | `correctness-under-ignorance` | 1954 |
 | `observe_external` | `identity` | no | no | yes | `correctness-under-ignorance` | 3495 |
-| `manage_record_policy` | `records` | no | no | yes | `atomicity` | 10712 |
+| `manage_record_policy` | `records` | no | no | yes | `atomicity` | 8336 |
 | `manage_instructions` | `guidance` | no | no | yes | `correctness-under-ignorance` | 1707 |
 | `manage_onboarding` | `guidance` | no | no | yes | `correctness-under-ignorance` | 3758 |
 | `render_record_version_diff` | `history` | no | no | yes | `bounded-context-or-calls` | 927 |
-| `manage_links` | `records` | yes | no | yes | `atomicity` | 1483 |
-| `manage_relationships` | `records` | no | no | yes | `atomicity` | 7872 |
+| `manage_links` | `records` | yes | no | yes | `atomicity` | 2131 |
+| `manage_relationships` | `records` | no | no | yes | `atomicity` | 6090 |
 | `manage_messages` | `messaging` | yes | no | yes | `atomicity` | 4963 |
 | `manage_interventions` | `messaging` | no | no | yes | `atomicity` | 1662 |
 | `instantiate_artifact` | `artifacts` | no | no | yes | `atomicity` | 1286 |
@@ -66,8 +66,8 @@ Exact compact UTF-8 `result.tools` descriptor arrays:
 | `render_artifact` | `artifacts` | no | no | yes | `bounded-context-or-calls` | 3888 |
 | `verify_artifact` | `artifacts` | no | no | yes | `correctness-under-ignorance` | 1817 |
 | `open_collection` | `artifacts` | no | no | yes | `bounded-context-or-calls` | 981 |
-| `invoke_artifact_interaction` | `artifacts` | no | no | yes | `atomicity` | 2116 |
-| `manage_facet_observations` | `facets` | no | no | yes | `correctness-under-ignorance` | 4385 |
+| `invoke_artifact_interaction` | `artifacts` | no | no | yes | `atomicity` | 2318 |
+| `manage_facet_observations` | `facets` | no | no | yes | `correctness-under-ignorance` | 3494 |
 | `resolve_facets` | `facets` | yes | no | yes | `correctness-under-ignorance` | 1283 |
 | `suggest_facet_values` | `facets` | no | no | yes | `correctness-under-ignorance` | 1158 |
 | `query_record` | `query` | yes | no | yes | `bounded-context-or-calls` | 8979 |
@@ -78,7 +78,7 @@ Exact compact UTF-8 `result.tools` descriptor arrays:
 | `resolve_many` | `query` | no | no | yes | `bounded-context-or-calls` | 1744 |
 | `manage_vocabularies` | `schema` | yes | no | yes | `correctness-under-ignorance` | 4035 |
 | `manage_schema_config` | `schema` | yes | no | yes | `correctness-under-ignorance` | 2095 |
-| `attach_text` | `attachments` | yes | no | yes | `atomicity` | 1819 |
+| `attach_text` | `attachments` | yes | no | yes | `atomicity` | 1855 |
 | `attach_from_url` | `attachments` | yes | no | yes | `correctness-under-ignorance` | 1892 |
 | `read_attachment` | `attachments` | yes | no | yes | `bounded-context-or-calls` | 1072 |
 | `manage_attachments` | `attachments` | yes | no | yes | `atomicity` | 1087 |
@@ -90,13 +90,13 @@ Exact compact UTF-8 `result.tools` descriptor arrays:
 | `create_attribution` | `citations` | no | no | yes | `atomicity` | 3915 |
 | `read_attributions` | `citations` | no | no | yes | `bounded-context-or-calls` | 1162 |
 | `manage_attributions` | `citations` | no | no | yes | `atomicity` | 1290 |
-| `manage_change_summaries` | `artifacts` | no | no | yes | `atomicity` | 8984 |
-| `query_change_summaries` | `artifacts` | no | no | yes | `correctness-under-ignorance` | 3236 |
-| `create_exploration` | `records` | no | no | yes | `atomicity` | 3244 |
+| `manage_change_summaries` | `artifacts` | no | no | yes | `atomicity` | 7499 |
+| `query_change_summaries` | `artifacts` | no | no | yes | `correctness-under-ignorance` | 2345 |
+| `create_exploration` | `records` | no | no | yes | `atomicity` | 3280 |
 | `get_event_context` | `coordination` | no | no | yes | `bounded-context-or-calls` | 1721 |
 | `set_intent` | `coordination` | yes | no | yes | `correctness-under-ignorance` | 943 |
 | `close_run` | `coordination` | no | no | yes | `atomicity` | 781 |
 | `preview_record_shape` | `schema` | no | no | yes | `correctness-under-ignorance` | 1755 |
-| `read_canvas` | `records` | no | no | yes | `bounded-context-or-calls` | 1698 |
+| `read_canvas` | `records` | no | no | yes | `bounded-context-or-calls` | 1860 |
 | `manage_canvas` | `records` | no | no | yes | `atomicity` | 1823 |
 | `export_snapshot` | `export` | yes | no | yes | `correctness-under-ignorance` | 1765 |

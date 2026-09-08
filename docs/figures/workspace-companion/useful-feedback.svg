@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 506" role="img" aria-labelledby="title desc">
+<title id="title">A check the agent can act on</title>
+<desc id="desc">The agent proposes Document/decision. Preview identifies Resolution as the governed type. The agent can revise to Resolution/decision before writing. The check is advisory and does not judge the decision itself.</desc>
+<defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8" fill="none" stroke="#e2231a"/></marker></defs>
+<rect width="600" height="506" fill="#f7f6f2"/>
+<g font-family="Inter, Arial, sans-serif">
+<text x="24" y="36" font-size="18" fill="#161616" font-weight="600">02 / FEEDBACK WITH A ROUTE TO REPAIR</text><rect x="24" y="58" width="552" height="88" fill="#fff" stroke="#b8b6b0"/><text x="44" y="90" font-size="20" fill="#555" font-weight="400">Agent proposes</text><text x="44" y="126" font-size="26" fill="#161616" font-weight="600">Document / decision</text><path d="M300 146 L300 179" fill="none" stroke="#e2231a" stroke-width="2" marker-end="url(#arrow)"/><rect x="24" y="195" width="552" height="109" fill="#fff" stroke="#b8b6b0"/><text x="44" y="229" font-size="20" fill="#555" font-weight="400">Preview reports</text><text x="44" y="266" font-size="23" fill="#161616" font-weight="600">decision is governed under Resolution</text><path d="M300 304 L300 337" fill="none" stroke="#e2231a" stroke-width="2" marker-end="url(#arrow)"/><rect x="24" y="353" width="552" height="88" fill="#fff" stroke="#b8b6b0"/><text x="44" y="385" font-size="20" fill="#555" font-weight="400">Agent can revise, then write</text><text x="44" y="422" font-size="26" fill="#161616" font-weight="600">Resolution / decision</text><text x="24" y="484" font-size="18" fill="#555" font-weight="400">ILLUSTRATION / Advisory check; no write yet.</text>
+</g>
+</svg>

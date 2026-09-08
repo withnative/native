@@ -24,13 +24,15 @@ when that selection or a named contract changes.
 ## Main flow
 
 ```text
-People, agents and optional views
-                |
-        MCP operation contracts
-                |
-     caller identity + authorization
-                |
-        governed domain operations
+People, agents and optional views <---------.
+                |                          |
+        MCP operation contracts            |
+                |                  results / conflicts /
+                |                       diagnostics
+                |                          |
+     caller identity + authorization ------|
+                |                          |
+        governed domain operations --------'
                 |
        append event + project
           (one transaction)
@@ -60,6 +62,21 @@ authoritative logs, or the appropriate meta tier and applies the operation's
 visibility rules. Replay folds the same ordered events through the same
 projectors into fresh projections; conformance checks that rebuilt and live
 state agree.
+
+The return path matters too. Handlers return structured results, conflicts or
+diagnostics through the MCP response layer. Shape preview supplies advisory
+facts before a write; an unknown kind can be stored with quarantine guidance;
+a guarded body update checks for a conflicting revision before committing.
+An agent can use that response to inspect current state and revise its next
+action. See the [feedback claim and proofs](docs/capability-map.md#workspace-feedback)
+for the selected implementation and exact limits. This path does not contain a
+general service that reviews the substance of a contribution.
+
+Authored views consume explicitly resolved inputs from this same governed
+state. Changing presentation does not copy the records or grant new action
+authority. MDX interactions return to host validation and authorization at
+invocation; HTML has read-only inputs and no workspace mutation surface.
+The [artifact runtime contract](docs/artifact-runtimes.md) owns those bounds.
 
 ## Layers and invariants
 

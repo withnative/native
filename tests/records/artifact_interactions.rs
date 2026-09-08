@@ -2847,3 +2847,116 @@ async fn a_replayed_spine_token_cannot_authorize_overwriting_a_competing_edit() 
         "blocked"
     );
 }
+
+/// Without the opt-in the commit is the fast receipt: no render, no plan.
+/// This is the pre-change envelope (the field omitted entirely) plus the
+/// explicit `false`, both of which must behave identically.
+#[tokio::test]
+async fn an_omitted_next_plan_flag_keeps_the_fast_receipt() {
+    let (db, registry, digest, _guard) = fixture().await;
+    let mut invocation = envelope("mark_triaged", &digest, "k-no-plan-1");
+    invocation["slots"] = json!({ "record": INSIDE });
+    invocation["observed"] = observed(&registry, &db, INSIDE, "triage").await;
+    assert!(
+        invocation.get("include_next_plan").is_none(),
+        "this case covers the omitted field"
+    );
+    let committed = call(&registry, &db, "invoke_artifact_interaction", invocation).await;
+    assert_eq!(committed["status"], "committed", "{committed:#}");
+    assert!(committed["refresh"].is_null(), "{committed:#}");
+
+    let mut explicit = envelope("set_triage", &digest, "k-no-plan-2");
+    explicit["slots"] = json!({ "record": INSIDE });
+    explicit["values"] = json!({ "choice": "blocked" });
+    explicit["observed"] = observed(&registry, &db, INSIDE, "triage").await;
+    explicit["include_next_plan"] = json!(false);
+    let second = call(&registry, &db, "invoke_artifact_interaction", explicit).await;
+    assert_eq!(second["status"], "committed", "{second:#}");
+    assert!(second["refresh"].is_null(), "{second:#}");
+}
+
+/// The one-exchange case: a committed facet write with the flag set carries
+/// the next authoritative plan, and that plan already reflects the write.
+#[tokio::test]
+async fn a_committed_facet_write_returns_the_next_plan_when_asked() {
+    let (db, registry, digest, _guard) = fixture().await;
+    let mut invocation = envelope("mark_triaged", &digest, "k-next-plan-1");
+    invocation["slots"] = json!({ "record": INSIDE });
+    invocation["observed"] = observed(&registry, &db, INSIDE, "triage").await;
+    invocation["include_next_plan"] = json!(true);
+    let committed = call(&registry, &db, "invoke_artifact_interaction", invocation).await;
+    assert_eq!(committed["status"], "committed", "{committed:#}");
+    let plan = &committed["refresh"]["plan"];
+    assert!(plan.is_object(), "{committed:#}");
+    assert!(
+        committed["refresh"].get("record").is_none(),
+        "a facet write refreshes only the plan: {committed:#}"
+    );
+    // The plan reflects the write: its observed token for the moved facet is
+    // the token this very commit left, not the precondition it consumed.
+    let token = committed["changes"][0]["version"]
+        .as_str()
+        .expect("a committed change carries the version it produced")
+        .to_owned();
+    assert_eq!(plan["observed"][INSIDE]["triage"], token.as_str());
+    // And it agrees with what a separate render_artifact would hand out, so
+    // the caller can skip that second round trip.
+    let rendered = call(&registry, &db, "render_artifact", json!({ "id": ARTIFACT })).await;
+    assert_eq!(rendered["status"], "rendered", "{rendered:#}");
+    assert_eq!(
+        rendered["plan"]["observed"][INSIDE]["triage"],
+        token.as_str()
+    );
+}
+
+/// A result that did not commit never carries a plan, flag or not: the write
+/// did not happen, so the plan the caller already holds is still current.
+#[tokio::test]
+async fn a_conflict_with_the_flag_set_carries_no_plan() {
+    let (db, registry, digest, _guard) = fixture().await;
+    let mut first = envelope("mark_triaged", &digest, "k-conflict-plan-1");
+    first["slots"] = json!({ "record": INSIDE });
+    first["observed"] = observed(&registry, &db, INSIDE, "triage").await;
+    let committed = call(&registry, &db, "invoke_artifact_interaction", first).await;
+    assert_eq!(committed["status"], "committed", "{committed:#}");
+
+    // Quote the now-stale precondition back with the flag set.
+    let mut stale = envelope("set_triage", &digest, "k-conflict-plan-2");
+    stale["slots"] = json!({ "record": INSIDE });
+    stale["values"] = json!({ "choice": "blocked" });
+    stale["observed"] = json!({ INSIDE: { "triage": "obs:0" } });
+    stale["include_next_plan"] = json!(true);
+    let conflict = call(&registry, &db, "invoke_artifact_interaction", stale).await;
+    assert_eq!(conflict["status"], "conflict", "{conflict:#}");
+    assert_eq!(conflict["error"]["code"], "facet_conflict");
+    assert!(conflict["refresh"].is_null(), "{conflict:#}");
+}
+
+/// A creation already refreshes the created record; with the flag set the
+/// plan joins it under the same `refresh`, rather than displacing it.
+#[tokio::test]
+async fn a_creation_with_the_flag_set_refreshes_both_record_and_plan() {
+    let (db, registry, digest, _guard) = create_fixture().await;
+    let committed = call(
+        &registry,
+        &db,
+        "invoke_artifact_interaction",
+        json!({
+            "version": INVOCATION_VERSION,
+            "artifact_id": ARTIFACT,
+            "entry_id": "create_task",
+            "source_digest": digest,
+            "values": { "title": "Ship both refreshes", "triage": "ready" },
+            "idempotency_key": "create:task:both",
+            "gesture": "submit",
+            "include_next_plan": true,
+        }),
+    )
+    .await;
+    assert_eq!(committed["status"], "committed", "{committed:#}");
+    assert!(
+        committed["refresh"]["record"]["id"].is_string(),
+        "{committed:#}"
+    );
+    assert!(committed["refresh"]["plan"].is_object(), "{committed:#}");
+}

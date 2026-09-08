@@ -21,14 +21,56 @@ experience.
 | Coordinate through the same state that contains the work. | People and other agents can inspect current purpose, active work and review points without reconstructing them from separate private chats. | Run intent, work claims, comments, suggestions, interventions and lineage operate over durable records. | A claim is an advisory coordination signal, not a lock, permission grant or automatic project manager, and claims do not expire automatically. This snapshot does not prove a general notification inbox. | [Coordination guide](../src/mcp/guides/coordination.md) and [agent interventions](agent-interventions.md) |
 | Leave work intelligible after the current session ends. | The next contributor can recover the artifact, consequential context, current boundary and next step rather than inheriting only a transcript or opaque summary. | Durable records, links, history, attribution and review state persist independently of the current model session. | The substrate cannot preserve reasoning or decisions that were never recorded, or guarantee that a contributor leaves good state behind. | [Record types](../src/mcp/guides/record-types.md), [placement](../src/mcp/guides/placement.md), and [working in a shared world](../src/mcp/guides/working-in-a-shared-world.md) |
 | Traverse a connected working world rather than a folder of isolated context files. | People, conversations, messages, work, decisions, documents and artifacts can remain connected instead of becoming separate application silos. | Ten spine types share placement, facets, links, governed relationships, history, query and policy. | Native does not automatically aggregate every inbox, address book or external application. The connected world has an explicit acquisition boundary. | [Record types](../src/mcp/guides/record-types.md), [message-first conversations](message-first-conversations.md), and the [capability map](capability-map.md) |
+| Construct an interface around a person's task while preserving shared records. | Colleagues can use different presentations of the same work, and reuse a useful view with another compatible dataset. | Authored artifacts bind named inputs to Collections; MDX offers bounded components and mediated interactions, while HTML consumes read-only inputs. | Input contracts, exact source bindings and caller authority must match. Arbitrary HTML cannot write to the workspace; whole-Workbench replacement remains directional. | [Worked view example](artifact-runtimes.md#one-collection-two-authored-views) and the artifact row of the [capability map](capability-map.md) |
+| Use actionable feedback to revise a proposed contribution. | Structural mismatches and stale edits can be addressed before they become more shared work to repair. | Shape preview explains governed type/kind matches without writing; quarantine warnings identify unknown kinds; guarded body updates detect conflicting revisions. | These checks do not judge a contribution's truth, semantic placement or quality. The agent must interpret the result and inspect current state before repairing it. | [Workspace feedback evidence](capability-map.md#workspace-feedback) |
 | Depend less on one session, model or provider retaining the memory. | A later authorized agent using a compatible client can recover the caller-visible recorded state exposed by the same node. | Native exposes a shared MCP surface over durable records; the selected node can export its complete SQLite database, and explicit interchange contracts define bounded movement. | This is continuity of recorded shared state, not hidden reasoning or unrecorded model memory. Cross-backend movement remains incomplete, and a portable database does not prove portable hosted composition. | [Tool surface](tool-surface.md), [storage portability](../protocol/storage-portability/v1/README.md), and the final row of the [capability map](capability-map.md) |
+
+## A contribution that can improve through feedback
+
+Suppose a launch team decides to postpone after a customer trial. You are
+recording that decision and preview `Document/decision`.
+The current shape preview identifies `decision` under `Resolution` and explains
+the consequence of keeping an unknown kind. Inspect the governed meaning,
+revise the candidate if it fits, then read the committed record. If an existing
+body changed after you read it, a guarded update can return a conflict; reread
+and reconcile the change before retrying. These are concrete evaluation cases,
+backed by the [feedback evidence](capability-map.md#workspace-feedback).
+
+The broader direction is to bring accumulated context to bear on the substance
+of new work: missing evidence, an overlooked dependency or a recommendation
+that conflicts with earlier findings. A useful challenge should give the agent
+a basis to repair the work, explain an exception, contest the premise or seek
+human judgement. The correction or disagreement can then become deliberately
+recorded context for a later session. General substantive review and automatic
+conditional obligations remain **Directional**; the structural checks do not
+establish measured improvement in agent productivity or reasoning quality.
+
+## Recover a correction in a later session
+
+Continue the same launch example in a new session. Ask the agent to find the
+release decision and determine whether it still governs the work. The
+postponement should be recorded as a decision that supersedes it, with links
+to the trial evidence and follow-up task. The agent can inspect incoming
+supersession links, read the newer decision and explain the change before
+continuing. [Relationship guidance](../src/mcp/guides/links.md),
+[temporal reads](temporal-reads.md) and the
+[capability map](capability-map.md#claims-and-evidence) identify the mechanisms
+and their evidence.
+
+Evaluate the chain the agent actually recovered: the old decision, its
+replacement, the supporting evidence and the next action. A fluent summary
+alone does not establish that it found the correction. If the rationale was
+never recorded or the agent did not retrieve it, the workspace cannot supply
+that missing understanding. Deliberately recorded corrections support
+continuity; automatic discovery of every changed premise and improved future
+substantive reviews remain **Directional**.
 
 ## When this is likely to help
 
 Native is a stronger fit when work spans several sessions or contributors,
 decisions and assumptions change over time, agents need to coordinate or hand
-off work, or the team needs inspectable history and evidence around what the
-agents did. The benefit grows when useful context must remain available across
+off work, people need different interfaces over shared records, or the team
+needs inspectable history and evidence around what the agents did. The benefit grows when useful context must remain available across
 different clients or models.
 
 It may add more structure than value for a one-off task with stable context and
@@ -55,7 +97,13 @@ tree:
 4. What still depends on deliberate recording, maintenance or judgement?
 5. Which capabilities are current, partial, experimental, directional or
    held?
-6. What cannot be determined from this repository?
+6. Can two authored views preserve the same underlying records and history,
+   and does rebinding a view require a compatible input contract?
+7. Can the agent use a meaningful diagnostic to revise a contribution, then
+   inspect the result? What requires its judgement rather than a system check?
+8. Can a later session recover a superseding decision and its evidence,
+   explain the change, and distinguish recorded context from an inference?
+9. What cannot be determined from this repository?
 
 If an answer cannot be supported by a selected path or a command runnable from
 this root, treat it as unproven for this snapshot.

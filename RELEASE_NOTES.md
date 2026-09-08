@@ -15,10 +15,11 @@ to a qualified runnable node and then to meaningful self-hosting with a usable
 public Workbench, team operation, recovery, and private coordination without
 a mandatory Native-hosted dependency.
 
-Native is developed in a private upstream. External contributions are not
-accepted, and this repository's Issues, Discussions, and pull requests are not
-supported feedback or support routes. For current product information and ways
-to contact the Native team, visit [withnative.ai](https://www.withnative.ai/).
+Native is developed in a private upstream. Contributions to this repository are by
+invitation following a conversation rather than by unsolicited pull request, and
+its Issues, Discussions, and pull requests are not feedback or support routes.
+For current product information and ways to contact the Native team, visit
+[withnative.ai](https://www.withnative.ai/) — we would like to hear from you.
 
 The maturity table in [`README.md`](README.md) and evidence routes in
 [`docs/capability-map.md`](docs/capability-map.md) are the authorities for what
@@ -27,10 +28,14 @@ is included, partial, experimental, held, or intended in this snapshot.
 ## Verification and provenance
 
 Each snapshot commit is the public verification artefact for its exact
-source-only inspection tree. Its message records the exact private-upstream
-source commit and tree, the SHA-256 of the public target-boundary manifest, the
-SHA-256 of the complete selected-source manifest, the publication mode, and the named
-public-candidate verification profile. These appear as the
+source-only inspection tree. New routine snapshots use a reviewed editorial
+subject describing the material change that became newly inspectable, followed
+by a body identifying the commit as a Native public source-inspection snapshot.
+Existing fixed-subject commits remain part of the valid history. Every message
+records the exact private-upstream source commit and tree, the SHA-256 of the
+public target-boundary manifest, the SHA-256 of the complete selected-source
+manifest, the publication mode, and the named public-candidate verification
+profile. These appear as the
 `Source-Commit`, `Source-Tree`, `Boundary-SHA256`,
 `Selected-Source-SHA256`, `Publication-Mode`, `Verification`, and
 `Image-Provenance` trailers. The first snapshot commit has no parent. Later

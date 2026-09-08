@@ -9,11 +9,11 @@ without a top-level action discriminator.
 
 ## Current operation census
 
-- **74 registered tools / 185 operations**.
-- **13 ordinary, 70 high-risk, and 102 specialized operations**.
-- **74 read-only and 111 mutating operations**.
-- **180 operations carry a non-disclosure obligation**.
-- All **111 mutating operations** carry an explicit no-write-on-deny obligation
+- **76 registered tools / 192 operations**.
+- **13 ordinary, 77 high-risk, and 102 specialized operations**.
+- **80 read-only and 112 mutating operations**.
+- **187 operations carry a non-disclosure obligation**.
+- All **112 mutating operations** carry an explicit no-write-on-deny obligation
   and named negative evidence.
 - **5 read operations** have justified `negative_evidence: not_applicable`:
   `ping.$tool`, `engine_info.$tool`, `quickstart.$tool`, `read_guide.$tool`, and

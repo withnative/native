@@ -1389,6 +1389,21 @@ pub(super) async fn enriched_or_error(
     tool: &str,
     id: &str,
 ) -> Result<Value> {
+    match enriched_or_none(db, caller, id).await? {
+        Some(value) => Ok(value),
+        None => Err(Error::engine(format!(
+            "{tool}: record {id} not readable after write"
+        ))),
+    }
+}
+
+/// The uncommitted half of [`enriched_or_error`]: the same live lens read and
+/// visibility filter, returning `Ok(None)` where the wrapper reports the
+/// vanished-record diagnostic. Idempotent replay uses this directly so a
+/// denied replay maps to the opaque `does not exist` denial rather than an
+/// existence-revealing string; every other caller keeps the wrapper, for
+/// which "not readable after write" is the correct diagnosis.
+pub(super) async fn enriched_or_none(db: &Db, caller: &Caller, id: &str) -> Result<Option<Value>> {
     let lens = ReadLens::live(db);
     let record = if super::is_legacy_local(caller) {
         read::get_record_with_lens(&lens, id, read::EnrichOptions::default()).await?
@@ -1404,11 +1419,9 @@ pub(super) async fn enriched_or_error(
     match record {
         Some(mut record) => {
             filter_enriched_record(db, caller, &mut record, read::EnrichOptions::default()).await?;
-            Ok(serde_json::to_value(record)?)
+            Ok(Some(serde_json::to_value(record)?))
         }
-        None => Err(Error::engine(format!(
-            "{tool}: record {id} not readable after write"
-        ))),
+        None => Ok(None),
     }
 }
 
@@ -1449,6 +1462,15 @@ struct CreateRecordArgs {
     /// mention semantics.
     mentions: Option<Vec<crate::awareness::MentionInput>>,
     target: Option<crate::citations::CitationTargetInput>,
+    /// Optional caller-supplied idempotency key for the ordinary create path.
+    /// Absent (or blank) means exactly today's behavior. When present, the
+    /// create joins the provenance command-attestation mechanism that
+    /// `manage_relationships` uses: same key plus same normalized request
+    /// replays the original receipt without appending; same key plus a
+    /// materially different request is a conflict error. The artifact and
+    /// delivered-Message routes keep their own narrower replay paths and never
+    /// set this field.
+    idempotency_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1706,7 +1728,34 @@ async fn create_record_inner(
     artifact_plan: Option<ArtifactCreatePlan>,
 ) -> Result<Value> {
     const TOOL: &str = "create_record";
+    // The provenance digests run over the raw tool arguments, not the parsed
+    // shape: a server-minted `id` must never enter the conflict detector, or
+    // every retry of a key without a caller-supplied id would conflict with
+    // the call it repeats. Run-context keys are already stripped by the
+    // request layer before the handler sees them.
+    let provenance_arguments = arguments.clone();
     let mut args: CreateRecordArgs = parse_args(TOOL, arguments)?;
+    // Only the digest is stored, so an unbounded key is a mild DoS surface:
+    // the same 1..=200 bound `manage_relationships` enforces. Blank stays
+    // keyless rather than erroring — a create with no key behaves as today.
+    if args
+        .idempotency_key
+        .as_deref()
+        .is_some_and(|key| key.len() > 200)
+    {
+        return Err(Error::engine(
+            "create_record: idempotency_key must be 1..200 characters",
+        ));
+    }
+    // The delivered-Message and artifact-interaction routes keep their own
+    // narrower replay paths (SendMessagePlan / ArtifactCreatePlan) and never
+    // set the ordinary key; the provenance mechanism stays out of their way.
+    let idempotent_create = send_plan.is_none()
+        && artifact_plan.is_none()
+        && args
+            .idempotency_key
+            .as_deref()
+            .is_some_and(|key| !key.trim().is_empty());
     require_nonblank_reason(TOOL, &args.reason)?;
     let lifecycle = args.lifecycle.take();
     if args.kind.is_empty() {
@@ -2474,6 +2523,73 @@ async fn create_record_inner(
             }),
         );
     }
+    // Idempotent replay, after every authorization and validation check and
+    // inside the same BEGIN IMMEDIATE transaction as the mutation — the same
+    // ordering contract `manage_relationships` keeps so the tool cannot become
+    // a command-existence oracle. A reused key with different normalized input
+    // never reaches here: the lookup itself errors.
+    //
+    // A stale replay must never return a live read: a live read would carry
+    // the CURRENT body_digest, and a guarded write issued against that digest
+    // could silently clobber an edit the retrying caller never saw. The slow
+    // path below rebuilds from the attested command's own pinned event
+    // horizons instead, so that write fails closed and sends the caller back
+    // to re-read. The fast path is only taken when the pinned state provably
+    // still holds (see `attested_state_unchanged_in`).
+    if idempotent_create {
+        if let Some(attestation_id) = crate::provenance::lookup_authorized_command_attestation_in(
+            &mut tx,
+            caller.credential(),
+            "create_record",
+            &provenance_arguments,
+            caller.intent(),
+        )
+        .await?
+        {
+            let attested = attested_create_horizons_in(&mut tx, &attestation_id).await?;
+            // Non-disclosure for the output: the receipt discloses the created
+            // record, so the replaying caller must still view it. A caller
+            // that lost access gets the opaque denial, not the receipt.
+            require_record_in(
+                &mut tx,
+                &caller,
+                TOOL,
+                &attested.record_id,
+                Capability::View,
+            )
+            .await?;
+            let unchanged = attested_state_unchanged_in(&mut tx, &attested).await?;
+            // The rebuild below is a deterministic function of this snapshot
+            // even though it runs after the rollback: the horizons pin
+            // immutable event rows, so holding BEGIN IMMEDIATE through a full
+            // prefix replay would serialize every writer for its duration for
+            // no additional consistency.
+            tx.rollback().await?;
+            crate::provenance::note_replayed_action_attestation(attestation_id);
+            if unchanged {
+                // A missing record here maps to the same opaque denial as the
+                // slow path, never to the existence-revealing "not readable
+                // after write" string: the caller passed the in-transaction
+                // View check, so from its side the record may as well never
+                // have existed. Unreachable through any coherent product flow
+                // — every View-revoking transition for the creator (tombstone,
+                // ownership transfer) appends a content event and closes the
+                // gate above — but identical by construction rather than by
+                // audit if one ever appears.
+                let existing = match enriched_or_none(&db, &caller, &attested.record_id).await? {
+                    Some(existing) => existing,
+                    None => {
+                        return Err(Error::engine(format!(
+                            "{TOOL}: record {} does not exist",
+                            attested.record_id
+                        )));
+                    }
+                };
+                return finish_create_receipt(existing, html_body_write);
+            }
+            return read_attested_create_receipt(&db, &caller, &attested, html_body_write).await;
+        }
+    }
     let source_event = append_in(
         &db,
         &mut tx,
@@ -2511,11 +2627,19 @@ async fn create_record_inner(
         )
         .await?;
     }
-    let relationship_draft = if relationship_link_indexes.is_empty() {
-        None
-    } else {
+    // One action identity per command. When the ordinary key is present the
+    // create's own attestation covers every content and relationship output —
+    // the relationship admission binds to this same identity — so a second
+    // attestation must never be reserved beside it: the local-authority unique
+    // index would reject the duplicate (principal, operation, digest) row.
+    let action_draft = if idempotent_create || !relationship_link_indexes.is_empty() {
         Some(crate::provenance::reserve_action_attestation()?)
+    } else {
+        None
     };
+    let relationship_draft: Option<&crate::provenance::ActionAttestationDraft> = action_draft
+        .as_ref()
+        .filter(|_| !relationship_link_indexes.is_empty());
     let mut specs = Vec::new();
     for (index, link) in args.links.iter().flatten().enumerate() {
         if relationship_link_indexes.contains(&index) {
@@ -2727,7 +2851,7 @@ async fn create_record_inner(
     }
     let after = required_violations_in(&mut tx, &schema_rows, &[&id]).await?;
     assert_required_not_worsened(TOOL, &before, &after)?;
-    if let Some(draft) = relationship_draft {
+    if let Some(draft) = action_draft {
         crate::provenance::issue_reserved_pending_action_in(&mut tx, draft).await?;
     }
     db.commit_content(tx).await?;
@@ -2759,9 +2883,522 @@ async fn create_record_inner(
     // for its next guarded write. Carrying it here also keeps the three
     // substrates uniform — Postgres and Turso mint it from their shared read
     // shape — so the corpus can pin it on creation instead of looking away.
+    finish_create_receipt(result, html_body_write)
+}
+
+/// The attested command's pinned position in both event logs: the highest
+/// content and relationship sequence numbers its action attestation covers.
+/// Both logs are append-only, so rows at or below a committed horizon are
+/// immutable — replaying exactly those prefixes reproduces the receipt the
+/// first call returned, regardless of later writes.
+struct AttestedCreate {
+    attestation_id: String,
+    record_id: String,
+    content_horizon: i64,
+    relationship_horizon: Option<i64>,
+}
+
+/// Decide inside the replay transaction whether the live projection still
+/// coincides with the attested state, in which case the receipt can be read
+/// live at zero reconstruction cost. All three reads are indexed point
+/// lookups (`seq` is the rowid alias on both logs; the endpoints and
+/// validity tables carry covering indexes), never scans.
+///
+/// The gate compares against the SLOW path's output, not the original
+/// receipt: schema, vocabulary, policy and bindings stay live in both paths
+/// by the documented `as_of` tier split, so those tiers cannot separate
+/// them. What can separate them is pinned state going stale, which is
+/// exactly: a newer event on either log, a relationship endpoint resolving
+/// onto this record after a keyless create (compat link rows need resolved
+/// endpoints, so their absence proves no such row exists), or a validity
+/// change against the attested command — an invalidation refreshes that
+/// command's admissions with no new log row, and the slow path deliberately
+/// excludes post-issuance validity rows to preserve the attested receipt.
+async fn attested_state_unchanged_in(
+    tx: &mut Transaction<'static, Sqlite>,
+    attested: &AttestedCreate,
+) -> Result<bool> {
+    let content_head: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(seq), 0) FROM content_events")
+        .fetch_one(&mut **tx)
+        .await?;
+    if content_head > attested.content_horizon {
+        return Ok(false);
+    }
+    match attested.relationship_horizon {
+        Some(horizon) => {
+            let head: i64 =
+                sqlx::query_scalar("SELECT COALESCE(MAX(seq), 0) FROM relationship_events")
+                    .fetch_one(&mut **tx)
+                    .await?;
+            if head > horizon {
+                return Ok(false);
+            }
+        }
+        None => {
+            let linked: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM relationship_endpoints WHERE record_id=?)",
+            )
+            .bind(&attested.record_id)
+            .fetch_one(&mut **tx)
+            .await?;
+            if linked {
+                return Ok(false);
+            }
+        }
+    }
+    let invalidated: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM provenance_attestation_validity_events
+                        WHERE attestation_id=?)",
+    )
+    .bind(&attested.attestation_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(!invalidated)
+}
+
+/// Shared receipt assembly for every create response shape: the previous-seq
+/// echo (always null on creation), the governed-HTML receipt when the body
+/// validated as HTML, and the whole-body CAS token. Identical on the first
+/// call, the fast replay and the pinned reconstruction by construction.
+fn finish_create_receipt(result: Value, html_body_write: Option<Value>) -> Result<Value> {
     let mut created = attach_html_body_write(echo_previous_seq(result, None)?, html_body_write)?;
     annotate_body_digest(&mut created);
     Ok(created)
+}
+
+/// Bound on concurrent pinned reconstructions. Each rebuild holds a full
+/// prefix fold in a scratch database, so unbounded concurrency is N× history
+/// in memory; the overwhelmingly common replay takes the horizon fast path
+/// and never touches this. Acquired after the write transaction has rolled
+/// back, so waiting here serializes only slow rebuilds, never writers.
+static ATTESTED_REBUILD_PERMITS: std::sync::OnceLock<tokio::sync::Semaphore> =
+    std::sync::OnceLock::new();
+
+fn attested_rebuild_permits() -> &'static tokio::sync::Semaphore {
+    ATTESTED_REBUILD_PERMITS.get_or_init(|| tokio::sync::Semaphore::new(2))
+}
+
+/// Resolve which record an ordinary keyed `create_record` first created and
+/// the pinned horizons its attestation covers. Mirrors `reconstruct_retry_in`
+/// in the relationships precedent.
+async fn attested_create_horizons_in(
+    tx: &mut Transaction<'static, Sqlite>,
+    attestation_id: &str,
+) -> Result<AttestedCreate> {
+    let created: Option<String> = sqlx::query_scalar(
+        "SELECT e.record_id FROM provenance_action_outputs o
+           JOIN content_events e ON e.id=o.output_event_id
+          WHERE o.action_attestation_id=? AND o.output_domain='content'
+            AND e.type='record.created' ORDER BY o.ordinal LIMIT 1",
+    )
+    .bind(attestation_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let fallback: Option<String> = if created.is_none() {
+        sqlx::query_scalar(
+            "SELECT e.record_id FROM provenance_action_outputs o
+               JOIN content_events e ON e.id=o.output_event_id
+              WHERE o.action_attestation_id=? AND o.output_domain='content'
+              ORDER BY o.ordinal LIMIT 1",
+        )
+        .bind(attestation_id)
+        .fetch_optional(&mut **tx)
+        .await?
+    } else {
+        None
+    };
+    let record_id = created
+        .or(fallback)
+        .ok_or_else(|| Error::engine("create_record: idempotent receipt is incomplete"))?;
+    let content_horizon: Option<i64> = sqlx::query_scalar(
+        "SELECT MAX(e.seq) FROM provenance_action_outputs o
+           JOIN content_events e ON e.id=o.output_event_id
+          WHERE o.action_attestation_id=? AND o.output_domain='content'",
+    )
+    .bind(attestation_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .flatten();
+    let content_horizon = content_horizon
+        .ok_or_else(|| Error::engine("create_record: idempotent receipt is incomplete"))?;
+    let relationship_horizon: Option<i64> = sqlx::query_scalar(
+        "SELECT MAX(e.seq) FROM provenance_action_outputs o
+           JOIN relationship_events e ON e.id=o.output_event_id
+          WHERE o.action_attestation_id=? AND o.output_domain='relationship'",
+    )
+    .bind(attestation_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .flatten();
+    Ok(AttestedCreate {
+        attestation_id: attestation_id.to_string(),
+        record_id,
+        content_horizon,
+        relationship_horizon,
+    })
+}
+
+/// Rebuild the exact receipt the attested create returned, from its pinned
+/// event prefixes replayed into a scratch projection — the same machinery
+/// `get_record`'s `as_of` path uses, minus the temporal echo the create
+/// receipt never carried. Content state is pinned; schema, vocabulary and
+/// authorization stay live, which is the documented `as_of` semantic. The
+/// single-read assembly (lens read, auth-split filter, previous_seq echo,
+/// HTML receipt, body digest) mirrors the creation path exactly.
+///
+/// A rebuilt record that is no longer visible maps to the opaque denial,
+/// never to a "not readable after write" diagnostic: from the caller's side
+/// that outcome is indistinguishable from the record never having existed.
+async fn read_attested_create_receipt(
+    db: &Db,
+    caller: &Caller,
+    attested: &AttestedCreate,
+    html_body_write: Option<Value>,
+) -> Result<Value> {
+    const TOOL: &str = "create_record";
+    // Slow path: only reached when the horizon fast path proved stale, i.e.
+    // something was genuinely written afterwards. Concurrent rebuilds share a
+    // small permit pool (see `ATTESTED_REBUILD_PERMITS`) so a replay storm
+    // cannot hold N histories in memory at once.
+    let _permit = attested_rebuild_permits()
+        .acquire()
+        .await
+        .map_err(|_| Error::engine("attested rebuild permits exhausted"))?;
+    let scratch = open_database(":memory:").await?;
+    let result = async {
+        apply_schema(&scratch).await?;
+        // A projector failure on an old prefix propagates as an engine
+        // error rather than falling back to a live read: a live read would
+        // return the CURRENT digest as if it were attested, which is exactly
+        // the lost-update vector this reconstruction exists to close. Full
+        // history replays through the current projector run in conformance,
+        // so skew that breaks old prefixes fails there first.
+        crate::query::lens::replay_projection(db, &scratch, attested.content_horizon).await?;
+        // The covered attestation's rows back both the admissions refresh
+        // below and the contribution byline's event attestation.
+        let mut seed = scratch.write_pool().begin().await?;
+        seed_attested_provenance_rows(db, &mut seed, &attested.attestation_id).await?;
+        seed.commit().await?;
+        if let Some(horizon) = attested.relationship_horizon {
+            replay_attested_relationship_prefix(db, &scratch, &attested.attestation_id, horizon)
+                .await?;
+        }
+        let resolved = crate::query::lens::resolve_as_of(
+            db,
+            crate::query::lens::AsOfSelector::ContentSeq(crate::query::lens::ContentSeqSelector {
+                content_seq: attested.content_horizon,
+            }),
+        )
+        .await?;
+        let lens = crate::query::lens::ReadLens::historical(&scratch, db, &resolved);
+        let record = if super::is_legacy_local(caller) {
+            read::get_record_with_lens(&lens, &attested.record_id, read::EnrichOptions::default())
+                .await?
+        } else {
+            read::get_record_with_lens_as(
+                &lens,
+                &attested.record_id,
+                read::EnrichOptions::default(),
+                super::principal(caller),
+            )
+            .await?
+        };
+        let mut record = match record {
+            Some(record) => record,
+            None => {
+                return Err(Error::engine(format!(
+                    "{TOOL}: record {} does not exist",
+                    attested.record_id
+                )));
+            }
+        };
+        filter_enriched_record_with_auth(
+            &scratch,
+            db,
+            caller,
+            &mut record,
+            read::EnrichOptions::default(),
+        )
+        .await?;
+        // The shared filter hydrates the contribution byline live, but the
+        // attested receipt names the event that produced the body as of the
+        // pinned horizon. Recompose the byline from pinned raw facts with
+        // live disclosure, mirroring `contribution_for_record_in` exactly.
+        record.contribution =
+            attested_contribution_for_record(&scratch, db, caller, &record.record.id).await?;
+        finish_create_receipt(serde_json::to_value(record)?, html_body_write)
+    }
+    .await;
+    scratch.close().await;
+    result
+}
+
+/// Recompose one record's contribution byline for an attested receipt: the
+/// raw facts (which event produced the body, which created the record, and
+/// their attestations) come from the pinned scratch projection, while viewer
+/// disclosure, alternative-set and selection context stay live — the same
+/// tier split the historical lens applies everywhere else. This mirrors
+/// `contribution_for_record_in` piece for piece; only the pools differ.
+async fn attested_contribution_for_record(
+    record_db: &Db,
+    auth_db: &Db,
+    caller: &Caller,
+    record_id: &str,
+) -> Result<Option<crate::contribution::ContributionProvenance>> {
+    let mut record_tx = record_db.write_pool().begin().await?;
+    let raw = crate::contribution::raw_contribution_in(&mut record_tx, record_id).await?;
+    record_tx.rollback().await?;
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let mut auth_tx = auth_db.write_pool().begin().await?;
+    let result = async {
+        let disclosure =
+            crate::contribution::viewer_disclosure_in(&mut auth_tx, caller, &raw).await?;
+        let alternative_set =
+            crate::contribution::alternative_set_context_in(&mut auth_tx, caller, record_id)
+                .await?;
+        let selection =
+            crate::contribution::selection_context_in(&mut auth_tx, caller, record_id).await?;
+        let context = crate::contribution::ContributionContext {
+            mode: alternative_set.is_some().then(|| "option".to_string()),
+            alternative_set,
+            selection,
+        };
+        Ok(Some(crate::contribution::project(
+            &raw,
+            &disclosure,
+            context,
+        )))
+    }
+    .await;
+    auth_tx.rollback().await?;
+    result
+}
+/// Replay the relationship log prefix at or below `horizon` into the scratch
+/// projection using the same fold live appends use, so relationship-owned
+/// link rows in the rebuilt receipt match the original. Federated prefix
+/// events resolve through receiver bindings, which need the database identity
+/// and the referenced native-record bindings present; both are seeded from
+/// live state, matching the `as_of` tier split (content pinned, the rest
+/// live). Causality keeps the seeding sound: anything the prefix resolves
+/// committed before the prefix did. The one edge this does not close is a
+/// native-record binding whose canonical mapping changed after the horizon:
+/// receiver resolution would then follow the live mapping rather than the
+/// attested one. That tier-split limitation is shared with every historical
+/// read and only affects federated prefixes, which keyed local creates do
+/// not produce.
+///
+/// The covered attestation's immutable provenance rows are seeded by the
+/// caller before this runs (see `read_attested_create_receipt`): the
+/// admissions refresh below verifies against them exactly as issuance did.
+/// Validity rows are deliberately excluded: none existed when the attestation
+/// was issued, so a later invalidation must not rewrite the attested receipt.
+async fn replay_attested_relationship_prefix(
+    db: &Db,
+    scratch: &Db,
+    attestation_id: &str,
+    horizon: i64,
+) -> Result<()> {
+    let mut conn = db.write_pool().acquire().await?;
+    let events = crate::relationship::read_relationship_event_prefix(&mut conn, horizon).await?;
+    drop(conn);
+    if events.is_empty() {
+        return Ok(());
+    }
+    let covered: Vec<String> = sqlx::query_scalar(
+        "SELECT output_event_id FROM provenance_action_outputs
+          WHERE action_attestation_id=? AND output_domain='relationship'
+          ORDER BY ordinal",
+    )
+    .bind(attestation_id)
+    .fetch_all(db.write_pool())
+    .await?;
+    let local_origin: String =
+        sqlx::query_scalar("SELECT origin_db_id FROM database_identity WHERE singleton=1")
+            .fetch_one(db.write_pool())
+            .await?;
+    let federated = events
+        .iter()
+        .filter(|event| event.issuer_origin_db_id != local_origin)
+        .map(|event| (event.issuer_origin_db_id.clone(), event.event_id.clone()))
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut tx = scratch.write_pool().begin().await?;
+    let identity =
+        sqlx::query("SELECT origin_db_id, created_at FROM database_identity WHERE singleton=1")
+            .fetch_one(db.write_pool())
+            .await?;
+    let origin: String = identity.try_get("origin_db_id")?;
+    let identity_created_at: String = identity.try_get("created_at")?;
+    sqlx::query(
+        "INSERT INTO database_identity(singleton, origin_db_id, created_at)
+         VALUES(1, ?, ?)",
+    )
+    .bind(&origin)
+    .bind(&identity_created_at)
+    .execute(&mut *tx)
+    .await?;
+    if !federated.is_empty() {
+        let bindings = sqlx::query(
+            "SELECT record_id, system, identifier, is_canonical, url, etag, last_seen_at
+               FROM bindings WHERE system='native-record'",
+        )
+        .fetch_all(db.write_pool())
+        .await?;
+        for binding in bindings {
+            let record_id: String = binding.try_get("record_id")?;
+            let mirrored: bool =
+                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM records WHERE id=?)")
+                    .bind(&record_id)
+                    .fetch_one(&mut *tx)
+                    .await?;
+            if !mirrored {
+                continue;
+            }
+            sqlx::query(
+                "INSERT INTO bindings(record_id, system, identifier, is_canonical, url, etag, last_seen_at)
+                 VALUES(?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&record_id)
+            .bind(binding.try_get::<String, _>("system")?)
+            .bind(binding.try_get::<String, _>("identifier")?)
+            .bind(binding.try_get::<i64, _>("is_canonical")?)
+            .bind(binding.try_get::<Option<String>, _>("url")?)
+            .bind(binding.try_get::<Option<String>, _>("etag")?)
+            .bind(binding.try_get::<Option<String>, _>("last_seen_at")?)
+            .execute(&mut *tx)
+            .await?;
+        }
+    }
+    crate::relationship::replay_relationship_events(&mut tx, &events, &federated).await?;
+    let outputs = covered
+        .iter()
+        .map(crate::provenance::ActionOutput::relationship)
+        .collect::<Vec<_>>();
+    crate::relationship::project_receiver_local_admissions_for_outputs_in(&mut tx, &outputs)
+        .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Copy the covered attestation's immutable provenance rows into the scratch
+/// projection so the admissions refresh verifies exactly as it did at
+/// issuance. Interaction receipts are immutable once issued, so the live row
+/// is the creation-time row.
+async fn seed_attested_provenance_rows(
+    db: &Db,
+    tx: &mut Transaction<'static, Sqlite>,
+    attestation_id: &str,
+) -> Result<()> {
+    let attestation = sqlx::query(
+        "SELECT id, schema_version, principal, executor_kind, channel, executor_ref,
+                delegation_ref, interaction_receipt_id, operation, action_commitment,
+                action_digest, output_event_set_digest, issuer, issuer_origin_database_id,
+                issued_at, command_identity_digest, intent_digest
+           FROM provenance_action_attestations WHERE id=?",
+    )
+    .bind(attestation_id)
+    .fetch_one(db.write_pool())
+    .await?;
+    if let Some(receipt_id) = attestation.try_get::<Option<String>, _>("interaction_receipt_id")? {
+        let receipt = sqlx::query(
+            "SELECT id, schema_version, principal, scope_digest, nonce, verifier,
+                    verified_at, evidence_digest, sealed_evidence_ref, retention_class
+               FROM provenance_interaction_receipts WHERE id=?",
+        )
+        .bind(&receipt_id)
+        .fetch_one(db.write_pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO provenance_interaction_receipts
+                (id, schema_version, principal, scope_digest, nonce, verifier,
+                 verified_at, evidence_digest, sealed_evidence_ref, retention_class)
+             VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(receipt.try_get::<String, _>("id")?)
+        .bind(receipt.try_get::<i64, _>("schema_version")?)
+        .bind(receipt.try_get::<String, _>("principal")?)
+        .bind(receipt.try_get::<String, _>("scope_digest")?)
+        .bind(receipt.try_get::<String, _>("nonce")?)
+        .bind(receipt.try_get::<String, _>("verifier")?)
+        .bind(receipt.try_get::<String, _>("verified_at")?)
+        .bind(receipt.try_get::<String, _>("evidence_digest")?)
+        .bind(receipt.try_get::<Option<String>, _>("sealed_evidence_ref")?)
+        .bind(receipt.try_get::<Option<String>, _>("retention_class")?)
+        .execute(&mut **tx)
+        .await?;
+    }
+    sqlx::query(
+        "INSERT INTO provenance_action_attestations
+            (id, schema_version, principal, executor_kind, channel, executor_ref,
+             delegation_ref, interaction_receipt_id, operation, action_commitment,
+             action_digest, output_event_set_digest, issuer, issuer_origin_database_id,
+             issued_at, command_identity_digest, intent_digest)
+         VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(attestation.try_get::<String, _>("id")?)
+    .bind(attestation.try_get::<i64, _>("schema_version")?)
+    .bind(attestation.try_get::<String, _>("principal")?)
+    .bind(attestation.try_get::<String, _>("executor_kind")?)
+    .bind(attestation.try_get::<String, _>("channel")?)
+    .bind(attestation.try_get::<Option<String>, _>("executor_ref")?)
+    .bind(attestation.try_get::<Option<String>, _>("delegation_ref")?)
+    .bind(attestation.try_get::<Option<String>, _>("interaction_receipt_id")?)
+    .bind(attestation.try_get::<String, _>("operation")?)
+    .bind(attestation.try_get::<String, _>("action_commitment")?)
+    .bind(attestation.try_get::<String, _>("action_digest")?)
+    .bind(attestation.try_get::<String, _>("output_event_set_digest")?)
+    .bind(attestation.try_get::<String, _>("issuer")?)
+    .bind(attestation.try_get::<String, _>("issuer_origin_database_id")?)
+    .bind(attestation.try_get::<String, _>("issued_at")?)
+    .bind(attestation.try_get::<Option<String>, _>("command_identity_digest")?)
+    .bind(attestation.try_get::<Option<String>, _>("intent_digest")?)
+    .execute(&mut **tx)
+    .await?;
+    let authority = sqlx::query(
+        "SELECT attestation_id, issuer_origin_database_id, principal, operation,
+                command_identity_digest, anchored_at
+           FROM provenance_local_attestation_authority WHERE attestation_id=?",
+    )
+    .bind(attestation_id)
+    .fetch_one(db.write_pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO provenance_local_attestation_authority
+            (attestation_id, issuer_origin_database_id, principal, operation,
+             command_identity_digest, anchored_at)
+         VALUES(?, ?, ?, ?, ?, ?)",
+    )
+    .bind(authority.try_get::<String, _>("attestation_id")?)
+    .bind(authority.try_get::<String, _>("issuer_origin_database_id")?)
+    .bind(authority.try_get::<String, _>("principal")?)
+    .bind(authority.try_get::<String, _>("operation")?)
+    .bind(authority.try_get::<Option<String>, _>("command_identity_digest")?)
+    .bind(authority.try_get::<String, _>("anchored_at")?)
+    .execute(&mut **tx)
+    .await?;
+    let outputs = sqlx::query(
+        "SELECT ordinal, output_domain, output_event_id
+           FROM provenance_action_outputs
+          WHERE action_attestation_id=? ORDER BY ordinal",
+    )
+    .bind(attestation_id)
+    .fetch_all(db.write_pool())
+    .await?;
+    for output in outputs {
+        sqlx::query(
+            "INSERT INTO provenance_action_outputs
+                (action_attestation_id, ordinal, output_domain, output_event_id)
+             VALUES(?, ?, ?, ?)",
+        )
+        .bind(attestation_id)
+        .bind(output.try_get::<i64, _>("ordinal")?)
+        .bind(output.try_get::<String, _>("output_domain")?)
+        .bind(output.try_get::<String, _>("output_event_id")?)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
 }
 
 async fn artifact_create_replay_in(
@@ -3012,10 +3649,18 @@ async fn filter_enriched_record_with_auth_in_pools(
     .bind(&record.record.id)
     .fetch_all(record_pool)
     .await?;
+    // Set-wise: one visibility fold for every child rather than one
+    // authorization walk per child, which made a large folder cost a request
+    // per row it contains.
+    let child_ids = child_rows
+        .iter()
+        .map(|row| row.try_get::<String, _>("id"))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let visible_children = super::visible_ids_in_pool(auth_pool, caller, child_ids).await?;
     let mut authorized_children = Vec::new();
     for row in child_rows {
         let id: String = row.try_get("id")?;
-        if super::can_record_in_pool(auth_pool, caller, &id, Capability::View).await? {
+        if visible_children.contains(&id) {
             authorized_children.push(read::ChildSummary {
                 id,
                 record_type: row.try_get("type")?,
@@ -3045,9 +3690,16 @@ async fn filter_enriched_record_with_auth_in_pools(
         .await?
         .expect("the enriched record still exists");
     record_snapshot.rollback().await?;
+    let link_peers = all_links
+        .links_out
+        .iter()
+        .map(|link| link.target_id.clone())
+        .chain(all_links.links_in.iter().map(|link| link.source_id.clone()))
+        .collect::<Vec<_>>();
+    let visible_peers = super::visible_ids_in_pool(auth_pool, caller, link_peers).await?;
     let mut outbound = Vec::new();
     for link in all_links.links_out {
-        if super::can_record_in_pool(auth_pool, caller, &link.target_id, Capability::View).await? {
+        if visible_peers.contains(&link.target_id) {
             outbound.push(link);
         }
     }
@@ -3059,7 +3711,7 @@ async fn filter_enriched_record_with_auth_in_pools(
         .collect();
     let mut inbound = Vec::new();
     for link in all_links.links_in {
-        if super::can_record_in_pool(auth_pool, caller, &link.source_id, Capability::View).await? {
+        if visible_peers.contains(&link.source_id) {
             inbound.push(link);
         }
     }
@@ -3136,10 +3788,18 @@ async fn filter_enriched_record_in(
     .bind(&record.record.id)
     .fetch_all(&mut **tx)
     .await?;
+    // Set-wise: one visibility fold for every child rather than one
+    // authorization walk per child, which made a large folder cost a request
+    // per row it contains.
+    let child_ids = child_rows
+        .iter()
+        .map(|row| row.try_get::<String, _>("id"))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let visible_children = super::visible_ids_in(tx, caller, child_ids).await?;
     let mut authorized_children = Vec::new();
     for row in child_rows {
         let id: String = row.try_get("id")?;
-        if super::can_record_in(tx, caller, &id, Capability::View).await? {
+        if visible_children.contains(&id) {
             authorized_children.push(read::ChildSummary {
                 id,
                 record_type: row.try_get("type")?,
@@ -3167,9 +3827,16 @@ async fn filter_enriched_record_in(
     let all_links = read::record_links_in(tx, &record.record.id)
         .await?
         .expect("the enriched record still exists");
+    let link_peers = all_links
+        .links_out
+        .iter()
+        .map(|link| link.target_id.clone())
+        .chain(all_links.links_in.iter().map(|link| link.source_id.clone()))
+        .collect::<Vec<_>>();
+    let visible_peers = super::visible_ids_in(tx, caller, link_peers).await?;
     let mut outbound = Vec::new();
     for link in all_links.links_out {
-        if super::can_record_in(tx, caller, &link.target_id, Capability::View).await? {
+        if visible_peers.contains(&link.target_id) {
             outbound.push(link);
         }
     }
@@ -3181,7 +3848,7 @@ async fn filter_enriched_record_in(
         .collect();
     let mut inbound = Vec::new();
     for link in all_links.links_in {
-        if super::can_record_in(tx, caller, &link.source_id, Capability::View).await? {
+        if visible_peers.contains(&link.source_id) {
             inbound.push(link);
         }
     }
@@ -4187,7 +4854,7 @@ impl BodyGuardTarget {
 /// content. Refused before any event is appended.
 ///
 /// This is an ordinary engine error on purpose. The executor's repair channel
-/// may only offer a `corrected_envelope` for envelope-shaped validation
+/// may only offer `corrections` for envelope-shaped validation
 /// failures, and synthesising `if_body_digest` from current state would hand
 /// the caller a token it never read — silently reproducing the lost update the
 /// guard exists to prevent. Reconciliation is the caller's judgement.
@@ -4221,8 +4888,8 @@ pub fn stale_body_digest_error(tool: &str, target: &BodyGuardTarget) -> Error {
 /// It keeps its pre-existing `Error::conflict` class — the shared contract
 /// scenarios pin that, and the record-wide precondition is older than this
 /// guard. The class is immaterial to the repair prohibition: every tool failure
-/// reaches the executor as `execution_error`, so `corrected_envelope` stays
-/// null and `retry_ready` false here exactly as for the other two.
+/// reaches the executor as `execution_error`, so `corrections` stays absent
+/// and `retry_ready` false here exactly as for the other two.
 pub fn stale_unmodified_since_error(tool: &str, target: &BodyGuardTarget) -> Error {
     Error::conflict(format!(
         "{tool}: stale write conflict — {} changed since the caller read it. Nothing was \
@@ -4245,6 +4912,157 @@ pub fn whole_body_write_needs_guard(
         && current_body.is_some_and(|body| !body.is_empty())
         && if_body_digest.is_none()
         && if_unmodified_since.is_none()
+}
+
+/// Minimum partial-anchor length worth reporting on a zero-match
+/// `body_replace`: shorter prefixes occur everywhere and re-anchor nothing.
+const BODY_REPLACE_PARTIAL_PREFIX_MIN_CHARS: usize = 24;
+/// Characters of body shown on each side of a zero-match partial anchor.
+const BODY_REPLACE_ZERO_MATCH_WINDOW_CHARS: usize = 200;
+/// Characters of body shown around each match on a count mismatch (split
+/// evenly before and after the match).
+const BODY_REPLACE_COUNT_MISMATCH_WINDOW_CHARS: usize = 80;
+/// Cap on per-match contexts in a count-mismatch error; the total count is
+/// always stated so the caller knows what was withheld.
+const BODY_REPLACE_MAX_MATCH_CONTEXTS: usize = 10;
+/// Cap on headings in a zero-match outline; the total is stated when more
+/// exist, so a heading-heavy body cannot bloat the rejection.
+const BODY_REPLACE_MAX_HEADINGS: usize = 20;
+/// Characters shown per heading line; longer headings clip with `...`.
+const BODY_REPLACE_MAX_HEADING_CHARS: usize = 120;
+
+/// Floor a byte index to the nearest char boundary at or before it, so
+/// window slicing never panics on multi-byte text.
+fn floor_char_boundary(text: &str, index: usize) -> usize {
+    let mut index = index.min(text.len());
+    while index > 0 && !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+/// Ceil a byte index to the nearest char boundary at or after it, so window
+/// slicing never panics on multi-byte text.
+fn ceil_char_boundary(text: &str, index: usize) -> usize {
+    let mut index = index.min(text.len());
+    while index < text.len() && !text.is_char_boundary(index) {
+        index += 1;
+    }
+    index
+}
+
+/// Up to `chars` characters of `body` immediately before `byte_index`,
+/// with whether older text was clipped away. The index is floored to a char
+/// boundary first; callers may pass raw match offsets freely.
+fn window_before(body: &str, byte_index: usize, chars: usize) -> (String, bool) {
+    let prefix = &body[..floor_char_boundary(body, byte_index)];
+    let count = prefix.chars().count();
+    if count <= chars {
+        (prefix.to_string(), false)
+    } else {
+        (prefix.chars().skip(count - chars).collect(), true)
+    }
+}
+
+/// Up to `chars` characters of `body` starting at `byte_index`, with whether
+/// later text was clipped away. The index is ceiled to a char boundary
+/// first; callers may pass raw match offsets freely.
+fn window_after(body: &str, byte_index: usize, chars: usize) -> (String, bool) {
+    let suffix = &body[ceil_char_boundary(body, byte_index)..];
+    if suffix.chars().count() <= chars {
+        (suffix.to_string(), false)
+    } else {
+        (suffix.chars().take(chars).collect(), true)
+    }
+}
+
+/// Longest prefix of `old` (in characters, at least
+/// [`BODY_REPLACE_PARTIAL_PREFIX_MIN_CHARS`]) that occurs in `body`, as
+/// `(byte_offset, prefix_chars)`. Occurrence is monotone in the prefix
+/// length — a match for length N contains one for length N-1 at the same
+/// spot — so this binary-searches after pinning the minimum. Prefixes are
+/// built from chars, never slicing `old` mid-codepoint.
+fn longest_matching_prefix(old: &str, body: &str) -> Option<(usize, usize)> {
+    let total = old.chars().count();
+    if total < BODY_REPLACE_PARTIAL_PREFIX_MIN_CHARS {
+        return None;
+    }
+    let prefix = |chars: usize| old.chars().take(chars).collect::<String>();
+    if !body.contains(&prefix(BODY_REPLACE_PARTIAL_PREFIX_MIN_CHARS)) {
+        return None;
+    }
+    let (mut low, mut high) = (BODY_REPLACE_PARTIAL_PREFIX_MIN_CHARS, total);
+    while low < high {
+        let mid = (low + high).div_ceil(2);
+        if body.contains(&prefix(mid)) {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    let matched = prefix(low);
+    body.find(matched.as_str()).map(|offset| (offset, low))
+}
+
+/// `(byte_offset, heading)` for the `#` heading lines in `body`, so a caller
+/// whose anchor matches nothing can re-anchor on structure without a full
+/// re-read. Offsets are byte offsets into `body`. Capped at
+/// [`BODY_REPLACE_MAX_HEADINGS`] headings of
+/// [`BODY_REPLACE_MAX_HEADING_CHARS`] chars each (`...` marks clipping);
+/// returns the shown entries plus the total heading count.
+fn heading_outline(body: &str) -> (Vec<(usize, String)>, usize) {
+    let mut outline = Vec::new();
+    let mut total = 0;
+    let mut offset = 0;
+    for line in body.split_inclusive('\n') {
+        let text = line.strip_suffix('\n').unwrap_or(line);
+        if text.starts_with('#') {
+            total += 1;
+            if outline.len() < BODY_REPLACE_MAX_HEADINGS {
+                let clipped = text.chars().count() > BODY_REPLACE_MAX_HEADING_CHARS;
+                let mut heading: String =
+                    text.chars().take(BODY_REPLACE_MAX_HEADING_CHARS).collect();
+                if clipped {
+                    heading.push_str("...");
+                }
+                outline.push((offset, heading));
+            }
+        }
+        offset += line.len();
+    }
+    (outline, total)
+}
+
+/// Byte offset plus an [`BODY_REPLACE_COUNT_MISMATCH_WINDOW_CHARS`]-char
+/// window (half before, half after) per match, capped at
+/// [`BODY_REPLACE_MAX_MATCH_CONTEXTS`] matches with the total stated, so the
+/// caller can pick `expected_count` or a sharper anchor without re-reading.
+fn match_contexts(body: &str, old: &str, count: usize) -> String {
+    let mut contexts = String::new();
+    let half = BODY_REPLACE_COUNT_MISMATCH_WINDOW_CHARS / 2;
+    for (offset, matched) in body
+        .match_indices(old)
+        .take(BODY_REPLACE_MAX_MATCH_CONTEXTS)
+    {
+        let (before, clipped_before) = window_before(body, offset, half);
+        let (after, clipped_after) = window_after(body, offset + matched.len(), half);
+        contexts.push_str(&format!(
+            "\n  match at byte offset {offset} \
+             ({}-char context, `...` marks clipping): {}{}{}{}{}",
+            BODY_REPLACE_COUNT_MISMATCH_WINDOW_CHARS,
+            if clipped_before { "..." } else { "" },
+            before,
+            "[MATCH]",
+            after,
+            if clipped_after { "..." } else { "" },
+        ));
+    }
+    if count > BODY_REPLACE_MAX_MATCH_CONTEXTS {
+        contexts.push_str(&format!(
+            "\n  showing first {BODY_REPLACE_MAX_MATCH_CONTEXTS} of {count} matches"
+        ));
+    }
+    contexts
 }
 
 fn apply_body_replacements(tool: &str, body: &str, ops: &[BodyReplace]) -> Result<String> {
@@ -4277,15 +5095,63 @@ fn apply_body_replacements(tool: &str, body: &str, ops: &[BodyReplace]) -> Resul
         // same in-memory value, itself read under the write transaction.
         let count = result.matches(&op.old).count();
         if count == 0 {
-            return Err(Error::engine(format!(
-                "{tool}: body_replace[{index}].old matched 0 occurrences"
-            )));
+            let mut message = format!("{tool}: body_replace[{index}].old matched 0 occurrences");
+            match longest_matching_prefix(&op.old, &result) {
+                Some((offset, prefix_chars)) => {
+                    let prefix_len = op.old.chars().take(prefix_chars).collect::<String>().len();
+                    let (before, clipped_before) =
+                        window_before(&result, offset, BODY_REPLACE_ZERO_MATCH_WINDOW_CHARS);
+                    let (after, clipped_after) = window_after(
+                        &result,
+                        offset + prefix_len,
+                        BODY_REPLACE_ZERO_MATCH_WINDOW_CHARS,
+                    );
+                    message.push_str(&format!(
+                        "\n  longest matching prefix of .old: {prefix_chars} chars \
+                         at byte offset {offset}; \
+                         {}-char window on each side (`...` marks clipping):\
+                         \n  {}{}{}{}{}",
+                        BODY_REPLACE_ZERO_MATCH_WINDOW_CHARS,
+                        if clipped_before { "..." } else { "" },
+                        before,
+                        "[MATCH]",
+                        after,
+                        if clipped_after { "..." } else { "" },
+                    ));
+                }
+                None => {
+                    let (outline, total) = heading_outline(&result);
+                    if outline.is_empty() {
+                        message.push_str(&format!(
+                            "\n  no prefix of .old ({}+ chars) occurs in the body, \
+                             and the body has no `#` headings",
+                            BODY_REPLACE_PARTIAL_PREFIX_MIN_CHARS,
+                        ));
+                    } else {
+                        message.push_str(&format!(
+                            "\n  no prefix of .old ({}+ chars) occurs in the body; \
+                             heading outline (byte offset: heading):",
+                            BODY_REPLACE_PARTIAL_PREFIX_MIN_CHARS,
+                        ));
+                        for (offset, heading) in outline {
+                            message.push_str(&format!("\n    {offset}: {heading}"));
+                        }
+                        if total > BODY_REPLACE_MAX_HEADINGS {
+                            message.push_str(&format!(
+                                "\n  showing first {BODY_REPLACE_MAX_HEADINGS} of {total} headings"
+                            ));
+                        }
+                    }
+                }
+            }
+            return Err(Error::engine(message));
         }
 
         if let Some(expected) = op.expected_count {
             if count != expected {
                 return Err(Error::engine(format!(
-                    "{tool}: body_replace[{index}] expected {expected} occurrences but matched {count}"
+                    "{tool}: body_replace[{index}] expected {expected} occurrences but matched {count}{}",
+                    match_contexts(&result, &op.old, count),
                 )));
             }
             result = result.replace(&op.old, &op.new);
@@ -4294,7 +5160,8 @@ fn apply_body_replacements(tool: &str, body: &str, ops: &[BodyReplace]) -> Resul
         } else {
             if count != 1 {
                 return Err(Error::engine(format!(
-                    "{tool}: body_replace[{index}].old matched {count} occurrences; set replace_all: true or expected_count: {count}"
+                    "{tool}: body_replace[{index}].old matched {count} occurrences; set replace_all: true or expected_count: {count}{}",
+                    match_contexts(&result, &op.old, count),
                 )));
             }
             result = result.replacen(&op.old, &op.new, 1);
@@ -6777,7 +7644,8 @@ pub fn register_lifecycle_tools(registry: &mut ToolRegistry) -> Result<()> {
                     "description":"Message-only immutable mentions; principal targets must be addressed.",
                     "items":{"type":"object","properties":{"mention_id":{"type":"string"},"target_kind":{"type":"string","enum":["principal","record"]},"target_id":{"type":"string"},"span_start":{"type":"integer","minimum":0},"span_end":{"type":"integer","minimum":1},"authored_label":{"type":"string"}},"required":["mention_id","target_kind","target_id","span_start","span_end","authored_label"],"additionalProperties":false}
                 },
-                "target": crate::mcp::tools::citations::target_schema()
+                "target": crate::mcp::tools::citations::target_schema(),
+                "idempotency_key": { "type": "string", "description": "Retry-safety key: on ambiguous failure, retry with the SAME key, never a fresh one. An identical retry returns the record you already created rather than a second one; the same key with different content is rejected. With no key, every call creates a new record." }
             },
             "required": ["type", "kind", "reason"],
             "additionalProperties": false
@@ -6979,4 +7847,389 @@ pub fn register_lifecycle_tools(registry: &mut ToolRegistry) -> Result<()> {
         render_record,
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod body_replace_context_tests {
+    use super::*;
+
+    fn replace(old: &str, new: &str) -> BodyReplace {
+        BodyReplace {
+            old: old.to_string(),
+            new: new.to_string(),
+            expected_count: None,
+            replace_all: None,
+        }
+    }
+
+    fn error_message(tool: &str, body: &str, ops: &[BodyReplace]) -> String {
+        apply_body_replacements(tool, body, ops)
+            .unwrap_err()
+            .to_string()
+    }
+
+    #[test]
+    fn zero_match_with_long_partial_prefix_returns_window() {
+        let body = format!(
+            "{}greeting from the old world{}",
+            "x".repeat(500),
+            "y".repeat(500),
+        );
+        // The anchor's tail changed, but its 30-char head still occurs.
+        let old = "greeting from the old world — edited tail".to_string();
+        let message = error_message("update_record", &body, &[replace(&old, "new")]);
+        let first_line = message.lines().next().unwrap();
+        assert_eq!(
+            first_line,
+            "update_record: body_replace[0].old matched 0 occurrences"
+        );
+        assert!(message.contains("27 chars"), "{message}");
+        let offset: usize = body.find("greeting").unwrap();
+        assert!(
+            message.contains(&format!("byte offset {offset}")),
+            "{message}"
+        );
+        // 200 chars on each side of the anchor, clipped on both ends.
+        assert!(message.contains(&"x".repeat(200)), "{message}");
+        assert!(message.contains(&"y".repeat(200)), "{message}");
+        assert!(message.contains("[MATCH]"), "{message}");
+        assert!(message.contains("..."), "{message}");
+    }
+
+    #[test]
+    fn zero_match_without_partial_prefix_returns_heading_outline() {
+        let body = "# Alpha\nbody text\n## Beta\nmore text\n# Gamma\n";
+        let message = error_message(
+            "update_record",
+            body,
+            &[replace("zzz-no-such-anchor", "new")],
+        );
+        let first_line = message.lines().next().unwrap();
+        assert_eq!(
+            first_line,
+            "update_record: body_replace[0].old matched 0 occurrences"
+        );
+        assert!(message.contains("heading outline"), "{message}");
+        assert!(message.contains("0: # Alpha"), "{message}");
+        assert!(message.contains("18: ## Beta"), "{message}");
+        assert!(message.contains("36: # Gamma"), "{message}");
+    }
+
+    #[test]
+    fn zero_match_heading_outline_stays_bounded() {
+        // Ten thousand headings: only the first 20 travel, with the total
+        // stated — the record body must not control rejection size.
+        let body = (0..10_000)
+            .map(|index| format!("# heading {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let message = error_message(
+            "update_record",
+            &body,
+            &[replace("zzz-no-such-anchor-anywhere", "new")],
+        );
+        assert!(
+            message
+                .lines()
+                .next()
+                .unwrap()
+                .ends_with("matched 0 occurrences"),
+            "{message}"
+        );
+        assert!(
+            message.contains("showing first 20 of 10000 headings"),
+            "{message}"
+        );
+        assert!(message.contains("0: # heading 0"), "{message}");
+        assert!(!message.contains("# heading 20"), "{message}");
+        assert!(
+            message.len() < 8192,
+            "10,000 headings must not bloat the rejection: {} bytes",
+            message.len()
+        );
+        // One 1MB heading line: clipped to 120 chars with a marker.
+        let body = format!("# {}", "z".repeat(1_000_000));
+        let message = error_message(
+            "update_record",
+            &body,
+            &[replace("zzz-no-such-anchor-anywhere", "new")],
+        );
+        assert!(!message.contains(&"z".repeat(121)), "{message}");
+        assert!(
+            message.contains(&format!("0: # {}...", "z".repeat(118))),
+            "{message}"
+        );
+        assert!(
+            message.len() < 1024,
+            "a 1MB heading must not bloat the rejection: {} bytes",
+            message.len()
+        );
+    }
+
+    #[test]
+    fn count_mismatch_reports_each_match_with_context() {
+        let body = "see dog one, see dog two, see dog three";
+        let mut op = replace("dog", "cat");
+        op.expected_count = Some(2);
+        let message = error_message("update_record", body, &[op]);
+        let first_line = message.lines().next().unwrap();
+        assert_eq!(
+            first_line,
+            "update_record: body_replace[0] expected 2 occurrences but matched 3"
+        );
+        for matched in body.match_indices("dog").map(|(offset, _)| offset) {
+            assert!(
+                message.contains(&format!("byte offset {matched}")),
+                "{message}"
+            );
+        }
+        assert!(message.contains("[MATCH]"), "{message}");
+    }
+
+    #[test]
+    fn count_mismatch_caps_contexts_at_ten_and_states_total() {
+        let body = (0..12)
+            .map(|index| format!("token{index} dog"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let message = error_message("update_record", &body, &[replace("dog", "cat")]);
+        let first_line = message.lines().next().unwrap();
+        assert!(first_line.contains("matched 12 occurrences"), "{message}");
+        assert_eq!(message.matches("byte offset").count(), 10, "{message}");
+        assert!(
+            message.contains("showing first 10 of 12 matches"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn windows_are_utf8_safe_at_window_edges() {
+        // Multi-byte text straddling every window edge: clipping must floor
+        // and ceil to char boundaries rather than panic on raw byte ranges.
+        let body = format!(
+            "{}needle-haystack-{}-anchor{}",
+            "é".repeat(300),
+            "🦮".repeat(100),
+            "您".repeat(300),
+        );
+        // Zero-match path with a long partial prefix deep in multi-byte text.
+        let old = format!("needle-haystack-{}-anchor-CHANGED", "🦮".repeat(100));
+        let message = error_message("update_record", &body, &[replace(&old, "new")]);
+        assert!(
+            message
+                .lines()
+                .next()
+                .unwrap()
+                .ends_with("matched 0 occurrences"),
+            "{message}"
+        );
+        assert!(message.contains("[MATCH]"), "{message}");
+        // Count-mismatch path over multi-byte matches.
+        let body = format!("{} dog {} dog", "é".repeat(100), "🦮".repeat(100));
+        let mut op = replace("dog", "cat");
+        op.expected_count = Some(5);
+        let message = error_message("update_record", &body, &[op]);
+        assert!(message.contains("but matched 2"), "{message}");
+        assert!(message.contains("[MATCH]"), "{message}");
+        // The helpers themselves never slice mid-codepoint, even when handed
+        // interior byte indices.
+        for index in 0..body.len() {
+            let _ = window_before(&body, index, 200);
+            let _ = window_after(&body, index, 200);
+            let _ = floor_char_boundary(&body, index);
+            let _ = ceil_char_boundary(&body, index);
+        }
+    }
+}
+
+#[cfg(test)]
+mod create_idempotency_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    /// Two concurrent creates with the same key must not both append. The
+    /// rendezvous parks the spawned racer inside `begin_write` — both writers
+    /// are then in flight at once, and `BEGIN IMMEDIATE` serializes them: the
+    /// loser begins after the winner commits, sees the attestation in its
+    /// in-transaction lookup, and replays. The partial unique index
+    /// underneath is the backstop, not the mechanism under test. This lives
+    /// in-crate (rather than in `tests/`) because the rendezvous seam
+    /// `with_before_begin_write_notification` is `pub(crate)`.
+    #[tokio::test]
+    async fn concurrent_keyed_creates_serialize_on_begin_and_append_once() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let mut registry = crate::mcp::ToolRegistry::new();
+        crate::mcp::register_surface_tools(&mut registry).unwrap();
+        let registry = Arc::new(registry);
+        let args = json!({
+            "type": "Document",
+            "kind": "note",
+            "name": "race",
+            "body": "durable prose",
+            "reason": "race two keyed creates through one write lock",
+            "idempotency_key": "race-key",
+        });
+
+        let before_begin = Arc::new(tokio::sync::Notify::new());
+        let racer_db = db.clone();
+        let racer_registry = registry.clone();
+        let racer_args = args.clone();
+        let racer = tokio::spawn(crate::db::with_before_begin_write_notification(
+            before_begin.clone(),
+            async move {
+                racer_registry
+                    .call(
+                        racer_db,
+                        crate::mcp::Caller::local(),
+                        "create_record",
+                        racer_args,
+                    )
+                    .await
+            },
+        ));
+        // The racer has reached `begin_write`; run the twin to completion
+        // while it is parked there, then release it into the overlap.
+        before_begin.notified().await;
+        let first = registry
+            .call(
+                db.clone(),
+                crate::mcp::Caller::local(),
+                "create_record",
+                args,
+            )
+            .await
+            .unwrap();
+        let second = racer.await.unwrap().unwrap();
+        assert_eq!(first, second, "both racers converge on one receipt");
+        let records: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM records WHERE name='race'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(records, 1, "exactly one record was appended");
+        let attestations: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM provenance_local_attestation_authority
+              WHERE principal='local' AND operation='create_record'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            attestations, 1,
+            "exactly one command attestation was issued"
+        );
+        db.close().await;
+    }
+
+    async fn replay_gate_open(db: &crate::Db, attestation: &str) -> bool {
+        let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+        let attested = super::attested_create_horizons_in(&mut tx, attestation)
+            .await
+            .unwrap();
+        let open = super::attested_state_unchanged_in(&mut tx, &attested)
+            .await
+            .unwrap();
+        tx.rollback().await.unwrap();
+        open
+    }
+
+    /// The horizon fast path is only taken while the pinned state provably
+    /// still holds: any newer event on either log, a relationship endpoint
+    /// resolving onto the record, or a validity change against the attested
+    /// command all close it and route the replay through reconstruction.
+    #[tokio::test]
+    async fn horizon_gate_closes_on_any_post_attestation_write() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let mut registry = crate::mcp::ToolRegistry::new();
+        crate::mcp::register_surface_tools(&mut registry).unwrap();
+        let keyed = |name: &str, key: &str| {
+            serde_json::json!({
+                "type": "Document",
+                "kind": "note",
+                "name": name,
+                "body": "durable prose",
+                "reason": "gate fixture",
+                "idempotency_key": key,
+            })
+        };
+        async fn call(
+            db: &crate::Db,
+            registry: &crate::mcp::ToolRegistry,
+            args: serde_json::Value,
+        ) -> serde_json::Value {
+            registry
+                .call(
+                    db.clone(),
+                    crate::mcp::Caller::local(),
+                    "create_record",
+                    args,
+                )
+                .await
+                .unwrap()
+        }
+        let first = call(&db, &registry, keyed("gated", "gate-key")).await;
+        let attestation = first["action_attestation_ids"][0]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            replay_gate_open(&db, &attestation).await,
+            "nothing written since: fast path applies"
+        );
+
+        // An unrelated write anywhere bumps the content head and closes it.
+        call(&db, &registry, keyed("unrelated", "other-key")).await;
+        assert!(
+            !replay_gate_open(&db, &attestation).await,
+            "unrelated append must route through reconstruction"
+        );
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn horizon_gate_closes_on_validity_change_without_new_events() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let mut registry = crate::mcp::ToolRegistry::new();
+        crate::mcp::register_surface_tools(&mut registry).unwrap();
+        let first = registry
+            .call(
+                db.clone(),
+                crate::mcp::Caller::local(),
+                "create_record",
+                serde_json::json!({
+                    "type": "Document",
+                    "kind": "note",
+                    "name": "gated",
+                    "body": "durable prose",
+                    "reason": "gate fixture",
+                    "idempotency_key": "gate-key",
+                }),
+            )
+            .await
+            .unwrap();
+        let attestation = first["action_attestation_ids"][0]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(replay_gate_open(&db, &attestation).await);
+
+        // An invalidation refreshes the command's admissions with no new log
+        // row, so the log heads alone cannot see it: the validity check is
+        // what closes the gate.
+        let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+        crate::provenance::append_validity_event_in(
+            &mut tx,
+            &attestation,
+            crate::provenance::ValidityChange::Invalidated,
+            "gate fixture",
+            "test",
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        assert!(
+            !replay_gate_open(&db, &attestation).await,
+            "invalidation without new events must still reconstruct"
+        );
+        db.close().await;
+    }
 }

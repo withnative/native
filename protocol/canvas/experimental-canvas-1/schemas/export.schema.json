@@ -1,0 +1,316 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://spec.withnative.ai/canvas/experimental-canvas-1/schemas/export.schema.json",
+  "title": "native.canvas-export.v1",
+  "description": "One caller-redacted export bundle returned by read_canvas.export. The scene section is the get_scene shape and the history section carries the changes batch shape, both exactly as those actions produce them; batch grammar (origin, ops) is referenced from native.canvas-batch.v1 rather than restated. A bundle whose disclosure.complete is false is not replayable in full. See docs/canvas-protocol-v1.md.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "action",
+    "version",
+    "exported_at",
+    "exported_by",
+    "canvas",
+    "canvas_version",
+    "scene",
+    "history",
+    "references",
+    "disclosure",
+    "limits"
+  ],
+  "properties": {
+    "action": {
+      "const": "export"
+    },
+    "version": {
+      "const": "native.canvas-export.v1"
+    },
+    "exported_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "exported_by": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "display_name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "canvas": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "type",
+        "kind",
+        "name",
+        "summary",
+        "home_id",
+        "archived",
+        "record_version"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "type": {
+          "const": "Document"
+        },
+        "kind": {
+          "const": "canvas"
+        },
+        "name": {
+          "type": "string"
+        },
+        "summary": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "home_id": {
+          "type": "string",
+          "description": "The home record id, or the literal \"withheld\" when the caller holds no View on the home, or null when the canvas has none."
+        },
+        "archived": {
+          "type": "boolean"
+        },
+        "record_version": {
+          "type": "string",
+          "pattern": "^rec:(0|[1-9][0-9]*)$"
+        }
+      }
+    },
+    "canvas_version": {
+      "type": "string",
+      "pattern": "^canvas:(0|[1-9][0-9]*)$"
+    },
+    "scene": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "version",
+        "objects"
+      ],
+      "properties": {
+        "version": {
+          "const": "native.canvas-scene.v1"
+        },
+        "objects": {
+          "type": "array",
+          "description": "The get_scene objects with include_deleted:true, redacted for the exporting caller. Object shapes are documented in docs/canvas-protocol-v1.md; no scene schema is frozen while the protocol is experimental.",
+          "items": {
+            "type": "object",
+            "required": [
+              "id",
+              "kind"
+            ],
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "note",
+                  "shape",
+                  "stroke",
+                  "connector",
+                  "frame",
+                  "record_card"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    "history": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "description": "The full changes feed from canvas:0 in order, or null when the bundle was requested with include_history:false (shell plus scene only, not replayable).",
+      "properties": {
+        "version": {
+          "const": "native.canvas-changes.v1"
+        },
+        "batches": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "batch_id",
+              "event_id",
+              "event_seq",
+              "canvas_version",
+              "actor",
+              "at",
+              "origin",
+              "base_version",
+              "ops",
+              "pre_images",
+              "detached"
+            ],
+            "properties": {
+              "batch_id": {
+                "type": "string"
+              },
+              "event_id": {
+                "type": "string"
+              },
+              "event_seq": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "canvas_version": {
+                "type": "string",
+                "pattern": "^canvas:(0|[1-9][0-9]*)$"
+              },
+              "actor": {
+                "description": "The disclosing actor face, or null where the caller may not identify that actor."
+              },
+              "at": {
+                "type": "string"
+              },
+              "origin": {
+                "$ref": "batch.schema.json#/properties/origin"
+              },
+              "base_version": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "ops": {
+                "$ref": "batch.schema.json#/properties/ops"
+              },
+              "pre_images": {
+                "type": "object"
+              },
+              "detached": {
+                "type": "array"
+              }
+            }
+          }
+        }
+      }
+    },
+    "references": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "records",
+        "links",
+        "attestations"
+      ],
+      "properties": {
+        "records": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "id",
+              "name"
+            ],
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "links": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "id",
+              "relationship"
+            ],
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "relationship": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "attestations": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "disclosure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "withheld_records",
+        "withheld_assertions",
+        "complete"
+      ],
+      "properties": {
+        "withheld_records": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "withheld_assertions": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "complete": {
+          "type": "boolean"
+        }
+      }
+    },
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Declared caps, not a measurement of this bundle: the per-batch and per-canvas limits the engine enforces, plus the two export caps. The bundle's actual size appears only in an over-cap refusal.",
+      "required": [
+        "ops_per_batch",
+        "batch_bytes",
+        "live_objects",
+        "export_bytes",
+        "export_batches"
+      ],
+      "properties": {
+        "ops_per_batch": {
+          "type": "integer"
+        },
+        "batch_bytes": {
+          "type": "integer"
+        },
+        "live_objects": {
+          "type": "integer"
+        },
+        "export_bytes": {
+          "type": "integer"
+        },
+        "export_batches": {
+          "type": "integer"
+        }
+      }
+    }
+  }
+}

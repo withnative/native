@@ -5,10 +5,11 @@ use std::sync::Arc;
 
 use native_ce::export::LocalSnapshotSource;
 use native_ce::mcp::{
-    register_builtin_tools, register_snapshot_tool, register_surface_tools, Caller,
-    ExposureProfile, ToolKind, ToolRegistry,
+    register_builtin_tools, register_reach_connect_tool_with, register_reach_read_tool_with,
+    register_snapshot_tool, register_surface_tools, Caller, ExposureProfile, ToolKind,
+    ToolRegistry,
 };
-use native_ce::{create_database, Db};
+use native_ce::{create_database, Db, Error};
 use serde_json::{json, Value};
 use sqlx::Row;
 
@@ -58,7 +59,7 @@ async fn create(registry: &ToolRegistry, db: &Db, id: &str, name: &str, parent: 
 fn every_local_registration_uses_the_exhaustive_tool_kind_path() {
     let registry = registry();
     let specs = registry.specs().collect::<Vec<_>>();
-    assert_eq!(specs.len(), ToolKind::ALL.len() - 2);
+    assert_eq!(specs.len(), ToolKind::ALL.len() - 4);
     assert!(
         specs.iter().all(|spec| spec.kind.is_some()),
         "a local tool used the custom/no-record registration escape hatch"
@@ -73,7 +74,12 @@ fn every_local_registration_uses_the_exhaustive_tool_kind_path() {
         specs.len(),
         "each local registration must use a distinct ToolKind"
     );
-    let hosted_only = HashSet::from([ToolKind::ManageMemberships, ToolKind::StandbyStatus]);
+    let hosted_only = HashSet::from([
+        ToolKind::ManageMemberships,
+        ToolKind::StandbyStatus,
+        ToolKind::ReachRead,
+        ToolKind::ReachConnect,
+    ]);
     let expected_local = exhaustive
         .difference(&hosted_only)
         .copied()
@@ -85,7 +91,7 @@ fn every_local_registration_uses_the_exhaustive_tool_kind_path() {
             .copied()
             .collect::<HashSet<_>>(),
         hosted_only,
-        "hosted membership management and standby-only status stay off the local registry"
+        "hosted membership management, reach, and standby-only status stay off the local registry"
     );
     for spec in &specs {
         assert_eq!(spec.name, spec.kind.unwrap().name());
@@ -253,6 +259,128 @@ async fn success_error_and_zero_result_calls_are_raw_rows() {
     .await
     .unwrap();
     assert_eq!(guide_touches, 0, "guide reads touch no content records");
+    db.close().await;
+}
+
+#[tokio::test]
+async fn reach_read_log_never_persists_queries_or_unrecognized_arguments() {
+    let db = create_database(":memory:").await.unwrap();
+    let mut registry = registry();
+    register_reach_read_tool_with(&mut registry, |_db, _caller, arguments| async move {
+        if arguments.get("action").and_then(Value::as_str) == Some("search_slack") {
+            Ok(json!({"results": [], "has_more": false}))
+        } else {
+            Err(Error::engine("reach fixture rejected invalid action"))
+        }
+    })
+    .unwrap();
+    register_reach_connect_tool_with(&mut registry, |_db, _caller, arguments| async move {
+        if arguments.get("provider").and_then(Value::as_str) == Some("slack") {
+            Ok(json!({
+                "provider":"slack",
+                "consent_url":"https://reach.example/connect?ticket=private-ticket",
+                "expires_at":"2026-09-07T12:41:00Z"
+            }))
+        } else {
+            Err(Error::engine("reach fixture rejected invalid provider"))
+        }
+    })
+    .unwrap();
+
+    call(
+        &registry,
+        &db,
+        "reach_read",
+        json!({
+            "action":"search_slack",
+            "query":"private query",
+            "token":"private token",
+            "run_key":RUN_KEY
+        }),
+    )
+    .await;
+    assert!(registry
+        .call(
+            db.clone(),
+            Caller::local(),
+            "reach_read",
+            json!({
+                "action":"private invalid action",
+                "query":"private rejected query",
+                "token":"private rejected token",
+                "run_key":RUN_KEY
+            }),
+        )
+        .await
+        .is_err());
+    call(
+        &registry,
+        &db,
+        "reach_connect",
+        json!({"provider":"slack", "token":"private token", "run_key":RUN_KEY}),
+    )
+    .await;
+    assert!(registry
+        .call(
+            db.clone(),
+            Caller::local(),
+            "reach_connect",
+            json!({
+                "provider":"private invalid provider",
+                "token":"private rejected token",
+                "run_key":RUN_KEY
+            }),
+        )
+        .await
+        .is_err());
+
+    let rows = sqlx::query(
+        "SELECT tool, arguments, outcome FROM read_log_calls
+          WHERE tool IN ('reach_read', 'reach_connect') ORDER BY seq",
+    )
+    .fetch_all(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 4);
+    let captured = rows
+        .iter()
+        .map(|row| {
+            (
+                row.get::<String, _>("tool"),
+                serde_json::from_str::<Value>(&row.get::<String, _>("arguments")).unwrap(),
+                row.get::<String, _>("outcome"),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        captured,
+        vec![
+            (
+                "reach_read".into(),
+                json!({"action":"search_slack"}),
+                "ok".into()
+            ),
+            ("reach_read".into(), json!({}), "error".into()),
+            (
+                "reach_connect".into(),
+                json!({"provider":"slack"}),
+                "ok".into()
+            ),
+            ("reach_connect".into(), json!({}), "error".into()),
+        ]
+    );
+    let stored = captured
+        .iter()
+        .map(|(_, arguments, _)| arguments.to_string())
+        .collect::<String>();
+    for private in [
+        "private query",
+        "private token",
+        "private invalid",
+        "private-ticket",
+    ] {
+        assert!(!stored.contains(private), "persisted {private}: {stored}");
+    }
     db.close().await;
 }
 

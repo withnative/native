@@ -63,6 +63,15 @@ struct CreateExplorationArgs {
     reason: String,
     exploration: ExplorationSelector,
     candidates: Vec<CandidateInput>,
+    /// Optional caller-supplied idempotency key for the whole composite call.
+    /// Absent (or blank) means exactly today's behavior. When present, the
+    /// call joins the provenance command-attestation mechanism that
+    /// `create_record` uses: same key plus same normalized request replays
+    /// the original receipt without appending; same key plus a materially
+    /// different request is a conflict error. One key covers the call's whole
+    /// effect — exploration, candidates, links and facets alike — so no
+    /// per-record identity plumbing is needed and record ids stay random.
+    idempotency_key: Option<String>,
 }
 
 /// Exactly one of: define a new exploration, or name an existing marked one.
@@ -172,7 +181,11 @@ pub fn register_exploration_tools(registry: &mut ToolRegistry) -> Result<()> {
                         "required": ["type", "kind"],
                         "additionalProperties": false
                     }
-                }
+                },
+                // Bare, like the `create_record` key: the Rust field comment
+                // carries the semantics, and the federated-lens Focused
+                // descriptor budget is binding down to the byte.
+                "idempotency_key": { "type": "string" }
             },
             "required": ["reason", "exploration", "candidates"],
             "additionalProperties": false
@@ -182,7 +195,28 @@ pub fn register_exploration_tools(registry: &mut ToolRegistry) -> Result<()> {
 }
 
 async fn create_exploration(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
+    // The provenance digests run over the raw tool arguments: no server-minted
+    // id enters the conflict detector, or every retry would conflict with the
+    // call it repeats. Run-context keys are already stripped by the request
+    // layer before the handler sees them.
+    let provenance_arguments = arguments.clone();
     let args: CreateExplorationArgs = parse_args(TOOL, arguments)?;
+    // Only the digest is stored, so an unbounded key is a mild DoS surface:
+    // the same 1..=200 bound `create_record` enforces. Blank stays keyless
+    // rather than erroring — a call with no key behaves as today.
+    if args
+        .idempotency_key
+        .as_deref()
+        .is_some_and(|key| key.len() > 200)
+    {
+        return Err(Error::engine(
+            "create_exploration: idempotency_key must be 1..200 characters",
+        ));
+    }
+    let idempotent = args
+        .idempotency_key
+        .as_deref()
+        .is_some_and(|key| !key.trim().is_empty());
     require_nonblank_reason(TOOL, &args.reason)?;
     if args.candidates.is_empty() {
         return Err(Error::engine(format!(
@@ -321,6 +355,74 @@ async fn create_exploration(db: Db, caller: Caller, arguments: Value) -> Result<
     let after = required_violations_in(&mut tx, &schema_rows, &ids).await?;
     assert_required_not_worsened(TOOL, &Default::default(), &after)?;
 
+    // Idempotent replay, after every authorization and validation check and
+    // inside the same BEGIN IMMEDIATE transaction as the mutation — the same
+    // ordering contract `create_record` keeps so the tool cannot become a
+    // command-existence oracle. A reused key with different normalized input
+    // errors out of the lookup below, after an explicit rollback so the
+    // tentative writes read as a rollback on every path, not just the hit.
+    //
+    // The tentative writes above are the validation: they run every guard the
+    // first call ran, so a replay whose targets have since been deleted fails
+    // exactly as a first call would. On a hit they are rolled back — nothing
+    // durable, no second exploration, no duplicate links or facets — and the
+    // receipt is rebuilt from the attested command's own membership links.
+    if idempotent {
+        let hit = match crate::provenance::lookup_authorized_command_attestation_in(
+            &mut tx,
+            caller.credential(),
+            TOOL,
+            &provenance_arguments,
+            caller.intent(),
+        )
+        .await
+        {
+            Ok(hit) => hit,
+            Err(error) => {
+                tx.rollback().await?;
+                return Err(error);
+            }
+        };
+        if let Some(attestation_id) = hit {
+            let attested = attested_exploration_in(&mut tx, &attestation_id).await?;
+            // Non-disclosure for the outputs: the receipt discloses the
+            // exploration and its candidates, so the replaying caller must
+            // still view each of them. A caller that lost access gets the
+            // opaque denial, not the receipt.
+            require_record_in(
+                &mut tx,
+                &caller,
+                TOOL,
+                &attested.exploration_id,
+                Capability::View,
+            )
+            .await?;
+            for candidate_id in &attested.candidate_ids {
+                require_record_in(&mut tx, &caller, TOOL, candidate_id, Capability::View).await?;
+            }
+            tx.rollback().await?;
+            crate::provenance::note_replayed_action_attestation(attestation_id);
+            // Reads happen only after the rollback; holding a second
+            // connection while the write transaction is live is the one
+            // deadlock trap here. These are live reads, not the pinned
+            // reconstruction `create_record` performs: the receipt carries no
+            // guarded-write token of its own, and membership context is live
+            // by design, so a replay after an unrelated write returns the
+            // current enrichment rather than a prefix rebuild.
+            let exploration =
+                enriched_or_error(&db, &caller, TOOL, &attested.exploration_id).await?;
+            let mut candidates = Vec::with_capacity(attested.candidate_ids.len());
+            for candidate_id in &attested.candidate_ids {
+                candidates.push(enriched_or_error(&db, &caller, TOOL, candidate_id).await?);
+            }
+            return Ok(exploration_receipt(
+                exploration,
+                attested.exploration_created,
+                candidates,
+            ));
+        }
+    }
+
     crate::provenance::issue_reserved_pending_action_in(&mut tx, draft).await?;
     db.commit_content(tx).await?;
 
@@ -331,9 +433,24 @@ async fn create_exploration(db: Db, caller: Caller, arguments: Value) -> Result<
     for record in &minted {
         candidates.push(enriched_or_error(&db, &caller, TOOL, &record.id).await?);
     }
-    Ok(json!({
+    Ok(exploration_receipt(
+        exploration,
+        created_exploration,
+        candidates,
+    ))
+}
+
+/// One receipt shape for the first call and every replay: the enriched
+/// exploration, whether this call created it, the candidates in request
+/// order, and the standing interpretation limits.
+fn exploration_receipt(
+    exploration: Value,
+    exploration_created: bool,
+    candidates: Vec<Value>,
+) -> Value {
+    json!({
         "exploration": exploration,
-        "exploration_created": created_exploration,
+        "exploration_created": exploration_created,
         "selection_role": ALTERNATIVE_SET_ROLE,
         // Request order, echoed so a caller can correlate its input. It is NOT
         // membership order, and nothing durable records one.
@@ -344,7 +461,84 @@ async fn create_exploration(db: Db, caller: Caller, arguments: Value) -> Result<
             crate::contribution::LIMIT_ALTERNATIVE_SET_FILTERED,
             crate::contribution::LIMIT_CREATION_NOT_STANCE,
         ],
-    }))
+    })
+}
+
+/// The attested command's own membership: which exploration it populated and
+/// which candidates it added, resolved from the attestation's `member_of`
+/// link outputs. Every `member_of` this operation appends points at the
+/// call's exploration — a supplied one is refused by the mint kernel — so the
+/// outputs' distinct target is the exploration and their sources are the
+/// candidates, in output (request) order. This holds whether the call created
+/// the exploration or joined an existing marked selection: in the latter case
+/// the exploration's `record.created` belongs to an older attestation and is
+/// simply absent here.
+struct AttestedExploration {
+    exploration_id: String,
+    candidate_ids: Vec<String>,
+    exploration_created: bool,
+}
+
+async fn attested_exploration_in(
+    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    attestation_id: &str,
+) -> Result<AttestedExploration> {
+    let rows = sqlx::query(
+        "SELECT e.payload FROM provenance_action_outputs o
+           JOIN content_events e ON e.id=o.output_event_id
+          WHERE o.action_attestation_id=? AND o.output_domain='content'
+            AND e.type='link.added' ORDER BY o.ordinal",
+    )
+    .bind(attestation_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    let mut exploration_id: Option<String> = None;
+    let mut candidate_ids = Vec::new();
+    for row in rows {
+        let payload: Value =
+            serde_json::from_str(&sqlx::Row::try_get::<String, _>(&row, "payload")?)?;
+        if payload.get("relationship").and_then(Value::as_str) != Some("member_of") {
+            continue;
+        }
+        let source = payload
+            .get("source_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::engine("create_exploration: idempotent receipt is incomplete"))?;
+        let target = payload
+            .get("target_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::engine("create_exploration: idempotent receipt is incomplete"))?;
+        match &exploration_id {
+            Some(known) if known != target => {
+                return Err(Error::engine(
+                    "create_exploration: idempotent receipt is incomplete",
+                ));
+            }
+            Some(_) => {}
+            None => exploration_id = Some(target.to_string()),
+        }
+        candidate_ids.push(source.to_string());
+    }
+    let Some(exploration_id) = exploration_id else {
+        return Err(Error::engine(
+            "create_exploration: idempotent receipt is incomplete",
+        ));
+    };
+    let exploration_created: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM provenance_action_outputs o
+           JOIN content_events e ON e.id=o.output_event_id
+          WHERE o.action_attestation_id=? AND o.output_domain='content'
+            AND e.type='record.created' AND e.record_id=?)",
+    )
+    .bind(attestation_id)
+    .bind(&exploration_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(AttestedExploration {
+        exploration_id,
+        candidate_ids,
+        exploration_created,
+    })
 }
 
 async fn assert_marked_alternative_set_in(
@@ -433,5 +627,197 @@ mod tests {
         // sat in the request array, and nothing here should start.
         let minted = Minted { id: "r1".into() };
         assert_eq!(minted.id, "r1");
+    }
+}
+
+#[cfg(test)]
+mod idempotency_tests {
+    use super::*;
+
+    async fn db() -> Db {
+        crate::create_database(":memory:").await.unwrap()
+    }
+
+    fn registry() -> ToolRegistry {
+        let mut registry = ToolRegistry::new();
+        crate::mcp::register_surface_tools(&mut registry).unwrap();
+        registry
+    }
+
+    async fn call(registry: &ToolRegistry, db: &Db, args: Value) -> Value {
+        registry
+            .call(db.clone(), Caller::local(), "create_exploration", args)
+            .await
+            .unwrap()
+    }
+
+    async fn call_err(registry: &ToolRegistry, db: &Db, args: Value) -> String {
+        registry
+            .call(db.clone(), Caller::local(), "create_exploration", args)
+            .await
+            .unwrap_err()
+            .to_string()
+    }
+
+    async fn count(db: &Db, sql: &str) -> i64 {
+        sqlx::query_scalar(sql)
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap()
+    }
+
+    fn new_args(key: Option<&str>) -> Value {
+        let mut args = json!({
+            "reason": "idempotency fixture",
+            "exploration": { "create": { "name": "Keyed exploration" } },
+            "candidates": [
+                { "type": "Document", "kind": "note", "name": "A", "body": "a" },
+                { "type": "Document", "kind": "note", "name": "B", "body": "b" },
+            ],
+        });
+        if let Some(key) = key {
+            args.as_object_mut()
+                .unwrap()
+                .insert("idempotency_key".into(), json!(key));
+        }
+        args
+    }
+
+    /// Same key plus same normalized request replays the original receipt:
+    /// same exploration and candidate ids, nothing appended twice, one
+    /// command attestation.
+    #[tokio::test]
+    async fn keyed_retry_replays_original_receipt_and_appends_once() {
+        let db = db().await;
+        let registry = registry();
+        let first = call(&registry, &db, new_args(Some("exploration-key"))).await;
+        let second = call(&registry, &db, new_args(Some("exploration-key"))).await;
+        assert_eq!(first, second, "retry converges on the original receipt");
+        assert_eq!(first["exploration_created"], true);
+        assert_eq!(first["candidates"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            count(
+                &db,
+                "SELECT COUNT(*) FROM records WHERE type='Collection' AND kind='selection'"
+            )
+            .await,
+            1,
+            "exactly one exploration was appended"
+        );
+        assert_eq!(
+            count(
+                &db,
+                "SELECT COUNT(*) FROM records WHERE type='Document' AND kind='note'"
+            )
+            .await,
+            2,
+            "exactly two candidates were appended"
+        );
+        assert_eq!(
+            count(&db, "SELECT COUNT(*) FROM content_events WHERE type='link.added' AND json_extract(payload, '$.relationship')='member_of'").await,
+            2,
+            "exactly two membership links were appended"
+        );
+        assert_eq!(
+            count(
+                &db,
+                "SELECT COUNT(*) FROM provenance_local_attestation_authority WHERE principal='local' AND operation='create_exploration'",
+            )
+            .await,
+            1,
+            "exactly one command attestation was issued"
+        );
+        db.close().await;
+    }
+
+    /// Same key with materially different content is a conflict error, and
+    /// the failed retry appends nothing.
+    #[tokio::test]
+    async fn reused_key_with_different_candidates_conflicts() {
+        let db = db().await;
+        let registry = registry();
+        call(&registry, &db, new_args(Some("conflict-key"))).await;
+        let mut different = new_args(Some("conflict-key"));
+        different["candidates"][0]["body"] = json!("changed");
+        let error = call_err(&registry, &db, different).await;
+        assert!(
+            error.contains("conflicting action input"),
+            "reused key with different content must conflict, got: {error}"
+        );
+        assert_eq!(
+            count(
+                &db,
+                "SELECT COUNT(*) FROM records WHERE type='Collection' AND kind='selection'"
+            )
+            .await,
+            1,
+            "conflicting retry appends no second exploration"
+        );
+        assert_eq!(
+            count(
+                &db,
+                "SELECT COUNT(*) FROM records WHERE type='Document' AND kind='note'"
+            )
+            .await,
+            2,
+            "conflicting retry appends no further candidates"
+        );
+        db.close().await;
+    }
+
+    /// Keyless calls behave exactly as today: every call creates again.
+    #[tokio::test]
+    async fn keyless_repeats_create_again() {
+        let db = db().await;
+        let registry = registry();
+        let first = call(&registry, &db, new_args(None)).await;
+        let second = call(&registry, &db, new_args(None)).await;
+        assert_ne!(
+            first["exploration"]["id"], second["exploration"]["id"],
+            "keyless repeats mint again"
+        );
+        assert_eq!(
+            count(
+                &db,
+                "SELECT COUNT(*) FROM records WHERE type='Collection' AND kind='selection'"
+            )
+            .await,
+            2
+        );
+        db.close().await;
+    }
+
+    /// A keyed call that joins an existing marked selection replays as a
+    /// join: `exploration_created` stays false and no candidate is duplicated.
+    #[tokio::test]
+    async fn keyed_join_of_existing_exploration_replays_as_join() {
+        let db = db().await;
+        let registry = registry();
+        let created = call(&registry, &db, new_args(Some("join-seed"))).await;
+        let exploration_id = created["exploration"]["id"].as_str().unwrap().to_string();
+        let join = json!({
+            "reason": "idempotency fixture",
+            "exploration": { "id": exploration_id },
+            "candidates": [{ "type": "Document", "kind": "note", "name": "C", "body": "c" }],
+            "idempotency_key": "join-key",
+        });
+        let first = call(&registry, &db, join.clone()).await;
+        assert_eq!(first["exploration_created"], false);
+        assert_eq!(first["exploration"]["id"].as_str().unwrap(), exploration_id);
+        let second = call(&registry, &db, join).await;
+        assert_eq!(
+            first, second,
+            "join retry converges on the original receipt"
+        );
+        assert_eq!(
+            count(
+                &db,
+                "SELECT COUNT(*) FROM records WHERE type='Document' AND kind='note'"
+            )
+            .await,
+            3,
+            "seed two plus one joined, never duplicated"
+        );
+        db.close().await;
     }
 }

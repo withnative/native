@@ -36,7 +36,7 @@ use crate::portable_sql::{
 };
 
 use super::lifecycle::{assert_facet_value_predicates, parse_facet_entry, FacetWrite};
-use super::{parse_args, require_record};
+use super::{parse_args, require_record, require_record_in};
 
 /// Cap on `attach_text` payloads — matches the guarded-fetch hard ceiling, so
 /// neither ingestion path can out-size the other.
@@ -68,6 +68,15 @@ struct AttachTextArgs {
     persistence: Option<String>,
     maturity: Option<String>,
     facets: Option<Map<String, Value>>,
+    /// Optional caller-supplied idempotency key for the whole attach call.
+    /// Absent (or blank) means exactly today's behavior. When present, the
+    /// call joins the provenance command-attestation mechanism that
+    /// `create_record` uses: same key plus same normalized request replays
+    /// the original receipt without appending; same key plus a materially
+    /// different request is a conflict error. One key covers the call's whole
+    /// effect — blob row, attachment record, link and facets alike — so no
+    /// per-record identity plumbing is needed and ids stay random.
+    idempotency_key: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -423,6 +432,11 @@ pub(crate) async fn fetch_attachment_from_url(
 
 async fn attach_text(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
     const TOOL: &str = "attach_text";
+    // The provenance digests run over the raw tool arguments: no server-minted
+    // id enters the conflict detector, or every retry would conflict with the
+    // call it repeats. Run-context keys are already stripped by the request
+    // layer before the handler sees them.
+    let provenance_arguments = arguments.clone();
     let args: AttachTextArgs = parse_args(TOOL, arguments)?;
     let record_id = args.record_id;
     let text = args.text;
@@ -431,6 +445,22 @@ async fn attach_text(db: Db, caller: Caller, arguments: Value) -> Result<Value> 
             "{TOOL}: text exceeds the {MAX_ATTACH_TEXT_BYTES} byte cap"
         )));
     }
+    // Only the digest is stored, so an unbounded key is a mild DoS surface:
+    // the same 1..=200 bound `create_record` enforces. Blank stays keyless
+    // rather than erroring — a call with no key behaves as today.
+    if args
+        .idempotency_key
+        .as_deref()
+        .is_some_and(|key| key.len() > 200)
+    {
+        return Err(Error::engine(
+            "attach_text: idempotency_key must be 1..200 characters",
+        ));
+    }
+    let idempotent = args
+        .idempotency_key
+        .as_deref()
+        .is_some_and(|key| !key.trim().is_empty());
     let filename = args.filename;
     let lifecycle = args.lifecycle;
     let owner_id = args.owner_id;
@@ -442,6 +472,25 @@ async fn attach_text(db: Db, caller: Caller, arguments: Value) -> Result<Value> 
         .name
         .or_else(|| filename.clone())
         .unwrap_or_else(|| "attachment".into());
+
+    if idempotent {
+        return attach_text_keyed(
+            &db,
+            &caller,
+            &provenance_arguments,
+            &record_id,
+            text.as_bytes(),
+            Some(&mime),
+            filename.as_deref(),
+            &name,
+            lifecycle.as_deref(),
+            owner_id.as_deref(),
+            persistence.as_deref(),
+            maturity.as_deref(),
+            facets,
+        )
+        .await;
+    }
 
     require_record(&db, &caller, TOOL, &record_id, Capability::Edit).await?;
     // Parent authorization and liveness are enforced again inside
@@ -468,6 +517,274 @@ async fn attach_text(db: Db, caller: Caller, arguments: Value) -> Result<Value> 
         },
     )
     .await
+}
+
+/// Keyed `attach_text`: the whole call — blob row, attachment record, link
+/// and facets — under one idempotency key, using the same provenance
+/// command-attestation mechanism `create_record` uses.
+///
+/// The tentative write below is the validation: it runs the exact domain
+/// fold the first call ran (authorization, bearer liveness, facet
+/// predicates, required checks), so a replay whose bearer has since been
+/// deleted or revoked fails exactly as a first call would. On a hit the
+/// whole tentative transaction — tentative blob row included — is rolled
+/// back and the receipt is rebuilt from the attested command's own outputs,
+/// so a retry appends nothing and leaves no second blob row. Ids stay
+/// random throughout: the attested outputs name the original attachment,
+/// bearer and blob, which still exist because blobs are never hard-deleted.
+#[allow(clippy::too_many_arguments)]
+async fn attach_text_keyed(
+    db: &Db,
+    caller: &Caller,
+    provenance_arguments: &Value,
+    bearer_id: &str,
+    bytes: &[u8],
+    mime: Option<&str>,
+    filename: Option<&str>,
+    name: &str,
+    lifecycle: Option<&str>,
+    owner_id: Option<&str>,
+    persistence: Option<&str>,
+    maturity: Option<&str>,
+    extra_facets: Vec<FacetWrite>,
+) -> Result<Value> {
+    const TOOL: &str = "attach_text";
+    // Advisory preflight, same as the keyless path. The authoritative
+    // authorization and liveness checks rerun inside the write transaction.
+    require_record(db, caller, TOOL, bearer_id, Capability::Edit).await?;
+    // ONE transaction. Everything below either commits together or does not
+    // exist. The reserved action identity is taken before the tentative
+    // write so the miss path commits under one accepted action.
+    let mut tx = crate::db::begin_write(db.write_pool()).await?;
+    let draft = crate::provenance::reserve_action_attestation()?;
+    let tentative = {
+        let mut port = SqliteAttachmentTransaction { db, tx: &mut tx };
+        crate::domain_transaction::create_attachment(
+            &mut port,
+            AttachmentCreate {
+                tool: TOOL,
+                bearer_id,
+                bytes,
+                mime,
+                filename,
+                name,
+                lifecycle,
+                owner_id,
+                persistence,
+                maturity,
+                extra_facets,
+                actor: caller.actor(),
+                credential: caller.credential(),
+                principal: super::principal(caller),
+                attachment_id: None,
+                image_insert: None,
+            },
+        )
+        .await?
+    };
+    // Idempotent replay, after every authorization and validation check and
+    // inside the same BEGIN IMMEDIATE transaction as the mutation — the same
+    // ordering contract `create_record` keeps so the tool cannot become a
+    // command-existence oracle. A reused key with different normalized input
+    // errors out of the lookup below, after an explicit rollback so the
+    // tentative writes read as a rollback on every path, not just the hit.
+    let hit = match crate::provenance::lookup_authorized_command_attestation_in(
+        &mut tx,
+        caller.credential(),
+        TOOL,
+        provenance_arguments,
+        caller.intent(),
+    )
+    .await
+    {
+        Ok(hit) => hit,
+        Err(error) => {
+            tx.rollback().await?;
+            return Err(error);
+        }
+    };
+    if let Some(attestation_id) = hit {
+        let attested = attested_attachment_in(&mut tx, &attestation_id).await?;
+        // Non-disclosure for the outputs: the receipt names the attachment,
+        // its bearer and its blob, so the replaying caller must still view
+        // both records. A caller that lost access gets the opaque denial,
+        // not the receipt.
+        require_record_in(
+            &mut tx,
+            caller,
+            TOOL,
+            &attested.attachment_id,
+            Capability::View,
+        )
+        .await?;
+        require_record_in(&mut tx, caller, TOOL, &attested.bearer_id, Capability::View).await?;
+        tx.rollback().await?;
+        crate::provenance::note_replayed_action_attestation(attestation_id);
+        // Reads happen only after the rollback; holding a second connection
+        // while the write transaction is live is the one deadlock trap here.
+        return read_attested_attachment_receipt(db, caller, &attested).await;
+    }
+
+    crate::provenance::issue_reserved_pending_action_in(&mut tx, draft).await?;
+    db.commit_content(tx).await?;
+    Ok(tentative)
+}
+
+/// The attested command's own outputs: which attachment it created, under
+/// which bearer, pointing at which blob. The blob row itself is not an
+/// attested output — it sits outside the event log — but the `blob_ref`
+/// facet that names it is, and blobs are never hard-deleted, so the row the
+/// facet names is still there to read.
+struct AttestedAttachment {
+    attachment_id: String,
+    bearer_id: String,
+    blob_id: String,
+}
+
+async fn attested_attachment_in(
+    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    attestation_id: &str,
+) -> Result<AttestedAttachment> {
+    let rows = sqlx::query(
+        "SELECT e.type, e.record_id, e.payload FROM provenance_action_outputs o
+           JOIN content_events e ON e.id=o.output_event_id
+          WHERE o.action_attestation_id=? AND o.output_domain='content'
+          ORDER BY o.ordinal",
+    )
+    .bind(attestation_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    let incomplete = || Error::engine("attach_text: idempotent receipt is incomplete");
+    let mut created: Vec<String> = Vec::new();
+    let mut bearers: Vec<(String, String)> = Vec::new();
+    let mut blobs: Vec<(String, String)> = Vec::new();
+    for row in &rows {
+        let event_type: String = row.try_get("type")?;
+        let record_id: String = row.try_get("record_id")?;
+        // Extra caller facets land as further `facet.set` events beside the
+        // `blob_ref` one, so every event is filtered by shape, not position.
+        match event_type.as_str() {
+            "record.created" => created.push(record_id),
+            "link.added" => {
+                let payload: Value = serde_json::from_str(&row.try_get::<String, _>("payload")?)?;
+                if payload.get("relationship").and_then(Value::as_str) != Some("part_of") {
+                    continue;
+                }
+                let source = payload
+                    .get("source_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(incomplete)?;
+                let target = payload
+                    .get("target_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(incomplete)?;
+                bearers.push((source.to_string(), target.to_string()));
+            }
+            "facet.set" => {
+                let payload: Value = serde_json::from_str(&row.try_get::<String, _>("payload")?)?;
+                if payload.get("key").and_then(Value::as_str)
+                    != Some(crate::blob::BLOB_REF_FACET_KEY)
+                {
+                    continue;
+                }
+                let blob_id = payload
+                    .get("value")
+                    .and_then(Value::as_str)
+                    .ok_or_else(incomplete)?;
+                blobs.push((record_id, blob_id.to_string()));
+            }
+            _ => {}
+        }
+    }
+    // This operation appends exactly one of each: one attachment record, one
+    // `part_of` link onto its bearer, one `blob_ref` facet. Anything else
+    // means the attestation does not describe this command. This couples to
+    // `create_attachment`'s current shape on purpose: if that fold ever gains
+    // a second link or facet, this fails closed with "receipt is incomplete"
+    // rather than guessing which output names the blob.
+    if created.len() != 1 || bearers.len() != 1 || blobs.len() != 1 {
+        return Err(incomplete());
+    }
+    let attachment_id = created.pop().expect("exactly one record.created");
+    let (link_source, bearer_id) = bearers.pop().expect("exactly one part_of link");
+    let (facet_record, blob_id) = blobs.pop().expect("exactly one blob_ref facet");
+    if link_source != attachment_id || facet_record != attachment_id {
+        return Err(incomplete());
+    }
+    Ok(AttestedAttachment {
+        attachment_id,
+        bearer_id,
+        blob_id,
+    })
+}
+
+/// Rebuild the first call's receipt from the attested outputs: the original
+/// attachment id and bearer, the live record name, and the ORIGINAL blob
+/// metadata — read from the still-present blob row, never from a tentative
+/// insert, so a retry returns the same blob id rather than minting a twin.
+async fn read_attested_attachment_receipt(
+    db: &Db,
+    caller: &Caller,
+    attested: &AttestedAttachment,
+) -> Result<Value> {
+    const TOOL: &str = "attach_text";
+    // Re-check after the rollback: the in-transaction View checks ran before
+    // it, so a concurrent tombstone or revocation in between must not yield
+    // a receipt. A miss maps to the same opaque denial the sibling
+    // `create_exploration` replay uses — a caller who has lost access must
+    // not learn the attachment still exists.
+    //
+    // Liveness is explicit rather than folded into `require_record`: that
+    // gate passes tombstoned ordinary records for shape-valid callers, so a
+    // detached attachment would otherwise present as live.
+    let live: Option<Option<String>> =
+        sqlx::query_scalar("SELECT deleted_at FROM records WHERE id=?")
+            .bind(&attested.attachment_id)
+            .fetch_optional(db.write_pool())
+            .await?;
+    if !matches!(live, Some(None)) {
+        return Err(Error::engine(format!(
+            "{TOOL}: record {} does not exist",
+            attested.attachment_id
+        )));
+    }
+    let bearer_live: Option<Option<String>> =
+        sqlx::query_scalar("SELECT deleted_at FROM records WHERE id=?")
+            .bind(&attested.bearer_id)
+            .fetch_optional(db.write_pool())
+            .await?;
+    if !matches!(bearer_live, Some(None)) {
+        return Err(Error::engine(format!(
+            "{TOOL}: record {} does not exist",
+            attested.bearer_id
+        )));
+    }
+    require_record(db, caller, TOOL, &attested.attachment_id, Capability::View).await?;
+    require_record(db, caller, TOOL, &attested.bearer_id, Capability::View).await?;
+    let name: Option<String> = sqlx::query_scalar("SELECT name FROM records WHERE id=?")
+        .bind(&attested.attachment_id)
+        .fetch_optional(db.write_pool())
+        .await?;
+    let Some(name) = name else {
+        return Err(Error::engine(format!(
+            "{TOOL}: record {} does not exist",
+            attested.attachment_id
+        )));
+    };
+    let meta = crate::blob::get_meta(db, &attested.blob_id)
+        .await?
+        .ok_or_else(|| {
+            Error::engine(format!(
+                "{TOOL}: blob {} referenced by attachment {} does not exist",
+                attested.blob_id, attested.attachment_id
+            ))
+        })?;
+    Ok(json!({
+        "attachment_id": attested.attachment_id,
+        "record_id": attested.bearer_id,
+        "name": name,
+        "blob": meta,
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -767,7 +1084,11 @@ pub fn register_attachment_tools_with(
                     "type": "object",
                     "description": "Open facets on the attachment record: key → string/number value or { value, vocab_ref }. Preserve JSON numbers for facets declared type:number. Engine-reserved and spine facets are refused.",
                     "additionalProperties": true
-                }
+                },
+                // Bare, like the `create_record` key: the Rust field comment
+                // carries the semantics, and the federated-lens Focused
+                // descriptor budget is binding down to the byte.
+                "idempotency_key": { "type": "string" }
             },
             "required": ["record_id", "text"],
             "additionalProperties": false
@@ -1144,5 +1465,289 @@ mod transaction_tests {
         .await
         .unwrap();
         assert_eq!(deletes, 1);
+    }
+}
+
+#[cfg(test)]
+mod idempotency_tests {
+    use super::*;
+
+    const PARENT_ID: &str = "a77ac000-0000-4000-8000-000000000011";
+
+    async fn db() -> Db {
+        let db = crate::create_database(":memory:").await.unwrap();
+        crate::meta::seed_vocabularies(&db).await.unwrap();
+        db
+    }
+
+    fn registry() -> crate::mcp::ToolRegistry {
+        let mut registry = crate::mcp::ToolRegistry::new();
+        crate::mcp::register_surface_tools(&mut registry).unwrap();
+        registry
+    }
+
+    async fn parent(db: &Db) {
+        crate::store::create_record(
+            db,
+            json!({ "id": PARENT_ID, "type": "Collection", "kind": "folder", "name": PARENT_ID }),
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn call(registry: &crate::mcp::ToolRegistry, db: &Db, tool: &str, args: Value) -> Value {
+        registry
+            .call(db.clone(), Caller::local(), tool, args)
+            .await
+            .unwrap()
+    }
+
+    async fn call_err(
+        registry: &crate::mcp::ToolRegistry,
+        db: &Db,
+        tool: &str,
+        args: Value,
+    ) -> String {
+        registry
+            .call(db.clone(), Caller::local(), tool, args)
+            .await
+            .unwrap_err()
+            .to_string()
+    }
+
+    async fn count(db: &Db, sql: &str) -> i64 {
+        sqlx::query_scalar(sql)
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap()
+    }
+
+    fn attach_args(key: Option<&str>) -> Value {
+        let mut args = json!({
+            "record_id": PARENT_ID,
+            "text": "keyed bytes",
+            "filename": "keyed.txt",
+            // An extra caller facet rides beside `blob_ref` as a further
+            // `facet.set` output, so the replay path must pick the blob by
+            // facet shape rather than by position.
+            "facets": { "replay_tag": "keep" },
+        });
+        if let Some(key) = key {
+            args.as_object_mut()
+                .unwrap()
+                .insert("idempotency_key".into(), json!(key));
+        }
+        args
+    }
+
+    /// Same key plus same normalized request replays the original receipt —
+    /// same attachment id, same blob id — and appends nothing: one blob
+    /// row, one attachment record, one command attestation.
+    #[tokio::test]
+    async fn keyed_retry_returns_original_attachment_and_single_blob() {
+        let db = db().await;
+        parent(&db).await;
+        let registry = registry();
+        let first = call(
+            &registry,
+            &db,
+            "attach_text",
+            attach_args(Some("attach-key")),
+        )
+        .await;
+        let second = call(
+            &registry,
+            &db,
+            "attach_text",
+            attach_args(Some("attach-key")),
+        )
+        .await;
+        assert_eq!(first, second, "retry converges on the original receipt");
+        assert_eq!(
+            first["attachment_id"].as_str().unwrap(),
+            second["attachment_id"].as_str().unwrap()
+        );
+        assert_eq!(
+            first["blob"]["id"].as_str().unwrap(),
+            second["blob"]["id"].as_str().unwrap(),
+            "replay reads the original blob row, never a tentative twin"
+        );
+        assert_eq!(first["record_id"].as_str().unwrap(), PARENT_ID);
+        assert_eq!(count(&db, "SELECT COUNT(*) FROM blobs").await, 1);
+        assert_eq!(
+            count(
+                &db,
+                "SELECT COUNT(*) FROM records WHERE type='Document' AND kind='attachment'"
+            )
+            .await,
+            1
+        );
+        assert_eq!(
+            count(
+                &db,
+                "SELECT COUNT(*) FROM content_events WHERE type='record.created' AND json_extract(payload, '$.kind')='attachment'"
+            )
+            .await,
+            1
+        );
+        assert_eq!(
+            count(
+                &db,
+                "SELECT COUNT(*) FROM provenance_local_attestation_authority WHERE principal='local' AND operation='attach_text'",
+            )
+            .await,
+            1,
+            "exactly one command attestation was issued"
+        );
+        db.close().await;
+    }
+
+    /// Same key with different bytes is a conflict error, and the failed
+    /// retry leaves no second blob row behind.
+    #[tokio::test]
+    async fn reused_key_with_different_text_conflicts() {
+        let db = db().await;
+        parent(&db).await;
+        let registry = registry();
+        call(
+            &registry,
+            &db,
+            "attach_text",
+            attach_args(Some("attach-conflict")),
+        )
+        .await;
+        let mut different = attach_args(Some("attach-conflict"));
+        different["text"] = json!("different bytes");
+        let error = call_err(&registry, &db, "attach_text", different).await;
+        assert!(
+            error.contains("conflicting action input"),
+            "reused key with different content must conflict, got: {error}"
+        );
+        assert_eq!(count(&db, "SELECT COUNT(*) FROM blobs").await, 1);
+        assert_eq!(
+            count(
+                &db,
+                "SELECT COUNT(*) FROM records WHERE type='Document' AND kind='attachment'"
+            )
+            .await,
+            1
+        );
+        db.close().await;
+    }
+
+    /// Keyless calls behave exactly as today: every call mints again, blob
+    /// row included.
+    #[tokio::test]
+    async fn keyless_repeats_mint_again() {
+        let db = db().await;
+        parent(&db).await;
+        let registry = registry();
+        let first = call(&registry, &db, "attach_text", attach_args(None)).await;
+        let second = call(&registry, &db, "attach_text", attach_args(None)).await;
+        assert_ne!(
+            first["attachment_id"], second["attachment_id"],
+            "keyless repeats mint again"
+        );
+        assert_ne!(
+            first["blob"]["id"], second["blob"]["id"],
+            "keyless repeats write a fresh blob row each time"
+        );
+        assert_eq!(count(&db, "SELECT COUNT(*) FROM blobs").await, 2);
+        db.close().await;
+    }
+
+    /// A replay whose bearer has since been deleted fails exactly as a
+    /// first call would — the tentative fold reruns every guard — and the
+    /// rolled-back tentative blob leaves no orphan row. The bearer is a
+    /// Document (homed in the folder) rather than the folder itself, so
+    /// deleting it is not blocked by the attachment homed beside it.
+    #[tokio::test]
+    async fn replay_after_bearer_deleted_fails_closed_and_leaves_no_blob() {
+        let db = db().await;
+        parent(&db).await;
+        let registry = registry();
+        let bearer = call(
+            &registry,
+            &db,
+            "create_record",
+            json!({
+                "type": "Document",
+                "kind": "note",
+                "name": "bearer",
+                "home_id": PARENT_ID,
+                "reason": "fail-closed fixture",
+            }),
+        )
+        .await["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let mut args = attach_args(Some("attach-stale"));
+        args["record_id"] = json!(bearer);
+        call(&registry, &db, "attach_text", args.clone()).await;
+        call(
+            &registry,
+            &db,
+            "delete_record",
+            json!({ "id": bearer, "reason": "fail-closed fixture" }),
+        )
+        .await;
+        let error = call_err(&registry, &db, "attach_text", args).await;
+        assert!(
+            error.contains("tombstoned") || error.contains("does not exist"),
+            "replay under a deleted bearer must fail closed, got: {error}"
+        );
+        assert_eq!(
+            count(&db, "SELECT COUNT(*) FROM blobs").await,
+            1,
+            "the rolled-back tentative blob leaves no orphan row"
+        );
+        assert_eq!(
+            count(
+                &db,
+                "SELECT COUNT(*) FROM records WHERE type='Document' AND kind='attachment'"
+            )
+            .await,
+            1
+        );
+        db.close().await;
+    }
+
+    /// The post-rollback receipt read re-checks View and liveness: a detached
+    /// attachment is refused with the opaque denial rather than returned as
+    /// live, and a full replay fails closed the same way.
+    #[tokio::test]
+    async fn attested_receipt_read_refuses_detached_attachment() {
+        let db = db().await;
+        parent(&db).await;
+        let registry = registry();
+        let args = attach_args(Some("attach-detach"));
+        let first = call(&registry, &db, "attach_text", args.clone()).await;
+        let attested = AttestedAttachment {
+            attachment_id: first["attachment_id"].as_str().unwrap().to_string(),
+            bearer_id: PARENT_ID.to_string(),
+            blob_id: first["blob"]["id"].as_str().unwrap().to_string(),
+        };
+        call(
+            &registry,
+            &db,
+            "manage_attachments",
+            json!({ "action": "detach", "attachment_id": attested.attachment_id }),
+        )
+        .await;
+        let error = read_attested_attachment_receipt(&db, &Caller::local(), &attested)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("does not exist"),
+            "detached attachment must map to the opaque denial, got: {error}"
+        );
+        let replay = call_err(&registry, &db, "attach_text", args).await;
+        assert!(
+            replay.contains("does not exist"),
+            "replay of a detached attachment must fail closed, got: {replay}"
+        );
+        db.close().await;
     }
 }

@@ -38,6 +38,16 @@ const WRITE_TOOL: &str = "manage_canvas";
 const DEFAULT_CHANGES_LIMIT: usize = 200;
 const MAX_CHANGES_LIMIT: usize = 200;
 
+/// The `read_canvas.export` envelope version: one document carrying the
+/// canvas shell, the scene, the full history and the derived references.
+pub const EXPORT_VERSION: &str = "native.canvas-export.v1";
+/// Refuse an export whose canonical bytes exceed this; `changes` paging is
+/// the fallback. 8 MiB keeps one document well inside tool result budgets.
+pub const EXPORT_MAX_BYTES: usize = 8 * 1024 * 1024;
+/// Refuse an export whose history exceeds this many batches; `changes`
+/// paging (or `include_history: false` for shell + scene) is the fallback.
+pub const EXPORT_MAX_BATCHES: usize = 10_000;
+
 /// At most this many objects in one promotion plan. Deliberately far below the
 /// batch op limit: a promotion mints records, and a plan a person is expected
 /// to review should stay reviewable.
@@ -99,6 +109,11 @@ enum ReadCanvasArgs {
     Describe {
         canvas_id: String,
     },
+    Export {
+        canvas_id: String,
+        #[serde(default)]
+        include_history: Option<bool>,
+    },
 }
 
 #[derive(Deserialize)]
@@ -148,12 +163,31 @@ fn referenced_record_ids(objects: &[Value], ops: &[Op]) -> Vec<String> {
         }
     }
     for op in ops {
-        if let Op::Create { object } = op {
-            if object.kind == ObjectKind::RecordCard {
+        match op {
+            Op::Create { object } if object.kind == ObjectKind::RecordCard => {
                 if let Some(id) = record_id_of_card(&object.props) {
                     ids.insert(id.to_owned());
                 }
             }
+            // A promotion binds a record to an existing object by patching
+            // `record_id` and `promoted_from` in, so the id it discloses
+            // never appears in a create. Harvesting only creates left every
+            // promotion patch over-redacted: the id was absent from the
+            // candidate set, so `withhold_record_reference` read it as not
+            // visible and withheld it even from the record's owner, which
+            // both dropped provenance from history and falsified
+            // `disclosure.complete`. Harvesting here cannot widen what is
+            // disclosed: this list is only the set of ids worth asking
+            // about, and `visible_ids_preloaded_in` still decides each one
+            // against the caller's View.
+            Op::Patch { set, .. } => {
+                if let Some(props) = set.props.as_ref() {
+                    if let Some(id) = record_id_of_card(props) {
+                        ids.insert(id.to_owned());
+                    }
+                }
+            }
+            _ => {}
         }
     }
     ids.into_iter().collect()
@@ -300,12 +334,17 @@ async fn resolve_connector_semantics(
 }
 
 fn withhold_record_reference(props: &mut Map<String, Value>, visible: &HashSet<String>) {
-    let visible_record = props
-        .get("record_id")
+    let record = props.get("record_id");
+    let visible_record = record
         .and_then(Value::as_str)
         .is_some_and(|id| visible.contains(id));
     if !visible_record {
-        if props.contains_key("record_id") {
+        // A `record_id` that is present but null names no record at all: a
+        // promotion's pre-image says "this object had no record before".
+        // Writing `withheld` over it claimed to be hiding an id that never
+        // existed, which cost the reader provenance and falsified
+        // `disclosure.complete` without protecting anything.
+        if record.is_some_and(|value| !value.is_null()) {
             props.insert("record_id".into(), Value::String(WITHHELD.into()));
         }
         props.remove("promoted_from");
@@ -480,6 +519,17 @@ async fn read_canvas(db: Db, caller: Caller, mut arguments: Value) -> Result<Val
                 .unwrap_or(canvas::CanvasVersion(0));
             Ok(canvas::describe_scene(&canvas_id, version, &objects))
         }
+        ReadCanvasArgs::Export {
+            canvas_id,
+            include_history,
+        } => {
+            if as_of.is_some() {
+                return Err(Error::engine(
+                    "read_canvas: as_of applies to get_scene only; export bundles the current scene",
+                ));
+            }
+            export_bundle(&db, &caller, &canvas_id, include_history.unwrap_or(true)).await
+        }
     }
 }
 
@@ -495,11 +545,36 @@ async fn get_scene(
     resolved_content_seq: Option<i64>,
 ) -> Result<Value> {
     let mut tx = db.write_pool().begin().await?;
-    require_canvas_in(&mut tx, caller, READ_TOOL, canvas_id, Capability::View).await?;
+    let output = get_scene_in(
+        &mut tx,
+        scene_source,
+        caller,
+        canvas_id,
+        include_deleted,
+        resolved_content_seq,
+    )
+    .await?;
+    tx.rollback().await?;
+    Ok(output)
+}
+
+/// The scene read against an existing transaction. The public `get_scene`
+/// opens the transaction and delegates; export opens one transaction for the
+/// scene and the history together and calls this, so the bundle cannot
+/// straddle a concurrent commit and so redaction lives in exactly one place.
+async fn get_scene_in(
+    tx: &mut Transaction<'_, Sqlite>,
+    scene_source: Option<&Db>,
+    caller: &Caller,
+    canvas_id: &str,
+    include_deleted: bool,
+    resolved_content_seq: Option<i64>,
+) -> Result<Value> {
+    require_canvas_in(&mut *tx, caller, READ_TOOL, canvas_id, Capability::View).await?;
     let (objects, version) = match scene_source {
         None => (
-            canvas::load_scene(&mut tx, canvas_id, include_deleted).await?,
-            canvas::current_version(&mut tx, canvas_id).await?,
+            canvas::load_scene(&mut *tx, canvas_id, include_deleted).await?,
+            canvas::current_version(&mut *tx, canvas_id).await?,
         ),
         Some(scratch) => {
             let mut historical = scratch.write_pool().begin().await?;
@@ -511,10 +586,10 @@ async fn get_scene(
     };
     let mut values: Vec<Value> = objects.iter().map(SceneObject::to_value).collect();
     let referenced = referenced_record_ids(&values, &[]);
-    let visible = visible_ids_preloaded_in(&mut tx, caller, &referenced).await?;
+    let visible = visible_ids_preloaded_in(&mut *tx, caller, &referenced).await?;
     let mut faces = HashMap::new();
     for id in &visible {
-        if let Some(face) = record_face(&mut tx, id).await? {
+        if let Some(face) = record_face(&mut *tx, id).await? {
             faces.insert(id.clone(), face);
         }
     }
@@ -534,8 +609,7 @@ async fn get_scene(
     for object in &mut values {
         redact_object(object, &visible, &faces);
     }
-    resolve_connector_semantics(&mut tx, &mut values, &cards, &visible).await?;
-    tx.rollback().await?;
+    resolve_connector_semantics(&mut *tx, &mut values, &cards, &visible).await?;
     let live = values
         .iter()
         .filter(|object| object.get("deleted") == Some(&Value::Bool(false)))
@@ -564,6 +638,8 @@ async fn changes(
     after: &str,
     limit: Option<usize>,
 ) -> Result<Value> {
+    // Validated before the transaction: a junk token or range must never
+    // check out a write-pool connection just to drop it.
     let Some(after) = CanvasVersion::parse(after) else {
         return Err(Error::engine(
             "read_canvas: after must be a canvas:N token (canvas:0 for full history)",
@@ -576,17 +652,34 @@ async fn changes(
         )));
     }
     let mut tx = db.write_pool().begin().await?;
-    require_canvas_in(&mut tx, caller, READ_TOOL, canvas_id, Capability::View).await?;
-    let head = canvas::current_version(&mut tx, canvas_id).await?;
+    let output = changes_in(&mut tx, caller, canvas_id, after, limit).await?;
+    tx.rollback().await?;
+    Ok(output)
+}
+
+/// The history read against an existing transaction. The public `changes`
+/// validates and opens the transaction, then delegates; export pages
+/// through this on its own single transaction with its own already-valid
+/// values, so every batch is redacted by this one function and the bundle
+/// shares the scene's snapshot.
+async fn changes_in(
+    tx: &mut Transaction<'_, Sqlite>,
+    caller: &Caller,
+    canvas_id: &str,
+    after: CanvasVersion,
+    limit: usize,
+) -> Result<Value> {
+    require_canvas_in(tx, caller, READ_TOOL, canvas_id, Capability::View).await?;
+    let head = canvas::current_version(&mut *tx, canvas_id).await?;
     let rows = sqlx::query(
         "SELECT b.batch_id,b.actor,b.event_id,b.event_seq,e.payload,e.created_at
            FROM canvas_batches b JOIN content_events e ON e.id=b.event_id
-          WHERE b.canvas_id=? AND b.event_seq>? ORDER BY b.event_seq LIMIT ?",
+           WHERE b.canvas_id=? AND b.event_seq>? ORDER BY b.event_seq LIMIT ?",
     )
     .bind(canvas_id)
     .bind(after.0)
     .bind(limit as i64 + 1)
-    .fetch_all(&mut *tx)
+    .fetch_all(&mut **tx)
     .await?;
     let more = rows.len() > limit;
     let mut batches = Vec::with_capacity(rows.len().min(limit));
@@ -614,9 +707,8 @@ async fn changes(
         ));
     }
     let referenced = referenced.into_iter().collect::<Vec<_>>();
-    let visible = visible_ids_preloaded_in(&mut tx, caller, &referenced).await?;
-    let disclosed = disclosed_actors(&mut tx, caller, actors).await?;
-    tx.rollback().await?;
+    let visible = visible_ids_preloaded_in(&mut *tx, caller, &referenced).await?;
+    let disclosed = disclosed_actors(&mut *tx, caller, actors).await?;
     let batches = batches
         .into_iter()
         .map(|(batch_id, actor, event_id, event_seq, at, stored)| {
@@ -654,6 +746,294 @@ async fn changes(
         "more": more,
         "next_after": next_after,
     }))
+}
+
+// ---- read_canvas export ----------------------------------------------------
+//
+// `read_canvas.export`: one document bundling the canvas shell, the scene,
+// the full history and the derived references.
+//
+// The scene and history sections are built by CALLING `get_scene_in` and
+// `changes_in` on a single transaction, so the bundle shares one snapshot
+// (it cannot straddle a concurrent commit) and inherits their redaction
+// structurally rather than through a second copy of the rules.
+async fn export_bundle(
+    db: &Db,
+    caller: &Caller,
+    canvas_id: &str,
+    include_history: bool,
+) -> Result<Value> {
+    let mut tx = db.write_pool().begin().await?;
+    // One explicit rollback for every exit: the body below returns through
+    // `?` in several places, and a transaction closed by drop costs the
+    // pool a reconnect instead of a reuse. The export holds its connection
+    // across the whole page loop, so it is the one worth tidying — same
+    // shape as the `as_of` branch's scratch handling above.
+    let result = export_bundle_in(&mut tx, caller, canvas_id, include_history).await;
+    tx.rollback().await?;
+    result
+}
+
+/// The export read against an existing transaction: scene plus history from
+/// one snapshot via `get_scene_in` and `changes_in`, with derived
+/// references and disclosure. The wrapper above owns the single rollback.
+async fn export_bundle_in(
+    tx: &mut Transaction<'_, Sqlite>,
+    caller: &Caller,
+    canvas_id: &str,
+    include_history: bool,
+) -> Result<Value> {
+    // The scene first: its inner require authenticates the canvas with the
+    // same non-existent-record refusal `get_scene` gives.
+    let scene_envelope = get_scene_in(&mut *tx, None, caller, canvas_id, true, None).await?;
+    let objects = scene_envelope
+        .get("objects")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let canvas_version = scene_envelope
+        .get("canvas_version")
+        .and_then(Value::as_str)
+        .unwrap_or("canvas:0")
+        .to_owned();
+
+    // The canvas shell, read live as the caller on the same snapshot.
+    let shell =
+        sqlx::query("SELECT name,summary,home_id FROM records WHERE id=? AND deleted_at IS NULL")
+            .bind(canvas_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+    let Some(shell) = shell else {
+        return Err(Error::engine(format!(
+            "{READ_TOOL}: record {canvas_id} does not exist"
+        )));
+    };
+    let name: String = shell.try_get("name")?;
+    let summary: Option<String> = shell.try_get("summary")?;
+    let home_id: Option<String> = shell.try_get("home_id")?;
+    let archived: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM facet_values WHERE record_id=? AND key=?)")
+            .bind(canvas_id)
+            .bind(crate::schema::ARCHIVED_FACET_KEY)
+            .fetch_one(&mut **tx)
+            .await?;
+    let head: Option<i64> =
+        sqlx::query_scalar("SELECT MAX(seq) FROM content_events WHERE record_id=?")
+            .bind(canvas_id)
+            .fetch_one(&mut **tx)
+            .await?;
+    let record_version = format!("rec:{}", head.unwrap_or(0));
+    // `canvas.home_id` reads as the id only for a caller who holds View on
+    // the home; otherwise the literal, and the bundle is not complete.
+    let (home_value, home_withheld) = match home_id {
+        None => (Value::Null, false),
+        Some(home) => {
+            if super::can_record_in(&mut *tx, caller, &home, Capability::View).await? {
+                (Value::String(home), false)
+            } else {
+                (Value::String(WITHHELD.into()), true)
+            }
+        }
+    };
+    let exported_by = super::history::disclosed_actor_identity_in(&mut *tx, caller, caller.actor())
+        .await?
+        .map(|(id, display_name)| json!({ "id": id, "display_name": display_name }))
+        .unwrap_or(Value::Null);
+    let exported_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+
+    // The history pages through `changes_in` on this same transaction, so
+    // every batch carries exactly the `changes` batch shape and redaction.
+    // The cursor is already a validated version: the public `changes`
+    // validates before it ever opens a transaction, and here there is no
+    // client-supplied token at all — `next_after` round-trips from the
+    // page this same function just built.
+    let mut batches_all: Vec<Value> = Vec::new();
+    if include_history {
+        let mut after = CanvasVersion(0);
+        loop {
+            let page = changes_in(&mut *tx, caller, canvas_id, after, MAX_CHANGES_LIMIT).await?;
+            let more = page.get("more").and_then(Value::as_bool).unwrap_or(false);
+            let next_after = page
+                .get("next_after")
+                .and_then(Value::as_str)
+                .and_then(CanvasVersion::parse)
+                .unwrap_or(CanvasVersion(0));
+            if let Some(batches) = page.get("batches").and_then(Value::as_array) {
+                batches_all.extend(batches.iter().cloned());
+            }
+            if batches_all.len() > EXPORT_MAX_BATCHES {
+                let count = batches_all.len();
+                return Err(Error::engine(format!(
+                    "read_canvas: export exceeds export_batches ({count} > {EXPORT_MAX_BATCHES}); \
+                     page history with read_canvas changes instead, or request \
+                     include_history:false for shell+scene"
+                )));
+            }
+            if !more {
+                break;
+            }
+            after = next_after;
+        }
+    }
+    let history = if include_history {
+        json!({ "version": CHANGES_VERSION, "batches": batches_all })
+    } else {
+        Value::Null
+    };
+
+    // References are derived from the redacted scene, never stored.
+    // Withheld entries are counted in `disclosure`, never listed.
+    let mut record_names: BTreeMap<String, Value> = BTreeMap::new();
+    let mut withheld_records: i64 = 0;
+    let mut withheld_assertions: i64 = 0;
+    let mut link_entries: BTreeMap<String, String> = BTreeMap::new();
+    let mut attestations: BTreeSet<String> = BTreeSet::new();
+    for object in &objects {
+        let kind = object.get("kind").and_then(Value::as_str).unwrap_or("");
+        if kind == "record_card" {
+            match object.pointer("/props/record_id").and_then(Value::as_str) {
+                Some(id) if id == WITHHELD => withheld_records += 1,
+                Some(id) => {
+                    let entry = record_names.entry(id.to_owned()).or_insert_with(|| {
+                        object
+                            .pointer("/record/name")
+                            .cloned()
+                            .unwrap_or(Value::String(String::new()))
+                    });
+                    // Prefer a real name when the first card seen for an id
+                    // carried none and a later one names it.
+                    if !entry.is_string() || entry.as_str() == Some("") {
+                        if let Some(name) = object.pointer("/record/name").cloned() {
+                            if name.is_string() && name.as_str() != Some("") {
+                                *entry = name;
+                            }
+                        }
+                    }
+                    if let Some(att) = object
+                        .pointer("/props/promoted_from/attestation_id")
+                        .and_then(Value::as_str)
+                    {
+                        attestations.insert(att.to_owned());
+                    }
+                }
+                None => {}
+            }
+        } else if kind == "connector" {
+            match object.pointer("/props/semantic") {
+                Some(Value::String(marker)) if marker.as_str() == WITHHELD => {
+                    withheld_assertions += 1;
+                }
+                Some(Value::Object(semantic))
+                    if semantic.get("status").and_then(Value::as_str) == Some("asserted") =>
+                {
+                    if let (Some(link_id), Some(relationship)) = (
+                        semantic.get("link_id").and_then(Value::as_str),
+                        semantic.get("relationship").and_then(Value::as_str),
+                    ) {
+                        link_entries.insert(link_id.to_owned(), relationship.to_owned());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let history_withheld = include_history && batches_all.iter().any(batch_has_caller_withheld);
+    let complete =
+        withheld_records == 0 && withheld_assertions == 0 && !home_withheld && !history_withheld;
+
+    let references = json!({
+        "records": record_names
+            .iter()
+            .map(|(id, name)| json!({ "id": id, "name": name }))
+            .collect::<Vec<_>>(),
+        "links": link_entries
+            .iter()
+            .map(|(id, relationship)| json!({ "id": id, "relationship": relationship }))
+            .collect::<Vec<_>>(),
+        "attestations": attestations.into_iter().collect::<Vec<_>>(),
+    });
+    let document = json!({
+        "action": "export",
+        "version": EXPORT_VERSION,
+        "exported_at": exported_at,
+        "exported_by": exported_by,
+        "canvas": {
+            "id": canvas_id,
+            "type": "Document",
+            "kind": "canvas",
+            "name": name,
+            "summary": summary,
+            "home_id": home_value,
+            "archived": archived,
+            "record_version": record_version,
+        },
+        "canvas_version": canvas_version,
+        "scene": { "version": SCENE_VERSION, "objects": objects },
+        "history": history,
+        "references": references,
+        "disclosure": {
+            "withheld_records": withheld_records,
+            "withheld_assertions": withheld_assertions,
+            "complete": complete,
+        },
+        "limits": {
+            "ops_per_batch": canvas::MAX_OPS_PER_BATCH,
+            "batch_bytes": canvas::MAX_BATCH_CANONICAL_BYTES,
+            "live_objects": canvas::MAX_LIVE_OBJECTS,
+            "export_bytes": EXPORT_MAX_BYTES,
+            "export_batches": EXPORT_MAX_BATCHES,
+        },
+    });
+    let bytes = crate::canonical_json::canonical_json(&document).len();
+    if bytes > EXPORT_MAX_BYTES {
+        return Err(Error::engine(format!(
+            "read_canvas: export exceeds export_bytes ({bytes} > {EXPORT_MAX_BYTES} canonical bytes); \
+             page history with read_canvas changes instead, or request \
+             include_history:false for shell+scene"
+        )));
+    }
+    Ok(document)
+}
+
+/// True when a redacted `changes` batch withholds something caller-specific:
+/// a `record_id` reading `"withheld"`. A `promoted_from` stripped for the
+/// same reason always accompanies such a `record_id`
+/// (`withhold_record_reference` removes both together), so the `record_id`
+/// check covers it.
+///
+/// Deliberately NOT counted: a connector `semantic` reading `"withheld"` in
+/// history. The feed withholds `semantic` whole and unconditionally for
+/// every caller — an op carries no endpoint context on which to resolve
+/// View — so counting it would mark `complete: false` on any canvas that
+/// ever had an asserted connector, for everyone including the owner, and
+/// the flag would stop distinguishing anything. The bundle stays
+/// self-sufficient without it: the SCENE carries the visible `semantic`,
+/// and replaying an assertion batch requires restoring that value from the
+/// bundle's own scene first — `apply_batch` only stores what the ops carry
+/// (and `validate_props` refuses the literal `"withheld"` under both
+/// authorities), so an assertion batch exported verbatim cannot be
+/// re-folded at all. The SCENE-level withheld `semantic` still counts
+/// through `withheld_assertions`, because `resolve_connector_semantics`
+/// withholds it only when the caller cannot see both endpoint records,
+/// which IS caller-specific.
+fn batch_has_caller_withheld(batch: &Value) -> bool {
+    if let Some(ops) = batch.get("ops").and_then(Value::as_array) {
+        for op in ops {
+            for pointer in ["/object/props/record_id", "/set/props/record_id"] {
+                if op.pointer(pointer).and_then(Value::as_str) == Some(WITHHELD) {
+                    return true;
+                }
+            }
+        }
+    }
+    if let Some(pre_images) = batch.get("pre_images").and_then(Value::as_object) {
+        for entry in pre_images.values() {
+            if entry.pointer("/props/record_id").and_then(Value::as_str) == Some(WITHHELD) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 // ---- manage_canvas -------------------------------------------------------
@@ -2485,16 +2865,18 @@ pub fn register_canvas_tools(registry: &mut ToolRegistry) -> Result<()> {
     registry.register(
         ToolKind::ReadCanvas,
         "Read a Document kind:canvas: the scene (get_scene), accepted batches after a \
-         canvas:N version (changes), or a prose outline (describe). Cards resolve as the \
+         canvas:N version (changes), a prose outline (describe), or one export bundle \
+         (export: scene plus full history). Cards resolve as the \
          caller; withheld records read \"withheld\". View required.",
         json!({
             "type": "object",
             "properties": {
-                "action": { "type": "string", "enum": ["get_scene", "changes", "describe"] },
+                "action": { "type": "string", "enum": ["get_scene", "changes", "describe", "export"] },
                 "canvas_id": { "type": "string" },
                 "include_deleted": { "type": "boolean", "description": "get_scene: with tombstones." },
                 "after": { "type": "string", "description": "changes: after canvas:N." },
                 "limit": { "type": "integer", "minimum": 1, "maximum": 200, "default": 200 },
+                "include_history": { "type": "boolean", "description": "export: with history; false gives shell+scene." },
                 "as_of": lens::as_of_input_schema()
             },
             "required": ["action", "canvas_id"],

@@ -823,6 +823,31 @@ fn ephemeral_file() -> Result<(String, Arc<TempDir>)> {
     Ok((path.to_string_lossy().into_owned(), Arc::new(dir)))
 }
 
+/// Cap the on-disk write-ahead log at 64 MiB.
+///
+/// SQLite's default is no limit: a checkpoint resets the WAL and lets the next
+/// writer reuse the file from the start, but never shrinks it, so the file
+/// keeps whatever size its busiest moment demanded for the lifetime of the
+/// database. Measured on the production volume on 5 Sep 2026, the Native HQ
+/// WAL sat at 689 MiB beside a 3.21 GiB database — unchanging in size across
+/// samples a minute apart while its mtime advanced with every one, which is
+/// the signature of a WAL that is cycling correctly inside a file nothing ever
+/// truncates.
+///
+/// With this limit set, the file comes back down on the first write
+/// transaction *after* a checkpoint resets the WAL — not on the checkpoint
+/// itself, which leaves the file at full size. Do not read a still-large WAL
+/// immediately after forcing a checkpoint as this setting having failed; an
+/// idle database keeps the oversized file until something writes again. The
+/// limit also does not prevent regrowth during a burst. It stops a peak from
+/// becoming permanent, which is all it is for.
+///
+/// 64 MiB is deliberate headroom, not a target. The default autocheckpoint
+/// fires every 1000 pages (~4 MiB at this page size), so a healthy WAL sits
+/// far below the limit and never pays for a truncation; the limit exists to
+/// stop an outlier burst from becoming permanent.
+const WAL_JOURNAL_SIZE_LIMIT_BYTES: i64 = 64 * 1024 * 1024;
+
 fn connect_options(path: &str, create_if_missing: bool) -> Result<SqliteConnectOptions> {
     // Accept a plain path or a `file:` URL (the CLI contract accepts both).
     let options = SqliteConnectOptions::from_str(&format!(
@@ -832,6 +857,13 @@ fn connect_options(path: &str, create_if_missing: bool) -> Result<SqliteConnectO
     Ok(options
         .create_if_missing(create_if_missing)
         .journal_mode(SqliteJournalMode::Wal)
+        // Only a connection that can write can checkpoint, and only a
+        // checkpoint can truncate. The read-only options below therefore do
+        // not carry this pragma: it would be inert there.
+        .pragma(
+            "journal_size_limit",
+            WAL_JOURNAL_SIZE_LIMIT_BYTES.to_string(),
+        )
         .foreign_keys(true)
         .busy_timeout(Duration::from_secs(5)))
 }
@@ -878,6 +910,103 @@ const QUERY_SQL_TEMP_CONTRACT_OBJECTS: &[&str] = &[
     "_query_sql_messages_awaiting_reply",
 ];
 const QUERY_SQL_TEMP_VIEW_COUNT: usize = QUERY_SQL_TEMP_CONTRACT_OBJECTS.len() - 4;
+
+#[cfg(test)]
+mod wal_journal_size_limit_tests {
+    use super::*;
+
+    /// The bug this guards against is a setting that never reaches SQLite.
+    /// Assert the readback on a real pooled connection rather than trusting
+    /// that the builder call was written.
+    #[tokio::test]
+    async fn write_pool_connections_carry_the_journal_size_limit() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("journal-size-limit.db");
+        let pool = open_pool(path.to_str().unwrap(), true).await.unwrap();
+
+        let limit: i64 = sqlx::query_scalar("PRAGMA journal_size_limit")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            limit, WAL_JOURNAL_SIZE_LIMIT_BYTES,
+            "journal_size_limit did not reach the write connection"
+        );
+        pool.close().await;
+    }
+
+    /// Pin the mechanism the fix actually depends on: SQLite applies the limit
+    /// on the commit that follows a WAL restart, not on the checkpoint.
+    /// Testing this with `wal_checkpoint(TRUNCATE)` would prove nothing,
+    /// because that mode truncates to zero whatever the limit is — including
+    /// when there is no limit at all. So restart the WAL, commit once more,
+    /// and require the commit to be what brings the file down.
+    #[tokio::test]
+    async fn the_commit_after_a_wal_restart_truncates_to_the_limit() {
+        const TEST_LIMIT: u64 = 65536;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("truncation.db");
+        let pool = open_pool(path.to_str().unwrap(), true).await.unwrap();
+        let wal = directory.path().join("truncation.db-wal");
+        // Every statement below must land on one physical connection:
+        // `journal_size_limit` and `wal_autocheckpoint` are per-connection
+        // settings, and this pool holds five.
+        let mut connection = pool.acquire().await.unwrap();
+
+        sqlx::query(&format!("PRAGMA journal_size_limit = {TEST_LIMIT}"))
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        // Hold the WAL open across the writes, so the growth assertion below
+        // observes a WAL that autocheckpointing has not already reset.
+        sqlx::query("PRAGMA wal_autocheckpoint = 0")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE bulk (id INTEGER PRIMARY KEY, payload BLOB NOT NULL)")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        for _ in 0..64 {
+            sqlx::query("INSERT INTO bulk (payload) VALUES (zeroblob(65536))")
+                .execute(&mut *connection)
+                .await
+                .unwrap();
+        }
+
+        let grown = std::fs::metadata(&wal).unwrap().len();
+        assert!(
+            grown > TEST_LIMIT,
+            "the WAL only reached {grown} bytes, so truncating to {TEST_LIMIT} proves nothing"
+        );
+
+        let (busy, _, _): (i64, i64, i64) = sqlx::query_as("PRAGMA wal_checkpoint(RESTART)")
+            .fetch_one(&mut *connection)
+            .await
+            .unwrap();
+        assert_eq!(busy, 0, "checkpoint did not complete");
+        assert_eq!(
+            std::fs::metadata(&wal).unwrap().len(),
+            grown,
+            "the restart itself shrank the file, so this test is not observing the commit-time limit"
+        );
+
+        sqlx::query("INSERT INTO bulk (payload) VALUES (zeroblob(16))")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&wal).unwrap().len(),
+            TEST_LIMIT,
+            "the commit after the restart did not truncate to the limit"
+        );
+        drop(connection);
+        pool.close().await;
+    }
+}
 
 async fn open_pool(path: &str, create_if_missing: bool) -> Result<SqlitePool> {
     let pool = SqlitePoolOptions::new()

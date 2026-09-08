@@ -271,7 +271,7 @@ pub(super) fn render_artifact_interaction(value: &Value) -> String {
     match status {
         "committed" => {
             if let Some(refresh) = value.get("refresh") {
-                let _ = writeln!(out, "Refresh: {}", inline_json(refresh));
+                render_commit_refresh(&mut out, refresh);
             }
         }
         "conflict" => {
@@ -295,6 +295,44 @@ pub(super) fn render_artifact_interaction(value: &Value) -> String {
         _ => unreachable!(),
     }
     out
+}
+
+/// A committed refresh stays readable in text form. The created record a
+/// creation refreshed keeps its inline receipt, exactly as before; the bonus
+/// next-plan is summarised with the same bounded walk `render_artifact` uses
+/// rather than inlined whole (up to a megabyte of plan JSON as one text
+/// line). Anything else is named in one bounded line. The full value is
+/// always in structuredContent.
+fn render_commit_refresh(out: &mut String, refresh: &Value) {
+    let Some(object) = refresh.as_object() else {
+        let _ = writeln!(out, "Refresh: {}", inline_json(refresh));
+        return;
+    };
+    if let Some(record) = object.get("record") {
+        let _ = writeln!(
+            out,
+            "Refresh: {}",
+            inline_json(&json!({ "record": record }))
+        );
+    }
+    if let Some(plan) = object.get("plan").filter(|plan| plan.is_object()) {
+        if plan.get("kind").and_then(Value::as_str) == Some("safe_tree") {
+            let _ = writeln!(
+                out,
+                "Next plan (summarised; full plan is in structuredContent):"
+            );
+            render_safe_tree_plan(out, plan);
+        } else {
+            let _ = writeln!(
+                out,
+                "Next plan kind: {} (full plan is in structuredContent)",
+                claimed_string(plan.get("kind"), "plan kind")
+            );
+        }
+    }
+    if !object.contains_key("record") && !object.contains_key("plan") {
+        let _ = writeln!(out, "Refresh: {}", one_line(&inline_json(refresh), 500));
+    }
 }
 
 const SAFE_TREE_SUMMARY_REGION_LIMIT: usize = 20;
