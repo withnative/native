@@ -190,7 +190,95 @@ struct GetRunActivityArgs {
     #[serde(default, deserialize_with = "deserialize_present")]
     cursor: Option<RunDiscoveryCursor>,
     limit: Option<i64>,
+    /// Select the retained overlap-notice evaluation instead of ordinary run
+    /// activity. Kept behind this explicit nested selector so existing calls
+    /// and their response shape remain byte-for-byte unchanged.
+    #[serde(default)]
+    overlap_evaluation: Option<OverlapEvaluationArgs>,
 }
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum OverlapEvaluationScope {
+    Own,
+    Workspace,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OverlapEvaluationArgs {
+    scope: OverlapEvaluationScope,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkOverlapEmission {
+    kind: String,
+    version: i64,
+    surface: String,
+    anchors: Vec<WorkOverlapEmissionAnchor>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkOverlapEmissionAnchor {
+    record_id: String,
+    overlap_record_ids: Vec<String>,
+    overlap_item_count: i64,
+    overlap_total_count: i64,
+    truncated: bool,
+}
+
+struct RetainedOverlapNotice {
+    seq: i64,
+    id: String,
+    run_key: Option<String>,
+    actor: String,
+    ended_at: String,
+    emission: WorkOverlapEmission,
+}
+
+#[derive(Default)]
+struct OverlapOutcomeCounts {
+    mature: i64,
+    pending: i64,
+    released: i64,
+    coordinated: i64,
+    proceeded: i64,
+    no_observed_outcome: i64,
+}
+
+const OVERLAP_OBSERVATION_MINUTES: i64 = 30;
+
+/// Successful calls whose extracted `mutated` touch represents material work
+/// on an existing record. The list is intentionally explicit: adding a new
+/// mutation surface does not silently change this evaluation instrument.
+const OVERLAP_MATERIAL_MUTATION_TOOLS: &[&str] = &[
+    "archive_record",
+    "attach_from_url",
+    "attach_text",
+    "claim_unowned_record",
+    "correct_record_type",
+    "create_attribution",
+    "delete_record",
+    "invoke_artifact_interaction",
+    "manage_artifact_inputs",
+    "manage_attachments",
+    "manage_attributions",
+    "manage_canvas",
+    "manage_citations",
+    "manage_change_summaries",
+    "manage_facet_observations",
+    "manage_interventions",
+    "manage_links",
+    "manage_mdx_modules",
+    "manage_messages",
+    "manage_relationships",
+    "resolve_external",
+    "resolve_suggestions",
+    "start_work",
+    "update_record",
+];
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -524,10 +612,10 @@ pub(super) async fn redact_event(
         event.payload = None;
         return Ok(());
     };
-    let claim_payload =
-        payload.get("claimed_by_account").is_some() || payload.get("claimed_run_key").is_some();
-    let claim_holder_visible = event.actor.as_deref() == Some(caller.credential())
-        && event.run_key.as_deref() == caller.run_key();
+    let claim_payload = payload.get("claimed_by_account").is_some()
+        || payload.get("claimed_run_key").is_some()
+        || payload.get("released_from_run_key").is_some();
+    let claim_holder_visible = event.actor.as_deref() == Some(caller.credential());
     if claim_payload && !claim_holder_visible {
         event.run_key = None;
         event.parent_key = None;
@@ -543,8 +631,10 @@ pub(super) async fn redact_event(
                     let record_key = key == "id"
                         || key.ends_with("_id")
                         || matches!(key.as_str(), "owner" | "home");
-                    let claim_identity_key =
-                        matches!(key.as_str(), "claimed_by_account" | "claimed_run_key");
+                    let claim_identity_key = matches!(
+                        key.as_str(),
+                        "claimed_by_account" | "claimed_run_key" | "released_from_run_key"
+                    );
                     if identity_key || (claim_identity_key && !claim_holder_visible) {
                         *child = Value::Null;
                     } else if record_key {
@@ -671,10 +761,10 @@ pub(super) async fn redact_event_in(
         event.payload = None;
         return Ok(());
     };
-    let claim_payload =
-        payload.get("claimed_by_account").is_some() || payload.get("claimed_run_key").is_some();
-    let claim_holder_visible = event.actor.as_deref() == Some(caller.credential())
-        && event.run_key.as_deref() == caller.run_key();
+    let claim_payload = payload.get("claimed_by_account").is_some()
+        || payload.get("claimed_run_key").is_some()
+        || payload.get("released_from_run_key").is_some();
+    let claim_holder_visible = event.actor.as_deref() == Some(caller.credential());
     if claim_payload && !claim_holder_visible {
         event.run_key = None;
         event.parent_key = None;
@@ -690,8 +780,10 @@ pub(super) async fn redact_event_in(
                     let record_key = key == "id"
                         || key.ends_with("_id")
                         || matches!(key.as_str(), "owner" | "home");
-                    let claim_identity_key =
-                        matches!(key.as_str(), "claimed_by_account" | "claimed_run_key");
+                    let claim_identity_key = matches!(
+                        key.as_str(),
+                        "claimed_by_account" | "claimed_run_key" | "released_from_run_key"
+                    );
                     if identity_key || (claim_identity_key && !claim_holder_visible) {
                         *child = Value::Null;
                     } else if record_key {
@@ -1115,10 +1207,10 @@ async fn redact_change_event(
         event.payload = None;
         return Ok(());
     };
-    let claim_payload =
-        payload.get("claimed_by_account").is_some() || payload.get("claimed_run_key").is_some();
-    let claim_holder_visible = event.actor.as_deref() == Some(caller.credential())
-        && event.run_key.as_deref() == caller.run_key();
+    let claim_payload = payload.get("claimed_by_account").is_some()
+        || payload.get("claimed_run_key").is_some()
+        || payload.get("released_from_run_key").is_some();
+    let claim_holder_visible = event.actor.as_deref() == Some(caller.credential());
     if claim_payload && !claim_holder_visible {
         event.run_key = None;
         event.parent_key = None;
@@ -1670,6 +1762,97 @@ async fn get_record_history_in(
     result
 }
 
+/// Opt-in oldest/newest visible-event attribution for `get_record` bylines.
+///
+/// Both ends run the same per-event pipeline as `get_history` on this
+/// snapshot — `event_is_visible_in`, then `redact_event_in` under the
+/// caller's shared disclosure memo, then snapshot-scoped actor-name
+/// resolution — and shape the survivors with `detail: metadata`. So
+/// "oldest"/"latest" mean oldest/newest *visible*, exactly as a
+/// `limit: 1` `oldest_first`/`newest_first` metadata read would report them,
+/// not raw `MIN`/`MAX(seq)` before visibility.
+///
+/// Each end advances in two-row raw windows (limit 1 plus the look-ahead row)
+/// from its end, moving the keyset cursor past hidden events, so finding one
+/// visible event never fetches a 1000-row full-payload page to discard. The
+/// windows are bounded; the walk itself ends at the first visible event, so
+/// its length is proportional to leading hidden events — the same traversal
+/// cost profile as a `limit: 1` `get_history` read. The result is always
+/// `Some`, even when both ends are null — presence of the summary on the
+/// record is the capability signal, and null ends mean "no visible event".
+pub(super) async fn history_summary_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    caller: &Caller,
+    disclosure: &mut ActorDisclosure,
+    record_id: &str,
+) -> Result<read::HistorySummary> {
+    let oldest = first_visible_in(
+        tx,
+        caller,
+        disclosure,
+        record_id,
+        events::EventOrder::OldestFirst,
+    )
+    .await?;
+    let latest = first_visible_in(
+        tx,
+        caller,
+        disclosure,
+        record_id,
+        events::EventOrder::NewestFirst,
+    )
+    .await?;
+    let shaped_inputs: Vec<EventRow> = oldest.clone().into_iter().chain(latest.clone()).collect();
+    let actor_names = resolve_actor_names_in(tx, &shaped_inputs).await;
+    let shape = |event: EventRow| {
+        shape_history_event(
+            event_to_value(&event, &actor_names),
+            HistoryDetail::Metadata,
+        )
+    };
+    Ok(read::HistorySummary {
+        oldest: oldest.map(&shape),
+        latest: latest.map(&shape),
+    })
+}
+
+/// First visible event from one end of a record's stream on this snapshot.
+///
+/// Keyset-pages two-row raw windows (limit 1 plus look-ahead) from the given
+/// end, advancing past hidden events exactly as the `get_history` traversal
+/// does, and returns the first event that survives visibility, already
+/// redacted. Ordinary records settle in one window per end; each further
+/// window is one more leading hidden event. `None` means the end is
+/// exhausted with nothing visible.
+async fn first_visible_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    caller: &Caller,
+    disclosure: &mut ActorDisclosure,
+    record_id: &str,
+    order: events::EventOrder,
+) -> Result<Option<EventRow>> {
+    const SUMMARY_SCAN: i64 = 1;
+    let mut cursor: Option<i64> = None;
+    loop {
+        let page = events::events_for_record_ordered_in(tx, record_id, cursor, SUMMARY_SCAN, order)
+            .await?;
+        if page.events.is_empty() {
+            return Ok(None);
+        }
+        for mut event in page.events {
+            cursor = Some(event.local_seq);
+            if !event_is_visible_in(tx, caller, &event).await? {
+                continue;
+            }
+            redact_event_in(tx, caller, disclosure, &mut event).await?;
+            return Ok(Some(event));
+        }
+        if page.next_after_seq.is_none() {
+            return Ok(None);
+        }
+    }
+}
+
 /// Aggregate-only projection of one run's disposable attention exhaust.
 ///
 /// The query names every permitted read-log column. In particular it never
@@ -1699,6 +1882,19 @@ fn run_activity_result(
 
 async fn get_run_activity(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
     let args: GetRunActivityArgs = parse_args("get_run_activity", arguments)?;
+    if let Some(evaluation) = args.overlap_evaluation {
+        if args.for_run.is_some()
+            || args.include_child_runs.is_some()
+            || args.cursor.is_some()
+            || args.limit.is_some()
+        {
+            return Err(Error::engine(
+                "get_run_activity: overlap_evaluation cannot be combined with for_run, \
+                 include_child_runs, cursor, or limit",
+            ));
+        }
+        return work_overlap_evaluation(&db, &caller, evaluation.scope).await;
+    }
     let Some(run_key) = args.for_run.as_deref() else {
         if args.include_child_runs.is_some() {
             return Err(Error::engine(
@@ -1769,11 +1965,12 @@ async fn get_run_activity(db: Db, caller: Caller, arguments: Value) -> Result<Va
               WHERE ? OR call.actor = ?
          )
          SELECT call.seq, call.run_key, call.parent_key, call.tool,
-                touch.record_id AS touch_record_id,
+                dictionary.record_id AS touch_record_id,
                 touch.interaction AS touch_interaction
            FROM selected_calls call
            LEFT JOIN read_log_touches touch ON touch.call_seq = call.seq
-          ORDER BY call.seq, touch.record_id, touch.interaction",
+           LEFT JOIN read_log_record_ids dictionary ON dictionary.record_ref = touch.record_ref
+          ORDER BY call.seq, dictionary.record_id, touch.interaction",
     )
     .bind(run_key)
     .bind(include_child_runs)
@@ -1883,6 +2080,502 @@ async fn get_run_activity(db: Db, caller: Caller, arguments: Value) -> Result<Va
         None,
         Some(visibility_filtered),
     ))
+}
+
+fn overlap_evaluation_unavailable(
+    as_of: &str,
+    scope: OverlapEvaluationScope,
+    reason: &str,
+) -> Value {
+    json!({
+        "view": "work_overlap_evaluation",
+        "scope": match scope { OverlapEvaluationScope::Own => "own", OverlapEvaluationScope::Workspace => "workspace" },
+        "as_of": as_of,
+        "observation_window_seconds": OVERLAP_OBSERVATION_MINUTES * 60,
+        "availability": {
+            "status": "unavailable",
+            "reason": reason,
+            "complete_history": false,
+            "retention": "The interaction log and its result annotations are disposable retained evidence, not canonical history."
+        },
+        "emissions": Value::Null,
+        "claim_outcomes": Value::Null,
+    })
+}
+
+fn is_explicit_coordination(action: &ObservedOverlapAction, eligible: &HashSet<String>) -> bool {
+    let touches_eligible = action.touched.iter().any(|id| eligible.contains(id));
+    match action.tool.as_str() {
+        // A durable link written on either side of disclosed work is the v1
+        // generic coordination primitive. Removal is material work instead.
+        "manage_links" => {
+            action.arguments.get("action").and_then(Value::as_str) == Some("add")
+                && touches_eligible
+        }
+        // Handoff is a governed core kind. It qualifies only when the create
+        // explicitly links the handoff to an anchor or disclosed overlap.
+        "create_record" => {
+            action.arguments.get("type").and_then(Value::as_str) == Some("Document")
+                && action.arguments.get("kind").and_then(Value::as_str) == Some("handoff")
+                && action
+                    .arguments
+                    .get("links")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|link| link.get("target_id").and_then(Value::as_str))
+                    .any(|reference| {
+                        let exact_touch_exists = action.touched.contains(reference);
+                        eligible.iter().any(|id| {
+                            action.touched.contains(id)
+                                && if exact_touch_exists {
+                                    reference == id
+                                } else {
+                                    record_reference_matches(reference, id)
+                                }
+                        })
+                    })
+        }
+        _ => false,
+    }
+}
+
+/// Match an original authored reference to a canonical successful touch. The
+/// request boundary accepts exact ids or unique UUID prefixes; because this
+/// call succeeded, a prefix matching an eligible touched id is the one the
+/// handler resolved. This avoids re-resolving against mutable current state.
+fn record_reference_matches(reference: &str, canonical_id: &str) -> bool {
+    if reference == canonical_id {
+        return true;
+    }
+    if !crate::mcp::record_ref::is_canonical_uuid_v4_or_v7(canonical_id) {
+        return false;
+    }
+    let compact = reference
+        .bytes()
+        .filter(|byte| *byte != b'-')
+        .map(|byte| byte.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    if !(6..32).contains(&compact.len()) || !compact.iter().all(u8::is_ascii_hexdigit) {
+        return false;
+    }
+    let canonical = canonical_id
+        .bytes()
+        .filter(|byte| *byte != b'-')
+        .collect::<Vec<_>>();
+    canonical.starts_with(&compact)
+}
+
+#[derive(Default)]
+struct ObservedOverlapAction {
+    tool: String,
+    arguments: Value,
+    touched: HashSet<String>,
+    mutated: HashSet<String>,
+}
+
+#[cfg(test)]
+mod overlap_coordination_tests {
+    use super::*;
+
+    const ELIGIBLE: &str = "01234567-89ab-4def-8abc-0123456789ab";
+
+    fn handoff(arguments: Value) -> ObservedOverlapAction {
+        ObservedOverlapAction {
+            tool: "create_record".into(),
+            arguments,
+            touched: HashSet::from([ELIGIBLE.to_owned()]),
+            mutated: HashSet::new(),
+        }
+    }
+
+    #[test]
+    fn handoff_requires_an_authored_link_to_the_eligible_canonical_touch() {
+        let eligible = HashSet::from([ELIGIBLE.to_owned()]);
+        assert!(!is_explicit_coordination(
+            &handoff(json!({
+                "type":"Document",
+                "kind":"handoff",
+                "home_id":"0123456"
+            })),
+            &eligible,
+        ));
+        assert!(!is_explicit_coordination(
+            &handoff(json!({
+                "type":"Document",
+                "kind":"handoff",
+                "home_id":"0123456",
+                "links":[{"target_id":"abcdef0","relationship":"relates_to"}]
+            })),
+            &eligible,
+        ));
+        let mut exact_legacy_collision = handoff(json!({
+            "type":"Document",
+            "kind":"handoff",
+            "home_id":"0123456",
+            "links":[{"target_id":"0123456","relationship":"relates_to"}]
+        }));
+        exact_legacy_collision.touched.insert("0123456".to_owned());
+        assert!(!is_explicit_coordination(
+            &exact_legacy_collision,
+            &eligible,
+        ));
+        assert!(is_explicit_coordination(
+            &handoff(json!({
+                "type":"Document",
+                "kind":"handoff",
+                "links":[{"target_id":"0123456","relationship":"relates_to"}]
+            })),
+            &eligible,
+        ));
+    }
+}
+
+async fn classify_overlap_claim(
+    db: &Db,
+    notice: &RetainedOverlapNotice,
+    as_of: chrono::DateTime<chrono::Utc>,
+) -> Result<(bool, Option<&'static str>)> {
+    let completed_at = chrono::DateTime::parse_from_rfc3339(&notice.ended_at)
+        .map_err(|_| Error::engine("get_run_activity: malformed overlap notice completion time"))?
+        .with_timezone(&chrono::Utc);
+    let deadline = completed_at + chrono::Duration::minutes(OVERLAP_OBSERVATION_MINUTES);
+    let closed_at: Option<String> = match notice.run_key.as_deref() {
+        Some(run_key) => {
+            sqlx::query_scalar("SELECT ended_at FROM agent_runs WHERE run_key=? AND account_id=?")
+                .bind(run_key)
+                .bind(&notice.actor)
+                .fetch_optional(db.write_pool())
+                .await?
+                .flatten()
+        }
+        None => None,
+    };
+    let closed_at = closed_at
+        .as_deref()
+        .map(chrono::DateTime::parse_from_rfc3339)
+        .transpose()
+        .map_err(|_| Error::engine("get_run_activity: malformed run closure time"))?
+        .map(|time| time.with_timezone(&chrono::Utc))
+        .filter(|time| *time >= completed_at);
+    let boundary = closed_at.map_or(deadline, |closed| closed.min(deadline));
+    if as_of < boundary {
+        return Ok((false, None));
+    }
+
+    let Some(root_run) = notice.run_key.as_deref() else {
+        return Ok((true, Some("no_observed_outcome")));
+    };
+    let rows = sqlx::query(
+        "WITH RECURSIVE included_runs(run_key) AS (
+             SELECT ?1
+             UNION
+             SELECT call.run_key
+               FROM read_log_calls call
+               JOIN included_runs parent ON call.parent_key=parent.run_key
+              WHERE call.actor=?2 AND call.run_key IS NOT NULL
+             UNION
+             SELECT event.run_key
+               FROM content_events event
+               JOIN included_runs parent ON event.parent_key=parent.run_key
+              WHERE event.actor=?2 AND event.run_key IS NOT NULL
+         )
+         SELECT call.seq,call.tool,call.arguments,dictionary.record_id,touch.interaction
+           FROM read_log_calls call
+           JOIN included_runs included ON included.run_key=call.run_key
+           LEFT JOIN read_log_touches touch ON touch.call_seq=call.seq
+           LEFT JOIN read_log_record_ids dictionary ON dictionary.record_ref=touch.record_ref
+          WHERE call.actor=?2 AND call.outcome='ok' AND call.seq>?3
+            AND call.ended_at>=?4 AND call.ended_at<=?5
+          ORDER BY call.ended_at,call.seq,dictionary.record_id,touch.interaction",
+    )
+    .bind(root_run)
+    .bind(&notice.actor)
+    .bind(notice.seq)
+    .bind(&notice.ended_at)
+    .bind(boundary.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+    .fetch_all(db.write_pool())
+    .await?;
+
+    let mut eligible = HashSet::new();
+    let mut anchor_ids = HashSet::new();
+    for anchor in &notice.emission.anchors {
+        anchor_ids.insert(anchor.record_id.clone());
+        eligible.insert(anchor.record_id.clone());
+        eligible.extend(anchor.overlap_record_ids.iter().cloned());
+    }
+    let mut order = Vec::new();
+    let mut actions: HashMap<i64, ObservedOverlapAction> = HashMap::new();
+    for row in rows {
+        let seq: i64 = row.try_get("seq")?;
+        let action = actions.entry(seq).or_insert_with(|| {
+            order.push(seq);
+            let arguments = row
+                .try_get::<String, _>("arguments")
+                .ok()
+                .and_then(|raw| serde_json::from_str(&raw).ok())
+                .unwrap_or(Value::Null);
+            ObservedOverlapAction {
+                tool: row.try_get("tool").unwrap_or_default(),
+                arguments,
+                touched: HashSet::new(),
+                mutated: HashSet::new(),
+            }
+        });
+        if let Some(record_id) = row.try_get::<Option<String>, _>("record_id")? {
+            action.touched.insert(record_id.clone());
+            if row.try_get::<Option<String>, _>("interaction")?.as_deref() == Some("mutated") {
+                action.mutated.insert(record_id);
+            }
+        }
+    }
+
+    for seq in order {
+        let action = &actions[&seq];
+        if action.tool == "start_work"
+            && action.arguments.get("action").and_then(Value::as_str) == Some("release")
+            && action.mutated.iter().any(|id| anchor_ids.contains(id))
+        {
+            return Ok((true, Some("released")));
+        }
+        if is_explicit_coordination(action, &eligible) {
+            return Ok((true, Some("coordinated")));
+        }
+        if OVERLAP_MATERIAL_MUTATION_TOOLS.contains(&action.tool.as_str())
+            && action.mutated.iter().any(|id| eligible.contains(id))
+        {
+            return Ok((true, Some("proceeded")));
+        }
+    }
+    Ok((true, Some("no_observed_outcome")))
+}
+
+async fn work_overlap_evaluation(
+    db: &Db,
+    caller: &Caller,
+    scope: OverlapEvaluationScope,
+) -> Result<Value> {
+    let as_of = crate::mcp::interactions::timestamp();
+    if matches!(scope, OverlapEvaluationScope::Workspace) && !super::is_legacy_local(caller) {
+        let admitted: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM member_contexts WHERE account_id=?)")
+                .bind(caller.credential())
+                .fetch_one(db.write_pool())
+                .await?;
+        if !admitted {
+            return Err(Error::engine(
+                "get_run_activity: workspace overlap evaluation requires a portable database member",
+            ));
+        }
+    }
+
+    let rows = match sqlx::query(
+        "SELECT seq,id,run_key,actor,ended_at,result_annotation
+           FROM read_log_calls
+          WHERE outcome='ok' AND result_annotation IS NOT NULL AND ended_at<=?
+          ORDER BY seq",
+    )
+    .bind(&as_of)
+    .fetch_all(db.write_pool())
+    .await
+    {
+        Ok(rows) => rows,
+        Err(_) => {
+            return Ok(overlap_evaluation_unavailable(
+                &as_of,
+                scope,
+                "measurement_evidence_unavailable",
+            ))
+        }
+    };
+
+    let mut notices = Vec::new();
+    let mut malformed_evidence = 0_i64;
+    for row in rows {
+        let actor: String = row.try_get("actor")?;
+        if matches!(scope, OverlapEvaluationScope::Own) && actor != caller.credential() {
+            continue;
+        }
+        let raw: String = row.try_get("result_annotation")?;
+        let Ok(emission) = serde_json::from_str::<WorkOverlapEmission>(&raw) else {
+            malformed_evidence += 1;
+            continue;
+        };
+        if emission.kind != "work_overlap_emission"
+            || emission.version != 1
+            || !matches!(emission.surface.as_str(), "claim" | "create" | "set_intent")
+            || emission.anchors.is_empty()
+            || emission.anchors.iter().any(|anchor| {
+                anchor.overlap_item_count < 1
+                    || anchor.overlap_total_count < anchor.overlap_item_count
+                    || usize::try_from(anchor.overlap_item_count).ok()
+                        != Some(anchor.overlap_record_ids.len())
+                    || anchor.truncated != (anchor.overlap_total_count > anchor.overlap_item_count)
+            })
+        {
+            malformed_evidence += 1;
+            continue;
+        }
+        notices.push(RetainedOverlapNotice {
+            seq: row.try_get("seq")?,
+            id: row.try_get("id")?,
+            run_key: row.try_get("run_key")?,
+            actor,
+            ended_at: row.try_get("ended_at")?,
+            emission,
+        });
+    }
+
+    let as_of_time = chrono::DateTime::parse_from_rfc3339(&as_of)
+        .expect("interaction timestamp is RFC3339")
+        .with_timezone(&chrono::Utc);
+    let mut by_surface =
+        HashMap::from([("claim", 0_i64), ("create", 0_i64), ("set_intent", 0_i64)]);
+    let mut anchor_count = 0_i64;
+    let mut overlap_item_count = 0_i64;
+    let mut overlap_disclosed_count = 0_i64;
+    let mut outcomes = OverlapOutcomeCounts::default();
+    let mut outcome_evidence_available = true;
+    let mut observations = Vec::new();
+    for notice in &notices {
+        *by_surface
+            .get_mut(notice.emission.surface.as_str())
+            .expect("validated surface") += 1;
+        anchor_count += i64::try_from(notice.emission.anchors.len()).unwrap_or(i64::MAX);
+        overlap_item_count += notice
+            .emission
+            .anchors
+            .iter()
+            .map(|anchor| anchor.overlap_total_count)
+            .sum::<i64>();
+        overlap_disclosed_count += notice
+            .emission
+            .anchors
+            .iter()
+            .map(|anchor| anchor.overlap_item_count)
+            .sum::<i64>();
+
+        let (classification, classification_available) = if notice.emission.surface == "claim" {
+            match classify_overlap_claim(db, notice, as_of_time).await {
+                Ok((mature, outcome)) => {
+                    if mature {
+                        outcomes.mature += 1;
+                        match outcome.expect("mature claims have an outcome") {
+                            "released" => outcomes.released += 1,
+                            "coordinated" => outcomes.coordinated += 1,
+                            "proceeded" => outcomes.proceeded += 1,
+                            "no_observed_outcome" => outcomes.no_observed_outcome += 1,
+                            _ => unreachable!("classifier returns a closed outcome set"),
+                        }
+                    } else {
+                        outcomes.pending += 1;
+                    }
+                    (outcome.map(str::to_string), true)
+                }
+                Err(_) => {
+                    // The annotation remains valid emission evidence even if
+                    // disposable follow-on call/touch/run evidence has been
+                    // deleted or is unavailable. Never silently turn that
+                    // absence into a behavioral zero.
+                    outcome_evidence_available = false;
+                    (None, false)
+                }
+            }
+        } else {
+            (None, true)
+        };
+
+        if matches!(scope, OverlapEvaluationScope::Own) {
+            let mut visible_anchors = Vec::new();
+            let mut visible_overlaps = Vec::new();
+            let mut identifiers_withheld = false;
+            for anchor in &notice.emission.anchors {
+                if can_record(db, caller, &anchor.record_id, Capability::View).await? {
+                    visible_anchors.push(anchor.record_id.clone());
+                } else {
+                    identifiers_withheld = true;
+                }
+                for record_id in &anchor.overlap_record_ids {
+                    if can_record(db, caller, record_id, Capability::View).await? {
+                        visible_overlaps.push(record_id.clone());
+                    } else {
+                        identifiers_withheld = true;
+                    }
+                }
+            }
+            visible_anchors.sort();
+            visible_anchors.dedup();
+            visible_overlaps.sort();
+            visible_overlaps.dedup();
+            observations.push(json!({
+                "notice_id": notice.id,
+                "surface": notice.emission.surface,
+                "completed_at": notice.ended_at,
+                "run_key": notice.run_key,
+                "anchor_record_ids": visible_anchors,
+                "overlap_record_ids": visible_overlaps,
+                "anchor_count": notice.emission.anchors.len(),
+                "overlap_item_count": notice.emission.anchors.iter().map(|anchor| anchor.overlap_total_count).sum::<i64>(),
+                "disclosed_overlap_item_count": notice.emission.anchors.iter().map(|anchor| anchor.overlap_item_count).sum::<i64>(),
+                "truncated": notice.emission.anchors.iter().any(|anchor| anchor.truncated),
+                "identifiers_withheld": identifiers_withheld,
+                "state": if notice.emission.surface != "claim" { "not_applicable" } else if !classification_available { "unavailable" } else if classification.is_some() { "mature" } else { "pending" },
+                "outcome": classification,
+            }));
+        }
+    }
+
+    debug_assert_eq!(
+        outcomes.mature,
+        outcomes.released
+            + outcomes.coordinated
+            + outcomes.proceeded
+            + outcomes.no_observed_outcome
+    );
+    let claim_outcomes = outcome_evidence_available.then(|| {
+        json!({
+            "unit": "mature_notice_bearing_claim_call",
+            "mature_denominator": outcomes.mature,
+            "pending_count": outcomes.pending,
+            "released": outcomes.released,
+            "coordinated": outcomes.coordinated,
+            "proceeded": outcomes.proceeded,
+            "no_observed_outcome": outcomes.no_observed_outcome,
+        })
+    });
+    let mut result = json!({
+        "view": "work_overlap_evaluation",
+        "scope": match scope { OverlapEvaluationScope::Own => "own", OverlapEvaluationScope::Workspace => "workspace" },
+        "as_of": as_of,
+        "observation_window_seconds": OVERLAP_OBSERVATION_MINUTES * 60,
+        "availability": {
+            "status": "partial",
+            "reason": if !outcome_evidence_available { "best_effort_retained_history_with_outcome_evidence_unavailable" } else if malformed_evidence == 0 { "best_effort_retained_history" } else { "best_effort_retained_history_with_malformed_evidence" },
+            "complete_history": false,
+            "retention": "The interaction log and its result annotations are disposable retained evidence. Counts cover retained, post-instrumentation annotations only; an empty result is not proof that no historical notice was emitted.",
+            "malformed_evidence_count": malformed_evidence,
+        },
+        "emissions": {
+            "unit": "notice_bearing_call",
+            "notice_bearing_call_count": notices.len(),
+            "by_surface": {
+                "claim": by_surface["claim"],
+                "create": by_surface["create"],
+                "set_intent": by_surface["set_intent"],
+            },
+            "anchor_count": anchor_count,
+            "overlap_item_count": overlap_item_count,
+            "disclosed_overlap_item_count": overlap_disclosed_count,
+        },
+        "claim_outcomes": claim_outcomes,
+    });
+    if matches!(scope, OverlapEvaluationScope::Own) {
+        result
+            .as_object_mut()
+            .expect("evaluation is an object")
+            .insert("observations".into(), Value::Array(observations));
+    }
+    Ok(result)
 }
 
 async fn discover_own_runs(
@@ -2269,7 +2962,7 @@ pub fn register_history_tools(registry: &mut ToolRegistry) -> Result<()> {
     )?;
     registry.register(
         ToolKind::GetRunActivity,
-        "With for_run, aggregate read activity for that run and optional descendants; no intent or raw trace data. Without for_run, page the caller account's open or recent durable runs with keys, retained-intent status, and best-effort freshness. Other accounts are excluded. Missing evidence is not_retained; log failure is unavailable.",
+        "With for_run, aggregate read activity for that run and optional descendants; no intent or raw trace data. Without for_run, page the caller account's open or recent durable runs with keys, retained-intent status, and best-effort freshness. Other accounts are excluded. Pass overlap_evaluation instead to measure retained privacy-safe overlap-notice emissions: own returns the originating account's notice detail, while workspace returns aggregate counts only. Missing or deleted evidence is explicitly unavailable or partial, never interpreted as a historical zero.",
         json!({
             "type": "object",
             "properties": {
@@ -2300,6 +2993,19 @@ pub fn register_history_tools(registry: &mut ToolRegistry) -> Result<()> {
                     "maximum": 50,
                     "default": 20,
                     "description": "Discovery page size; valid only when for_run is omitted."
+                },
+                "overlap_evaluation": {
+                    "type": "object",
+                    "properties": {
+                        "scope": {
+                            "type": "string",
+                            "enum": ["own", "workspace"],
+                            "description": "own returns notice-level detail only for the authenticated account; workspace returns aggregate counts only."
+                        }
+                    },
+                    "required": ["scope"],
+                    "additionalProperties": false,
+                    "description": "Evaluate retained work-overlap notice emissions and mature claim outcomes. Mutually exclusive with ordinary run-activity arguments."
                 }
             },
             "additionalProperties": false

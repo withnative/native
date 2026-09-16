@@ -48,6 +48,75 @@ def git(repo: Path, *args: str) -> None:
     subprocess.run(("git", *args), cwd=repo, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
 
+class RustLexerTests(unittest.TestCase):
+    @staticmethod
+    def masked(text: str) -> str:
+        return "".join("\n" if char == "\n" else " " for char in text)
+
+    def test_raw_literals_at_nonzero_offsets_keep_following_code(self) -> None:
+        prefix = "let café = "
+        suffix = "; include!(\"next.rs\");"
+        for marker in ("r", "br", "rb"):
+            for hashes in ("", "#", "###"):
+                contents = "// comment /* nested */ λ\n"
+                if hashes:
+                    contents += '"' + hashes[:-1] + " still literal"
+                literal = marker + hashes + '"' + contents + '"' + hashes
+                for retain_literals in (True, False):
+                    with self.subTest(marker=marker, hashes=hashes, retain_literals=retain_literals):
+                        expected_literal = literal if retain_literals else self.masked(literal)
+                        expected_suffix = suffix if retain_literals else '; include!(         );'
+                        self.assertEqual(
+                            boundary.strip_rust_comments(
+                                prefix + literal + suffix, "fixture.rs", retain_literals=retain_literals
+                            ),
+                            prefix + expected_literal + expected_suffix,
+                        )
+
+    def test_comments_and_escaped_literals_preserve_positions(self) -> None:
+        comment = "/* outer λ\n /* nested */ end */"
+        line_comment = "// ignored r###\" /*\n"
+        literals = ('"escaped \\\" // λ\\\nmore"', "'λ'", "'\\n'", "'\\''", "'/'")
+        for literal in literals:
+            source = "before " + comment + literal + line_comment + "after"
+            for retain_literals in (True, False):
+                with self.subTest(literal=literal, retain_literals=retain_literals):
+                    expected = (
+                        "before " + self.masked(comment)
+                        + (literal if retain_literals else self.masked(literal))
+                        + self.masked(line_comment) + "after"
+                    )
+                    self.assertEqual(
+                        boundary.strip_rust_comments(source, "fixture.rs", retain_literals=retain_literals),
+                        expected,
+                    )
+
+    def test_lifetimes_identifiers_and_line_comment_at_eof(self) -> None:
+        code = "fn borrow<'a>(r#type: &'a str) { let λ = br_identifier; }"
+        comment = "// no newline"
+        for retain_literals in (True, False):
+            with self.subTest(retain_literals=retain_literals):
+                self.assertEqual(
+                    boundary.strip_rust_comments(
+                        code + comment, "fixture.rs", retain_literals=retain_literals
+                    ),
+                    code + self.masked(comment),
+                )
+
+    def test_unterminated_forms_fail_with_the_same_path_in_both_modes(self) -> None:
+        for fragment in ('/* outer /* nested */', '"string', '"escape\\', "'\\'",
+                         'r"raw', 'br#"raw"', 'rb###"raw"##'):
+            for retain_literals in (True, False):
+                with self.subTest(fragment=fragment, retain_literals=retain_literals):
+                    with self.assertRaises(boundary.BoundaryError) as error:
+                        boundary.strip_rust_comments(
+                            "let λ = " + fragment, "nested/fixture.rs", retain_literals=retain_literals
+                        )
+                    self.assertEqual(
+                        str(error.exception), "cannot lex Rust source safely: nested/fixture.rs"
+                    )
+
+
 class SourceBoundaryTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:

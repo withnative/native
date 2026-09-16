@@ -57,6 +57,15 @@ async fn turso_applies_native_ddl_with_only_declared_physical_overlays() {
         let statement = if statement.contains("GENERATED ALWAYS AS") {
             overlays.insert("projection.facet-value-number");
             TURSO_FACET_VALUES_DDL
+        } else if statement.contains("CREATE TABLE read_log_touches")
+            && statement.contains("WITHOUT ROWID")
+        {
+            // turso_core 0.7.2 translate/index.rs refuses CREATE INDEX on
+            // WITHOUT ROWID. Keep the released rowid table; not a new overlay.
+            statement
+                .trim_end()
+                .trim_end_matches("WITHOUT ROWID")
+                .trim_end()
         } else {
             statement
         };

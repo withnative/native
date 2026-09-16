@@ -70,6 +70,8 @@ mod protocol;
 pub(crate) mod record_ref;
 pub mod registry;
 pub mod render;
+#[doc(hidden)]
+pub mod request_timing;
 pub mod snapshot;
 pub mod status_only;
 pub mod stdio;
@@ -107,7 +109,7 @@ pub use lens_surface::{
     lens_descriptor_projection, lens_descriptor_projection_for_policy, lens_local_tool_exposures,
     lens_tool_policy, validate_lens_policy_budget, validate_lens_profile_budgets, LensToolPolicy,
 };
-pub use protocol::PROTOCOL_VERSION;
+pub use protocol::{DATABASE_POOL_TIMEOUT, DATABASE_POOL_TIMEOUT_RECOVERY, PROTOCOL_VERSION};
 #[cfg(feature = "mcp-executor-prototype")]
 #[doc(hidden)]
 pub use registry::HostedMembershipPlanExecution;
@@ -126,7 +128,10 @@ pub use snapshot::{
 };
 pub use status_only::{StatusOnlyStdioServer, STANDBY_STATUS_ONLY_ERROR};
 pub use stdio::StdioServer;
-pub use surface::McpSurfaceMode;
+pub use surface::{
+    ExperimentalExecutors, McpSurfaceMode, EXPERIMENTAL_EXECUTORS_ENV,
+    EXPERIMENTAL_FRESHNESS_EXECUTOR,
+};
 #[doc(hidden)]
 pub use tools::register_build_enabled_experimental_tools;
 #[cfg(feature = "experimental-agent-intents")]

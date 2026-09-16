@@ -23,18 +23,22 @@ fn registry() -> ToolRegistry {
 }
 
 async fn call(registry: &ToolRegistry, db: &Db, tool: &str, args: Value) -> Value {
-    registry
+    let result = registry
         .call(db.clone(), Caller::local(), tool, args)
         .await
-        .unwrap()
+        .unwrap();
+    db.drain_captures_for_tests().await;
+    result
 }
 
 async fn call_err(registry: &ToolRegistry, db: &Db, tool: &str, args: Value) -> String {
-    registry
+    let error = registry
         .call(db.clone(), Caller::local(), tool, args)
         .await
         .unwrap_err()
-        .to_string()
+        .to_string();
+    db.drain_captures_for_tests().await;
+    error
 }
 
 async fn create(registry: &ToolRegistry, db: &Db, mut args: Value) -> String {
@@ -709,6 +713,15 @@ async fn concurrent_accept_has_one_winner_and_one_structured_conflict() {
         body_and_lifecycle(&db, &target).await.0.as_deref(),
         Some("after")
     );
+    // These two calls had to reach the registry directly to run concurrently,
+    // so they bypassed `call`, which is where this file drains. Interaction
+    // capture is enqueued on the response path and written by the queue's
+    // worker afterwards, so the rows counted below may not be there yet when
+    // the calls return. Both captures are already accounted in `enqueued` by
+    // then — `capture_interaction` is awaited inline before the response
+    // (`domain_transaction/request.rs:673`) and `enqueue` counts under its
+    // admission mutex — so draining here is a barrier over exactly these two.
+    db.drain_captures_for_tests().await;
     let touches: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM read_log_touches t
           JOIN read_log_calls c ON c.seq = t.call_seq

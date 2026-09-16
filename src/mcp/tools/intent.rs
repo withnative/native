@@ -12,6 +12,7 @@ use crate::query::lineage;
 
 use super::super::registry::{Caller, ToolRegistry};
 use super::super::ToolKind;
+use super::work::work_overlap_for_record;
 use super::{can_record, parse_args};
 
 const DECLARATION_LIMIT: usize = 10;
@@ -20,6 +21,9 @@ const NON_TERMINAL_LIMIT: usize = 20;
 const UNCLASSIFIED_LIFECYCLE_LIMIT: usize = 20;
 const CLAIM_LIMIT: usize = 20;
 const CLAIM_CANDIDATE_LIMIT: usize = 100;
+/// Anchors named in `overlapping_claims.items`: open-claim records first,
+/// then records this run touched, deduplicated, in that order.
+const OVERLAP_ANCHOR_CAP: usize = 10;
 
 // The briefing version describes the compatible response family. New bounded
 // sections are additive within v1; bump it only when an existing field's
@@ -63,6 +67,11 @@ fn unavailable_briefing(reason: &'static str) -> Value {
         "resume": null,
         "working_under": empty_working_under(),
         "open_claims": bounded(Vec::new(), 0, CLAIM_LIMIT),
+        "overlapping_claims": json!({
+            "items": [],
+            "total_count": 0,
+            "truncated": false,
+        }),
     })
 }
 
@@ -123,7 +132,8 @@ async fn touched_between(
                 MAX(c.ended_at) AS last_touched_at
            FROM read_log_calls c
            JOIN read_log_touches t ON t.call_seq = c.seq
-           JOIN records r ON r.id = t.record_id
+           JOIN read_log_record_ids d ON d.record_ref = t.record_ref
+           JOIN records r ON r.id = d.record_id
           WHERE c.run_key = ? AND c.seq > ? AND (? IS NULL OR c.seq < ?)
           GROUP BY r.id, r.name, r.type, r.lifecycle
           ORDER BY last_touched_at DESC, r.id",
@@ -219,7 +229,8 @@ async fn lifecycle_lists(db: &Db, caller: &Caller, run_key: &str) -> Result<(Val
                 MAX(c.ended_at) AS last_touched_at
            FROM read_log_calls c
            JOIN read_log_touches t ON t.call_seq = c.seq
-           JOIN records r ON r.id = t.record_id
+           JOIN read_log_record_ids d ON d.record_ref = t.record_ref
+           JOIN records r ON r.id = d.record_id
           WHERE c.run_key = ?
             AND r.deleted_at IS NULL
             AND r.lifecycle IS NOT NULL
@@ -395,11 +406,68 @@ async fn open_claims(db: &Db, caller: &Caller) -> Result<Value> {
     }))
 }
 
+/// Neighbouring claims around the records this briefing already names:
+/// the caller's open claims first, then the records this run has touched,
+/// deduplicated, in that order. Each anchor with a non-empty overlap window
+/// is named with its window; unlike the claim-time notice the anchor ITSELF
+/// is folded in as a `same_record` item when another holder claims it, so a
+/// run that walked straight into someone else's claim sees it here.
+///
+/// The cap bounds only the emitted items: every anchor's window is computed
+/// so `total_count` stays the exact number of anchors with a non-empty
+/// overlap and `truncated` means precisely that more anchors than the cap had
+/// overlap. Always present, even when empty — an additive section inside
+/// briefing v1, so no version bump.
+async fn overlapping_claims(db: &Db, caller: &Caller, open: &Value) -> Result<Value> {
+    let mut anchors: Vec<String> = open
+        .get("items")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.get("id").and_then(Value::as_str).map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    if let Some(run_key) = caller.run_key() {
+        let touched = touched_between(db, caller, run_key, -1, None, TOUCHED_LIMIT).await?;
+        for item in touched
+            .get("items")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if let Some(id) = item.get("id").and_then(Value::as_str) {
+                if !anchors.iter().any(|anchor| anchor == id) {
+                    anchors.push(id.to_string());
+                }
+            }
+        }
+    }
+    let mut items = Vec::new();
+    let mut total_count = 0usize;
+    for anchor in &anchors {
+        let Some(window) = work_overlap_for_record(db, caller, anchor, true).await? else {
+            continue;
+        };
+        total_count += 1;
+        if items.len() < OVERLAP_ANCHOR_CAP {
+            items.push(json!({ "record_id": anchor, "overlap": window }));
+        }
+    }
+    Ok(json!({
+        "items": items,
+        "total_count": total_count,
+        "truncated": total_count > OVERLAP_ANCHOR_CAP,
+    }))
+}
+
 async fn briefing_from_log(db: &Db, caller: &Caller, intent: &str) -> Result<Value> {
     let Some(run_key) = caller.run_key() else {
         return Ok(unavailable_briefing("run_context_unavailable"));
     };
     let declared_at = crate::mcp::interactions::timestamp();
+    let open = open_claims(db, caller).await?;
     Ok(json!({
         "availability": {
             "status": "available",
@@ -410,7 +478,8 @@ async fn briefing_from_log(db: &Db, caller: &Caller, intent: &str) -> Result<Val
         },
         "resume": resume(db, caller).await?,
         "working_under": working_under(db, run_key, intent).await?,
-        "open_claims": open_claims(db, caller).await?,
+        "open_claims": open,
+        "overlapping_claims": overlapping_claims(db, caller, &open).await?,
     }))
 }
 

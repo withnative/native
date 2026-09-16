@@ -1,8 +1,10 @@
 //! SQLite implementation of the backend-neutral freshness kernel contract.
 
+use std::collections::HashMap;
+
 use serde::Serialize;
 use serde_json::{json, Value};
-use sqlx::{Row, SqliteConnection};
+use sqlx::{Row, Sqlite, SqliteConnection, Transaction};
 use uuid::Uuid;
 
 use crate::authorization::{
@@ -602,14 +604,30 @@ pub async fn bind_occurrence(
         return Err(Error::engine("invalid Occurrence binding input"));
     }
     let mut tx = begin_write(db.write_pool()).await?;
-    let bearer = unit_bearer_on(&mut tx, &input.unit_revision.subject_id).await?;
-    for record_id in [
-        input.unit_revision.subject_id.as_str(),
-        bearer.as_str(),
-        input.artefact_revision.subject_id.as_str(),
-    ] {
-        require_capability_on(&mut tx, principal, record_id, Capability::Edit).await?;
-    }
+    let bearer = unit_bearer_on(&mut tx, &input.unit_revision.subject_id)
+        .await
+        .map_err(|error| semantic_read_error(principal, "Unit unavailable", error))?;
+    // The bearer id is kernel-derived, never caller-supplied, so its denial
+    // is sanitized like `read_unit` and checked first: effective capability on
+    // the Unit already folds the bearer in, so a bearer-denied caller would
+    // otherwise always fail the Unit check before reaching this one.
+    require_capability_on(&mut tx, principal, &bearer, Capability::Edit)
+        .await
+        .map_err(|error| semantic_read_error(principal, "Unit unavailable", error))?;
+    require_capability_on(
+        &mut tx,
+        principal,
+        &input.unit_revision.subject_id,
+        Capability::Edit,
+    )
+    .await?;
+    require_capability_on(
+        &mut tx,
+        principal,
+        &input.artefact_revision.subject_id,
+        Capability::Edit,
+    )
+    .await?;
     verify_revision_ref_on(&mut tx, &input.unit_revision).await?;
     let anchored = verify_revision_ref_on(&mut tx, &input.artefact_revision).await?;
     input.selectors = canonicalize_occurrence_selectors(input.selectors, &anchored)?;
@@ -629,14 +647,27 @@ pub async fn bind_occurrence(
                 .fetch_one(&mut *tx)
                 .await?;
         let occurrence = load_occurrence_on(&mut tx, &occurrence_id).await?;
-        let bearer = unit_bearer_on(&mut tx, &occurrence.unit_revision.subject_id).await?;
-        for record_id in [
-            occurrence.unit_revision.subject_id.as_str(),
-            bearer.as_str(),
-            occurrence.artefact_revision.subject_id.as_str(),
-        ] {
-            require_capability_on(&mut tx, principal, record_id, Capability::Edit).await?;
-        }
+        let bearer = unit_bearer_on(&mut tx, &occurrence.unit_revision.subject_id)
+            .await
+            .map_err(|error| semantic_read_error(principal, "Unit unavailable", error))?;
+        // Bearer first here too, for the same reason as the fresh path above.
+        require_capability_on(&mut tx, principal, &bearer, Capability::Edit)
+            .await
+            .map_err(|error| semantic_read_error(principal, "Unit unavailable", error))?;
+        require_capability_on(
+            &mut tx,
+            principal,
+            &occurrence.unit_revision.subject_id,
+            Capability::Edit,
+        )
+        .await?;
+        require_capability_on(
+            &mut tx,
+            principal,
+            &occurrence.artefact_revision.subject_id,
+            Capability::Edit,
+        )
+        .await?;
         return Ok(BindOccurrenceResult {
             occurrence,
             high_water: high_water(&prior),
@@ -725,10 +756,17 @@ pub async fn revise_unit(
         return Err(Error::engine("invalid Unit revision input"));
     }
     let mut tx = begin_write(db.write_pool()).await?;
-    let bearer = unit_bearer_on(&mut tx, input.unit_id.as_str()).await?;
-    for record_id in [input.unit_id.as_str(), bearer.as_str()] {
-        require_capability_on(&mut tx, principal, record_id, Capability::Edit).await?;
-    }
+    let bearer = unit_bearer_on(&mut tx, input.unit_id.as_str())
+        .await
+        .map_err(|error| semantic_read_error(principal, "Unit unavailable", error))?;
+    // The bearer id is kernel-derived, never caller-supplied, so its denial
+    // is sanitized like `read_unit` and checked first: effective capability on
+    // the Unit already folds the bearer in, so a bearer-denied caller would
+    // otherwise always fail the Unit check before reaching this one.
+    require_capability_on(&mut tx, principal, &bearer, Capability::Edit)
+        .await
+        .map_err(|error| semantic_read_error(principal, "Unit unavailable", error))?;
+    require_capability_on(&mut tx, principal, input.unit_id.as_str(), Capability::Edit).await?;
     verify_revision_ref_on(&mut tx, &input.expected_current).await?;
     let intent = intent_sha256(&input)?;
     if let Some(prior) = prior_command(
@@ -741,10 +779,20 @@ pub async fn revise_unit(
     .await?
     {
         let revision = load_unit_revision_on(&mut tx, &prior.result_event_id).await?;
-        let bearer = unit_bearer_on(&mut tx, &revision.revision.subject_id).await?;
-        for record_id in [revision.revision.subject_id.as_str(), bearer.as_str()] {
-            require_capability_on(&mut tx, principal, record_id, Capability::Edit).await?;
-        }
+        let bearer = unit_bearer_on(&mut tx, &revision.revision.subject_id)
+            .await
+            .map_err(|error| semantic_read_error(principal, "Unit unavailable", error))?;
+        // Bearer first here too, for the same reason as the fresh path above.
+        require_capability_on(&mut tx, principal, &bearer, Capability::Edit)
+            .await
+            .map_err(|error| semantic_read_error(principal, "Unit unavailable", error))?;
+        require_capability_on(
+            &mut tx,
+            principal,
+            revision.revision.subject_id.as_str(),
+            Capability::Edit,
+        )
+        .await?;
         let previous = revision
             .based_on_revision_event_id
             .as_deref()
@@ -1048,6 +1096,251 @@ fn semantic_read_error(principal: Principal<'_>, public: &str, error: Error) -> 
     } else {
         Error::engine(public)
     }
+}
+
+/// Occurrence ids bound to one artefact record, oldest binding first.
+///
+/// The `idx_occurrences_artefact` index serves the `artefact_id` lookup; the
+/// `ORDER BY binding_event_seq` sort is separate (that index leads with
+/// `artefact_revision_seq`, not the binding sequence).
+pub(crate) async fn occurrence_ids_for_artefact_on(
+    conn: &mut SqliteConnection,
+    artefact_id: &str,
+) -> Result<Vec<String>> {
+    Ok(sqlx::query_scalar(
+        "SELECT occurrence_id FROM occurrences WHERE artefact_id=? ORDER BY binding_event_seq ASC",
+    )
+    .bind(artefact_id)
+    .fetch_all(&mut *conn)
+    .await?)
+}
+
+/// Advisory freshness projection for one record read, evaluated inside the
+/// caller's own live snapshot transaction.
+///
+/// Returns `None` — absent, not empty — when no Occurrence is bound to the
+/// artefact, so records without bindings serialize byte-identically to a read
+/// without this projection. Live reads only: historical (`as_of`) callers
+/// must not call this.
+///
+/// Authorization mirrors `read_unit`: the record itself is already visible to
+/// the caller; each Occurrence additionally requires `View` on the Unit
+/// record and on its authority bearer. When either check fails that
+/// occurrence reports `"unit": "withheld"` with `unit_moved` still exposed.
+/// Successor Units are gated the same way, one by one: hidden successors are
+/// dropped from `unit_superseded_by` and never contribute to `possibly_stale`.
+/// A `None` principal (the trusted-local read path) sees everything.
+pub(crate) async fn freshness_for_artefact_in(
+    tx: &mut Transaction<'_, Sqlite>,
+    artefact_id: &str,
+    principal: Option<Principal<'_>>,
+) -> Result<Option<FreshnessQualification>> {
+    let occurrence_ids = occurrence_ids_for_artefact_on(&mut *tx, artefact_id).await?;
+    if occurrence_ids.is_empty() {
+        return Ok(None);
+    }
+    // One bound Occurrence as loaded for this artefact, before Unit-relative
+    // evaluation. The vector stays in binding sequence throughout.
+    struct LoadedOccurrence {
+        view: OccurrenceView,
+        anchor: String,
+        anchor_live: bool,
+        current_range: Option<ResolvedRange>,
+        bound_revision: FreshnessRevisionRef,
+    }
+    // Load every Occurrence bound to this artefact first, in binding order,
+    // so reconciliation — a relation between an earlier and a later binding
+    // — resolves in one pass without reordering the list.
+    let mut loaded = Vec::with_capacity(occurrence_ids.len());
+    for occurrence_id in &occurrence_ids {
+        let occurrence = load_occurrence_on(&mut *tx, occurrence_id).await?;
+        let resolution = resolve_occurrence_view_on(&mut *tx, occurrence.clone()).await?;
+        let anchor = match resolution.state {
+            OccurrenceResolutionState::Current => "current",
+            OccurrenceResolutionState::Relocated => "relocated",
+            OccurrenceResolutionState::Conflict => "conflict",
+            OccurrenceResolutionState::Stale => "stale",
+            OccurrenceResolutionState::Unavailable => "unavailable",
+        }
+        .to_string();
+        let anchor_live = matches!(
+            resolution.state,
+            OccurrenceResolutionState::Current | OccurrenceResolutionState::Relocated
+        );
+        let bound_row: (String, i64) = sqlx::query_as(
+            "SELECT revision_event_id, revision_seq FROM unit_revisions WHERE revision_event_id=?",
+        )
+        .bind(&occurrence.unit_revision.revision_event_id)
+        .fetch_one(&mut **tx)
+        .await?;
+        loaded.push(LoadedOccurrence {
+            view: occurrence,
+            anchor,
+            anchor_live,
+            current_range: resolution.current_range,
+            bound_revision: FreshnessRevisionRef {
+                event_id: bound_row.0,
+                revision_seq: bound_row.1,
+            },
+        });
+    }
+    // The Unit's head, once per Unit: `revise_unit` maintains a single head,
+    // so this is one row in practice. If several ever coexist, the newest
+    // sequence wins so the projection stays deterministic. A missing head
+    // leaves `current_unit_revision` absent and reports `unit_moved` as
+    // false. Only that case is tolerated: every other inconsistency (a
+    // missing Occurrence, a missing bound revision) still propagates and
+    // fails the read.
+    let mut unit_ids: Vec<&str> = loaded
+        .iter()
+        .map(|item| item.view.unit_revision.subject_id.as_str())
+        .collect();
+    unit_ids.sort();
+    unit_ids.dedup();
+    let mut heads: HashMap<&str, Option<FreshnessRevisionRef>> = HashMap::new();
+    for unit_id in unit_ids {
+        let head_row: Option<(String, i64)> = sqlx::query_as(
+            "SELECT h.revision_event_id, r.revision_seq
+               FROM unit_heads h JOIN unit_revisions r ON r.revision_event_id = h.revision_event_id
+              WHERE h.unit_id=? ORDER BY r.revision_seq DESC LIMIT 1",
+        )
+        .bind(unit_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+        heads.insert(
+            unit_id,
+            head_row.map(|(event_id, revision_seq)| FreshnessRevisionRef {
+                event_id,
+                revision_seq,
+            }),
+        );
+    }
+    // Reconciliation, per Unit: an earlier Occurrence whose own bound
+    // revision has moved off the Unit's current head is reconciled when a
+    // later one (greater binding sequence) on this artefact binds the same
+    // Unit at its current head behind a live anchor. A head-bound Occurrence
+    // needs no reconciling, so a later head-bound sibling leaves it alone.
+    // The reconciler itself is evaluated normally below. A reconciled
+    // Occurrence is still listed but never contributes to `possibly_stale`.
+    let mut reconciled_by: Vec<Option<String>> = vec![None; loaded.len()];
+    for (index, item) in loaded.iter().enumerate() {
+        let unit_id = item.view.unit_revision.subject_id.as_str();
+        let head_event = heads
+            .get(unit_id)
+            .and_then(|head| head.as_ref())
+            .map(|head| head.event_id.as_str());
+        let Some(head_event) = head_event else {
+            continue;
+        };
+        if item.bound_revision.event_id == head_event {
+            continue;
+        }
+        if let Some(reconciler) = loaded.iter().skip(index + 1).find(|later| {
+            later.view.unit_revision.subject_id.as_str() == unit_id
+                && later.bound_revision.event_id == head_event
+                && later.anchor_live
+        }) {
+            reconciled_by[index] = Some(reconciler.view.occurrence_id.as_str().to_string());
+        }
+    }
+    let mut occurrences = Vec::with_capacity(loaded.len());
+    let mut possibly_stale = false;
+    for (index, item) in loaded.iter().enumerate() {
+        let unit_id = item.view.unit_revision.subject_id.as_str();
+        let current_revision = heads.get(unit_id).and_then(|head| head.clone());
+        let unit_moved = current_revision
+            .as_ref()
+            .is_some_and(|current| current.event_id != item.bound_revision.event_id);
+        let reconciled = reconciled_by[index].is_some();
+        let successor_rows: Vec<String> = sqlx::query_scalar(
+            "SELECT successor_unit_id FROM unit_supersessions
+              WHERE predecessor_unit_id=? ORDER BY ordinal ASC, supersession_event_seq ASC, successor_unit_id ASC",
+        )
+        .bind(unit_id)
+        .fetch_all(&mut **tx)
+        .await?;
+        // Successor Units are individually View-gated like every other Unit
+        // read: a non-trusted caller lists only the successors it can View
+        // (the successor Unit record and its authority bearer). Hidden
+        // successors are dropped entirely and never contribute to
+        // `possibly_stale`, the same rule withheld occurrences follow.
+        let visible_successors = match principal {
+            None => successor_rows,
+            Some(viewer) => {
+                let mut visible = Vec::with_capacity(successor_rows.len());
+                for successor_id in successor_rows {
+                    let bearer = unit_bearer_on(&mut *tx, &successor_id).await?;
+                    if require_capability_on(tx, viewer, &successor_id, Capability::View)
+                        .await
+                        .is_ok()
+                        && require_capability_on(tx, viewer, &bearer, Capability::View)
+                            .await
+                            .is_ok()
+                    {
+                        visible.push(successor_id);
+                    }
+                }
+                visible
+            }
+        };
+        let superseded_by = (!visible_successors.is_empty()).then_some(visible_successors);
+        let fully_visible = match principal {
+            None => true,
+            Some(viewer) => {
+                let bearer = unit_bearer_on(&mut *tx, unit_id).await?;
+                require_capability_on(tx, viewer, unit_id, Capability::View)
+                    .await
+                    .is_ok()
+                    && require_capability_on(tx, viewer, &bearer, Capability::View)
+                        .await
+                        .is_ok()
+            }
+        };
+        if fully_visible {
+            if !reconciled && item.anchor_live && (unit_moved || superseded_by.is_some()) {
+                possibly_stale = true;
+            }
+            occurrences.push(FreshnessOccurrence {
+                occurrence_id: item.view.occurrence_id.as_str().to_string(),
+                expression_role: item.view.expression_role.as_str().to_string(),
+                anchor: item.anchor.clone(),
+                current_range: item.current_range.clone(),
+                unit_id: Some(unit_id.to_string()),
+                unit: None,
+                bound_unit_revision: Some(item.bound_revision.clone()),
+                current_unit_revision: current_revision,
+                unit_moved,
+                reconciled_by: reconciled_by[index].clone(),
+                unit_superseded_by: superseded_by,
+            });
+        } else {
+            // Withheld occurrences disclose no Unit identifiers — including no
+            // successor list, whose entries are Unit ids — so only the still
+            // emitted `unit_moved` can contribute here. The reconciling
+            // Occurrence id is not a Unit identifier and stays visible.
+            if !reconciled && item.anchor_live && unit_moved {
+                possibly_stale = true;
+            }
+            occurrences.push(FreshnessOccurrence {
+                occurrence_id: item.view.occurrence_id.as_str().to_string(),
+                expression_role: item.view.expression_role.as_str().to_string(),
+                anchor: item.anchor.clone(),
+                current_range: item.current_range.clone(),
+                unit_id: None,
+                unit: Some("withheld".to_string()),
+                bound_unit_revision: None,
+                current_unit_revision: None,
+                unit_moved,
+                reconciled_by: reconciled_by[index].clone(),
+                unit_superseded_by: None,
+            });
+        }
+    }
+    Ok(Some(FreshnessQualification {
+        contract: READ_FRESHNESS_CONTRACT.to_string(),
+        possibly_stale,
+        occurrences,
+    }))
 }
 
 pub async fn current_history_high_water(db: &Db) -> Result<HistoryHighWater> {

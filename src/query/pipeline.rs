@@ -19,6 +19,7 @@
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -1489,12 +1490,15 @@ impl SelectionSession<'_, '_, '_> {
     }
 
     async fn authorize(&mut self, ids: Vec<String>) -> Vec<String> {
-        match self {
+        let started = Instant::now();
+        let authorized = match self {
             Self::Lens { lens, principal } => {
                 authorize_ids(lens.meta().snapshot_pool(), ids, *principal).await
             }
             Self::Live { tx, principal } => authorize_ids_in(tx, ids, *principal).await,
-        }
+        };
+        super::stage_timing::add_authorization(started);
+        authorized
     }
 
     /// Apply lifecycle tokens after ordinary candidate selection so aliases

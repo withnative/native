@@ -1068,7 +1068,7 @@ pub fn register_attachment_tools_with(
         ToolKind::AttachText,
         "Capture text as an attachment under a record: bytes into the blob tier, \
          plus a Document kind:attachment record bound via the blob_ref facet.",
-        json!({
+        crate::mcp::record_ref::with_record_selector_aliases("attach_text", json!({
             "type": "object",
             "properties": {
                 "record_id": { "type": "string", "description": "Record to attach under." },
@@ -1092,7 +1092,7 @@ pub fn register_attachment_tools_with(
             },
             "required": ["record_id", "text"],
             "additionalProperties": false
-        }),
+        })),
         attach_text,
     )?;
     registry.register(
@@ -1152,20 +1152,47 @@ pub fn register_attachment_tools_with(
         }),
         read_attachment,
     )?;
+    let list_schema = crate::mcp::record_ref::with_record_selector_aliases(
+        "manage_attachments.list",
+        json!({
+            "type":"object",
+            "properties":{
+                "action":{"const":"list"},
+                "record_id":{"type":"string","description":"Attachment parent."}
+            },
+            "required":["action","record_id"],
+            "additionalProperties":false
+        }),
+    );
+    let action_schema = json!({
+        "type":"object",
+        "oneOf":[
+            list_schema,
+            {
+                "type":"object",
+                "properties":{
+                    "action":{"const":"inspect"},
+                    "attachment_id":{"type":"string"}
+                },
+                "required":["action","attachment_id"],
+                "additionalProperties":false
+            },
+            {
+                "type":"object",
+                "properties":{
+                    "action":{"const":"detach"},
+                    "attachment_id":{"type":"string"}
+                },
+                "required":["action","attachment_id"],
+                "additionalProperties":false
+            }
+        ]
+    });
     registry.register(
         ToolKind::ManageAttachments,
         "List, inspect or detach attachments on a record. Detach soft-deletes the \
          attachment record (record.deleted); the blob is retained.",
-        json!({
-            "type": "object",
-            "properties": {
-                "action": { "type": "string", "enum": ["list", "inspect", "detach"] },
-                "record_id": { "type": "string", "description": "list: the record whose attachments to list." },
-                "attachment_id": { "type": "string", "description": "inspect/detach: the attachment record." }
-            },
-            "required": ["action"],
-            "additionalProperties": false
-        }),
+        action_schema,
         manage_attachments,
     )?;
     Ok(())

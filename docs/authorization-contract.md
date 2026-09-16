@@ -9,10 +9,10 @@ without a top-level action discriminator.
 
 ## Current operation census
 
-- **76 registered tools / 192 operations**.
-- **13 ordinary, 77 high-risk, and 102 specialized operations**.
-- **80 read-only and 112 mutating operations**.
-- **187 operations carry a non-disclosure obligation**.
+- **76 registered tools / 193 operations**.
+- **13 ordinary, 77 high-risk, and 103 specialized operations**.
+- **81 read-only and 112 mutating operations**.
+- **188 operations carry a non-disclosure obligation**.
 - All **112 mutating operations** carry an explicit no-write-on-deny obligation
   and named negative evidence.
 - **5 read operations** have justified `negative_evidence: not_applicable`:

@@ -16,6 +16,7 @@ use super::super::apps::{RECORD_VERSION_DIFF_URI, SUGGESTION_REVIEW_URI};
 use super::super::registry::{AppMetadata, Caller, ToolRegistry};
 use super::super::ToolKind;
 use super::{can_record, history::record_version_at, parse_args, require_record};
+use crate::mcp::record_ref::with_record_selector_aliases;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -188,7 +189,7 @@ pub fn register_history_app_tool(registry: &mut ToolRegistry) -> Result<()> {
     registry.register_app(
         ToolKind::RenderRecordVersionDiff,
         "Open a read-only App comparing one historical record revision with its current state. The prose fallback identifies both revisions for hosts without MCP Apps.",
-        json!({
+        with_record_selector_aliases("render_record_version_diff", json!({
             "type": "object",
             "properties": {
                 "record_id": { "type": "string" },
@@ -196,7 +197,7 @@ pub fn register_history_app_tool(registry: &mut ToolRegistry) -> Result<()> {
             },
             "required": ["record_id", "before_seq"],
             "additionalProperties": false
-        }),
+        })),
         AppMetadata::model_and_app(RECORD_VERSION_DIFF_URI),
         render_record_version_diff,
     )
@@ -206,12 +207,12 @@ pub fn register_suggestion_app_tool(registry: &mut ToolRegistry) -> Result<()> {
     registry.register_app(
         ToolKind::RenderSuggestionReview,
         "Open an App for reviewing the open body suggestions under one target. The App stages locally, dry-runs the ordered selection, and commits once.",
-        json!({
+        with_record_selector_aliases("render_suggestion_review", json!({
             "type": "object",
             "properties": { "record_id": { "type": "string" } },
             "required": ["record_id"],
             "additionalProperties": false
-        }),
+        })),
         AppMetadata::model_and_app(SUGGESTION_REVIEW_URI),
         render_suggestion_review,
     )

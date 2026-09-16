@@ -540,9 +540,24 @@ where
     E: sqlx::Executor<'e, Database = Sqlite>,
 {
     let sql = format!("PRAGMA table_info({})", quote_identifier(table));
-    Ok(sqlx::query_as::<_, TableColumn>(&sql)
+    let mut columns = sqlx::query_as::<_, TableColumn>(&sql)
         .fetch_all(executor)
-        .await?)
+        .await?;
+    // Interchange carries logical historical IDs. Dictionary references are
+    // receiver-local storage, not a new portable identity or section.
+    if table == "read_log_touches" {
+        for column in &mut columns {
+            if column.name == "record_ref" {
+                ensure(
+                    column.declared_type == "INTEGER" && column.pk == 2,
+                    "read-log dictionary reference has an unsupported shape",
+                )?;
+                column.name = "record_id".into();
+                column.declared_type = "TEXT".into();
+            }
+        }
+    }
+    Ok(columns)
 }
 
 async fn export_section(tx: &mut sqlx::Transaction<'_, Sqlite>, name: &str) -> Result<Section> {
@@ -585,16 +600,30 @@ async fn export_section(tx: &mut sqlx::Transaction<'_, Sqlite>, name: &str) -> R
         .map(|column| quote_identifier(column))
         .collect::<Vec<_>>()
         .join(", ");
-    let sql = format!(
-        "SELECT {select_columns} FROM {} ORDER BY {order}",
-        quote_identifier(name)
-    );
+    let sql = if name == "read_log_touches" {
+        // LEFT JOIN retains any broken reference as a NULL logical key, which
+        // the decoder below refuses instead of silently dropping the row.
+        "SELECT t.call_seq, d.record_id, t.interaction, t.result_rank FROM read_log_touches t LEFT JOIN read_log_record_ids d ON d.record_ref=t.record_ref ORDER BY t.call_seq, d.record_id, t.interaction".to_string()
+    } else {
+        format!(
+            "SELECT {select_columns} FROM {} ORDER BY {order}",
+            quote_identifier(name)
+        )
+    };
     let result_rows = sqlx::query(&sql).fetch_all(&mut **tx).await?;
     let mut rows = Vec::with_capacity(result_rows.len());
     for row in result_rows {
         let mut cells = Vec::with_capacity(columns.len());
         for index in 0..columns.len() {
             let raw = row.try_get_raw(index)?;
+            if name == "read_log_touches"
+                && index == 1
+                && (raw.is_null() || raw.type_info().name() != "TEXT")
+            {
+                return Err(Error::engine(
+                    "canonical read-log touch has no TEXT dictionary identity",
+                ));
+            }
             if raw.is_null() {
                 cells.push(Cell::Null);
                 continue;
@@ -640,7 +669,7 @@ fn validate_bundle(bundle: &Bundle) -> Result<()> {
     ensure(
         matches!(
             bundle.manifest.source_engine_schema,
-            45 | CURRENT_ENGINE_SCHEMA_VERSION
+            45 | 53 | CURRENT_ENGINE_SCHEMA_VERSION
         ),
         "unsupported source engine schema revision",
     )?;
@@ -921,19 +950,55 @@ async fn validate_destination_section(
 }
 
 async fn import_section(tx: &mut sqlx::Transaction<'_, Sqlite>, section: &Section) -> Result<()> {
+    let touches = section.name == "read_log_touches";
+    let mut dictionary = std::collections::BTreeMap::<String, i64>::new();
     let columns = section
         .columns
         .iter()
-        .map(|column| quote_identifier(&column.name))
+        .map(|column| {
+            quote_identifier(if touches && column.name == "record_id" {
+                "record_ref"
+            } else {
+                &column.name
+            })
+        })
         .collect::<Vec<_>>()
         .join(", ");
     for row in &section.rows {
+        let record_ref = if touches {
+            let Some(Cell::Text(record_id)) = row.get(1) else {
+                return Err(Error::engine("canonical read-log record ID must be TEXT"));
+            };
+            let record_ref = if let Some(record_ref) = dictionary.get(record_id) {
+                *record_ref
+            } else {
+                sqlx::query("INSERT OR IGNORE INTO read_log_record_ids(record_id) VALUES (?)")
+                    .bind(record_id)
+                    .execute(&mut **tx)
+                    .await?;
+                let record_ref: i64 = sqlx::query_scalar(
+                    "SELECT record_ref FROM read_log_record_ids WHERE record_id=?",
+                )
+                .bind(record_id)
+                .fetch_one(&mut **tx)
+                .await?;
+                dictionary.insert(record_id.clone(), record_ref);
+                record_ref
+            };
+            Some(record_ref)
+        } else {
+            None
+        };
         let mut query = QueryBuilder::<Sqlite>::new(format!(
             "INSERT INTO {} ({columns}) ",
             quote_identifier(&section.name)
         ));
         query.push_values(std::iter::once(row), |mut separated, cells| {
-            for cell in cells {
+            for (index, cell) in cells.iter().enumerate() {
+                if let Some(record_ref) = record_ref.filter(|_| index == 1) {
+                    separated.push_bind(record_ref);
+                    continue;
+                }
                 match cell {
                     Cell::Null => separated.push_bind(None::<i64>),
                     Cell::Integer(value) => separated.push_bind(*value),
@@ -1218,6 +1283,107 @@ mod tests {
             .unwrap();
         assert_eq!(cell_integer(&cutover.rows[0][1]), Some(legacy_event_count));
         assert_eq!(cell_integer(&cutover.rows[0][3]), Some(45));
+    }
+
+    #[tokio::test]
+    async fn dictionary_touches_round_trip_as_legacy_text_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = crate::create_database(temp.path().join("source.db").to_str().unwrap())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO read_log_calls (seq,id,tool,outcome,started_at,ended_at) VALUES (1,'portable-call','test','ok','2026-09-12','2026-09-12')")
+            .execute(source.write_pool()).await.unwrap();
+        // Deliberately assign references in a different order from TEXT keys.
+        for (index, id) in ["z", "Case", "case", "", "dangling-id", "雪"]
+            .iter()
+            .enumerate()
+        {
+            sqlx::query("INSERT INTO read_log_record_ids(record_ref,record_id) VALUES (?,?)")
+                .bind(index as i64 + 1)
+                .bind(id)
+                .execute(source.write_pool())
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO read_log_touches(call_seq,record_ref,interaction,result_rank) VALUES (1,?,'opened',?)")
+                .bind(index as i64 + 1).bind(if index == 0 { None } else { Some(index as i64) })
+                .execute(source.write_pool()).await.unwrap();
+        }
+        let bytes = export_canonical_interchange(&source).await.unwrap();
+        let bundle: Bundle = serde_json::from_slice(&bytes).unwrap();
+        assert!(!bundle
+            .sections
+            .iter()
+            .any(|section| section.name == "read_log_record_ids"));
+        let original = bundle
+            .sections
+            .iter()
+            .find(|section| section.name == "read_log_touches")
+            .unwrap()
+            .clone();
+        assert_eq!(original.columns[1].name, "record_id");
+        assert_eq!(original.columns[1].declared_type, "TEXT");
+        assert!(matches!(&original.rows[0][1], Cell::Text(id) if id.is_empty()));
+        // Every accepted wire generation carries the same logical IDs,
+        // including populated revision-1 bundles from engine 45.
+        for version in [45, 53, CURRENT_ENGINE_SCHEMA_VERSION] {
+            let mut input = if version == 45 {
+                downgrade_to_revision_1(bundle.clone())
+            } else {
+                bundle.clone()
+            };
+            input.manifest.source_engine_schema = version;
+            let imported = import_canonical_interchange(
+                &serde_json::to_vec(&input).unwrap(),
+                &temp.path().join(format!("import-{version}.db")),
+            )
+            .await
+            .unwrap();
+            let exported: Bundle =
+                serde_json::from_slice(&export_canonical_interchange(&imported).await.unwrap())
+                    .unwrap();
+            let decoded = exported
+                .sections
+                .iter()
+                .find(|section| section.name == "read_log_touches")
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(decoded).unwrap(),
+                serde_json::to_value(&original).unwrap(),
+                "source engine {version}"
+            );
+            let refs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM read_log_record_ids")
+                .fetch_one(imported.write_pool())
+                .await
+                .unwrap();
+            assert_eq!(refs, 6);
+        }
+    }
+
+    #[tokio::test]
+    async fn dictionary_export_refuses_a_missing_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = crate::create_database(temp.path().join("source.db").to_str().unwrap())
+            .await
+            .unwrap();
+        let mut connection = source.write_pool().acquire().await.unwrap();
+        sqlx::query("PRAGMA foreign_keys=OFF")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO read_log_calls (seq,id,tool,outcome,started_at,ended_at) VALUES (1,'broken-call','test','ok','2026-09-12','2026-09-12')").execute(&mut *connection).await.unwrap();
+        sqlx::query(
+            "INSERT INTO read_log_touches(call_seq,record_ref,interaction) VALUES (1,99,'opened')",
+        )
+        .execute(&mut *connection)
+        .await
+        .unwrap();
+        sqlx::query("PRAGMA foreign_keys=ON")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        drop(connection);
+        let error = export_canonical_interchange(&source).await.unwrap_err();
+        assert!(error.to_string().contains("dictionary identity"), "{error}");
     }
 
     #[tokio::test]

@@ -137,7 +137,6 @@ async fn get_event_context(db: Db, caller: Caller, arguments: Value) -> Result<V
     }
 
     let event_created_at = selected.created_at.clone();
-    let event_run_key = selected.run_key.clone();
     let event_record_id = selected.record_id.clone();
     let event_seq = selected.local_seq;
 
@@ -145,6 +144,11 @@ async fn get_event_context(db: Db, caller: Caller, arguments: Value) -> Result<V
 
     let mut disclosure = ActorDisclosure::default();
     redact_event(&db, &caller, &mut disclosure, &mut selected).await?;
+    // The run block, the consulted scope and the neighbour scope must all
+    // observe the REDACTED run key: for a caller outside the holder's
+    // account the claim run is withheld exactly as on ordinary history,
+    // so capture it only after redaction above.
+    let event_run_key = selected.run_key.clone();
     // The event-local intent is the one stamped on THIS event, not the run's
     // latest. A run that has since re-declared its aim must not have that later
     // aim retro-attached to an earlier write.
@@ -351,8 +355,8 @@ async fn consulted_context(
         return Ok(ConsultedEvidence::unavailable());
     }
 
-    let episode_start_seq: Option<i64> = sqlx::query_scalar(
-        "SELECT seq FROM read_log_calls
+    let episode_boundary: Option<(i64, String)> = sqlx::query_as(
+        "SELECT seq, ended_at FROM read_log_calls
           WHERE run_key = ? AND tool = 'set_intent' AND outcome = 'ok'
             AND intent IS NOT NULL AND ended_at <= ?
           ORDER BY ended_at DESC, seq DESC LIMIT 1",
@@ -361,22 +365,40 @@ async fn consulted_context(
     .bind(event_created_at)
     .fetch_optional(db.write_pool())
     .await?;
+    // Response-time ordering, not insertion ordering: the synchronous
+    // declaration path can sequence a `set_intent` row ahead of an earlier-
+    // ended ordinary read whose queued capture lands later. Filtering by
+    // `seq > boundary_seq` alone would then admit that pre-intent read as
+    // episode evidence. Instead require the read to have begun at or after
+    // the declaration ended; `seq <> boundary_seq` is identity exclusion of
+    // the boundary row itself (which carries no touches), never a temporal
+    // tie-break. Same-millisecond ties are a bounded ambiguity this
+    // deliberately preserves: timestamps cannot establish chronology within
+    // one millisecond across the direct and queued paths, so a read stamped
+    // in the boundary millisecond is treated as episode evidence.
+    let (episode_start_seq, episode_start_ended_at): (Option<i64>, Option<String>) =
+        match &episode_boundary {
+            Some((seq, ended_at)) => (Some(*seq), Some(ended_at.clone())),
+            None => (None, None),
+        };
 
     let rows = sqlx::query(
-        "SELECT touch.record_id AS record_id,
+        "SELECT dictionary.record_id AS record_id,
                 touch.interaction AS interaction,
                 MAX(call.ended_at) AS last_at
            FROM read_log_calls call
            JOIN read_log_touches touch ON touch.call_seq = call.seq
+           JOIN read_log_record_ids dictionary ON dictionary.record_ref = touch.record_ref
           WHERE call.run_key = ?
             AND call.outcome = 'ok'
             AND call.ended_at <= ?
-            AND (?3 IS NULL OR call.seq > ?3)
-          GROUP BY touch.record_id, touch.interaction
-          ORDER BY last_at DESC, touch.record_id",
+            AND (?3 IS NULL OR (call.started_at >= ?3 AND call.seq <> ?4))
+          GROUP BY dictionary.record_id, touch.interaction
+          ORDER BY last_at DESC, dictionary.record_id",
     )
     .bind(run_key)
     .bind(event_created_at)
+    .bind(episode_start_ended_at)
     .bind(episode_start_seq)
     .fetch_all(db.write_pool())
     .await?;
@@ -520,5 +542,164 @@ mod tests {
             EvidenceStatus::Unavailable.as_str(),
             "an absent read log must never render as 'no records opened'"
         );
+    }
+
+    /// A pre-intent read whose queued capture lands after the synchronous
+    /// declaration must not become episode evidence: insertion order (`seq`)
+    /// no longer reflects response order across the direct and queued paths,
+    /// so the boundary compares response-time `ended_at` first. Insert the
+    /// declaration first (smaller `seq`, later `ended_at`), then the earlier-
+    /// ended read (larger `seq`), and require the read to be excluded.
+    #[tokio::test]
+    async fn delayed_pre_intent_capture_is_not_episode_evidence() {
+        let db = crate::db::create_database(":memory:").await.unwrap();
+        let run_key = "scout-chair-a748b2";
+        let record_id = crate::store::create_record(
+            &db,
+            serde_json::json!({"type": "Document", "kind": "note", "name": "consulted"}),
+        )
+        .await
+        .unwrap();
+        // Declaration responds (and inserts) second in time but first in seq.
+        sqlx::query(
+            "INSERT INTO read_log_calls
+              (id, tool, run_key, outcome, intent, started_at, ended_at)
+             VALUES ('decl-1', 'set_intent', ?, 'ok', 'episode two',
+                     '2026-09-16T00:00:00.000Z', '2026-09-16T00:00:02.000Z')",
+        )
+        .bind(run_key)
+        .execute(db.write_pool())
+        .await
+        .unwrap();
+        // Ordinary read responds first but its queued capture inserts later.
+        sqlx::query(
+            "INSERT INTO read_log_calls
+              (id, tool, run_key, outcome, started_at, ended_at)
+             VALUES ('read-1', 'get_record', ?, 'ok',
+                     '2026-09-16T00:00:00.000Z', '2026-09-16T00:00:01.000Z')",
+        )
+        .bind(run_key)
+        .execute(db.write_pool())
+        .await
+        .unwrap();
+        let read_seq: i64 =
+            sqlx::query_scalar("SELECT seq FROM read_log_calls WHERE id = 'read-1'")
+                .fetch_one(db.write_pool())
+                .await
+                .unwrap();
+        let declaration_seq: i64 =
+            sqlx::query_scalar("SELECT seq FROM read_log_calls WHERE id = 'decl-1'")
+                .fetch_one(db.write_pool())
+                .await
+                .unwrap();
+        assert!(
+            read_seq > declaration_seq,
+            "fixture must invert seq vs response order: read_seq={read_seq} decl_seq={declaration_seq}"
+        );
+        sqlx::query("INSERT OR IGNORE INTO read_log_record_ids (record_id) VALUES (?)")
+            .bind(&record_id)
+            .execute(db.write_pool())
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO read_log_touches (call_seq, record_ref, interaction, result_rank)
+             VALUES (?, (SELECT record_ref FROM read_log_record_ids WHERE record_id = ?), 'opened', NULL)",
+        )
+        .bind(read_seq)
+        .bind(&record_id)
+        .execute(db.write_pool())
+        .await
+        .unwrap();
+
+        let evidence = consulted_context(
+            &db,
+            &Caller::local(),
+            run_key,
+            "2026-09-16T00:00:03.000Z",
+            &record_id,
+        )
+        .await
+        .unwrap();
+        assert!(
+            evidence.records.is_empty(),
+            "pre-intent read leaked into the episode: {:?}",
+            evidence.records
+        );
+        db.close().await;
+    }
+
+    /// Same-millisecond ties are a bounded ambiguity this preserves: a read
+    /// stamped in the boundary millisecond is treated as episode evidence,
+    /// because timestamps cannot establish chronology within one millisecond
+    /// across the direct and queued paths. This pins that choice so a future
+    /// change to conservative exclusion fails loudly here instead of
+    /// silently narrowing episode evidence.
+    #[tokio::test]
+    async fn boundary_millisecond_read_counts_as_episode_evidence() {
+        let db = crate::db::create_database(":memory:").await.unwrap();
+        let run_key = "scout-chair-a748b2";
+        let record_id = crate::store::create_record(
+            &db,
+            serde_json::json!({"type": "Document", "kind": "note", "name": "consulted"}),
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO read_log_calls
+              (id, tool, run_key, outcome, intent, started_at, ended_at)
+             VALUES ('decl-1', 'set_intent', ?, 'ok', 'episode two',
+                     '2026-09-16T00:00:00.000Z', '2026-09-16T00:00:02.000Z')",
+        )
+        .bind(run_key)
+        .execute(db.write_pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO read_log_calls
+              (id, tool, run_key, outcome, started_at, ended_at)
+             VALUES ('read-1', 'get_record', ?, 'ok',
+                     '2026-09-16T00:00:02.000Z', '2026-09-16T00:00:02.000Z')",
+        )
+        .bind(run_key)
+        .execute(db.write_pool())
+        .await
+        .unwrap();
+        let read_seq: i64 =
+            sqlx::query_scalar("SELECT seq FROM read_log_calls WHERE id = 'read-1'")
+                .fetch_one(db.write_pool())
+                .await
+                .unwrap();
+        sqlx::query("INSERT OR IGNORE INTO read_log_record_ids (record_id) VALUES (?)")
+            .bind(&record_id)
+            .execute(db.write_pool())
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO read_log_touches (call_seq, record_ref, interaction, result_rank)
+             VALUES (?, (SELECT record_ref FROM read_log_record_ids WHERE record_id = ?), 'opened', NULL)",
+        )
+        .bind(read_seq)
+        .bind(&record_id)
+        .execute(db.write_pool())
+        .await
+        .unwrap();
+
+        let evidence = consulted_context(
+            &db,
+            &Caller::local(),
+            run_key,
+            "2026-09-16T00:00:03.000Z",
+            &record_id,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            evidence.records.len(),
+            1,
+            "boundary-millisecond read should count as episode evidence: {:?}",
+            evidence.records
+        );
+        assert_eq!(evidence.records[0]["record_id"], record_id);
+        db.close().await;
     }
 }

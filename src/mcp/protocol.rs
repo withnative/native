@@ -41,6 +41,18 @@ pub(crate) const INTERNAL_ERROR: i64 = -32603;
 pub(crate) const HEADER_MISMATCH: i64 = -32020;
 pub(crate) const UNSUPPORTED_PROTOCOL_VERSION: i64 = -32022;
 
+/// Stable in-band classification for database pool acquisition timeouts
+/// (`sqlx::Error::PoolTimedOut`). The outcome is unknown — never read as
+/// unapplied — so this code carries conservative recovery guidance instead of
+/// the deployment read-only lane's `retryable`/`applied` claims. Exported for
+/// the hosted HTTP gateway so both transports share one source of truth.
+pub const DATABASE_POOL_TIMEOUT: &str = "DATABASE_POOL_TIMEOUT";
+
+/// Conservative recovery guidance for [`DATABASE_POOL_TIMEOUT`]. Shared with
+/// the hosted HTTP gateway so the in-band text, structured, and HTTP bodies
+/// carry the same wording.
+pub const DATABASE_POOL_TIMEOUT_RECOVERY: &str = "Database pool acquisition timed out (outcome unknown). Bootstrap and read-only calls are safe to retry within a bounded budget. A timed-out write has unknown outcome: verify current state before acting, and reuse the call's supported idempotency key rather than issuing a fresh write. Never assume the write was unapplied.";
+
 const PROTOCOL_VERSION_META: &str = "io.modelcontextprotocol/protocolVersion";
 const CLIENT_INFO_META: &str = "io.modelcontextprotocol/clientInfo";
 const CLIENT_CAPABILITIES_META: &str = "io.modelcontextprotocol/clientCapabilities";
@@ -756,6 +768,7 @@ pub(crate) fn call_error_content(
 ) -> Value {
     let standby_read_only = error.to_string() == super::registry::STANDBY_READ_ONLY_ERROR;
     let deployment_operation = error.deployment_read_only_operation();
+    let pool_timeout = matches!(error, Error::Sqlx(sqlx::Error::PoolTimedOut));
     let message = if standby_read_only {
         "this Native server is a read-only standby".to_string()
     } else if deployment_operation.is_some() {
@@ -764,6 +777,12 @@ pub(crate) fn call_error_content(
         error.to_string()
     };
     let mut text = message.clone();
+    // Text clients do not necessarily read structuredContent, so the pool
+    // recovery guidance rides in the text body too — not only in `recovery`.
+    if pool_timeout {
+        text.push_str("\n\nRecovery: ");
+        text.push_str(DATABASE_POOL_TIMEOUT_RECOVERY);
+    }
     text.push_str(&render::render_run_context(&run_context));
     let mut result = json!({
         "content": [{ "type": "text", "text": text }],
@@ -780,6 +799,16 @@ pub(crate) fn call_error_content(
         result["structuredContent"]["retryable"] = json!(true);
         result["structuredContent"]["applied"] = json!(false);
         result["structuredContent"]["operation"] = json!(operation);
+    } else if pool_timeout {
+        // A pool acquisition timeout leaves the outcome unknown: the timed-out
+        // call may or may not have applied. Never claim `applied: false`, and
+        // never mark an arbitrary timed-out write generically retryable — a
+        // blind retry can duplicate the effect. Bootstrap and read-only calls
+        // stay bounded-retryable; a timed-out write must verify current state
+        // first and reuse its supported idempotency key.
+        result["structuredContent"]["error_code"] = json!(DATABASE_POOL_TIMEOUT);
+        result["structuredContent"]["outcome"] = json!("unknown");
+        result["structuredContent"]["recovery"] = json!(DATABASE_POOL_TIMEOUT_RECOVERY);
     }
     if let Some(resource_uri) = resource_uri {
         result
@@ -879,7 +908,8 @@ async fn tools_call_kernel(
     };
     let call = match dispatched {
         Ok(call) => call,
-        Err(error @ Error::DeploymentReadOnly(_)) => {
+        Err(error @ Error::DeploymentReadOnly(_))
+        | Err(error @ Error::Sqlx(sqlx::Error::PoolTimedOut)) => {
             return Ok(call_error_content(
                 &error,
                 Value::Null,
@@ -898,13 +928,12 @@ async fn tools_call_kernel(
                 tool.ui.as_ref().map(|ui| ui.resource_uri),
             ))
         }
-        Err(err @ (Error::Engine(_) | Error::Conflict(_) | Error::Auth(_))) => {
-            Ok(call_error_content(
-                &err,
-                call.run_context,
-                tool.ui.as_ref().map(|ui| ui.resource_uri),
-            ))
-        }
+        Err(err @ (Error::Engine(_) | Error::Conflict(_) | Error::Auth(_)))
+        | Err(err @ Error::Sqlx(sqlx::Error::PoolTimedOut)) => Ok(call_error_content(
+            &err,
+            call.run_context,
+            tool.ui.as_ref().map(|ui| ui.resource_uri),
+        )),
         Err(err) => Err((INTERNAL_ERROR, err.to_string())),
     }
 }
@@ -1166,7 +1195,7 @@ fn discover_result() -> Value {
         "resultType": "complete",
         "supportedVersions": [PROTOCOL_VERSION],
         "capabilities": { "tools": {}, "resources": {} },
-        "instructions": "Native's event-authoritative knowledge store. Use tools/list to discover the available tool surface.",
+        "instructions": "Native's event-authoritative knowledge store. Use tools/list to discover the available tool surface. Bootstrap is read-only: after transient transport/pool failure or HTTP 502/503/504, retry at most twice (1s, then 2s; honor Retry-After up to 30s), then stop. Never retry auth, validation, or instruction-readiness failures. Retain the run key once received.",
         "ttlMs": 0,
         "cacheScope": "private",
         "_meta": result_meta(),
@@ -1785,6 +1814,83 @@ mod tests {
             .unwrap();
         assert_eq!(captured, 0);
         db.close().await;
+    }
+
+    #[tokio::test]
+    async fn pool_timeout_is_in_band_across_protocol_eras() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let mut registry = ToolRegistry::new();
+        registry
+            .register(
+                crate::mcp::ToolKind::Bootstrap,
+                "bootstrap fault fixture",
+                json!({"type":"object","properties":{},"additionalProperties":false}),
+                |_db: crate::Db, _caller: Caller, _args: Value| async {
+                    Err::<Value, Error>(Error::Sqlx(sqlx::Error::PoolTimedOut))
+                },
+            )
+            .unwrap();
+        let registry = std::sync::Arc::new(registry);
+        for modern_era in [false, true] {
+            let params = json!({"name":"bootstrap","arguments":{}});
+            let request = if modern_era {
+                modern(75, "tools/call", params)
+            } else {
+                json!({"jsonrpc":"2.0","id":75,"method":"tools/call","params":params})
+            };
+            let reply = if modern_era {
+                response(
+                    handle_modern_message(registry.clone(), db.clone(), Caller::local(), request)
+                        .await,
+                )
+            } else {
+                response(
+                    handle_legacy_message(registry.clone(), db.clone(), Caller::local(), request)
+                        .await,
+                )
+            };
+            assert!(reply.get("error").is_none(), "{reply}");
+            assert_eq!(reply["result"]["isError"], true);
+            let body = &reply["result"]["structuredContent"];
+            assert_eq!(body["error_code"], DATABASE_POOL_TIMEOUT);
+            assert_eq!(body["outcome"], "unknown");
+            assert!(body.get("run_context").is_some());
+            assert!(body.get("applied").is_none());
+        }
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn pool_timeout_is_typed_outcome_unknown_without_applied_or_blanket_retryable() {
+        let content =
+            call_error_content(&Error::Sqlx(sqlx::Error::PoolTimedOut), Value::Null, None);
+        assert_eq!(content["isError"], true);
+        let body = &content["structuredContent"];
+        assert_eq!(body["error_code"], DATABASE_POOL_TIMEOUT);
+        assert_eq!(body["outcome"], "unknown");
+        assert!(
+            body.get("applied").is_none(),
+            "a timed-out write must never be reported as unapplied: {body}"
+        );
+        assert!(
+            body.get("retryable").is_none(),
+            "a timed-out write must never be marked generically retryable: {body}"
+        );
+        let recovery = body["recovery"].as_str().unwrap();
+        assert!(recovery.contains("Bootstrap"), "{recovery}");
+        assert!(recovery.contains("idempotency"), "{recovery}");
+        assert!(
+            recovery.contains("Never assume the write was unapplied"),
+            "{recovery}"
+        );
+        // Text clients do not necessarily read structuredContent: the same
+        // recovery guidance must be visible in the text body.
+        let text = content["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("Recovery: "), "{text}");
+        assert!(
+            text.contains("Never assume the write was unapplied"),
+            "{text}"
+        );
     }
 
     #[tokio::test]

@@ -425,7 +425,7 @@ WITH _query_sql_agent_activity_claim_events AS (
              AND release.type='record.updated'
              AND json_type(release.payload,'$.claimed_by_account')='null'
              AND json_type(release.payload,'$.claimed_run_key')='null'
-             AND ((release.actor=event.actor AND release.run_key=event.run_key)
+             AND ((release.actor=event.actor)
                   OR release.actor='local')
             ORDER BY release.seq
             LIMIT 1) AS released_at
@@ -2486,6 +2486,7 @@ mod production_acl_tests {
             "annotation_targets",
             "read_log_calls",
             "read_log_touches",
+            "read_log_record_ids",
         ];
         for relation in raw {
             for statement in [
@@ -3198,6 +3199,94 @@ mod production_acl_tests {
 
         // Preserve the fixture's ordinary caller-relative assertions elsewhere.
         assert_eq!(bea.credential(), "bea");
+    }
+
+    #[tokio::test]
+    async fn same_principal_release_from_another_run_closes_the_claim() {
+        let (db, _alice, _bea) = protected_fixture().await;
+        let first_run = "scout-chair-a748b2";
+        let second_run = "scout-chair-b748b2";
+        crate::control::ensure_agent_run(&db, first_run, "alice")
+            .await
+            .unwrap();
+        crate::control::ensure_agent_run(&db, second_run, "alice")
+            .await
+            .unwrap();
+        replace_explicit_policy(
+            &db,
+            "test:activity-policy",
+            COMMON_ID,
+            vec![
+                AllowEntry::account("alice", Capability::Edit),
+                AllowEntry::account("bea", Capability::View),
+            ],
+        )
+        .await
+        .unwrap();
+        let mut registry = crate::mcp::ToolRegistry::new();
+        crate::mcp::register_builtin_tools(&mut registry).unwrap();
+        crate::mcp::register_surface_tools(&mut registry).unwrap();
+        // SAFETY: this test models the authenticated hosted ingress after it
+        // has admitted Bea's live member context; no SQL argument controls it.
+        let bea_activity = unsafe {
+            QueryPrincipal::activity_reader_unchecked(
+                "bea",
+                vec![
+                    crate::query::principal::ActivityRosterMember::verified_unchecked(
+                        "alice",
+                        "native:workspace-member:alice",
+                    ),
+                    crate::query::principal::ActivityRosterMember::verified_unchecked(
+                        "bea",
+                        "native:workspace-member:bea",
+                    ),
+                ],
+            )
+        };
+        registry
+            .call(
+                db.clone(),
+                crate::mcp::Caller::authenticated("alice"),
+                "start_work",
+                json!({ "record_id": COMMON_ID, "run_key": first_run }),
+            )
+            .await
+            .unwrap();
+        let open = query_sql(
+            &db,
+            &bea_activity,
+            "SELECT claim_id,is_current,released_at FROM agent_activity_claims ORDER BY claim_id",
+        )
+        .await
+        .unwrap();
+        assert_eq!(open.row_count, 1);
+        assert_eq!(open.rows[0]["is_current"], 1);
+        assert!(open.rows[0]["released_at"].is_null());
+        registry
+            .call(
+                db.clone(),
+                crate::mcp::Caller::authenticated("alice"),
+                "start_work",
+                json!({
+                    "record_id": COMMON_ID,
+                    "action": "release",
+                    "run_key": second_run,
+                    "expected_holder_run_key": first_run,
+                }),
+            )
+            .await
+            .unwrap();
+        let closed = query_sql(
+            &db,
+            &bea_activity,
+            "SELECT claim_id,is_current,released_at FROM agent_activity_claims ORDER BY claim_id",
+        )
+        .await
+        .unwrap();
+        assert_eq!(closed.row_count, 1);
+        assert_eq!(closed.rows[0]["claim_id"], open.rows[0]["claim_id"]);
+        assert!(closed.rows[0]["released_at"].is_string());
+        assert_eq!(closed.rows[0]["is_current"], 0);
     }
 
     #[tokio::test]

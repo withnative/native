@@ -36,6 +36,7 @@ use super::render;
 use super::{
     DeploymentAdmission, DeploymentMutationBarrier, DeploymentPersistenceLease, OperationAccess,
 };
+use super::{ExperimentalExecutors, EXPERIMENTAL_FRESHNESS_EXECUTOR};
 
 #[path = "executor_prototype/plan_store.rs"]
 mod plan_store;
@@ -168,10 +169,17 @@ struct Audit {
 #[derive(Deserialize)]
 struct CandidateSurfaces {
     stable: StableSurfaces,
+    build_enabled_experimental: BuildEnabledExperimentalSurfaces,
 }
 
 #[derive(Deserialize)]
 struct StableSurfaces {
+    ordinary: CandidateSurface,
+    lens: CandidateSurface,
+}
+
+#[derive(Deserialize)]
+struct BuildEnabledExperimentalSurfaces {
     ordinary: CandidateSurface,
     lens: CandidateSurface,
 }
@@ -272,10 +280,51 @@ impl PinnedLensExecutorCatalogue {
     }
 }
 
+/// Whether an audit row may enter a catalogue. Stable rows always may.
+/// Experimental rows may only when the deployment allowlisted their executor;
+/// anything else is never advertised. Together with the allowlisted
+/// descriptor push in the catalogue builders, this filter is why the audited
+/// `experimental_freshness` executor is not advertised by default.
+fn row_is_admitted(row: &AuditRow, experimental: &ExperimentalExecutors) -> bool {
+    if row.stability == "stable" {
+        return true;
+    }
+    row.stability == "experimental" && experimental.contains(&row.candidate_executor)
+}
+
+/// The audited `experimental_freshness` executor descriptor, loaded verbatim
+/// from the `build_enabled_experimental` surface of the committed public
+/// projection (itself a verbatim copy of the held candidate audit's surface).
+/// Nothing about the stable inventory changes: the descriptor only enters a
+/// catalogue when its executor is allowlisted.
+fn experimental_freshness_descriptor(
+    surface: &CandidateSurface,
+    surface_name: &str,
+) -> Result<Value> {
+    if serde_json::to_vec(&surface.descriptors)?.len() != surface.descriptor_bytes {
+        return Err(Error::engine(format!(
+            "audited build-enabled-experimental {surface_name} executor descriptor byte count drifted"
+        )));
+    }
+    surface
+        .descriptors
+        .iter()
+        .find(|descriptor| {
+            descriptor.get("name").and_then(Value::as_str) == Some(EXPERIMENTAL_FRESHNESS_EXECUTOR)
+        })
+        .cloned()
+        .ok_or_else(|| {
+            Error::engine(format!(
+                "audited build-enabled-experimental {surface_name} surface is missing {EXPERIMENTAL_FRESHNESS_EXECUTOR}"
+            ))
+        })
+}
+
 fn build_ordinary_catalogue(
     registry: &ToolRegistry,
     engine_kind: super::registry::EngineKind,
     hosted: bool,
+    experimental: &ExperimentalExecutors,
 ) -> Result<PinnedExecutorCatalogue> {
     let audit: Audit = serde_json::from_str(AUDIT)?;
     let BuiltContracts {
@@ -287,6 +336,7 @@ fn build_ordinary_catalogue(
         &audit.audit_rows,
         ExecutorSurface::Ordinary,
         hosted,
+        experimental,
     )?;
     let source_surface = audit.candidate_surfaces.stable.ordinary;
     if serde_json::to_vec(&source_surface.descriptors)?.len() != source_surface.descriptor_bytes {
@@ -294,8 +344,14 @@ fn build_ordinary_catalogue(
             "audited ordinary executor descriptor byte count drifted",
         ));
     }
-    let mut descriptors =
-        executable_descriptors(source_surface.descriptors, &operations_by_executor)?;
+    let mut source_descriptors = source_surface.descriptors;
+    if experimental.contains(EXPERIMENTAL_FRESHNESS_EXECUTOR) {
+        source_descriptors.push(experimental_freshness_descriptor(
+            &audit.candidate_surfaces.build_enabled_experimental.ordinary,
+            "ordinary",
+        )?);
+    }
+    let mut descriptors = executable_descriptors(source_descriptors, &operations_by_executor)?;
     add_ordinary_executor_format_contracts(&mut descriptors, &contracts)?;
     add_operation_field_listings(&mut descriptors, &contracts)?;
     let descriptor_bytes = serde_json::to_vec(&descriptors)?.len();
@@ -507,6 +563,7 @@ struct ExecutorConstruction {
     plan_store: plan_store::PlanStore,
     hosted_authority: Option<Arc<dyn HostedExecutorAuthority>>,
     pinned_catalogue: Option<Arc<PinnedExecutorCatalogue>>,
+    experimental: ExperimentalExecutors,
     telemetry: TelemetryConstruction,
     transport: telemetry::TelemetryTransport,
     deployment_mutation_barrier: Option<DeploymentMutationBarrier>,
@@ -516,10 +573,18 @@ impl ExecutorPrototypeStdioServer {
     pub(crate) fn pin_hosted_catalogue(
         registry: &ToolRegistry,
     ) -> Result<Arc<PinnedExecutorCatalogue>> {
+        Self::pin_hosted_catalogue_with_experimental(registry, &ExperimentalExecutors::empty())
+    }
+
+    pub(crate) fn pin_hosted_catalogue_with_experimental(
+        registry: &ToolRegistry,
+        experimental: &ExperimentalExecutors,
+    ) -> Result<Arc<PinnedExecutorCatalogue>> {
         Ok(Arc::new(build_ordinary_catalogue(
             registry,
             super::registry::EngineKind::Sqlite,
             true,
+            experimental,
         )?))
     }
 
@@ -549,6 +614,7 @@ impl ExecutorPrototypeStdioServer {
                 plan_store,
                 hosted_authority: None,
                 pinned_catalogue: None,
+                experimental: ExperimentalExecutors::empty(),
                 telemetry: TelemetryConstruction::Disabled,
                 transport: telemetry::TelemetryTransport::Stdio,
                 deployment_mutation_barrier,
@@ -564,6 +630,27 @@ impl ExecutorPrototypeStdioServer {
         caller: Caller,
         trace_path: Option<&Path>,
         telemetry: Arc<ExecutorTelemetryContext>,
+    ) -> Result<Self> {
+        Self::new_with_telemetry_and_experimental(
+            registry,
+            engine,
+            caller,
+            trace_path,
+            telemetry,
+            ExperimentalExecutors::empty(),
+        )
+        .await
+    }
+
+    /// Build the local executor with the privacy-safe dogfood sink enabled
+    /// and an explicit experimental-executor allowlist.
+    pub async fn new_with_telemetry_and_experimental(
+        registry: Arc<ToolRegistry>,
+        engine: impl Into<EngineHandle>,
+        caller: Caller,
+        trace_path: Option<&Path>,
+        telemetry: Arc<ExecutorTelemetryContext>,
+        experimental: ExperimentalExecutors,
     ) -> Result<Self> {
         let engine = engine.into();
         let plan_store = match &engine {
@@ -585,6 +672,7 @@ impl ExecutorPrototypeStdioServer {
                 plan_store,
                 hosted_authority: None,
                 pinned_catalogue: None,
+                experimental,
                 telemetry: TelemetryConstruction::Local(telemetry),
                 transport: telemetry::TelemetryTransport::Stdio,
                 deployment_mutation_barrier,
@@ -691,6 +779,7 @@ impl ExecutorPrototypeStdioServer {
                 plan_store,
                 hosted_authority: Some(authority),
                 pinned_catalogue: Some(catalogue),
+                experimental: ExperimentalExecutors::empty(),
                 telemetry: telemetry
                     .map(TelemetryConstruction::Hosted)
                     .unwrap_or(TelemetryConstruction::Disabled),
@@ -712,6 +801,7 @@ impl ExecutorPrototypeStdioServer {
             plan_store,
             hosted_authority,
             pinned_catalogue,
+            experimental,
             telemetry: telemetry_construction,
             transport,
             deployment_mutation_barrier,
@@ -723,6 +813,7 @@ impl ExecutorPrototypeStdioServer {
                 &registry,
                 engine.kind(),
                 hosted_authority.is_some(),
+                &experimental,
             )?),
         };
         // Local stdio construction is a process-start boundary. Hosted
@@ -916,7 +1007,7 @@ impl ExecutorPrototypeStdioServer {
                 "invalid params: missing tool name",
             ));
         };
-        let arguments = params
+        let mut arguments = params
             .get("arguments")
             .cloned()
             .unwrap_or_else(|| json!({}));
@@ -1043,6 +1134,27 @@ impl ExecutorPrototypeStdioServer {
                 .await,
             );
         };
+        // Hoist `arguments.run_key`/`arguments.parent_key` to the envelope
+        // before any run-keyed bookkeeping, so a hoisted key attaches exactly
+        // as an envelope key would. Conflicts and non-strings reject here
+        // rather than silently dropping either value.
+        if let Err(diagnostic) = hoist_nested_routing_keys(&mut arguments) {
+            return Some(
+                self.fixture_error_response(
+                    id,
+                    modern,
+                    &executor,
+                    &operation,
+                    &diagnostic,
+                    Some(&contract),
+                    &arguments,
+                    "validation_failure",
+                    Some(false),
+                    true,
+                )
+                .await,
+            );
+        }
         let _deployment_admission = match self.admit_deployment_operation(&contract) {
             Ok(admission) => admission,
             Err(error) => {
@@ -1086,29 +1198,79 @@ impl ExecutorPrototypeStdioServer {
                 .await,
             );
         }
-        let operation_arguments = arguments
-            .get("arguments")
-            .cloned()
-            .unwrap_or_else(|| json!({}));
-        let schema_errors = match jsonschema::validator_for(&contract.input_schema) {
-            Ok(validator) => validator
-                .iter_errors(&operation_arguments)
-                .map(|error| error.to_string())
-                .collect::<Vec<_>>(),
-            Err(error) => vec![format!("invalid authoritative contract: {error}")],
-        };
-        let schema_valid = schema_errors.is_empty();
-        if !schema_valid {
+        // The selector is part of the callable input contract. Validate it
+        // before dispatch so its rejection cannot become a state/auth failure.
+        // Plan-backed operations returned above; fixed-format surfaces have
+        // their own handler and never enter this ordinary direct path.
+        let mut format_arguments = arguments.clone();
+        if let Err(error) = render::take_format(&contract.source_tool, &mut format_arguments) {
             return Some(
                 self.fixture_error_response(
                     id,
                     modern,
                     &executor,
                     &operation,
-                    &format!(
-                        "arguments do not match the authoritative operation contract: {}",
-                        schema_errors.join("; ")
-                    ),
+                    &error,
+                    Some(&contract),
+                    &arguments,
+                    "validation_failure",
+                    Some(false),
+                    true,
+                )
+                .await,
+            );
+        }
+        let operation_arguments = arguments
+            .get("arguments")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        let normalized_arguments = match normalized_executor_arguments(&operation, &arguments) {
+            Ok(arguments) => arguments,
+            Err(error) => {
+                return Some(
+                    self.fixture_error_response(
+                        id,
+                        modern,
+                        &executor,
+                        &operation,
+                        &error.to_string(),
+                        Some(&contract),
+                        &arguments,
+                        "validation_failure",
+                        Some(false),
+                        true,
+                    )
+                    .await,
+                )
+            }
+        };
+        let schema_errors = match jsonschema::validator_for(&contract.input_schema) {
+            Ok(validator) => validator
+                .iter_errors(&operation_arguments)
+                .map(|error| schema_error_text(&error))
+                .collect::<Vec<_>>(),
+            Err(error) => vec![format!("invalid authoritative contract: {error}")],
+        };
+        let schema_valid = schema_errors.is_empty();
+        if !schema_valid {
+            let diagnostic = crate::mcp::record_ref::invalid_operation_record_selector_diagnostic(
+                &operation,
+                &operation_arguments,
+            )
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| {
+                format!(
+                    "arguments do not match the authoritative operation contract: {}",
+                    schema_errors.join("; ")
+                )
+            });
+            return Some(
+                self.fixture_error_response(
+                    id,
+                    modern,
+                    &executor,
+                    &operation,
+                    &diagnostic,
                     Some(&contract),
                     &arguments,
                     "validation_failure",
@@ -1120,7 +1282,10 @@ impl ExecutorPrototypeStdioServer {
         }
         let runtime_validation = validate_enabled_operation(
             &contract,
-            operation_arguments.clone(),
+            normalized_arguments
+                .get("arguments")
+                .cloned()
+                .unwrap_or_else(|| json!({})),
             self.hosted_authority.as_deref(),
         );
         if let Err(error) = runtime_validation {
@@ -1157,7 +1322,7 @@ impl ExecutorPrototypeStdioServer {
             repair_of,
             described_before,
         };
-        let mut legacy_arguments = match translate_arguments(&contract, &arguments) {
+        let mut legacy_arguments = match translate_arguments(&contract, &normalized_arguments) {
             Ok(arguments) => arguments,
             Err(error) => {
                 return Some(
@@ -1771,8 +1936,9 @@ pub(crate) struct ExecutorPrototypeLensServer {
 }
 
 impl ExecutorPrototypeLensServer {
-    pub(crate) fn pin_catalogue(
+    pub(crate) fn pin_catalogue_with_experimental(
         registry: &ToolRegistry,
+        experimental: &ExperimentalExecutors,
     ) -> Result<Arc<PinnedLensExecutorCatalogue>> {
         let audit: Audit = serde_json::from_str(AUDIT)?;
         let policy = super::ResolvedToolExposure::new(super::ExposureProfile::Complete);
@@ -1780,7 +1946,7 @@ impl ExecutorPrototypeLensServer {
         let BuiltContracts {
             contracts,
             operations_by_executor,
-        } = build_lens_contracts(registry, &sources, &audit.audit_rows)?;
+        } = build_lens_contracts(registry, &sources, &audit.audit_rows, experimental)?;
         let source_surface = audit.candidate_surfaces.stable.lens;
         if serde_json::to_vec(&source_surface.descriptors)?.len() != source_surface.descriptor_bytes
         {
@@ -1788,8 +1954,14 @@ impl ExecutorPrototypeLensServer {
                 "audited lens executor descriptor byte count drifted",
             ));
         }
-        let mut descriptors =
-            executable_descriptors(source_surface.descriptors, &operations_by_executor)?;
+        let mut source_descriptors = source_surface.descriptors;
+        if experimental.contains(EXPERIMENTAL_FRESHNESS_EXECUTOR) {
+            source_descriptors.push(experimental_freshness_descriptor(
+                &audit.candidate_surfaces.build_enabled_experimental.lens,
+                "lens",
+            )?);
+        }
+        let mut descriptors = executable_descriptors(source_descriptors, &operations_by_executor)?;
         add_operation_field_listings(&mut descriptors, &contracts)?;
         let descriptor_bytes = serde_json::to_vec(&descriptors)?.len();
         let manifest_digest = jcs_sha256(&Value::Array(descriptors.clone()))?;
@@ -1859,7 +2031,7 @@ impl ExecutorPrototypeLensServer {
                 "invalid params: missing tool name",
             ));
         };
-        let arguments = params
+        let mut arguments = params
             .get("arguments")
             .cloned()
             .unwrap_or_else(|| json!({}));
@@ -1946,6 +2118,14 @@ impl ExecutorPrototypeLensServer {
                     .await,
             );
         };
+        // Hoist nested routing keys before validation so the delegated
+        // legacy call carries them; conflicts and non-strings reject here.
+        if let Err(diagnostic) = hoist_nested_routing_keys(&mut arguments) {
+            return Some(
+                self.error_response(id, modern, &diagnostic, Some(&contract), &arguments)
+                    .await,
+            );
+        }
         if let Err(error) = validate_envelope_fields(
             &arguments,
             &[
@@ -1996,10 +2176,31 @@ impl ExecutorPrototypeLensServer {
             .get("arguments")
             .cloned()
             .unwrap_or_else(|| json!({}));
+        let normalized_arguments = match normalized_executor_arguments(&operation, &arguments) {
+            Ok(arguments) => arguments,
+            Err(error) => {
+                self.emit_validation_failure(
+                    telemetry_request.as_ref(),
+                    &contract,
+                    &arguments,
+                    telemetry::TelemetryErrorClass::RuntimeValidation,
+                );
+                return Some(
+                    self.error_response(
+                        id,
+                        modern,
+                        &error.to_string(),
+                        Some(&contract),
+                        &arguments,
+                    )
+                    .await,
+                );
+            }
+        };
         let schema_errors = match jsonschema::validator_for(&contract.input_schema) {
             Ok(validator) => validator
                 .iter_errors(&operation_arguments)
-                .map(|error| error.to_string())
+                .map(|error| schema_error_text(&error))
                 .collect::<Vec<_>>(),
             Err(error) => vec![format!("invalid authoritative contract: {error}")],
         };
@@ -2010,21 +2211,23 @@ impl ExecutorPrototypeLensServer {
                 &arguments,
                 telemetry::TelemetryErrorClass::SchemaValidation,
             );
-            return Some(
-                self.error_response(
-                    id,
-                    modern,
-                    &format!(
-                        "arguments do not match the authoritative lens operation contract: {}",
-                        schema_errors.join("; ")
-                    ),
-                    Some(&contract),
-                    &arguments,
+            let diagnostic = crate::mcp::record_ref::invalid_operation_record_selector_diagnostic(
+                &operation,
+                &operation_arguments,
+            )
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| {
+                format!(
+                    "arguments do not match the authoritative lens operation contract: {}",
+                    schema_errors.join("; ")
                 )
-                .await,
+            });
+            return Some(
+                self.error_response(id, modern, &diagnostic, Some(&contract), &arguments)
+                    .await,
             );
         }
-        let legacy_arguments = match translate_arguments(&contract, &arguments) {
+        let legacy_arguments = match translate_arguments(&contract, &normalized_arguments) {
             Ok(arguments) => arguments,
             Err(error) => {
                 self.emit_validation_failure(
@@ -2357,7 +2560,14 @@ fn build_contracts(
     rows: &[AuditRow],
     surface: ExecutorSurface,
 ) -> Result<BuiltContracts> {
-    build_contracts_for_hosting(registry, engine_kind, rows, surface, false)
+    build_contracts_for_hosting(
+        registry,
+        engine_kind,
+        rows,
+        surface,
+        false,
+        &ExperimentalExecutors::empty(),
+    )
 }
 
 fn build_contracts_for_hosting(
@@ -2366,11 +2576,12 @@ fn build_contracts_for_hosting(
     rows: &[AuditRow],
     surface: ExecutorSurface,
     hosted_membership_plans: bool,
+    experimental: &ExperimentalExecutors,
 ) -> Result<BuiltContracts> {
     let mut contracts = BTreeMap::new();
     let mut operations_by_executor = OperationsByExecutor::new();
     for row in rows.iter().filter(|row| {
-        row.stability == "stable"
+        row_is_admitted(row, experimental)
             && row
                 .availability
                 .iter()
@@ -2453,6 +2664,7 @@ fn build_lens_contracts(
     registry: &ToolRegistry,
     source_descriptors: &[super::registry::AdvertisedTool],
     rows: &[AuditRow],
+    experimental: &ExperimentalExecutors,
 ) -> Result<BuiltContracts> {
     let schemas = source_descriptors
         .iter()
@@ -2477,7 +2689,7 @@ fn build_lens_contracts(
     let mut contracts = BTreeMap::new();
     let mut operations_by_executor = OperationsByExecutor::new();
     for row in rows.iter().filter(|row| {
-        row.stability == "stable" && row.availability.iter().any(|value| value == "lens")
+        row_is_admitted(row, experimental) && row.availability.iter().any(|value| value == "lens")
     }) {
         validate_candidate_plan_policy(row)?;
         let Some(source_schema) = schemas.get(row.legacy_tool.as_str()) else {
@@ -2843,6 +3055,26 @@ fn add_operation_field_listings(
             .collect::<Vec<_>>();
         if routed.is_empty() {
             continue;
+        }
+        // Body writes need their semantics at first contact: a caller that
+        // mistakes replacement for append can lose content despite a valid
+        // concurrency token. Disclose this bounded exception only when the
+        // routed contract actually carries the explicit body operations.
+        if let Some(contract) = routed
+            .iter()
+            .find(|contract| contract.operation == "update_record")
+        {
+            let mut fields = Vec::new();
+            collect_property_names(&contract.input_schema, &mut fields);
+            if ["body_set", "body_append", "body_replace"]
+                .iter()
+                .all(|field| fields.iter().any(|name| name == *field))
+            {
+                let description = descriptor["description"].as_str().unwrap_or_default();
+                descriptor["description"] = json!(format!(
+                    "{description} update_record body operations (choose one): body_set replaces the whole body; body_append appends literal text; body_replace applies surgical edits; body is a deprecated full-replacement alias."
+                ));
+            }
         }
         let listings = routed
             .iter()
@@ -3245,6 +3477,95 @@ fn validate_envelope_fields(arguments: &Value, allowed: &[&str]) -> Result<()> {
     Ok(())
 }
 
+/// Hoist a `run_key`/`parent_key` nested under `arguments` to the executor
+/// envelope, preserving run correlation.
+///
+/// Transactional: normalization runs on a clone and the caller's envelope is
+/// assigned only on full success, so a rejection/repair is always built from
+/// the envelope the caller actually sent — never from a partially hoisted
+/// one (e.g. `run_key` moved before a later `parent_key` error is found).
+///
+/// Returns `Ok(true)` when the envelope was mutated (hoisted or deduped),
+/// `Ok(false)` when there was nothing nested to do, and `Err(diagnostic)`
+/// when the call must be rejected rather than silently reinterpreted:
+/// a non-string nested key, or any envelope key (including null) beside a
+/// nested key that is not the identical string. Only a missing envelope key
+/// hoists; only an identical string dedupes.
+fn hoist_nested_routing_keys(envelope: &mut Value) -> std::result::Result<bool, String> {
+    // Preflight before the transactional clone: the common case carries no
+    // nested routing keys, and must not pay for an envelope-wide clone.
+    let needs_hoist = envelope
+        .get("arguments")
+        .and_then(Value::as_object)
+        .is_some_and(|arguments| {
+            arguments.contains_key("run_key") || arguments.contains_key("parent_key")
+        });
+    if !needs_hoist {
+        return Ok(false);
+    }
+    let mut candidate = envelope.clone();
+    let mut hoisted = false;
+    for field in ["run_key", "parent_key"] {
+        let nested = candidate
+            .get("arguments")
+            .and_then(Value::as_object)
+            .and_then(|arguments| arguments.get(field))
+            .cloned();
+        let Some(nested_value) = nested else {
+            continue;
+        };
+        let outer = candidate.get(field).cloned();
+        match (outer, nested_value) {
+            (None, Value::String(nested_key)) => {
+                if let Some(envelope_object) = candidate.as_object_mut() {
+                    envelope_object.insert(field.into(), Value::String(nested_key));
+                }
+                if let Some(arguments_object) = candidate
+                    .get_mut("arguments")
+                    .and_then(Value::as_object_mut)
+                {
+                    arguments_object.remove(field);
+                }
+                hoisted = true;
+            }
+            (None, nested_value) => {
+                let _ = nested_value;
+                return Err(misplaced_routing_key_diagnostic(field, false));
+            }
+            (Some(outer_value), Value::String(nested_key))
+                if outer_value == Value::String(nested_key.clone()) =>
+            {
+                if let Some(arguments_object) = candidate
+                    .get_mut("arguments")
+                    .and_then(Value::as_object_mut)
+                {
+                    arguments_object.remove(field);
+                }
+                hoisted = true;
+            }
+            (Some(_), _) => {
+                return Err(misplaced_routing_key_diagnostic(field, true));
+            }
+        }
+    }
+    if hoisted {
+        *envelope = candidate;
+    }
+    Ok(hoisted)
+}
+
+fn misplaced_routing_key_diagnostic(field: &str, conflict: bool) -> String {
+    if conflict {
+        format!(
+            "arguments.{field} conflicts with envelope {field}: remove the nested key and keep the envelope {field}; hoisting must not silently drop a conflicting key."
+        )
+    } else {
+        format!(
+            "arguments.{field} is misplaced: put {field} on the executor envelope alongside operation and arguments; the nested value must be a string {field}."
+        )
+    }
+}
+
 fn translate_arguments(contract: &OperationContract, envelope: &Value) -> Result<Value> {
     let mut arguments = envelope
         .get("arguments")
@@ -3287,6 +3608,23 @@ fn translate_arguments(contract: &OperationContract, envelope: &Value) -> Result
         }
     }
     Ok(arguments)
+}
+
+fn normalized_executor_arguments(operation: &str, envelope: &Value) -> Result<Value> {
+    let operation_arguments = envelope
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let normalized = crate::mcp::record_ref::normalize_operation_record_selector(
+        operation,
+        operation_arguments,
+    )?;
+    let mut envelope = envelope.clone();
+    envelope
+        .as_object_mut()
+        .ok_or_else(|| Error::engine("executor arguments must be an object"))?
+        .insert("arguments".into(), normalized);
+    Ok(envelope)
 }
 
 fn validate_enabled_operation(
@@ -3662,6 +4000,15 @@ fn attach_repair_result(
     hosted_authority: Option<&dyn HostedExecutorAuthority>,
 ) {
     let cue = repair_cue(contract, envelope, diagnostic, hosted_authority);
+    let selector_shape_invalid = envelope
+        .get("arguments")
+        .and_then(|arguments| {
+            crate::mcp::record_ref::invalid_operation_record_selector_diagnostic(
+                &contract.operation,
+                arguments,
+            )
+        })
+        .is_some();
     let is_execution_error = error_class == "execution_error";
     let is_validation_error = matches!(
         error_class,
@@ -3768,7 +4115,11 @@ fn attach_repair_result(
     // the caller's own envelope into the corrected one. Moves travel by
     // reference (`from`); genuinely new values travel literally up to the
     // same bound, disclosed when truncated.
-    if !is_execution_error {
+    // Descended composite cues stay value-free end to end (the diagnostic
+    // above is masked for composites, and no offending value travels here),
+    // mirroring the read-side selector redaction. Direct cues keep their
+    // existing bounded `failing_value` behavior.
+    if !is_execution_error && !selector_shape_invalid && !cue.suppress_failing_value {
         if let Some(failing_value) = repair_failing_value(&cue.failing_pointer, envelope) {
             repair["failing_value"] = failing_value;
         }
@@ -3815,6 +4166,147 @@ struct RepairCue {
     /// names none. False falls back to prose, and keeps the whole contract.
     localised: bool,
     corrected_envelope: Option<Value>,
+    /// True when the cue was produced by descending into a `oneOf`/`anyOf`
+    /// composite to name the best branch's leaf failure. Descended cues stay
+    /// value-free (no `failing_value`): the read-side selector diagnostic
+    /// already sets that precedent, and the offending value on a write path
+    /// can carry record content. Direct (non-composite) cues keep their
+    /// existing bounded `failing_value` behavior.
+    suppress_failing_value: bool,
+}
+
+/// One leaf failure, owned so that top-level borrow lifetimes and the
+/// `'static` nested `context` errors can share one selection without lifetime
+/// plumbing. A single conversion (`leaf_from_error`) and a single
+/// reason-mapping block serve both the direct and the descended paths.
+#[derive(Clone)]
+struct SelectedLeaf {
+    instance_path: String,
+    schema_path: String,
+    keyword: String,
+    rank: u8,
+    unexpected_sorted: Vec<String>,
+    required_property: Option<String>,
+}
+
+/// Specificity rank for leaf failures: a rejected property name is the most
+/// actionable (it pairs with the accepted-name list), a missing required
+/// field next, typed/valued constraints after that, and everything else
+/// (not/falseSchema/composite leftovers) last.
+fn selected_leaf_rank(keyword: &str) -> u8 {
+    match keyword {
+        "additionalProperties" | "unevaluatedProperties" => 0,
+        "required" => 1,
+        "type" | "enum" | "const" | "minItems" | "minimum" | "exclusiveMinimum" | "maximum"
+        | "exclusiveMaximum" | "minLength" | "maxLength" | "pattern" | "format" => 2,
+        _ => 3,
+    }
+}
+
+/// Single conversion from a borrowed validator error to an owned leaf.
+/// `sort_unexpected` sorts the rejected-name list for deterministic reporting
+/// inside composite selection only; the direct (non-composite) path passes
+/// `false` to preserve the validator's existing `unexpected.first()`
+/// ordering exactly.
+fn leaf_from_error(error: &jsonschema::ValidationError<'_>, sort_unexpected: bool) -> SelectedLeaf {
+    use jsonschema::error::ValidationErrorKind;
+    let keyword = error.kind().keyword().to_string();
+    let (unexpected_sorted, required_property) = match error.kind() {
+        ValidationErrorKind::AdditionalProperties { unexpected }
+        | ValidationErrorKind::UnevaluatedProperties { unexpected } => {
+            if sort_unexpected {
+                let mut sorted = unexpected.clone();
+                sorted.sort();
+                (sorted, None)
+            } else {
+                (unexpected.first().cloned().into_iter().collect(), None)
+            }
+        }
+        ValidationErrorKind::Required { property } => {
+            (Vec::new(), property.as_str().map(str::to_string))
+        }
+        _ => (Vec::new(), None),
+    };
+    SelectedLeaf {
+        instance_path: error.instance_path().as_str().to_string(),
+        schema_path: error.schema_path().as_str().to_string(),
+        rank: selected_leaf_rank(&keyword),
+        keyword,
+        unexpected_sorted,
+        required_property,
+    }
+}
+
+/// Actual violation count for a branch: each rejected property name counts
+/// separately (one `additionalProperties` aggregate can reject several
+/// names), every other leaf counts once.
+fn branch_violation_count(leaves: &[SelectedLeaf]) -> usize {
+    leaves
+        .iter()
+        .map(|leaf| match leaf.keyword.as_str() {
+            "additionalProperties" | "unevaluatedProperties" => leaf.unexpected_sorted.len().max(1),
+            _ => 1,
+        })
+        .sum()
+}
+
+/// Resolve one validator error to the leaves it contributes to its parent
+/// branch: a nested `oneOf`/`anyOf` contributes its own best branch's
+/// leaves (selected recursively), any other error contributes itself.
+/// `oneOf` with several valid branches is deliberately left generic.
+fn resolve_error_leaves(error: &jsonschema::ValidationError<'_>) -> Vec<SelectedLeaf> {
+    use jsonschema::error::ValidationErrorKind;
+    match error.kind() {
+        ValidationErrorKind::OneOfNotValid { context } | ValidationErrorKind::AnyOf { context } => {
+            select_composite_best(context).unwrap_or_default()
+        }
+        _ => vec![leaf_from_error(error, true)],
+    }
+}
+
+/// Select the best branch of a `oneOf`/`anyOf` context and return its
+/// resolved leaves. Branch order: fewest actual violations first, then most
+/// specific (an unexpected-property branch beats a missing-key branch at
+/// equal counts), then lowest branch index. The deterministic tie-break is
+/// part of the contract: ambiguous branches report the first branch.
+fn select_composite_best(
+    context: &[Vec<jsonschema::ValidationError<'static>>],
+) -> Option<Vec<SelectedLeaf>> {
+    let mut best_key: Option<(usize, u8, usize)> = None;
+    let mut best_leaves: Vec<SelectedLeaf> = Vec::new();
+    let mut found = false;
+    for (index, branch_errors) in context.iter().enumerate() {
+        let mut leaves = Vec::new();
+        for branch_error in branch_errors {
+            leaves.extend(resolve_error_leaves(branch_error));
+        }
+        if leaves.is_empty() {
+            continue;
+        }
+        let count = branch_violation_count(&leaves);
+        let specificity = leaves.iter().map(|leaf| leaf.rank).min().unwrap_or(3);
+        let key = (count, specificity, index);
+        if !found || key < best_key.unwrap_or((usize::MAX, u8::MAX, usize::MAX)) {
+            best_key = Some(key);
+            best_leaves = leaves;
+            found = true;
+        }
+    }
+    if found {
+        Some(best_leaves)
+    } else {
+        None
+    }
+}
+
+/// Best single leaf within a winning branch: unexpected field, missing
+/// required field, typed/valued constraints, then anything else; ties break
+/// by instance path, then schema path.
+fn best_leaf_in_branch(mut leaves: Vec<SelectedLeaf>) -> Option<SelectedLeaf> {
+    leaves.sort_by(|a, b| {
+        (a.rank, &a.instance_path, &a.schema_path).cmp(&(b.rank, &b.instance_path, &b.schema_path))
+    });
+    leaves.into_iter().next()
 }
 
 fn repair_cue(
@@ -3823,6 +4315,40 @@ fn repair_cue(
     diagnostic: Option<&str>,
     hosted_authority: Option<&dyn HostedExecutorAuthority>,
 ) -> RepairCue {
+    // A nested routing-key rejection from the hoist helper names its own
+    // field in the diagnostic (`arguments.run_key ...` / `arguments.parent_key
+    // ...`). Honor it ahead of every other derivation: the schema
+    // `unexpected.first()` below follows caller key order and can name the
+    // other nested key when both are present, and the format pre-check would
+    // otherwise override the actual rejection entirely.
+    let routing_rejected = ["run_key", "parent_key"].iter().copied().find(|field| {
+        diagnostic.is_some_and(|diagnostic| diagnostic.starts_with(&format!("arguments.{field}")))
+    });
+    if routing_rejected.is_none()
+        && contract.surface == ExecutorSurface::Ordinary
+        && !write_operations::requires_plan(&contract.executor, &contract.operation)
+    {
+        let mut format_arguments = envelope.clone();
+        if render::take_format(&contract.source_tool, &mut format_arguments).is_err() {
+            let mut expected_shape = render::format_schema(&contract.source_tool);
+            expected_shape["supported_values"] = expected_shape["enum"].clone();
+            expected_shape["description"] = json!(
+                "Select a supported format at the executor envelope /format, or omit the field to preserve this operation's default representation."
+            );
+            return RepairCue {
+                reason_code: if envelope["format"].is_string() {
+                    "unsupported_value"
+                } else {
+                    "wrong_type"
+                },
+                failing_pointer: "/format".into(),
+                expected_shape,
+                localised: true,
+                corrected_envelope: None,
+                suppress_failing_value: false,
+            };
+        }
+    }
     let operation_arguments = envelope
         .get("arguments")
         .cloned()
@@ -3833,41 +4359,85 @@ fn repair_cue(
         "description": runtime_expected_shape(contract, diagnostic),
     });
     let mut localised = false;
+    let mut descended = false;
     if let Ok(validator) = jsonschema::validator_for(&contract.input_schema) {
         if let Some(error) = validator.iter_errors(&operation_arguments).next() {
             use jsonschema::error::ValidationErrorKind;
-            let path = error.instance_path().as_str();
-            failing_pointer = format!("/arguments{path}");
-            reason_code = match error.kind() {
-                ValidationErrorKind::Required { property } => {
-                    if let Some(property) = property.as_str() {
+            // Best-branch descent for `oneOf`/`anyOf`: the validator's first
+            // error for a branch combinator is the whole combinator at
+            // `/arguments`, which names no field. Use the nested `context`
+            // errors (one entry per branch, full pointers retained) to pick
+            // the branch the caller most likely meant, then report that
+            // branch's best leaf failure with its pointer and accepted names.
+            //
+            // Branch order: fewest actual violations first (each rejected
+            // property name counts separately, not one per aggregate), then
+            // most specific (an unexpected-property branch beats a
+            // missing-key branch at equal counts), then lowest branch index.
+            // The index tie-break is part of the contract: ambiguous branches
+            // report the first branch deterministically. Leaf order within
+            // the winner: unexpected field, missing required field,
+            // typed/valued constraints, then anything else; ties break by
+            // instance path, then schema path. Inside composite selection a
+            // multi-element unexpected list reports its lexicographically
+            // smallest name so the choice does not depend on caller key
+            // order; the direct path keeps validator ordering. `oneOf` with
+            // several valid branches stays generic (but value-free) rather
+            // than naming one match. Nested `oneOf`/`anyOf` select their own
+            // best branch recursively; branches are never flattened across
+            // mutually exclusive alternatives.
+            let descended_leaf: Option<SelectedLeaf> =
+                if let ValidationErrorKind::OneOfNotValid { context }
+                | ValidationErrorKind::AnyOf { context } = error.kind()
+                {
+                    select_composite_best(context).and_then(best_leaf_in_branch)
+                } else {
+                    None
+                };
+            // Single reason mapping for both paths: the direct path converts
+            // the top error preserving validator ordering, the descended
+            // path uses the winning branch's leaf (sorted inside composite
+            // selection only). A multiply-valid `oneOf` stays generic but
+            // suppresses values like any composite cue: its diagnostic is
+            // masked and its whole-object value must not travel.
+            let multiple_valid =
+                matches!(error.kind(), ValidationErrorKind::OneOfMultipleValid { .. });
+            let leaf: SelectedLeaf = match descended_leaf {
+                Some(leaf) => {
+                    descended = true;
+                    leaf
+                }
+                None => leaf_from_error(&error, false),
+            };
+            if multiple_valid {
+                descended = true;
+            }
+            failing_pointer = format!("/arguments{}", leaf.instance_path);
+            reason_code = match leaf.keyword.as_str() {
+                "required" => {
+                    if let Some(property) = leaf.required_property.as_deref() {
                         failing_pointer.push('/');
                         failing_pointer.push_str(&escape_json_pointer(property));
                     }
                     "required_field_missing"
                 }
-                ValidationErrorKind::AdditionalProperties { unexpected }
-                | ValidationErrorKind::UnevaluatedProperties { unexpected } => {
-                    if let Some(property) = unexpected.first() {
+                "additionalProperties" | "unevaluatedProperties" => {
+                    if let Some(property) = leaf.unexpected_sorted.first() {
                         failing_pointer.push('/');
                         failing_pointer.push_str(&escape_json_pointer(property));
                     }
                     "unexpected_field"
                 }
-                ValidationErrorKind::Type { .. } => "wrong_type",
-                ValidationErrorKind::Enum { .. } | ValidationErrorKind::Constant { .. } => {
-                    "unsupported_value"
-                }
-                ValidationErrorKind::MinItems { .. } => "array_too_short",
-                ValidationErrorKind::Minimum { .. }
-                | ValidationErrorKind::ExclusiveMinimum { .. } => "value_too_small",
-                ValidationErrorKind::Maximum { .. }
-                | ValidationErrorKind::ExclusiveMaximum { .. } => "value_too_large",
+                "type" => "wrong_type",
+                "enum" | "const" => "unsupported_value",
+                "minItems" => "array_too_short",
+                "minimum" | "exclusiveMinimum" => "value_too_small",
+                "maximum" | "exclusiveMaximum" => "value_too_large",
                 _ => "schema_constraint_failed",
             };
-            let schema_pointer = error.schema_path().as_str();
-            let constraint = contract.input_schema.pointer(schema_pointer);
-            let keyword = error.kind().keyword();
+            let schema_pointer = leaf.schema_path.clone();
+            let constraint = contract.input_schema.pointer(&schema_pointer);
+            let keyword = leaf.keyword.clone();
             let mut shape = json!({
                 "keyword": keyword,
                 "constraint": constraint,
@@ -3880,7 +4450,10 @@ fn repair_cue(
             // not their subschemas — so the correction is recoverable from the
             // repair without a second round trip.
             let mut names_disclosed = true;
-            if matches!(keyword, "additionalProperties" | "unevaluatedProperties") {
+            if matches!(
+                keyword.as_str(),
+                "additionalProperties" | "unevaluatedProperties"
+            ) {
                 names_disclosed = false;
                 let enclosing = schema_pointer
                     .rfind('/')
@@ -3907,12 +4480,72 @@ fn repair_cue(
             localised = constraint.is_some() && names_disclosed;
         }
     }
+    if let Some(field) = routing_rejected {
+        // The helper rejected this exact field; the schema derivation above
+        // may have named the other nested key instead.
+        failing_pointer = format!("/arguments/{field}");
+        reason_code = "unexpected_field";
+    }
+    if contract.surface == ExecutorSurface::Ordinary
+        && !write_operations::requires_plan(&contract.executor, &contract.operation)
+        && failing_pointer == "/arguments/format"
+    {
+        expected_shape["description"] = json!(
+            "arguments.format is misplaced: put format on the executor envelope alongside operation, arguments and run_key. Omission preserves the operation's default representation."
+        );
+        expected_shape["supported_values"] =
+            render::format_schema(&contract.source_tool)["enum"].clone();
+        if contract.executor == "records_read" && contract.operation == "get_record" {
+            // Show placement without echoing a potentially large caller payload.
+            // The existing correction patches preserve the actual ids/run key.
+            expected_shape["request_example"] = json!({
+                "operation":"get_record",
+                "arguments":{"ids":["<record-reference>"]},
+                "format":"json",
+                "run_key":"<bootstrap-run-key>"
+            });
+        }
+    }
+    // `run_key`/`parent_key` ride the envelope, not the operation arguments:
+    // the inner schemas strip them (`strip_routing_fields`), so a nested key
+    // fails as a generic unknown property. Name the envelope placement
+    // directly, mirroring the `format` misplacement repair. This covers any
+    // path that reaches validation with the keys still nested (conflicts,
+    // non-strings, or callers that bypassed the hoist); the hoisted path
+    // itself proceeds without failing.
+    if failing_pointer == "/arguments/run_key" {
+        expected_shape["description"] = json!(
+            "arguments.run_key is misplaced: put run_key on the executor envelope alongside operation and arguments."
+        );
+    } else if failing_pointer == "/arguments/parent_key" {
+        expected_shape["description"] = json!(
+            "arguments.parent_key is misplaced: put parent_key on the executor envelope alongside operation, arguments and run_key."
+        );
+    }
     RepairCue {
         reason_code,
         failing_pointer,
         expected_shape,
         localised,
         corrected_envelope: minimal_corrected_envelope(contract, envelope, hosted_authority),
+        suppress_failing_value: descended,
+    }
+}
+
+/// Value-free rendering of a schema validation failure for the diagnostic
+/// string. Composite `oneOf`/`anyOf` failures echo the whole instance in
+/// their `Display` (the entire arguments object, record content included),
+/// which then feeds `structuredContent.error`, the text block, and
+/// `repair.diagnostic`. Mask those to the `value` placeholder so a descended
+/// composite cue stays value-free end to end; direct leaf failures keep
+/// their existing rendering.
+fn schema_error_text(error: &jsonschema::ValidationError<'_>) -> String {
+    use jsonschema::error::ValidationErrorKind;
+    match error.kind() {
+        ValidationErrorKind::OneOfNotValid { .. }
+        | ValidationErrorKind::AnyOf { .. }
+        | ValidationErrorKind::OneOfMultipleValid { .. } => error.masked().to_string(),
+        _ => error.to_string(),
     }
 }
 
@@ -4002,6 +4635,19 @@ fn minimal_corrected_envelope(
         }
     }
     operation_arguments.remove("operation");
+    // A non-string routing key must never be advertised as an automatic
+    // correction: moving a number/bool to the envelope would read as
+    // retry_ready, and the retry would then succeed with correlation
+    // silently absent (envelope keys only attach as strings). This covers
+    // both a nested non-string lifted here and a pre-existing non-string
+    // envelope key the correction would otherwise preserve.
+    for field in ["run_key", "parent_key"] {
+        if let Some(value) = corrected.get(field) {
+            if !value.is_string() {
+                return None;
+            }
+        }
+    }
 
     if contract.operation == "query_record" {
         normalize_query_record_arguments(&mut operation_arguments);
@@ -4014,6 +4660,14 @@ fn minimal_corrected_envelope(
         || validate_enabled_operation(contract, operation_arguments, hosted_authority).is_err()
     {
         return None;
+    }
+    if contract.surface == ExecutorSurface::Ordinary
+        && !write_operations::requires_plan(&contract.executor, &contract.operation)
+    {
+        // A moved selector must be executable, not merely absent from the
+        // operation arguments. Do not advertise an invalid format as retry-ready.
+        let mut translated = translate_arguments(contract, &corrected).ok()?;
+        render::take_format(&contract.source_tool, &mut translated).ok()?;
     }
     Some(corrected)
 }
@@ -4319,11 +4973,87 @@ mod tests {
     use futures::future::BoxFuture;
     use sqlx::Row;
 
+    struct SelectorHostedAuthority {
+        pool: sqlx::SqlitePool,
+    }
+
+    impl HostedPlanCatalogue for SelectorHostedAuthority {
+        fn executor_plan_pool(&self) -> &sqlx::SqlitePool {
+            &self.pool
+        }
+    }
+
+    impl HostedExecutorAuthority for SelectorHostedAuthority {
+        fn validate_membership_write(&self, _arguments: Value) -> Result<()> {
+            Ok(())
+        }
+
+        fn prepare_membership_write<'a>(
+            &'a self,
+            _db: &'a crate::Db,
+            _caller: &'a Caller,
+            _arguments: Value,
+        ) -> BoxFuture<'a, Result<HostedMembershipPreparation>> {
+            Box::pin(async { Err(Error::engine("selector fixture never prepares a write")) })
+        }
+    }
+
+    struct SelectorHostedKeys;
+
+    impl HostedPlanKeyProvider for SelectorHostedKeys {
+        fn active_key_id(&self) -> BoxFuture<'static, Result<String>> {
+            Box::pin(async { Ok("selector-fixture-key".into()) })
+        }
+
+        fn seal(&self, key_id: String, _payload: Value) -> BoxFuture<'static, Result<String>> {
+            Box::pin(async move { Ok(format!("{key_id}:fixture-signature")) })
+        }
+
+        fn verify(
+            &self,
+            key_id: String,
+            _payload: Value,
+            signature: String,
+        ) -> BoxFuture<'static, Result<()>> {
+            Box::pin(async move {
+                if signature == format!("{key_id}:fixture-signature") {
+                    Ok(())
+                } else {
+                    Err(Error::engine("selector fixture signature mismatch"))
+                }
+            })
+        }
+    }
+
     fn registry() -> Arc<ToolRegistry> {
         let mut registry = ToolRegistry::new();
         register_builtin_tools(&mut registry).unwrap();
         register_surface_tools(&mut registry).unwrap();
         Arc::new(registry)
+    }
+
+    async fn call_records_read(
+        server: &ExecutorPrototypeStdioServer,
+        id: i64,
+        operation: &str,
+        arguments: Value,
+    ) -> Value {
+        server
+            .handle_message(json!({
+                "jsonrpc":"2.0",
+                "id":id,
+                "method":"tools/call",
+                "params":{
+                    "name":"records_read",
+                    "arguments":{
+                        "operation":operation,
+                        "arguments":arguments,
+                        "run_key":"recordselector-alias-0537ed7"
+                    }
+                }
+            }))
+            .await
+            .unwrap()
     }
 
     /// The registry the hosted deployment actually serves, mirrored from the
@@ -4545,9 +5275,13 @@ mod tests {
         // catalogue the facade serves must route `canvas_read` /
         // `read_canvas.export` to a contract.
         let registry = hosted_registry();
-        let catalogue =
-            build_ordinary_catalogue(&registry, super::super::registry::EngineKind::Sqlite, true)
-                .unwrap();
+        let catalogue = build_ordinary_catalogue(
+            &registry,
+            super::super::registry::EngineKind::Sqlite,
+            true,
+            &ExperimentalExecutors::empty(),
+        )
+        .unwrap();
         let operations_by_executor = &catalogue.operations_by_executor;
         let contracts = &catalogue.contracts;
         let operations = operations_by_executor
@@ -4569,9 +5303,13 @@ mod tests {
     #[test]
     fn reach_operations_are_selectable_only_on_the_ordinary_facade() {
         let registry = hosted_registry();
-        let catalogue =
-            build_ordinary_catalogue(&registry, super::super::registry::EngineKind::Sqlite, true)
-                .unwrap();
+        let catalogue = build_ordinary_catalogue(
+            &registry,
+            super::super::registry::EngineKind::Sqlite,
+            true,
+            &ExperimentalExecutors::empty(),
+        )
+        .unwrap();
         let reads = catalogue
             .operations_by_executor
             .get("reach_read")
@@ -4767,7 +5505,11 @@ mod tests {
     #[test]
     fn lens_executor_bootstrap_exposure_is_fixed_to_its_descriptor_catalogue() {
         let registry = registry();
-        let catalogue = ExecutorPrototypeLensServer::pin_catalogue(&registry).unwrap();
+        let catalogue = ExecutorPrototypeLensServer::pin_catalogue_with_experimental(
+            &registry,
+            &ExperimentalExecutors::empty(),
+        )
+        .unwrap();
         let summary = executor_exposure_summary(
             "lens",
             catalogue.descriptors.len(),
@@ -4785,7 +5527,11 @@ mod tests {
     #[tokio::test]
     async fn lens_executor_bootstrap_omission_returns_exact_json() {
         let registry = registry();
-        let catalogue = ExecutorPrototypeLensServer::pin_catalogue(&registry).unwrap();
+        let catalogue = ExecutorPrototypeLensServer::pin_catalogue_with_experimental(
+            &registry,
+            &ExperimentalExecutors::empty(),
+        )
+        .unwrap();
         let server = ExecutorPrototypeLensServer::new_with_pinned_catalogue(
             registry,
             Arc::new(BootstrapLensDispatch),
@@ -4969,6 +5715,102 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // Serialize MDX admission across the complete test.
+    async fn artifact_authoring_discovery_routes_to_callable_creation_and_guide() {
+        let _guard = native_artifact_runtime::mdx::test_guard();
+        let db = create_database(":memory:").await.unwrap();
+        let server =
+            ExecutorPrototypeStdioServer::new(registry(), db.clone(), Caller::local(), None)
+                .await
+                .unwrap();
+        let listed = server
+            .handle_message(json!({"jsonrpc":"2.0", "id":1, "method":"tools/list"}))
+            .await
+            .unwrap();
+        let descriptor = listed["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "artifacts_write")
+            .unwrap();
+        let cue = descriptor["description"].as_str().unwrap();
+        for route in [
+            "records_write.create_record",
+            "facets.runtime",
+            "compositions",
+        ] {
+            assert!(
+                cue.contains(route),
+                "missing authoring route {route}: {cue}"
+            );
+        }
+
+        async fn call(server: &ExecutorPrototypeStdioServer, name: &str, args: Value) -> Value {
+            let response = server
+                .handle_message(json!({
+                    "jsonrpc":"2.0", "id":2, "method":"tools/call",
+                    "params":{"name":name, "arguments":args}
+                }))
+                .await
+                .unwrap();
+            assert!(response_succeeded(&response), "{response:#}");
+            response["result"]["structuredContent"].clone()
+        }
+
+        let copy = call(
+            &server,
+            "describe_operation",
+            json!({
+                "executor":"artifacts_write", "operation":"instantiate_artifact", "format":"json"
+            }),
+        )
+        .await;
+        assert!(copy["source"]["tool_description"]
+            .as_str()
+            .unwrap()
+            .contains("records_write.create_record"));
+        assert_eq!(copy["input_schema"]["required"], json!(["source_id"]));
+
+        let guide = call(
+            &server,
+            "guidance_read",
+            json!({
+                "operation":"read_guide", "arguments":{"topic":"compositions"}, "format":"json"
+            }),
+        )
+        .await;
+        assert!(guide["markdown"]
+            .as_str()
+            .unwrap()
+            .contains("manage_artifact_module_grants.grant"));
+
+        // Exercise the advertised route with an authored source, without a
+        // template or source_id. Live-input behavior has its own operated fixture.
+        let id = "66eb2aa1-2ec6-4c6b-9434-afecf550ea76";
+        call(&server, "records_write", json!({
+            "operation":"create_record", "format":"json", "arguments":{
+                "id":id, "type":"Document", "kind":"artifact", "name":"Authored from scratch",
+                "body":"export const nativeArtifact = { schema: \"native.mdx.artifact.v2\", inputs: {}, module_inputs: {}, capability_requests: [] }\n\n# Authored from scratch",
+                "facets":{"runtime":"native.mdx.v2"},
+                "reason":"Prove the advertised creation route accepts new artifact source."
+            }
+        })).await;
+        let rendered = call(
+            &server,
+            "artifacts_execute",
+            json!({
+                "operation":"render_artifact", "arguments":{"id":id}, "format":"json"
+            }),
+        )
+        .await;
+        assert_eq!(rendered["status"], "rendered", "{rendered:#}");
+        assert!(rendered["plan"]["tree"]
+            .to_string()
+            .contains("Authored from scratch"));
+        db.close().await;
+    }
+
     #[test]
     fn candidate_manifest_and_read_contracts_are_stable_and_source_derived() {
         let registry = registry();
@@ -4979,7 +5821,7 @@ mod tests {
         );
         assert_eq!(
             audit.candidate_surfaces.stable.ordinary.descriptor_bytes,
-            41_262
+            41_663
         );
         assert_eq!(
             serde_json::to_vec(&audit.candidate_surfaces.stable.ordinary.descriptors)
@@ -4996,7 +5838,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             audit.candidate_surfaces.stable.lens.descriptor_bytes,
-            47_293
+            47_694
         );
         assert_eq!(
             serde_json::to_vec(&audit.candidate_surfaces.stable.lens.descriptors)
@@ -5093,9 +5935,13 @@ mod tests {
     #[test]
     fn executor_descriptors_advertise_each_operations_field_names() {
         let registry = registry();
-        let catalogue =
-            build_ordinary_catalogue(&registry, super::super::registry::EngineKind::Sqlite, false)
-                .unwrap();
+        let catalogue = build_ordinary_catalogue(
+            &registry,
+            super::super::registry::EngineKind::Sqlite,
+            false,
+            &ExperimentalExecutors::empty(),
+        )
+        .unwrap();
         let descriptor = catalogue
             .descriptors
             .iter()
@@ -5104,6 +5950,16 @@ mod tests {
         let description = descriptor["inputSchema"]["properties"]["arguments"]["description"]
             .as_str()
             .expect("arguments description");
+
+        let body_guidance = descriptor["description"].as_str().unwrap();
+        for expected in [
+            "body_set replaces the whole body",
+            "body_append appends literal text",
+            "body_replace applies surgical edits",
+            "body is a deprecated full-replacement alias",
+        ] {
+            assert!(body_guidance.contains(expected), "{body_guidance}");
+        }
 
         // The incident that opened the investigation: `create_record` rejected
         // for a `reason` the advertised contract never mentioned.
@@ -5204,7 +6060,11 @@ mod tests {
         const EXECUTOR_DESCRIPTOR_MAX_BYTES: usize = 96 * 1024;
         let registry = hosted_registry();
         let ordinary = ExecutorPrototypeStdioServer::pin_hosted_catalogue(&registry).unwrap();
-        let lens = ExecutorPrototypeLensServer::pin_catalogue(&registry).unwrap();
+        let lens = ExecutorPrototypeLensServer::pin_catalogue_with_experimental(
+            &registry,
+            &ExperimentalExecutors::empty(),
+        )
+        .unwrap();
         let ordinary_names: Vec<&str> = ordinary
             .descriptors
             .iter()
@@ -5251,15 +6111,436 @@ mod tests {
         }
     }
 
-    /// The listing must not name a shared contract's fields as one operation's
-    /// own. `manage_attachments` hand-declares a flat properties bag against a
-    /// `deny_unknown_fields` handler (`a193c01`), so its actions defer.
+    /// The opted-in `experimental_freshness` descriptor is data, not code: it
+    /// is loaded verbatim from the `build_enabled_experimental` surface of
+    /// the committed public projection. This asserts the loaded descriptor
+    /// exists on both surfaces with the audited name, and pins the opted-in
+    /// catalogue bytes so a projection or pipeline change fails here rather
+    /// than shipping a different discovery surface. Opting in must never be
+    /// the change that spends the ceiling's margin either.
+    ///
+    /// Needs the experimental legacy tool registered, so it is unavailable
+    /// in `--no-default-features` builds.
+    #[cfg(feature = "experimental-agent-intents")]
     #[test]
-    fn operations_sharing_a_contract_defer_instead_of_advertising_the_union() {
-        let registry = registry();
-        let catalogue =
-            build_ordinary_catalogue(&registry, super::super::registry::EngineKind::Sqlite, false)
+    fn experimental_descriptors_come_from_the_audited_projection() {
+        const EXECUTOR_DESCRIPTOR_MAX_BYTES: usize = 96 * 1024;
+        let audit: Audit = serde_json::from_str(AUDIT).unwrap();
+        for (surface, source_surface) in [
+            (
+                "ordinary",
+                &audit.candidate_surfaces.build_enabled_experimental.ordinary,
+            ),
+            (
+                "lens",
+                &audit.candidate_surfaces.build_enabled_experimental.lens,
+            ),
+        ] {
+            let descriptor = source_surface
+                .descriptors
+                .iter()
+                .find(|descriptor| {
+                    descriptor.get("name").and_then(Value::as_str)
+                        == Some(EXPERIMENTAL_FRESHNESS_EXECUTOR)
+                })
+                .unwrap_or_else(|| {
+                    panic!("audited build-enabled-experimental {surface} surface is missing {EXPERIMENTAL_FRESHNESS_EXECUTOR}")
+                });
+            assert_eq!(
+                descriptor.get("name").and_then(Value::as_str),
+                Some(EXPERIMENTAL_FRESHNESS_EXECUTOR),
+            );
+        }
+        let registry = hosted_registry();
+        let experimental = ExperimentalExecutors::from_env_value(Some(
+            EXPERIMENTAL_FRESHNESS_EXECUTOR.to_string(),
+        ))
+        .unwrap();
+        let ordinary = ExecutorPrototypeStdioServer::pin_hosted_catalogue_with_experimental(
+            &registry,
+            &experimental,
+        )
+        .unwrap();
+        let lens =
+            ExecutorPrototypeLensServer::pin_catalogue_with_experimental(&registry, &experimental)
                 .unwrap();
+        assert_eq!(
+            ordinary.descriptor_bytes(),
+            69531,
+            "ordinary+experimental byte count"
+        );
+        assert_eq!(
+            lens.descriptor_bytes(),
+            41149,
+            "lens+experimental byte count"
+        );
+        for (surface, bytes) in [
+            ("ordinary+experimental", ordinary.descriptor_bytes()),
+            ("lens+experimental", lens.descriptor_bytes()),
+        ] {
+            assert!(
+                bytes <= EXECUTOR_DESCRIPTOR_MAX_BYTES,
+                "{surface} executor descriptors are {bytes} bytes against a \
+                 {EXECUTOR_DESCRIPTOR_MAX_BYTES} ceiling."
+            );
+        }
+    }
+
+    /// The audited `experimental_freshness` operations, verbatim from the
+    /// candidate audit rows. Executor operation names follow the audit's
+    /// dotted `tool.action` convention (as every stable executor does), so
+    /// these are the exact enum values the opted-in descriptor advertises.
+    #[cfg(feature = "experimental-agent-intents")]
+    const EXPERIMENTAL_FRESHNESS_OPERATIONS: [&str; 6] = [
+        "experimental_freshness_agent_intent.assess_exact_change",
+        "experimental_freshness_agent_intent.bind_exact_expression",
+        "experimental_freshness_agent_intent.declare_sources",
+        "experimental_freshness_agent_intent.promote_exact_expression",
+        "experimental_freshness_agent_intent.reconcile_affected_output",
+        "experimental_freshness_agent_intent.revise_exact_expression",
+    ];
+
+    fn pinned_descriptor_names(descriptors: &[Value]) -> Vec<&str> {
+        descriptors
+            .iter()
+            .filter_map(|descriptor| descriptor.get("name").and_then(Value::as_str))
+            .collect()
+    }
+
+    #[cfg(feature = "experimental-agent-intents")]
+    fn operation_enum(descriptors: &[Value], executor: &str) -> Vec<String> {
+        descriptors
+            .iter()
+            .find(|descriptor| descriptor.get("name").and_then(Value::as_str) == Some(executor))
+            .expect("executor descriptor")
+            .pointer("/inputSchema/properties/operation/enum")
+            .expect("operation enum")
+            .as_array()
+            .expect("operation enum array")
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// The executor enum of the `describe_operation` descriptor, which names
+    /// executors rather than operations.
+    fn describe_executor_enum(descriptors: &[Value]) -> Vec<String> {
+        descriptors
+            .iter()
+            .find(|descriptor| {
+                descriptor.get("name").and_then(Value::as_str) == Some("describe_operation")
+            })
+            .expect("describe_operation descriptor")
+            .pointer("/inputSchema/properties/executor/enum")
+            .expect("executor enum")
+            .as_array()
+            .expect("executor enum array")
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Without the allowlist the catalogues are the stable-only surface. This
+    /// proves it with the exact descriptor name lists and the pinned stable
+    /// bytes (ordinary 67561, lens 39249), plus the absence of
+    /// `experimental_freshness` — including in `describe_operation`'s
+    /// executor enum — on both surfaces.
+    #[test]
+    fn stable_catalogues_stay_byte_identical_without_the_opt_in() {
+        let registry = hosted_registry();
+        let ordinary = ExecutorPrototypeStdioServer::pin_hosted_catalogue(&registry).unwrap();
+        let lens = ExecutorPrototypeLensServer::pin_catalogue_with_experimental(
+            &registry,
+            &ExperimentalExecutors::empty(),
+        )
+        .unwrap();
+        let ordinary_names = pinned_descriptor_names(&ordinary.descriptors);
+        let lens_names = pinned_descriptor_names(&lens.descriptors);
+        assert_eq!(
+            ordinary_names,
+            [
+                "bootstrap",
+                "describe_operation",
+                "system_read",
+                "guidance_read",
+                "guidance_admin",
+                "records_read",
+                "records_write",
+                "records_lifecycle",
+                "records_delete",
+                "coordination_read",
+                "coordination_write",
+                "sql_read",
+                "external_import",
+                "identity_read",
+                "identity_resolve",
+                "identity_admin",
+                "access_read",
+                "access_admin",
+                "schema_read",
+                "schema_admin",
+                "schema_delete",
+                "messaging_read",
+                "messaging_write",
+                "artifacts_read",
+                "artifacts_execute",
+                "artifacts_write",
+                "membership_read",
+                "membership_admin",
+                "membership_remove",
+                "export",
+                "canvas_read",
+                "canvas_write",
+                "reach_read",
+                "reach_connect",
+            ],
+        );
+        // The lens surface withholds plan-required executors (its execution
+        // path is direct-only), so the stable lens catalogue is the audit
+        // lens list minus records_delete, identity_admin, access_admin,
+        // schema_admin, and schema_delete. That withholding predates this
+        // opt-in and is unchanged by it.
+        assert_eq!(
+            lens_names,
+            [
+                "bootstrap",
+                "describe_operation",
+                "system_read",
+                "guidance_read",
+                "guidance_admin",
+                "records_read",
+                "records_write",
+                "records_lifecycle",
+                "coordination_read",
+                "coordination_write",
+                "sql_read",
+                "external_import",
+                "identity_read",
+                "identity_resolve",
+                "access_read",
+                "schema_read",
+                "messaging_read",
+                "messaging_write",
+                "artifacts_read",
+                "artifacts_execute",
+                "artifacts_write",
+                "membership_read",
+                "export",
+                "canvas_read",
+                "canvas_write",
+            ],
+        );
+        // Pinned byte counts, locked so an accidental catalogue change fails
+        // here rather than shipping a different discovery surface.
+        // get_record's include_history_summary adds 25 bytes (name + separator)
+        // to the accepted-field listing on each surface.
+        assert_eq!(ordinary.descriptor_bytes(), 67813, "ordinary byte count");
+        assert_eq!(lens.descriptor_bytes(), 39501, "lens byte count");
+        // `describe_operation` must not name an executor that has no
+        // descriptor, in either direction, on either surface.
+        for descriptors in [&ordinary.descriptors, &lens.descriptors] {
+            assert!(
+                !describe_executor_enum(descriptors)
+                    .contains(&EXPERIMENTAL_FRESHNESS_EXECUTOR.to_string()),
+                "stable describe_operation must not advertise {EXPERIMENTAL_FRESHNESS_EXECUTOR}"
+            );
+        }
+        assert!(!ordinary_names.contains(&EXPERIMENTAL_FRESHNESS_EXECUTOR));
+        assert!(!lens_names.contains(&EXPERIMENTAL_FRESHNESS_EXECUTOR));
+    }
+
+    /// With `experimental_freshness` allowlisted, both surfaces advertise the
+    /// executor with exactly the six audited operations, `describe_operation`
+    /// reflects it, and `describe_operation` resolves one of its contracts.
+    ///
+    /// Needs the experimental legacy tool registered, so it is unavailable
+    /// in `--no-default-features` builds.
+    #[cfg(feature = "experimental-agent-intents")]
+    #[test]
+    fn experimental_opt_in_advertises_freshness_on_both_surfaces() {
+        let registry = hosted_registry();
+        let experimental = ExperimentalExecutors::from_env_value(Some(
+            EXPERIMENTAL_FRESHNESS_EXECUTOR.to_string(),
+        ))
+        .unwrap();
+        let ordinary = ExecutorPrototypeStdioServer::pin_hosted_catalogue_with_experimental(
+            &registry,
+            &experimental,
+        )
+        .unwrap();
+        let lens =
+            ExecutorPrototypeLensServer::pin_catalogue_with_experimental(&registry, &experimental)
+                .unwrap();
+        for descriptors in [&ordinary.descriptors, &lens.descriptors] {
+            let names = pinned_descriptor_names(descriptors);
+            assert!(
+                names.contains(&EXPERIMENTAL_FRESHNESS_EXECUTOR),
+                "opted-in catalogue is missing {EXPERIMENTAL_FRESHNESS_EXECUTOR}: {names:?}"
+            );
+            assert_eq!(
+                operation_enum(descriptors, EXPERIMENTAL_FRESHNESS_EXECUTOR),
+                EXPERIMENTAL_FRESHNESS_OPERATIONS,
+            );
+            let executor_enum = describe_executor_enum(descriptors);
+            assert!(
+                executor_enum.contains(&EXPERIMENTAL_FRESHNESS_EXECUTOR.to_string()),
+                "describe_operation must reflect the opted-in executor: {executor_enum:?}"
+            );
+        }
+        // The opted-in executor carries per-operation contracts on both
+        // surfaces, resolved through the registered legacy tool.
+        for contracts in [&ordinary.contracts, &lens.contracts] {
+            for operation in EXPERIMENTAL_FRESHNESS_OPERATIONS {
+                let contract = contracts
+                    .get(&(
+                        EXPERIMENTAL_FRESHNESS_EXECUTOR.to_string(),
+                        operation.to_string(),
+                    ))
+                    .unwrap_or_else(|| panic!("missing contract for {operation}"));
+                assert_eq!(contract.source_tool, "experimental_freshness_agent_intent");
+                assert!(contract.selector.is_some(), "{operation} has no selector");
+            }
+        }
+        // Opting in advertises exactly one more descriptor per surface.
+        let stable_ordinary =
+            ExecutorPrototypeStdioServer::pin_hosted_catalogue(&registry).unwrap();
+        let stable_lens = ExecutorPrototypeLensServer::pin_catalogue_with_experimental(
+            &registry,
+            &ExperimentalExecutors::empty(),
+        )
+        .unwrap();
+        assert_eq!(
+            ordinary.descriptors.len(),
+            stable_ordinary.descriptors.len() + 1
+        );
+        assert_eq!(lens.descriptors.len(), stable_lens.descriptors.len() + 1);
+    }
+
+    /// End to end on SQLite: through an executor-prototype stdio server built
+    /// with the allowlist, `experimental_freshness /
+    /// experimental_freshness_agent_intent.promote_exact_expression` promotes
+    /// an exact expression and returns a Unit, revision, and Occurrence. The
+    /// executor performs no freshness logic itself; it translates the envelope
+    /// back to the exact legacy tool/action and delegates once.
+    #[cfg(feature = "experimental-agent-intents")]
+    #[tokio::test]
+    async fn experimental_opt_in_dispatches_promote_exact_expression_end_to_end() {
+        let db = create_database(":memory:").await.unwrap();
+        let source_text = "Audience: technical founders.";
+        let source = crate::store::create_record(
+            &db,
+            json!({"type":"Document","kind":"note","name":"Audience source","body":source_text}),
+        )
+        .await
+        .unwrap();
+        let source_revision = crate::freshness::current_record_body_revision(&db, &source)
+            .await
+            .unwrap();
+        let experimental = ExperimentalExecutors::from_env_value(Some(
+            EXPERIMENTAL_FRESHNESS_EXECUTOR.to_string(),
+        ))
+        .unwrap();
+        let telemetry_sink = Arc::new(telemetry::TestTelemetrySink::default());
+        let telemetry =
+            ExecutorTelemetryContext::new(telemetry_sink, telemetry::DEFAULT_RETENTION_DAYS)
+                .unwrap();
+        let server = ExecutorPrototypeStdioServer::new_with_telemetry_and_experimental(
+            hosted_registry(),
+            db.clone(),
+            Caller::local(),
+            None,
+            telemetry,
+            experimental,
+        )
+        .await
+        .unwrap();
+        // With the allowlist the executor is advertised and selectable.
+        let list = server
+            .handle_message(json!({
+                "jsonrpc":"2.0",
+                "id":1,
+                "method":"tools/list",
+                "params":{}
+            }))
+            .await
+            .unwrap();
+        let tools = list["result"]["tools"].as_array().unwrap();
+        let freshness = tools
+            .iter()
+            .find(|tool| tool["name"] == EXPERIMENTAL_FRESHNESS_EXECUTOR)
+            .expect("opted-in tools/list advertises experimental_freshness");
+        assert_eq!(
+            freshness["inputSchema"]["properties"]["operation"]["enum"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>(),
+            EXPERIMENTAL_FRESHNESS_OPERATIONS,
+        );
+        let promoted = server
+            .handle_message(json!({
+                "jsonrpc":"2.0",
+                "id":2,
+                "method":"tools/call",
+                    "params":{
+                    "name": EXPERIMENTAL_FRESHNESS_EXECUTOR,
+                    "arguments":{
+                        "operation": "experimental_freshness_agent_intent.promote_exact_expression",
+                        "arguments":{
+                            "input": {
+                                "source_revision": serde_json::to_value(&source_revision).unwrap(),
+                                "selectors": [{"type":"text_quote","exact": source_text}],
+                                "first_content": {
+                                    "content": "Primary audience: technical founders.",
+                                    "content_media_type": "text/plain",
+                                    "encoding_version": 1
+                                },
+                                "expression_role": "canonical",
+                                "idempotency_key": "executor-e2e-promote-a748b2"
+                            }
+                        },
+                        "run_key": "executor-e2e-a748b2"
+                    }
+                }
+            }))
+            .await
+            .unwrap();
+        assert_eq!(promoted["result"]["isError"], false, "{promoted}");
+        let evidence = &promoted["result"]["structuredContent"]["result"];
+        let unit_id = evidence["promoted"]["unit_id"].as_str().unwrap();
+        assert!(!unit_id.is_empty(), "{evidence}");
+        assert_eq!(evidence["unit"]["unit_id"].as_str().unwrap(), unit_id);
+        assert_eq!(
+            evidence["occurrence"]["occurrence"]["occurrence_id"]
+                .as_str()
+                .unwrap(),
+            evidence["promoted"]["occurrence_id"].as_str().unwrap(),
+        );
+        assert!(
+            evidence["promoted"]["first_revision"]["sha256"]
+                .as_str()
+                .is_some_and(|sha| sha.len() == 64),
+            "{evidence}"
+        );
+        db.close().await;
+    }
+
+    /// Once a shared source publishes action-discriminated branches, each
+    /// executor operation must advertise its own fields rather than the old
+    /// shared-contract deferral.
+    #[test]
+    fn action_discriminated_attachment_operations_advertise_their_own_fields() {
+        let registry = registry();
+        let catalogue = build_ordinary_catalogue(
+            &registry,
+            super::super::registry::EngineKind::Sqlite,
+            false,
+            &ExperimentalExecutors::empty(),
+        )
+        .unwrap();
         let description = catalogue
             .descriptors
             .iter()
@@ -5271,12 +6552,12 @@ mod tests {
             .to_string();
 
         assert!(
-            !description.contains("manage_attachments.detach"),
-            "a shared contract must not be listed as the operation's own fields: {description}"
+            description.contains("manage_attachments.detach"),
+            "the action branch must be listed with its own fields: {description}"
         );
         assert!(
-            description.contains("shares one contract with its sibling actions"),
-            "the deferral must explain the absence: {description}"
+            !description.contains("manage_attachments shares one contract with its sibling actions"),
+            "an action-discriminated source no longer needs the shared-contract deferral: {description}"
         );
 
         // A single-operation source tool has no siblings, so it still lists.
@@ -5293,9 +6574,13 @@ mod tests {
     #[test]
     fn every_arguments_copy_carries_the_same_listing() {
         let registry = registry();
-        let catalogue =
-            build_ordinary_catalogue(&registry, super::super::registry::EngineKind::Sqlite, false)
-                .unwrap();
+        let catalogue = build_ordinary_catalogue(
+            &registry,
+            super::super::registry::EngineKind::Sqlite,
+            false,
+            &ExperimentalExecutors::empty(),
+        )
+        .unwrap();
         fn argument_descriptions(schema: &Value, into: &mut Vec<String>) {
             if let Some(description) = schema
                 .pointer("/properties/arguments/description")
@@ -5342,10 +6627,18 @@ mod tests {
     #[test]
     fn operations_with_action_specific_schemas_are_named_not_deferred() {
         let registry = registry();
-        let ordinary =
-            build_ordinary_catalogue(&registry, super::super::registry::EngineKind::Sqlite, false)
-                .unwrap();
-        let lens = ExecutorPrototypeLensServer::pin_catalogue(&registry).unwrap();
+        let ordinary = build_ordinary_catalogue(
+            &registry,
+            super::super::registry::EngineKind::Sqlite,
+            false,
+            &ExperimentalExecutors::empty(),
+        )
+        .unwrap();
+        let lens = ExecutorPrototypeLensServer::pin_catalogue_with_experimental(
+            &registry,
+            &ExperimentalExecutors::empty(),
+        )
+        .unwrap();
         let mut named = 0;
         let mut deferred = 0;
         for (surface, descriptors, contracts) in [
@@ -5404,9 +6697,13 @@ mod tests {
     #[test]
     fn shared_and_branched_contracts_are_each_classified_correctly() {
         let registry = registry();
-        let catalogue =
-            build_ordinary_catalogue(&registry, super::super::registry::EngineKind::Sqlite, false)
-                .unwrap();
+        let catalogue = build_ordinary_catalogue(
+            &registry,
+            super::super::registry::EngineKind::Sqlite,
+            false,
+            &ExperimentalExecutors::empty(),
+        )
+        .unwrap();
         let classified = |executor: &str, operation: &str| {
             catalogue
                 .contracts
@@ -5415,9 +6712,10 @@ mod tests {
                 .action_specific_projection
         };
 
-        // Flat properties bag against a deny_unknown_fields handler: shared.
-        assert!(!classified("records_delete", "manage_attachments.detach"));
-        assert!(!classified("records_read", "manage_attachments.list"));
+        // Attachments now declare one branch per action so the list branch can
+        // carry selector aliases without leaking them to inspect or detach.
+        assert!(classified("records_delete", "manage_attachments.detach"));
+        assert!(classified("records_read", "manage_attachments.list"));
 
         // Declared branches whose projected schemas are byte-identical to a
         // sibling's. Comparing projected results deferred these; the source
@@ -5464,27 +6762,37 @@ mod tests {
                 contract.executor, contract.operation
             );
         }
-        fn properties_of(contract: &OperationContract) -> HashSet<&str> {
-            contract.input_schema["properties"]
-                .as_object()
-                .unwrap_or_else(|| {
-                    panic!("{}.{} properties", contract.executor, contract.operation)
-                })
-                .keys()
-                .map(String::as_str)
-                .collect::<HashSet<_>>()
+        fn properties_of(contract: &OperationContract) -> HashSet<String> {
+            let mut properties = Vec::new();
+            collect_property_names(&contract.input_schema, &mut properties);
+            properties.into_iter().collect()
         }
         assert_eq!(
             properties_of(add),
-            HashSet::from(["source_id", "target_id", "relationship", "note"])
+            HashSet::from([
+                "source_id".into(),
+                "target_id".into(),
+                "relationship".into(),
+                "note".into(),
+            ])
         );
         assert_eq!(
             properties_of(remove),
-            HashSet::from(["source_id", "target_id", "relationship"])
+            HashSet::from([
+                "source_id".into(),
+                "target_id".into(),
+                "relationship".into(),
+            ])
         );
         assert_eq!(
             properties_of(list),
-            HashSet::from(["record_id", "limit", "cursor"])
+            HashSet::from([
+                "id".into(),
+                "record_id".into(),
+                "ids".into(),
+                "limit".into(),
+                "cursor".into(),
+            ])
         );
         // The exact sets above already exclude every sibling field. This one
         // is named anyway because it is the defect: the flat bag disclosed
@@ -5878,9 +7186,13 @@ mod tests {
     #[test]
     fn ordinary_executor_formats_are_conditional_and_inner_contracts_reject_them() {
         let registry = registry();
-        let catalogue =
-            build_ordinary_catalogue(&registry, super::super::registry::EngineKind::Sqlite, false)
-                .unwrap();
+        let catalogue = build_ordinary_catalogue(
+            &registry,
+            super::super::registry::EngineKind::Sqlite,
+            false,
+            &ExperimentalExecutors::empty(),
+        )
+        .unwrap();
         let descriptor = |name: &str| {
             catalogue
                 .descriptors
@@ -6716,7 +8028,13 @@ mod tests {
         let BuiltContracts {
             contracts,
             operations_by_executor: operations,
-        } = build_lens_contracts(&registry, &sources, &audit.audit_rows).unwrap();
+        } = build_lens_contracts(
+            &registry,
+            &sources,
+            &audit.audit_rows,
+            &ExperimentalExecutors::empty(),
+        )
+        .unwrap();
         let lens_send = contracts
             .get(&("messaging_write".into(), "manage_messages.send".into()))
             .expect("lens manage_messages.send contract");
@@ -6836,7 +8154,13 @@ mod tests {
         let BuiltContracts {
             contracts: restricted_contracts,
             ..
-        } = build_lens_contracts(&registry, &restricted_sources, &audit.audit_rows).unwrap();
+        } = build_lens_contracts(
+            &registry,
+            &restricted_sources,
+            &audit.audit_rows,
+            &ExperimentalExecutors::empty(),
+        )
+        .unwrap();
         assert!(!restricted_contracts
             .contains_key(&("identity_resolve".into(), "materialize_record".into())));
     }
@@ -7151,11 +8475,11 @@ mod tests {
             "both repair shapes must stay covered: localised={localised_seen} fallback={fallback_seen}"
         );
 
-        // A misspelled field has to be correctable from the repair alone. The
-        // observed failure is `get_record` carrying `record_id` where the
-        // contract wants `ids`. The repair omits the contract for this class,
-        // so its accepted-name list is the caller's only route to the right
-        // spelling; `additionalProperties: false` on its own would not be one.
+        // A genuinely misspelled field has to be correctable from the repair
+        // alone. All three singular/batch selector spellings are intentional
+        // now, so use `record_ids` as the negative specimen. The repair omits
+        // the contract for this class, making its accepted-name list the
+        // caller's only route to a supported spelling.
         let misspelled = server
             .handle_message(json!({
                 "jsonrpc":"2.0",
@@ -7165,7 +8489,7 @@ mod tests {
                     "name":"records_read",
                     "arguments":{
                         "operation":"get_record",
-                        "arguments":{"record_id":"read-fixture-a748b2"},
+                        "arguments":{"record_ids":"read-fixture-a748b2"},
                         "run_key":"read-misspelled-a748b2"
                     }
                 }
@@ -7179,7 +8503,7 @@ mod tests {
             "{misspelled}"
         );
         assert_eq!(
-            misspelled["failing_pointer"], "/arguments/record_id",
+            misspelled["failing_pointer"], "/arguments/record_ids",
             "{misspelled}"
         );
         assert_eq!(
@@ -7197,7 +8521,9 @@ mod tests {
             accepted.contains(&"ids"),
             "the caller must be able to recover the correct spelling without describe_operation: {misspelled}"
         );
-        assert!(!accepted.contains(&"record_id"), "{misspelled}");
+        assert!(accepted.contains(&"id"), "{misspelled}");
+        assert!(accepted.contains(&"record_id"), "{misspelled}");
+        assert!(!accepted.contains(&"record_ids"), "{misspelled}");
         assert!(
             misspelled["expected_shape"]["required_properties"].is_array(),
             "{misspelled}"
@@ -7207,7 +8533,7 @@ mod tests {
         assert_eq!(
             misspelled["failing_value"],
             json!({
-                "pointer": "/arguments/record_id",
+                "pointer": "/arguments/record_ids",
                 "value": "read-fixture-a748b2",
                 "length": 19,
                 "truncated": false,
@@ -7298,6 +8624,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(valid["result"]["isError"], false, "{valid}");
+        // Captures run on the handle's background queue; drain before
+        // asserting per-tool dispatch counts.
+        db.drain_captures().await;
         let source_calls: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM read_log_calls WHERE tool='query_record'")
                 .fetch_one(db.write_pool())
@@ -7517,8 +8846,13 @@ mod tests {
         let policy =
             super::super::ResolvedToolExposure::new(super::super::ExposureProfile::Complete);
         let sources = lens_descriptor_projection_for_policy(&registry, &policy).unwrap();
-        let BuiltContracts { contracts, .. } =
-            build_lens_contracts(&registry, &sources, &audit.audit_rows).unwrap();
+        let BuiltContracts { contracts, .. } = build_lens_contracts(
+            &registry,
+            &sources,
+            &audit.audit_rows,
+            &ExperimentalExecutors::empty(),
+        )
+        .unwrap();
         let contract = contracts
             .get(&("records_write".into(), "update_record".into()))
             .unwrap();
@@ -7664,8 +8998,9 @@ mod tests {
     /// Two envelopes failing the same way — one with a small body, one with a
     /// ~20KB body — must produce repair blocks within a small constant of
     /// each other. The old shape echoed the whole payload three times over
-    /// (`preserved_intent`, `corrected_envelope`, `retry.arguments`); the new
-    /// shape carries only the bounded offending value.
+    /// (`preserved_intent`, `corrected_envelope`, `retry.arguments`); the
+    /// descended composite shape names the rejected field and carries no
+    /// offending value at all.
     #[tokio::test]
     async fn repair_size_does_not_scale_with_submitted_body() {
         let db = create_database(":memory:").await.unwrap();
@@ -7715,48 +9050,33 @@ mod tests {
         );
         let small_repair = repair_for(&small);
         let large_repair = repair_for(&large);
-        // The `update_record` contract wraps its variants in `oneOf`, so the
-        // validator's first error is the whole-arguments constraint — the
-        // offending value is the arguments object itself, large body included.
+        // The `update_record` contract wraps its variants in `oneOf`; descent
+        // names the rejected field in the closest branch instead of the whole
+        // combinator. The cue is value-free, so neither body size travels.
         for repair in [&small_repair, &large_repair] {
+            assert_eq!(repair["reason_code"], "unexpected_field", "{repair}");
             assert_eq!(
-                repair["reason_code"], "schema_constraint_failed",
+                repair["failing_pointer"], "/arguments/bogus_field",
                 "{repair}"
             );
-            assert_eq!(repair["failing_pointer"], "/arguments", "{repair}");
+            assert_eq!(
+                repair["expected_shape"]["keyword"], "additionalProperties",
+                "{repair}"
+            );
+            let accepted = repair["expected_shape"]["accepted_properties"]
+                .as_array()
+                .expect("rejected name must be answered with accepted names");
+            assert!(
+                accepted.iter().any(|name| name == "id"),
+                "caller must recover without describe_operation: {repair}"
+            );
+            assert!(repair.get("failing_value").is_none(), "{repair}");
             assert_eq!(repair["retry_ready"], false, "{repair}");
             assert!(repair.get("preserved_intent").is_none(), "{repair}");
             assert!(repair.get("corrected_envelope").is_none(), "{repair}");
             assert!(repair.get("retry").is_none(), "{repair}");
             assert!(repair.get("corrections").is_none(), "{repair}");
         }
-        // The small arguments travel whole; the large ones are cut to the
-        // 200-char bound with their original length disclosed.
-        let small_args = serde_json::to_string(&small["arguments"]).unwrap();
-        assert_eq!(
-            small_repair["failing_value"],
-            json!({
-                "pointer": "/arguments",
-                "value": small["arguments"],
-                "length": small_args.chars().count(),
-                "truncated": false,
-            })
-        );
-        let large_args = serde_json::to_string(&large["arguments"]).unwrap();
-        assert_eq!(large_repair["failing_value"]["pointer"], "/arguments");
-        assert_eq!(
-            large_repair["failing_value"]["length"],
-            large_args.chars().count()
-        );
-        assert_eq!(large_repair["failing_value"]["truncated"], true);
-        assert_eq!(
-            large_repair["failing_value"]["value"]
-                .as_str()
-                .unwrap()
-                .chars()
-                .count(),
-            200
-        );
         let small_text = serde_json::to_string(&small_repair).unwrap();
         let large_text = serde_json::to_string(&large_repair).unwrap();
         assert!(
@@ -7772,6 +9092,452 @@ mod tests {
             "same failure, ~20KB apart in payload, {gap} bytes apart in repair"
         );
         db.close().await;
+    }
+
+    fn test_contract(operation: &str, input_schema: Value) -> OperationContract {
+        OperationContract {
+            surface: ExecutorSurface::Ordinary,
+            executor: "test".into(),
+            operation: operation.into(),
+            source_tool: "test".into(),
+            tool_description: String::new(),
+            selector: None,
+            input_schema,
+            selector_specific_schema: false,
+            action_specific_projection: true,
+            access: OperationAccess::Mutation,
+            digest: "test-digest".into(),
+            bytes: 0,
+        }
+    }
+
+    /// bff6395 regression: `update_record` with a definitely-unknown property
+    /// (`recordd_id` survives the e674559 alias work; `record_id` itself may
+    /// become valid) must name the rejected field and the accepted names,
+    /// value-free end to end. Exercised on stdio and hosted alike: the
+    /// schema-error diagnostic is masked for composites, `failing_value` is
+    /// suppressed for descended cues, and the text block carries the field
+    /// name via the JSON repair it appends.
+    #[tokio::test]
+    async fn oneof_descent_names_unknown_property_value_free() {
+        const UNKNOWN_SENTINEL: &str = "SENTINEL_UNKNOWN_BFF6395";
+        const BODY_SENTINEL: &str = "SENTINEL_BODY_BFF6395_APPEND";
+
+        async fn exercise(server: &ExecutorPrototypeStdioServer) {
+            // Default, explicit `json`, and explicit `text` envelopes share
+            // one contract cue; the text block carries the field name in all
+            // three because the renderer appends the JSON repair.
+            for (offset, format) in [None, Some("json"), Some("text")].into_iter().enumerate() {
+                let mut envelope = json!({
+                    "operation": "update_record",
+                    "arguments": {
+                        "recordd_id": UNKNOWN_SENTINEL,
+                        "reason": "bff6395 descent probe",
+                        "body_append": BODY_SENTINEL,
+                    },
+                    "run_key": "bff6395-descent-a748b2",
+                });
+                if let Some(format) = format {
+                    envelope["format"] = json!(format);
+                }
+                let response = server
+                    .handle_message(json!({
+                        "jsonrpc": "2.0",
+                        "id": 63950 + offset as i64,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "records_write",
+                            "arguments": envelope,
+                        },
+                    }))
+                    .await
+                    .unwrap();
+                assert_eq!(response["result"]["isError"], true, "{response}");
+                // No input value anywhere in the serialized response.
+                let serialized = serde_json::to_string(&response).unwrap();
+                for sentinel in [UNKNOWN_SENTINEL, BODY_SENTINEL] {
+                    assert!(
+                        !serialized.contains(sentinel),
+                        "descended cue reflected input value {sentinel}: {serialized}"
+                    );
+                }
+                let repair = &response["result"]["structuredContent"]["repair"];
+                assert_eq!(repair["code"], "operation_contract_repair", "{repair}");
+                assert_eq!(repair["reason_code"], "unexpected_field", "{repair}");
+                assert_eq!(
+                    repair["failing_pointer"], "/arguments/recordd_id",
+                    "{repair}"
+                );
+                assert_eq!(
+                    repair["expected_shape"]["keyword"], "additionalProperties",
+                    "{repair}"
+                );
+                let accepted = repair["expected_shape"]["accepted_properties"]
+                    .as_array()
+                    .expect("rejected name must be answered with accepted names");
+                assert!(
+                    accepted.iter().any(|name| name == "id"),
+                    "caller must recover `id` without describe_operation: {repair}"
+                );
+                assert!(
+                    repair["expected_shape"]["required_properties"].is_array(),
+                    "{repair}"
+                );
+                assert!(repair.get("input_schema").is_none(), "{repair}");
+                assert!(repair.get("failing_value").is_none(), "{repair}");
+                assert!(repair.get("preserved_intent").is_none(), "{repair}");
+                assert!(repair.get("corrected_envelope").is_none(), "{repair}");
+                assert!(repair.get("retry").is_none(), "{repair}");
+                assert_eq!(repair["retry_ready"], false, "{repair}");
+                assert!(repair.get("corrections").is_none(), "{repair}");
+                // No valid selector was supplied, so the alias diagnostic takes
+                // precedence while the repair still names the unknown field.
+                let diagnostic = repair["diagnostic"].as_str().unwrap_or_default();
+                assert!(
+                    diagnostic.contains("update_record accepts exactly one selector"),
+                    "missing selector must explain the accepted aliases: {repair}"
+                );
+                // Text renderer appends the JSON repair, so the field name and
+                // accepted-shape keys travel to `format: text` callers too.
+                let text = response["result"]["content"][0]["text"].as_str().unwrap();
+                assert!(text.contains("Repair contract:"), "{text}");
+                assert!(text.contains("recordd_id"), "{text}");
+                assert!(text.contains("accepted_properties"), "{text}");
+            }
+        }
+
+        let db = create_database(":memory:").await.unwrap();
+        let stdio =
+            ExecutorPrototypeStdioServer::new(registry(), db.clone(), Caller::local(), None)
+                .await
+                .unwrap();
+        exercise(&stdio).await;
+
+        let catalogue = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        for statement in [
+            "CREATE TABLE databases (id TEXT PRIMARY KEY, status TEXT NOT NULL, activity_epoch INTEGER NOT NULL)",
+            "CREATE TABLE executor_write_plans (key_id TEXT)",
+            "INSERT INTO databases (id, status, activity_epoch) VALUES ('bff6395-hosted-db', 'ready', 0)",
+        ] {
+            sqlx::query(statement).execute(&catalogue).await.unwrap();
+        }
+        let hosted = ExecutorPrototypeStdioServer::new_hosted(
+            registry(),
+            db.clone(),
+            Caller::authenticated("bff6395-hosted-account")
+                .with_hosting_context("bff6395-hosted-user", "bff6395-hosted-db"),
+            Arc::new(SelectorHostedAuthority { pool: catalogue }),
+            "bff6395-hosted-db",
+            Arc::new(SelectorHostedKeys),
+        )
+        .await
+        .unwrap();
+        exercise(&hosted).await;
+        db.close().await;
+    }
+
+    /// A wrong-typed `id` must stay in the singular branch (`wrong_type` at
+    /// `/arguments/id`): the batch branch rejects more names and misses more
+    /// keys, so fewest-violations-first keeps the cue where the caller meant.
+    #[tokio::test]
+    async fn oneof_descent_keeps_wrong_type_in_closest_branch() {
+        let db = create_database(":memory:").await.unwrap();
+        let server =
+            ExecutorPrototypeStdioServer::new(registry(), db.clone(), Caller::local(), None)
+                .await
+                .unwrap();
+        let response = server
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 6396,
+                "method": "tools/call",
+                "params": {
+                    "name": "records_write",
+                    "arguments": {
+                        "operation": "update_record",
+                        "arguments": {
+                            "id": 42,
+                            "reason": "bff6395 wrong-type probe",
+                            "body_append": "literal",
+                        },
+                        "run_key": "bff6395-wrongtype-a748b2",
+                    },
+                },
+            }))
+            .await
+            .unwrap();
+        assert_eq!(response["result"]["isError"], true, "{response}");
+        let repair = &response["result"]["structuredContent"]["repair"];
+        assert_eq!(repair["reason_code"], "wrong_type", "{repair}");
+        assert_eq!(repair["failing_pointer"], "/arguments/id", "{repair}");
+        assert!(repair.get("failing_value").is_none(), "{repair}");
+        db.close().await;
+    }
+
+    /// A missing `reason` still reports `required_field_missing` at
+    /// `/arguments/reason`: top-level required failures never enter descent.
+    #[tokio::test]
+    async fn oneof_descent_missing_reason_stays_required() {
+        let db = create_database(":memory:").await.unwrap();
+        let server =
+            ExecutorPrototypeStdioServer::new(registry(), db.clone(), Caller::local(), None)
+                .await
+                .unwrap();
+        let response = server
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 6397,
+                "method": "tools/call",
+                "params": {
+                    "name": "records_write",
+                    "arguments": {
+                        "operation": "update_record",
+                        "arguments": {
+                            "id": "bff6395-missing-reason",
+                            "body_append": "literal",
+                        },
+                        "run_key": "bff6395-required-a748b2",
+                    },
+                },
+            }))
+            .await
+            .unwrap();
+        assert_eq!(response["result"]["isError"], true, "{response}");
+        let repair = &response["result"]["structuredContent"]["repair"];
+        assert_eq!(repair["reason_code"], "required_field_missing", "{repair}");
+        assert_eq!(repair["failing_pointer"], "/arguments/reason", "{repair}");
+        db.close().await;
+    }
+
+    /// Frozen pre-alias `update_record` shape: the original `record_id`
+    /// report, kept as a unit test on a pinned contract so it survives the
+    /// e674559 alias work making `record_id` valid on the live contract.
+    #[test]
+    fn oneof_descent_original_record_id_on_frozen_contract() {
+        let input_schema = json!({
+            "type": "object",
+            "properties": {"reason": {"type": "string"}},
+            "required": ["reason"],
+            "oneOf": [
+                {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string"},
+                        "reason": {"type": "string"},
+                        "body_append": {"type": "string"}
+                    },
+                    "required": ["id", "reason"],
+                    "additionalProperties": false
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "ids": {"type": "array", "items": {"type": "string"}},
+                        "reason": {"type": "string"}
+                    },
+                    "required": ["ids", "reason"],
+                    "additionalProperties": false
+                }
+            ]
+        });
+        let contract = test_contract("update_record", input_schema);
+        let envelope = json!({
+            "operation": "update_record",
+            "arguments": {
+                "record_id": "frozen-sentinel",
+                "reason": "bff6395 frozen probe",
+                "body_append": "literal"
+            },
+            "run_key": "bff6395-frozen-a748b2"
+        });
+        let cue = repair_cue(&contract, &envelope, None, None);
+        assert_eq!(cue.reason_code, "unexpected_field");
+        assert_eq!(cue.failing_pointer, "/arguments/record_id");
+        assert!(cue.suppress_failing_value);
+        let accepted = cue.expected_shape["accepted_properties"]
+            .as_array()
+            .expect("accepted names must travel");
+        assert!(accepted.iter().any(|name| name == "id"));
+    }
+
+    /// Each rejected name counts separately, not one per aggregate: branch A
+    /// accepts anything with no required keys, so `{b, x, y}` fails it with a
+    /// single aggregate rejecting three names; branch B requires `b`, which
+    /// the caller supplied, so it fails with a single aggregate rejecting two
+    /// names. Aggregate counting ties 1-1 and falls back to index 0 (the
+    /// wrong branch); per-name counting picks B 3-2 (the branch the caller
+    /// meant) and reports its deterministic smallest name.
+    #[test]
+    fn composite_descent_counts_each_rejected_name() {
+        let input_schema = json!({
+            "type": "object",
+            "oneOf": [
+                {
+                    "type": "object",
+                    "properties": {"a": {"type": "string"}},
+                    "additionalProperties": false
+                },
+                {
+                    "type": "object",
+                    "properties": {"b": {"type": "string"}},
+                    "required": ["b"],
+                    "additionalProperties": false
+                }
+            ]
+        });
+        let contract = test_contract("probe", input_schema);
+        let envelope = json!({
+            "operation": "probe",
+            "arguments": {"b": "ok", "x": "1", "y": "2"},
+            "run_key": "bff6395-count-a748b2"
+        });
+        let cue = repair_cue(&contract, &envelope, None, None);
+        assert_eq!(cue.reason_code, "unexpected_field");
+        assert_eq!(cue.failing_pointer, "/arguments/x");
+        let accepted = cue.expected_shape["accepted_properties"]
+            .as_array()
+            .expect("accepted names must travel");
+        assert!(accepted.iter().any(|name| name == "b"));
+        assert!(!accepted.iter().any(|name| name == "a"));
+    }
+
+    /// Nested combinators select their own best branch recursively: the inner
+    /// combinator prefers its unexpected-property variant (f2 rejects one
+    /// name) over its missing-key variant (f1 misses its key and rejects two
+    /// names), so the outer slow branch contributes one violation against the
+    /// fast branch's three and the cue names the nested rejected field.
+    /// Flattening across the mutually exclusive nested variants would pool
+    /// both variants' failures and could not select f2. Covered for both
+    /// nested `oneOf` and nested `anyOf` under a top-level `oneOf`.
+    #[test]
+    fn composite_descent_selects_nested_best_branch_recursively() {
+        for nested in ["oneOf", "anyOf"] {
+            let input_schema = json!({
+                "type": "object",
+                "oneOf": [
+                    {
+                        "type": "object",
+                        "properties": {
+                            "mode": {"const": "fast"},
+                            "speed": {"type": "integer"}
+                        },
+                        "required": ["mode", "speed"],
+                        "additionalProperties": false
+                    },
+                    {
+                        "type": "object",
+                        "properties": {
+                            "mode": {"const": "slow"},
+                            "payload": {
+                                "type": "object",
+                                nested: [
+                                    {
+                                        "type": "object",
+                                        "properties": {"f1": {"type": "string"}},
+                                        "required": ["f1"],
+                                        "additionalProperties": false
+                                    },
+                                    {
+                                        "type": "object",
+                                        "properties": {"f2": {"type": "string"}},
+                                        "required": ["f2"],
+                                        "additionalProperties": false
+                                    }
+                                ]
+                            }
+                        },
+                        "required": ["mode", "payload"],
+                        "additionalProperties": false
+                    }
+                ]
+            });
+            let contract = test_contract("probe", input_schema);
+            let envelope = json!({
+                "operation": "probe",
+                "arguments": {
+                    "mode": "slow",
+                    "payload": {"f2": "ok", "deep": "nope"}
+                },
+                "run_key": "bff6395-nested-a748b2"
+            });
+            let cue = repair_cue(&contract, &envelope, None, None);
+            assert_eq!(cue.reason_code, "unexpected_field", "nested={nested}");
+            assert_eq!(
+                cue.failing_pointer, "/arguments/payload/deep",
+                "nested={nested}"
+            );
+            assert_eq!(
+                cue.expected_shape["keyword"], "additionalProperties",
+                "nested={nested}"
+            );
+            let accepted = cue.expected_shape["accepted_properties"]
+                .as_array()
+                .expect("nested accepted names must travel");
+            assert!(
+                accepted.iter().any(|name| name == "f2"),
+                "nested={nested}: {accepted:?}"
+            );
+            let pointer = cue.expected_shape["contract_pointer"]
+                .as_str()
+                .expect("nested contract pointer must travel");
+            assert_eq!(
+                pointer,
+                &format!("/oneOf/1/properties/payload/{nested}/1/additionalProperties"),
+                "nested={nested}"
+            );
+            assert!(cue.suppress_failing_value, "nested={nested}");
+        }
+    }
+
+    /// Overlapping branches that both accept the instance stay generic but
+    /// value-free: no branch leaf is named, and neither the whole-object
+    /// value nor the diagnostic echoes input.
+    #[test]
+    fn composite_multiple_valid_stays_generic_but_value_free() {
+        const SECRET: &str = "OVERLAP_SECRET_BFF6395";
+        let input_schema = json!({
+            "type": "object",
+            "oneOf": [
+                {
+                    "type": "object",
+                    "properties": {"a": {"type": "string"}},
+                    "required": ["a"]
+                },
+                {
+                    "type": "object",
+                    "properties": {"a": {"type": "string"}},
+                    "required": ["a"]
+                }
+            ]
+        });
+        let contract = test_contract("probe", input_schema);
+        let envelope = json!({
+            "operation": "probe",
+            "arguments": {"a": SECRET},
+            "run_key": "bff6395-overlap-a748b2"
+        });
+        let cue = repair_cue(&contract, &envelope, None, None);
+        assert_eq!(cue.reason_code, "schema_constraint_failed");
+        assert_eq!(cue.failing_pointer, "/arguments");
+        assert!(cue.suppress_failing_value);
+        let mut result = json!({"structuredContent": {}});
+        attach_repair_result(
+            &mut result,
+            &contract,
+            "validation_failure",
+            Some("value is not valid under more than one of the schemas listed in the 'oneOf' keyword"),
+            &envelope,
+            None,
+        );
+        let serialized = serde_json::to_string(&result).unwrap();
+        assert!(
+            !serialized.contains(SECRET),
+            "multiply-valid cue leaked its value: {serialized}"
+        );
     }
 
     /// The boundedness guarantee on the path that actually moves bytes: the
@@ -8052,8 +9818,13 @@ mod tests {
         let policy =
             super::super::ResolvedToolExposure::new(super::super::ExposureProfile::Complete);
         let sources = lens_descriptor_projection_for_policy(&registry, &policy).unwrap();
-        let BuiltContracts { contracts, .. } =
-            build_lens_contracts(&registry, &sources, &audit.audit_rows).unwrap();
+        let BuiltContracts { contracts, .. } = build_lens_contracts(
+            &registry,
+            &sources,
+            &audit.audit_rows,
+            &ExperimentalExecutors::empty(),
+        )
+        .unwrap();
         let contract = contracts
             .get(&("records_read".into(), "get_record".into()))
             .unwrap();
@@ -8216,6 +9987,9 @@ mod tests {
                 "{operation}: {response}"
             );
         }
+        // Source-tool captures run on the handle's background queue; drain
+        // before asserting per-tool dispatch counts.
+        db.drain_captures().await;
         for tool in [
             "query_record",
             "get_record",
@@ -8342,7 +10116,6 @@ mod tests {
             "updated_at",
             "custody_boundary",
             "containment_path_visible",
-            "kind_governance",
             "lifecycle_interpretation",
         ] {
             let expected = format!("\"{key}\":");
@@ -8351,7 +10124,15 @@ mod tests {
                 "default prose lost {key}: {default_text}"
             );
         }
-        assert!(default_text.contains("Read scope:"), "{default_text}");
+        assert!(!default_text.contains("Read scope:"), "{default_text}");
+        let omissions = default_text
+            .lines()
+            .find(|line| line.contains("Additional record fields omitted from text:"))
+            .unwrap();
+        for key in ["kind_governance", "contribution"] {
+            assert!(omissions.contains(key), "{default_text}");
+            assert!(!default_text.contains(&format!("\"{key}\":")));
+        }
 
         // `json` returns the serialized payload instead, and is not merely
         // accepted and ignored — the text must actually change shape.
@@ -8370,6 +10151,10 @@ mod tests {
             explicit["result"]["structuredContent"]["records"][0]["id"] == "native:root",
             "{explicit}"
         );
+        for key in ["kind_governance", "contribution"] {
+            assert!(explicit["result"]["structuredContent"]["records"][0][key].is_object());
+        }
+        assert_eq!(explicit["result"]["structuredContent"]["resolve"], true);
 
         // `text` is selectable explicitly and agrees with the default.
         let text = call(Some("text")).await;
@@ -9551,6 +11336,752 @@ mod tests {
         db.close().await;
     }
 
+    #[tokio::test]
+    async fn record_selector_aliases_have_schema_runtime_and_sqlite_replay_parity() {
+        const RECORD_ID: &str = "0537ed75-466f-457c-ad04-bcdf48c4fdbe";
+        const SHORT_ID: &str = "0537ed7";
+
+        fn companions(operation: &str, before_seq: i64) -> Value {
+            match operation {
+                "render_record_version_diff" => json!({"before_seq":before_seq}),
+                "manage_attachments.list" => json!({}),
+                "manage_links.list" => json!({"limit":1}),
+                "manage_facet_observations.list" => json!({"key":"amount", "limit":1}),
+                "resolve_rollup" => json!({"rollup_name":"count"}),
+                _ => json!({}),
+            }
+        }
+
+        fn with_selector(mut companions: Value, field: &str, reference: &str) -> Value {
+            companions.as_object_mut().unwrap().insert(
+                field.into(),
+                if field == "ids" {
+                    json!([reference])
+                } else {
+                    json!(reference)
+                },
+            );
+            companions
+        }
+
+        fn stable_payload(operation: &str, mut payload: Value) -> Value {
+            if operation == "resolve_rollup" {
+                let text = payload.as_str().unwrap().replace(" [cache hit]", "");
+                payload = json!(text);
+            }
+            payload
+        }
+
+        fn legacy_call(operation: &str, mut arguments: Value) -> (&str, Value) {
+            let tool = match operation {
+                "manage_attachments.list" => "manage_attachments",
+                "manage_links.list" => "manage_links",
+                "manage_facet_observations.list" => "manage_facet_observations",
+                other => other,
+            };
+            if operation.contains(".list") {
+                arguments["action"] = json!("list");
+            }
+            (tool, arguments)
+        }
+
+        fn stable_structured(operation: &str, mut payload: Value) -> Value {
+            if operation == "resolve_rollup" {
+                payload.as_object_mut().unwrap().remove("cache_hit");
+            }
+            payload
+        }
+
+        fn schema_has_property(schema: &Value, property: &str) -> bool {
+            schema["properties"].get(property).is_some()
+                || ["oneOf", "anyOf", "allOf"].into_iter().any(|keyword| {
+                    schema[keyword].as_array().is_some_and(|branches| {
+                        branches
+                            .iter()
+                            .any(|branch| schema_has_property(branch, property))
+                    })
+                })
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("record-selector-aliases.sqlite3");
+        let db = create_database(path.to_str().unwrap()).await.unwrap();
+        let registry = registry();
+        registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "create_record",
+                json!({
+                    "id":RECORD_ID,
+                    "type":"Document",
+                    "kind":"note",
+                    "name":"Record selector alias fixture",
+                    "body":"before",
+                    "facets":{"rollup":json!({
+                        "v":"0.1",
+                        "outputs":{"count":{
+                            "query":{"steps":[{"step":"filter","home_id":"native:root"}]},
+                            "fold":{"op":"count"}
+                        }}
+                    }).to_string()},
+                    "reason":"record selector alias fixture"
+                }),
+            )
+            .await
+            .unwrap();
+        let before_seq: i64 =
+            sqlx::query_scalar("SELECT MAX(seq) FROM content_events WHERE record_id = ?")
+                .bind(RECORD_ID)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "update_record",
+                json!({
+                    "id":RECORD_ID,
+                    "body":"after",
+                    "if_body_digest":hex::encode(Sha256::digest(b"before")),
+                    "reason":"make a version diff"
+                }),
+            )
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM read_log_calls")
+            .execute(db.write_pool())
+            .await
+            .unwrap();
+
+        let server =
+            ExecutorPrototypeStdioServer::new(registry.clone(), db.clone(), Caller::local(), None)
+                .await
+                .unwrap();
+        let operations = [
+            ("get_record", "ids"),
+            ("render_record", "id"),
+            ("render_record_version_diff", "record_id"),
+            ("render_suggestion_review", "record_id"),
+            ("manage_attachments.list", "record_id"),
+            ("manage_links.list", "record_id"),
+            ("manage_facet_observations.list", "record_id"),
+            ("resolve_rollup", "record_id"),
+        ];
+
+        // Discovery and describe_operation expose precisely the same alias
+        // contract that runtime accepts.
+        for (index, (operation, canonical)) in operations.iter().enumerate() {
+            let contract = server
+                .contracts
+                .get(&("records_read".into(), (*operation).into()))
+                .unwrap_or_else(|| panic!("missing records_read.{operation}"));
+            let validator = jsonschema::validator_for(&contract.input_schema).unwrap();
+            for field in ["id", "record_id", "ids"] {
+                let arguments = with_selector(companions(operation, before_seq), field, RECORD_ID);
+                assert!(
+                    validator.is_valid(&arguments),
+                    "{operation}.{field}: {arguments}; {}",
+                    contract.input_schema
+                );
+            }
+            let mut invalid_arguments = vec![
+                companions(operation, before_seq),
+                {
+                    let mut value = companions(operation, before_seq);
+                    value["ids"] = json!([]);
+                    value
+                },
+                {
+                    let mut value = companions(operation, before_seq);
+                    value["id"] = json!(RECORD_ID);
+                    value["record_id"] = json!(RECORD_ID);
+                    value
+                },
+            ];
+            if *operation == "get_record" {
+                invalid_arguments.push(with_selector(companions(operation, before_seq), "id", ""));
+            } else {
+                invalid_arguments.push(with_selector(companions(operation, before_seq), "ids", ""));
+                let mut multiple = companions(operation, before_seq);
+                multiple["ids"] = json!([RECORD_ID, RECORD_ID]);
+                invalid_arguments.push(multiple);
+            }
+            for arguments in invalid_arguments {
+                assert!(!validator.is_valid(&arguments), "{operation}: {arguments}");
+            }
+
+            let described = server
+                .handle_message(json!({
+                    "jsonrpc":"2.0", "id":10_000 + index, "method":"tools/call",
+                    "params":{"name":"describe_operation","arguments":{
+                        "executor":"records_read", "operation":operation, "format":"json"
+                    }}
+                }))
+                .await
+                .unwrap();
+            assert_eq!(described["result"]["isError"], false, "{described}");
+            assert_eq!(
+                described["result"]["structuredContent"]["input_schema"], contract.input_schema,
+                "describe drift for {operation}"
+            );
+            assert!(schema_has_property(&contract.input_schema, canonical));
+        }
+
+        // Every operation produces the same semantic payload for every
+        // spelling, with both the full id and its unique short reference.
+        let mut request_id = 20_000_i64;
+        for (operation, canonical) in operations {
+            let baseline_arguments =
+                with_selector(companions(operation, before_seq), canonical, RECORD_ID);
+            let baseline =
+                call_records_read(&server, request_id, operation, baseline_arguments).await;
+            request_id += 1;
+            assert_eq!(baseline["result"]["isError"], false, "{baseline}");
+            let expected =
+                stable_payload(operation, baseline["result"]["content"][0]["text"].clone());
+            for reference in [RECORD_ID, SHORT_ID] {
+                for field in ["id", "record_id", "ids"] {
+                    let response = call_records_read(
+                        &server,
+                        request_id,
+                        operation,
+                        with_selector(companions(operation, before_seq), field, reference),
+                    )
+                    .await;
+                    request_id += 1;
+                    assert_eq!(
+                        response["result"]["isError"], false,
+                        "{operation}.{field}({reference}): {response}"
+                    );
+                    assert_eq!(
+                        stable_payload(operation, response["result"]["content"][0]["text"].clone()),
+                        expected,
+                        "semantic drift for {operation}.{field}({reference})"
+                    );
+                }
+            }
+        }
+
+        // The legacy exact-name surface runs its own operation-aware boundary,
+        // rather than relying on the grouped executor's translation.
+        for (operation, canonical) in operations {
+            let (tool, baseline_arguments) = legacy_call(
+                operation,
+                with_selector(companions(operation, before_seq), canonical, RECORD_ID),
+            );
+            let expected = stable_structured(
+                operation,
+                registry
+                    .call(db.clone(), Caller::local(), tool, baseline_arguments)
+                    .await
+                    .unwrap(),
+            );
+            for reference in [RECORD_ID, SHORT_ID] {
+                for field in ["id", "record_id", "ids"] {
+                    let (tool, arguments) = legacy_call(
+                        operation,
+                        with_selector(companions(operation, before_seq), field, reference),
+                    );
+                    let actual = registry
+                        .call(db.clone(), Caller::local(), tool, arguments)
+                        .await
+                        .unwrap_or_else(|error| {
+                            panic!("legacy {operation}.{field}({reference}): {error}")
+                        });
+                    assert_eq!(
+                        stable_structured(operation, actual),
+                        expected,
+                        "legacy semantic drift for {operation}.{field}({reference})"
+                    );
+                }
+            }
+        }
+
+        // Explicit MCP replay: three differently shaped legacy handlers all
+        // consume the same singleton `ids` spelling against disposable SQLite.
+        for (operation, arguments) in [
+            ("get_record", json!({"ids":[SHORT_ID]})),
+            (
+                "render_record",
+                json!({"ids":[SHORT_ID], "include_interpretation":false}),
+            ),
+            ("manage_attachments.list", json!({"ids":[SHORT_ID]})),
+        ] {
+            let response = call_records_read(&server, request_id, operation, arguments).await;
+            request_id += 1;
+            assert_eq!(response["result"]["isError"], false, "{response}");
+        }
+
+        // Runtime selector failures are rejected before the source handler can
+        // append a read-log call, and carry one actionable operation-aware cue.
+        // Drain first: prior valid calls' captures must have landed, or they
+        // race the after-count below.
+        db.drain_captures().await;
+        let calls_before_invalid: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM read_log_calls")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        for (operation, _) in operations {
+            let mut invalid_arguments = vec![
+                companions(operation, before_seq),
+                {
+                    let mut value = companions(operation, before_seq);
+                    value["ids"] = json!([]);
+                    value
+                },
+                {
+                    let mut value = companions(operation, before_seq);
+                    value["id"] = json!(RECORD_ID);
+                    value["record_id"] = json!(RECORD_ID);
+                    value
+                },
+            ];
+            if operation == "get_record" {
+                invalid_arguments.push(with_selector(
+                    companions(operation, before_seq),
+                    "record_id",
+                    "",
+                ));
+            } else {
+                let mut multiple = companions(operation, before_seq);
+                multiple["ids"] = json!([RECORD_ID, RECORD_ID]);
+                invalid_arguments.push(multiple);
+            }
+            for arguments in invalid_arguments {
+                let response = call_records_read(&server, request_id, operation, arguments).await;
+                request_id += 1;
+                assert_eq!(response["result"]["isError"], true, "{response}");
+                let text = response["result"]["content"][0]["text"].as_str().unwrap();
+                for needle in [operation, "operation_contract_repair", "retry_ready"] {
+                    assert!(text.contains(needle), "missing {needle:?}: {text}");
+                }
+            }
+        }
+        let calls_after_invalid: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM read_log_calls")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(calls_after_invalid, calls_before_invalid);
+
+        // Equal-value conflicts are rejected, but an exact creation id keeps
+        // its existing write meaning and excluded attachment actions do not
+        // acquire the alias.
+        let creation_id = "1537ed75-466f-457c-ad04-bcdf48c4fdbe";
+        let created = registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "create_record",
+                json!({
+                    "id":creation_id,
+                    "type":"Document",
+                    "kind":"note",
+                    "name":"Boundary fixture",
+                    "reason":"prove create_record id semantics are unchanged"
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created["id"], creation_id);
+        let excluded = registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "manage_attachments",
+                json!({"action":"inspect", "ids":[RECORD_ID], "attachment_id":"missing"}),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(excluded.contains("ids"), "{excluded}");
+
+        db.close().await;
+    }
+
+    /// Write-selector aliases on the direct executor paths (e674559): every
+    /// spelling executes the same single-record write the canonical field
+    /// would, while conflicts and singleton-batch misuse reject without
+    /// writing and without reflecting the selector value.
+    #[tokio::test]
+    async fn write_selector_aliases_execute_direct_writes_and_reject_conflicts() {
+        async fn call_executor(
+            server: &ExecutorPrototypeStdioServer,
+            id: i64,
+            executor: &str,
+            operation: &str,
+            arguments: Value,
+        ) -> Value {
+            server
+                .handle_message(json!({
+                    "jsonrpc":"2.0",
+                    "id":id,
+                    "method":"tools/call",
+                    "params":{
+                        "name":executor,
+                        "arguments":{
+                            "operation":operation,
+                            "arguments":arguments,
+                            "run_key":"write-selector-alias-3f71aa",
+                            "format":"json"
+                        }
+                    }
+                }))
+                .await
+                .unwrap()
+        }
+
+        const RECORD_ID: &str = "0537ed75-466f-457c-ad04-bcdf48c4fdbe";
+        let db = create_database(":memory:").await.unwrap();
+        let registry = registry();
+        registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "create_record",
+                json!({
+                    "id":RECORD_ID,
+                    "type":"Document",
+                    "kind":"note",
+                    "name":"Write selector alias fixture",
+                    "body":"before",
+                    "reason":"write selector alias fixture"
+                }),
+            )
+            .await
+            .unwrap();
+        let server =
+            ExecutorPrototypeStdioServer::new(registry.clone(), db.clone(), Caller::local(), None)
+                .await
+                .unwrap();
+
+        // update_record through record_id writes exactly as id would.
+        let updated = call_executor(
+            &server,
+            1,
+            "records_write",
+            "update_record",
+            json!({"record_id":RECORD_ID, "body_append":" plus alias", "reason":"alias single write"}),
+        )
+        .await;
+        assert_eq!(updated["result"]["isError"], false, "{updated}");
+        let fetched = registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "get_record",
+                json!({"ids":[RECORD_ID]}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(fetched["records"][0]["body"], "before plus alias");
+
+        // attach_text through id attaches under the same record.
+        let attached = call_executor(
+            &server,
+            2,
+            "records_write",
+            "attach_text",
+            json!({"id":RECORD_ID, "text":"aliased bytes", "filename":"alias.txt"}),
+        )
+        .await;
+        assert_eq!(attached["result"]["isError"], false, "{attached}");
+        assert_eq!(
+            attached["result"]["structuredContent"]["record_id"],
+            RECORD_ID
+        );
+
+        // archive_record through a singleton ids list archives the record.
+        let archived = call_executor(
+            &server,
+            3,
+            "records_lifecycle",
+            "archive_record",
+            json!({"ids":[RECORD_ID], "reason":"alias archive"}),
+        )
+        .await;
+        assert_eq!(archived["result"]["isError"], false, "{archived}");
+        assert_eq!(archived["result"]["structuredContent"]["changed"], true);
+
+        // manage_facet_observations.set through record_id observes on it.
+        let observed = call_executor(
+            &server,
+            4,
+            "records_write",
+            "manage_facet_observations.set",
+            json!({
+                "record_id":RECORD_ID,
+                "key":"alias_probe",
+                "value":"v",
+                "as_of":"2026-08-01T00:00:00Z",
+                "reason":"alias observation write"
+            }),
+        )
+        .await;
+        assert_eq!(observed["result"]["isError"], false, "{observed}");
+        assert_eq!(observed["result"]["structuredContent"]["status"], "set");
+
+        // A conflicting selector rejects value-free and writes nothing.
+        let events_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM content_events")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        let conflicted = call_executor(
+            &server,
+            5,
+            "records_write",
+            "update_record",
+            json!({"id":RECORD_ID, "record_id":RECORD_ID, "name":"must not land", "reason":"conflict probe"}),
+        )
+        .await;
+        assert_eq!(conflicted["result"]["isError"], true, "{conflicted}");
+        let serialized = serde_json::to_string(&conflicted).unwrap();
+        assert!(serialized.contains("exactly one selector"), "{serialized}");
+        assert!(
+            !serialized.contains(RECORD_ID),
+            "the rejection must not reflect the selector value: {serialized}"
+        );
+        let events_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM content_events")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(events_after, events_before);
+
+        // A singleton ids list on update_record stays a batch call: the
+        // single-only field rejects through the batch parser.
+        let singleton = call_executor(
+            &server,
+            6,
+            "records_write",
+            "update_record",
+            json!({"ids":[RECORD_ID], "body_append":"must not land", "reason":"batch probe"}),
+        )
+        .await;
+        assert_eq!(singleton["result"]["isError"], true, "{singleton}");
+        let fetched = registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "get_record",
+                json!({"ids":[RECORD_ID]}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(fetched["records"][0]["body"], "before plus alias");
+        db.close().await;
+    }
+
+    /// Operation-specific selector constraints stay value-free on the direct
+    /// executor path (e674559): a claim alias carrying a non-UUID and a
+    /// batch carrying a non-UUID or a duplicate reject with the shape
+    /// diagnostic rather than a schema-library message echoing the value.
+    /// Normalisation still passes these through untouched, so legacy parser
+    /// wording and authority order are unchanged — this is repair-surface
+    /// behaviour only.
+    #[tokio::test]
+    async fn write_selector_constraint_repairs_never_reflect_selector_values() {
+        const PRIVATE_A: &str = "PRIVATE_WRITE_SELECTOR_SENTINEL_A";
+        const DUPLICATE: &str = "1537ed75-466f-457c-ad04-bcdf48c4fdbe";
+        let db = create_database(":memory:").await.unwrap();
+        let registry = registry();
+        let server = ExecutorPrototypeStdioServer::new(registry, db.clone(), Caller::local(), None)
+            .await
+            .unwrap();
+        for (id, (executor, operation, arguments)) in (40_000_i64..).zip([
+            (
+                "records_write",
+                "claim_unowned_record",
+                json!({"id":PRIVATE_A, "reason":"Sentinel claim probe"}),
+            ),
+            (
+                "records_write",
+                "claim_unowned_record",
+                json!({"record_id":PRIVATE_A, "reason":"Sentinel claim probe"}),
+            ),
+            (
+                "records_write",
+                "claim_unowned_record",
+                json!({"ids":[PRIVATE_A], "reason":"Sentinel claim probe"}),
+            ),
+            (
+                "records_write",
+                "update_record",
+                json!({"ids":[PRIVATE_A], "facets":{"probe":"v"}, "reason":"Sentinel batch probe"}),
+            ),
+            (
+                "records_write",
+                "update_record",
+                json!({"ids":[DUPLICATE, DUPLICATE], "facets":{"probe":"v"}, "reason":"Duplicate batch probe"}),
+            ),
+        ]) {
+            let response = server
+                .handle_message(json!({
+                    "jsonrpc":"2.0",
+                    "id":id,
+                    "method":"tools/call",
+                    "params":{
+                        "name":executor,
+                        "arguments":{
+                            "operation":operation,
+                            "arguments":arguments,
+                            "run_key":"write-selector-redaction-9c44bd"
+                        }
+                    }
+                }))
+                .await
+                .unwrap();
+            assert_eq!(response["result"]["isError"], true, "{response}");
+            let serialized = serde_json::to_string(&response).unwrap();
+            assert!(
+                serialized.contains("exactly one selector"),
+                "{operation}: {serialized}"
+            );
+            for sentinel in [PRIVATE_A, DUPLICATE] {
+                assert!(
+                    !serialized.contains(sentinel),
+                    "{operation} reflected selector value {sentinel}: {serialized}"
+                );
+            }
+            let repair = &response["result"]["structuredContent"]["repair"];
+            assert_eq!(repair["code"], "operation_contract_repair", "{repair}");
+            assert!(repair.get("failing_value").is_none(), "{repair}");
+        }
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn selector_shape_repairs_never_reflect_selector_values_on_stdio_or_hosted() {
+        const PRIVATE_A: &str = "PRIVATE_SELECTOR_SENTINEL_A_0537ED7";
+        const PRIVATE_B: &str = "PRIVATE_SELECTOR_SENTINEL_B_0537ED7";
+
+        fn assert_redacted(operation: &str, response: &Value) {
+            assert_eq!(response["result"]["isError"], true, "{response}");
+            let serialized = serde_json::to_string(response).unwrap();
+            for sentinel in [PRIVATE_A, PRIVATE_B] {
+                assert!(
+                    !serialized.contains(sentinel),
+                    "{operation} reflected selector value {sentinel}: {serialized}"
+                );
+            }
+            let repair = &response["result"]["structuredContent"]["repair"];
+            assert_eq!(repair["code"], "operation_contract_repair", "{repair}");
+            assert_eq!(repair["operation"], operation, "{repair}");
+            assert!(
+                repair["failing_pointer"]
+                    .as_str()
+                    .is_some_and(|pointer| pointer.starts_with("/arguments")),
+                "{repair}"
+            );
+            assert!(repair["expected_shape"].is_object(), "{repair}");
+            assert!(repair.get("contract_reference").is_some(), "{repair}");
+            assert!(repair.get("failing_value").is_none(), "{repair}");
+            let text = response["result"]["content"][0]["text"].as_str().unwrap();
+            assert!(text.contains("Repair contract:"), "{text}");
+        }
+
+        async fn exercise(server: &ExecutorPrototypeStdioServer) {
+            let operations = [
+                "get_record",
+                "render_record",
+                "render_record_version_diff",
+                "render_suggestion_review",
+                "manage_attachments.list",
+                "manage_links.list",
+                "manage_facet_observations.list",
+                "resolve_rollup",
+            ];
+            for (index, operation) in operations.into_iter().enumerate() {
+                let response = call_records_read(
+                    server,
+                    30_000 + index as i64,
+                    operation,
+                    json!({"id":PRIVATE_A, "record_id":PRIVATE_B}),
+                )
+                .await;
+                assert_redacted(operation, &response);
+            }
+            for (offset, (operation, arguments)) in [
+                ("render_record", json!({"ids":[PRIVATE_A, PRIVATE_B]})),
+                ("render_record", json!({"id":{"private":PRIVATE_A}})),
+                ("get_record", json!({"ids":[{"private":PRIVATE_A}]})),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let response =
+                    call_records_read(server, 31_000 + offset as i64, operation, arguments).await;
+                assert_redacted(operation, &response);
+            }
+
+            let boundary = call_records_read(
+                server,
+                32_000,
+                "get_record",
+                json!({"ids":vec!["native:root"; crate::mcp::tools::lifecycle::MAX_BATCH_GET]}),
+            )
+            .await;
+            assert_eq!(boundary["result"]["isError"], false, "{boundary}");
+
+            let over_limit = call_records_read(
+                server,
+                32_001,
+                "get_record",
+                json!({
+                    "ids":vec![
+                        PRIVATE_A;
+                        crate::mcp::tools::lifecycle::MAX_BATCH_GET + 1
+                    ]
+                }),
+            )
+            .await;
+            assert_redacted("get_record", &over_limit);
+            let serialized = serde_json::to_string(&over_limit).unwrap();
+            assert!(
+                serialized.contains(&format!(
+                    "maximum {}",
+                    crate::mcp::tools::lifecycle::MAX_BATCH_GET
+                )),
+                "over-limit repair must state the authoritative cap: {serialized}"
+            );
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("selector-redaction.sqlite3");
+        let db = create_database(path.to_str().unwrap()).await.unwrap();
+        let stdio =
+            ExecutorPrototypeStdioServer::new(registry(), db.clone(), Caller::local(), None)
+                .await
+                .unwrap();
+        exercise(&stdio).await;
+
+        let catalogue = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        for statement in [
+            "CREATE TABLE databases (id TEXT PRIMARY KEY, status TEXT NOT NULL, activity_epoch INTEGER NOT NULL)",
+            "CREATE TABLE executor_write_plans (key_id TEXT)",
+            "INSERT INTO databases (id, status, activity_epoch) VALUES ('selector-hosted-db', 'ready', 0)",
+        ] {
+            sqlx::query(statement).execute(&catalogue).await.unwrap();
+        }
+        let hosted = ExecutorPrototypeStdioServer::new_hosted(
+            registry(),
+            db.clone(),
+            Caller::authenticated("selector-hosted-account")
+                .with_hosting_context("selector-hosted-user", "selector-hosted-db"),
+            Arc::new(SelectorHostedAuthority { pool: catalogue }),
+            "selector-hosted-db",
+            Arc::new(SelectorHostedKeys),
+        )
+        .await
+        .unwrap();
+        exercise(&hosted).await;
+        db.close().await;
+    }
+
     /// An unusable `format` fails loudly rather than falling back to a default.
     #[tokio::test]
     async fn envelope_format_rejects_a_representation_it_cannot_produce() {
@@ -9580,5 +12111,379 @@ mod tests {
         let text = response["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("format"), "{text}");
         db.close().await;
+    }
+
+    /// Helper boundaries: hoist only a missing envelope key, dedupe only an
+    /// identical string, and never partially normalize. A rejection leaves
+    /// the caller's envelope untouched so the repair describes what was sent.
+    #[test]
+    fn nested_run_key_helper_hoists_transactionally_and_rejects_conflicts() {
+        // Missing outer + string nested hoists both keys.
+        let mut envelope = json!({
+            "operation": "get_record",
+            "arguments": {"ids": ["native:root"], "run_key": "hoist-a748b2", "parent_key": "parent-a748b2"},
+        });
+        assert_eq!(hoist_nested_routing_keys(&mut envelope), Ok(true));
+        assert_eq!(envelope["run_key"], "hoist-a748b2");
+        assert_eq!(envelope["parent_key"], "parent-a748b2");
+        assert!(envelope["arguments"].get("run_key").is_none());
+        assert!(envelope["arguments"].get("parent_key").is_none());
+
+        // Identical strings dedupe to the envelope value.
+        let mut envelope = json!({
+            "operation": "get_record",
+            "arguments": {"ids": ["native:root"], "run_key": "same-a748b2"},
+            "run_key": "same-a748b2",
+        });
+        assert_eq!(hoist_nested_routing_keys(&mut envelope), Ok(true));
+        assert_eq!(envelope["run_key"], "same-a748b2");
+        assert!(envelope["arguments"].get("run_key").is_none());
+
+        // Differing keys conflict rather than silently dropping either.
+        let mut envelope = json!({
+            "operation": "get_record",
+            "arguments": {"ids": ["native:root"], "run_key": "nested-a748b2"},
+            "run_key": "envelope-a748b2",
+        });
+        let diagnostic = hoist_nested_routing_keys(&mut envelope).unwrap_err();
+        assert!(diagnostic.contains("conflicts"), "{diagnostic}");
+        assert_eq!(envelope["run_key"], "envelope-a748b2");
+        assert_eq!(envelope["arguments"]["run_key"], "nested-a748b2");
+
+        // An explicit null envelope key counts as present: no hoist.
+        let mut envelope = json!({
+            "operation": "get_record",
+            "arguments": {"ids": ["native:root"], "run_key": "nested-a748b2"},
+            "run_key": Value::Null,
+        });
+        let diagnostic = hoist_nested_routing_keys(&mut envelope).unwrap_err();
+        assert!(diagnostic.contains("conflicts"), "{diagnostic}");
+        assert!(envelope["run_key"].is_null());
+        assert_eq!(envelope["arguments"]["run_key"], "nested-a748b2");
+
+        // Equal non-strings never dedupe.
+        let mut envelope = json!({
+            "operation": "get_record",
+            "arguments": {"run_key": 17},
+            "run_key": 17,
+        });
+        let diagnostic = hoist_nested_routing_keys(&mut envelope).unwrap_err();
+        assert!(diagnostic.contains("conflicts"), "{diagnostic}");
+
+        // A non-string nested key with no outer key is misplaced, not hoisted.
+        let mut envelope = json!({
+            "operation": "get_record",
+            "arguments": {"ids": ["native:root"], "run_key": 17},
+        });
+        let diagnostic = hoist_nested_routing_keys(&mut envelope).unwrap_err();
+        assert!(diagnostic.contains("misplaced"), "{diagnostic}");
+        assert!(envelope["arguments"].get("run_key").is_some());
+
+        // Transactional: a valid `run_key` hoist is rolled back when a later
+        // `parent_key` fails, so the repair sees the envelope as sent.
+        let mut envelope = json!({
+            "operation": "get_record",
+            "arguments": {"ids": ["native:root"], "run_key": "hoist-a748b2", "parent_key": 17},
+        });
+        let before = envelope.clone();
+        let diagnostic = hoist_nested_routing_keys(&mut envelope).unwrap_err();
+        assert!(diagnostic.contains("parent_key"), "{diagnostic}");
+        assert_eq!(envelope, before);
+    }
+
+    /// A nested `run_key`/`parent_key` attaches exactly as an envelope key
+    /// would; conflicts and non-strings fail with a targeted repair beside
+    /// the existing `format` misplacement message.
+    #[tokio::test]
+    async fn nested_run_keys_hoist_and_correlate_on_the_ordinary_surface() {
+        let db = create_database(":memory:").await.unwrap();
+        let server =
+            ExecutorPrototypeStdioServer::new(registry(), db.clone(), Caller::local(), None)
+                .await
+                .unwrap();
+        let call = |id: i64, envelope: Value| {
+            let server = &server;
+            async move {
+                server
+                    .handle_message(json!({
+                        "jsonrpc":"2.0",
+                        "id":id,
+                        "method":"tools/call",
+                        "params":{"name":"records_read","arguments":envelope}
+                    }))
+                    .await
+                    .unwrap()
+            }
+        };
+
+        // Nested `run_key` succeeds and correlates like an envelope key.
+        let nested = call(
+            1,
+            json!({
+                "operation": "get_record",
+                "arguments": {"ids": ["native:root"], "run_key": "nested-hoist-a748b2"},
+            }),
+        )
+        .await;
+        assert_eq!(nested["result"]["isError"], false, "{nested}");
+        let envelope_call = call(
+            2,
+            json!({
+                "operation": "get_record",
+                "arguments": {"ids": ["native:root"]},
+                "run_key": "nested-hoist-a748b2",
+            }),
+        )
+        .await;
+        assert_eq!(envelope_call["result"]["isError"], false, "{envelope_call}");
+        assert_eq!(
+            nested["result"]["content"][0]["text"], envelope_call["result"]["content"][0]["text"],
+            "a hoisted key must render exactly as an envelope key would"
+        );
+        assert!(
+            server
+                .trace_events()
+                .iter()
+                .any(|event| event["kind"] == "operation_selection"
+                    && event["run_key"] == "nested-hoist-a748b2"),
+            "a hoisted key must attach the call to the run exactly as an envelope key would"
+        );
+
+        // Nested `parent_key` hoists alongside an envelope `run_key`.
+        let parented = call(
+            3,
+            json!({
+                "operation": "get_record",
+                "arguments": {"ids": ["native:root"], "parent_key": "nested-parent-a748b2"},
+                "run_key": "parent-probe-a748b2",
+            }),
+        )
+        .await;
+        assert_eq!(parented["result"]["isError"], false, "{parented}");
+
+        // An identical duplicate dedupes harmlessly.
+        let duplicate = call(
+            4,
+            json!({
+                "operation": "get_record",
+                "arguments": {"ids": ["native:root"], "run_key": "same-a748b2"},
+                "run_key": "same-a748b2",
+            }),
+        )
+        .await;
+        assert_eq!(duplicate["result"]["isError"], false, "{duplicate}");
+
+        // Differing keys reject without silently dropping either value.
+        let conflict = call(
+            5,
+            json!({
+                "operation": "get_record",
+                "arguments": {"ids": ["native:root"], "run_key": "nested-a748b2"},
+                "run_key": "envelope-a748b2",
+            }),
+        )
+        .await;
+        assert_eq!(conflict["result"]["isError"], true, "{conflict}");
+        let conflict_text = conflict["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(conflict_text.contains("conflicts"), "{conflict_text}");
+        let conflict_repair = &conflict["result"]["structuredContent"]["repair"];
+        assert_eq!(
+            conflict_repair["failing_pointer"], "/arguments/run_key",
+            "{conflict_repair}"
+        );
+        assert!(
+            conflict_repair["expected_shape"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("arguments.run_key is misplaced"),
+            "{conflict_repair}"
+        );
+
+        // A non-string nested key is a targeted misplacement, not a hoist.
+        let non_string = call(
+            6,
+            json!({
+                "operation": "get_record",
+                "arguments": {"ids": ["native:root"], "run_key": 17},
+            }),
+        )
+        .await;
+        assert_eq!(non_string["result"]["isError"], true, "{non_string}");
+        let non_string_text = non_string["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(non_string_text.contains("misplaced"), "{non_string_text}");
+        assert!(
+            non_string_text.contains("must be a string"),
+            "{non_string_text}"
+        );
+        let non_string_repair = &non_string["result"]["structuredContent"]["repair"];
+        assert_eq!(
+            non_string_repair["failing_pointer"], "/arguments/run_key",
+            "{non_string_repair}"
+        );
+        assert!(
+            non_string_repair["expected_shape"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("arguments.run_key is misplaced"),
+            "{non_string_repair}"
+        );
+        // No automatic correction: lifting the number to the envelope would
+        // read as retry_ready, and the retry would succeed with correlation
+        // silently absent.
+        assert_eq!(
+            non_string_repair["retry_ready"], false,
+            "{non_string_repair}"
+        );
+        assert!(
+            non_string_repair.get("corrections").is_none(),
+            "{non_string_repair}"
+        );
+
+        // Both keys nested with the helper rejecting the later-processed
+        // field: the repair still names the helper's field, not whichever
+        // key the schema iterator yields first.
+        let both_nested = call(
+            7,
+            json!({
+                "operation": "get_record",
+                "arguments": {"ids": ["native:root"], "parent_key": 17, "run_key": 18},
+            }),
+        )
+        .await;
+        assert_eq!(both_nested["result"]["isError"], true, "{both_nested}");
+        let both_text = both_nested["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap();
+        assert!(both_text.contains("arguments.run_key"), "{both_text}");
+        let both_repair = &both_nested["result"]["structuredContent"]["repair"];
+        assert_eq!(
+            both_repair["failing_pointer"], "/arguments/run_key",
+            "{both_repair}"
+        );
+        assert!(
+            both_repair["expected_shape"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("arguments.run_key is misplaced"),
+            "{both_repair}"
+        );
+        assert_eq!(both_repair["retry_ready"], false, "{both_repair}");
+
+        // A helper rejection wins over an invalid envelope format: the
+        // repair names the routing key, not /format.
+        let format_override = call(
+            8,
+            json!({
+                "operation": "get_record",
+                "arguments": {"ids": ["native:root"], "run_key": "nested-a748b2"},
+                "run_key": "envelope-a748b2",
+                "format": "yaml",
+            }),
+        )
+        .await;
+        assert_eq!(
+            format_override["result"]["isError"], true,
+            "{format_override}"
+        );
+        let override_repair = &format_override["result"]["structuredContent"]["repair"];
+        assert_eq!(
+            override_repair["failing_pointer"], "/arguments/run_key",
+            "{override_repair}"
+        );
+        db.close().await;
+    }
+
+    /// The lens path hoists before validation and forwards the hoisted key
+    /// in the delegated legacy call.
+    #[tokio::test]
+    async fn lens_nested_run_key_hoists_into_the_delegated_call() {
+        use std::sync::{Arc, Mutex};
+        struct RecordingLensDispatch {
+            seen: Arc<Mutex<Option<Value>>>,
+        }
+        impl LensDispatch for RecordingLensDispatch {
+            fn exposure_policy(
+                &self,
+                _registry: &ToolRegistry,
+            ) -> super::super::ResolvedToolExposure {
+                super::super::ResolvedToolExposure::new(super::super::ExposureProfile::Complete)
+            }
+            fn tools_list(&self, _registry: &ToolRegistry, _modern: bool) -> Result<Value> {
+                Ok(json!({"tools": []}))
+            }
+            fn run_context<'a>(
+                &'a self,
+                _registry: &'a ToolRegistry,
+                _arguments: &'a Value,
+            ) -> futures::future::BoxFuture<'a, Value> {
+                Box::pin(async { Value::Null })
+            }
+            fn tools_call<'a>(
+                &'a self,
+                _registry: &'a ToolRegistry,
+                params: &'a serde_json::Map<String, Value>,
+                _modern: bool,
+            ) -> futures::future::BoxFuture<'a, std::result::Result<Value, (i64, String)>>
+            {
+                let seen = self.seen.clone();
+                let captured = params.get("arguments").cloned().unwrap_or(Value::Null);
+                Box::pin(async move {
+                    *seen.lock().unwrap() = Some(captured);
+                    Ok(json!({
+                        "content": [{"type": "text", "text": "{}"}],
+                        "structuredContent": {},
+                        "isError": false,
+                    }))
+                })
+            }
+            fn revision(&self) -> i64 {
+                1
+            }
+        }
+
+        let seen = Arc::new(Mutex::new(None));
+        let registry = registry();
+        let catalogue = ExecutorPrototypeLensServer::pin_catalogue_with_experimental(
+            &registry,
+            &ExperimentalExecutors::empty(),
+        )
+        .unwrap();
+        let server = ExecutorPrototypeLensServer::new_with_pinned_catalogue(
+            registry,
+            Arc::new(RecordingLensDispatch { seen: seen.clone() }),
+            catalogue,
+            None,
+        )
+        .unwrap();
+        let response = server
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "records_read",
+                    "arguments": {
+                        "operation": "get_record",
+                        "arguments": {"ids": ["native:root"], "run_key": "lens-hoist-a748b2"},
+                    },
+                },
+            }))
+            .await
+            .unwrap();
+        assert_eq!(response["result"]["isError"], false, "{response}");
+        let delegated = seen
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("lens delegate must run");
+        assert_eq!(
+            delegated.get("run_key"),
+            Some(&json!("lens-hoist-a748b2")),
+            "the delegated legacy call must carry the hoisted run key: {delegated}"
+        );
+        assert!(
+            delegated.get("ids").is_some(),
+            "the delegated call must preserve the operation arguments: {delegated}"
+        );
     }
 }

@@ -33,6 +33,10 @@ workspace authority. A future system could use this separation to make larger
 parts of the product shell user-authored, but whole-Workbench replacement is
 directional rather than a shipped promise.
 
+What an already-open artifact does when its bound records change, per
+runtime and with the tests that prove it, is stated in
+[artifact-open-view-promise.md](artifact-open-view-promise.md).
+
 ## One Collection, two authored views
 
 Suppose a governed Collection contains the tasks for a launch. Create
@@ -188,12 +192,31 @@ closed before hashing or delivery when any integer is outside
 governed-SQL rows alike. HTML has no module imports, mutation surface, or
 network authority. Historical governed-SQL relation execution is explicitly
 unsupported and fails closed until a portable replay contract exists. The host
-performs no wall-clock liveness polling of the frame: it arms only a
-bootstrap-handshake timeout. The frame announces a non-persisted `pagehide`
+performs no wall-clock liveness polling of the frame: it arms a
+bootstrap-handshake timeout and one bounded acknowledgement wait per in-place
+input delivery, and nothing else. The frame announces a non-persisted `pagehide`
 over the bridge, and the host answers that announcement by requesting a fresh
 launch, because a reloaded frame lands on a consumed one-use ticket and can
 neither bootstrap again nor be observed by any host-side timer; only repeated
 reloads fail shut with a diagnostic.
+
+A booted document may subscribe to later input deliveries with
+`nativeArtifact.onInput(callback)`; `nativeArtifact.input` reads the bundle
+currently held. When a refresh resolves a different input digest under the
+same body digest, the host posts the new frozen bundle, its digest, and its
+revision over the existing bridge port instead of replacing the frame, at
+most once per digest. An ordered delivery is always answered: `input-applied`
+once every subscriber has run — including idempotently when the digest is one
+the bridge already holds — or `input-unhandled` with a reason when it cannot
+be applied (`no-subscriber`, `subscriber-threw`, `stale` for a sequence that
+does not advance under a different digest, `freeze-failed` when the bundle
+cannot be frozen). A message that fails the trust checks (wrong bridge
+version, arrival before initialisation, a non-string digest, or a non-number
+sequence) is dropped silently, and the host's bounded wait then relaunches.
+Any answer other than `input-applied` within that one bounded wait, or a
+changed body digest, replaces the frame with a fresh one-use launch exactly
+as before. The message set is additive under `native.html.bridge.v1`; a
+document that never subscribes sees no change in behaviour.
 
 ## `native.mdx.v1`
 
@@ -316,11 +339,13 @@ The engine also retains a content-free operational snapshot: aggregate
 attempt/failure, cache, denial, limit and latency counters plus the latest 128
 validation/render observations. Each observation is bounded and contains only
 artifact id, runtime/revision, a 12-character body-digest prefix, stage
-durations, cache state, input counts/bytes, output nodes/bytes, and diagnostic
-phase/code/limit. Source, input values, generated code and record content are
-never collected. native-ce intentionally has no process-wide log/metrics
-backend; a hosting exporter polls `artifacts::mdx_telemetry_snapshot()` and
-translates this internal seam to its configured logs and metrics backend.
+durations, cache state, input counts/bytes, output nodes/bytes, diagnostic
+phase/code/limit, and a per-port split keyed by author-declared port
+identifiers (kind, cache state, and microsecond counters only). Source, input
+values, generated code and record content are never collected. native-ce
+intentionally has no process-wide log/metrics backend; a hosting exporter polls
+`artifacts::mdx_telemetry_snapshot()` and translates this internal seam to its
+configured logs and metrics backend.
 
 Any compiler/transitive lock, executor, profile, component policy, envelope,
 safe-tree, limit or adapter-code change requires an adapter-revision and cache
@@ -420,6 +445,62 @@ write interaction's `bound_input` domain; relation mutation is outside revision
 8's surface. Authorization, hidden-record filtering, atomic snapshot resolution,
 module scoping, receipts, cache hydration, and historical replay use the same
 host boundaries as other named inputs.
+
+Live Collection-port envelopes are also held in a process-global, bounded
+in-memory cache (compile-time entry count and total bytes; LRU eviction; never
+persisted). The key includes origin database id, collection id, port-declaration
+identity, caller principal fingerprint (the same digest as `caller_sha256`),
+the pinned `snapshot_event_id` and `snapshot_event_seq`,
+`authorization_revision`, a content-free `meta_sha256` over the ordered rows of
+`schema_config`, `vocabularies` and `vocabulary_values`, the port's
+`binding_event_seq`, and the server build/adapter revision. Seq and epoch can
+rewind after a backup restore or workspace re-adoption under the same
+`origin_db_id`; the head event UUID keeps those coincidences from reviving a
+stale envelope. Schema-config and vocabulary writes move neither the content
+head nor the authorization epoch, so `meta_sha256` is what makes those
+envelopes unreachable. An entry is therefore unreachable after any content,
+authorization, meta-tier, or binding change; historical (`as_of`) renders and
+governed-SQL relation ports never consult it. Legacy record-relation and
+grouped-count ports are neither re-executed nor cached on a successful
+`revalidate`; they are skipped by determinism under an unchanged head, epoch,
+and meta digest. Other DIRECT-WRITE tables (`blobs`, `jobs`, `read_log_calls`,
+hosted `bindings`, `derivation_requests`) are not read when assembling a
+Collection-port envelope. `database_identity.origin_db_id` is part of the key
+itself. A cache hit restores the exact envelope that previously entered the
+input bundle.
+
+`render_artifact` accepts an optional `revalidate` object: the previous live
+`native.mdx.v2` `plan.provenance.revalidation` token plus `ports` copied from
+`input_bundle.ports`. The token is
+`{ artifact_id, snapshot_event_id, snapshot_event_seq, authorization_revision,
+cache_key, caller_sha256, meta_sha256 }`. Unknown extra keys are ignored.
+After the artifact read and authorization fence inside the pinned transaction,
+any doubt — `as_of` present, a missing or malformed field, an unknown port, a
+cache-key mismatch, a different content head (event id or seq) or authorization
+epoch, a missing or different `caller_sha256` or `meta_sha256`, an
+`artifact_id` that is not the requested artifact, or a non-v2 runtime — falls
+through to a full render rather than an error. Otherwise Collection ports are
+skipped (they cannot change without the head, epoch, or meta digest moving) and
+every governed-SQL relation port is re-executed. Matching row and output-schema
+digests yield `status: "rendered"` with `unchanged: true` and a slim plan:
+`kind`, `version`, provenance of the verified fields only (no `render_sha256`,
+no `input_bundle.ports`), `cache.state: "unchanged"`, and timing if requested.
+No tree, interactions, observed tokens, interaction availability, or styles.
+A mismatch reuses any relation envelopes just executed and returns a full tree
+with `cache.state: "revalidated_full"` and a content-free
+`cache.revalidation.miss` of `artifact`, `head`, `authorization`, `cache_key`,
+`caller`, `meta`, `relation_port`, or `malformed`. Execution-receipt-only
+differences (`observed_at`, snapshot token) are not a relation change; a query
+such as `strftime('%Y-%m-%dT%H:%M:%fZ','now')` that actually changes rows
+therefore takes the full-render path, which is then cheap because Collection
+ports hit the in-memory cache.
+
+Every live v2 render's provenance includes `caller_sha256`: SHA-256 of the
+origin database id plus the authorization principal (trusted-local bypass,
+membership, and account id). It is content-free, lives on the revalidation
+token, and is repeated next to `render_sha256` on a full plan. The
+compiled-graph cache (`plan.cache.key`) is unchanged: it still keys parsed
+source and the module closure, not resolved inputs.
 
 V2's component policy is `native.mdx.components@3`. It retains the authenticated
 `BarChart` primitive: authored code must pass the exact grouped-count envelope
@@ -654,4 +735,5 @@ local sequence numbers, are the portable identities.
 For a historical v2 render, admission happens before scratch database creation,
 schema setup, or replay. One permit is held across exactly one replay and the
 subsequent render; the already-materialized snapshot path cannot acquire a
-second permit or replay again.
+second permit or replay again. Combining `as_of` with `revalidate` always
+takes the full historical path; the short-circuit is live-only.

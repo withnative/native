@@ -2,6 +2,22 @@
 
 # Lifecycle, archive, delete, and recovery
 
+## Editing a record body
+
+Choose exactly one body operation on `update_record`:
+
+- `body_set` replaces the entire body with the supplied string, or clears it with `null`.
+- `body_append` appends the supplied string to the current body atomically. It inserts no whitespace or paragraph separators: include them in your text. An absent body is treated as empty.
+- `body_replace` applies surgical `{old, new}` edits, retaining its exact-match and occurrence-count checks.
+
+The old `body` argument is a deprecated alias for full replacement, with a warning directing callers to `body_set`. It does not append. Do not combine it with another body operation. `create_record.body` still supplies the initial content of a new record.
+
+Replacing a non-empty body requires `if_body_digest` from a fresh `get_record.body_digest` and/or `if_unmodified_since`. Surgical edits and append do not require a digest, but a supplied digest must match current content. An append without a digest preserves edits committed before it acquires the write transaction. A stale guard rejects the write without changing the record; reread and reconcile before retrying.
+
+Body-write receipts identify the operation and report lengths before and after the write, plus the signed net change, counted in Unicode scalar values. Full replacement remains explicit even when the lengths are equal. Check the receipt when you intended to preserve existing content. Append is not retry-idempotent: if a response is lost, inspect the record before repeating the call.
+
+## Lifecycle and recovery
+
 `lifecycle` is an open spine facet used by workflows and coordination. It is not a universal engine state machine: installations and kinds may use different tokens, and ordinary updates can change it subject to authorization and schema rules.
 
 Archiving is separate. `archive_record` sets the engine-reserved `archived` facet to `true`; restoration calls the same tool with `archived:false`, which unsets the facet. Absence is the restored state—`archived=false` is not stored. Archive/restore preserves the lifecycle value and is idempotent (`changed:false` means no event was appended).

@@ -235,8 +235,20 @@ pub struct LifecycleInterpreter {
 
 impl LifecycleInterpreter {
     pub async fn load(db: &Db, principal: Option<Principal<'_>>) -> Result<Self> {
-        let schema_rows = cascade::schema_config_rows_for_principal(db, principal).await?;
-        Self::load_from_pool(db.write_pool(), schema_rows).await
+        Self::load_in_pool(db.write_pool(), principal).await
+    }
+
+    /// Pool-scoped construction for callers that must not queue on the
+    /// writer. Identical logic to [`load`]: caller-relative schema rows plus
+    /// the vocabulary index, all committed-state reads with no
+    /// same-transaction dependency.
+    pub async fn load_in_pool(
+        pool: &sqlx::SqlitePool,
+        principal: Option<Principal<'_>>,
+    ) -> Result<Self> {
+        let schema_rows =
+            cascade::schema_config_rows_for_principal_in_pool(pool, principal).await?;
+        Self::load_from_pool(pool, schema_rows).await
     }
 
     /// Load against a pool after the caller has selected its visible schema

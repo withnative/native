@@ -48,16 +48,266 @@ use super::{
 };
 
 /// Cap on one `get_record` batch.
-const MAX_BATCH_GET: usize = 100;
+pub(crate) const MAX_BATCH_GET: usize = 100;
 
 /// Multi-target `update_record` deliberately shares the ordinary read-batch
 /// ceiling: the caller names a closed cohort, validation stays bounded, and a
 /// successful receipt can preserve one input-correlated row per target.
-const MAX_MULTI_UPDATE: usize = 100;
+pub(crate) const MAX_MULTI_UPDATE: usize = 100;
 
 /// Atomic multi-target rejections keep diagnostics useful without echoing an
 /// unbounded cohort through the error channel.
 const MAX_MULTI_UPDATE_FAILURE_DETAILS: usize = 20;
+
+/// Controls whether a successful single-record write returns the compact
+/// continuation receipt or the complete enriched record shape.
+#[derive(Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ResponseMode {
+    #[default]
+    Summary,
+    Verbose,
+}
+
+#[cfg(test)]
+mod response_mode_tests {
+    use super::*;
+
+    async fn setup() -> (crate::Db, crate::mcp::ToolRegistry) {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let mut registry = crate::mcp::ToolRegistry::new();
+        crate::mcp::register_surface_tools(&mut registry).unwrap();
+        (db, registry)
+    }
+
+    fn assert_summary(result: &Value) {
+        for key in [
+            "id",
+            "type",
+            "kind",
+            "name",
+            "display_reference",
+            "version",
+            "body_digest",
+            "lifecycle_interpretation",
+        ] {
+            assert!(result.get(key).is_some(), "missing {key}: {result}");
+        }
+        assert!(result["version"]
+            .as_str()
+            .is_some_and(|version| version.starts_with("rec:")));
+        assert!(result["warnings"].is_array());
+        assert!(
+            result.get("body").is_none(),
+            "summary leaked body: {result}"
+        );
+        assert!(
+            result.get("contribution").is_none(),
+            "summary leaked enrichment: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn singular_write_response_modes_default_to_summary_and_preserve_verbose_shapes() {
+        let (db, registry) = setup().await;
+        let created = registry
+            .call(
+                db.clone(),
+                crate::mcp::Caller::local(),
+                "create_record",
+                json!({
+                    "type": "Document",
+                    "kind": "note",
+                    "name": "compact create",
+                    "body": "known prose",
+                    "reason": "exercise compact creation",
+                }),
+            )
+            .await
+            .unwrap();
+        assert_summary(&created);
+
+        let verbose_created = registry
+            .call(
+                db.clone(),
+                crate::mcp::Caller::local(),
+                "create_record",
+                json!({
+                    "type": "Document",
+                    "kind": "note",
+                    "name": "verbose create",
+                    "body": "complete prose",
+                    "reason": "exercise verbose creation",
+                    "response_mode": "verbose",
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(verbose_created["body"], json!("complete prose"));
+        assert!(verbose_created.get("display_reference").is_none());
+        assert!(verbose_created.get("version").is_none());
+
+        let updated = registry
+            .call(
+                db.clone(),
+                crate::mcp::Caller::local(),
+                "update_record",
+                json!({
+                    "id": created["id"],
+                    "body_append": " plus",
+                    "reason": "exercise compact update",
+                }),
+            )
+            .await
+            .unwrap();
+        assert_summary(&updated);
+        assert_eq!(updated["body_receipt"]["operation"], json!("body_append"));
+        assert!(updated.get("previous_seq").is_some());
+
+        let verbose_updated = registry
+            .call(
+                db.clone(),
+                crate::mcp::Caller::local(),
+                "update_record",
+                json!({
+                    "id": verbose_created["id"],
+                    "body_append": " plus",
+                    "reason": "exercise verbose update",
+                    "response_mode": "verbose",
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(verbose_updated["body"], json!("complete prose plus"));
+        assert!(verbose_updated.get("display_reference").is_none());
+        assert!(verbose_updated.get("version").is_none());
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn create_idempotency_ignores_response_mode_and_shapes_the_retry_requested() {
+        let (db, registry) = setup().await;
+        let base = json!({
+            "type": "Document",
+            "kind": "note",
+            "body": "retry prose",
+            "reason": "exercise presentation-only retry",
+            "idempotency_key": "response-mode-retry",
+        });
+        let summary = registry
+            .call(
+                db.clone(),
+                crate::mcp::Caller::local(),
+                "create_record",
+                base.clone(),
+            )
+            .await
+            .unwrap();
+        assert_summary(&summary);
+        let mut verbose_args = base;
+        verbose_args["response_mode"] = json!("verbose");
+        let verbose = registry
+            .call(
+                db.clone(),
+                crate::mcp::Caller::local(),
+                "create_record",
+                verbose_args,
+            )
+            .await
+            .unwrap();
+        assert_eq!(verbose["id"], summary["id"]);
+        assert_eq!(verbose["body"], json!("retry prose"));
+        let creates: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM content_events WHERE record_id = ? AND type = 'record.created'",
+        )
+        .bind(summary["id"].as_str().unwrap())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(creates, 1);
+        db.close().await;
+    }
+}
+
+impl ResponseMode {
+    async fn render(self, db: &Db, result: Value, version_seq: i64) -> Result<Value> {
+        match self {
+            Self::Summary => summarize_write_receipt(db, result, version_seq).await,
+            Self::Verbose => Ok(result),
+        }
+    }
+}
+
+/// Keep exactly the information a caller needs to continue a write workflow,
+/// while omitting the record body and its expensive enrichments. Operation
+/// receipts remain top-level under their established names so a compact
+/// response is a projection of the verbose response rather than a second
+/// protocol.
+async fn summarize_write_receipt(db: &Db, result: Value, version_seq: i64) -> Result<Value> {
+    const REQUIRED: [&str; 6] = [
+        "id",
+        "type",
+        "kind",
+        "name",
+        "body_digest",
+        "lifecycle_interpretation",
+    ];
+    const OPTIONAL_RECEIPTS: [&str; 7] = [
+        "previous_seq",
+        "body_receipt",
+        "html_body_write",
+        "delivery",
+        "action_attestation_ids",
+        "artifact_input_continuity",
+        "work_overlap",
+    ];
+
+    let object = result
+        .as_object()
+        .ok_or_else(|| Error::engine("single-record write returned a non-object result"))?;
+    let mut receipt = Map::new();
+    for key in REQUIRED {
+        let value = object.get(key).ok_or_else(|| {
+            Error::engine(format!("single-record write receipt is missing '{key}'"))
+        })?;
+        receipt.insert(key.into(), value.clone());
+    }
+    let id = receipt["id"]
+        .as_str()
+        .ok_or_else(|| Error::engine("single-record write receipt has a non-string id"))?;
+    // A display reference is a SQLite-only addressing affordance. Explicit
+    // null makes the compact shape stable when this record has no resolvable
+    // prefix, while callers on other backends can use the full id.
+    receipt.insert(
+        "display_reference".into(),
+        serde_json::to_value(crate::mcp::record_ref::display_reference(db, id).await?)?,
+    );
+    receipt.insert("version".into(), json!(format!("rec:{version_seq}")));
+    receipt.insert(
+        "warnings".into(),
+        object
+            .get("warnings")
+            .cloned()
+            .unwrap_or_else(|| Value::Array(Vec::new())),
+    );
+    for key in OPTIONAL_RECEIPTS {
+        if let Some(value) = object.get(key) {
+            receipt.insert(key.into(), value.clone());
+        }
+    }
+    Ok(Value::Object(receipt))
+}
+
+async fn current_record_version_in(
+    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    record_id: &str,
+) -> Result<i64> {
+    sqlx::query_scalar::<_, Option<i64>>("SELECT MAX(seq) FROM content_events WHERE record_id = ?")
+        .bind(record_id)
+        .fetch_one(&mut **tx)
+        .await?
+        .ok_or_else(|| Error::engine(format!("record {record_id} has no content version")))
+}
 
 fn html_body_write_result(manifest: &crate::artifact_html::Manifest, source: &str) -> Value {
     json!({
@@ -222,9 +472,10 @@ async fn correction_snapshot_in(
     require_record_in(tx, caller, TOOL, &args.record_id, required).await?;
     require_nonblank_reason(TOOL, &args.reason)?;
     if !SPINE_TYPES.contains(&args.target_type.as_str()) || args.target_kind.trim().is_empty() {
-        return Err(Error::engine(
-            "correct_record_type: target_type must be a closed spine type and target_kind must be non-empty",
-        ));
+        return Err(Error::engine(format!(
+            "correct_record_type: target_type must be a closed spine type ({}) and target_kind must be non-empty",
+            SPINE_TYPES.join(", "),
+        )));
     }
     let row = sqlx::query(
         "SELECT id,type,kind,name,body,home_id,updated_at,deleted_at FROM records WHERE id=?",
@@ -1397,6 +1648,44 @@ pub(super) async fn enriched_or_error(
     }
 }
 
+/// Read only the just-written record projection needed by a compact receipt.
+/// This deliberately bypasses ordinary read eligibility: some governed
+/// derived records (for example a suggestion before it has a bearer) can be
+/// authored successfully but are not yet exposed through `get_record`.
+/// Returning their own identity and continuation token is still safe, and
+/// keeping the read on this transaction pins the receipt to the write.
+async fn compact_record_source_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    caller: &Caller,
+    tool: &str,
+    id: &str,
+) -> Result<Value> {
+    let sql = format!(
+        "SELECT {} FROM records WHERE id = ?",
+        crate::query::RECORD_COLUMNS
+    );
+    let row = sqlx::query(&sql)
+        .bind(id)
+        .fetch_optional(&mut **tx)
+        .await?
+        .ok_or_else(|| Error::engine(format!("{tool}: record {id} missing after write")))?;
+    let mut record = crate::query::record_from_row(&row)?;
+    let principal = (!super::is_legacy_local(caller)).then(|| super::principal(caller));
+    let schema_rows = cascade::schema_config_rows_for_principal_on(tx, principal).await?;
+    let lifecycle_interpreter =
+        crate::query::lifecycle::LifecycleInterpreter::load_from_connection(tx, schema_rows)
+            .await?;
+    record.lifecycle_interpretation = lifecycle_interpreter.interpret(
+        &record.record_type,
+        record.kind.as_deref(),
+        record.home_id.as_deref(),
+        record.lifecycle.as_deref(),
+    );
+    let mut value = serde_json::to_value(record)?;
+    annotate_body_digest(&mut value);
+    Ok(value)
+}
+
 /// The uncommitted half of [`enriched_or_error`]: the same live lens read and
 /// visibility filter, returning `Ok(None)` where the wrapper reports the
 /// vanished-record diagnostic. Idempotent replay uses this directly so a
@@ -1471,6 +1760,8 @@ struct CreateRecordArgs {
     /// delivered-Message routes keep their own narrower replay paths and never
     /// set this field.
     idempotency_key: Option<String>,
+    #[serde(default)]
+    response_mode: ResponseMode,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1602,7 +1893,26 @@ async fn resolve_message_origin_in(
 }
 
 pub(super) async fn create_record(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
-    create_record_inner(db, caller, arguments, None, None).await
+    create_record_inner(db, caller, arguments, None, None, None).await
+}
+
+/// Internal graph and host-composed creation routes need the pre-existing
+/// enriched response even though the public singleton surface now defaults to
+/// a compact receipt.
+pub(super) async fn create_record_verbose(
+    db: Db,
+    caller: Caller,
+    arguments: Value,
+) -> Result<Value> {
+    create_record_inner(
+        db,
+        caller,
+        arguments,
+        None,
+        None,
+        Some(ResponseMode::Verbose),
+    )
+    .await
 }
 
 #[derive(Debug, Clone)]
@@ -1667,6 +1977,7 @@ pub(crate) async fn create_record_from_artifact(
         arguments,
         None,
         Some(plan.clone()),
+        Some(ResponseMode::Verbose),
     )
     .await
     {
@@ -1717,7 +2028,15 @@ pub(crate) async fn send_message_record(
     arguments: Value,
     plan: SendMessagePlan,
 ) -> Result<Value> {
-    create_record_inner(db, caller, arguments, Some(plan), None).await
+    create_record_inner(
+        db,
+        caller,
+        arguments,
+        Some(plan),
+        None,
+        Some(ResponseMode::Verbose),
+    )
+    .await
 }
 
 async fn create_record_inner(
@@ -1726,6 +2045,7 @@ async fn create_record_inner(
     arguments: Value,
     send_plan: Option<SendMessagePlan>,
     artifact_plan: Option<ArtifactCreatePlan>,
+    response_mode_override: Option<ResponseMode>,
 ) -> Result<Value> {
     const TOOL: &str = "create_record";
     // The provenance digests run over the raw tool arguments, not the parsed
@@ -1733,8 +2053,15 @@ async fn create_record_inner(
     // every retry of a key without a caller-supplied id would conflict with
     // the call it repeats. Run-context keys are already stripped by the
     // request layer before the handler sees them.
-    let provenance_arguments = arguments.clone();
+    let mut provenance_arguments = arguments.clone();
+    // Response representation is not part of the governed command. A retry
+    // may ask for a verbose record after receiving a compact receipt (or the
+    // reverse) without turning the same idempotency key into a conflict.
+    if let Some(arguments) = provenance_arguments.as_object_mut() {
+        arguments.remove("response_mode");
+    }
     let mut args: CreateRecordArgs = parse_args(TOOL, arguments)?;
+    let response_mode = response_mode_override.unwrap_or(args.response_mode);
     // Only the digest is stored, so an unbounded key is a mild DoS surface:
     // the same 1..=200 bound `manage_relationships` enforces. Blank stays
     // keyless rather than erroring — a create with no key behaves as today.
@@ -2585,9 +2912,21 @@ async fn create_record_inner(
                         )));
                     }
                 };
-                return finish_create_receipt(existing, html_body_write);
+                return response_mode
+                    .render(
+                        &db,
+                        finish_create_receipt(existing, html_body_write)?,
+                        attested.content_horizon,
+                    )
+                    .await;
             }
-            return read_attested_create_receipt(&db, &caller, &attested, html_body_write).await;
+            return response_mode
+                .render(
+                    &db,
+                    read_attested_create_receipt(&db, &caller, &attested, html_body_write).await?,
+                    attested.content_horizon,
+                )
+                .await;
         }
     }
     let source_event = append_in(
@@ -2854,9 +3193,19 @@ async fn create_record_inner(
     if let Some(draft) = action_draft {
         crate::provenance::issue_reserved_pending_action_in(&mut tx, draft).await?;
     }
+    let compact_result = if response_mode == ResponseMode::Summary {
+        Some(compact_record_source_in(&mut tx, &caller, TOOL, &id).await?)
+    } else {
+        None
+    };
+    // Pin the continuation token to this exact transactional result.
+    let version_seq = current_record_version_in(&mut tx, &id).await?;
     db.commit_content(tx).await?;
 
-    let mut result = enriched_or_error(&db, &caller, TOOL, &id).await?;
+    let mut result = match compact_result {
+        Some(result) => result,
+        None => enriched_or_error(&db, &caller, TOOL, &id).await?,
+    };
     if let Some((_, _, evaluation)) = send_evaluation {
         let database_id = sqlx::query_scalar::<_, String>(
             "SELECT origin_db_id FROM database_identity WHERE singleton=1",
@@ -2883,7 +3232,34 @@ async fn create_record_inner(
     // for its next guarded write. Carrying it here also keeps the three
     // substrates uniform — Postgres and Turso mint it from their shared read
     // shape — so the corpus can pin it on creation instead of looking away.
-    finish_create_receipt(result, html_body_write)
+    let mut receipt = finish_create_receipt(result, html_body_write)?;
+    // A non-replayed advisory naming active claims in the new record's
+    // neighbourhood, attached AFTER the receipt is assembled and only on this
+    // fresh-create path: every idempotent replay returns above through its own
+    // `finish_create_receipt` (or pinned reconstruction) without reaching
+    // here, so putting the window inside the receipt would break the replay
+    // identity guarantee the idempotency tests pin. The key is omitted
+    // entirely when there is no overlap — or the record is not a WorkItem
+    // carrying a `part_of` link — so every other create response stays
+    // byte-identical to before this notice existed. The new record itself is
+    // unclaimed, so the anchor needs no self-exclusion.
+    if record_type == "WorkItem"
+        && args
+            .links
+            .iter()
+            .flatten()
+            .any(|link| link.relationship == "part_of")
+    {
+        if let Some(overlap) =
+            super::work::work_overlap_for_record(&db, &caller, &id, false).await?
+        {
+            receipt
+                .as_object_mut()
+                .expect("create_record receipt is an object")
+                .insert("work_overlap".into(), overlap);
+        }
+    }
+    response_mode.render(&db, receipt, version_seq).await
 }
 
 /// The attested command's pinned position in both event logs: the highest
@@ -3721,6 +4097,35 @@ async fn filter_enriched_record_with_auth_in_pools(
         .skip(opts.links_offset as usize)
         .take(opts.links_limit as usize)
         .collect();
+    // Succession names through the same visibility fold as links — with the
+    // full ordered set reloaded first. The read path carries a capped window,
+    // and truncating that window before filtering would let an invisible head
+    // hide a nameable tail. An invisible successor stays COUNTED in
+    // `total_count` but is never named in `items`: the count is the
+    // disclosure, the name would be a leak.
+    if record.superseded_by.is_some() {
+        let mut grouped =
+            read::load_superseded_by_batch(record_pool, std::slice::from_ref(&record.record.id))
+                .await?;
+        match grouped.remove(&record.record.id) {
+            None => record.superseded_by = None,
+            Some(successors) => {
+                let total_count = successors.len() as i64;
+                let successor_ids = successors
+                    .iter()
+                    .map(|(id, _)| id.clone())
+                    .collect::<Vec<_>>();
+                let visible_successors =
+                    super::visible_ids_in_pool(auth_pool, caller, successor_ids).await?;
+                let visible = successors
+                    .into_iter()
+                    .filter(|(id, _)| visible_successors.contains(id))
+                    .collect::<Vec<_>>();
+                let items = read::truncate_superseded_items(visible);
+                record.superseded_by = Some(read::SupersededBy { items, total_count });
+            }
+        }
+    }
     // Suggestions and citations derive access from this already-authorized
     // bearer. Their independent filing/policy is not another gate.
     if record
@@ -3858,6 +4263,30 @@ async fn filter_enriched_record_in(
         .skip(opts.links_offset as usize)
         .take(opts.links_limit as usize)
         .collect();
+    // Same succession rule as the pooled filter above: reload the full
+    // ordered set, filter by visibility, then truncate — never the reverse.
+    if record.superseded_by.is_some() {
+        let mut grouped =
+            read::load_superseded_by_batch(&mut **tx, std::slice::from_ref(&record.record.id))
+                .await?;
+        match grouped.remove(&record.record.id) {
+            None => record.superseded_by = None,
+            Some(successors) => {
+                let total_count = successors.len() as i64;
+                let successor_ids = successors
+                    .iter()
+                    .map(|(id, _)| id.clone())
+                    .collect::<Vec<_>>();
+                let visible_successors = super::visible_ids_in(tx, caller, successor_ids).await?;
+                let visible = successors
+                    .into_iter()
+                    .filter(|(id, _)| visible_successors.contains(id))
+                    .collect::<Vec<_>>();
+                let items = read::truncate_superseded_items(visible);
+                record.superseded_by = Some(read::SupersededBy { items, total_count });
+            }
+        }
+    }
     if record
         .record
         .owner_id
@@ -3926,6 +4355,7 @@ struct GetRecordArgs {
     include_comments: Option<bool>,
     comments_limit: Option<i64>,
     comments_offset: Option<i64>,
+    include_history_summary: Option<bool>,
 }
 
 enum RecordSupplementSource<'a, 'db> {
@@ -4161,6 +4591,11 @@ async fn get_record(db: Db, caller: Caller, mut arguments: Value) -> Result<Valu
             "get_record: include_interpretation is not supported with as_of in v1; use read_attributions with as_of_event_seq",
         ));
     }
+    if as_of.is_some() && args.include_history_summary.unwrap_or(false) {
+        return Err(Error::engine(
+            "get_record: include_history_summary cannot be combined with as_of in v1",
+        ));
+    }
     let Some(selector) = as_of else {
         return get_record_from_lens(&ReadLens::live(&db), &caller, args).await;
     };
@@ -4199,6 +4634,12 @@ async fn get_record_from_lens(
             "get_record: include_interpretation is not supported with as_of in v1; use read_attributions with as_of_event_seq",
         ));
     }
+    let include_history_summary = args.include_history_summary.unwrap_or(false);
+    if include_history_summary && lens.temporal().is_some() {
+        return Err(Error::engine(
+            "get_record: include_history_summary cannot be combined with as_of in v1",
+        ));
+    }
     if include_interpretation
         && args.ids.len() > super::attribution::MAX_GENERIC_INTERPRETATION_BEARERS
     {
@@ -4233,13 +4674,42 @@ async fn get_record_from_lens(
         let principal = (!super::is_legacy_local(caller)).then(|| super::principal(caller));
         let result = async {
             let mut items =
-                read::get_records_live_in(&mut snapshot, lens, &args.ids, opts, principal).await?;
+                read::get_records_live_in(&mut snapshot, &args.ids, opts, principal).await?;
             hide_attribution_batch_items(&mut items);
+            // One disclosure memo for every summary on this call: a batch
+            // holds many records but few distinct actors.
+            let mut history_disclosure = super::history::ActorDisclosure::default();
             for item in &mut items {
                 let read::BatchGetItem::Found(record) = item else {
                     continue;
                 };
                 filter_enriched_record_in(&mut snapshot, caller, record, opts).await?;
+                // Advisory freshness projection, live reads only: the same
+                // snapshot transaction keeps the authorization decision and
+                // the kernel state on one SQLite snapshot. Records without
+                // bound Occurrences keep `freshness: None`, so the key stays
+                // absent from their output.
+                record.freshness = crate::freshness::freshness_for_artefact_in(
+                    &mut snapshot,
+                    &record.record.id,
+                    principal,
+                )
+                .await?;
+                // Opt-in byline attribution on the same snapshot: oldest and
+                // newest visible events in metadata shape. Absent entirely
+                // unless asked, so unrelated callers pay nothing.
+                if include_history_summary {
+                    let record_id = record.record.id.clone();
+                    record.history_summary = Some(
+                        super::history::history_summary_in(
+                            &mut snapshot,
+                            caller,
+                            &mut history_disclosure,
+                            &record_id,
+                        )
+                        .await?,
+                    );
+                }
             }
             let mut items = supplement_get_record_items(
                 &mut RecordSupplementSource::Live(&mut snapshot),
@@ -4324,6 +4794,7 @@ async fn get_record_from_lens(
         "include_comments": opts.include_comments,
         "comments_limit": opts.comments_limit,
         "comments_offset": opts.comments_offset,
+        "include_history_summary": include_history_summary,
     });
     if include_interpretation {
         output
@@ -4368,6 +4839,7 @@ async fn annotate_display_references_in_pool(
         }
         apply_record_path_annotations(item, &references)?;
         apply_enriched_record_path_annotations(item, &references)?;
+        apply_superseded_by_reference_annotations(item, &references)?;
     }
     Ok(())
 }
@@ -4393,6 +4865,19 @@ fn collect_record_path_annotation_ids_from_item(item: &Value, ids: &mut Vec<Stri
         };
         for summary in summaries {
             if let Some(id) = summary.get("id").and_then(Value::as_str) {
+                ids.push(id.to_owned());
+            }
+        }
+    }
+    // Named successors need short references for the header line; collect
+    // them into the same batch rather than paying a second prefix scan.
+    if let Some(successors) = item
+        .get("superseded_by")
+        .and_then(|superseded| superseded.get("items"))
+        .and_then(Value::as_array)
+    {
+        for successor in successors {
+            if let Some(id) = successor.get("id").and_then(Value::as_str) {
                 ids.push(id.to_owned());
             }
         }
@@ -4448,6 +4933,67 @@ fn apply_enriched_record_path_annotations(
             };
             apply_record_path_with_reference(record, &id, references.get(&id).cloned().flatten())?;
         }
+    }
+    Ok(())
+}
+
+/// Stamp short references onto the named successors of one enriched record.
+/// The `get_record` JSON path annotates the serialized payload instead; the
+/// markdown path here works on the typed struct, so it needs its own stamp —
+/// otherwise it would always degrade to the full id.
+async fn populate_superseded_references_in_pool(
+    pool: &sqlx::SqlitePool,
+    record: &mut read::EnrichedRecord,
+) -> Result<()> {
+    let Some(superseded) = record.superseded_by.as_mut() else {
+        return Ok(());
+    };
+    let ids = superseded
+        .items
+        .iter()
+        .map(|item| item.id.clone())
+        .collect::<Vec<_>>();
+    let references = batch_display_references_in_pool(pool, &ids).await?;
+    for item in &mut superseded.items {
+        if let Some(reference) = references.get(&item.id).cloned().flatten() {
+            item.display_reference = Some(reference);
+        }
+    }
+    Ok(())
+}
+
+/// Stamp short references onto named successors in serialized `get_record`
+/// payloads. Unlike every other summary this annotates, a successor carries
+/// a fixed shape — `id`, `name`, optional `display_reference` — so the shared
+/// path annotator (which also writes `record_path`/`record_path_full`)
+/// cannot be reused: those keys would leak into the shape. Absent references
+/// stay absent; renderers degrade to the full id there.
+fn apply_superseded_by_reference_annotations(
+    item: &mut Value,
+    references: &std::collections::HashMap<String, Option<String>>,
+) -> Result<()> {
+    let Some(successors) = item
+        .get_mut("superseded_by")
+        .and_then(|superseded| superseded.get_mut("items"))
+        .and_then(Value::as_array_mut)
+    else {
+        return Ok(());
+    };
+    for successor in successors {
+        let Some(id) = successor
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+        else {
+            continue;
+        };
+        let Some(reference) = references.get(&id).cloned().flatten() else {
+            continue;
+        };
+        successor
+            .as_object_mut()
+            .ok_or_else(|| Error::engine("superseded successor is not an object"))?
+            .insert("display_reference".into(), json!(reference));
     }
     Ok(())
 }
@@ -4515,6 +5061,107 @@ pub(crate) async fn annotate_record_paths_batch(db: &Db, items: &mut [Value]) ->
             continue;
         };
         apply_record_path_with_reference(item, &id, references.get(&id).cloned().flatten())?;
+    }
+    Ok(())
+}
+
+/// Stamp the incoming-`supersedes` disclosure onto already-built record JSON —
+/// the surfaces whose rows are shaped SQL projections rather than
+/// `EnrichedRecord`s (query_record, dashboard, structure, search, scan).
+///
+/// Content (which successors exist, and their names) reads from
+/// `content_pool`; visibility and short references resolve against
+/// `auth_pool`, which is the live database whenever the content projection is
+/// a historical replay. An invisible successor is counted in `total_count`
+/// but never named. Records with no live successor are left untouched, so
+/// their text renders byte-identical to before.
+pub(crate) async fn annotate_superseded_by_in_pools(
+    content_pool: &sqlx::SqlitePool,
+    auth_pool: &sqlx::SqlitePool,
+    caller: &Caller,
+    records: &mut [Value],
+) -> Result<()> {
+    annotate_superseded_by_inner(content_pool, auth_pool, caller, records, true).await
+}
+
+/// World-preview variant: successor entries carry id and short reference but
+/// not the title, keeping each preview item under its byte budget.
+pub(crate) async fn annotate_superseded_refs_in_pools(
+    content_pool: &sqlx::SqlitePool,
+    auth_pool: &sqlx::SqlitePool,
+    caller: &Caller,
+    records: &mut [Value],
+) -> Result<()> {
+    annotate_superseded_by_inner(content_pool, auth_pool, caller, records, false).await
+}
+
+async fn annotate_superseded_by_inner(
+    content_pool: &sqlx::SqlitePool,
+    auth_pool: &sqlx::SqlitePool,
+    caller: &Caller,
+    records: &mut [Value],
+    include_names: bool,
+) -> Result<()> {
+    // One statement for the whole row set, grouped in Rust: the rows
+    // annotated here are already windowed (page, bucket, sample head), so
+    // nothing fetched is discarded.
+    let ids = records
+        .iter()
+        .filter_map(|record| record.get("id").and_then(Value::as_str).map(str::to_owned))
+        .collect::<Vec<_>>();
+    let grouped = read::load_superseded_by_batch(content_pool, &ids).await?;
+    let successor_ids = grouped
+        .values()
+        .flatten()
+        .map(|(id, _)| id.clone())
+        .collect::<Vec<_>>();
+    let (visible, references): (
+        std::collections::HashSet<String>,
+        std::collections::HashMap<String, Option<String>>,
+    ) = if successor_ids.is_empty() {
+        Default::default()
+    } else {
+        let borrowed: Vec<&str> = successor_ids.iter().map(String::as_str).collect();
+        let references =
+            crate::mcp::record_ref::display_references_in_pool(auth_pool, &borrowed).await?;
+        (
+            super::visible_ids_in_pool(auth_pool, caller, successor_ids).await?,
+            references,
+        )
+    };
+    for record in records.iter_mut() {
+        let Some(id) = record.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        // Visibility first, truncation second: an invisible head never hides
+        // a nameable tail. Records with no live successor are left untouched,
+        // so their text renders byte-identical to before.
+        let Some(successors) = grouped.get(id) else {
+            continue;
+        };
+        let mut items = Vec::new();
+        for (successor_id, name) in successors
+            .iter()
+            .filter(|(successor_id, _)| visible.contains(successor_id))
+            .take(read::MAX_SUPERSEDED_ITEMS)
+        {
+            let mut entry = serde_json::Map::with_capacity(3);
+            entry.insert("id".into(), json!(successor_id));
+            if include_names {
+                entry.insert("name".into(), json!(name));
+            }
+            if let Some(reference) = references.get(successor_id).cloned().flatten() {
+                entry.insert("display_reference".into(), json!(reference));
+            }
+            items.push(Value::Object(entry));
+        }
+        let Some(object) = record.as_object_mut() else {
+            continue;
+        };
+        object.insert(
+            "superseded_by".into(),
+            json!({ "items": items, "total_count": successors.len() }),
+        );
     }
     Ok(())
 }
@@ -4588,6 +5235,12 @@ struct UpdateRecordArgs {
     name: Option<Value>,
     #[serde(default, deserialize_with = "present")]
     body: Option<Value>,
+    /// Explicit full replacement (string or null), matching legacy `body`.
+    #[serde(default, deserialize_with = "present")]
+    body_set: Option<Value>,
+    /// Literal append of exactly the supplied string (null body reads as empty).
+    #[serde(default, deserialize_with = "present")]
+    body_append: Option<Value>,
     #[serde(default, deserialize_with = "present")]
     kind: Option<Value>,
     #[serde(default, deserialize_with = "present")]
@@ -4606,6 +5259,8 @@ struct UpdateRecordArgs {
     if_body_digest: Option<String>,
     if_unmodified_since: Option<String>,
     facets: Option<Map<String, Value>>,
+    #[serde(default)]
+    response_mode: ResponseMode,
 }
 
 #[derive(Deserialize)]
@@ -4860,8 +5515,8 @@ impl BodyGuardTarget {
 /// guard exists to prevent. Reconciliation is the caller's judgement.
 pub fn unguarded_body_write_error(tool: &str, target: &BodyGuardTarget) -> Error {
     Error::engine(format!(
-        "{tool}: unguarded whole-body write refused — {} already has a non-empty body, so 'body' \
-         must be accompanied by 'if_body_digest' and/or 'if_unmodified_since' (both must match \
+        "{tool}: unguarded whole-body write refused — {} already has a non-empty body, so 'body_set' \
+         (or deprecated alias 'body') must be accompanied by 'if_body_digest' and/or 'if_unmodified_since' (both must match \
          when both are supplied). Nothing was written. {}",
         target.described(),
         target.state()
@@ -5656,16 +6311,66 @@ async fn update_record(db: Db, caller: Caller, arguments: Value) -> Result<Value
 
 async fn update_record_singular(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
     const TOOL: &str = "update_record";
+    // `body_replace: null` would fold to `None` through `Option<Vec<..>>`
+    // and silently vanish — including alongside another body op. Reject the
+    // explicit null up front so malformed input cannot bypass exclusivity.
+    if arguments.get("body_replace").is_some_and(Value::is_null) {
+        return Err(Error::engine(format!(
+            "{TOOL}: 'body_replace' must be an array of {{old, new}} edits, got null"
+        )));
+    }
     let args: UpdateRecordArgs = parse_args(TOOL, arguments)?;
+    let response_mode = args.response_mode;
     require_nonblank_reason(TOOL, &args.reason)?;
     let touches_message_expectation = args.facets.as_ref().is_some_and(|facets| {
         facets.contains_key(crate::message_expectation::EXPECTATION_FACET_KEY)
     });
 
-    if args.body.is_some() && args.body_replace.is_some() {
+    // `body` (deprecated full-replacement alias), `body_set` (full
+    // replacement), `body_append` (literal append) and `body_replace`
+    // (surgical edits) are mutually exclusive — even when null. Presence,
+    // not value, decides: an explicit null still names the operation.
+    let present_body_ops = [
+        ("body", args.body.is_some()),
+        ("body_set", args.body_set.is_some()),
+        ("body_append", args.body_append.is_some()),
+        ("body_replace", args.body_replace.is_some()),
+    ]
+    .into_iter()
+    .filter(|(_, present)| *present)
+    .map(|(name, _)| name)
+    .collect::<Vec<_>>();
+    if present_body_ops.len() > 1 {
         return Err(Error::engine(format!(
-            "{TOOL}: 'body' and 'body_replace' are mutually exclusive"
+            "{TOOL}: {} are mutually exclusive (got {})",
+            present_body_ops.join(", "),
+            present_body_ops.join(" + "),
         )));
+    }
+    if let Some(value) = &args.body_set {
+        match value {
+            Value::String(_) | Value::Null => {}
+            other => {
+                return Err(Error::engine(format!(
+                    "{TOOL}: 'body_set' must be a string or null, got {other}"
+                )))
+            }
+        }
+    }
+    if let Some(value) = &args.body_append {
+        match value {
+            Value::String(_) => {}
+            Value::Null => {
+                return Err(Error::engine(format!(
+                    "{TOOL}: 'body_append' must be a string; clearing the body is a replacement, use 'body_set' with null"
+                )))
+            }
+            other => {
+                return Err(Error::engine(format!(
+                    "{TOOL}: 'body_append' must be a string, got {other}"
+                )))
+            }
+        }
     }
 
     let mut fields = Map::new();
@@ -5711,6 +6416,11 @@ async fn update_record_singular(db: Db, caller: Caller, arguments: Value) -> Res
         }
         fields.insert(key.into(), value.clone());
     }
+    // `body_set` is the explicit full-replacement verb: same payload shape as
+    // legacy `body`, carried under the `body` event key.
+    if let Some(value) = &args.body_set {
+        fields.insert("body".into(), value.clone());
+    }
 
     // The root's `name` is the only mutable field on it — `kind`, `home_id`
     // and `persistence` are refused by the projector's engine-filing guard —
@@ -5738,7 +6448,11 @@ async fn update_record_singular(db: Db, caller: Caller, arguments: Value) -> Res
             }
         }
     }
-    if fields.is_empty() && facet_specs.is_empty() && args.body_replace.is_none() {
+    if fields.is_empty()
+        && facet_specs.is_empty()
+        && args.body_replace.is_none()
+        && args.body_append.is_none()
+    {
         return Err(Error::engine(format!(
             "{TOOL}: no changes — pass at least one field or facet"
         )));
@@ -5752,7 +6466,7 @@ async fn update_record_singular(db: Db, caller: Caller, arguments: Value) -> Res
     // unconditionally would silently drop the prose the caller was required to
     // supply, while copying it onto every event would inflate one reason into
     // several and corrupt any later count of them.
-    if !fields.is_empty() || args.body_replace.is_some() {
+    if !fields.is_empty() || args.body_replace.is_some() || args.body_append.is_some() {
         fields.insert("reason".into(), json!(args.reason));
     } else if let Some(first) = facet_specs.first_mut() {
         if let Some(payload) = first.payload.as_object_mut() {
@@ -6093,7 +6807,18 @@ async fn update_record_singular(db: Db, caller: Caller, arguments: Value) -> Res
     // evaluated against CURRENT state, which is why two concurrent first
     // writers against an empty body cannot both pass.
     let mut guard_failure: Option<(bool, BodyGuardTarget)> = None;
-    if args.body.is_some() || args.body_replace.is_some() || args.if_body_digest.is_some() {
+    // The body receipt carries Unicode scalar counts with an explicit unit,
+    // so a destructive replacement is visible at the point it happens. The
+    // operation is the requested verb — an equal-length replacement still
+    // reports itself as a replacement, never as a no-op.
+    let mut body_receipt: Option<Value> = None;
+    let mut legacy_body_alias = false;
+    if args.body.is_some()
+        || args.body_set.is_some()
+        || args.body_append.is_some()
+        || args.body_replace.is_some()
+        || args.if_body_digest.is_some()
+    {
         let row =
             sqlx::query("SELECT body, name, updated_at, deleted_at FROM records WHERE id = ?")
                 .bind(&args.id)
@@ -6136,7 +6861,7 @@ async fn update_record_singular(db: Db, caller: Caller, arguments: Value) -> Res
         };
 
         if whole_body_write_needs_guard(
-            args.body.is_some(),
+            args.body.is_some() || args.body_set.is_some(),
             current_body.as_deref(),
             args.if_body_digest.as_deref(),
             args.if_unmodified_since.as_deref(),
@@ -6156,12 +6881,57 @@ async fn update_record_singular(db: Db, caller: Caller, arguments: Value) -> Res
         }
 
         if guard_failure.is_none() {
-            if let Some(ops) = &args.body_replace {
-                let current_body = current_body.as_deref().unwrap_or("");
-                fields.insert(
-                    "body".into(),
-                    Value::String(apply_body_replacements(TOOL, current_body, ops)?),
-                );
+            let current_str = current_body.as_deref().unwrap_or("");
+            let before_chars = current_str.chars().count() as u64;
+            if let Some(append) = args.body_append.as_ref().and_then(Value::as_str) {
+                // Literal append against the CURRENT body under the same BEGIN
+                // IMMEDIATE transaction: no digest required, but a supplied
+                // digest/timestamp was already checked above. Null reads as
+                // empty; exactly the supplied text is added, no separator.
+                let new_body = format!("{current_str}{append}");
+                let after_chars = new_body.chars().count() as u64;
+                body_receipt = Some(json!({
+                    "operation": "body_append",
+                    "requested_as": "body_append",
+                    "before_chars": before_chars,
+                    "after_chars": after_chars,
+                    "delta_chars": after_chars as i64 - before_chars as i64,
+                    "unit": "unicode_scalars",
+                }));
+                fields.insert("body".into(), Value::String(new_body));
+            } else if let Some(ops) = &args.body_replace {
+                let new_body = apply_body_replacements(TOOL, current_str, ops)?;
+                let after_chars = new_body.chars().count() as u64;
+                body_receipt = Some(json!({
+                    "operation": "body_replace",
+                    "requested_as": "body_replace",
+                    "before_chars": before_chars,
+                    "after_chars": after_chars,
+                    "delta_chars": after_chars as i64 - before_chars as i64,
+                    "unit": "unicode_scalars",
+                }));
+                fields.insert("body".into(), Value::String(new_body));
+            } else if args.body.is_some() || args.body_set.is_some() {
+                // Full replacement: the new value is already in `fields`
+                // under `body` (legacy alias and `body_set` share the shape).
+                legacy_body_alias = args.body.is_some();
+                let requested_as = if args.body.is_some() {
+                    "body"
+                } else {
+                    "body_set"
+                };
+                let after_chars = match fields.get("body") {
+                    Some(Value::String(next)) => next.chars().count() as u64,
+                    _ => 0,
+                };
+                body_receipt = Some(json!({
+                    "operation": "body_set",
+                    "requested_as": requested_as,
+                    "before_chars": before_chars,
+                    "after_chars": after_chars,
+                    "delta_chars": after_chars as i64 - before_chars as i64,
+                    "unit": "unicode_scalars",
+                }));
             }
         }
     }
@@ -6678,6 +7448,13 @@ async fn update_record_singular(db: Db, caller: Caller, arguments: Value) -> Res
     }
     let after = required_violations_in(&mut tx, &schema_rows, &[&args.id]).await?;
     assert_required_not_worsened(TOOL, &before, &after)?;
+    let compact_result = if response_mode == ResponseMode::Summary {
+        Some(compact_record_source_in(&mut tx, &caller, TOOL, &args.id).await?)
+    } else {
+        None
+    };
+    // Capture the version from the same transaction and snapshot.
+    let version_seq = current_record_version_in(&mut tx, &args.id).await?;
     db.commit_content(tx).await?;
 
     // The success response reports the digest of the body it just wrote, so a
@@ -6686,7 +7463,10 @@ async fn update_record_singular(db: Db, caller: Caller, arguments: Value) -> Res
     let mut updated = attach_artifact_input_continuity(
         attach_html_body_write(
             echo_previous_seq(
-                enriched_or_error(&db, &caller, TOOL, &args.id).await?,
+                match compact_result {
+                    Some(result) => result,
+                    None => enriched_or_error(&db, &caller, TOOL, &args.id).await?,
+                },
                 previous_seq,
             )?,
             html_body_write,
@@ -6694,7 +7474,33 @@ async fn update_record_singular(db: Db, caller: Caller, arguments: Value) -> Res
         artifact_input_continuity,
     )?;
     annotate_body_digest(&mut updated);
-    Ok(updated)
+    if let Some(receipt) = body_receipt {
+        updated
+            .as_object_mut()
+            .expect("enriched record object")
+            .insert("body_receipt".into(), receipt);
+    }
+    // Legacy `body` stays functional but always warns — including on
+    // content-identical (no-op) successes — directing callers to `body_set`.
+    if legacy_body_alias {
+        let warning = json!({
+            "code": "deprecated_body_alias",
+            "message": "update_record 'body' is a deprecated alias for full replacement; use 'body_set' for new calls.",
+        });
+        match updated.get_mut("warnings") {
+            Some(Value::Array(warnings)) => warnings.push(warning),
+            Some(existing) => {
+                *existing = Value::Array(vec![existing.clone(), warning]);
+            }
+            None => {
+                updated
+                    .as_object_mut()
+                    .expect("enriched record object")
+                    .insert("warnings".into(), Value::Array(vec![warning]));
+            }
+        }
+    }
+    response_mode.render(&db, updated, version_seq).await
 }
 
 // ---------------------------------------------------------------------------
@@ -7297,6 +8103,29 @@ pub(crate) fn render_enriched_record_markdown(
     if let Some(owner) = &r.owner_id {
         status.push(format!("owner: {owner}"));
     }
+    // Succession disclosure on the status line: the markdown read names the
+    // successor without the reader inspecting links. Names are escaped for
+    // the shared summariser, whose contract is pre-escaped input; a short
+    // reference degrades to the full id where none was annotated.
+    if let Some(superseded) = record.superseded_by.as_ref() {
+        let items = superseded
+            .items
+            .iter()
+            .map(|item| {
+                (
+                    crate::mcp::render::display_inline(&item.name),
+                    crate::mcp::render::display_inline(
+                        item.display_reference.as_deref().unwrap_or(&item.id),
+                    ),
+                )
+            })
+            .collect::<Vec<_>>();
+        if let Some(summary) =
+            crate::mcp::render::summarize_superseded_items(&items, superseded.total_count)
+        {
+            status.push(summary);
+        }
+    }
     if record.archived {
         status.push("ARCHIVED".into());
     }
@@ -7388,14 +8217,12 @@ async fn render_record(db: Db, caller: Caller, arguments: Value) -> Result<Value
     let args: RenderRecordArgs = parse_args(TOOL, arguments)?;
     let include_interpretation = args.include_interpretation.unwrap_or(false);
     let (record, names, interpretation) = if include_interpretation {
-        let read_lens = ReadLens::live(&db);
         let mut snapshot = db.write_pool().begin().await?;
         let result = async {
             require_record_in(&mut snapshot, &caller, TOOL, &args.id, Capability::View).await?;
             let principal = (!super::is_legacy_local(&caller)).then(|| super::principal(&caller));
             let mut items = read::get_records_live_in(
                 &mut snapshot,
-                &read_lens,
                 std::slice::from_ref(&args.id),
                 read::EnrichOptions::default(),
                 principal,
@@ -7432,7 +8259,12 @@ async fn render_record(db: Db, caller: Caller, arguments: Value) -> Result<Value
             Ok((record, names, interpretation))
         }
         .await;
-        let (record, names, interpretation) = finish_read_snapshot(snapshot, result).await?;
+        let (mut record, names, interpretation) = finish_read_snapshot(snapshot, result).await?;
+        // After the snapshot releases: successor display references resolve
+        // through their own pool checkout, never nested inside the handler's
+        // snapshot the way the in-transaction call above did. Same ordering
+        // as `get_record_from_lens`, which annotates after its snapshot.
+        populate_superseded_references_in_pool(db.write_pool(), &mut record).await?;
         (record, names, Some(interpretation))
     } else {
         require_record(&db, &caller, TOOL, &args.id, Capability::View).await?;
@@ -7455,6 +8287,7 @@ async fn render_record(db: Db, caller: Caller, arguments: Value) -> Result<Value
             )));
         };
         filter_enriched_record(&db, &caller, &mut record, read::EnrichOptions::default()).await?;
+        populate_superseded_references_in_pool(db.write_pool(), &mut record).await?;
         let names = endpoint_names(&db, &record).await?;
         (record, names, None)
     };
@@ -7482,14 +8315,21 @@ async fn render_record(db: Db, caller: Caller, arguments: Value) -> Result<Value
 
 /// Register tools 5–10.
 fn update_record_input_schema() -> Value {
-    let singular = json!({
+    // The base singular shape carries every property. Mutual exclusivity of
+    // the four body operations lives in sibling `allOf` branches — never as
+    // sibling keys — because the TypeScript generator resolves `allOf` first
+    // and ignores sibling properties (see `tool_types.rs` `schema_to_ts`).
+    let singular_body = json!({
         "type": "object",
-        "description": "Singular update. Replacing a non-empty body requires if_body_digest (copy get_record.body_digest) and/or if_unmodified_since.",
+        "description": "Replacing a non-empty body requires if_body_digest (get_record.body_digest) and/or if_unmodified_since. Append/surgical guards optional; supplied guards must match.",
         "properties": {
             "id": { "type": "string" },
+            "record_id": { "type": "string", "description": "Single-write alias for id; normalized before dispatch. ids (even one element) stays the batch branch below." },
             "reason": { "type": "string", "minLength": 1 },
             "name": { "type": "string" },
-            "body": { "type": ["string", "null"] },
+            "body": { "type": ["string", "null"], "description": "Deprecated body_set alias." },
+            "body_set": { "type": ["string", "null"], "description": "Replace all; null clears." },
+            "body_append": { "type": "string", "description": "Append literal text; no separator." },
             "body_replace": {
                 "type": "array",
                 "minItems": 1,
@@ -7508,6 +8348,7 @@ fn update_record_input_schema() -> Value {
             },
             "if_body_digest": { "type": "string", "pattern": "^[0-9a-fA-F]{64}$" },
             "if_unmodified_since": { "type": "string", "format": "date-time" },
+            "response_mode": { "type": "string", "enum": ["summary", "verbose"], "default": "summary" },
             "kind": { "type": "string", "minLength": 1 },
             "home_id": { "type": "string", "description": "Move to a canonical browse home. Only the engine root may have null." },
             "summary": { "type": ["string", "null"] },
@@ -7521,9 +8362,20 @@ fn update_record_input_schema() -> Value {
                 "additionalProperties": true
             }
         },
-        "required": ["id", "reason"],
-        "not": { "required": ["body", "body_replace"] },
+        "required": ["reason"],
         "additionalProperties": false
+    });
+    let singular = json!({
+        "allOf": [
+            singular_body,
+            { "oneOf": [{ "required": ["id"] }, { "required": ["record_id"] }] },
+            { "not": { "required": ["body", "body_set"] } },
+            { "not": { "required": ["body", "body_append"] } },
+            { "not": { "required": ["body", "body_replace"] } },
+            { "not": { "required": ["body_set", "body_append"] } },
+            { "not": { "required": ["body_set", "body_replace"] } },
+            { "not": { "required": ["body_append", "body_replace"] } }
+        ]
     });
     let multi_base = json!({
         "type": "object",
@@ -7585,13 +8437,7 @@ pub fn register_lifecycle_tools(registry: &mut ToolRegistry) -> Result<()> {
         .join(";");
     registry.register(
         ToolKind::CreateRecord,
-        "Create one record atomically; requires spine type/open kind. preview_record_shape gives \
-         optional shape and facet-value advice; creation revalidates live state without a preview token. Messages require \
-         immutable audience. Comments require type Annotation, kind comment, nonblank body and \
-         exactly one outgoing part_of link. Roots default to informational lifecycle; open is \
-         allowed. A reply bears directly on the root comment, inherits context and has null \
-         lifecycle. Passage targets require exact text_quote and canonical UTF-8 data_position. \
-         Replies stay targetless. Omit summary until resolution.",
+        "Create atomically. Compact default; response_mode=verbose gives full record. Requires spine type/open kind; preview_record_shape advises; create revalidates. Artifacts: Document/artifact, source body, facets.runtime; see compositions guide. Messages require fixed audience. Comments require type Annotation, kind comment, nonblank body and exactly one outgoing part_of link. Roots default informational/open. A reply bears directly on the root comment; inherits context/null lifecycle. Targets require text_quote + canonical UTF-8 data_position. Replies stay targetless. Omit summary until resolution.",
         json!({
             "type": "object",
             "properties": {
@@ -7645,7 +8491,8 @@ pub fn register_lifecycle_tools(registry: &mut ToolRegistry) -> Result<()> {
                     "items":{"type":"object","properties":{"mention_id":{"type":"string"},"target_kind":{"type":"string","enum":["principal","record"]},"target_id":{"type":"string"},"span_start":{"type":"integer","minimum":0},"span_end":{"type":"integer","minimum":1},"authored_label":{"type":"string"}},"required":["mention_id","target_kind","target_id","span_start","span_end","authored_label"],"additionalProperties":false}
                 },
                 "target": crate::mcp::tools::citations::target_schema(),
-                "idempotency_key": { "type": "string", "description": "Retry-safety key: on ambiguous failure, retry with the SAME key, never a fresh one. An identical retry returns the record you already created rather than a second one; the same key with different content is rejected. With no key, every call creates a new record." }
+                "idempotency_key": { "type": "string", "description": "Retry-safety key: on ambiguous failure, retry with the SAME key, never a fresh one. An identical retry returns the record you already created rather than a second one; the same key with different content is rejected. With no key, every call creates a new record." },
+                "response_mode": { "type": "string", "enum": ["summary", "verbose"], "default": "summary" }
             },
             "required": ["type", "kind", "reason"],
             "additionalProperties": false
@@ -7654,18 +8501,13 @@ pub fn register_lifecycle_tools(registry: &mut ToolRegistry) -> Result<()> {
     )?;
     registry.register(
         ToolKind::GetRecord,
-        "Batch get by full ids or short record references, with partial \
-         success, caller-visible totals, and independently \
-         paged enrichments. Comments expose comment_count; include_comments pages \
-         direct roots from comments_offset and returns each exact anchored passage. \
-         resolve:false skips saved queries; as_of pins content while \
-         authorization/schema stay live. include_interpretation:true (default false) \
-         adds a live caller-authorized typed projection for <=50 ids; it rejects \
-         as_of and request overflow is unavailable without a count. Each found record \
-         carries body_digest, the SHA-256 of its stored body (sha256(\"\") when empty or \
-         null); copy it into update_record.if_body_digest to replace a whole body safely. \
-         No other read surface returns it.",
-        json!({
+        "Batch get by full ids or short record references: partial success, visible totals, paged enrichments. \
+         Comments expose comment_count; include_comments pages direct roots from comments_offset \
+         with each exact anchored passage. resolve:false skips saved queries. \
+         as_of pins content; authorization/schema stay live. Interpretation overflow returns \
+         unavailable without count. Only this read returns body_digest: SHA-256 of stored body \
+         (empty/null -> sha256(\"\")); use update_record.if_body_digest for safe whole-body replacement.",
+        crate::mcp::record_ref::with_record_selector_aliases("get_record", json!({
             "type": "object",
             "properties": {
                 "ids": {
@@ -7673,7 +8515,7 @@ pub fn register_lifecycle_tools(registry: &mut ToolRegistry) -> Result<()> {
                     "items": { "type": "string" },
                     "minItems": 1,
                     "maxItems": MAX_BATCH_GET,
-                    "description": "Full ids or short record references to read directly. Use search.query for unknown text or concepts instead."
+                    "description": "IDs or short record references; search.query for unknown text."
                 },
                 "resolve": {
                     "type": "boolean",
@@ -7681,7 +8523,7 @@ pub fn register_lifecycle_tools(registry: &mut ToolRegistry) -> Result<()> {
                 },
                 "include_interpretation": {
                     "type": "boolean",
-                    "description": "Bounded live interpretation; default false, <=50 ids, rejects as_of."
+                    "description": "Live caller-authorized typed projection; default false, <=50 ids, rejects as_of."
                 },
                 "children_limit": {
                     "type": "integer",
@@ -7744,23 +8586,27 @@ pub fn register_lifecycle_tools(registry: &mut ToolRegistry) -> Result<()> {
                     "type": "integer", "minimum": 0,
                     "description": "Comments offset; roots newest-first, replies oldest-first."
                 },
+                "include_history_summary": {
+                    "type": "boolean",
+                    "description": "Oldest/newest visible-event attribution; default false; rejects as_of."
+                },
                 "as_of": lens::as_of_input_schema()
             },
             "required": ["ids"],
             "additionalProperties": false
-        }),
+        })),
         get_record,
     )?;
     registry.register(
         ToolKind::UpdateRecord,
-        &format!("Update one record or atomically patch facets/maturity/home_id for 1–100 exact unique ids; preflight, skip no-ops, ordered. facets=current state; observations: manage_facet_observations.set. if_body_digest guard. Comments: open -> resolved: lifecycle:\"resolved\" + nonblank summary. Tombstones reject. For non-destructive recovery, do not create a v2 copy: compensating updates restore record fields only and are not atomic. {PREVIOUS_SEQ_DESCRIPTION}"),
+        "Default summary; response_mode=verbose is full. body_set replaces; body_append appends; body_replace is surgical; body aliases body_set. if_body_digest guards. Batch: 1–100 ids; skips no-ops. facets=current; use facet observations for evidence. Resolve comments: lifecycle:\"resolved\", nonblank summary (open -> resolved). Tombstones reject. Recovery: previous_seq -> get_record as_of.content_seq; compensation covers record fields only, is non-destructive and not atomic; do not create a v2 copy.",
         update_record_input_schema(),
         update_record,
     )?;
     registry.register(
         ToolKind::ClaimUnownedRecord,
         "Exceptional ownership recovery for one exact, full record id naming a visible, live, ordinary record whose owner_id is null; abbreviated ids are not resolved. Host owners (or the standalone filesystem operator) may claim only for their own uniquely bound portable person identity. Engine records, Messages, semantic Units, derived annotations and attachments are excluded. Already-owned records and retries are refused without writing.",
-        json!({
+        crate::mcp::record_ref::with_record_selector_aliases("claim_unowned_record", json!({
             "type": "object",
             "properties": {
                 "record_id": {
@@ -7772,13 +8618,13 @@ pub fn register_lifecycle_tools(registry: &mut ToolRegistry) -> Result<()> {
             },
             "required": ["record_id", "reason"],
             "additionalProperties": false
-        }),
+        })),
         claim_unowned_record,
     )?;
     registry.register(
         ToolKind::CorrectRecordType,
         "Correct a live record's mistaken spine type through a governed plan. Preparation requires ordinary record edit authority; an autonomous same-run correction retains that authority, while an established or shared-use correction requires explicit record-manage confirmation. The target kind must be supplied explicitly, and execution fails without writing if the record changed after preparation.",
-        json!({
+        crate::mcp::record_ref::with_record_selector_aliases("correct_record_type", json!({
             "type": "object",
             "properties": {
                 "record_id": { "type": "string" },
@@ -7788,7 +8634,7 @@ pub fn register_lifecycle_tools(registry: &mut ToolRegistry) -> Result<()> {
             },
             "required": ["record_id", "target_type", "target_kind", "reason"],
             "additionalProperties": false
-        }),
+        })),
         correct_record_type,
     )?;
     registry.register(
@@ -7798,7 +8644,7 @@ pub fn register_lifecycle_tools(registry: &mut ToolRegistry) -> Result<()> {
          (the projector rejects all further mutation events). No hard delete \
          in v1. {PREVIOUS_SEQ_DESCRIPTION}"
         ),
-        json!({
+        crate::mcp::record_ref::with_record_selector_aliases("delete_record", json!({
             "type": "object",
             "properties": {
                 "id": { "type": "string" },
@@ -7806,7 +8652,7 @@ pub fn register_lifecycle_tools(registry: &mut ToolRegistry) -> Result<()> {
             },
             "required": ["id", "reason"],
             "additionalProperties": false
-        }),
+        })),
         delete_record,
     )?;
     registry.register(
@@ -7815,7 +8661,7 @@ pub fn register_lifecycle_tools(registry: &mut ToolRegistry) -> Result<()> {
          record via the engine-reserved archived facet. Archived records drop \
          out of default queries but stay mutable; lifecycle is preserved \
          across the round trip. {PREVIOUS_SEQ_DESCRIPTION}"),
-        json!({
+        crate::mcp::record_ref::with_record_selector_aliases("archive_record", json!({
             "type": "object",
             "properties": {
                 "id": { "type": "string" },
@@ -7824,7 +8670,7 @@ pub fn register_lifecycle_tools(registry: &mut ToolRegistry) -> Result<()> {
             },
             "required": ["id", "reason"],
             "additionalProperties": false
-        }),
+        })),
         archive_record,
     )?;
     registry.register(
@@ -7832,18 +8678,21 @@ pub fn register_lifecycle_tools(registry: &mut ToolRegistry) -> Result<()> {
         "Deterministic record/enrichment Markdown, with no model. \
          include_interpretation:true (default false) adds the same bounded live \
          caller-authorized typed projection and summary.",
-        json!({
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "include_interpretation": {
-                    "type": "boolean",
-                    "description": "Bounded live interpretation plus Markdown; default false."
-                }
-            },
-            "required": ["id"],
-            "additionalProperties": false
-        }),
+        crate::mcp::record_ref::with_record_selector_aliases(
+            "render_record",
+            json!({
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string" },
+                    "include_interpretation": {
+                        "type": "boolean",
+                        "description": "Bounded live interpretation plus Markdown; default false."
+                    }
+                },
+                "required": ["id"],
+                "additionalProperties": false
+            }),
+        ),
         render_record,
     )?;
     Ok(())
@@ -8230,6 +9079,710 @@ mod create_idempotency_tests {
             !replay_gate_open(&db, &attestation).await,
             "invalidation without new events must still reconstruct"
         );
+        db.close().await;
+    }
+}
+
+#[cfg(test)]
+mod body_set_append_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    async fn setup() -> (crate::Db, Arc<crate::mcp::ToolRegistry>) {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let mut registry = crate::mcp::ToolRegistry::new();
+        crate::mcp::register_surface_tools(&mut registry).unwrap();
+        (db, Arc::new(registry))
+    }
+
+    async fn create_note(
+        registry: &crate::mcp::ToolRegistry,
+        db: &crate::Db,
+        body: Option<&str>,
+    ) -> String {
+        let mut args = json!({
+            "type": "Document",
+            "kind": "note",
+            "name": "body probe",
+            "reason": "body_set/append fixture",
+        });
+        if let Some(body) = body {
+            args["body"] = json!(body);
+        }
+        let created = registry
+            .call(
+                db.clone(),
+                crate::mcp::Caller::local(),
+                "create_record",
+                args,
+            )
+            .await
+            .unwrap();
+        created["id"].as_str().unwrap().to_string()
+    }
+
+    async fn stored_body(db: &crate::Db, id: &str) -> Option<String> {
+        sqlx::query_scalar("SELECT body FROM records WHERE id = ?")
+            .bind(id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap()
+    }
+
+    async fn event_count(db: &crate::Db, id: &str) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM content_events WHERE record_id = ?")
+            .bind(id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap()
+    }
+
+    fn receipt(result: &Value) -> &Value {
+        result
+            .get("body_receipt")
+            .expect("a body operation must return a body_receipt")
+    }
+
+    fn has_deprecation_warning(result: &Value) -> bool {
+        result
+            .get("warnings")
+            .and_then(Value::as_array)
+            .is_some_and(|warnings| {
+                warnings.iter().any(|warning| {
+                    warning.get("code").and_then(Value::as_str) == Some("deprecated_body_alias")
+                })
+            })
+    }
+
+    #[tokio::test]
+    async fn set_replaces_with_unicode_scalar_receipt() {
+        let (db, registry) = setup().await;
+        let id = create_note(&registry, &db, Some("Hello")).await;
+        let new_body = "Hello, world 🌍";
+        let result = registry
+            .call(
+                db.clone(),
+                crate::mcp::Caller::local(),
+                "update_record",
+                json!({
+                    "id": id,
+                    "body_set": new_body,
+                    "if_body_digest": body_digest(Some("Hello")),
+                    "reason": "explicit replacement",
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stored_body(&db, &id).await.as_deref(), Some(new_body));
+        let expected_after = new_body.chars().count() as u64;
+        assert_eq!(receipt(&result)["operation"], json!("body_set"));
+        assert_eq!(receipt(&result)["requested_as"], json!("body_set"));
+        assert_eq!(receipt(&result)["before_chars"], json!(5));
+        assert_eq!(receipt(&result)["after_chars"], json!(expected_after));
+        assert_eq!(
+            receipt(&result)["delta_chars"],
+            json!(expected_after as i64 - 5)
+        );
+        assert_eq!(receipt(&result)["unit"], json!("unicode_scalars"));
+        assert!(!has_deprecation_warning(&result));
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn set_null_clears_with_zero_after_chars() {
+        let (db, registry) = setup().await;
+        let id = create_note(&registry, &db, Some("abc")).await;
+        let result = registry
+            .call(
+                db.clone(),
+                crate::mcp::Caller::local(),
+                "update_record",
+                json!({
+                    "id": id,
+                    "body_set": null,
+                    "if_body_digest": body_digest(Some("abc")),
+                    "reason": "clear the body",
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stored_body(&db, &id).await, None);
+        assert_eq!(receipt(&result)["operation"], json!("body_set"));
+        assert_eq!(receipt(&result)["before_chars"], json!(3));
+        assert_eq!(receipt(&result)["after_chars"], json!(0));
+        assert_eq!(receipt(&result)["delta_chars"], json!(-3));
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn legacy_body_warns_including_content_identical_noop() {
+        let (db, registry) = setup().await;
+        let id = create_note(&registry, &db, Some("same")).await;
+        // Content-identical write still succeeds and still warns.
+        let noop = registry
+            .call(
+                db.clone(),
+                crate::mcp::Caller::local(),
+                "update_record",
+                json!({
+                    "id": id,
+                    "body": "same",
+                    "if_body_digest": body_digest(Some("same")),
+                    "reason": "legacy no-op",
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(has_deprecation_warning(&noop), "{noop}");
+        assert_eq!(receipt(&noop)["operation"], json!("body_set"));
+        assert_eq!(receipt(&noop)["requested_as"], json!("body"));
+        assert_eq!(receipt(&noop)["delta_chars"], json!(0));
+        // A real change through the alias warns the same way.
+        let changed = registry
+            .call(
+                db.clone(),
+                crate::mcp::Caller::local(),
+                "update_record",
+                json!({
+                    "id": id,
+                    "body": "changed",
+                    "if_body_digest": body_digest(Some("same")),
+                    "reason": "legacy replacement",
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stored_body(&db, &id).await.as_deref(), Some("changed"));
+        assert!(has_deprecation_warning(&changed));
+        assert_eq!(receipt(&changed)["requested_as"], json!("body"));
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn unguarded_set_refused_but_append_needs_no_digest() {
+        let (db, registry) = setup().await;
+        let id = create_note(&registry, &db, Some("nonempty")).await;
+        let before = event_count(&db, &id).await;
+        let err = registry
+            .call(
+                db.clone(),
+                crate::mcp::Caller::local(),
+                "update_record",
+                json!({ "id": id, "body_set": "other", "reason": "unguarded" }),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unguarded whole-body write refused"), "{err}");
+        assert!(err.contains("body_set"), "{err}");
+        assert_eq!(event_count(&db, &id).await, before);
+        assert_eq!(stored_body(&db, &id).await.as_deref(), Some("nonempty"));
+        // Append against a non-empty body needs no digest.
+        let appended = registry
+            .call(
+                db.clone(),
+                crate::mcp::Caller::local(),
+                "update_record",
+                json!({ "id": id, "body_append": "!", "reason": "append" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stored_body(&db, &id).await.as_deref(), Some("nonempty!"));
+        assert_eq!(receipt(&appended)["operation"], json!("body_append"));
+        assert_eq!(receipt(&appended)["before_chars"], json!(8));
+        assert_eq!(receipt(&appended)["after_chars"], json!(9));
+        assert_eq!(receipt(&appended)["delta_chars"], json!(1));
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn append_is_literal_with_caller_separator_and_unicode() {
+        let (db, registry) = setup().await;
+        let id = create_note(&registry, &db, Some("Hello")).await;
+        let result = registry
+            .call(
+                db.clone(),
+                crate::mcp::Caller::local(),
+                "update_record",
+                json!({ "id": id, "body_append": ", world", "reason": "append" }),
+            )
+            .await
+            .unwrap();
+        // The separator travelled inside the caller's text; nothing was added.
+        assert_eq!(stored_body(&db, &id).await.as_deref(), Some("Hello, world"));
+        assert_eq!(receipt(&result)["delta_chars"], json!(7));
+        // Unicode scalars, not bytes: café is 4, the append is 3.
+        let unicode = create_note(&registry, &db, Some("café")).await;
+        let appended = registry
+            .call(
+                db.clone(),
+                crate::mcp::Caller::local(),
+                "update_record",
+                json!({ "id": unicode, "body_append": " 🦮🌍", "reason": "append" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            stored_body(&db, &unicode).await.as_deref(),
+            Some("café 🦮🌍")
+        );
+        assert_eq!(receipt(&appended)["before_chars"], json!(4));
+        assert_eq!(receipt(&appended)["after_chars"], json!(7));
+        assert_eq!(receipt(&appended)["delta_chars"], json!(3));
+        assert_eq!(receipt(&appended)["unit"], json!("unicode_scalars"));
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn append_to_null_body_reads_as_empty() {
+        let (db, registry) = setup().await;
+        let id = create_note(&registry, &db, None).await;
+        assert_eq!(stored_body(&db, &id).await, None);
+        let result = registry
+            .call(
+                db.clone(),
+                crate::mcp::Caller::local(),
+                "update_record",
+                json!({ "id": id, "body_append": "seed", "reason": "append" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stored_body(&db, &id).await.as_deref(), Some("seed"));
+        assert_eq!(receipt(&result)["before_chars"], json!(0));
+        assert_eq!(receipt(&result)["after_chars"], json!(4));
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn all_six_exclusive_pairs_reject_without_mutation() {
+        let (db, registry) = setup().await;
+        let id = create_note(&registry, &db, Some("stable")).await;
+        let replacement = json!([{ "old": "stable", "new": "other" }]);
+        let pairs = [
+            ("body", json!("x"), "body_set", json!("x")),
+            ("body", json!("x"), "body_append", json!("x")),
+            ("body", json!("x"), "body_replace", replacement.clone()),
+            ("body_set", json!("x"), "body_append", json!("x")),
+            ("body_set", json!("x"), "body_replace", replacement.clone()),
+            ("body_append", json!("x"), "body_replace", replacement),
+        ];
+        for (first, first_value, second, second_value) in pairs {
+            let before = event_count(&db, &id).await;
+            let mut obj = serde_json::Map::new();
+            obj.insert("id".into(), json!(id));
+            obj.insert("reason".into(), json!("conflicting body ops"));
+            obj.insert(first.into(), first_value);
+            obj.insert(second.into(), second_value);
+            let err = registry
+                .call(
+                    db.clone(),
+                    crate::mcp::Caller::local(),
+                    "update_record",
+                    Value::Object(obj),
+                )
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("mutually exclusive"), "{err}");
+            assert_eq!(event_count(&db, &id).await, before, "{err}");
+        }
+        // Explicit nulls still name the operation: null + null conflicts.
+        let null_err = registry
+            .call(
+                db.clone(),
+                crate::mcp::Caller::local(),
+                "update_record",
+                json!({ "id": id, "reason": "null pair", "body": null, "body_set": null }),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(null_err.contains("mutually exclusive"), "{null_err}");
+        // An explicit null body_replace cannot fold away beside another op.
+        let folded_err = registry
+            .call(
+                db.clone(),
+                crate::mcp::Caller::local(),
+                "update_record",
+                json!({ "id": id, "reason": "null replace", "body_set": "x", "body_replace": null }),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(folded_err.contains("body_replace"), "{folded_err}");
+        assert_eq!(stored_body(&db, &id).await.as_deref(), Some("stable"));
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn stale_digest_rejects_append_and_set_without_mutation() {
+        let (db, registry) = setup().await;
+        let id = create_note(&registry, &db, Some("v1")).await;
+        let stale = body_digest(Some("v1"));
+        registry
+            .call(
+                db.clone(),
+                crate::mcp::Caller::local(),
+                "update_record",
+                json!({
+                    "id": id,
+                    "body_set": "v2",
+                    "if_body_digest": stale.clone(),
+                    "reason": "advance",
+                }),
+            )
+            .await
+            .unwrap();
+        for args in [
+            json!({ "id": id, "body_append": "!", "if_body_digest": stale, "reason": "stale append" }),
+            json!({ "id": id, "body_set": "v3", "if_body_digest": stale, "reason": "stale set" }),
+        ] {
+            let before = event_count(&db, &id).await;
+            let err = registry
+                .call(
+                    db.clone(),
+                    crate::mcp::Caller::local(),
+                    "update_record",
+                    args,
+                )
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("digest conflict"), "{err}");
+            assert_eq!(event_count(&db, &id).await, before, "{err}");
+        }
+        assert_eq!(stored_body(&db, &id).await.as_deref(), Some("v2"));
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn fresh_digest_append_succeeds() {
+        let (db, registry) = setup().await;
+        let id = create_note(&registry, &db, Some("a")).await;
+        let result = registry
+            .call(
+                db.clone(),
+                crate::mcp::Caller::local(),
+                "update_record",
+                json!({
+                    "id": id,
+                    "body_append": "b",
+                    "if_body_digest": body_digest(Some("a")),
+                    "reason": "guarded append",
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stored_body(&db, &id).await.as_deref(), Some("ab"));
+        assert_eq!(receipt(&result)["operation"], json!("body_append"));
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn equal_length_replacement_reports_operation_with_zero_delta() {
+        let (db, registry) = setup().await;
+        let id = create_note(&registry, &db, Some("ab")).await;
+        let set = registry
+            .call(
+                db.clone(),
+                crate::mcp::Caller::local(),
+                "update_record",
+                json!({
+                    "id": id,
+                    "body_set": "cd",
+                    "if_body_digest": body_digest(Some("ab")),
+                    "reason": "equal length set",
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(receipt(&set)["operation"], json!("body_set"));
+        assert_eq!(receipt(&set)["delta_chars"], json!(0));
+        let replaced = registry
+            .call(
+                db.clone(),
+                crate::mcp::Caller::local(),
+                "update_record",
+                json!({
+                    "id": id,
+                    "body_replace": [{ "old": "cd", "new": "ef" }],
+                    "reason": "equal length surgical",
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stored_body(&db, &id).await.as_deref(), Some("ef"));
+        assert_eq!(receipt(&replaced)["operation"], json!("body_replace"));
+        assert_eq!(receipt(&replaced)["delta_chars"], json!(0));
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn separate_writer_appends_both_land() {
+        let (db, registry) = setup().await;
+        let id = create_note(&registry, &db, Some("start")).await;
+        let first = registry.call(
+            db.clone(),
+            crate::mcp::Caller::local(),
+            "update_record",
+            json!({ "id": id, "body_append": "-one", "reason": "writer one" }),
+        );
+        let second = registry.call(
+            db.clone(),
+            crate::mcp::Caller::local(),
+            "update_record",
+            json!({ "id": id, "body_append": "-two", "reason": "writer two" }),
+        );
+        let (first, second) = tokio::join!(first, second);
+        first.unwrap();
+        second.unwrap();
+        let body = stored_body(&db, &id).await.expect("body present");
+        assert!(
+            body == "start-one-two" || body == "start-two-one",
+            "both appends must land exactly once: {body}"
+        );
+        assert_eq!(body.chars().count(), 13);
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn singular_schema_nests_exclusivity_in_allof() {
+        let (_, registry) = setup().await;
+        let schema = &registry
+            .specs()
+            .find(|spec| spec.name == "update_record")
+            .expect("update_record registered")
+            .input_schema;
+        let singular = &schema["oneOf"][0];
+        let base = &singular["allOf"][0];
+        for field in ["body", "body_set", "body_append", "body_replace"] {
+            assert!(
+                base["properties"].get(field).is_some(),
+                "singular base must declare {field}"
+            );
+        }
+        // One base shape, six body exclusions, and one selector clause.
+        let clauses = singular["allOf"].as_array().unwrap();
+        assert_eq!(clauses.len(), 8);
+        assert_eq!(
+            clauses
+                .iter()
+                .filter(|clause| clause.get("not").is_some())
+                .count(),
+            6
+        );
+        assert_eq!(
+            clauses
+                .iter()
+                .filter(|clause| clause.get("oneOf").is_some())
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_timestamp_rejects_both_new_ops_without_mutation() {
+        let (db, registry) = setup().await;
+        let id = create_note(&registry, &db, Some("v1")).await;
+        for args in [
+            json!({ "id": id, "body_set": "v2", "if_unmodified_since": "2000-01-01T00:00:00Z", "reason": "stale set" }),
+            json!({ "id": id, "body_append": "!", "if_unmodified_since": "2000-01-01T00:00:00Z", "reason": "stale append" }),
+        ] {
+            let before = event_count(&db, &id).await;
+            let err = registry
+                .call(
+                    db.clone(),
+                    crate::mcp::Caller::local(),
+                    "update_record",
+                    args,
+                )
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("stale write conflict"), "{err}");
+            assert_eq!(event_count(&db, &id).await, before, "{err}");
+        }
+        assert_eq!(stored_body(&db, &id).await.as_deref(), Some("v1"));
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn append_empty_string_succeeds_with_zero_delta() {
+        let (db, registry) = setup().await;
+        let id = create_note(&registry, &db, Some("kept")).await;
+        let before = event_count(&db, &id).await;
+        let result = registry
+            .call(
+                db.clone(),
+                crate::mcp::Caller::local(),
+                "update_record",
+                json!({ "id": id, "body_append": "", "reason": "empty append" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stored_body(&db, &id).await.as_deref(), Some("kept"));
+        assert_eq!(receipt(&result)["operation"], json!("body_append"));
+        assert_eq!(receipt(&result)["delta_chars"], json!(0));
+        assert_eq!(
+            receipt(&result)["before_chars"],
+            receipt(&result)["after_chars"]
+        );
+        // Content-identical append still commits its event under current behavior.
+        assert_eq!(event_count(&db, &id).await, before + 1);
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn set_empty_string_needs_guard_then_clears_to_empty() {
+        let (db, registry) = setup().await;
+        let id = create_note(&registry, &db, Some("abc")).await;
+        let before = event_count(&db, &id).await;
+        let err = registry
+            .call(
+                db.clone(),
+                crate::mcp::Caller::local(),
+                "update_record",
+                json!({ "id": id, "body_set": "", "reason": "unguarded clear" }),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unguarded whole-body write refused"), "{err}");
+        assert_eq!(event_count(&db, &id).await, before, "{err}");
+        let result = registry
+            .call(
+                db.clone(),
+                crate::mcp::Caller::local(),
+                "update_record",
+                json!({
+                    "id": id,
+                    "body_set": "",
+                    "if_body_digest": body_digest(Some("abc")),
+                    "reason": "guarded clear",
+                }),
+            )
+            .await
+            .unwrap();
+        // Empty string persists as empty, distinct from null.
+        assert_eq!(stored_body(&db, &id).await.as_deref(), Some(""));
+        assert_eq!(receipt(&result)["operation"], json!("body_set"));
+        assert_eq!(receipt(&result)["after_chars"], json!(0));
+        assert_eq!(receipt(&result)["delta_chars"], json!(-3));
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn both_new_ops_reject_on_tombstoned_record() {
+        let (db, registry) = setup().await;
+        let id = create_note(&registry, &db, Some("epitaph")).await;
+        let digest = body_digest(Some("epitaph"));
+        registry
+            .call(
+                db.clone(),
+                crate::mcp::Caller::local(),
+                "delete_record",
+                json!({ "id": id, "reason": "tombstone fixture" }),
+            )
+            .await
+            .unwrap();
+        let before = event_count(&db, &id).await;
+        for args in [
+            json!({ "id": id, "body_set": "resurrect", "if_body_digest": digest.clone(), "reason": "set on tombstone" }),
+            json!({ "id": id, "body_append": "!", "reason": "append on tombstone" }),
+        ] {
+            let err = registry
+                .call(
+                    db.clone(),
+                    crate::mcp::Caller::local(),
+                    "update_record",
+                    args,
+                )
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("tombstoned"), "{err}");
+            assert_eq!(event_count(&db, &id).await, before, "{err}");
+        }
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn body_op_combines_with_name_in_one_event() {
+        let (db, registry) = setup().await;
+        let id = create_note(&registry, &db, Some("base")).await;
+        let before = event_count(&db, &id).await;
+        let result = registry
+            .call(
+                db.clone(),
+                crate::mcp::Caller::local(),
+                "update_record",
+                json!({ "id": id, "name": "renamed", "body_append": "+", "reason": "both at once" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stored_body(&db, &id).await.as_deref(), Some("base+"));
+        assert_eq!(result["name"], json!("renamed"));
+        assert_eq!(event_count(&db, &id).await, before + 1);
+        let payload: String = sqlx::query_scalar(
+            "SELECT payload FROM content_events WHERE record_id=? AND type='record.updated' ORDER BY seq DESC LIMIT 1",
+        )
+        .bind(&id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        let payload: Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(payload["body"], json!("base+"));
+        assert_eq!(payload["name"], json!("renamed"));
+        assert_eq!(payload["reason"], json!("both at once"));
+        db.close().await;
+    }
+}
+
+#[cfg(all(test, feature = "mcp-executor-prototype"))]
+mod correction_spine_tests {
+    use super::*;
+    use crate::schema::SPINE_TYPES;
+
+    /// The direct `correct_record_type` tool only executes through a claimed
+    /// plan, so the closed-spine-type refusal in `correction_snapshot_in` is
+    /// reachable from the surface only via preparation. This drives the real
+    /// prepare entry point against a live database.
+    #[tokio::test]
+    async fn prepare_with_unknown_target_type_lists_the_closed_spine_set() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let mut registry = crate::mcp::ToolRegistry::new();
+        crate::mcp::register_surface_tools(&mut registry).unwrap();
+        let created = registry
+            .call(
+                db.clone(),
+                crate::mcp::Caller::local(),
+                "create_record",
+                json!({
+                    "type": "WorkItem",
+                    "kind": "task",
+                    "name": "subject",
+                    "reason": "Seed for an unknown-target-type refusal.",
+                }),
+            )
+            .await
+            .unwrap();
+        let record_id = created["id"].as_str().unwrap().to_string();
+        let err = prepare_correct_record_type(
+            &db,
+            &crate::mcp::Caller::local(),
+            json!({
+                "record_id": record_id,
+                "target_type": "Nope",
+                "target_kind": "note",
+                "reason": "Exercise the unknown-type refusal.",
+            }),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        for spine in SPINE_TYPES {
+            assert!(err.contains(spine), "refusal must name {spine}: {err}");
+        }
         db.close().await;
     }
 }

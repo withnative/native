@@ -130,6 +130,13 @@ pub const SPINE_TYPE_GLOSSES: [(&str, &str); 10] = [
     ),
 ];
 
+/// Inline-alternatives limit for governance failure messages. When the valid
+/// set holds this many entries or fewer, refusals and warnings name the
+/// alternatives inline; larger sets name the exact `schema_read`
+/// `preview_record_shape` / `manage_vocabularies.list_values` call instead.
+/// Sized at 10 so the closed spine-type set always lists inline.
+pub const GOVERNANCE_INLINE_ALTERNATIVES_LIMIT: usize = 10;
+
 /// Name-only compatibility projection for validation and schema enumeration.
 pub const SPINE_TYPES: [&str; 10] = [
     SPINE_TYPE_MEANINGS[0].name,
@@ -295,7 +302,7 @@ pub const ARCHIVED_FACET_KEY: &str = "archived";
 /// (new hard-shaped data lands as a new substrate primitive, not a new top-level
 /// type) and still conform; conformance requires presence, never absence, of
 /// tables.
-pub const REQUIRED_TABLES: [&str; 122] = [
+pub const REQUIRED_TABLES: [&str; 123] = [
     // Substrate primitives
     "content_events",
     "content_event_causal_frontier",
@@ -434,6 +441,7 @@ pub const REQUIRED_TABLES: [&str; 122] = [
     // physical drop. Recreating the tables restores structural conformance. The
     // `read-log-disposability` check holds the operational half of that split.
     "read_log_calls",
+    "read_log_record_ids",
     "read_log_touches",
 ];
 
@@ -690,7 +698,7 @@ pub fn ddl_sha256() -> String {
 /// support baseline must deliberately add its own fixture and fingerprint as
 /// part of the activation checklist in `docs/schema-migrations.md`.
 pub const FROZEN_DDL_SHA256: &str =
-    "86290c2beea87599feb867309ad2bde3a5154f15217114744ed4c765ca2a0c25";
+    "eb10e6879ffa1bdbac22289bd0d85d68ea75892d98c5bcc77a5594aeeefa9d7f";
 
 #[cfg(test)]
 mod tests {

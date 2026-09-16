@@ -997,3 +997,127 @@ async fn bootstrap_rejects_stale_pending_generation_without_partial_entries() {
         .unwrap()
         .is_empty());
 }
+
+#[tokio::test]
+async fn bootstrap_recovery_is_pre_call_discoverable_and_preserves_the_run_key() {
+    let registry = registry();
+    // Recovery guidance must be visible before the first bootstrap succeeds:
+    // a caller stranded by a transient failure only has tools/list.
+    let description = registry.get("bootstrap").unwrap().description.clone();
+    assert!(description.contains("retry at most twice"), "{description}");
+    assert!(description.contains("pool failure"), "{description}");
+    assert!(description.contains("Never retry auth"), "{description}");
+    assert!(
+        description.contains("Retain the run key once received"),
+        "{description}"
+    );
+
+    let db = create_database(":memory:").await.unwrap();
+    let member = Caller::authenticated("acct:recover");
+    let first = call(&registry, &db, member.clone(), "bootstrap", json!({})).await;
+    let key = first["run"]["run_key"].as_str().unwrap().to_string();
+    assert_eq!(first["session"]["run_key"].as_str().unwrap(), key);
+
+    let before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM control_events")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    // A retry that carries the key gets that same key echoed back rather than
+    // a fresh one, and the read-only bootstrap writes nothing durable either
+    // way — so a transient failure leaves no run behind to collide with.
+    let retry = call(
+        &registry,
+        &db,
+        member.clone(),
+        "bootstrap",
+        json!({"run_key": key}),
+    )
+    .await;
+    assert_eq!(retry["run"]["run_key"].as_str().unwrap(), key);
+    assert_eq!(retry["session"]["run_key"].as_str().unwrap(), key);
+    let after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM control_events")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(before, after);
+    let runs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_runs")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(runs, 0);
+
+    let text = render::render("bootstrap", &retry).unwrap();
+    assert!(
+        text.contains("retry bootstrap itself at most twice"),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn failed_first_bootstrap_then_no_key_retry_creates_no_durable_run() {
+    // Fault-injected first bootstrap: pool acquisition times out, so the
+    // caller never receives a key — the failure the bounded retry guidance
+    // covers. Bootstrap writes nothing durable either way, so neither the
+    // failure nor any no-key retry can leave a run behind to collide with.
+    let mut failing = ToolRegistry::new();
+    failing
+        .register(
+            native_ce::mcp::ToolKind::Bootstrap,
+            "failing bootstrap",
+            json!({"type":"object","properties":{},"additionalProperties":false}),
+            |_db: Db, _caller: Caller, _args: Value| async {
+                Err::<Value, native_ce::Error>(native_ce::Error::Sqlx(sqlx::Error::PoolTimedOut))
+            },
+        )
+        .unwrap();
+    let db = create_database(":memory:").await.unwrap();
+    let member = Caller::authenticated("acct:recover-fail");
+    let failure = failing
+        .call(db.clone(), member.clone(), "bootstrap", json!({}))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(failure.contains("pool"), "{failure}");
+    let runs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_runs")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(runs, 0);
+
+    // No-key retry (the caller never received a key) succeeds ...
+    let registry = registry();
+    let events_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM control_events")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    let first = call(&registry, &db, member.clone(), "bootstrap", json!({})).await;
+    let key = first["run"]["run_key"].as_str().unwrap().to_string();
+
+    // ... and a discarded-response retry — a second no-key bootstrap from a
+    // caller that never saw the first response — still creates no durable run
+    // and no control-event delta.
+    let second = call(&registry, &db, member.clone(), "bootstrap", json!({})).await;
+    assert!(second["run"]["run_key"].as_str().is_some());
+    let events_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM control_events")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(events_before, events_after);
+    let runs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_runs")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(runs, 0);
+
+    // A retry that does carry the received key gets that same key echoed back
+    // rather than a fresh one.
+    let carried = call(
+        &registry,
+        &db,
+        member.clone(),
+        "bootstrap",
+        json!({"run_key": key}),
+    )
+    .await;
+    assert_eq!(carried["run"]["run_key"].as_str().unwrap(), key);
+}

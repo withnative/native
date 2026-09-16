@@ -79,20 +79,24 @@ const PERMISSIONS_POLICY: &str = "camera=(), microphone=(), geolocation=(), disp
 /// cannot fabricate host navigation/slide messages by posting at the parent.
 const BOOTSTRAP: &str = r#"(()=>{"use strict";
 const HOST=__NATIVE_WORKBENCH_ORIGIN__, VERSION="native.html.bridge.v1";
-const apply=Reflect.apply,own=Object.getOwnPropertyDescriptor,parentOf=Object.getPrototypeOf,define=Object.defineProperty,freezeObject=Object.freeze,objectKeys=Object.keys,isFrozen=Object.isFrozen,NativeString=String;
+const apply=Reflect.apply,own=Object.getOwnPropertyDescriptor,parentOf=Object.getPrototypeOf,define=Object.defineProperty,freezeObject=Object.freeze,objectKeys=Object.keys,isFrozen=Object.isFrozen,NativeString=String,arrayPush=Array.prototype.push,arrayIndexOf=Array.prototype.indexOf,arraySplice=Array.prototype.splice;
 const getter=(proto,name)=>{for(let current=proto;current;current=parentOf(current)){const descriptor=own(current,name);if(descriptor?.get)return descriptor.get}};
 const read=(nativeGetter,value)=>apply(nativeGetter,value,[]),eventAdd=EventTarget.prototype.addEventListener,eventRemove=EventTarget.prototype.removeEventListener,eventPrevent=Event.prototype.preventDefault,eventStop=Event.prototype.stopImmediatePropagation,portPost=MessagePort.prototype.postMessage,portStart=MessagePort.prototype.start,elementClosest=Element.prototype.closest,elementAttribute=Element.prototype.getAttribute;
 const pristineEvent=new Event("native-html-bootstrap"),messageData=getter(MessageEvent.prototype,"data"),messageSource=getter(MessageEvent.prototype,"source"),messageOrigin=getter(MessageEvent.prototype,"origin"),messagePorts=getter(MessageEvent.prototype,"ports"),eventTarget=getter(Event.prototype,"target"),eventTrusted=own(pristineEvent,"isTrusted")?.get||getter(Event.prototype,"isTrusted"),eventPrevented=getter(Event.prototype,"defaultPrevented"),nodeType=getter(Node.prototype,"nodeType"),keyValue=getter(KeyboardEvent.prototype,"key"),shiftValue=getter(KeyboardEvent.prototype,"shiftKey"),pageTransitionPersisted=getter(PageTransitionEvent.prototype,"persisted");
 const listen=(target,type,listener,options)=>apply(eventAdd,target,[type,listener,options]),unlisten=(target,type,listener,options)=>apply(eventRemove,target,[type,listener,options]),prevent=event=>apply(eventPrevent,event,[]),stop=event=>apply(eventStop,event,[]),post=(port,value,transfer)=>apply(portPost,port,transfer?[value,transfer]:[value]),start=port=>apply(portStart,port,[]),isElement=value=>!!value&&read(nodeType,value)===1,attribute=(element,name)=>apply(elementAttribute,element,[name]),closest=(element,selector)=>apply(elementClosest,element,[selector]),trusted=event=>!!eventTrusted&&read(eventTrusted,event)===true,prevented=event=>!!eventPrevented&&read(eventPrevented,event)===true;
-let channel=null, initialized=false, current=0, slides=[], queued=[];
+let channel=null, initialized=false, current=0, slides=[], queued=[], heldInput, heldSeq=null, heldDigest, inputSubscribers=[];
 let resolveReady, rejectReady;
 const ready=new Promise((resolve,reject)=>{resolveReady=resolve;rejectReady=reject});
 const propose=intent=>{if(!intent||typeof intent!=="object"||Array.isArray(intent))throw new TypeError("artifact intent must be an object");send({version:VERSION,type:"intent",intent});};
-define(window,"nativeArtifact",{value:freezeObject({ready,propose}),writable:false,configurable:false});
+const pushValue=(array,value)=>apply(arrayPush,array,[value]),indexOfValue=(array,value)=>apply(arrayIndexOf,array,[value]),spliceValue=(array,start,deleteCount)=>apply(arraySplice,array,[start,deleteCount]);
+const onInput=callback=>{if(typeof callback!=="function")throw new TypeError("input subscriber must be a function");pushValue(inputSubscribers,callback);return()=>{const index=indexOfValue(inputSubscribers,callback);if(index>=0)spliceValue(inputSubscribers,index,1)}};
+define(window,"nativeArtifact",{value:freezeObject({ready,propose,onInput,get input(){return heldInput}}),writable:false,configurable:false});
 const bounded=value=>NativeString(value??"").slice(0,512);
-const send=value=>{if(channel)post(channel,value);else if(queued.length<32)queued.push(value)};
+const send=value=>{if(channel)post(channel,value);else if(queued.length<32)pushValue(queued,value)};
 const report=(code,detail={})=>send({version:VERSION,type:"diagnostic",code,detail});
 const freeze=value=>{if(value&&typeof value==="object"&&!isFrozen(value)){freezeObject(value);for(const key of objectKeys(value))freeze(value[key])}return value};
+const detailOf=error=>{let detail="";try{detail=error&&error.message||error}catch{detail=""}return bounded(detail)};
+const deliverInput=data=>{if(data?.version!==VERSION||!initialized||typeof data?.input_digest!=="string")return;const revision=data?.revision,seq=revision&&typeof revision==="object"?revision.content_event_seq:undefined;if(typeof seq!=="number")return;if(data.input_digest===heldDigest){send({version:VERSION,type:"input-applied",input_digest:data.input_digest});return}if(!(heldSeq==null||seq>heldSeq)){send({version:VERSION,type:"input-unhandled",input_digest:data.input_digest,reason:"stale"});return}let next;try{next=freeze(data.input)}catch(error){report("html_input_update_failed",{message:detailOf(error)});send({version:VERSION,type:"input-unhandled",input_digest:data.input_digest,reason:"freeze-failed"});return}if(!inputSubscribers.length){send({version:VERSION,type:"input-unhandled",input_digest:data.input_digest,reason:"no-subscriber"});return}heldInput=next;heldDigest=data.input_digest;heldSeq=seq;const delivery=freezeObject({input:next});let threw=false,failed="";const count=inputSubscribers.length;for(let index=0;index<count;index+=1){const subscriber=inputSubscribers[index];if(typeof subscriber!=="function")continue;try{apply(subscriber,undefined,[delivery])}catch(error){threw=true;failed=detailOf(error)}}if(threw){report("html_input_update_failed",{message:failed});send({version:VERSION,type:"input-unhandled",input_digest:data.input_digest,reason:"subscriber-threw"})}else send({version:VERSION,type:"input-applied",input_digest:data.input_digest})};
 for(const name of ["RTCPeerConnection","webkitRTCPeerConnection","mozRTCPeerConnection"]){try{define(globalThis,name,{value:undefined,writable:false,configurable:false})}catch{}}
 listen(window,"error",event=>report("html_runtime_error",{message:bounded(event.message),line:event.lineno||0,column:event.colno||0}),true);
 listen(window,"unhandledrejection",event=>report("html_runtime_error",{message:bounded(event.reason)}),true);
@@ -102,7 +106,7 @@ function show(index){if(!slides.length)return;current=Math.max(0,Math.min(index,
 function command(action){if(action==="first")show(0);else if(action==="previous")show(current-1);else if(action==="next")show(current+1);else if(action==="last")show(slides.length-1)}
 function setupSlides(){const deck=document.querySelector("main[data-native-deck]");if(!deck)return;slides=[...deck.children].filter(node=>node.matches("section[data-native-slide]"));show(0);listen(window,"keydown",event=>{const target=read(eventTarget,event),key=read(keyValue,event),shift=read(shiftValue,event);if(prevented(event)||interactive(target))return;const backwards=key==="ArrowLeft"||key==="PageUp"||(key===" "&&shift);const forwards=key==="ArrowRight"||key==="PageDown"||(key===" "&&!shift);if(backwards||forwards||key==="Home"||key==="End"){prevent(event);command(key==="Home"?"first":key==="End"?"last":backwards?"previous":"next")}},true)}
 listen(window,"click",event=>{if(!trusted(event)||prevented(event))return;const target=read(eventTarget,event),link=isElement(target)?closest(target,"[data-native-record-id],[data-native-external-url]"):null;if(!link)return;prevent(event);send({version:VERSION,type:"navigation",recordId:attribute(link,"data-native-record-id"),href:attribute(link,"data-native-external-url")})},true);
-function receive(event){const data=read(messageData,event),ports=read(messagePorts,event);if(initialized||read(messageSource,event)!==parent||read(messageOrigin,event)!==HOST||data?.type!=="native-html-init"||data?.version!==VERSION||ports.length!==1)return;stop(event);initialized=true;unlisten(window,"message",receive,true);channel=ports[0];listen(channel,"message",message=>{const commandData=read(messageData,message);if(commandData?.version===VERSION&&commandData?.type==="command"&&["first","previous","next","last"].includes(commandData.action))command(commandData.action)});start(channel);for(const item of queued)post(channel,item);queued=[];listen(window,"pagehide",event=>{if(trusted(event)&&read(pageTransitionPersisted,event)!==true)send({version:VERSION,type:"unloading"})},true);try{const input=freeze(data.input);setupSlides();resolveReady(freezeObject({input}));send({version:VERSION,type:"ready",profile:slides.length?"slides":"document",slides:slides.length})}catch(error){rejectReady(error);report("html_delivery_failed",{message:bounded(error)})}}
+function receive(event){const data=read(messageData,event),ports=read(messagePorts,event);if(initialized||read(messageSource,event)!==parent||read(messageOrigin,event)!==HOST||data?.type!=="native-html-init"||data?.version!==VERSION||ports.length!==1)return;stop(event);initialized=true;unlisten(window,"message",receive,true);channel=ports[0];listen(channel,"message",message=>{const commandData=read(messageData,message);if(commandData?.version!==VERSION)return;if(commandData?.type==="command"&&["first","previous","next","last"].includes(commandData.action))command(commandData.action);else if(commandData?.type==="input")deliverInput(commandData)});start(channel);for(const item of queued)post(channel,item);queued=[];listen(window,"pagehide",event=>{if(trusted(event)&&read(pageTransitionPersisted,event)!==true)send({version:VERSION,type:"unloading"})},true);try{const input=freeze(data.input);heldInput=input;if(typeof data.input_digest==="string")heldDigest=data.input_digest;const initRevision=data.revision;if(initRevision&&typeof initRevision==="object"&&typeof initRevision.content_event_seq==="number")heldSeq=initRevision.content_event_seq;setupSlides();resolveReady(freezeObject({input}));send({version:VERSION,type:"ready",profile:slides.length?"slides":"document",slides:slides.length})}catch(error){rejectReady(error);report("html_delivery_failed",{message:bounded(error)})}}
 listen(window,"message",receive,true);
 const hostPost=parent.postMessage;apply(hostPost,parent,[{type:"native-html-bootstrap",version:VERSION},HOST]);
 })();"#;
@@ -2020,6 +2024,29 @@ mod tests {
         let failure = validate(&located).unwrap_err();
         assert!(failure.details["line"].as_u64().unwrap() > 1);
         assert!(failure.details["column"].as_u64().unwrap() > 0);
+    }
+
+    #[test]
+    fn bootstrap_carries_the_in_place_input_update_surface() {
+        // String-level, like `bootstrap_order_...`: the bridge keeps every
+        // existing message untouched and only adds the subscriber API plus
+        // the additive input delivery acknowledgements.
+        assert!(BOOTSTRAP.contains("onInput"));
+        assert!(BOOTSTRAP.contains("get input()"));
+        assert!(BOOTSTRAP.contains("input-unhandled"));
+        assert!(BOOTSTRAP.contains("input-applied"));
+        assert!(BOOTSTRAP.contains("no-subscriber"));
+        assert!(BOOTSTRAP.contains("subscriber-threw"));
+        assert!(BOOTSTRAP.contains("html_input_update_failed"));
+        assert!(BOOTSTRAP.contains("input_digest"));
+        assert!(BOOTSTRAP.contains("content_event_seq"));
+        assert!(BOOTSTRAP.contains("stale"));
+        assert!(BOOTSTRAP.contains("freeze-failed"));
+        assert!(BOOTSTRAP.contains("Array.prototype.push"));
+        assert!(BOOTSTRAP.contains("Array.prototype.indexOf"));
+        assert!(BOOTSTRAP.contains("Array.prototype.splice"));
+        assert!(BOOTSTRAP.contains("native-html-init"));
+        assert!(BOOTSTRAP.contains("VERSION"));
     }
 
     #[test]

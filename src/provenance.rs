@@ -560,6 +560,12 @@ fn action_arguments(operation: &str, arguments: &Value) -> Value {
         for key in ["run_key", "parent_key", "agent_key"] {
             object.remove(key);
         }
+        // Response shaping is presentation-only. It must not change the
+        // governed action identity or make an idempotent create conflict when
+        // a retry asks for the other representation.
+        if operation == "create_record" || operation == "update_record" {
+            object.remove("response_mode");
+        }
         if operation == "manage_relationships" {
             if let Some(key) = object.get_mut("idempotency_key") {
                 if let Some(value) = key.as_str() {

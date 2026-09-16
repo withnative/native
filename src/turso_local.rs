@@ -59,6 +59,26 @@ const TURSO_RUNTIME_TOPOLOGY_DDL_V2: &str = "CREATE TABLE _native_turso_runtime 
 const TURSO_RUNTIME_TOPOLOGY_DDL_V3: &str = "CREATE TABLE _native_turso_runtime (singleton INTEGER PRIMARY KEY CHECK (singleton = 1), logical_database_id TEXT NOT NULL UNIQUE, profile_revision INTEGER NOT NULL CHECK (profile_revision = 3))";
 const TURSO_RUNTIME_TOPOLOGY_DDL: &str = "CREATE TABLE _native_turso_runtime (singleton INTEGER PRIMARY KEY CHECK (singleton = 1), logical_database_id TEXT NOT NULL UNIQUE, profile_revision INTEGER NOT NULL CHECK (profile_revision = 4))";
 const TURSO_FACET_VALUES_DDL: &str = "CREATE TABLE facet_values (id TEXT PRIMARY KEY, record_id TEXT NOT NULL REFERENCES records (id) ON DELETE CASCADE, \"key\" TEXT NOT NULL, value TEXT, value_num REAL, vocab_ref TEXT, created_at TEXT NOT NULL DEFAULT (strftime ('%Y-%m-%dT%H:%M:%fZ', 'now')), UNIQUE (record_id, \"key\"))";
+/// Current engine `read_log_touches` physical form. turso_core 0.7.2
+/// `translate/index.rs` refuses `CREATE INDEX` on WITHOUT ROWID (and insert/
+/// delete refuse FKs and DELETE on that layout), so Turso keeps the rowid
+/// table. Physical columns match SQLite engine 55 internment: dictionary
+/// `record_ref`, FK to `read_log_record_ids` (no `ON DELETE CASCADE`, no FK
+/// to `records`), FK to `read_log_calls(seq) ON DELETE CASCADE`, and
+/// `idx_read_log_touches_record` on `(record_ref, call_seq)`. This is a DDL
+/// substitution on the existing install_schema /
+/// compiled_runtime_schema_definition seam, not a new overlay identity and
+/// not turso's experimental `enable_without_rowid` gate. Released engines
+/// 51–53 still store TEXT `record_id` on this rowid table; 53→54 copies.
+/// Canonical interchange is not implemented on this adapter; SQLite export
+/// owns decoding interned rows to logical TEXT `record_id`.
+const TURSO_READ_LOG_TOUCHES_DDL: &str = r#"CREATE TABLE read_log_touches (
+     call_seq     INTEGER NOT NULL REFERENCES read_log_calls(seq) ON DELETE CASCADE,
+     record_ref   INTEGER NOT NULL REFERENCES read_log_record_ids(record_ref),
+     interaction  TEXT NOT NULL CHECK (interaction IN ('surfaced','opened','mutated')),
+     result_rank  INTEGER,
+     PRIMARY KEY (call_seq, record_ref, interaction)
+   )"#;
 const TURSO_RUN_CONTEXTS_DDL: &str = "CREATE TABLE run_contexts (run_key TEXT PRIMARY KEY, intent TEXT, agent_key TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (strftime ('%Y-%m-%dT%H:%M:%fZ', 'now')), updated_at TEXT NOT NULL DEFAULT (strftime ('%Y-%m-%dT%H:%M:%fZ', 'now')))";
 const TURSO_REQUIRED_RUNTIME_TABLES: [&str; 33] = [
     "content_events",
@@ -1130,7 +1150,7 @@ fn preflight_existing_runtime(path: &Path) -> Result<()> {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(|_| Error::engine("existing Turso-local file failed read-only preflight"))?;
-    if !matches!(version, 45..=49 | crate::CURRENT_ENGINE_SCHEMA_VERSION) {
+    if !(45..=crate::CURRENT_ENGINE_SCHEMA_VERSION).contains(&version) {
         return Err(Error::engine(format!(
             "Turso-local schema version {version} is not supported (required current version {})",
             crate::CURRENT_ENGINE_SCHEMA_VERSION
@@ -1139,51 +1159,86 @@ fn preflight_existing_runtime(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Keep the shared 45→46 table definitions, copy projections and additive
+/// statements, but use Turso's safe create/copy/drop/rename rebuild order.
+/// Renaming the old parent would rewrite incoming FKs despite the unsupported
+/// legacy_alter_table pragma. The event AUTOINCREMENT high-water mark can be
+/// above MAX(seq) after historical deletions and must survive the rebuild.
+fn turso_engine_45_to_46_statements(high_water: i64) -> Result<Vec<String>> {
+    let fail = || Error::engine("Turso-local engine-46 migration statement failed");
+    if high_water < 0 {
+        return Err(fail());
+    }
+    let shared = &crate::migrations::ENGINE_45_TO_46_STATEMENTS;
+    let mut result = Vec::new();
+    for (start, table) in [(0, "content_events"), (6, "replicated_message_provenance")] {
+        let old = format!("{table}_v45");
+        let replacement = format!("{table}_v46");
+        if shared[start] != format!("ALTER TABLE {table} RENAME TO {old}")
+            || shared[start + 3] != format!("DROP TABLE {old}")
+        {
+            return Err(fail());
+        }
+        let definition = shared[start + 1]
+            .strip_prefix(format!("CREATE TABLE {table} ").as_str())
+            .ok_or_else(fail)?;
+        let projection = shared[start + 2]
+            .strip_prefix(format!("INSERT INTO {table}").as_str())
+            .and_then(|copy| copy.strip_suffix(format!("FROM {old}").as_str()))
+            .ok_or_else(fail)?;
+        result.push(format!("CREATE TABLE {replacement} {definition}"));
+        result.push(format!("INSERT INTO {replacement}{projection}FROM {table}"));
+        result.push(format!("DROP TABLE {table}"));
+        result.push(format!("ALTER TABLE {replacement} RENAME TO {table}"));
+        if table == "content_events" {
+            result.push(format!(
+                "UPDATE sqlite_sequence SET seq=MAX(seq,{high_water}) WHERE name='content_events'"
+            ));
+            result.push(format!(
+                "INSERT INTO sqlite_sequence(name,seq) SELECT 'content_events',{high_water} WHERE NOT EXISTS (SELECT 1 FROM sqlite_sequence WHERE name='content_events')"
+            ));
+            result.extend(shared[4..6].iter().map(|statement| (*statement).to_owned()));
+        }
+    }
+    result.extend(shared[10..].iter().map(|statement| (*statement).to_owned()));
+    Ok(result)
+}
+
 /// Error-label convention for the shared 45-to-46 and 46-to-47 edges: statement
 /// failures use bare stable labels named for the target schema (`engine-46` and
 /// `engine-47`), without driver detail or statement text. Keep those labels
 /// byte-stable; change either only deliberately, with test cover asserting the
 /// new text. Other migration rungs retain their own established error mapping.
 async fn migrate_existing_engine_schema(connection: &turso::Connection) -> Result<()> {
-    let version = scalar_i64(connection, "PRAGMA user_version").await?;
+    let mut version = scalar_i64(connection, "PRAGMA user_version").await?;
     if version == crate::CURRENT_ENGINE_SCHEMA_VERSION {
         return Ok(());
     }
-    if !matches!(version, 45..=49) {
+    if !(45..crate::CURRENT_ENGINE_SCHEMA_VERSION).contains(&version) {
         return Err(Error::engine(format!(
             "Turso-local schema version {version} is not supported"
         )));
     }
 
-    connection
-        .execute("PRAGMA foreign_keys=OFF", ())
-        .await
-        .map_err(|_| Error::engine("cannot disable Turso-local migration foreign keys"))?;
-    connection
-        .execute("BEGIN IMMEDIATE", ())
-        .await
-        .map_err(|_| Error::engine("cannot begin Turso-local engine migration"))?;
-    let migration = async {
+    if version <= 51 {
+        connection
+            .execute("PRAGMA foreign_keys=OFF", ())
+            .await
+            .map_err(|_| Error::engine("cannot disable Turso-local migration foreign keys"))?;
+        connection
+            .execute("BEGIN IMMEDIATE", ())
+            .await
+            .map_err(|_| Error::engine("cannot begin Turso-local engine migration"))?;
+        let migration = async {
         if version == 45 {
-            // Migration statement errors name the target schema reached by
-            // this sequence.
-            connection
-                .execute("PRAGMA legacy_alter_table=ON", ())
-                .await
-                .map_err(|_| {
-                    Error::engine("Turso-local engine-46 migration statement failed")
-                })?;
-            for statement in crate::migrations::ENGINE_45_TO_46_STATEMENTS {
-                connection.execute(statement, ()).await.map_err(|_| {
+            let high_water = scalar_i64(connection,
+                "SELECT COALESCE(MAX(seq),0) FROM sqlite_sequence WHERE name='content_events'"
+            ).await.map_err(|_| Error::engine("Turso-local engine-46 migration statement failed"))?;
+            for statement in turso_engine_45_to_46_statements(high_water)? {
+                connection.execute(&statement, ()).await.map_err(|_| {
                     Error::engine("Turso-local engine-46 migration statement failed")
                 })?;
             }
-            connection
-                .execute("PRAGMA legacy_alter_table=OFF", ())
-                .await
-                .map_err(|_| {
-                    Error::engine("Turso-local engine-46 migration statement failed")
-                })?;
         }
         if version <= 48 {
             for statement in crate::migrations::ENGINE_46_TO_47_STATEMENTS {
@@ -1225,11 +1280,19 @@ async fn migrate_existing_engine_schema(connection: &turso::Connection) -> Resul
                 .await
                 .map_err(|_| Error::engine("Turso-local engine-49 migration statement failed"))?;
         }
-        for statement in [
-            "PRAGMA legacy_alter_table=ON",
-            "ALTER TABLE provenance_action_attestations RENAME TO provenance_action_attestations_v49",
-            crate::schema::ddl::PROVENANCE_ACTION_ATTESTATIONS_DDL,
-            r#"INSERT INTO provenance_action_attestations
+        if version <= 49 {
+            // Turso does not honor legacy_alter_table: renaming the referenced
+            // old table rewrites dependent FKs to the disposable name. Create
+            // the replacement first, copy, drop the old canonical table with
+            // enforcement off, then rename only the replacement. Its DDL has
+            // no self-FK; its interaction-receipt FK retains the canonical target.
+            let definition = crate::schema::ddl::PROVENANCE_ACTION_ATTESTATIONS_DDL
+                .strip_prefix("CREATE TABLE provenance_action_attestations ")
+                .ok_or_else(|| Error::engine("unexpected provenance attestation DDL prefix"))?;
+            let replacement = format!("CREATE TABLE provenance_action_attestations_v50 {definition}");
+            for statement in [
+                replacement.as_str(),
+            r#"INSERT INTO provenance_action_attestations_v50
                  (id,schema_version,principal,executor_kind,channel,executor_ref,
                   delegation_ref,interaction_receipt_id,operation,action_commitment,
                   action_digest,output_event_set_digest,issuer,issuer_origin_database_id,
@@ -1238,8 +1301,9 @@ async fn migrate_existing_engine_schema(connection: &turso::Connection) -> Resul
                       delegation_ref,interaction_receipt_id,operation,action_commitment,
                       action_digest,output_event_set_digest,issuer,issuer_origin_database_id,
                       issued_at,command_identity_digest,intent_digest
-                 FROM provenance_action_attestations_v49"#,
-            "DROP TABLE provenance_action_attestations_v49",
+                 FROM provenance_action_attestations"#,
+            "DROP TABLE provenance_action_attestations",
+            "ALTER TABLE provenance_action_attestations_v50 RENAME TO provenance_action_attestations",
             "CREATE INDEX idx_provenance_action_principal ON provenance_action_attestations(principal, issued_at, id)",
             "CREATE INDEX idx_provenance_action_command ON provenance_action_attestations(principal, operation, command_identity_digest) WHERE command_identity_digest IS NOT NULL",
             r#"CREATE TRIGGER provenance_action_attestations_no_update
@@ -1248,25 +1312,378 @@ async fn migrate_existing_engine_schema(connection: &turso::Connection) -> Resul
             r#"CREATE TRIGGER provenance_action_attestations_no_delete
                  BEFORE DELETE ON provenance_action_attestations
                  BEGIN SELECT RAISE(ABORT, 'provenance_action_attestations is append-only'); END"#,
-            "PRAGMA legacy_alter_table=OFF",
+            ] {
+                connection.execute(statement, ()).await.map_err(|error| {
+                    Error::engine(format!(
+                        "Turso-local engine-50 attribution migration failed: {error}; statement: {statement}"
+                    ))
+                })?;
+            }
+            for statement in crate::schema::ddl::ENGINE_50_WEBHOOK_DDL {
+                connection.execute(statement, ()).await.map_err(|error| {
+                    Error::engine(format!(
+                        "Turso-local engine-50 webhook migration failed: {error}; statement: {statement}"
+                    ))
+                })?;
+            }
+            connection
+                .execute("PRAGMA user_version=50", ())
+                .await
+                .map_err(|_| Error::engine("Turso-local engine-50 migration statement failed"))?;
+        }
+        if version <= 50 {
+            connection
+                .execute(
+                    "ALTER TABLE read_log_calls ADD COLUMN result_annotation TEXT CHECK (result_annotation IS NULL OR json_valid(result_annotation))",
+                    (),
+                )
+                .await
+                .map_err(|error| {
+                    Error::engine(format!(
+                        "Turso-local engine-51 read-log migration failed: {error}"
+                    ))
+                })?;
+            connection
+                .execute(
+                    "CREATE INDEX idx_read_log_calls_overlap_annotation ON read_log_calls(actor, ended_at, seq) WHERE result_annotation IS NOT NULL",
+                    (),
+                )
+                .await
+                .map_err(|error| {
+                    Error::engine(format!(
+                        "Turso-local engine-51 read-log index migration failed: {error}"
+                    ))
+                })?;
+        }
+        // SQLite 51→52 rebuilds touches WITHOUT ROWID and 52→53 vacuums.
+        // turso_core 0.7.2 cannot host that physical layout, so Turso keeps
+        // the released TEXT rowid table and only advances the version stamp.
+        // This stamp is not the dictionary conversion: released files still
+        // store exact TEXT `record_id` through 53. Engine 53→54 copies below.
+        connection
+            .execute("PRAGMA user_version=53", ())
+            .await
+            .map_err(|_| Error::engine("Turso-local engine-53 migration statement failed"))?;
+        Ok::<_, Error>(())
+    }
+    .await;
+        if let Err(error) = migration {
+            let _ = connection.execute("ROLLBACK", ()).await;
+            let _ = connection.execute("PRAGMA foreign_keys=ON", ()).await;
+            return Err(error);
+        }
+        connection
+            .execute("COMMIT", ())
+            .await
+            .map_err(|_| Error::engine("cannot commit Turso-local engine migration"))?;
+        connection
+            .execute("PRAGMA foreign_keys=ON", ())
+            .await
+            .map_err(|_| Error::engine("cannot restore Turso-local migration foreign keys"))?;
+        version = 53;
+    }
+
+    if version == 52 {
+        connection
+            .execute("BEGIN IMMEDIATE", ())
+            .await
+            .map_err(|_| Error::engine("cannot begin Turso-local engine-53 version stamp"))?;
+        if let Err(error) = connection.execute("PRAGMA user_version=53", ()).await {
+            let _ = connection.execute("ROLLBACK", ()).await;
+            return Err(Error::engine(format!(
+                "Turso-local engine-53 migration statement failed: {error}"
+            )));
+        }
+        connection
+            .execute("COMMIT", ())
+            .await
+            .map_err(|_| Error::engine("cannot commit Turso-local engine-53 version stamp"))?;
+        version = 53;
+    }
+
+    if version == 53 {
+        migrate_engine_53_to_54_read_log_dictionary(connection).await?;
+        version = 54;
+    }
+
+    if version == 54 {
+        // SQLite 54→55 vacuums interned pages; turso_core has no equivalent
+        // compaction gate on this adapter (the same reason 52→53 was stamp-only).
+        connection
+            .execute("BEGIN IMMEDIATE", ())
+            .await
+            .map_err(|_| Error::engine("cannot begin Turso-local engine-55 version stamp"))?;
+        if let Err(error) = connection.execute("PRAGMA user_version=55", ()).await {
+            let _ = connection.execute("ROLLBACK", ()).await;
+            return Err(Error::engine(format!(
+                "Turso-local engine-55 migration statement failed: {error}"
+            )));
+        }
+        connection
+            .execute("COMMIT", ())
+            .await
+            .map_err(|_| Error::engine("cannot commit Turso-local engine-55 version stamp"))?;
+    }
+
+    Ok(())
+}
+
+/// turso_core 0.7.2 silently ignores `PRAGMA foreign_key_check` and has no
+/// table-valued equivalent. Inspect supported FK metadata instead, then look
+/// for a violating child row for each complete constraint. A NULL in any
+/// child component exempts that row (SQLite MATCH SIMPLE semantics). Parent
+/// columns stay on the left; unary + removes child affinity so the parent's
+/// affinity and collation govern equality, including composite constraints.
+/// Implicit parent-PK references are outside the released schema and are
+/// refused rather than guessing their column order. Metadata/query failures
+/// are fatal. All row cursors are dropped before returning to migration DDL.
+async fn validate_turso_foreign_keys(
+    connection: &turso::Connection,
+) -> Result<BTreeMap<String, usize>> {
+    fn identifier(value: &str) -> String {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    }
+    let inspect_error = || Error::engine("cannot inspect Turso-local foreign-key metadata");
+    let mut tables = Vec::new();
+    {
+        let mut rows = connection
+            .query("SELECT name FROM sqlite_schema WHERE type='table'", ())
+            .await
+            .map_err(|_| inspect_error())?;
+        while let Some(row) = rows.next().await.map_err(|_| inspect_error())? {
+            tables.push(row.get::<String>(0).map_err(|_| inspect_error())?);
+        }
+    }
+    if tables.is_empty() {
+        return Err(inspect_error());
+    }
+    let mut validated = BTreeMap::new();
+    for table in tables {
+        type ForeignKeyColumns = BTreeMap<i64, (String, String)>;
+        let mut constraints: BTreeMap<i64, (String, ForeignKeyColumns)> = BTreeMap::new();
+        {
+            let mut rows = connection
+                .query(
+                    &format!("PRAGMA foreign_key_list({})", identifier(&table)),
+                    (),
+                )
+                .await
+                .map_err(|_| inspect_error())?;
+            // Unknown pragmas can silently yield no rows. Require the
+            // supported metadata result shape even for a table with no FKs.
+            if rows.column_names()
+                != [
+                    "id",
+                    "seq",
+                    "table",
+                    "from",
+                    "to",
+                    "on_update",
+                    "on_delete",
+                    "match",
+                ]
+            {
+                return Err(inspect_error());
+            }
+            while let Some(row) = rows.next().await.map_err(|_| inspect_error())? {
+                let id: i64 = row.get(0).map_err(|_| inspect_error())?;
+                let seq: i64 = row.get(1).map_err(|_| inspect_error())?;
+                let parent: String = row.get(2).map_err(|_| inspect_error())?;
+                let child_column: String = row.get(3).map_err(|_| inspect_error())?;
+                let parent_column: String = row.get(4).map_err(|_| {
+                    Error::engine(
+                        "Turso-local foreign-key validation requires explicit parent columns",
+                    )
+                })?;
+                if parent_column.is_empty() {
+                    return Err(Error::engine(
+                        "Turso-local foreign-key validation requires explicit parent columns",
+                    ));
+                }
+                let matching: String = row.get(7).map_err(|_| inspect_error())?;
+                if id < 0 || seq < 0 || !matches!(matching.as_str(), "NONE" | "SIMPLE") {
+                    return Err(inspect_error());
+                }
+                let (constraint_parent, columns) = constraints
+                    .entry(id)
+                    .or_insert_with(|| (parent.clone(), BTreeMap::new()));
+                if *constraint_parent != parent
+                    || columns.insert(seq, (child_column, parent_column)).is_some()
+                {
+                    return Err(inspect_error());
+                }
+            }
+        }
+        validated.insert(table.clone(), constraints.len());
+        for (id, (parent, columns)) in constraints {
+            if columns.keys().copied().ne(0..columns.len() as i64) {
+                return Err(inspect_error());
+            }
+            let non_null = columns
+                .values()
+                .map(|(child, _)| format!("c.{} IS NOT NULL", identifier(child)))
+                .collect::<Vec<_>>()
+                .join(" AND ");
+            let equal = columns
+                .values()
+                .map(|(child, parent)| {
+                    format!("p.{} = +c.{}", identifier(parent), identifier(child))
+                })
+                .collect::<Vec<_>>()
+                .join(" AND ");
+            let sql = format!(
+                "SELECT 1 FROM {} c WHERE {non_null} AND NOT EXISTS (SELECT 1 FROM {} p WHERE {equal}) LIMIT 1",
+                identifier(&table), identifier(&parent)
+            );
+            let mut rows = connection.query(&sql, ()).await.map_err(|error| {
+                Error::engine(format!(
+                    "Turso-local foreign-key validation query failed: {error}"
+                ))
+            })?;
+            if rows.next().await.map_err(|_| inspect_error())?.is_some() {
+                return Err(Error::engine(format!(
+                    "Turso-local foreign-key violation in table {table}, constraint {id}"
+                )));
+            }
+        }
+    }
+    Ok(validated)
+}
+
+/// Intern exact historical `record_id` strings into `read_log_record_ids` and
+/// rebuild `read_log_touches` on `record_ref`. SQLite 53→54 keeps the
+/// rebuilt table WITHOUT ROWID; this adapter keeps the current rowid
+/// overlay. Decoded equality and FK checks run before commit, using TEXT
+/// `record_id` as the stable logical identity and sort key.
+async fn migrate_engine_53_to_54_read_log_dictionary(connection: &turso::Connection) -> Result<()> {
+    connection
+        .execute("PRAGMA foreign_keys=OFF", ())
+        .await
+        .map_err(|_| Error::engine("cannot disable Turso-local migration foreign keys"))?;
+    connection
+        .execute("BEGIN IMMEDIATE", ())
+        .await
+        .map_err(|_| Error::engine("cannot begin Turso-local engine-54 migration"))?;
+    let migration = async {
+        connection
+            .execute("PRAGMA legacy_alter_table=ON", ())
+            .await
+            .map_err(|error| {
+                Error::engine(format!(
+                    "Turso-local engine-54 migration statement failed: {error}; statement: PRAGMA legacy_alter_table=ON"
+                ))
+            })?;
+        for statement in [
+            "ALTER TABLE read_log_touches RENAME TO read_log_touches_v53",
+            "CREATE TABLE read_log_record_ids (record_ref INTEGER PRIMARY KEY, record_id TEXT NOT NULL UNIQUE)",
+            // Ascending exact strings assign ascending references. Logical
+            // order stays TEXT `record_id`, not interned `record_ref`.
+            "INSERT INTO read_log_record_ids (record_id) SELECT DISTINCT record_id FROM read_log_touches_v53 ORDER BY record_id",
+            TURSO_READ_LOG_TOUCHES_DDL,
+            "INSERT INTO read_log_touches (call_seq, record_ref, interaction, result_rank) SELECT t.call_seq, d.record_ref, t.interaction, t.result_rank FROM read_log_touches_v53 t JOIN read_log_record_ids d ON d.record_id=t.record_id ORDER BY t.call_seq, t.record_id, t.interaction",
         ] {
             connection.execute(statement, ()).await.map_err(|error| {
                 Error::engine(format!(
-                    "Turso-local engine-50 attribution migration failed: {error}; statement: {statement}"
+                    "Turso-local engine-54 migration statement failed: {error}; statement: {statement}"
                 ))
             })?;
         }
-        for statement in crate::schema::ddl::ENGINE_50_WEBHOOK_DDL {
-            connection.execute(statement, ()).await.map_err(|error| {
+        for comparison in [
+            "SELECT call_seq, record_id, interaction, result_rank FROM read_log_touches_v53 EXCEPT SELECT t.call_seq, d.record_id, t.interaction, t.result_rank FROM read_log_touches t JOIN read_log_record_ids d ON d.record_ref=t.record_ref LIMIT 1",
+            "SELECT t.call_seq, d.record_id, t.interaction, t.result_rank FROM read_log_touches t JOIN read_log_record_ids d ON d.record_ref=t.record_ref EXCEPT SELECT call_seq, record_id, interaction, result_rank FROM read_log_touches_v53 LIMIT 1",
+        ] {
+            let mut rows = connection.query(comparison, ()).await.map_err(|error| {
                 Error::engine(format!(
-                    "Turso-local engine-50 webhook migration failed: {error}; statement: {statement}"
+                    "Turso-local engine-54 decoded-equality check failed: {error}; statement: {comparison}"
                 ))
             })?;
+            // Turso accepts top-level EXCEPT but not a compound SELECT
+            // inside EXISTS. Any returned row witnesses a decoded difference.
+            if rows
+                .next()
+                .await
+                .map_err(|error| {
+                    Error::engine(format!(
+                        "Turso-local engine-54 decoded-equality check failed: {error}; statement: {comparison}"
+                    ))
+                })?
+                .is_some()
+            {
+                return Err(Error::engine(
+                    "Turso-local engine-54 read-log dictionary migration changed decoded touches",
+                ));
+            }
+        }
+        let validated_foreign_keys = validate_turso_foreign_keys(connection).await?;
+        if validated_foreign_keys.get("read_log_touches") != Some(&2) {
+            return Err(Error::engine(
+                "Turso-local foreign-key metadata omitted the rebuilt touch constraints",
+            ));
+        }
+        for dangling in [
+            "SELECT COUNT(*) FROM read_log_touches t WHERE NOT EXISTS (SELECT 1 FROM read_log_calls c WHERE c.seq = t.call_seq)",
+            "SELECT COUNT(*) FROM read_log_touches t WHERE NOT EXISTS (SELECT 1 FROM read_log_record_ids d WHERE d.record_ref = t.record_ref)",
+        ] {
+            let mut rows = connection.query(dangling, ()).await.map_err(|error| {
+                Error::engine(format!(
+                    "Turso-local engine-54 foreign-key check failed: {error}; statement: {dangling}"
+                ))
+            })?;
+            let row = rows
+                .next()
+                .await
+                .map_err(|error| {
+                    Error::engine(format!(
+                        "Turso-local engine-54 foreign-key check failed: {error}; statement: {dangling}"
+                    ))
+                })?
+                .ok_or_else(|| {
+                    Error::engine(format!(
+                        "Turso-local engine-54 foreign-key check returned no row; statement: {dangling}"
+                    ))
+                })?;
+            let count: i64 = row.get(0).map_err(|_| {
+                Error::engine(
+                    "Turso-local engine-54 foreign-key check returned an invalid value",
+                )
+            })?;
+            if count != 0 {
+                return Err(Error::engine(format!(
+                    "Turso-local engine-54 read-log dictionary left {count} dangling foreign-key row(s)"
+                )));
+            }
         }
         connection
-            .execute("PRAGMA user_version=50", ())
+            .execute("DROP TABLE read_log_touches_v53", ())
             .await
-            .map_err(|_| Error::engine("Turso-local engine-50 migration statement failed"))?;
+            .map_err(|error| {
+                Error::engine(format!(
+                    "Turso-local engine-54 migration statement failed: {error}; statement: DROP TABLE read_log_touches_v53"
+                ))
+            })?;
+        connection
+            .execute(
+                "CREATE INDEX idx_read_log_touches_record ON read_log_touches(record_ref, call_seq)",
+                (),
+            )
+            .await
+            .map_err(|error| {
+                Error::engine(format!(
+                    "Turso-local engine-54 migration statement failed: {error}; statement: CREATE INDEX idx_read_log_touches_record ON read_log_touches(record_ref, call_seq)"
+                ))
+            })?;
+        connection
+            .execute("PRAGMA legacy_alter_table=OFF", ())
+            .await
+            .map_err(|error| {
+                Error::engine(format!(
+                    "Turso-local engine-54 migration statement failed: {error}; statement: PRAGMA legacy_alter_table=OFF"
+                ))
+            })?;
+        connection
+            .execute("PRAGMA user_version=54", ())
+            .await
+            .map_err(|_| Error::engine("Turso-local engine-54 migration statement failed"))?;
         Ok::<_, Error>(())
     }
     .await;
@@ -1278,7 +1695,7 @@ async fn migrate_existing_engine_schema(connection: &turso::Connection) -> Resul
     connection
         .execute("COMMIT", ())
         .await
-        .map_err(|_| Error::engine("cannot commit Turso-local engine migration"))?;
+        .map_err(|_| Error::engine("cannot commit Turso-local engine-54 migration"))?;
     connection
         .execute("PRAGMA foreign_keys=ON", ())
         .await
@@ -1288,6 +1705,10 @@ async fn migrate_existing_engine_schema(connection: &turso::Connection) -> Resul
 
 fn sqlite_fts_statement(statement: &str) -> bool {
     statement.contains("records_fts") || statement.contains("records_name_idx")
+}
+
+fn sqlite_without_rowid_touches_statement(statement: &str) -> bool {
+    statement.contains("CREATE TABLE read_log_touches") && statement.contains("WITHOUT ROWID")
 }
 
 async fn install_schema(connection: &turso::Connection, logical_database_id: &str) -> Result<()> {
@@ -1306,6 +1727,8 @@ async fn install_schema(connection: &turso::Connection, logical_database_id: &st
             }
             let statement = if statement.contains("GENERATED ALWAYS AS") {
                 TURSO_FACET_VALUES_DDL
+            } else if sqlite_without_rowid_touches_statement(statement) {
+                TURSO_READ_LOG_TOUCHES_DDL
             } else {
                 statement
             };
@@ -1870,6 +2293,9 @@ fn compiled_runtime_schema_definition(object_type: &str, name: &str) -> Result<&
     }
     if object_type == "table" && name == "run_contexts" {
         return Ok(TURSO_RUN_CONTEXTS_DDL);
+    }
+    if object_type == "table" && name == "read_log_touches" {
+        return Ok(TURSO_READ_LOG_TOUCHES_DDL);
     }
     crate::schema::DDL_STATEMENTS
         .iter()
@@ -5605,9 +6031,10 @@ async fn correction_snapshot(
     if !crate::schema::SPINE_TYPES.contains(&args.target_type.as_str())
         || args.target_kind.trim().is_empty()
     {
-        return Err(Error::engine(
-            "correct_record_type: target_type must be a closed spine type and target_kind must be non-empty",
-        ));
+        return Err(Error::engine(format!(
+            "correct_record_type: target_type must be a closed spine type ({}) and target_kind must be non-empty",
+            crate::schema::SPINE_TYPES.join(", "),
+        )));
     }
     let rows = correction_rows(
         transaction,
@@ -6348,6 +6775,183 @@ struct CreateRecordArguments {
     links: Option<Vec<NewLink>>,
     addressed_to: Option<Vec<String>>,
     reason: String,
+    #[serde(default)]
+    response_mode: ResponseMode,
+}
+
+/// Single-record write presentation is portable even though this adapter does
+/// not mint display references. Multi-update retains its established receipt
+/// and rejects this field through its separate strict argument type.
+#[derive(Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ResponseMode {
+    #[default]
+    Summary,
+    Verbose,
+}
+
+struct CompactWriteReceipt {
+    version_seq: i64,
+    previous_seq: Option<i64>,
+    body_receipt: Option<Value>,
+}
+
+fn summarize_write_receipt(result: Value, write: CompactWriteReceipt) -> Result<Value> {
+    const REQUIRED: [&str; 6] = [
+        "id",
+        "type",
+        "kind",
+        "name",
+        "body_digest",
+        "lifecycle_interpretation",
+    ];
+    const OPTIONAL_RECEIPTS: [&str; 7] = [
+        "previous_seq",
+        "body_receipt",
+        "html_body_write",
+        "delivery",
+        "action_attestation_ids",
+        "artifact_input_continuity",
+        "work_overlap",
+    ];
+
+    let object = result
+        .as_object()
+        .ok_or_else(|| Error::engine("single-record write returned a non-object result"))?;
+    let mut receipt = Map::new();
+    for key in REQUIRED {
+        let value = object.get(key).ok_or_else(|| {
+            Error::engine(format!("single-record write receipt is missing '{key}'"))
+        })?;
+        receipt.insert(key.into(), value.clone());
+    }
+    receipt.insert(
+        "display_reference".into(),
+        object
+            .get("display_reference")
+            .cloned()
+            .unwrap_or(Value::Null),
+    );
+    receipt.insert(
+        "version".into(),
+        Value::String(format!("rec:{}", write.version_seq)),
+    );
+    receipt.insert("previous_seq".into(), serde_json::json!(write.previous_seq));
+    if let Some(body_receipt) = write.body_receipt {
+        receipt.insert("body_receipt".into(), body_receipt);
+    }
+    receipt.insert(
+        "warnings".into(),
+        object
+            .get("warnings")
+            .cloned()
+            .unwrap_or_else(|| Value::Array(Vec::new())),
+    );
+    for key in OPTIONAL_RECEIPTS {
+        if let Some(value) = object.get(key) {
+            receipt.insert(key.into(), value.clone());
+        }
+    }
+    Ok(Value::Object(receipt))
+}
+
+async fn record_version_in(transaction: &mut TursoDomainTransaction<'_>, id: &str) -> Result<i64> {
+    let select = statement(
+        StatementKind::Select,
+        "content_events",
+        &[
+            "SELECT COALESCE(MAX(seq),0) AS seq FROM {{relation}} WHERE record_id=",
+            "",
+        ],
+    )
+    .map_err(|error| stable("read compact write version", error))?;
+    let rows = transaction
+        .rows(
+            "read compact write version",
+            &select,
+            &[BindValue::Text(id.into())],
+            &[ColumnSpec::required("seq", LogicalType::Integer)],
+        )
+        .await?;
+    integer(
+        rows.first()
+            .ok_or_else(|| Error::engine("Turso-local record version returned no row"))?,
+        "seq",
+        "record version",
+    )
+}
+
+/// Compact write receipts describe the projection the transaction just wrote.
+/// They must not depend on ordinary record visibility: derived records can be
+/// valid writes before they have an ordinary readable bearer.
+async fn compact_write_projection_in(
+    transaction: &mut TursoDomainTransaction<'_>,
+    caller: &crate::mcp::Caller,
+    record_id: &str,
+) -> Result<Value> {
+    let select = statement(
+        StatementKind::Select,
+        "records",
+        &[
+            "SELECT id,type,kind,name,body,home_id,lifecycle FROM {{relation}} WHERE id=",
+            "",
+        ],
+    )
+    .map_err(|error| stable("read compact write projection", error))?;
+    let rows = transaction
+        .rows(
+            "read compact write projection",
+            &select,
+            &[BindValue::Text(record_id.into())],
+            &[
+                ColumnSpec::required("id", LogicalType::Text),
+                ColumnSpec::required("type", LogicalType::Text),
+                ColumnSpec::nullable("kind", LogicalType::Text),
+                ColumnSpec::required("name", LogicalType::Text),
+                ColumnSpec::nullable("body", LogicalType::Text),
+                ColumnSpec::nullable("home_id", LogicalType::Text),
+                ColumnSpec::nullable("lifecycle", LogicalType::Text),
+            ],
+        )
+        .await?;
+    let row = rows.first().ok_or_else(|| {
+        Error::engine(format!("compact write projection lost record {record_id}"))
+    })?;
+    let record_type = text(row, "type", "compact write projection")?;
+    let kind = optional_text(row, "kind", "compact write projection")?;
+    let home_id = optional_text(row, "home_id", "compact write projection")?;
+    let lifecycle = optional_text(row, "lifecycle", "compact write projection")?;
+    let lifecycle_interpreter = crate::query::lifecycle::LifecycleInterpreter::load_visible_with(
+        transaction,
+        principal(caller),
+    )
+    .await?;
+    let mut record = serde_json::json!({
+        "id": text(row, "id", "compact write projection")?,
+        "type": record_type,
+        "kind": kind,
+        "name": text(row, "name", "compact write projection")?,
+        "body": optional_text(row, "body", "compact write projection")?,
+        "lifecycle_interpretation": lifecycle_interpreter.interpret(
+            &record_type,
+            kind.as_deref(),
+            home_id.as_deref(),
+            lifecycle.as_deref(),
+        ),
+    });
+    crate::mcp::tools::lifecycle::annotate_body_digest(&mut record);
+    Ok(record)
+}
+
+fn render_write_response(
+    response_mode: ResponseMode,
+    result: Value,
+    write: CompactWriteReceipt,
+) -> Result<Value> {
+    if response_mode == ResponseMode::Verbose {
+        return Ok(result);
+    }
+    summarize_write_receipt(result, write)
 }
 
 fn facet_write(key: String, value: Value) -> Result<crate::domain_transaction::FacetWrite> {
@@ -6362,6 +6966,7 @@ async fn create_record(
 ) -> Result<Value> {
     const TOOL: &str = "create_record";
     let mut args: CreateRecordArguments = parse_arguments(TOOL, arguments)?;
+    let response_mode = args.response_mode;
     require_reason(TOOL, &args.reason)?;
     let normalized_lifecycle = args.lifecycle.take();
     if args.kind.is_empty() {
@@ -6394,7 +6999,7 @@ async fn create_record(
     let links = args.links.unwrap_or_default();
     let id_for_write = id.clone();
     let caller = caller.clone();
-    run_db_operation_write(db, TOOL, &ExecutionControl::default(), move |transaction| {
+    let result = run_db_operation_write(db, TOOL, &ExecutionControl::default(), move |transaction| {
         Box::pin(async move {
             let mut facets = facets;
             let mut owner_id = owner_id;
@@ -6606,16 +7211,31 @@ async fn create_record(
                     })
                     .await?;
             }
-            read_record_in(transaction, &caller, &id_for_write)
-                .await?
-                .ok_or_else(|| {
-                    Error::engine(format!(
-                        "create_record: record {id_for_write} not readable after write"
-                    ))
-                })
+            let version_seq = record_version_in(transaction, &id_for_write).await?;
+            let record = if response_mode == ResponseMode::Summary {
+                compact_write_projection_in(transaction, &caller, &id_for_write).await?
+            } else {
+                read_record_in(transaction, &caller, &id_for_write)
+                    .await?
+                    .ok_or_else(|| {
+                        Error::engine(format!(
+                            "create_record: record {id_for_write} not readable after write"
+                        ))
+                    })?
+            };
+            Ok((
+                record,
+                CompactWriteReceipt {
+                    version_seq,
+                    previous_seq: None,
+                    body_receipt: None,
+                },
+            ))
         })
     })
-    .await
+    .await?;
+    let (result, write) = result;
+    render_write_response(response_mode, result, write)
 }
 
 #[derive(Deserialize)]
@@ -7088,6 +7708,8 @@ struct UpdateRecordArguments {
     facets: Option<Map<String, Value>>,
     if_body_digest: Option<String>,
     if_unmodified_since: Option<String>,
+    #[serde(default)]
+    response_mode: ResponseMode,
 }
 
 const MAX_MULTI_UPDATE: usize = 100;
@@ -7713,6 +8335,7 @@ async fn update_record_singular(
 ) -> Result<Value> {
     const TOOL: &str = "update_record";
     let args: UpdateRecordArguments = parse_arguments(TOOL, arguments)?;
+    let response_mode = args.response_mode;
     require_reason(TOOL, &args.reason)?;
     crate::mcp::tools::require_workspace_rename_authority(
         TOOL,
@@ -7762,7 +8385,7 @@ async fn update_record_singular(
         .collect::<Result<Vec<_>>>()?;
     let id = args.id;
     let caller = caller.clone();
-    run_db_operation_write(db, TOOL, &ExecutionControl::default(), move |transaction| {
+    let result = run_db_operation_write(db, TOOL, &ExecutionControl::default(), move |transaction| {
         Box::pin(async move {
             let mut fields = fields;
             let mut facets = facets;
@@ -7778,6 +8401,7 @@ async fn update_record_singular(
                 },
             )
             .await?;
+            let previous_seq = record_version_in(transaction, &id).await?;
             if let Some(owner_value) = new_owner.as_ref() {
                 let new_owner = owner_value.as_str().ok_or_else(|| {
                     Error::engine(format!(
@@ -8032,6 +8656,23 @@ async fn update_record_singular(
             let record_type = text(current, "type", "comment update")?;
             let current_kind = optional_text(current, "kind", "comment update")?;
             let current_body = optional_text(current, "body", "comment update")?;
+            let body_receipt = body_touched.then(|| {
+                let before_chars = current_body.as_deref().unwrap_or("").chars().count() as u64;
+                let after_chars = fields
+                    .get("body")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .chars()
+                    .count() as u64;
+                serde_json::json!({
+                    "operation": "body_set",
+                    "requested_as": "body",
+                    "before_chars": before_chars,
+                    "after_chars": after_chars,
+                    "delta_chars": after_chars as i64 - before_chars as i64,
+                    "unit": "unicode_scalars",
+                })
+            });
             let current_lifecycle = optional_text(current, "lifecycle", "comment update")?;
             let current_summary = optional_text(current, "summary", "comment update")?;
             let mut resulting_kind = match fields.get("kind") {
@@ -8301,12 +8942,27 @@ async fn update_record_singular(
                 &before_required,
                 &after_required,
             )?;
-            read_record_in(transaction, &caller, &id)
-                .await?
-                .ok_or_else(|| Error::engine(format!("update_record: record {id} disappeared")))
+            let version_seq = record_version_in(transaction, &id).await?;
+            let record = if response_mode == ResponseMode::Summary {
+                compact_write_projection_in(transaction, &caller, &id).await?
+            } else {
+                read_record_in(transaction, &caller, &id)
+                    .await?
+                    .ok_or_else(|| Error::engine(format!("update_record: record {id} disappeared")))?
+            };
+            Ok((
+                record,
+                CompactWriteReceipt {
+                    version_seq,
+                    previous_seq: Some(previous_seq),
+                    body_receipt,
+                },
+            ))
         })
     })
-    .await
+    .await?;
+    let (result, write) = result;
+    render_write_response(response_mode, result, write)
 }
 
 #[derive(Deserialize)]
@@ -9437,54 +10093,6 @@ async fn describe_schema(
     }
     drop(connection);
 
-    let caller_for_snapshot = caller.clone();
-    #[cfg(feature = "turso-tests")]
-    let faults = Arc::clone(&db.inner.contract_faults);
-    let (mut resolved, kind_registry) =
-        run_db_snapshot(db, &ExecutionControl::default(), move |transaction| {
-            Box::pin(async move {
-                let rows = crate::query::cascade::schema_config_rows_with(transaction).await?;
-                #[cfg(feature = "turso-tests")]
-                faults.snapshot.enter("describe_schema").await?;
-                let mut visible = Vec::with_capacity(rows.len());
-                for row in rows {
-                    let allowed = match row.applies_to_collection_id.as_deref() {
-                        None => true,
-                        Some(bearer) => {
-                            crate::authorization::allows_record_with(
-                                transaction,
-                                principal(&caller_for_snapshot),
-                                bearer,
-                                crate::authorization::Capability::View,
-                            )
-                            .await?
-                        }
-                    };
-                    if allowed {
-                        visible.push(row);
-                    }
-                }
-                let resolved = crate::query::cascade::resolve_from_rows(&visible).resolved;
-                let mut kind_registry = Map::new();
-                for record_type in crate::schema::SPINE_TYPES {
-                    let kinds =
-                        crate::meta::kind::list_active_with(transaction, record_type).await?;
-                    kind_registry.insert(record_type.into(), serde_json::to_value(kinds)?);
-                }
-                Ok((resolved, kind_registry))
-            })
-        })
-        .await?;
-    for record_type in crate::schema::SPINE_TYPES {
-        let tokens = kind_registry[record_type]
-            .as_array()
-            .expect("kind registry values are arrays")
-            .iter()
-            .filter_map(|kind| kind.get("token").cloned())
-            .collect();
-        resolved["shapes"][record_type]["kinds"] = Value::Array(tokens);
-    }
-
     let tables = TURSO_REQUIRED_RUNTIME_TABLES
         .iter()
         .filter(|table| turso_schema_table_visible(table, caller))
@@ -9537,8 +10145,6 @@ async fn describe_schema(
             "runtime_topology_table_exposed":false,
         },
         "tables":tables,
-        "resolved_schema_config":resolved,
-        "kind_registry":kind_registry,
     });
     if let Some(ddl_statements) = ddl_statements {
         out["ddl_statements"] = serde_json::to_value(ddl_statements)?;
@@ -12179,6 +12785,174 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_engine_45_database_reopens_preserving_causal_dependents_and_sequence() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = TursoLocalRuntimeConfig {
+            format: TURSO_LOCAL_RUNTIME_CONFIG_FORMAT.into(),
+            logical_database_id: "engine-45-causal-reopen".into(),
+            data_directory: directory.path().to_path_buf(),
+        };
+        let db = config.open().await.unwrap();
+        let connection = db.connect().unwrap();
+        for statement in [
+            "DROP INDEX idx_read_log_calls_overlap_annotation",
+            "ALTER TABLE read_log_calls DROP COLUMN result_annotation",
+            "DROP TABLE webhook_deliveries",
+            "DROP TABLE webhook_credentials",
+            "DROP TABLE webhook_endpoints",
+            "DROP TABLE canvas_batches",
+            "DROP TABLE canvas_objects",
+        ] {
+            connection.execute(statement, ()).await.unwrap();
+        }
+        restore_released_rowid_text_read_log_touches(&connection).await;
+        // Keep fixture preparation on Turso: SQLite cannot parse this
+        // backend's internal FTS schema. Remove actual causal columns/tables
+        // and restore v1-only provenance instead of merely restamping current.
+        for statement in [
+            r#"PRAGMA foreign_keys=OFF"#,
+            r#"DROP TABLE content_event_causal_frontier"#,
+            r#"DROP TABLE content_event_causal_cutover"#,
+            r#"ALTER TABLE content_events DROP COLUMN causal_envelope_version"#,
+            r#"ALTER TABLE content_events DROP COLUMN causal_status"#,
+            r#"CREATE TABLE replicated_message_provenance_fixture (
+                 source_event_id TEXT PRIMARY KEY REFERENCES content_event_sources(event_id) ON DELETE CASCADE,
+                 content_version TEXT NOT NULL CHECK(content_version='native.message.v1'),
+                 operation TEXT NOT NULL CHECK(operation='message.created'),
+                 source_account_token TEXT NOT NULL CHECK(length(trim(source_account_token))>0),
+                 source_created_at TEXT NOT NULL,
+                 canonical_payload TEXT NOT NULL CHECK(json_valid(canonical_payload)),
+                 payload_digest TEXT NOT NULL CHECK(length(payload_digest)=64),
+                 envelope_id TEXT, envelope_digest TEXT,
+                 CHECK((envelope_id IS NULL AND envelope_digest IS NULL) OR
+                       (envelope_id IS NOT NULL AND envelope_digest IS NOT NULL AND
+                        length(trim(envelope_id))>0 AND length(envelope_digest)=64))
+             )"#,
+            r#"INSERT INTO replicated_message_provenance_fixture SELECT * FROM replicated_message_provenance"#,
+            r#"DROP TABLE replicated_message_provenance"#,
+            r#"ALTER TABLE replicated_message_provenance_fixture RENAME TO replicated_message_provenance"#,
+            r#"INSERT INTO records(id,type,kind,name)
+               VALUES('45000000-0000-4000-8000-000000000045','Document','Message','Historical message')"#,
+            r#"INSERT INTO content_events(seq,id,record_id,type,payload,actor,run_key,parent_key,intent,created_at)
+               VALUES(900000,'45000000-0000-4000-8000-000000000046',
+                      '45000000-0000-4000-8000-000000000045','message.created','{}',
+                      'migration:test','run:legacy',NULL,'old intent','2026-01-01T00:00:00Z')"#,
+            r#"INSERT INTO content_events(seq,id,record_id,type,created_at)
+               VALUES(1000000,'deleted-high-water','historical','test','2026-01-01T00:00:00Z')"#,
+            r#"DELETE FROM content_events WHERE seq=1000000"#,
+            r#"INSERT INTO content_event_sources VALUES(
+               '45000000-0000-4000-8000-000000000046','origin',7,'source-record',
+               'source-principal',printf('%064d',1))"#,
+            r#"INSERT INTO replicated_message_provenance VALUES(
+               '45000000-0000-4000-8000-000000000046','native.message.v1','message.created',
+               'source-account','2026-01-01T00:00:00Z','{}',printf('%064d',2),NULL,NULL)"#,
+            r#"INSERT INTO destination_message_ingest VALUES(
+               '45000000-0000-4000-8000-000000000045',
+               '45000000-0000-4000-8000-000000000046','queued','applied',
+               '2026-01-01T00:00:00Z','principal_only',NULL,'display')"#,
+            r#"PRAGMA user_version=45"#,
+        ] {
+            connection
+                .execute(statement, ())
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("engine45 fixture statement failed: {error}; {statement}")
+                });
+        }
+        let original_events = scalar_i64(&connection, "SELECT COUNT(*) FROM content_events")
+            .await
+            .unwrap();
+        const OLD_EVENT: &str = "SELECT json_array(seq,id,record_id,type,payload,actor,run_key,parent_key,intent,created_at)
+            FROM content_events WHERE seq=900000";
+        const OLD_PROVENANCE: &str = "SELECT json_array(source_event_id,content_version,operation,source_account_token,
+            source_created_at,canonical_payload,payload_digest,envelope_id,envelope_digest)
+            FROM replicated_message_provenance WHERE source_event_id='45000000-0000-4000-8000-000000000046'";
+        let old_event = scalar_text(&connection, OLD_EVENT).await.unwrap();
+        let old_provenance = scalar_text(&connection, OLD_PROVENANCE).await.unwrap();
+        assert_eq!(
+            scalar_i64(
+                &connection,
+                "SELECT seq FROM sqlite_sequence WHERE name='content_events'"
+            )
+            .await
+            .unwrap(),
+            1000000
+        );
+        validate_turso_foreign_keys(&connection).await.unwrap();
+        drop(connection);
+        drop(db);
+
+        let reopened = config.open().await.unwrap();
+        let connection = reopened.connect().unwrap();
+        assert_eq!(
+            scalar_i64(&connection, "PRAGMA user_version")
+                .await
+                .unwrap(),
+            crate::CURRENT_ENGINE_SCHEMA_VERSION
+        );
+        assert!(required_runtime_schema_ready(&connection).await.unwrap());
+        assert_eq!(
+            scalar_text(&connection, OLD_EVENT).await.unwrap(),
+            old_event
+        );
+        assert_eq!(
+            scalar_text(&connection, OLD_PROVENANCE).await.unwrap(),
+            old_provenance
+        );
+        assert_eq!(scalar_i64(&connection, "SELECT COUNT(*) FROM content_events WHERE causal_envelope_version=1 AND causal_status='legacy_unknown'").await.unwrap(), original_events);
+        assert_eq!(
+            scalar_i64(
+                &connection,
+                "SELECT COUNT(*) FROM content_event_causal_frontier"
+            )
+            .await
+            .unwrap(),
+            0
+        );
+        assert_eq!(scalar_i64(&connection, "SELECT last_legacy_local_seq FROM content_event_causal_cutover WHERE from_engine_schema=45").await.unwrap(), 900000);
+        assert_eq!(
+            scalar_i64(
+                &connection,
+                "SELECT seq FROM sqlite_sequence WHERE name='content_events'"
+            )
+            .await
+            .unwrap(),
+            1000000
+        );
+        assert_eq!(scalar_i64(&connection, "SELECT COUNT(*) FROM destination_message_ingest d JOIN replicated_message_provenance p ON p.source_event_id=d.source_event_id JOIN content_event_sources s ON s.event_id=p.source_event_id JOIN content_events e ON e.id=s.event_id WHERE e.seq=900000").await.unwrap(), 1);
+        for (table, expected_parent) in [
+            ("content_event_sources", "content_events"),
+            (
+                "destination_message_ingest",
+                "replicated_message_provenance",
+            ),
+        ] {
+            let mut rows = connection
+                .query(&format!("PRAGMA foreign_key_list({table})"), ())
+                .await
+                .unwrap();
+            let mut found = false;
+            while let Some(row) = rows.next().await.unwrap() {
+                let parent: String = row.get(2).unwrap();
+                assert!(!parent.ends_with("_v45") && !parent.ends_with("_v46"));
+                found |= parent == expected_parent;
+            }
+            assert!(found, "{table} lost {expected_parent}");
+        }
+        validate_turso_foreign_keys(&connection).await.unwrap();
+        connection.execute("INSERT INTO content_events(id,record_id,type,causal_envelope_version,causal_status) VALUES('post-migration','historical','test',1,'complete')", ()).await.unwrap();
+        assert_eq!(
+            scalar_i64(
+                &connection,
+                "SELECT seq FROM content_events WHERE id='post-migration'"
+            )
+            .await
+            .unwrap(),
+            1000001
+        );
+    }
+
+    #[tokio::test]
     async fn turso_migrates_engine_46_trigger_definitions_to_current() {
         let directory = tempfile::tempdir().unwrap();
         let db = TursoLocalRuntimeConfig {
@@ -12196,9 +12970,12 @@ mod tests {
             .unwrap();
         // `install_schema` built this database at the current shape. An actual
         // engine-46 database has neither the engine-49 canvas tables nor the
-        // engine-50 webhook tables, and the additive rungs refuse to recreate
-        // existing tables. Drop them so the test exercises the real path.
+        // engine-50 webhook tables nor the engine-51 read-log annotation, and
+        // the additive rungs refuse to recreate existing objects. Drop them
+        // so the test exercises the real path.
         for statement in [
+            "DROP INDEX idx_read_log_calls_overlap_annotation",
+            "ALTER TABLE read_log_calls DROP COLUMN result_annotation",
             "DROP TABLE webhook_deliveries",
             "DROP TABLE webhook_credentials",
             "DROP TABLE webhook_endpoints",
@@ -12207,6 +12984,7 @@ mod tests {
         ] {
             connection.execute(statement, ()).await.unwrap();
         }
+        restore_released_rowid_text_read_log_touches(&connection).await;
 
         migrate_existing_engine_schema(&connection).await.unwrap();
         assert_eq!(
@@ -12220,7 +12998,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_engine_48_database_reopens_and_migrates_rather_than_being_refused() {
-        // The migration rung accepts 45..=49, but reopening goes through
+        // The migration rung accepts 45 through 52, but reopening goes through
         // `preflight_existing_runtime` first. When that gate listed versions
         // individually it stopped naming 48 the moment CURRENT moved to 49, so
         // every database written by the previous release refused to open and
@@ -12233,8 +13011,49 @@ mod tests {
         };
         let db = config.open().await.unwrap();
         let connection = db.connect().unwrap();
+        connection
+            .execute(
+                "INSERT INTO provenance_action_attestations
+             (id,schema_version,principal,executor_kind,channel,executor_ref,delegation_ref,
+              interaction_receipt_id,operation,action_commitment,action_digest,
+              output_event_set_digest,issuer,issuer_origin_database_id,issued_at,
+              command_identity_digest,intent_digest)
+             VALUES('migration-attestation',1,'principal','local','local','executor',NULL,
+                    NULL,'migration.operation','{}',printf('%064d',1),printf('%064d',2),
+                    'issuer','ndb_00000000000000000000000000000000','2026-01-01T00:00:00Z',
+                    printf('%064d',3),NULL)",
+                (),
+            )
+            .await
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO provenance_local_attestation_authority
+             VALUES('migration-attestation','ndb_00000000000000000000000000000000',
+                    'principal','migration.operation',NULL,'2026-01-01T00:00:00Z')",
+                (),
+            )
+            .await
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO provenance_attestation_validity_events
+             VALUES('migration-validity','migration-attestation',0,'invalidated',
+                    'test reason','issuer','2026-01-01T00:00:00Z')",
+                (),
+            )
+            .await
+            .unwrap();
+        const ATTESTATION_TUPLE: &str = "SELECT json_array(id,schema_version,principal,
+            executor_kind,channel,executor_ref,delegation_ref,interaction_receipt_id,
+            operation,action_commitment,action_digest,output_event_set_digest,issuer,
+            issuer_origin_database_id,issued_at,command_identity_digest,intent_digest)
+            FROM provenance_action_attestations WHERE id='migration-attestation'";
+        let old_attestation = scalar_text(&connection, ATTESTATION_TUPLE).await.unwrap();
         // Stand the file back down to engine 48's additive-table shape.
         for statement in [
+            "DROP INDEX idx_read_log_calls_overlap_annotation",
+            "ALTER TABLE read_log_calls DROP COLUMN result_annotation",
             "DROP TABLE webhook_deliveries",
             "DROP TABLE webhook_credentials",
             "DROP TABLE webhook_endpoints",
@@ -12243,6 +13062,7 @@ mod tests {
         ] {
             connection.execute(statement, ()).await.unwrap();
         }
+        restore_released_rowid_text_read_log_touches(&connection).await;
         connection
             .execute("PRAGMA user_version=48", ())
             .await
@@ -12259,6 +13079,721 @@ mod tests {
             crate::CURRENT_ENGINE_SCHEMA_VERSION
         );
         assert!(required_runtime_schema_ready(&connection).await.unwrap());
+        assert_eq!(
+            scalar_text(&connection, ATTESTATION_TUPLE).await.unwrap(),
+            old_attestation
+        );
+        for table in [
+            "provenance_local_attestation_authority",
+            "provenance_action_events",
+            "provenance_attestation_validity_events",
+            "provenance_action_outputs",
+        ] {
+            let mut rows = connection
+                .query(&format!("PRAGMA foreign_key_list({table})"), ())
+                .await
+                .unwrap();
+            let mut canonical_target = false;
+            while let Some(row) = rows.next().await.unwrap() {
+                let target: String = row.get(2).unwrap();
+                assert_ne!(target, "provenance_action_attestations_v49");
+                assert_ne!(target, "provenance_action_attestations_v50");
+                canonical_target |= target == "provenance_action_attestations";
+            }
+            assert!(
+                canonical_target,
+                "{table} lost its canonical attestation FK"
+            );
+        }
+        assert_eq!(
+            scalar_i64(
+                &connection,
+                "SELECT COUNT(*) FROM provenance_local_attestation_authority a
+             JOIN provenance_attestation_validity_events v ON v.attestation_id=a.attestation_id
+             WHERE a.attestation_id='migration-attestation' AND v.id='migration-validity'"
+            )
+            .await
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            scalar_i64(
+                &connection,
+                "SELECT COUNT(*) FROM sqlite_schema WHERE name IN
+             ('provenance_action_attestations_v49','provenance_action_attestations_v50')"
+            )
+            .await
+            .unwrap(),
+            0
+        );
+        let mut rows = connection
+            .query(
+                "PRAGMA foreign_key_list(provenance_action_attestations)",
+                (),
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        assert_eq!(
+            row.get::<String>(2).unwrap(),
+            "provenance_interaction_receipts"
+        );
+        assert!(rows.next().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn an_engine_50_database_reopens_with_the_read_log_annotation_and_index() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = TursoLocalRuntimeConfig {
+            format: TURSO_LOCAL_RUNTIME_CONFIG_FORMAT.into(),
+            logical_database_id: "engine-50-read-log-reopen".into(),
+            data_directory: directory.path().to_path_buf(),
+        };
+        let db = config.open().await.unwrap();
+        let connection = db.connect().unwrap();
+        connection
+            .execute("DROP INDEX idx_read_log_calls_overlap_annotation", ())
+            .await
+            .unwrap();
+        connection
+            .execute(
+                "ALTER TABLE read_log_calls DROP COLUMN result_annotation",
+                (),
+            )
+            .await
+            .unwrap();
+        restore_released_rowid_text_read_log_touches(&connection).await;
+        connection
+            .execute("PRAGMA user_version=50", ())
+            .await
+            .unwrap();
+        drop(connection);
+        drop(db);
+
+        let reopened = config.open().await.unwrap();
+        let connection = reopened.connect().unwrap();
+        assert_eq!(
+            scalar_i64(&connection, "PRAGMA user_version")
+                .await
+                .unwrap(),
+            crate::CURRENT_ENGINE_SCHEMA_VERSION
+        );
+        assert_eq!(
+            scalar_i64(
+                &connection,
+                "SELECT COUNT(*) FROM pragma_table_info('read_log_calls') WHERE name='result_annotation'",
+            )
+            .await
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            scalar_i64(
+                &connection,
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_read_log_calls_overlap_annotation'",
+            )
+            .await
+            .unwrap(),
+            1
+        );
+    }
+
+    /// Same per-connection FK-on contract as `run_db_write` /
+    /// `run_db_write_with_disposition`. `connect()` is the raw factory:
+    /// turso_core 0.7.2 starts `fk_pragma` false, and `install_schema`'s
+    /// `PRAGMA foreign_keys = ON` lives only on the `open()` connection,
+    /// which is dropped before tests reconnect.
+    async fn connect_with_write_pool_foreign_keys(db: &TursoLocalDb) -> turso::Connection {
+        let connection = db.connect().unwrap();
+        connection
+            .execute("PRAGMA foreign_keys = ON", ())
+            .await
+            .unwrap();
+        assert_eq!(
+            scalar_i64(&connection, "PRAGMA foreign_keys")
+                .await
+                .unwrap(),
+            1,
+            "write-pool connections enable PRAGMA foreign_keys per connection"
+        );
+        connection
+    }
+
+    async fn restore_released_rowid_text_read_log_touches(connection: &turso::Connection) {
+        for statement in [
+            "DROP INDEX idx_read_log_touches_record",
+            "DROP TABLE read_log_touches",
+            "DROP TABLE read_log_record_ids",
+            r#"CREATE TABLE read_log_touches (
+                 call_seq     INTEGER NOT NULL REFERENCES read_log_calls(seq) ON DELETE CASCADE,
+                 record_id    TEXT NOT NULL,
+                 interaction  TEXT NOT NULL CHECK (interaction IN ('surfaced','opened','mutated')),
+                 result_rank  INTEGER,
+                 PRIMARY KEY (call_seq, record_id, interaction)
+               )"#,
+            "CREATE INDEX idx_read_log_touches_record ON read_log_touches(record_id, call_seq)",
+        ] {
+            connection.execute(statement, ()).await.unwrap();
+        }
+    }
+
+    const READ_LOG_SAMPLE_ROWS: [(&str, &str, &str); 3] = [
+        ("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "opened", "1"),
+        ("native:root", "surfaced", "NULL"),
+        ("café-record", "mutated", "0"),
+    ];
+
+    async fn seed_released_text_read_log_sample(connection: &turso::Connection) -> i64 {
+        connection
+            .execute(
+                "INSERT INTO read_log_calls (id,tool,outcome,started_at,ended_at)
+                 VALUES ('turso-readlog-call','get_record','ok',
+                         '2026-09-12T00:00:00.000Z','2026-09-12T00:00:00.000Z')",
+                (),
+            )
+            .await
+            .unwrap();
+        let seq = scalar_i64(
+            connection,
+            "SELECT seq FROM read_log_calls WHERE id='turso-readlog-call'",
+        )
+        .await
+        .unwrap();
+        for (record_id, interaction, rank_sql) in READ_LOG_SAMPLE_ROWS {
+            connection
+                .execute(
+                    &format!(
+                        "INSERT INTO read_log_touches (call_seq, record_id, interaction, result_rank)
+                         VALUES ({seq}, '{record_id}', '{interaction}', {rank_sql})"
+                    ),
+                    (),
+                )
+                .await
+                .unwrap();
+        }
+        seq
+    }
+
+    async fn seed_read_log_sample(connection: &turso::Connection) -> i64 {
+        connection
+            .execute(
+                "INSERT INTO read_log_calls (id,tool,outcome,started_at,ended_at)
+                 VALUES ('turso-readlog-call','get_record','ok',
+                         '2026-09-12T00:00:00.000Z','2026-09-12T00:00:00.000Z')",
+                (),
+            )
+            .await
+            .unwrap();
+        let seq = scalar_i64(
+            connection,
+            "SELECT seq FROM read_log_calls WHERE id='turso-readlog-call'",
+        )
+        .await
+        .unwrap();
+        for (record_id, interaction, rank_sql) in READ_LOG_SAMPLE_ROWS {
+            connection
+                .execute(
+                    &format!("INSERT OR IGNORE INTO read_log_record_ids (record_id) VALUES ('{record_id}')"),
+                    (),
+                )
+                .await
+                .unwrap();
+            connection
+                .execute(
+                    &format!(
+                        "INSERT INTO read_log_touches (call_seq, record_ref, interaction, result_rank)
+                         VALUES ({seq}, (SELECT record_ref FROM read_log_record_ids WHERE record_id='{record_id}'), '{interaction}', {rank_sql})"
+                    ),
+                    (),
+                )
+                .await
+                .unwrap();
+        }
+        seq
+    }
+
+    async fn assert_read_log_touches_rowid_physical(connection: &turso::Connection) {
+        let sql = scalar_text(
+            connection,
+            "SELECT sql FROM sqlite_schema WHERE type='table' AND name='read_log_touches'",
+        )
+        .await
+        .unwrap();
+        assert!(
+            !sql.to_uppercase().contains("WITHOUT ROWID"),
+            "Turso must keep the interned rowid touches table: {sql}"
+        );
+        assert!(
+            sql.contains("record_ref"),
+            "interned touches must store record_ref: {sql}"
+        );
+        assert!(
+            sql.contains("read_log_record_ids"),
+            "dictionary FK must remain: {sql}"
+        );
+        assert!(
+            sql.contains("read_log_calls"),
+            "FK to read_log_calls must remain: {sql}"
+        );
+        assert_eq!(
+            scalar_i64(
+                connection,
+                "SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name='read_log_record_ids'",
+            )
+            .await
+            .unwrap(),
+            1,
+            "dictionary table must be present"
+        );
+        let index = scalar_i64(
+            connection,
+            "SELECT COUNT(*) FROM sqlite_schema WHERE type='index' AND name='idx_read_log_touches_record'",
+        )
+        .await
+        .unwrap();
+        assert_eq!(index, 1, "secondary record index must remain");
+    }
+
+    async fn assert_read_log_sample_queryable(connection: &turso::Connection, seq: i64) {
+        assert_eq!(
+            scalar_i64(
+                connection,
+                &format!("SELECT COUNT(*) FROM read_log_touches WHERE call_seq={seq}"),
+            )
+            .await
+            .unwrap(),
+            3
+        );
+        assert_eq!(
+            scalar_i64(
+                connection,
+                &format!(
+                    "SELECT COUNT(*) FROM read_log_touches t
+                      JOIN read_log_record_ids d ON d.record_ref = t.record_ref
+                      WHERE t.call_seq={seq} AND d.record_id='native:root' AND t.interaction='surfaced'"
+                ),
+            )
+            .await
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            scalar_i64(
+                connection,
+                &format!(
+                    "SELECT COUNT(*) FROM read_log_touches t
+                      JOIN read_log_record_ids d ON d.record_ref = t.record_ref
+                      WHERE t.call_seq={seq} AND d.record_id='café-record'"
+                ),
+            )
+            .await
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            scalar_i64(
+                connection,
+                &format!(
+                    "SELECT COUNT(*) FROM read_log_touches t
+                      JOIN read_log_record_ids d ON d.record_ref = t.record_ref
+                      WHERE t.call_seq={seq} AND d.record_id='aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+                        AND t.result_rank = 1"
+                ),
+            )
+            .await
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            scalar_i64(
+                connection,
+                &format!(
+                    "SELECT COUNT(*) FROM read_log_touches t
+                      JOIN read_log_record_ids d ON d.record_ref = t.record_ref
+                      WHERE t.call_seq={seq} AND d.record_id='native:root' AND t.result_rank IS NULL"
+                ),
+            )
+            .await
+            .unwrap(),
+            1
+        );
+    }
+
+    async fn assert_released_text_read_log_sample(connection: &turso::Connection, seq: i64) {
+        assert_eq!(
+            scalar_i64(
+                connection,
+                &format!("SELECT COUNT(*) FROM read_log_touches WHERE call_seq={seq}"),
+            )
+            .await
+            .unwrap(),
+            3
+        );
+        assert_eq!(
+            scalar_i64(
+                connection,
+                &format!(
+                    "SELECT COUNT(*) FROM read_log_touches
+                      WHERE call_seq={seq} AND record_id='native:root' AND interaction='surfaced'"
+                ),
+            )
+            .await
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            scalar_i64(
+                connection,
+                &format!(
+                    "SELECT COUNT(*) FROM read_log_touches
+                      WHERE call_seq={seq} AND record_id='café-record'"
+                ),
+            )
+            .await
+            .unwrap(),
+            1
+        );
+    }
+
+    async fn assert_read_log_fk_cascade_and_rejection(connection: &turso::Connection, seq: i64) {
+        assert_eq!(
+            scalar_i64(connection, "PRAGMA foreign_keys").await.unwrap(),
+            1,
+            "cascade/dangling checks require the write-pool FK-on contract"
+        );
+        assert_eq!(
+            scalar_i64(connection, "SELECT COUNT(*) FROM read_log_record_ids")
+                .await
+                .unwrap(),
+            3,
+            "dictionary rows are independent of call cascade"
+        );
+        connection
+            .execute(
+                "DELETE FROM read_log_calls WHERE id='turso-readlog-call'",
+                (),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            scalar_i64(
+                connection,
+                &format!("SELECT COUNT(*) FROM read_log_touches WHERE call_seq={seq}"),
+            )
+            .await
+            .unwrap(),
+            0,
+            "ON DELETE CASCADE must empty touches"
+        );
+        assert_eq!(
+            scalar_i64(connection, "SELECT COUNT(*) FROM read_log_record_ids")
+                .await
+                .unwrap(),
+            3,
+            "deleting a call must not erase interned record ids"
+        );
+        let dangling_call = connection
+            .execute(
+                "INSERT INTO read_log_touches (call_seq, record_ref, interaction, result_rank)
+                 VALUES (999999, 1, 'opened', NULL)",
+                (),
+            )
+            .await;
+        assert!(
+            dangling_call.is_err(),
+            "dangling call_seq must be rejected: {dangling_call:?}"
+        );
+        connection
+            .execute(
+                "INSERT INTO read_log_calls (id,tool,outcome,started_at,ended_at)
+                 VALUES ('turso-readlog-call-2','get_record','ok',
+                         '2026-09-12T00:00:00.000Z','2026-09-12T00:00:00.000Z')",
+                (),
+            )
+            .await
+            .unwrap();
+        let dangling_dict = connection
+            .execute(
+                "INSERT INTO read_log_touches (call_seq, record_ref, interaction, result_rank)
+                 VALUES ((SELECT seq FROM read_log_calls WHERE id='turso-readlog-call-2'), 999999, 'opened', NULL)",
+                (),
+            )
+            .await;
+        assert!(
+            dangling_dict.is_err(),
+            "dangling record_ref must be rejected: {dangling_dict:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn turso_fresh_install_keeps_rowid_read_log_touches_with_fk_and_queries() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = TursoLocalRuntimeConfig {
+            format: TURSO_LOCAL_RUNTIME_CONFIG_FORMAT.into(),
+            logical_database_id: "engine-55-read-log-fresh".into(),
+            data_directory: directory.path().to_path_buf(),
+        }
+        .open()
+        .await
+        .unwrap();
+        let connection = connect_with_write_pool_foreign_keys(&db).await;
+        assert_eq!(
+            scalar_i64(&connection, "PRAGMA user_version")
+                .await
+                .unwrap(),
+            crate::CURRENT_ENGINE_SCHEMA_VERSION
+        );
+        assert_read_log_touches_rowid_physical(&connection).await;
+        let seq = seed_read_log_sample(&connection).await;
+        assert_read_log_sample_queryable(&connection, seq).await;
+        assert_read_log_fk_cascade_and_rejection(&connection, seq).await;
+    }
+
+    #[tokio::test]
+    async fn an_engine_51_database_reopens_and_migrates_rather_than_being_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = TursoLocalRuntimeConfig {
+            format: TURSO_LOCAL_RUNTIME_CONFIG_FORMAT.into(),
+            logical_database_id: "engine-51-read-log-reopen".into(),
+            data_directory: directory.path().to_path_buf(),
+        };
+        let db = config.open().await.unwrap();
+        let connection = connect_with_write_pool_foreign_keys(&db).await;
+        restore_released_rowid_text_read_log_touches(&connection).await;
+        let seq = seed_released_text_read_log_sample(&connection).await;
+        assert_released_text_read_log_sample(&connection, seq).await;
+        connection
+            .execute("PRAGMA user_version=51", ())
+            .await
+            .unwrap();
+        drop(connection);
+        drop(db);
+
+        let reopened = config.open().await.unwrap();
+        let connection = connect_with_write_pool_foreign_keys(&reopened).await;
+        assert_eq!(
+            scalar_i64(&connection, "PRAGMA user_version")
+                .await
+                .unwrap(),
+            crate::CURRENT_ENGINE_SCHEMA_VERSION
+        );
+        assert_read_log_touches_rowid_physical(&connection).await;
+        assert_read_log_sample_queryable(&connection, seq).await;
+        assert_read_log_fk_cascade_and_rejection(&connection, seq).await;
+    }
+
+    #[tokio::test]
+    async fn explicit_fk_validator_obeys_composite_null_collation_and_parent_affinity() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("foreign-keys.db");
+        let sqlite = rusqlite::Connection::open(&path).unwrap();
+        sqlite
+            .execute_batch(
+                "CREATE TABLE parent (a TEXT COLLATE NOCASE, b INTEGER, UNIQUE(a,b));
+             CREATE TABLE child (a TEXT COLLATE BINARY, b TEXT,
+                 FOREIGN KEY(a,b) REFERENCES parent(a,b));
+             INSERT INTO parent VALUES('Mixed',1),('Other',2);
+             INSERT INTO child VALUES('mixed','01'),(NULL,'missing'),('missing',NULL);
+             CREATE TABLE text_parent (id TEXT PRIMARY KEY);
+             CREATE TABLE numeric_child (id INTEGER REFERENCES text_parent(id));
+             INSERT INTO text_parent VALUES('01');
+             CREATE TABLE binary_parent(id TEXT COLLATE BINARY PRIMARY KEY);
+             CREATE TABLE nocase_child(id TEXT COLLATE NOCASE REFERENCES binary_parent(id));
+             INSERT INTO binary_parent VALUES('Case');",
+            )
+            .unwrap();
+        drop(sqlite);
+        let database = turso::Builder::new_local(path.to_str().unwrap())
+            .build()
+            .await
+            .unwrap();
+        let connection = database.connect().unwrap();
+        validate_turso_foreign_keys(&connection).await.unwrap();
+        // Inverse collation direction must also use the parent's BINARY
+        // comparison, not the child's NOCASE declaration.
+        connection
+            .execute("INSERT INTO nocase_child VALUES('case')", ())
+            .await
+            .unwrap();
+        assert!(validate_turso_foreign_keys(&connection).await.is_err());
+        connection
+            .execute("DELETE FROM nocase_child", ())
+            .await
+            .unwrap();
+        connection
+            .execute("INSERT INTO nocase_child VALUES('Case')", ())
+            .await
+            .unwrap();
+        validate_turso_foreign_keys(&connection).await.unwrap();
+        // Both components independently exist, but not together: checking
+        // components as independent foreign keys would wrongly accept this.
+        connection
+            .execute("INSERT INTO child VALUES('Mixed','2')", ())
+            .await
+            .unwrap();
+        assert!(validate_turso_foreign_keys(&connection).await.is_err());
+        connection
+            .execute("DELETE FROM child WHERE b='2'", ())
+            .await
+            .unwrap();
+        validate_turso_foreign_keys(&connection).await.unwrap();
+        // The TEXT parent's '01' must not be coerced to numeric 1 by the
+        // INTEGER child. This detects loss of the unary + in the comparison.
+        connection
+            .execute("INSERT INTO numeric_child VALUES(1)", ())
+            .await
+            .unwrap();
+        assert!(validate_turso_foreign_keys(&connection).await.is_err());
+        connection
+            .execute("DELETE FROM numeric_child", ())
+            .await
+            .unwrap();
+        connection
+            .execute("INSERT INTO text_parent VALUES('1')", ())
+            .await
+            .unwrap();
+        connection
+            .execute("INSERT INTO numeric_child VALUES(1)", ())
+            .await
+            .unwrap();
+        validate_turso_foreign_keys(&connection).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn explicit_fk_validator_refuses_an_empty_schema_scan() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("empty-foreign-key.db");
+        let database = turso::Builder::new_local(path.to_str().unwrap())
+            .build()
+            .await
+            .unwrap();
+        let connection = database.connect().unwrap();
+        assert!(validate_turso_foreign_keys(&connection).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn explicit_fk_validator_refuses_implicit_parent_columns() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("implicit-foreign-key.db");
+        let sqlite = rusqlite::Connection::open(&path).unwrap();
+        sqlite
+            .execute_batch(
+                "CREATE TABLE parent(id INTEGER PRIMARY KEY);
+             CREATE TABLE child(id INTEGER REFERENCES parent);",
+            )
+            .unwrap();
+        drop(sqlite);
+        let database = turso::Builder::new_local(path.to_str().unwrap())
+            .build()
+            .await
+            .unwrap();
+        let connection = database.connect().unwrap();
+        let error = validate_turso_foreign_keys(&connection).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("requires explicit parent columns"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn engine_53_dictionary_migration_refuses_existing_foreign_key_violation_and_rolls_back()
+    {
+        let directory = tempfile::tempdir().unwrap();
+        let db = TursoLocalRuntimeConfig {
+            format: TURSO_LOCAL_RUNTIME_CONFIG_FORMAT.into(),
+            logical_database_id: "engine-53-dangling-fk".into(),
+            data_directory: directory.path().to_path_buf(),
+        }
+        .open()
+        .await
+        .unwrap();
+        let connection = db.connect().unwrap();
+        restore_released_rowid_text_read_log_touches(&connection).await;
+        let seq = seed_released_text_read_log_sample(&connection).await;
+        connection
+            .execute("PRAGMA user_version=53", ())
+            .await
+            .unwrap();
+        // An unrelated, real domain FK must be checked, not just the two
+        // rebuilt touch relationships. Enforcement is off on this raw handle.
+        connection.execute(
+            "INSERT INTO facet_values(id,record_id,key,value) VALUES('fk-test','absent-parent','tag','value')", ()
+        ).await.unwrap();
+        let error = migrate_engine_53_to_54_read_log_dictionary(&connection)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("foreign-key violation"),
+            "{error}"
+        );
+        assert_eq!(
+            scalar_i64(&connection, "PRAGMA user_version")
+                .await
+                .unwrap(),
+            53
+        );
+        assert_eq!(scalar_i64(&connection,
+            "SELECT COUNT(*) FROM sqlite_schema WHERE name IN ('read_log_record_ids','read_log_touches_v53')"
+        ).await.unwrap(), 0);
+        assert_released_text_read_log_sample(&connection, seq).await;
+        assert_eq!(
+            scalar_i64(
+                &connection,
+                "SELECT COUNT(*) FROM facet_values WHERE id='fk-test'"
+            )
+            .await
+            .unwrap(),
+            1
+        );
+        connection
+            .execute("DELETE FROM facet_values WHERE id='fk-test'", ())
+            .await
+            .unwrap();
+        migrate_engine_53_to_54_read_log_dictionary(&connection)
+            .await
+            .unwrap();
+        assert_eq!(
+            scalar_i64(&connection, "PRAGMA user_version")
+                .await
+                .unwrap(),
+            54
+        );
+        assert_read_log_sample_queryable(&connection, seq).await;
+    }
+
+    #[tokio::test]
+    async fn an_engine_53_database_reopens_and_interns_read_log_record_ids() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = TursoLocalRuntimeConfig {
+            format: TURSO_LOCAL_RUNTIME_CONFIG_FORMAT.into(),
+            logical_database_id: "engine-53-read-log-intern".into(),
+            data_directory: directory.path().to_path_buf(),
+        };
+        let db = config.open().await.unwrap();
+        let connection = connect_with_write_pool_foreign_keys(&db).await;
+        restore_released_rowid_text_read_log_touches(&connection).await;
+        let seq = seed_released_text_read_log_sample(&connection).await;
+        assert_released_text_read_log_sample(&connection, seq).await;
+        connection
+            .execute("PRAGMA user_version=53", ())
+            .await
+            .unwrap();
+        drop(connection);
+        drop(db);
+
+        let reopened = config.open().await.unwrap();
+        let connection = connect_with_write_pool_foreign_keys(&reopened).await;
+        assert_eq!(
+            scalar_i64(&connection, "PRAGMA user_version")
+                .await
+                .unwrap(),
+            crate::CURRENT_ENGINE_SCHEMA_VERSION
+        );
+        assert_read_log_touches_rowid_physical(&connection).await;
+        assert_read_log_sample_queryable(&connection, seq).await;
+        assert_read_log_fk_cascade_and_rejection(&connection, seq).await;
     }
 
     #[tokio::test]

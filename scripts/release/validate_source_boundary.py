@@ -93,6 +93,7 @@ DEBT_KEYS = {
 }
 ID_RE = re.compile(r"^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$")
 TASK_RE = re.compile(r"^[0-9a-f]{7}$")
+RUST_RAW_STRING_START_RE = re.compile(r'(?:br|rb|r)(#*)"')
 REQUIRED_PUBLICATION_MAPPINGS = {
     "publication/root/.gitignore": ".gitignore",
     "publication/root/ARCHITECTURE.md": "ARCHITECTURE.md",
@@ -763,7 +764,7 @@ def strip_rust_comments(source: str, path: str, *, retain_literals: bool = True)
                 block_depth = 1
                 output.extend("  ")
                 index += 2
-            elif (raw := re.match(r'(?:br|rb|r)(#*)"', source[index:])) is not None:
+            elif (raw := RUST_RAW_STRING_START_RE.match(source, index)) is not None:
                 token = raw.group(0)
                 raw_end = '"' + raw.group(1)
                 state = "raw"

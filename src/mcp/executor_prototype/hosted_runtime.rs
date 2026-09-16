@@ -20,7 +20,7 @@ use super::{
     PinnedLensExecutorCatalogue,
 };
 use crate::mcp::OperationAccess;
-use crate::mcp::{Caller, LensDispatch, ToolRegistry};
+use crate::mcp::{Caller, ExperimentalExecutors, LensDispatch, ToolRegistry};
 use crate::DeploymentReadOnlyOperation;
 
 const MAX_PINNED_LENS_CATALOGUES: usize = 128;
@@ -39,6 +39,7 @@ pub struct HostedExecutorRuntime {
     ordinary_telemetry: BoundExecutorTelemetry,
     lenses: PinnedLensCatalogueCache,
     telemetry: Arc<ExecutorTelemetryContext>,
+    experimental: ExperimentalExecutors,
 }
 
 #[derive(Clone)]
@@ -62,9 +63,20 @@ impl HostedExecutorRuntime {
         authority: Arc<dyn HostedExecutorAuthority>,
         keys: Arc<dyn HostedPlanKeyProvider>,
     ) -> Result<Self> {
+        Self::new_with_experimental(registry, authority, keys, ExperimentalExecutors::empty()).await
+    }
+
+    /// Initialize with an explicit experimental-executor allowlist. Without
+    /// the allowlist the pinned catalogues are the stable-only surface.
+    pub async fn new_with_experimental(
+        registry: Arc<ToolRegistry>,
+        authority: Arc<dyn HostedExecutorAuthority>,
+        keys: Arc<dyn HostedPlanKeyProvider>,
+        experimental: ExperimentalExecutors,
+    ) -> Result<Self> {
         Self::validate_keys(&authority, &keys).await?;
         let telemetry = ExecutorTelemetryContext::structured_log()?;
-        Self::from_validated(registry, authority, keys, telemetry).await
+        Self::from_validated(registry, authority, keys, telemetry, experimental).await
     }
 
     /// Initialize with an injected process-scoped telemetry context. Key
@@ -75,8 +87,27 @@ impl HostedExecutorRuntime {
         keys: Arc<dyn HostedPlanKeyProvider>,
         telemetry: Arc<ExecutorTelemetryContext>,
     ) -> Result<Self> {
+        Self::new_with_telemetry_and_experimental(
+            registry,
+            authority,
+            keys,
+            telemetry,
+            ExperimentalExecutors::empty(),
+        )
+        .await
+    }
+
+    /// Initialize with an injected process-scoped telemetry context and an
+    /// explicit experimental-executor allowlist.
+    pub async fn new_with_telemetry_and_experimental(
+        registry: Arc<ToolRegistry>,
+        authority: Arc<dyn HostedExecutorAuthority>,
+        keys: Arc<dyn HostedPlanKeyProvider>,
+        telemetry: Arc<ExecutorTelemetryContext>,
+        experimental: ExperimentalExecutors,
+    ) -> Result<Self> {
         Self::validate_keys(&authority, &keys).await?;
-        Self::from_validated(registry, authority, keys, telemetry).await
+        Self::from_validated(registry, authority, keys, telemetry, experimental).await
     }
 
     async fn validate_keys(
@@ -92,6 +123,7 @@ impl HostedExecutorRuntime {
         authority: Arc<dyn HostedExecutorAuthority>,
         keys: Arc<dyn HostedPlanKeyProvider>,
         telemetry: Arc<ExecutorTelemetryContext>,
+        experimental: ExperimentalExecutors,
     ) -> Result<Self> {
         let _maintenance_admission = match registry.deployment_mutation_barrier() {
             Some(barrier) => Some(barrier.admit(
@@ -107,7 +139,10 @@ impl HostedExecutorRuntime {
             super::plan_store::EXPIRED_PLAN_RETENTION_MS,
         )
         .await?;
-        let ordinary = ExecutorPrototypeStdioServer::pin_hosted_catalogue(&registry)?;
+        let ordinary = ExecutorPrototypeStdioServer::pin_hosted_catalogue_with_experimental(
+            &registry,
+            &experimental,
+        )?;
         let ordinary_telemetry =
             telemetry.bind_hosted_manifest(ordinary.manifest_digest(), ordinary.descriptor_bytes());
         Ok(Self {
@@ -118,6 +153,7 @@ impl HostedExecutorRuntime {
             ordinary_telemetry,
             lenses: PinnedLensCatalogueCache::default(),
             telemetry,
+            experimental,
         })
     }
 
@@ -163,6 +199,7 @@ impl HostedExecutorRuntime {
             dispatcher.revision(),
             &self.registry,
             Some(&self.telemetry),
+            &self.experimental,
         )?;
         if let Some(telemetry) = &pinned.telemetry {
             telemetry.authorization_accepted();
@@ -206,7 +243,13 @@ impl PinnedLensCatalogueCache {
         registry: &ToolRegistry,
     ) -> Result<Arc<PinnedLensExecutorCatalogue>> {
         Ok(self
-            .pin_runtime(lens_id, revision, registry, None)?
+            .pin_runtime(
+                lens_id,
+                revision,
+                registry,
+                None,
+                &ExperimentalExecutors::empty(),
+            )?
             .catalogue)
     }
 
@@ -216,6 +259,7 @@ impl PinnedLensCatalogueCache {
         revision: i64,
         registry: &ToolRegistry,
         telemetry: Option<&Arc<ExecutorTelemetryContext>>,
+        experimental: &ExperimentalExecutors,
     ) -> Result<PinnedLensCatalogue> {
         let mut lenses = self
             .entries
@@ -236,7 +280,8 @@ impl PinnedLensCatalogueCache {
         }
         // Build while holding the bounded cache lock so two first requests can
         // never race different authoritative revisions into the same process.
-        let catalogue = ExecutorPrototypeLensServer::pin_catalogue(registry)?;
+        let catalogue =
+            ExecutorPrototypeLensServer::pin_catalogue_with_experimental(registry, experimental)?;
         let telemetry = telemetry.map(|context| {
             context.bind_hosted_manifest(catalogue.manifest_digest(), catalogue.descriptor_bytes())
         });

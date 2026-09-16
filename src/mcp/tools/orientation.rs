@@ -33,7 +33,7 @@ use crate::db::{apply_schema, open_database, Db};
 use crate::error::{Error, Result};
 use crate::query::lens::{self, ReadLens};
 use crate::query::lifecycle::{LifecycleInterpretation, LifecycleInterpreter};
-use crate::query::{cascade, pipeline, tree};
+use crate::query::{pipeline, tree};
 use crate::schema::{
     CONTROL_PROJECTION_TABLES, DDL_STATEMENTS, DERIVATION_PROJECTION_TABLES, FROZEN_DDL_SHA256,
     META_PROJECTION_TABLES, PROJECTION_TABLES, REQUIRED_TABLES, SPINE_TYPES,
@@ -45,7 +45,10 @@ use crate::{
 
 use super::super::registry::{Caller, ToolRegistry};
 use super::super::ToolKind;
-use super::{can_record, parse_args, require_record, visible_ids};
+use super::{
+    can_record, can_record_in_pool, parse_args, require_record, require_record_in_pool,
+    visible_ids, visible_ids_in_pool,
+};
 
 /// Default depth for `get_structure` walks.
 const DEFAULT_STRUCTURE_DEPTH: i64 = 3;
@@ -165,8 +168,11 @@ const BOOTSTRAP_TOP_LEVEL_KEYS: &[&str] = &[
 struct BootstrapArgs {}
 
 async fn user_version(db: &Db) -> Result<i64> {
+    // Committed file-header state: the migration stamp only changes at open,
+    // long before any request, so the physically read-only pool observes the
+    // same value without queueing on the writer.
     let row = sqlx::query("PRAGMA user_version")
-        .fetch_one(db.write_pool())
+        .fetch_one(db.pool())
         .await?;
     Ok(row.get(0))
 }
@@ -223,7 +229,7 @@ async fn bounded_visible_record_count(db: &Db, caller: &Caller) -> Result<(usize
         .await?;
     let truncated = ids.len() > WORKSPACE_VISIBILITY_SCAN_LIMIT;
     ids.truncate(WORKSPACE_VISIBILITY_SCAN_LIMIT);
-    let visible = visible_ids(db, caller, ids).await?;
+    let visible = visible_ids_in_pool(db.pool(), caller, ids).await?;
     Ok((visible.len(), truncated))
 }
 
@@ -250,7 +256,7 @@ async fn principal_footing(db: &Db, caller: &Caller, observed_at: &str) -> Resul
     let mut email_truncated = false;
     if let Some(row) = row {
         let id: String = row.try_get("id")?;
-        if can_record(db, caller, &id, Capability::View).await? {
+        if can_record_in_pool(db.pool(), caller, &id, Capability::View).await? {
             person_record_id = Some(id);
             let raw_name: String = row.try_get("name")?;
             if !raw_name.trim().is_empty() {
@@ -409,7 +415,9 @@ async fn workspace_footing(
     let registered_humans_visible = if super::is_legacy_local(caller) {
         human_candidates.len()
     } else {
-        visible_ids(db, caller, human_candidates).await?.len()
+        visible_ids_in_pool(db.pool(), caller, human_candidates)
+            .await?
+            .len()
     };
 
     Ok(json!({
@@ -440,6 +448,7 @@ async fn workspace_footing(
 fn world_item(
     row: &sqlx::sqlite::SqliteRow,
     lifecycle_interpretation: &crate::query::lifecycle::LifecycleInterpretation,
+    superseded_by: Option<&Value>,
 ) -> Result<Option<Value>> {
     let id: String = row.try_get("id")?;
     if id.len() > MAX_PREVIEW_ID_BYTES {
@@ -461,8 +470,36 @@ fn world_item(
         "lifecycle_interpretation": lifecycle_interpretation,
         "last_activity_at": row.try_get::<String, _>("observed_activity_at")?,
     });
+    // The budget gate applies to the item WITHOUT the annotation: Bootstrap
+    // annotates, never excludes, so an item that fits on its own is always
+    // listed. Succession without titles (id plus short reference only) rides
+    // along when it fits; when it does not, the count alone rides when IT
+    // fits, and only then is the annotation dropped — never the item.
     if serialized_bytes(&item)? > MAX_PREVIEW_ITEM_BYTES {
         return Ok(None);
+    }
+    if let Some(superseded) = superseded_by {
+        let mut annotated = item.clone();
+        annotated
+            .as_object_mut()
+            .expect("world item is an object")
+            .insert("superseded_by".into(), superseded.clone());
+        if serialized_bytes(&annotated)? <= MAX_PREVIEW_ITEM_BYTES {
+            return Ok(Some(annotated));
+        }
+        let degraded = superseded
+            .get("total_count")
+            .map(|total| json!({ "items": [], "total_count": total }));
+        if let Some(degraded) = degraded {
+            let mut degraded_item = item.clone();
+            degraded_item
+                .as_object_mut()
+                .expect("world item is an object")
+                .insert("superseded_by".into(), degraded);
+            if serialized_bytes(&degraded_item)? <= MAX_PREVIEW_ITEM_BYTES {
+                return Ok(Some(degraded_item));
+            }
+        }
     }
     Ok(Some(item))
 }
@@ -504,11 +541,33 @@ async fn current_world_preview(db: &Db, caller: &Caller, observed_at: &str) -> R
     let visible = if super::is_legacy_local(caller) {
         candidate_ids.into_iter().collect::<HashSet<_>>()
     } else {
-        visible_ids(db, caller, candidate_ids).await?
+        visible_ids_in_pool(db.pool(), caller, candidate_ids).await?
     };
-    let lifecycle_interpreter =
-        crate::query::lifecycle::LifecycleInterpreter::load(db, Some(super::principal(caller)))
-            .await?;
+    let lifecycle_interpreter = crate::query::lifecycle::LifecycleInterpreter::load_in_pool(
+        db.pool(),
+        Some(super::principal(caller)),
+    )
+    .await?;
+
+    // Succession for the preview, computed once over the visible candidates:
+    // id plus short reference, never the title, so items stay under budget.
+    // Superseded items stay listed — Bootstrap annotates, never excludes.
+    let mut superseded_stubs: Vec<Value> = visible.iter().map(|id| json!({ "id": id })).collect();
+    super::lifecycle::annotate_superseded_refs_in_pools(
+        db.pool(),
+        db.pool(),
+        caller,
+        &mut superseded_stubs,
+    )
+    .await?;
+    let superseded_by = superseded_stubs
+        .into_iter()
+        .filter_map(|stub| {
+            let id = stub.get("id")?.as_str()?.to_owned();
+            let disclosure = stub.get("superseded_by")?.clone();
+            Some((id, disclosure))
+        })
+        .collect::<std::collections::HashMap<_, _>>();
 
     let mut recent = Vec::new();
     let mut open_work = Vec::new();
@@ -531,7 +590,7 @@ async fn current_world_preview(db: &Db, caller: &Caller, observed_at: &str) -> R
             home_id.as_deref(),
             lifecycle.as_deref(),
         );
-        let item = world_item(row, &interpretation)?;
+        let item = world_item(row, &interpretation, superseded_by.get(&id))?;
         if item.is_none() {
             omitted_unrepresentable += 1;
         }
@@ -648,7 +707,7 @@ pub(crate) async fn resolve_session_footing(db: &Db, caller: &Caller, tool: &str
     // rotate its own key and fragment its run.
     let run_key = match caller.run_key() {
         Some(existing) => existing.to_string(),
-        None => crate::runkey::suggest(db).await?,
+        None => crate::runkey::suggest_in_pool(db.pool()).await?,
     };
 
     let not_hidden_r = crate::query::not_hidden_predicate("r");
@@ -662,7 +721,7 @@ pub(crate) async fn resolve_session_footing(db: &Db, caller: &Caller, tool: &str
                              WHERE av.record_id = r.id AND av.key = 'archived')
           ORDER BY r.name, r.id"
     );
-    let root_rows = sqlx::query(&roots_sql).fetch_all(db.write_pool()).await?;
+    let root_rows = sqlx::query(&roots_sql).fetch_all(db.pool()).await?;
     if root_rows.len() != 1
         || root_rows[0].try_get::<String, _>("id")? != crate::schema::ROOT_RECORD_ID
     {
@@ -674,7 +733,7 @@ pub(crate) async fn resolve_session_footing(db: &Db, caller: &Caller, tool: &str
     }
     let root = &root_rows[0];
     let root_id: String = root.try_get("id")?;
-    if !can_record(db, caller, &root_id, Capability::View).await? {
+    if !can_record_in_pool(db.pool(), caller, &root_id, Capability::View).await? {
         return Err(Error::auth(format!(
             "{tool}: canonical root is not visible to this caller"
         )));
@@ -688,11 +747,11 @@ pub(crate) async fn resolve_session_footing(db: &Db, caller: &Caller, tool: &str
     );
     let child_ids: Vec<String> = sqlx::query_scalar(&child_ids_sql)
         .bind(&root_id)
-        .fetch_all(db.write_pool())
+        .fetch_all(db.pool())
         .await?;
     let mut visible_children = 0i64;
     for child in child_ids {
-        if can_record(db, caller, &child, Capability::View).await? {
+        if can_record_in_pool(db.pool(), caller, &child, Capability::View).await? {
             visible_children += 1;
         }
     }
@@ -708,12 +767,9 @@ pub(crate) async fn resolve_session_footing(db: &Db, caller: &Caller, tool: &str
         "content": crate::instructions::ENGINE_ORIENTATION,
         "ownership": "build-owned and guaranteed independently of portable instruction resolution",
     });
-    let portable_resolution = crate::instructions::resolve_for_account(
-        db.write_pool(),
-        caller.credential(),
-        Some(&run_key),
-    )
-    .await?;
+    let portable_resolution =
+        crate::instructions::resolve_for_account(db.pool(), caller.credential(), Some(&run_key))
+            .await?;
     let portable_status = portable_resolution.instructions.status.clone();
     let portable_entry_count = portable_resolution.instructions.entries.len();
     let pending_obligation_count = portable_resolution.pending_obligations.len();
@@ -974,15 +1030,21 @@ async fn get_structure(db: Db, caller: Caller, mut arguments: Value) -> Result<V
     const TOOL: &str = "get_structure";
     let as_of = lens::take_as_of(TOOL, &mut arguments)?;
     let args: GetStructureArgs = parse_args(TOOL, arguments)?;
-    require_record(&db, &caller, TOOL, &args.root_id, Capability::View).await?;
+    // Read-tier guard: `require_record_in_pool` runs the identical admission
+    // + authorization logic as `require_record` on the physically read-only
+    // pool. The shared `Db`-taking helpers stay on the write pool for the
+    // write handlers that may depend on read-your-writes inside an open
+    // write transaction; this read-only handler must not queue on them.
+    // See `resolve_session_footing` for the same seam choice.
+    require_record_in_pool(db.pool(), &caller, TOOL, &args.root_id, Capability::View).await?;
     let Some(selector) = as_of else {
         return get_structure_from_lens(&ReadLens::live(&db), &caller, args).await;
     };
-    let resolved = lens::resolve_as_of(&db, selector).await?;
+    let resolved = lens::resolve_as_of_in_pool(db.pool(), selector).await?;
     let scratch = open_database(":memory:").await?;
     let result = async {
         apply_schema(&scratch).await?;
-        lens::replay_projection(&db, &scratch, resolved.resolved_content_seq).await?;
+        lens::replay_projection_in_pool(db.pool(), &scratch, resolved.resolved_content_seq).await?;
         let read_lens = ReadLens::historical(&scratch, &db, &resolved);
         let mut output = get_structure_from_lens(&read_lens, &caller, args).await?;
         lens::echo_temporal(&mut output, &resolved);
@@ -999,7 +1061,10 @@ async fn get_structure_from_lens(
     args: GetStructureArgs,
 ) -> Result<Value> {
     const TOOL: &str = "get_structure";
-    let db = lens.projection().snapshot_pool();
+    // Shared-tier existence gate: committed record state is visible
+    // cross-connection in WAL and this handler writes nothing, so the
+    // read-only pool observes the same row without queueing on the writer.
+    let db = lens.projection().shared_pool();
     let row = sqlx::query("SELECT deleted_at FROM records WHERE id = ?")
         .bind(&args.root_id)
         .fetch_optional(db)
@@ -1049,12 +1114,26 @@ async fn get_structure_from_lens(
     // Both bounds are echoed back: a caller comparing a node's `child_count`
     // against the siblings it received needs to know which cap produced the
     // gap, and defaults it never passed are exactly the ones it does not know.
-    Ok(json!({
+    let mut output = json!({
         "root_id": args.root_id,
         "max_depth": max_depth,
         "max_children_per_node": max_children_per_node,
         "nodes": nodes,
-    }))
+    });
+    // Succession per node: content (which successors, what they are called)
+    // from this read's projection — the replay scratch under `as_of` —
+    // while visibility and short references stay live, matching how the
+    // enriched-record filter splits the same two tiers.
+    if let Some(nodes) = output.get_mut("nodes").and_then(Value::as_array_mut) {
+        super::lifecycle::annotate_superseded_by_in_pools(
+            lens.projection().shared_pool(),
+            lens.meta().shared_pool(),
+            caller,
+            nodes,
+        )
+        .await?;
+    }
+    Ok(output)
 }
 
 // ---------------------------------------------------------------------------
@@ -1344,6 +1423,22 @@ async fn get_dashboard(db: Db, caller: Caller, arguments: Value) -> Result<Value
         }
     }
 
+    // Succession disclosure on every row actually shown — except the
+    // unclassified census, whose rows render as raw JSON rather than through
+    // `record_line` and would print the annotation as a literal key. Stale
+    // was collected whole above and truncated oldest-first, so annotate after
+    // the truncate to stay bounded by the output rather than the candidate
+    // scan.
+    for bucket in [&mut active, &mut stale, &mut blocked] {
+        super::lifecycle::annotate_superseded_by_in_pools(
+            db.write_pool(),
+            db.write_pool(),
+            &caller,
+            bucket,
+        )
+        .await?;
+    }
+
     // Lifecycle census over the scope, via the pipeline engine.
     let census_steps = [pipeline::Step::filter(pipeline::Filter {
         ancestor_id: args.scope.clone(),
@@ -1495,6 +1590,7 @@ async fn describe_schema(db: Db, caller: Caller, arguments: Value) -> Result<Val
                 | "meta_events"
                 | "jobs"
                 | "read_log_calls"
+                | "read_log_record_ids"
                 | "read_log_touches"
                 | "embeddings"
         ) || table.starts_with("records_fts")
@@ -1538,27 +1634,6 @@ async fn describe_schema(db: Db, caller: Caller, arguments: Value) -> Result<Val
             "columns": columns,
         }));
     }
-    let all_schema_rows = cascade::schema_config_rows(&db, None).await?;
-    let mut visible_schema_rows = Vec::with_capacity(all_schema_rows.len());
-    for row in all_schema_rows {
-        let visible = match row.applies_to_collection_id.as_deref() {
-            Some(collection) => can_record(&db, &caller, collection, Capability::View).await?,
-            None => true,
-        };
-        if visible {
-            visible_schema_rows.push(row);
-        }
-    }
-    let mut resolved = cascade::resolve_from_rows(&visible_schema_rows);
-    let mut connection = db.write_pool().acquire().await?;
-    cascade::inject_kind_projection_on(&mut connection, &mut resolved.resolved).await?;
-    let mut kind_registry = serde_json::Map::new();
-    for record_type in SPINE_TYPES {
-        kind_registry.insert(
-            record_type.into(),
-            serde_json::to_value(crate::meta::kind::list_active(&db, record_type).await?)?,
-        );
-    }
     let mut out = json!({
         "engine": {
             "name": ENGINE_NAME,
@@ -1586,8 +1661,6 @@ async fn describe_schema(db: Db, caller: Caller, arguments: Value) -> Result<Val
                   for stable derivation series, immutable revisions, exact input manifests and \
                   failed attempts; projections are rebuilt by replay and must never be written directly",
         "tables": tables,
-        "resolved_schema_config": resolved.resolved,
-        "kind_registry": kind_registry,
     });
     if args.include_ddl.unwrap_or(false) {
         if !caller.is_host_owner() {
@@ -1610,11 +1683,10 @@ async fn describe_schema(db: Db, caller: Caller, arguments: Value) -> Result<Val
 pub fn register_orientation_tools(registry: &mut ToolRegistry) -> Result<()> {
     registry.register(
         ToolKind::Bootstrap,
-        "Predictably bounded first-contact orientation for the connected Native database: \
-         build-owned shared-world posture, verified principal/workspace footing, standing \
-         context, a freshness-labelled current-world preview, exact callable continuations, \
-         and the required reusable run key. Intent is deliberately declared separately with \
-         set_intent.",
+        "Read-only orientation, instructions and run key; declare intent via set_intent. \
+         After transient transport/pool failure or HTTP 502/503/504, retry at most twice \
+         (1s, 2s; honor Retry-After up to 30s), then stop. Never retry auth, validation, \
+         or instruction-readiness failures. Retain the run key once received for every call.",
         json!({
             "type": "object",
             "properties": {},
@@ -1688,10 +1760,11 @@ pub fn register_orientation_tools(registry: &mut ToolRegistry) -> Result<()> {
     )?;
     registry.register(
         ToolKind::DescribeSchema,
-        "The physical schema: every table with its columns and its authority \
-         role (authoritative log / projection / substrate / meta tier) — \
-         orientation before reading the database directly. Set include_ddl for \
-         the frozen statements.",
+        "Physical tables and columns with authority roles (authoritative log / \
+         projection / substrate / meta tier): orientation for sql_read. For \
+         record types, kinds, facets and vocabularies use \
+         preview_record_shape or manage_vocabularies.list_values instead. \
+         Set include_ddl for the frozen statements.",
         json!({
             "type": "object",
             "properties": {

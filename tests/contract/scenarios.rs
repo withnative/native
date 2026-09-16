@@ -158,7 +158,23 @@ pub fn assert_describe_schema_shared_contract(owner: &Value, member: &Value) {
         assert_eq!(column["portability"], portability);
     }
 
-    let governed_kind = owner["kind_registry"]["Document"]
+    assert_eq!(
+        member["engine"]["ddl_fingerprint"],
+        owner["engine"]["ddl_fingerprint"]
+    );
+}
+
+/// The governed record-shape half of the same fixture, read through
+/// `preview_record_shape`. `describe_schema` used to carry these facts in its
+/// `kind_registry` and `resolved_schema_config` blocks; it is now the physical
+/// table listing its capability name promises, and `preview_record_shape` is
+/// the single tool that answers "what shape may I write?".
+///
+/// Both arguments must be `preview_record_shape` responses for
+/// `{"type":"Document","kind":"review_note"}` — `owner` as the local caller and
+/// `member` as an ordinary member.
+pub fn assert_record_shape_shared_contract(owner: &Value, member: &Value) {
+    let governed_kind = owner["selection"]["active_kinds"]
         .as_array()
         .unwrap()
         .iter()
@@ -166,31 +182,37 @@ pub fn assert_describe_schema_shared_contract(owner: &Value, member: &Value) {
         .expect("governed kind mutation must be visible");
     assert_eq!(governed_kind["value_id"], DESCRIBE_SCHEMA_KIND_ID);
     assert_eq!(governed_kind["metadata"], describe_schema_kind_metadata());
+
+    // The global declaration governs the effective shape...
     assert_eq!(
-        owner["resolved_schema_config"]["shapes"]["Document:review_note"]["facets"]
-            ["review_marker"]["required"],
+        owner["selection"]["effective_facet_shape"]["review_marker"]["required"],
         true
     );
-    assert!(!owner["resolved_schema_config"]
-        .to_string()
-        .contains("hidden_marker"));
-    assert_eq!(
-        member["resolved_schema_config"],
-        owner["resolved_schema_config"]
-    );
-    assert_eq!(member["kind_registry"], owner["kind_registry"]);
-    assert_eq!(
-        member["engine"]["ddl_fingerprint"],
-        owner["engine"]["ddl_fingerprint"]
-    );
+    // ...while the collection-scoped declaration never does. This is a
+    // property of the cascade itself: `resolve_from_rows` overlays global rows
+    // only, so a collection-scoped row cannot reach an effective write shape
+    // for any caller.
+    assert!(!owner["selection"].to_string().contains("hidden_marker"));
+
+    // Global governance is caller-independent, exactly as the response's own
+    // `shape_scope` states.
+    assert_eq!(member["selection"], owner["selection"]);
 }
 
 async fn call<H: ContractHarness>(
     harness: &H,
     database: &H::Database,
     tool: &str,
-    arguments: Value,
+    mut arguments: Value,
 ) -> Result<Value> {
+    // These established backend-neutral scenarios inspect complete records.
+    // New summary-mode behavior is covered by the dedicated corpus entries.
+    if (tool == "create_record" || tool == "update_record")
+        && arguments.get("ids").is_none()
+        && arguments.get("response_mode").is_none()
+    {
+        arguments["response_mode"] = json!("verbose");
+    }
     harness
         .call(database, TestCaller::Local, tool, arguments)
         .await
@@ -2077,6 +2099,7 @@ pub async fn timestamp_precondition<H: ContractHarness>(
                 "facets": { "priority": "high" },
                 "if_body_digest": body_digest,
                 "if_unmodified_since": equivalent_offset,
+                "response_mode": "verbose",
                 "reason": REASON
             }),
         )

@@ -217,6 +217,9 @@ async fn latest_content_seq(db: &Db) -> i64 {
 }
 
 async fn set_open_human_routing(db: &Db, message_id: &str, idempotency_key: &str) {
+    // This fixture uses a deferred transaction; exclude queued setup captures
+    // before its read-to-write upgrade, just as before capture became async.
+    db.drain_captures_for_tests().await;
     let pool = crate::common::fixture_write_pool(db).await;
     let mut tx = pool.begin().await.unwrap();
     native_ce::awareness::set_routing(

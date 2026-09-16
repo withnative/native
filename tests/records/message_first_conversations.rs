@@ -521,6 +521,520 @@ async fn structured_mentions_create_body_free_candidates_and_exact_human_evidenc
     );
 }
 
+// --- `manage_messages get_attention`: the server-side header dot. ---
+
+/// Read the dot the way the workbench attention snapshot does: one small
+/// read-only call, no inbox snapshot, no hydrated Messages.
+async fn attention_as(registry: &ToolRegistry, db: &Db, caller: Caller) -> Value {
+    call_as(
+        registry,
+        db,
+        caller,
+        "manage_messages",
+        json!({"action":"get_attention"}),
+    )
+    .await
+    .unwrap()
+}
+
+async fn attention_channel(registry: &ToolRegistry, db: &Db, name: &str) -> String {
+    call(
+        registry,
+        db,
+        "create_record",
+        json!({"type":"Collection","kind":"folder","name":name}),
+    )
+    .await["id"]
+        .as_str()
+        .unwrap()
+        .into()
+}
+
+async fn attention_collection_message(
+    registry: &ToolRegistry,
+    db: &Db,
+    folder: &str,
+    body: &str,
+) -> String {
+    call(
+        registry,
+        db,
+        "manage_messages",
+        json!({
+            "action":"send",
+            "body":body,
+            "owner_id":SENDER,
+            "origin":{"type":"collection","collection_id":folder},
+            "addressed_to":[RECIPIENT],
+            "expectation":"none",
+            "idempotency_key":format!("attention-send-{body}"),
+            "reason":"Create the Collection attention fixture through the policy gate."
+        }),
+    )
+    .await["id"]
+        .as_str()
+        .unwrap()
+        .into()
+}
+
+/// Advance one Message to `stage` with a server-verified human attestation,
+/// the only authority that moves human awareness.
+async fn present_as(
+    registry: &ToolRegistry,
+    db: &Db,
+    account: &str,
+    message: &str,
+    stage: &str,
+    key: &str,
+) {
+    let issuer = native_ce::awareness::HumanInteractionTokenIssuer::random("test-attention");
+    let ids = vec![message.to_string()];
+    let token = issuer.issue(account, stage, &ids, 60).unwrap();
+    let caller = Caller::authenticated(account)
+        .with_human_interaction_token(&issuer, &token, stage, &ids)
+        .unwrap();
+    call_as(
+        registry,
+        db,
+        caller,
+        "manage_messages",
+        json!({"action":"mutate_human_awareness","message_ids":ids,"stage":stage,"expected_versions":{message:0},"idempotency_key":key,"reason":"Reviewed for the attention fixture."}),
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn attention_true_for_unsurfaced_inbound_false_once_presented() {
+    let db = create_database(":memory:").await.unwrap();
+    install_people(&db).await;
+    let registry = registry();
+    let message = message(&registry, &db, "attention please").await;
+
+    // The typed boolean arrives with no inbox hydration: no items, no bodies,
+    // no snapshot token to pin or store.
+    let lit = attention_as(&registry, &db, Caller::authenticated("acct_recipient")).await;
+    assert_eq!(lit["schema"], "native.message-attention.v1");
+    assert_eq!(lit["has_new_messages"], true);
+    assert_eq!(lit["viewer_relative"], true);
+    // No inbox hydration: no items, no bodies, no snapshot token to pin.
+    // (`run_context` is the registry's own call echo, not endpoint content.)
+    for absent in ["items", "snapshot", "body", "messages"] {
+        assert!(
+            lit.get(absent).is_none(),
+            "get_attention must not hydrate {absent}"
+        );
+    }
+
+    present_as(
+        &registry,
+        &db,
+        "acct_recipient",
+        &message,
+        "presented",
+        "attention-present",
+    )
+    .await;
+    let dark = attention_as(&registry, &db, Caller::authenticated("acct_recipient")).await;
+    assert_eq!(dark["has_new_messages"], false);
+}
+
+#[tokio::test]
+async fn attention_excludes_self_authored() {
+    let db = create_database(":memory:").await.unwrap();
+    install_people(&db).await;
+    let registry = registry();
+    message(&registry, &db, "my own send").await;
+
+    // The sender owns the Message; the recipient does not.
+    assert_eq!(
+        attention_as(&registry, &db, Caller::authenticated("acct_sender")).await
+            ["has_new_messages"],
+        false
+    );
+    assert_eq!(
+        attention_as(&registry, &db, Caller::authenticated("acct_recipient")).await
+            ["has_new_messages"],
+        true
+    );
+}
+
+#[tokio::test]
+async fn attention_suppressed_muted_archived_snoozed_have_no_signal() {
+    let db = create_database(":memory:").await.unwrap();
+    install_people(&db).await;
+    let registry = registry();
+    let muted = message(&registry, &db, "muted one").await;
+    let archived = message(&registry, &db, "archived one").await;
+    let snoozed = message(&registry, &db, "snoozed one").await;
+    let recipient = Caller::authenticated("acct_recipient");
+    assert_eq!(
+        attention_as(&registry, &db, recipient.clone()).await["has_new_messages"],
+        true
+    );
+
+    for (message, preference, extra, key) in [
+        (muted, "mute", None, "attention-mute"),
+        (archived, "archive", None, "attention-archive"),
+        (
+            snoozed,
+            "snooze",
+            Some("2999-01-01T00:00:00Z"),
+            "attention-snooze",
+        ),
+    ] {
+        let mut args = json!({"action":"set_preference","message_id":message,"preference":preference,"expected_version":0,"idempotency_key":key,"reason":"Suppress the attention fixture."});
+        if let Some(until) = extra {
+            args["snoozed_until"] = json!(until);
+        }
+        call_as(&registry, &db, recipient.clone(), "manage_messages", args)
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        attention_as(&registry, &db, recipient).await["has_new_messages"],
+        false
+    );
+}
+
+#[tokio::test]
+async fn attention_person_unknown_and_unauthorized_have_no_signal() {
+    let db = create_database(":memory:").await.unwrap();
+    install_people(&db).await;
+    let registry = registry();
+    message(&registry, &db, "someone else's mail").await;
+
+    // No account binding at all: Person unknown, so no signal — and no error.
+    let ghost = attention_as(&registry, &db, Caller::authenticated("acct_ghost")).await;
+    assert_eq!(ghost["has_new_messages"], false);
+
+    // A live Person with no visibility into the Message: likewise silent.
+    let intruder = attention_as(&registry, &db, Caller::authenticated("acct_intruder")).await;
+    assert_eq!(intruder["has_new_messages"], false);
+
+    // Sanity: the addressed recipient still lights.
+    assert_eq!(
+        attention_as(&registry, &db, Caller::authenticated("acct_recipient")).await
+            ["has_new_messages"],
+        true
+    );
+}
+
+#[tokio::test]
+async fn attention_hidden_bound_person_keeps_self_exclusion_parity() {
+    // The old claim path gated its Person on record View (an unviewable bound
+    // record meant "no visible binding"), but its roster fallback disclosed
+    // the same id with no such gate and excluded on it. The endpoint follows
+    // the fallback outcome: the bound id only ever meets `owner_id`, so it
+    // discloses nothing, and gating it would turn a hidden-but-bound Person's
+    // own mail into someone else's signal instead of its own exclusion.
+    let db = create_database(":memory:").await.unwrap();
+    install_people(&db).await;
+    let registry = registry();
+    let inbound = message(&registry, &db, "sender mail").await;
+    // Self-authored under the same hidden Person: visible through its audience
+    // but its author's own.
+    let own = call(
+        &registry,
+        &db,
+        "manage_messages",
+        json!({
+            "action":"send","body":"my own note","owner_id":RECIPIENT,
+            "origin":{"type":"direct","participant_ids":[RECIPIENT,SENDER]},
+            "addressed_to":[SENDER],"expectation":"none",
+            "idempotency_key":"attention-hidden-own-note",
+            "reason":"Create a self-authored fixture under the hidden Person."
+        }),
+    )
+    .await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    native_ce::authorization::replace_explicit_policy(
+        &db,
+        "test:attention-hide-person",
+        RECIPIENT,
+        vec![],
+    )
+    .await
+    .unwrap();
+
+    // The bound id still excludes its author's own mail (parity with the old
+    // roster fallback), while another author's visible mail lights.
+    let recipient = Caller::authenticated("acct_recipient");
+    assert_eq!(
+        attention_as(&registry, &db, recipient.clone()).await["has_new_messages"],
+        true
+    );
+    present_as(
+        &registry,
+        &db,
+        "acct_recipient",
+        &inbound,
+        "presented",
+        "attention-hidden-present",
+    )
+    .await;
+    assert_eq!(
+        attention_as(&registry, &db, recipient).await["has_new_messages"],
+        false,
+        "only the self-authored {own} remains, and it must never light its author's dot"
+    );
+}
+
+#[tokio::test]
+async fn attention_person_rebind_answers_for_new_person() {
+    let db = create_database(":memory:").await.unwrap();
+    install_people(&db).await;
+    let registry = registry();
+    // Owned by the recipient's current Person and addressed to the sender, so
+    // the recipient sees it but is its author: no signal.
+    let owned = call(
+        &registry,
+        &db,
+        "manage_messages",
+        json!({
+            "action":"send","body":"my own note","owner_id":RECIPIENT,
+            "origin":{"type":"direct","participant_ids":[RECIPIENT,SENDER]},
+            "addressed_to":[SENDER],"expectation":"none",
+            "idempotency_key":"attention-owned-note",
+            "reason":"Create a self-authored fixture for the rebind."
+        }),
+    )
+    .await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let recipient = Caller::authenticated("acct_recipient");
+    assert_eq!(
+        attention_as(&registry, &db, recipient.clone()).await["has_new_messages"],
+        false
+    );
+
+    // Rebind the same account to a new Person by moving the canonical account
+    // binding (`bindings` is unique on system+identifier, so a rebind moves
+    // the row rather than adding a second). The Message is still visible
+    // through the unchanged audience, but its owner is now someone else, so
+    // the same account's dot lights: the dot answers for the new Person.
+    const NEWBIE: &str = "4e55a9e0-0000-4000-8000-000000000009";
+    create_raw_record(
+        &db,
+        json!({"id":NEWBIE,"type":"Entity","kind":"person","name":NEWBIE}),
+    )
+    .await
+    .unwrap();
+    let pool = crate::common::fixture_write_pool(&db).await;
+    sqlx::query(
+        "UPDATE bindings SET record_id=? WHERE system='account' AND identifier='acct_recipient'",
+    )
+    .bind(NEWBIE)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO bindings(record_id,system,identifier,is_canonical) VALUES (?,?,?,1)")
+        .bind(NEWBIE)
+        .bind("native-principal")
+        .bind("native/newbie")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let lit = attention_as(&registry, &db, recipient).await;
+    assert_eq!(
+        lit["has_new_messages"], true,
+        "rebind must answer for {NEWBIE}, not the old owner"
+    );
+    let owner: String = sqlx::query_scalar("SELECT owner_id FROM records WHERE id=?")
+        .bind(&owned)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        owner, RECIPIENT,
+        "the fixture Message stays owned by the old Person"
+    );
+}
+
+#[tokio::test]
+async fn attention_revocation_removes_signal() {
+    let db = create_database(":memory:").await.unwrap();
+    install_people(&db).await;
+    let registry = registry();
+    let message = message(&registry, &db, "granted then revoked").await;
+    let recipient = Caller::authenticated("acct_recipient");
+    assert_eq!(
+        attention_as(&registry, &db, recipient.clone()).await["has_new_messages"],
+        true
+    );
+
+    native_ce::authorization::replace_explicit_policy(
+        &db,
+        "test:attention-revoke",
+        &message,
+        vec![],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        attention_as(&registry, &db, recipient).await["has_new_messages"],
+        false
+    );
+}
+
+#[tokio::test]
+async fn attention_collection_origin_lights_dot() {
+    let db = create_database(":memory:").await.unwrap();
+    install_people(&db).await;
+    let registry = registry();
+    let folder = attention_channel(&registry, &db, "Attention channel").await;
+    attention_collection_message(&registry, &db, &folder, "channel news").await;
+    assert_eq!(
+        attention_as(&registry, &db, Caller::authenticated("acct_recipient")).await
+            ["has_new_messages"],
+        true
+    );
+    // The sender's own channel post is not their own news.
+    assert_eq!(
+        attention_as(&registry, &db, Caller::authenticated("acct_sender")).await
+            ["has_new_messages"],
+        false
+    );
+}
+
+#[tokio::test]
+async fn attention_legacy_origin_uses_home_and_null_home_has_no_destination() {
+    let db = create_database(":memory:").await.unwrap();
+    install_people(&db).await;
+    let registry = registry();
+    // A declared direct Message, rewound to the pre-origin shape history
+    // leaves behind: explicit `legacy_unknown` filed under its home.
+    let homed = message(&registry, &db, "legacy homed").await;
+    let homeless = message(&registry, &db, "legacy homeless").await;
+    let pool = crate::common::fixture_write_pool(&db).await;
+    for id in [&homed, &homeless] {
+        sqlx::query("UPDATE message_origin_state SET status='legacy_unknown',origin_type=NULL,collection_id=NULL,direct_set_digest=NULL,participant_count=NULL,declaration_event_seq=NULL WHERE message_id=?")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM message_origin_principals WHERE message_id=?")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    // Direct sends file under `native:unfiled`, so the homed legacy Message
+    // keeps a destination while the homeless one (home removed) has none.
+    sqlx::query("UPDATE records SET home_id=NULL WHERE id=?")
+        .bind(&homeless)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let recipient = Caller::authenticated("acct_recipient");
+    assert_eq!(
+        attention_as(&registry, &db, recipient.clone()).await["has_new_messages"],
+        true
+    );
+    sqlx::query("UPDATE records SET home_id=NULL WHERE id=?")
+        .bind(&homed)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        attention_as(&registry, &db, recipient).await["has_new_messages"],
+        false
+    );
+}
+
+#[tokio::test]
+async fn attention_direct_corruption_fails_closed_not_false() {
+    let db = create_database(":memory:").await.unwrap();
+    install_people(&db).await;
+    let registry = registry();
+    let message = message(&registry, &db, "corrupted direct").await;
+    let pool = crate::common::fixture_write_pool(&db).await;
+    sqlx::query("UPDATE message_origin_state SET participant_count=99 WHERE message_id=?")
+        .bind(&message)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let error = call_as(
+        &registry,
+        &db,
+        Caller::authenticated("acct_recipient"),
+        "manage_messages",
+        json!({"action":"get_attention"}),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.contains("inconsistent direct communication-origin projection"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn attention_missing_origin_projection_fails_closed_not_false() {
+    // Like query hydration, a Message with no origin projection state is an
+    // explicit error: answering `false` would hide corruption as "no mail".
+    let db = create_database(":memory:").await.unwrap();
+    install_people(&db).await;
+    let registry = registry();
+    let message = message(&registry, &db, "projectionless").await;
+    let pool = crate::common::fixture_write_pool(&db).await;
+    sqlx::query("DELETE FROM message_origin_state WHERE message_id=?")
+        .bind(&message)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let error = call_as(
+        &registry,
+        &db,
+        Caller::authenticated("acct_recipient"),
+        "manage_messages",
+        json!({"action":"get_attention"}),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.contains("has no communication-origin projection state"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn attention_null_owner_and_expired_snooze_keep_parity() {
+    // `owner_id IS NOT` keeps the NULL-owner behaviour identical to the
+    // workbench `!==` comparison: an ownerless visible Message is nobody's
+    // own, so it lights. An expired snooze likewise no longer suppresses.
+    let db = create_database(":memory:").await.unwrap();
+    install_people(&db).await;
+    let registry = registry();
+    let ownerless = message(&registry, &db, "ownerless mail").await;
+    let snoozed = message(&registry, &db, "once snoozed mail").await;
+    let pool = crate::common::fixture_write_pool(&db).await;
+    sqlx::query("UPDATE records SET owner_id=NULL WHERE id=?")
+        .bind(&ownerless)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let recipient = Caller::authenticated("acct_recipient");
+    call_as(
+        &registry,
+        &db,
+        recipient.clone(),
+        "manage_messages",
+        json!({"action":"set_preference","message_id":snoozed,"preference":"snooze","snoozed_until":"2000-01-01T00:00:00Z","expected_version":0,"idempotency_key":"attention-expired-snooze","reason":"Lapsed snooze must not suppress."}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        attention_as(&registry, &db, recipient).await["has_new_messages"],
+        true
+    );
+}
+
 #[tokio::test]
 async fn multibyte_reply_with_mention_threads_and_indexes_utf8_bytes() {
     let db = create_database(":memory:").await.unwrap();

@@ -13,6 +13,7 @@
 //! reliably unprompted.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::time::Instant;
 
 use schemars::r#gen::SchemaSettings;
 use schemars::schema::Schema;
@@ -1236,12 +1237,15 @@ impl QueryExecutionSource<'_, '_> {
         let mut states = match self {
             Self::Lens(lens) => {
                 let mut conn = lens.projection().snapshot_pool().acquire().await?;
-                super::work::project_work_states_in(&mut conn, live_target_pool, caller, &ids)
-                    .await?
+                super::work::project_work_states_in_cross_pool(
+                    &mut conn,
+                    live_target_pool,
+                    caller,
+                    &ids,
+                )
+                .await?
             }
-            Self::Live(tx) => {
-                super::work::project_work_states_in(tx, live_target_pool, caller, &ids).await?
-            }
+            Self::Live(tx) => super::work::project_work_states_in(tx, caller, &ids).await?,
         };
         for record in records {
             let Some(object) = record.as_object_mut() else {
@@ -1736,6 +1740,17 @@ async fn redact_query_record_references(
     caller: &Caller,
     payload: &mut Value,
 ) -> Result<()> {
+    let started = Instant::now();
+    let result = redact_query_record_references_inner(source, caller, payload).await;
+    crate::query::stage_timing::add_redaction(started);
+    result
+}
+
+async fn redact_query_record_references_inner(
+    source: &mut QueryExecutionSource<'_, '_>,
+    caller: &Caller,
+    payload: &mut Value,
+) -> Result<()> {
     let Some(records) = payload.get_mut("records").and_then(Value::as_array_mut) else {
         return Ok(());
     };
@@ -2153,7 +2168,7 @@ async fn query_record(db: Db, caller: Caller, mut arguments: Value) -> Result<Va
                 "local_database_id".into(),
                 json!(crate::identity::database_id(&db).await?),
             );
-        annotate_query_record_paths(&db, &mut output).await?;
+        annotate_query_record_paths(&db, &caller, db.write_pool(), &mut output).await?;
         return Ok(output);
     }
     let Some(selector) = as_of else {
@@ -2168,11 +2183,11 @@ async fn query_record(db: Db, caller: Caller, mut arguments: Value) -> Result<Va
                 page_basis_digest.as_deref(),
             )
             .await?;
-            annotate_query_record_paths(&db, &mut output).await?;
+            annotate_query_record_paths(&db, &caller, db.write_pool(), &mut output).await?;
             return Ok(output);
         }
         let mut output = execute_query_record_args_as(&db, &caller, TOOL, arguments).await?;
-        annotate_query_record_paths(&db, &mut output).await?;
+        annotate_query_record_paths(&db, &caller, db.write_pool(), &mut output).await?;
         return Ok(output);
     };
     let resolved = lens::resolve_as_of(&db, selector).await?;
@@ -2198,7 +2213,16 @@ async fn query_record(db: Db, caller: Caller, mut arguments: Value) -> Result<Va
                 .annotate_work_states(db.write_pool(), &caller, &mut output)
                 .await?;
         }
-        annotate_query_record_paths(&db, &mut output).await?;
+        // Succession content from this read's projection — the replay
+        // scratch — while visibility and references stay live, matching
+        // get_record and get_structure under `as_of`.
+        annotate_query_record_paths(
+            &db,
+            &caller,
+            read_lens.projection().snapshot_pool(),
+            &mut output,
+        )
+        .await?;
         if include_coordination {
             let coordination_observed_at =
                 chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
@@ -2223,11 +2247,28 @@ async fn query_record(db: Db, caller: Caller, mut arguments: Value) -> Result<Va
     result
 }
 
-async fn annotate_query_record_paths(db: &Db, payload: &mut Value) -> Result<()> {
+async fn annotate_query_record_paths(
+    db: &Db,
+    caller: &Caller,
+    content_pool: &sqlx::SqlitePool,
+    payload: &mut Value,
+) -> Result<()> {
     let Some(records) = payload.get_mut("records").and_then(Value::as_array_mut) else {
         return Ok(());
     };
-    super::lifecycle::annotate_record_paths_batch(db, records).await
+    super::lifecycle::annotate_record_paths_batch(db, records).await?;
+    // Succession content comes from the same projection as the rows —
+    // the replay scratch under `as_of`, the live pool otherwise — while
+    // visibility and short references stay live, exactly as
+    // `get_structure_from_lens` splits the two tiers. Portable backends
+    // never reach this annotator, so their record JSON is unchanged.
+    super::lifecycle::annotate_superseded_by_in_pools(
+        content_pool,
+        db.write_pool(),
+        caller,
+        records,
+    )
+    .await
 }
 
 pub(crate) const SAVED_QUERY_VERSION: &str = "0.2";
@@ -3459,11 +3500,11 @@ async fn search(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
         }
         object.insert("guidance".into(), json!(guidance));
     }
-    annotate_search_record_paths(&db, &mut payload).await?;
+    annotate_search_record_paths(&db, &caller, &mut payload).await?;
     Ok(payload)
 }
 
-async fn annotate_search_record_paths(db: &Db, payload: &mut Value) -> Result<()> {
+async fn annotate_search_record_paths(db: &Db, caller: &Caller, payload: &mut Value) -> Result<()> {
     let mut ids = Vec::new();
     for pointer in [
         "/hits",
@@ -3503,6 +3544,18 @@ async fn annotate_search_record_paths(db: &Db, payload: &mut Value) -> Result<()
                 references.get(&id).cloned().flatten(),
             )?;
         }
+    }
+    // Succession on hits only: near-miss rows are minimal projections whose
+    // renderer names id/type/title, so naming successors there would be
+    // payload without a reader.
+    if let Some(hits) = payload.get_mut("hits").and_then(Value::as_array_mut) {
+        super::lifecycle::annotate_superseded_by_in_pools(
+            db.write_pool(),
+            db.write_pool(),
+            caller,
+            hits,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -3968,10 +4021,15 @@ async fn axis(
         query = query.bind(bind);
     }
     let rows = query.fetch_all(db.write_pool()).await?;
+    let ids = rows
+        .iter()
+        .map(|row| row.try_get::<String, _>("id"))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let visible = super::visible_ids(db, caller, ids).await?;
     let mut visible_rows = Vec::new();
     for row in &rows {
         let id: String = row.try_get("id")?;
-        if super::can_record(db, caller, &id, crate::authorization::Capability::View).await? {
+        if visible.contains(&id) {
             visible_rows.push(row);
         }
     }
@@ -4029,49 +4087,96 @@ async fn derived_relationship_axis(
         query = query.bind(bind);
     }
     let rows = query.fetch_all(db.write_pool()).await?;
-    let mut matches = Vec::new();
-    for row in rows {
-        let id: String = row.try_get("id")?;
-        if !super::can_record(db, caller, &id, crate::authorization::Capability::View).await? {
-            continue;
-        }
-        let related: Vec<String> = match metric {
-            DerivedAxisMetric::Degree => {
-                sqlx::query_scalar(
-                    "SELECT CASE WHEN source_id = ? THEN target_id ELSE source_id END
-                       FROM links WHERE source_id = ? OR target_id = ?",
-                )
-                .bind(&id)
-                .bind(&id)
-                .bind(&id)
-                .fetch_all(db.write_pool())
-                .await?
-            }
-            DerivedAxisMetric::ChildCount => {
-                let sql = format!(
-                    "SELECT c.id FROM records c
-                      WHERE c.home_id = ? AND c.deleted_at IS NULL AND {}",
-                    crate::query::not_hidden_predicate("c")
-                );
-                sqlx::query_scalar(&sql)
-                    .bind(&id)
-                    .fetch_all(db.write_pool())
-                    .await?
-            }
-        };
-        let mut visible_metric = 0i64;
-        for related_id in related {
-            if super::can_record(
-                db,
-                caller,
-                &related_id,
-                crate::authorization::Capability::View,
+    let corpus_ids = rows
+        .iter()
+        .map(|row| row.try_get::<String, _>("id"))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let visible_corpus = super::visible_ids(db, caller, corpus_ids.clone()).await?;
+    let visible_rows: Vec<(String, _)> = rows
+        .into_iter()
+        .zip(corpus_ids)
+        .filter(|(_, id)| visible_corpus.contains(id))
+        .map(|(row, id)| (id, row))
+        .collect();
+    if visible_rows.is_empty() {
+        return Ok(AxisFacet {
+            count: 0,
+            samples: Vec::new(),
+        });
+    }
+    // Set-based relation loads: ONE links/children fetch for the whole visible
+    // corpus, then ONE bulk authorization for every distinct related id. The
+    // related ids are deliberately not restricted to the corpus/scope/type
+    // filters, exactly as the former per-record loads were not: a link out of
+    // the scope still counts towards degree. Duplicate link rows still count
+    // once each, and a self-link still counts once, because the former
+    // per-record query matched each link row once.
+    let corpus_ids: Vec<&String> = visible_rows.iter().map(|(id, _)| id).collect();
+    let corpus_json = serde_json::to_string(&corpus_ids)?;
+    let index: HashMap<&str, usize> = corpus_ids
+        .iter()
+        .enumerate()
+        .map(|(position, id)| (id.as_str(), position))
+        .collect();
+    let mut related_per_corpus: Vec<Vec<String>> = vec![Vec::new(); corpus_ids.len()];
+    match metric {
+        DerivedAxisMetric::Degree => {
+            let link_rows: Vec<(String, String)> = sqlx::query_as(
+                "SELECT source_id, target_id FROM links
+                  WHERE source_id IN (SELECT value FROM json_each(?))
+                     OR target_id IN (SELECT value FROM json_each(?))",
             )
-            .await?
-            {
-                visible_metric += 1;
+            .bind(&corpus_json)
+            .bind(&corpus_json)
+            .fetch_all(db.write_pool())
+            .await?;
+            for (source_id, target_id) in link_rows {
+                if source_id == target_id {
+                    if let Some(position) = index.get(source_id.as_str()) {
+                        related_per_corpus[*position].push(target_id);
+                    }
+                    continue;
+                }
+                if let Some(position) = index.get(source_id.as_str()) {
+                    related_per_corpus[*position].push(target_id.clone());
+                }
+                if let Some(position) = index.get(target_id.as_str()) {
+                    related_per_corpus[*position].push(source_id);
+                }
             }
         }
+        DerivedAxisMetric::ChildCount => {
+            let sql = format!(
+                "SELECT c.id, c.home_id FROM records c
+                  WHERE c.home_id IN (SELECT value FROM json_each(?))
+                    AND c.deleted_at IS NULL AND {}",
+                crate::query::not_hidden_predicate("c")
+            );
+            let child_rows: Vec<(String, String)> = sqlx::query_as(&sql)
+                .bind(&corpus_json)
+                .fetch_all(db.write_pool())
+                .await?;
+            for (child_id, home_id) in child_rows {
+                if let Some(position) = index.get(home_id.as_str()) {
+                    related_per_corpus[*position].push(child_id);
+                }
+            }
+        }
+    }
+    let mut seen = HashSet::new();
+    let unique_related = related_per_corpus
+        .iter()
+        .flatten()
+        .filter(|id| seen.insert(*id))
+        .map(|id| id.to_string())
+        .collect::<Vec<_>>();
+    let visible_related = super::visible_ids(db, caller, unique_related).await?;
+    let mut matches = Vec::new();
+    for ((id, row), related) in visible_rows.iter().zip(related_per_corpus.iter()) {
+        let visible_metric = related
+            .iter()
+            .filter(|related_id| visible_related.contains(*related_id))
+            .count() as i64;
         if visible_metric < minimum {
             continue;
         }
@@ -4082,7 +4187,7 @@ async fn derived_relationship_axis(
         matches.push((
             visible_metric,
             AxisSample {
-                id,
+                id: id.clone(),
                 record_type: row.try_get("type")?,
                 name: row.try_get("name")?,
                 evidence: vec![(json_key.into(), json!(visible_metric))],
@@ -4136,6 +4241,29 @@ async fn annotate_scan_axes_record_paths(
                 references.get(&id).cloned().flatten(),
             )?;
         }
+    }
+    Ok(())
+}
+
+/// Carry the succession disclosure on every axis sample head. `scan` prints
+/// unknown sample keys generically, so carrying the field is surfacing it —
+/// no renderer change needed.
+async fn annotate_scan_axes_superseded(
+    db: &Db,
+    caller: &Caller,
+    axes: &mut serde_json::Map<String, Value>,
+) -> Result<()> {
+    for facet in axes.values_mut() {
+        let Some(samples) = facet.get_mut("samples").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        super::lifecycle::annotate_superseded_by_in_pools(
+            db.write_pool(),
+            db.write_pool(),
+            caller,
+            samples,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -4195,6 +4323,7 @@ fn build_scan_convergence(axes: &serde_json::Map<String, Value>) -> Vec<Value> {
         record_path: Option<Value>,
         record_path_full: Option<Value>,
         lifecycle_interpretation: Option<Value>,
+        superseded_by: Option<Value>,
     }
 
     let mut appearances: std::collections::HashMap<String, ConvergenceRecord> =
@@ -4222,6 +4351,7 @@ fn build_scan_convergence(axes: &serde_json::Map<String, Value>) -> Vec<Value> {
                     record_path: sample.get("record_path").cloned(),
                     record_path_full: sample.get("record_path_full").cloned(),
                     lifecycle_interpretation: sample.get("lifecycle_interpretation").cloned(),
+                    superseded_by: sample.get("superseded_by").cloned(),
                 })
                 .axes
                 .push(axis_name.clone());
@@ -4264,6 +4394,9 @@ fn build_scan_convergence(axes: &serde_json::Map<String, Value>) -> Vec<Value> {
             if let Some(lifecycle_interpretation) = record.lifecycle_interpretation {
                 object.insert("lifecycle_interpretation".into(), lifecycle_interpretation);
             }
+            if let Some(superseded_by) = record.superseded_by {
+                object.insert("superseded_by".into(), superseded_by);
+            }
             value
         })
         .collect()
@@ -4304,9 +4437,8 @@ async fn scan(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
     }
     if let Some(types) = &args.types {
         if !types.is_empty() {
-            let placeholders = vec!["?"; types.len()].join(", ");
-            corpus_clauses.push(format!("r.type IN ({placeholders})"));
-            corpus_binds.extend(types.iter().cloned());
+            corpus_clauses.push("r.type IN (SELECT value FROM json_each(?))".into());
+            corpus_binds.push(serde_json::to_string(types)?);
         }
     }
     if let Some(root) = &args.scope {
@@ -4321,9 +4453,11 @@ async fn scan(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
                 "{TOOL}: scope record {root} does not exist"
             )));
         }
-        let placeholders = vec!["?"; ids.len()].join(", ");
-        corpus_clauses.push(format!("r.id IN ({placeholders})"));
-        corpus_binds.extend(ids);
+        // Set-valued binding: one JSON-array bind regardless of subtree
+        // size, so scoped scans stay under the per-connection variable
+        // limit instead of spending one scalar bind per subtree id.
+        corpus_clauses.push("r.id IN (SELECT value FROM json_each(?))".into());
+        corpus_binds.push(serde_json::to_string(&ids)?);
     }
     let corpus_where = corpus_clauses.join(" AND ");
 
@@ -4333,15 +4467,16 @@ async fn scan(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
         for bind in &corpus_binds {
             query = query.bind(bind);
         }
-        let rows = query.fetch_all(db.write_pool()).await?;
-        let mut count = 0i64;
-        for row in rows {
-            let id: String = row.try_get("id")?;
-            if super::can_record(&db, &caller, &id, crate::authorization::Capability::View).await? {
-                count += 1;
-            }
-        }
-        count
+        let ids: Vec<String> = query
+            .fetch_all(db.write_pool())
+            .await?
+            .iter()
+            .map(|row| row.try_get("id"))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        // One bulk authorization for the whole corpus instead of one
+        // `can_record` transaction per row. The count is still the number of
+        // distinct visible records, exactly as the scalar loop counted.
+        super::visible_ids(&db, &caller, ids).await?.len() as i64
     };
 
     // Census: bucket counts along the spine axes (the type/kind/lifecycle
@@ -4421,10 +4556,15 @@ async fn scan(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
         provenance_query = provenance_query.bind(bind);
     }
     let provenance_rows = provenance_query.fetch_all(db.write_pool()).await?;
+    let provenance_ids = provenance_rows
+        .iter()
+        .map(|row| row.try_get::<String, _>("record_id"))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let visible_provenance = super::visible_ids(&db, &caller, provenance_ids).await?;
     let mut provenance_counts = std::collections::BTreeMap::<String, i64>::new();
     for row in &provenance_rows {
         let id: String = row.try_get("record_id")?;
-        if super::can_record(&db, &caller, &id, crate::authorization::Capability::View).await? {
+        if visible_provenance.contains(&id) {
             *provenance_counts
                 .entry(row.try_get("provenance")?)
                 .or_default() += 1;
@@ -4613,6 +4753,7 @@ async fn scan(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
 
     annotate_scan_axes_lifecycle(&db, &caller, &mut axes).await?;
     annotate_scan_axes_record_paths(&db, &mut axes).await?;
+    annotate_scan_axes_superseded(&db, &caller, &mut axes).await?;
 
     // Convergence: described records surfacing in the SAMPLES of two or more
     // axes — the strongest orientation signal a stateless scan can give.
@@ -4657,15 +4798,18 @@ pub fn register_query_tools(registry: &mut ToolRegistry) -> Result<()> {
          'rollup' facet. The stable address is record_id + rollup_name. \
          Successful results use the opened database's bounded revision-keyed \
          in-memory cache; derived values are never written back.",
-        json!({
-            "type": "object",
-            "properties": {
-                "record_id": { "type": "string", "minLength": 1 },
-                "rollup_name": { "type": "string", "minLength": 1 }
-            },
-            "required": ["record_id", "rollup_name"],
-            "additionalProperties": false
-        }),
+        crate::mcp::record_ref::with_record_selector_aliases(
+            "resolve_rollup",
+            json!({
+                "type": "object",
+                "properties": {
+                    "record_id": { "type": "string", "minLength": 1 },
+                    "rollup_name": { "type": "string", "minLength": 1 }
+                },
+                "required": ["record_id", "rollup_name"],
+                "additionalProperties": false
+            }),
+        ),
         resolve_rollup,
     )?;
     registry.register(
@@ -5385,6 +5529,7 @@ mod governed_sql_tests {
         assert_eq!(public.rows.len(), crate::query::sql_contract::MAX_ROWS);
         assert!(public.truncated);
         tx.rollback().await.unwrap();
+        drop(connection);
 
         let mut definition = definition("SELECT name,id FROM records WHERE type=?1", 1000);
         definition.output.order = vec![SavedSqlOrder {
@@ -5898,5 +6043,559 @@ mod scan_record_path_tests {
             json!("/0189d4c6-1f2a-4a1b-9c3d-5e6f70819293")
         );
         db.close().await;
+    }
+}
+
+/// Scalability guardrails for `scan`.
+///
+/// `scan` used to expand a scope subtree into one host variable per id and to
+/// authorize every corpus, provenance, link and child row with its own
+/// `can_record` transaction. Both scale with the corpus, so the tool failed or
+/// crawled on exactly the large workspaces scoping exists to serve. These
+/// tests pin bounded statement width and batch-scaled application statements
+/// for ordinary records, while preserving visibility, custody, relationship
+/// and lifecycle answers. SQLite's nested FTS work is reported separately.
+#[cfg(test)]
+mod scan_scalability_tests {
+    use super::*;
+    use crate::authorization::{replace_explicit_policy, AllowEntry, Capability};
+    use crate::db::create_database;
+    use crate::query::test_sqlite::SqliteTrace as ConnectionTrace;
+    use crate::store::{append, create_record, AppendSpec};
+
+    /// Both pools are opened with this ceiling (`db::open_pool`,
+    /// `db::open_read_pool`). Holding this many connections at once therefore
+    /// forces every connection the pool can ever hand out to exist, so a
+    /// per-connection hook installed on all of them covers the whole call.
+    const POOL_MAX: usize = 5;
+
+    /// What one `scan` call cost SQLite.
+    ///
+    /// `statements` counts only the statements Native itself prepared.
+    /// SQLite reports trigger and virtual-table sub-statements through the
+    /// same trace, marking their SQL text with a leading `--`; FTS5 runs one
+    /// content lookup and one docsize lookup per MATCHED row, which tracks the
+    /// result set by that index's design and is not work `scan` can batch.
+    /// Counting those here would drown the signal this test exists for.
+    /// `internal_statements` keeps them visible rather than silent.
+    ///
+    /// `max_bind_parameters` is the widest prepared statement the call ran, in
+    /// host variables: the number the old scope filter made grow with the
+    /// subtree, and the number SQLITE_LIMIT_VARIABLE_NUMBER caps.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct SqliteWork {
+        statements: usize,
+        internal_statements: usize,
+        max_bind_parameters: usize,
+    }
+
+    /// Observes every connection used by scan, retaining the original variable
+    /// limit so the fixture can restore it when measurement ends.
+    struct PoolTrace {
+        connections: HashMap<usize, (ConnectionTrace, i32)>,
+        variable_limit: Option<i32>,
+    }
+
+    impl PoolTrace {
+        async fn hold_all(db: &Db) -> Vec<sqlx::pool::PoolConnection<sqlx::Sqlite>> {
+            let mut held = Vec::new();
+            for pool in [db.write_pool(), db.pool()] {
+                for _ in 0..POOL_MAX {
+                    held.push(pool.acquire().await.expect("pool connection"));
+                }
+            }
+            held
+        }
+
+        async fn identity_and_limit(conn: &mut sqlx::SqliteConnection) -> (usize, i32) {
+            let mut handle = conn.lock_handle().await.expect("locked handle");
+            let raw = handle.as_raw_handle().as_ptr();
+            // SAFETY: lock_handle excludes concurrent SQLite use.
+            let limit = unsafe {
+                libsqlite3_sys::sqlite3_limit(raw, libsqlite3_sys::SQLITE_LIMIT_VARIABLE_NUMBER, -1)
+            };
+            (raw as usize, limit)
+        }
+
+        async fn set_limit(conn: &mut sqlx::SqliteConnection, limit: i32) {
+            let mut handle = conn.lock_handle().await.expect("locked handle");
+            // SAFETY: lock_handle excludes concurrent SQLite use.
+            unsafe {
+                libsqlite3_sys::sqlite3_limit(
+                    handle.as_raw_handle().as_ptr(),
+                    libsqlite3_sys::SQLITE_LIMIT_VARIABLE_NUMBER,
+                    limit,
+                );
+            }
+        }
+
+        async fn install(db: &Db, variable_limit: Option<i32>) -> (Self, i32) {
+            let mut held = Self::hold_all(db).await;
+            let mut connections = HashMap::new();
+            let mut original_limits = Vec::new();
+            for conn in &mut held {
+                let (id, original_limit) = Self::identity_and_limit(conn).await;
+                original_limits.push(original_limit);
+                if let Some(limit) = variable_limit {
+                    Self::set_limit(conn, limit).await;
+                    assert_eq!(Self::identity_and_limit(conn).await.1, limit);
+                }
+                let trace = ConnectionTrace::install(conn).await.unwrap();
+                assert!(connections.insert(id, (trace, original_limit)).is_none());
+            }
+            assert!(original_limits
+                .iter()
+                .all(|limit| *limit == original_limits[0]));
+            (
+                Self {
+                    connections,
+                    variable_limit,
+                },
+                original_limits[0],
+            )
+        }
+
+        async fn reset(&self, db: &Db) {
+            // Holding all handles drains pool release/sanitizer work before
+            // resetting the window; no callback can race these counter stores.
+            // Dropping `held` adds five write-pool sanitizer statements to both
+            // fixture sizes. They remain included, as do releases during scan;
+            // extra per-record releases should fail the growth bound too.
+            let mut held = Self::hold_all(db).await;
+            for conn in &mut held {
+                let (id, limit) = Self::identity_and_limit(conn).await;
+                if let Some(expected) = self.variable_limit {
+                    assert_eq!(limit, expected);
+                }
+                self.connections
+                    .get(&id)
+                    .expect("observed connection replaced")
+                    .0
+                    .reset(conn)
+                    .await
+                    .unwrap();
+            }
+        }
+
+        async fn finish(mut self, db: &Db) -> SqliteWork {
+            let mut held = Self::hold_all(db).await;
+            let mut work = SqliteWork {
+                statements: 0,
+                internal_statements: 0,
+                max_bind_parameters: 0,
+            };
+            for conn in &mut held {
+                let (id, limit) = Self::identity_and_limit(conn).await;
+                let (trace, original_limit) = self
+                    .connections
+                    .remove(&id)
+                    .expect("observed connection replaced");
+                if let Some(expected) = self.variable_limit {
+                    assert_eq!(limit, expected, "the variable limit changed during scan");
+                }
+                let measured = trace.finish(conn).await.unwrap();
+                work.statements += measured.statements - measured.internal_statements;
+                work.internal_statements += measured.internal_statements;
+                work.max_bind_parameters =
+                    work.max_bind_parameters.max(measured.max_bind_parameters);
+                Self::set_limit(conn, original_limit).await;
+                assert_eq!(Self::identity_and_limit(conn).await.1, original_limit);
+            }
+            assert!(self.connections.is_empty());
+            work
+        }
+    }
+
+    /// Prove the lowered limit really is in force on a pooled connection, by
+    /// running the scalar `IN (?, ?, …)` form `scan` used to build. Without
+    /// this control, a scan that passes proves nothing.
+    async fn scalar_in_list_error(db: &Db, ids: &[String]) -> String {
+        let placeholders = vec!["?"; ids.len()].join(", ");
+        let sql = format!("SELECT COUNT(*) FROM records r WHERE r.id IN ({placeholders})");
+        let mut query = sqlx::query_scalar::<_, i64>(&sql);
+        for id in ids {
+            query = query.bind(id);
+        }
+        query
+            .fetch_one(db.write_pool())
+            .await
+            .expect_err("the scalar scope filter must still exceed the lowered limit")
+            .to_string()
+    }
+
+    async fn folder(db: &Db, name: &str, home: Option<&str>) -> String {
+        let mut fields = json!({ "type": "Collection", "kind": "folder", "name": name });
+        if let Some(home) = home {
+            fields["home_id"] = json!(home);
+        }
+        create_record(db, fields).await.unwrap()
+    }
+
+    async fn note(db: &Db, name: &str, home: &str) -> String {
+        create_record(
+            db,
+            json!({ "type": "Document", "kind": "note", "name": name, "home_id": home }),
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn link(db: &Db, source: &str, target: &str, relationship: &str) {
+        sqlx::query(
+            "INSERT INTO links(id, source_id, target_id, relationship, created_at) \
+             VALUES(?, ?, ?, ?, '2026-01-01T00:00:00.000Z')",
+        )
+        .bind(format!("{source}:{target}:{relationship}"))
+        .bind(source)
+        .bind(target)
+        .bind(relationship)
+        .execute(db.write_pool())
+        .await
+        .unwrap();
+    }
+
+    async fn archive(db: &Db, id: &str) {
+        append(
+            db,
+            AppendSpec {
+                record_id: id.into(),
+                event_type: "facet.set".into(),
+                payload: json!({ "key": "archived", "value": "true" }),
+                actor: Some("test:archive".into()),
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    fn ids_of(facet: &Value) -> Vec<String> {
+        facet["samples"]
+            .as_array()
+            .expect("samples array")
+            .iter()
+            .map(|sample| sample["id"].as_str().expect("sample id").to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn scoped_scan_survives_a_corpus_wider_than_the_variable_limit() {
+        // 600 scoped records against a 500-variable connection: the scalar
+        // scope filter cannot prepare at all, while the set-valued filter does
+        // not care how wide the subtree is.
+        const CORPUS: usize = 600;
+        const LOWERED_LIMIT: i32 = 500;
+
+        let db = create_database(":memory:").await.unwrap();
+        // The folder name deliberately shares no token with the lexical
+        // probe, so the expected lexical count is the note count exactly.
+        let scope = folder(&db, "Holding folder", None).await;
+        let mut ids = vec![scope.clone()];
+        for index in 0..CORPUS {
+            ids.push(note(&db, &format!("guardrail note {index:04}"), &scope).await);
+        }
+
+        let (trace, default_limit) = PoolTrace::install(&db, Some(LOWERED_LIMIT)).await;
+        assert!(
+            default_limit > LOWERED_LIMIT,
+            "this build's runtime variable limit is {default_limit}, so lowering to \
+             {LOWERED_LIMIT} would not constrain anything"
+        );
+
+        let error = scalar_in_list_error(&db, &ids).await;
+        assert!(
+            error.contains("too many SQL variables"),
+            "the lowered limit did not bite: {error}"
+        );
+
+        trace.reset(&db).await;
+        let result = scan(
+            db.clone(),
+            Caller::local(),
+            json!({ "scope": scope, "query": "guardrail", "high_degree_min": 1 }),
+        )
+        .await
+        .expect("a scoped scan must not depend on the host variable limit");
+        let work = trace.finish(&db).await;
+
+        assert_eq!(result["corpus_size"], json!(CORPUS as i64 + 1));
+        assert_eq!(result["axes"]["lexical"]["count"], json!(CORPUS as i64));
+        assert_eq!(result["axes"]["containers"]["count"], json!(1));
+        assert_eq!(
+            result["axes"]["containers"]["samples"][0]["child_count"],
+            json!(CORPUS as i64)
+        );
+        assert!(
+            work.max_bind_parameters < LOWERED_LIMIT as usize,
+            "scan prepared a {}-variable statement over a {CORPUS}-record scope",
+            work.max_bind_parameters
+        );
+
+        // finish verified every original connection retained the lowered
+        // limit throughout the call and restored it before returning it.
+        let (recheck, restored) = PoolTrace::install(&db, None).await;
+        assert_eq!(restored, default_limit);
+        recheck.finish(&db).await;
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn batched_visibility_keeps_counts_custody_and_sample_order() {
+        let db = create_database(":memory:").await.unwrap();
+        let scope = folder(&db, "Scope", None).await;
+        replace_explicit_policy(
+            &db,
+            "test:policy",
+            &scope,
+            vec![AllowEntry::account("acct:viewer", Capability::View)],
+        )
+        .await
+        .unwrap();
+        let alpha = note(&db, "Alpha", &scope).await;
+        let bravo = note(&db, "Bravo", &scope).await;
+        let charlie = note(&db, "Charlie", &scope).await;
+        let hidden_child = note(&db, "Hidden child", &scope).await;
+        replace_explicit_policy(&db, "test:policy", &hidden_child, vec![])
+            .await
+            .unwrap();
+
+        // Two related records OUTSIDE the scope and outside a Document type
+        // filter: one the caller may see, one it may not. Neither filter has
+        // ever bounded which related records a relationship metric counts.
+        let outside_visible = folder(&db, "Outside visible", None).await;
+        replace_explicit_policy(
+            &db,
+            "test:policy",
+            &outside_visible,
+            vec![AllowEntry::account("acct:viewer", Capability::View)],
+        )
+        .await
+        .unwrap();
+        let outside_hidden = folder(&db, "Outside hidden", None).await;
+        replace_explicit_policy(&db, "test:policy", &outside_hidden, vec![])
+            .await
+            .unwrap();
+
+        // Alpha: one visible neighbour reached twice through two distinct link
+        // rows, one invisible neighbour, and one self-link. Degree counts link
+        // rows to visible records, so that is 2 + 0 + 1 = 3.
+        link(&db, &alpha, &outside_visible, "relates_to").await;
+        link(&db, &alpha, &outside_visible, "mentions").await;
+        link(&db, &alpha, &outside_hidden, "relates_to").await;
+        link(&db, &alpha, &alpha, "relates_to").await;
+        // Bravo and Charlie each reach one visible record; Bravo also reaches
+        // the hidden child, which must not lift it above Charlie.
+        link(&db, &bravo, &charlie, "relates_to").await;
+        link(&db, &bravo, &hidden_child, "relates_to").await;
+
+        let viewer = Caller::authenticated("acct:viewer");
+        let result = scan(
+            db.clone(),
+            viewer.clone(),
+            json!({ "scope": scope, "high_degree_min": 1 }),
+        )
+        .await
+        .unwrap();
+
+        // Corpus: the scope plus three visible notes. The denied child is not
+        // counted, and never appears as anyone's neighbour.
+        assert_eq!(result["corpus_size"], json!(4));
+        let high_degree = &result["axes"]["high_degree"];
+        assert_eq!(high_degree["count"], json!(3));
+        assert_eq!(
+            ids_of(high_degree),
+            vec![alpha.clone(), bravo.clone(), charlie.clone()],
+            "samples order by degree DESC, then name, then id"
+        );
+        assert_eq!(high_degree["samples"][0]["degree"], json!(3));
+        assert_eq!(high_degree["samples"][1]["degree"], json!(1));
+        assert_eq!(high_degree["samples"][2]["degree"], json!(1));
+        let containers = &result["axes"]["containers"];
+        assert_eq!(containers["count"], json!(1));
+        assert_eq!(ids_of(containers), vec![scope.clone()]);
+        assert_eq!(
+            containers["samples"][0]["child_count"],
+            json!(3),
+            "the denied child is not part of any visible container count"
+        );
+
+        // The same relationships under a type filter that excludes every
+        // neighbour: the metric is unchanged, only the corpus narrows.
+        let typed = scan(
+            db.clone(),
+            viewer.clone(),
+            json!({ "scope": scope, "types": ["Document"], "high_degree_min": 1 }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(typed["corpus_size"], json!(3));
+        assert_eq!(typed["axes"]["high_degree"]["count"], json!(3));
+        assert_eq!(
+            typed["axes"]["high_degree"]["samples"][0]["degree"],
+            json!(3)
+        );
+        assert_eq!(typed["axes"]["containers"]["count"], json!(0));
+
+        // A caller with no grant sees no relationship rows at all, rather
+        // than counts derived from rows it cannot read. Asserted on the
+        // uncapped pool counts, not the sample head, and restricted to
+        // Documents so the engine's own seeded folders stay out of it.
+        let stranger = Caller::authenticated("acct:stranger");
+        let denied = scan(
+            db.clone(),
+            stranger.clone(),
+            json!({ "types": ["Document"], "high_degree_min": 1 }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(denied["corpus_size"], json!(0));
+        assert_eq!(denied["axes"]["high_degree"]["count"], json!(0));
+        assert_eq!(denied["axes"]["containers"]["count"], json!(0));
+
+        // And the scope itself stays an absence, not a permission error.
+        let refused = scan(db.clone(), stranger, json!({ "scope": scope }))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("does not exist"), "{refused}");
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn include_archived_semantics_are_unchanged() {
+        let db = create_database(":memory:").await.unwrap();
+        let scope = folder(&db, "Holding folder", None).await;
+        let _live = note(&db, "archivable live", &scope).await;
+        let archived = note(&db, "archivable filed", &scope).await;
+        archive(&db, &archived).await;
+
+        // Counts, not sample heads: a sample is capped at three records, so
+        // membership in one would depend on how the engine's own seeded
+        // records happened to sort.
+        let unscoped = scan(
+            db.clone(),
+            Caller::local(),
+            json!({ "query": "archivable" }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(unscoped["axes"]["lexical"]["count"], json!(1));
+
+        let unscoped_archived = scan(
+            db.clone(),
+            Caller::local(),
+            json!({ "query": "archivable", "include_archived": true }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(unscoped_archived["axes"]["lexical"]["count"], json!(2));
+        assert_eq!(
+            unscoped_archived["corpus_size"].as_i64().unwrap()
+                - unscoped["corpus_size"].as_i64().unwrap(),
+            1,
+            "include_archived admits exactly the archived record"
+        );
+
+        // Scoped, `scan` resolves its corpus through the default subtree walk,
+        // which prunes archived records whatever `include_archived` says,
+        // while the lexical axis resolves its own scope with the flag honoured.
+        // Pinned here as the observed behaviour of a contract this change did
+        // not touch, not as an endorsement of the asymmetry.
+        let scoped = scan(
+            db.clone(),
+            Caller::local(),
+            json!({ "scope": scope.clone(), "query": "archivable" }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(scoped["corpus_size"], json!(2));
+        assert_eq!(scoped["axes"]["lexical"]["count"], json!(1));
+
+        let scoped_archived = scan(
+            db.clone(),
+            Caller::local(),
+            json!({ "scope": scope, "query": "archivable", "include_archived": true }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            scoped_archived["corpus_size"],
+            json!(2),
+            "the scoped corpus still excludes the archived record"
+        );
+        assert_eq!(
+            scoped_archived["axes"]["lexical"]["count"],
+            json!(2),
+            "the lexical axis still resolves its own scope with the flag"
+        );
+        db.close().await;
+    }
+
+    /// `query::pipeline` deliberately batches its scalar id lists in blocks
+    /// of 400, so the widest statement a `scan` runs saturates at that block
+    /// size and stops growing. The guardrail is that saturation, not a small
+    /// absolute number: a corpus twice as large must not buy a wider
+    /// statement, and must not buy statements in proportion to its records.
+    const PIPELINE_ID_BLOCK: usize = 400;
+
+    #[tokio::test]
+    async fn statement_and_bind_cost_do_not_track_corpus_size() {
+        async fn scan_cost(records: usize) -> SqliteWork {
+            let db = create_database(":memory:").await.unwrap();
+            let scope = folder(&db, "Holding folder", None).await;
+            let mut ids = Vec::new();
+            for index in 0..records {
+                ids.push(note(&db, &format!("cost note {index:04}"), &scope).await);
+            }
+            // Link the notes into a ring, so the link rows the degree axis
+            // must load and authorize grow with the corpus too. Without them
+            // a regression that made per-related-record authorization scalar
+            // again would cost nothing here.
+            for (index, source) in ids.iter().enumerate() {
+                link(&db, source, &ids[(index + 1) % ids.len()], "relates_to").await;
+            }
+            let (trace, _) = PoolTrace::install(&db, None).await;
+            trace.reset(&db).await;
+            scan(
+                db.clone(),
+                Caller::local(),
+                json!({ "scope": scope, "query": "cost", "high_degree_min": 1 }),
+            )
+            .await
+            .unwrap();
+            let work = trace.finish(&db).await;
+            db.close().await;
+            work
+        }
+
+        // Both corpora are past the pipeline block size, so both already pay
+        // the widest statement the design admits.
+        let small = scan_cost(PIPELINE_ID_BLOCK + 50).await;
+        let large = scan_cost(2 * PIPELINE_ID_BLOCK + 100).await;
+        println!("scan cost: {small:?} -> {large:?}");
+
+        assert_eq!(
+            large.max_bind_parameters, small.max_bind_parameters,
+            "statement width tracked the corpus: {small:?} -> {large:?}"
+        );
+        assert!(
+            large.internal_statements > small.internal_statements,
+            "the FTS5 per-row lookups this test excludes were not actually \
+             exercised, so excluding them proves nothing: {small:?} -> {large:?}"
+        );
+        assert!(
+            large.max_bind_parameters <= PIPELINE_ID_BLOCK + 16,
+            "a scan statement bound {} variables, past the {PIPELINE_ID_BLOCK}-id \
+             block plus its fixed parameters",
+            large.max_bind_parameters
+        );
+        // The corpus grew by 450 records and 450 link rows. Batched work may
+        // add a statement or so per additional block; per-record work would
+        // add hundreds. Pool sanitizer releases remain included; the helper
+        // adds the same five initial release statements to both fixtures.
+        let extra_blocks = 2;
+        assert!(
+            large.statements <= small.statements + 4 * extra_blocks,
+            "statement count tracked the corpus: {small:?} -> {large:?}"
+        );
     }
 }

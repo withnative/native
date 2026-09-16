@@ -125,6 +125,7 @@ pub async fn descendants(db: &Db, root_id: &str, opts: TreeOptions) -> Result<Ve
     descendants_inner(
         ProjectionRead::new(db),
         db.write_pool(),
+        db.write_pool(),
         root_id,
         opts,
         None,
@@ -144,6 +145,7 @@ pub async fn descendants_as(
     descendants_inner(
         ProjectionRead::new(db),
         db.write_pool(),
+        db.write_pool(),
         root_id,
         opts,
         Some(principal),
@@ -153,6 +155,14 @@ pub async fn descendants_as(
 
 /// Historical-aware caller-relative containment walk. Tree content comes from
 /// the replay projection while authorization remains anchored to live policy.
+///
+/// Both tiers read from the concurrent shared pools, not the snapshot pools:
+/// `get_structure` — the sole production caller — performs no writes
+/// in-request, so there is no same-transaction state the shared tier could
+/// miss; committed content and policy are visible cross-connection in WAL.
+/// This keeps a non-mutating structure walk off the serialised writer.
+/// Ancestor-chain containment for non-root roots still resolves through the
+/// passed projection (see `descendants_inner`).
 pub async fn descendants_with_lens_as(
     lens: &ReadLens<'_>,
     root_id: &str,
@@ -161,7 +171,8 @@ pub async fn descendants_with_lens_as(
 ) -> Result<Vec<TreeNode>> {
     descendants_inner(
         lens.projection(),
-        lens.meta().snapshot_pool(),
+        lens.projection().shared_pool(),
+        lens.meta().shared_pool(),
         root_id,
         opts,
         Some(principal),
@@ -169,22 +180,37 @@ pub async fn descendants_with_lens_as(
     .await
 }
 
+/// Legacy-local containment walk over the concurrent shared tier.
+/// `get_structure` is the sole production caller; like
+/// [`descendants_with_lens_as`] it performs no writes in-request, so
+/// committed content reads run on the shared pool rather than the
+/// serialised writer. The snapshot-tier [`descendants`]/[`descendants_as`]
+/// entry points are unchanged for callers that need read-your-writes.
 pub async fn descendants_from(
     projection: ProjectionRead<'_>,
     root_id: &str,
     opts: TreeOptions,
 ) -> Result<Vec<TreeNode>> {
-    descendants_inner(projection, projection.snapshot_pool(), root_id, opts, None).await
+    descendants_inner(
+        projection,
+        projection.shared_pool(),
+        projection.shared_pool(),
+        root_id,
+        opts,
+        None,
+    )
+    .await
 }
 
 async fn descendants_inner(
     projection: ProjectionRead<'_>,
+    content_pool: &sqlx::SqlitePool,
     authorization_pool: &sqlx::SqlitePool,
     root_id: &str,
     opts: TreeOptions,
     principal: Option<crate::authorization::Principal<'_>>,
 ) -> Result<Vec<TreeNode>> {
-    let db = projection.snapshot_pool();
+    let db = content_pool;
     if opts.max_depth < 0 {
         return Err(contract_violation("tree max_depth must be >= 0"));
     }
@@ -379,31 +405,27 @@ async fn descendants_inner(
             rows.extend(q.fetch_all(db).await?);
         }
 
+        // One preloaded authorization fold per level. Admission stays in SQL
+        // above; fail-closed per record; the cap still applies after this
+        // filter, and the wide path still fetches uncapped.
+        let visible: HashSet<String> = match principal {
+            None => HashSet::new(),
+            Some(principal) => {
+                let ids = rows
+                    .iter()
+                    .map(|row| row.try_get::<String, _>("id"))
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                authorized_ids_in_pool(authorization_pool, principal, ids).await?
+            }
+        };
+
         for row in &rows {
             let mut node = node_from_row(row, depth)?;
             let Some(parent) = node.home_id.clone() else {
                 continue;
             };
-            if let Some(principal) = principal {
-                let visible = crate::authorization::effective_capability_in_pool(
-                    authorization_pool,
-                    principal,
-                    &node.id,
-                )
-                .await
-                .is_ok_and(|capability| capability.allows(crate::authorization::Capability::View));
-                if !visible {
-                    continue;
-                }
-                node.child_count = authorized_child_count(
-                    projection,
-                    authorization_pool,
-                    &node.id,
-                    opts.include_archived,
-                    &opts.exclude_types,
-                    principal,
-                )
-                .await?;
+            if principal.is_some() && !visible.contains(&node.id) {
+                continue;
             }
             // Rows arrive in (name, id) order within each parent either way, so
             // a per-parent counter is the sibling rank. Still applied to the
@@ -419,6 +441,19 @@ async fn descendants_inner(
             // single-valued, so a repeat id means a loop, not a diamond.
             if !visited.insert(node.id.clone()) {
                 continue;
+            }
+            // Deferred past cap/visited: discarded rows never enter the
+            // frontier, so their counts are never read. Read-only either way.
+            if let Some(principal) = principal {
+                node.child_count = authorized_child_count(
+                    projection,
+                    authorization_pool,
+                    &node.id,
+                    opts.include_archived,
+                    &opts.exclude_types,
+                    principal,
+                )
+                .await?;
             }
             let path = format!("{}{},", paths[parent.as_str()], node.id);
             next.push(Frontier {
@@ -606,6 +641,32 @@ async fn can_view_in(
         .is_ok_and(|capability| capability.allows(crate::authorization::Capability::View))
 }
 
+/// One preloaded View fold over a bounded id set on the live-policy pool.
+/// Fail-closed per record; snapshot-wide failures propagate.
+async fn authorized_ids_in_pool(
+    authorization_pool: &sqlx::SqlitePool,
+    principal: crate::authorization::Principal<'_>,
+    ids: Vec<String>,
+) -> Result<HashSet<String>> {
+    if ids.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let mut snapshot = authorization_pool.begin().await?;
+    // `false` matches the scalar path this replaces. Historical walks replay
+    // content but authorize live, so a live-tombstoned record stays hidden
+    // even for trusted local.
+    let visible = crate::authorization::ids_with_capability_preloaded_on(
+        &mut snapshot,
+        principal,
+        ids,
+        crate::authorization::Capability::View,
+        false,
+    )
+    .await?;
+    snapshot.rollback().await?;
+    Ok(visible.into_iter().collect())
+}
+
 async fn authorized_child_count(
     projection: ProjectionRead<'_>,
     authorization_pool: &sqlx::SqlitePool,
@@ -631,13 +692,10 @@ async fn authorized_child_count(
         .bind(record_id)
         .fetch_all(projection.shared_pool())
         .await?;
-    let mut count = 0;
-    for id in ids {
-        if can_view(authorization_pool, principal, &id).await {
-            count += 1;
-        }
-    }
-    Ok(count)
+    // One preloaded fold replaces O(children) scalar walks. SQL filters are
+    // untouched, so count semantics are unchanged.
+    let visible = authorized_ids_in_pool(authorization_pool, principal, ids).await?;
+    Ok(visible.len() as i64)
 }
 
 /// One entry of an ancestor chain.
@@ -809,4 +867,79 @@ pub(crate) async fn subtree_ids_with_hidden_in(
     rows.iter()
         .map(|row| Ok(row.try_get::<String, _>("id")?))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{descendants_with_lens_as, TreeOptions};
+    use crate::query::lens::{self, AsOfSelector, ContentSeqSelector, ReadLens};
+
+    /// The batched fold keeps `include_initial_tombstone = false` like the
+    /// scalar path: a live-tombstoned record stays hidden in historical walks
+    /// even for trusted local.
+    #[tokio::test]
+    async fn trusted_historical_walk_still_denies_live_tombstoned_records() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let root = crate::store::create_record(
+            &db,
+            serde_json::json!({ "type": "Collection", "kind": "folder", "name": "Root" }),
+        )
+        .await
+        .unwrap();
+        let live_sibling = crate::store::create_record(
+            &db,
+            serde_json::json!({
+                "type": "WorkItem", "kind": "task",
+                "name": "Live sibling", "home_id": root,
+            }),
+        )
+        .await
+        .unwrap();
+        let doomed = crate::store::create_record(
+            &db,
+            serde_json::json!({
+                "type": "WorkItem", "kind": "task",
+                "name": "Doomed sibling", "home_id": root,
+            }),
+        )
+        .await
+        .unwrap();
+        let as_of: i64 = sqlx::query_scalar("SELECT MAX(seq) FROM content_events")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        crate::store::delete_record(&db, &doomed).await.unwrap();
+
+        let scratch = crate::db::open_database(":memory:").await.unwrap();
+        crate::db::apply_schema(&scratch).await.unwrap();
+        lens::replay_projection(&db, &scratch, as_of).await.unwrap();
+        let resolved = lens::resolve_as_of(
+            &db,
+            AsOfSelector::ContentSeq(ContentSeqSelector { content_seq: as_of }),
+        )
+        .await
+        .unwrap();
+        let lens = ReadLens::historical(&scratch, &db, &resolved);
+        let nodes = descendants_with_lens_as(
+            &lens,
+            &root,
+            TreeOptions {
+                max_depth: 1,
+                ..Default::default()
+            },
+            crate::authorization::Principal::trusted_local(),
+        )
+        .await
+        .unwrap();
+        let ids: Vec<&str> = nodes.iter().map(|node| node.id.as_str()).collect();
+        assert!(ids.contains(&root.as_str()));
+        assert!(ids.contains(&live_sibling.as_str()));
+        assert!(
+            !ids.contains(&doomed.as_str()),
+            "live-tombstoned record must stay hidden from trusted historical walks"
+        );
+        assert_eq!(nodes[0].child_count, 1);
+        scratch.close().await;
+        db.close().await;
+    }
 }

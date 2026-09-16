@@ -6,13 +6,19 @@
 //! connection by the pool's connect options rather than living in the DDL.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::error::Error as StdError;
+use std::ffi::c_void;
+use std::fmt;
 use std::path::Path;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+#[cfg(test)]
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use sha2::Digest;
+use sqlx::error::{DatabaseError, ErrorKind};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{Connection, Row, SqliteConnection, SqlitePool};
 use tempfile::TempDir;
@@ -97,7 +103,7 @@ impl RollupCache {
 
 /// Engine schema stored in each ejectable user database's file header.
 /// This is independent of the product's SemVer and the catalog schema.
-pub const CURRENT_ENGINE_SCHEMA_VERSION: i64 = 50;
+pub const CURRENT_ENGINE_SCHEMA_VERSION: i64 = 55;
 /// The deliberately selected historical support baseline, once one exists.
 ///
 /// `None` is a product contract, not an implementation gap: development
@@ -191,6 +197,38 @@ pub(crate) const ENGINE_48_SHAPE_CONTRACT_SHA256: &str =
 pub(crate) const ENGINE_49_SHAPE_CONTRACT_SHA256: &str =
     "d4dab728487fbc8af38c427731f9e30e11ff4d9a49c9ac14b51298c6717c07b1";
 
+/// Shape-contract digest measured from the released engine-50 tree immediately
+/// before read-log result annotations landed.
+pub(crate) const ENGINE_50_SHAPE_CONTRACT_SHA256: &str =
+    "a46f0f66a78d99d53551ba8776ecfc7636f7a71aad011d000198e1011e19aed9";
+
+/// Shape-contract digest of the engine-51 tree immediately before the
+/// `read_log_touches` WITHOUT ROWID rebuild. Measured by
+/// `docs/evidence/readlog-without-rowid/derive_pins.py`, whose DDL extraction
+/// and shape-contract serialization are held to the frozen DDL fingerprint and
+/// the engine-50 digest above as known-answer checks;
+/// `migrations::tests::engine_51_to_52_rebuilds_read_log_touches_without_rowid`
+/// then holds it honest through the real Rust implementation by reconstructing
+/// the same shape from current and requiring this digest to admit it.
+pub(crate) const ENGINE_51_SHAPE_CONTRACT_SHA256: &str =
+    "249f3c96105d2871ac8071c7fd8b0afe9d4ffb27efe8bfa4b0046f3725f2e4e7";
+
+/// Shape-contract digest of the engine-52 tree immediately before the
+/// freelist-compaction edge. The 52→53 compaction moves no schema objects, so
+/// this is by construction the same structural digest as engine 53; the
+/// 52→53 migration test asserts that equality rather than assuming it.
+pub(crate) const ENGINE_52_SHAPE_CONTRACT_SHA256: &str =
+    "84fbb225d5904d9faa29963aa2ee2e32010c676dcab183d0708741e0be5febce";
+
+/// Released engine-53 shape at c33181fc, before dictionary normalization.
+pub(crate) const ENGINE_53_SHAPE_CONTRACT_SHA256: &str =
+    "84fbb225d5904d9faa29963aa2ee2e32010c676dcab183d0708741e0be5febce";
+
+/// Engine 54's dictionary shape. Engine 55 compacts pages without changing
+/// schema objects; historical validation keeps this measured pin explicit.
+pub(crate) const ENGINE_54_SHAPE_CONTRACT_SHA256: &str =
+    "ecc7fb3964c4af2ee281aa2bf0f3a898958ab5559660d8f295a47591b7fca96f";
+
 /// A read-only classification of an on-disk SQLite database.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(tag = "state", content = "detail", rename_all = "snake_case")]
@@ -269,6 +307,18 @@ pub struct Db {
     /// closes the in-process admission-to-write race for handlers using any
     /// transaction helper.
     portability_policy_gate: Arc<tokio::sync::RwLock<()>>,
+    /// Bounded FIFO queue for response-independent interaction capture.
+    /// Clones share it; reopening the same file deliberately starts empty.
+    /// One worker preserves enqueue order and holds at most one write-pool
+    /// slot, so background writes cannot starve handler writes.
+    capture_queue: Arc<crate::mcp::interactions::CaptureQueue>,
+    /// Handle-local memo of the immutable `database_identity` singleton.
+    /// Successful reads only, never negative: clones share it because the
+    /// cell lives behind `Arc`; reopening the same file starts cold.
+    /// Offline rekey (`crate::identity::rekey_database_offline`) requires
+    /// the caller to drain live handles first; this memo offers no
+    /// cross-handle invalidation by design.
+    database_id_cache: Arc<tokio::sync::OnceCell<String>>,
     /// Keeps the ephemeral temp dir alive for `:memory:` databases.
     _tmp: Option<Arc<TempDir>>,
 }
@@ -313,6 +363,477 @@ tokio::task_local! {
     static REQUEST_REALTIME_COMPLETION: Arc<RequestRealtimeCompletion>;
 }
 
+// Handler-body count of write-pool connection acquisitions, for the
+// readonly-pool migration (stage 1: the instrument only; no handler moves).
+// The production request-work counter and the older test-only migration
+// counter share these acquisition hooks. Both are task-local, so concurrent
+// requests keep independent totals; outside a scope each hook is a cheap miss.
+#[cfg(test)]
+tokio::task_local! {
+    static WRITE_POOL_ACQUISITIONS: Arc<AtomicU64>;
+}
+
+// Test-only handoff for the handler-body count. Production dispatch discards
+// the count; tests observe it by wrapping `registry.call(...)` in
+// `with_write_pool_acquisition_sink` and reading the sink afterwards.
+#[cfg(test)]
+tokio::task_local! {
+    static WRITE_POOL_ACQUISITION_SINK: Arc<AtomicU64>;
+}
+
+/// Run `future` with a fresh write-pool acquisition counter and return its
+/// output alongside the number of write-pool acquisitions it performed.
+/// This scope is test-only. The pool hooks also feed the separate opt-in
+/// production request-work counters.
+///
+/// Test dispatch (`dispatch_with_request_port`) scopes the handler invocation
+/// only — after reference resolution, before capture — so the count is
+/// attributable to the handler body specifically. Two reads bracket every
+/// request outside that scope on the read-only pool and must never be
+/// attributed to the handler: pre-handler `record_ref::resolve_record_ids`
+/// takes a read-pool (`db.pool().begin()`) snapshot to expand short
+/// references, and `storage_profile::with_operation` loads the admission
+/// policy via `load_policy_from_pool(db.pool())` around the whole execution
+/// (`domain_transaction::request`, outside the handler scope).
+/// Post-handler capture still writes the read envelope through
+/// `begin_capture_write` on the write pool from the handle's background
+/// capture queue (no pool policy pre-read; enforcement happens inside the
+/// write transaction), so it is excluded from the handler count by running
+/// off-scope rather than by pool.
+///
+/// Why the pool hooks: `Db::write_pool()` hands out `&SqlitePool`, and
+/// callers acquire implicitly by executing queries against it, so counting
+/// calls to `write_pool()` would be a proxy, not a measurement. The hooks
+/// are the only seam observing every *`acquire`-path* checkout the pool
+/// hands out: sqlx 0.8 fires `before_acquire` for reused idle connections
+/// only and `after_connect` for newly established connections only, so both
+/// are wired and each increments the same task-local counter. Wiring only
+/// one of them would undercount (a false "zero");
+/// `new_write_pool_connection_is_counted` pins the fresh-connect half by
+/// forcing the connect path (second checkout while the first is still held,
+/// so reuse is impossible) and `reused_write_pool_connection_is_counted`
+/// pins the reuse half against a pre-warmed idle connection. Deliberately
+/// not built on `begin_write`: governed writes go through it, but read
+/// transactions use raw `pool.begin()`, so it sees none of the read traffic
+/// this instrument exists to measure.
+///
+/// What it captures: one increment per pooled connection acquisition on the
+/// write pool while the scoped future runs — whether the acquisition serves
+/// a direct query, `pool.acquire()`, or `pool.begin()`. A transaction or an
+/// explicitly acquired connection held across N statements counts once: the
+/// unit is pool slots taken, which is the contention metric behind the pool
+/// timeouts, not statements run.
+///
+/// What it misses — each a way to read a false zero, so grep before trusting
+/// one:
+/// - direct `SqliteConnection::connect` calls (migrations/probes), which
+///   never touch the pool at all;
+/// - the physically separate read pool, which carries no hooks;
+/// - `try_acquire` / `try_begin` / `try_begin_with`: these pop an idle
+///   connection directly (`PoolInner::try_acquire`) and skip
+///   `check_idle_conn`, so **no hook fires** for a genuine pooled
+///   acquisition. Nothing in the tree calls these on a pool today (verified
+///   by grep — the `try_begin` hits are non-pool types), so this is latent;
+///   but a stage-2 handler switching to `write_pool().try_begin()` would
+///   hold a write-pool slot while reporting zero, certifying the migration
+///   on a lie;
+/// - work handed to the handle's background capture queue, since the queue
+///   worker never runs inside the scoped future. Load-bearing for capture
+///   exclusion (`interactions::enqueue_record_call` returns before the
+///   queue worker runs), verified
+///   by `spawned_write_pool_use_is_not_attributed` and the `quickstart`
+///   end-to-end test. Otherwise verified safe today, not an open hole:
+///   every `tokio::spawn` under `src/mcp/tools/` and
+///   `src/mcp/deployment_read_only.rs` sits inside a `#[tokio::test]` fn
+///   (checked per site), and the production `spawn_blocking` uses (mdx
+///   parsing, html validation in `artifacts.rs` / `artifact_interactions.rs`)
+///   capture only owned data, never a pool;
+/// - nested dispatch: an inner `dispatch_with_request_port` scope shadows
+///   the outer counter, so a re-entrant handler's acquisitions are invisible
+///   to the outer count. That is an undercount risk, not a feature: all
+///   re-entrant `registry.call` sites today are in test modules (verified),
+///   but a stage-2 composite tool dispatching sub-tools through the registry
+///   would trip it.
+///
+/// Eager-pool note: `open_pool` does NOT start empty. sqlx `connect_with`
+/// always runs one `acquire` + `release` (`max(1, min_connections)`), so
+/// every handle holds one live idle write-pool connection before any scope
+/// exists. That eager connection cannot pollute a later scope — no scope is
+/// active when it is established, so the hooks' `try_with` finds nothing
+/// and counts nothing. (An earlier version of this comment claimed
+/// construction was lazy because `min_connections` is 0; it is not.)
+///
+/// Production cost outside an opt-in request scope is one failed task-local
+/// lookup per acquisition. The test-only compatibility counter adds its own
+/// lookup only in test builds.
+#[cfg(test)]
+pub(crate) async fn with_write_pool_acquisition_counter<F>(future: F) -> (F::Output, u64)
+where
+    F: std::future::Future,
+{
+    let counter = Arc::new(AtomicU64::new(0));
+    let output = WRITE_POOL_ACQUISITIONS
+        .scope(Arc::clone(&counter), future)
+        .await;
+    (output, counter.load(Ordering::Relaxed))
+}
+
+/// Acquisitions so far in the enclosing
+/// [`with_write_pool_acquisition_counter`] scope, or 0 outside one.
+/// Test-only: the only readers are the instrument's own tests.
+#[cfg(test)]
+pub(crate) fn write_pool_acquisitions() -> u64 {
+    WRITE_POOL_ACQUISITIONS
+        .try_with(|counter| counter.load(Ordering::Relaxed))
+        .unwrap_or(0)
+}
+
+/// Scope a test sink that receives the handler-body count published by
+/// production dispatch. Without a sink the count is discarded.
+#[cfg(test)]
+pub(crate) async fn with_write_pool_acquisition_sink<F>(
+    sink: Arc<AtomicU64>,
+    future: F,
+) -> F::Output
+where
+    F: std::future::Future,
+{
+    WRITE_POOL_ACQUISITION_SINK.scope(sink, future).await
+}
+
+/// Called by production dispatch with the just-finished handler-body count.
+/// Stores into the test sink when one is scoped, otherwise a no-op.
+#[cfg(test)]
+pub(crate) fn publish_write_pool_acquisitions(count: u64) {
+    WRITE_POOL_ACQUISITION_SINK
+        .try_with(|sink| {
+            sink.store(count, Ordering::Relaxed);
+        })
+        .ok();
+}
+
+/// One half of the acquisition counter. Runs inline on the acquiring task
+/// inside `PoolInner::acquire`, so the task-local scope is visible here.
+/// Never fails acquisition: counting must not turn a healthy checkout into
+/// an error, so the boolean is unconditionally `true`.
+fn count_write_pool_reuse(
+    _connection: &mut SqliteConnection,
+    _metadata: sqlx::pool::PoolConnectionMetadata,
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = std::result::Result<bool, sqlx::Error>> + Send + '_>,
+> {
+    Box::pin(async move {
+        crate::request_work::record_workspace_writer_acquisition();
+        #[cfg(test)]
+        WRITE_POOL_ACQUISITIONS
+            .try_with(|counter| {
+                counter.fetch_add(1, Ordering::Relaxed);
+            })
+            .ok();
+        Ok(true)
+    })
+}
+
+/// The other half: newly established connections never see `before_acquire`,
+/// so without this every first-use checkout would be invisible.
+fn count_write_pool_new_connection(
+    _connection: &mut SqliteConnection,
+    _metadata: sqlx::pool::PoolConnectionMetadata,
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = std::result::Result<(), sqlx::Error>> + Send + '_>,
+> {
+    Box::pin(async move {
+        crate::request_work::record_workspace_writer_acquisition();
+        #[cfg(test)]
+        WRITE_POOL_ACQUISITIONS
+            .try_with(|counter| {
+                counter.fetch_add(1, Ordering::Relaxed);
+            })
+            .ok();
+        Ok(())
+    })
+}
+
+static CATALOG_TRACE_CONTEXTS: OnceLock<Mutex<HashMap<usize, usize>>> = OnceLock::new();
+static ACTIVE_CATALOG_TRACES: AtomicUsize = AtomicUsize::new(0);
+
+fn catalog_trace_contexts() -> &'static Mutex<HashMap<usize, usize>> {
+    CATALOG_TRACE_CONTEXTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+unsafe extern "C" fn catalog_trace(
+    event: u32,
+    context: *mut c_void,
+    statement: *mut c_void,
+    _detail: *mut c_void,
+) -> i32 {
+    if event == libsqlite3_sys::SQLITE_TRACE_STMT as u32 {
+        // SAFETY: the trace installation transfers one Arc reference to
+        // SQLite and release/close removes the callback before reclaiming it.
+        unsafe { &*context.cast::<crate::request_work::Counters>() }.record_catalog_statement();
+    } else if event == libsqlite3_sys::SQLITE_TRACE_CLOSE as u32 {
+        let connection = statement.cast::<libsqlite3_sys::sqlite3>();
+        // SQLITE_CLOSE runs under SQLite's connection mutex. Detach first so
+        // a failed close cannot invoke this callback twice with freed state.
+        unsafe {
+            libsqlite3_sys::sqlite3_trace_v2(connection, 0, None, std::ptr::null_mut());
+        }
+        let stored = catalog_trace_contexts()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&(connection as usize));
+        if stored.is_some() {
+            ACTIVE_CATALOG_TRACES.fetch_sub(1, Ordering::Release);
+            // SAFETY: installation transferred exactly this Arc reference.
+            drop(unsafe { Arc::from_raw(context.cast::<crate::request_work::Counters>()) });
+        }
+    }
+    0
+}
+
+async fn attach_catalog_trace(connection: &mut SqliteConnection) -> sqlx::Result<()> {
+    let Some(counters) = crate::request_work::current() else {
+        return Ok(());
+    };
+    let mut handle = connection.lock_handle().await?;
+    let raw = handle.as_raw_handle().as_ptr();
+    let key = raw as usize;
+    let context = Arc::into_raw(counters);
+    let mut contexts = catalog_trace_contexts()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if contexts.contains_key(&key) {
+        // This pool owns the one SQLite trace slot, and release must always
+        // detach it before a physical connection can be acquired again.
+        drop(unsafe { Arc::from_raw(context) });
+        return Err(sqlx::Error::Protocol(
+            "catalog SQLite trace remained attached across checkout".into(),
+        ));
+    }
+    let status = unsafe {
+        libsqlite3_sys::sqlite3_trace_v2(
+            raw,
+            (libsqlite3_sys::SQLITE_TRACE_STMT | libsqlite3_sys::SQLITE_TRACE_CLOSE) as u32,
+            Some(catalog_trace),
+            context.cast_mut().cast(),
+        )
+    };
+    if status != libsqlite3_sys::SQLITE_OK {
+        drop(unsafe { Arc::from_raw(context) });
+        return Err(sqlx::Error::Protocol(format!(
+            "catalog SQLite trace install failed: {status}"
+        )));
+    }
+    contexts.insert(key, context as usize);
+    ACTIVE_CATALOG_TRACES.fetch_add(1, Ordering::Release);
+    Ok(())
+}
+
+async fn detach_catalog_trace(connection: &mut SqliteConnection) -> sqlx::Result<()> {
+    if ACTIVE_CATALOG_TRACES.load(Ordering::Acquire) == 0 {
+        return Ok(());
+    }
+    let mut handle = connection.lock_handle().await?;
+    let raw = handle.as_raw_handle().as_ptr();
+    let context = catalog_trace_contexts()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(&(raw as usize));
+    if let Some(context) = context {
+        ACTIVE_CATALOG_TRACES.fetch_sub(1, Ordering::Release);
+        unsafe {
+            libsqlite3_sys::sqlite3_trace_v2(raw, 0, None, std::ptr::null_mut());
+            drop(Arc::from_raw(
+                context as *const crate::request_work::Counters,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn attach_catalog_trace_on_reuse(
+    connection: &mut SqliteConnection,
+    _metadata: sqlx::pool::PoolConnectionMetadata,
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = std::result::Result<bool, sqlx::Error>> + Send + '_>,
+> {
+    Box::pin(async move {
+        attach_catalog_trace(connection).await?;
+        Ok(true)
+    })
+}
+
+fn attach_catalog_trace_on_connect(
+    connection: &mut SqliteConnection,
+    _metadata: sqlx::pool::PoolConnectionMetadata,
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = std::result::Result<(), sqlx::Error>> + Send + '_>,
+> {
+    Box::pin(attach_catalog_trace(connection))
+}
+
+#[cfg(test)]
+mod write_pool_acquisition_tests {
+    use super::*;
+
+    /// Fresh-connect half, pinned structurally rather than by timing: check
+    /// out one connection and hold it, then assert no idle connection
+    /// remains. With the idle queue provably empty the in-scope query MUST
+    /// establish a new connection, so its count can only come from
+    /// `after_connect`. (The pool holds exactly one connection here — the
+    /// eager one `connect_with` always establishes — so one held checkout
+    /// drains idle to zero; the `num_idle` precondition makes that
+    /// structural instead of assumed. Unwiring `after_connect` drops this to
+    /// 0 and fails.)
+    #[tokio::test]
+    async fn new_write_pool_connection_is_counted() {
+        let db = open_database(":memory:").await.unwrap();
+        let held = db.write_pool().acquire().await.unwrap();
+        assert_eq!(
+            db.write_pool().num_idle(),
+            0,
+            "precondition failed: an idle connection exists, so reuse is possible"
+        );
+        let (_, count) = with_write_pool_acquisition_counter(async {
+            sqlx::query_scalar::<_, i64>("SELECT 1")
+                .fetch_one(db.write_pool())
+                .await
+                .unwrap();
+        })
+        .await;
+        assert_eq!(count, 1, "fresh-connect checkout was not counted");
+        drop(held);
+        db.close().await;
+    }
+
+    /// Reuse half, pinned structurally: warm exactly one idle connection
+    /// BEFORE the scope (outside it, so the warmup itself is uncounted) and
+    /// assert it is idle. The in-scope query must then pop it via
+    /// `check_idle_conn` — the pool never opens a second connection while
+    /// its idle queue is non-empty — so the count can only come from
+    /// `before_acquire`. (Unwiring `before_acquire` drops this to 0 and
+    /// fails. A ping failure would also open a fresh connection and count
+    /// via the other half, but a failed ping on a just-used local SQLite
+    /// connection fails the query loudly rather than silently.)
+    #[tokio::test]
+    async fn reused_write_pool_connection_is_counted() {
+        let db = open_database(":memory:").await.unwrap();
+        sqlx::query_scalar::<_, i64>("SELECT 1")
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap();
+        // The pool returns connections asynchronously on drop (the checkout
+        // is handed back by a spawned task), so the warmed connection may
+        // not be idle yet. Poll until it lands — bounded, because a missing
+        // return would be a pool bug, not a slow machine. Without this wait
+        // the in-scope query could itself take the connect path and this
+        // test would pin the wrong half.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while db.write_pool().num_idle() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("warmed connection never returned to idle");
+        let (_, count) = with_write_pool_acquisition_counter(async {
+            sqlx::query_scalar::<_, i64>("SELECT 1")
+                .fetch_one(db.write_pool())
+                .await
+                .unwrap();
+        })
+        .await;
+        assert_eq!(count, 1, "reused checkout was not counted");
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn request_work_counts_reused_and_new_workspace_writer_checkouts() {
+        let db = open_database(":memory:").await.unwrap();
+        let work = crate::request_work::RequestWork::new();
+        work.scope(async {
+            sqlx::query("SELECT 1")
+                .execute(db.write_pool())
+                .await
+                .unwrap();
+        })
+        .await;
+        assert_eq!(work.snapshot().workspace_writer_acquisitions, 1);
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while db.write_pool().num_idle() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("measured connection never returned to idle");
+        let held = db.write_pool().acquire().await.unwrap();
+        assert_eq!(db.write_pool().num_idle(), 0);
+        let fresh = crate::request_work::RequestWork::new();
+        fresh
+            .scope(async {
+                sqlx::query("SELECT 1")
+                    .execute(db.write_pool())
+                    .await
+                    .unwrap();
+            })
+            .await;
+        assert_eq!(fresh.snapshot().workspace_writer_acquisitions, 1);
+        drop(held);
+        db.close().await;
+    }
+
+    /// Read-pool work and idle scopes report zero, and so does the reader
+    /// outside any scope. The read pool carries no hooks by design.
+    #[tokio::test]
+    async fn untouched_write_pool_reports_zero() {
+        let db = open_database(":memory:").await.unwrap();
+        let (_, count) = with_write_pool_acquisition_counter(async {
+            let value = sqlx::query_scalar::<_, i64>("SELECT 1")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+            assert_eq!(value, 1);
+            assert_eq!(
+                write_pool_acquisitions(),
+                0,
+                "read-pool query leaked into the write-pool count"
+            );
+        })
+        .await;
+        assert_eq!(count, 0);
+        let (_, idle) = with_write_pool_acquisition_counter(async {}).await;
+        assert_eq!(idle, 0);
+        assert_eq!(write_pool_acquisitions(), 0);
+        db.close().await;
+    }
+
+    /// The spawn boundary the capture exclusion relies on: a write-pool query
+    /// executed in a `tokio::spawn`ed task — awaited inside the scope — is
+    /// not attributed to the scope, because task-locals do not cross spawn
+    /// boundaries. Post-handler capture (`interactions::spawn_record_call`)
+    /// runs in exactly such a detached task.
+    #[tokio::test]
+    async fn spawned_write_pool_use_is_not_attributed() {
+        let db = open_database(":memory:").await.unwrap();
+        let pool = db.write_pool().clone();
+        let (_, count) = with_write_pool_acquisition_counter(async {
+            let handle = tokio::spawn(async move {
+                sqlx::query_scalar::<_, i64>("SELECT 1")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap()
+            });
+            assert_eq!(handle.await.unwrap(), 1);
+        })
+        .await;
+        assert_eq!(
+            count, 0,
+            "spawned write-pool use leaked into the enclosing count"
+        );
+        db.close().await;
+    }
+}
+
 /// The SQLite kernel satisfies all four of query's named read capabilities.
 /// `snapshot_pool` is the read-your-writes tier (the engine write pool, whose
 /// raw use for writes remains crate-private via `write_pool`); `shared_pool`
@@ -348,12 +869,21 @@ impl crate::query::lens::ContentLogCapability for Db {
 }
 
 impl Db {
-    /// A physically read-only pool for diagnostics and ad-hoc observation.
+    /// The physically read-only pool. A serving path, not only a diagnostic
+    /// one: `bootstrap` and `get_structure` read exclusively through it, and
+    /// further non-mutating handlers are migrating onto it (c331eb8). In WAL
+    /// these connections never wait on the serialised writer, which is the
+    /// point — a non-mutating handler on the write pool is pure contention.
     ///
     /// SQLite opens these connections with `SQLITE_OPEN_READONLY`, so mutation
     /// statements and writable transactions fail at the engine boundary. All
     /// supported writes must use Native's domain APIs, where strict portability
     /// admission and mutation-boundary checks are enforced.
+    ///
+    /// These connections are a different snapshot from the write pool's, so a
+    /// read moved here no longer observes writes made in a still-open
+    /// transaction earlier in the same request. Establish that no such
+    /// dependency exists before moving a read onto this tier.
     pub fn pool(&self) -> &SqlitePool {
         &self.read_pool
     }
@@ -361,6 +891,13 @@ impl Db {
     /// The immutable SQLite authority selected when this handle was opened.
     pub fn open_mode(&self) -> DatabaseOpenMode {
         self.location.open_mode
+    }
+
+    /// Point-in-time write-pool size and idle count for hosted diagnostics.
+    /// These gauges do not identify the acquisition or lock that timed out.
+    #[doc(hidden)]
+    pub fn write_pool_gauges(&self) -> (u32, usize) {
+        (self.write_pool.size(), self.write_pool.num_idle())
     }
 
     /// Privileged engine pool. Crate-private by design: callers must not gain a
@@ -386,6 +923,12 @@ impl Db {
 
     pub(crate) fn portability_policy_gate(&self) -> &tokio::sync::RwLock<()> {
         &self.portability_policy_gate
+    }
+
+    /// Handle-local `database_identity` memo cell. Clones share it;
+    /// fresh opens get a new empty one (see each constructor).
+    pub(crate) fn database_id_cell(&self) -> &tokio::sync::OnceCell<String> {
+        &self.database_id_cache
     }
 
     /// Install the `embed()` seam's implementation on this handle. Returns a
@@ -571,26 +1114,109 @@ impl Db {
         drop(self.write_pool.close());
     }
 
-    /// Close both pools. Ephemeral backing files are deleted once every clone
-    /// of this handle has dropped.
+    /// Close both pools, draining response-independent captures first.
+    /// Queued captures are awaited (bounded by
+    /// [`crate::mcp::interactions::CAPTURE_DRAIN_TIMEOUT`]) before the pools
+    /// refuse checkouts, so graceful shutdown keeps captures rather than
+    /// failing them on a closed pool. Leftovers past the cap fail on the
+    /// closed pool and are counted, never silently lost. Ephemeral backing
+    /// files are deleted once every clone of this handle has dropped.
     pub async fn close(&self) {
+        self.capture_queue.initiate_shutdown();
+        self.capture_queue.drain_capped().await;
         self.mark_pools_closed();
-        tokio::join!(self.read_pool.close(), self.write_pool.close());
+        tokio::join!(
+            close_pool_and_drain(&self.read_pool),
+            close_pool_and_drain(&self.write_pool)
+        );
+    }
+
+    /// Monotonic counters for this handle's background capture queue.
+    /// Test-only: production observes drops/failures via stderr, and shutdown
+    /// via `close`; no serving path reads these counters.
+    #[cfg(test)]
+    pub(crate) fn capture_stats(&self) -> crate::mcp::interactions::CaptureStats {
+        self.capture_queue.stats()
+    }
+
+    /// Run one semantic declaration to durability in an owned task and await
+    /// it. Bypasses the lossy queue; accounting stays coherent with queued
+    /// captures. See `CaptureQueue::record_declaration`.
+    pub(crate) async fn record_declaration(
+        &self,
+        capture: crate::mcp::interactions::PendingCapture,
+    ) {
+        self.capture_queue.record_declaration(capture).await;
+    }
+
+    /// Test-only: refuse all further queue admissions. The synchronous
+    /// declaration path bypasses the queue and is unaffected.
+    #[cfg(test)]
+    pub(crate) fn capture_queue_for_test_initiate_shutdown(&self) {
+        self.capture_queue.initiate_shutdown();
+    }
+
+    /// Enqueue one prepared interaction capture without blocking. Returns
+    /// false (counted and stderr-reported by the queue) when shut down or
+    /// full. The response path never awaits the result.
+    pub(crate) fn enqueue_capture(
+        &self,
+        capture: crate::mcp::interactions::PendingCapture,
+    ) -> bool {
+        self.capture_queue.enqueue(capture)
+    }
+
+    /// Wait until every enqueued capture has completed. Unbounded; prefer
+    /// [`Self::close`] (which caps the wait) for shutdown paths. Tests use
+    /// this to observe captures deterministically.
+    pub(crate) async fn drain_captures(&self) {
+        self.capture_queue.drain().await;
+    }
+
+    /// Test-only drain for integration harnesses outside the crate: wait
+    /// until every enqueued capture has completed. Unbounded, like
+    /// [`Self::drain_captures`].
+    #[doc(hidden)]
+    pub async fn drain_captures_for_tests(&self) {
+        self.capture_queue.drain().await;
     }
 
     /// End a shared handle from a synchronous lifecycle boundary such as LRU
     /// eviction. Both pools are marked closed before this function returns;
     /// when a runtime is available it also drains their physical shutdown in
     /// the background.
+    ///
+    /// Eviction is not graceful shutdown: captures still queued or in flight
+    /// fail on the closed pool and are counted as failures (never silently
+    /// lost). Use [`Self::close`] where captures must be kept.
     pub(crate) fn close_in_background(&self) {
+        self.capture_queue.initiate_shutdown();
         self.mark_pools_closed();
         let read_pool = self.read_pool.clone();
         let write_pool = self.write_pool.clone();
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
-                tokio::join!(read_pool.close(), write_pool.close());
+                tokio::join!(
+                    close_pool_and_drain(&read_pool),
+                    close_pool_and_drain(&write_pool)
+                );
             });
         }
+    }
+}
+
+// SQLx 0.8.6 can return from Pool::close with a checked-out connection when
+// closing idle connections over-credits its semaphore. The pool is fenced at
+// that point, but physical drain requires size == 0. Retry close to collect
+// connections whose asynchronous return raced with the initial close; sleep
+// between retries so held transactions do not cause a busy loop.
+async fn close_pool_and_drain(pool: &SqlitePool) {
+    loop {
+        pool.close().await;
+        if pool.size() == 0 {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
     }
 }
 
@@ -685,6 +1311,51 @@ mod close_tests {
     }
 
     #[tokio::test]
+    async fn close_waits_for_checkouts_even_when_other_connections_are_idle() {
+        for hold_writer in [false, true] {
+            let db = create_database(":memory:").await.unwrap();
+            let pool = if hold_writer {
+                db.write_pool()
+            } else {
+                db.pool()
+            };
+            let held = pool.acquire().await.unwrap();
+            let spare = pool.acquire().await.unwrap();
+            drop(spare);
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while pool.num_idle() == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("spare connection was not returned");
+
+            let closing_db = db.clone();
+            let mut closing = tokio::spawn(async move { closing_db.close().await });
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while !pool.is_closed() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("close did not fence the pool");
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), &mut closing)
+                    .await
+                    .is_err(),
+                "close completed with a retained connection (writer={hold_writer})"
+            );
+            drop(held);
+            tokio::time::timeout(Duration::from_secs(2), closing)
+                .await
+                .expect("close did not drain the released connection")
+                .unwrap();
+            assert_eq!(db.pool().size(), 0);
+            assert_eq!(db.write_pool().size(), 0);
+        }
+    }
+
+    #[tokio::test]
     async fn background_close_invalidates_both_pools_synchronously() {
         let db = create_database(":memory:").await.unwrap();
         let clone = db.clone();
@@ -715,6 +1386,49 @@ pub(crate) async fn begin_write(
     Ok(transaction)
 }
 
+/// The opened half of a capture-path write: the transaction plus the bounded
+/// `BEGIN IMMEDIATE` retry count that [`begin_write`] discards.
+pub(crate) struct CaptureBegin {
+    pub transaction: sqlx::Transaction<'static, sqlx::Sqlite>,
+    pub retry_count: usize,
+}
+
+/// Begin a response-independent interaction-capture write. Same `BEGIN
+/// IMMEDIATE` bounded retry and write-profile enforcement as [`begin_write`],
+/// but exhaustion keeps its retry count inside the returned error so the
+/// background capture path can log it instead of swallowing it: a read tool
+/// call can stall up to the writer deadline on this write and still return
+/// 200, and the count is what distinguishes contention from a poisoned lock.
+pub(crate) async fn begin_capture_write(pool: &SqlitePool) -> Result<CaptureBegin> {
+    let started_at = Instant::now();
+    let begun = begin_write_attempts_with(
+        || pool.begin_with("BEGIN IMMEDIATE"),
+        Duration::from_secs(15),
+    )
+    .await;
+    let success = match begun {
+        Ok(success) => success,
+        Err(failure) => {
+            return Err(Error::engine(format!(
+                "interaction capture begin_write {} after {} retries in {}ms: {}",
+                failure.retry_outcome,
+                failure.retry_count,
+                started_at.elapsed().as_millis(),
+                failure.error
+            )));
+        }
+    };
+    let mut transaction = success.transaction;
+    if let Err(error) = crate::storage_profile::enforce_write_boundary(&mut transaction).await {
+        let _ = transaction.rollback().await;
+        return Err(error);
+    }
+    Ok(CaptureBegin {
+        transaction,
+        retry_count: success.retry_count,
+    })
+}
+
 /// Begin an authoritative hosted control-plane SQLite write.
 ///
 /// Hosted catalogues own their pool directly rather than receiving a portable
@@ -728,6 +1442,249 @@ pub async fn begin_host_control_plane_sqlite_write(
     begin_write(pool).await
 }
 
+/// A hosted control-plane write carrying bounded-BEGIN diagnostics through its
+/// statement and commit stages.
+///
+/// This is deliberately purpose-specific: hosted migration-journal callers
+/// need retained diagnostics even when stderr has no tracing subscriber, while
+/// ordinary engine callers keep the existing raw-error behaviour of
+/// [`begin_write`].
+#[doc(hidden)]
+pub struct DiagnosedHostControlPlaneSqliteWrite {
+    transaction: sqlx::Transaction<'static, sqlx::Sqlite>,
+    operation: &'static str,
+    started_at: Instant,
+    begin_retry_count: usize,
+}
+
+impl DiagnosedHostControlPlaneSqliteWrite {
+    /// Borrow the underlying SQLite connection for one journal statement.
+    pub fn connection(&mut self) -> &mut SqliteConnection {
+        &mut self.transaction
+    }
+
+    /// Add operation, stage, bounded-BEGIN outcome, and elapsed time to a
+    /// journal statement error without discarding a SQLite database error's
+    /// code or classification.
+    pub fn statement_error(&self, statement: &'static str, error: sqlx::Error) -> Error {
+        self.stage_error(
+            "statement",
+            Some(("statement", statement)),
+            Error::Sqlx(error),
+        )
+    }
+
+    /// Commit the journal transition, retaining the same operation and BEGIN
+    /// history if SQLite rejects the commit.
+    pub async fn commit(self) -> Result<()> {
+        let Self {
+            transaction,
+            operation,
+            started_at,
+            begin_retry_count,
+        } = self;
+        match transaction.commit().await {
+            Ok(()) => Ok(()),
+            Err(error) => Err(contextualize_write_error(
+                write_diagnostic_context(
+                    operation,
+                    "commit",
+                    None,
+                    started_at.elapsed(),
+                    successful_begin_retry_outcome(begin_retry_count),
+                    begin_retry_count,
+                ),
+                Error::Sqlx(error),
+            )),
+        }
+    }
+
+    fn stage_error(
+        &self,
+        stage: &'static str,
+        detail: Option<(&'static str, &'static str)>,
+        error: Error,
+    ) -> Error {
+        contextualize_write_error(
+            write_diagnostic_context(
+                self.operation,
+                stage,
+                detail,
+                self.started_at.elapsed(),
+                successful_begin_retry_outcome(self.begin_retry_count),
+                self.begin_retry_count,
+            ),
+            error,
+        )
+    }
+}
+
+/// Begin a diagnosed authoritative hosted control-plane SQLite write.
+///
+/// The operation must be a fixed server-side label. It is retained in errors;
+/// callers must not put tenant identifiers or other request data in it.
+#[doc(hidden)]
+pub async fn begin_diagnosed_host_control_plane_sqlite_write(
+    pool: &SqlitePool,
+    operation: &'static str,
+) -> Result<DiagnosedHostControlPlaneSqliteWrite> {
+    let started_at = Instant::now();
+    let begin = begin_write_attempts_with(
+        || pool.begin_with("BEGIN IMMEDIATE"),
+        Duration::from_secs(15),
+    )
+    .await;
+    let BeginWriteSuccess {
+        mut transaction,
+        retry_count,
+    } = match begin {
+        Ok(begin) => begin,
+        Err(failure) => {
+            let context = write_diagnostic_context(
+                operation,
+                "begin",
+                None,
+                started_at.elapsed(),
+                failure.retry_outcome,
+                failure.retry_count,
+            );
+            return Err(contextualize_write_error(context, failure.error));
+        }
+    };
+    if let Err(error) = crate::storage_profile::enforce_write_boundary(&mut transaction).await {
+        let context = write_diagnostic_context(
+            operation,
+            "begin",
+            Some(("boundary", "write_profile")),
+            started_at.elapsed(),
+            successful_begin_retry_outcome(retry_count),
+            retry_count,
+        );
+        let error = contextualize_write_error(context, error);
+        let _ = transaction.rollback().await;
+        return Err(error);
+    }
+    Ok(DiagnosedHostControlPlaneSqliteWrite {
+        transaction,
+        operation,
+        started_at,
+        begin_retry_count: retry_count,
+    })
+}
+
+fn successful_begin_retry_outcome(retry_count: usize) -> &'static str {
+    if retry_count == 0 {
+        "not_needed"
+    } else {
+        "succeeded_after_retry"
+    }
+}
+
+fn write_diagnostic_context(
+    operation: &'static str,
+    stage: &'static str,
+    detail: Option<(&'static str, &'static str)>,
+    elapsed: Duration,
+    begin_retry_outcome: &'static str,
+    begin_retry_count: usize,
+) -> String {
+    let detail = detail
+        .map(|(key, value)| format!(" {key}={value}"))
+        .unwrap_or_default();
+    format!(
+        "migration journal operation={operation} stage={stage}{detail} elapsed_ms={} begin_retry_outcome={begin_retry_outcome} begin_retry_count={begin_retry_count}",
+        elapsed.as_millis()
+    )
+}
+
+fn contextualize_write_error(context: String, error: Error) -> Error {
+    match error {
+        Error::Sqlx(sqlx::Error::Database(source)) => Error::Sqlx(sqlx::Error::Database(Box::new(
+            ContextualDatabaseError::new(context, source),
+        ))),
+        error => Error::engine(format!("{context}: {error}")),
+    }
+}
+
+#[derive(Debug)]
+struct ContextualDatabaseError {
+    message: String,
+    context: String,
+    source: Box<dyn DatabaseError>,
+}
+
+impl ContextualDatabaseError {
+    fn new(context: String, source: Box<dyn DatabaseError>) -> Self {
+        let message = format!("{context}: {}", source.message());
+        Self {
+            message,
+            context,
+            source,
+        }
+    }
+}
+
+impl fmt::Display for ContextualDatabaseError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}: {}", self.context, self.source)
+    }
+}
+
+impl StdError for ContextualDatabaseError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        Some(self.source.as_error())
+    }
+}
+
+impl DatabaseError for ContextualDatabaseError {
+    fn message(&self) -> &str {
+        &self.message
+    }
+
+    fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
+        self.source.code()
+    }
+
+    fn as_error(&self) -> &(dyn StdError + Send + Sync + 'static) {
+        self.source.as_error()
+    }
+
+    fn as_error_mut(&mut self) -> &mut (dyn StdError + Send + Sync + 'static) {
+        self.source.as_error_mut()
+    }
+
+    fn into_error(self: Box<Self>) -> Box<dyn StdError + Send + Sync + 'static> {
+        self.source.into_error()
+    }
+
+    fn is_transient_in_connect_phase(&self) -> bool {
+        self.source.is_transient_in_connect_phase()
+    }
+
+    fn constraint(&self) -> Option<&str> {
+        self.source.constraint()
+    }
+
+    fn table(&self) -> Option<&str> {
+        self.source.table()
+    }
+
+    fn kind(&self) -> ErrorKind {
+        self.source.kind()
+    }
+}
+
+struct BeginWriteSuccess {
+    transaction: sqlx::Transaction<'static, sqlx::Sqlite>,
+    retry_count: usize,
+}
+
+struct BeginWriteFailure {
+    error: Error,
+    retry_count: usize,
+    retry_outcome: &'static str,
+}
+
 async fn begin_write_with<F, Fut>(mut begin: F) -> Result<sqlx::Transaction<'static, sqlx::Sqlite>>
 where
     F: FnMut() -> Fut,
@@ -735,10 +1692,32 @@ where
         Output = std::result::Result<sqlx::Transaction<'static, sqlx::Sqlite>, sqlx::Error>,
     >,
 {
-    let deadline = Instant::now() + Duration::from_secs(15);
+    begin_write_attempts_with(&mut begin, Duration::from_secs(15))
+        .await
+        .map(|success| success.transaction)
+        .map_err(|failure| failure.error)
+}
+
+async fn begin_write_attempts_with<F, Fut>(
+    mut begin: F,
+    retry_for: Duration,
+) -> std::result::Result<BeginWriteSuccess, BeginWriteFailure>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<
+        Output = std::result::Result<sqlx::Transaction<'static, sqlx::Sqlite>, sqlx::Error>,
+    >,
+{
+    let deadline = Instant::now() + retry_for;
+    let mut retry_count = 0;
     loop {
         match begin().await {
-            Ok(transaction) => return Ok(transaction),
+            Ok(transaction) => {
+                return Ok(BeginWriteSuccess {
+                    transaction,
+                    retry_count,
+                })
+            }
             Err(sqlx_error) => {
                 let error = Error::from(sqlx_error);
                 // A canceled SQLite transaction queues its rollback on the
@@ -749,10 +1728,20 @@ where
                 // drains; retry it within the same bounded writer deadline.
                 let cleanup_pending =
                     matches!(&error, Error::Sqlx(sqlx::Error::InvalidSavePointStatement));
-                if (!error.is_busy() && !cleanup_pending) || Instant::now() >= deadline {
-                    return Err(error);
+                let retryable = error.is_busy() || cleanup_pending;
+                if !retryable || Instant::now() >= deadline {
+                    return Err(BeginWriteFailure {
+                        error,
+                        retry_count,
+                        retry_outcome: if retryable {
+                            "exhausted"
+                        } else {
+                            "not_retriable"
+                        },
+                    });
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
+                retry_count += 1;
             }
         }
     }
@@ -760,9 +1749,50 @@ where
 
 #[cfg(test)]
 mod begin_write_tests {
+    use std::borrow::Cow;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+
+    #[derive(Debug)]
+    struct TestDatabaseError {
+        code: &'static str,
+        message: &'static str,
+    }
+
+    impl fmt::Display for TestDatabaseError {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(formatter, "(code: {}) {}", self.code, self.message)
+        }
+    }
+
+    impl StdError for TestDatabaseError {}
+
+    impl DatabaseError for TestDatabaseError {
+        fn message(&self) -> &str {
+            self.message
+        }
+
+        fn code(&self) -> Option<Cow<'_, str>> {
+            Some(Cow::Borrowed(self.code))
+        }
+
+        fn as_error(&self) -> &(dyn StdError + Send + Sync + 'static) {
+            self
+        }
+
+        fn as_error_mut(&mut self) -> &mut (dyn StdError + Send + Sync + 'static) {
+            self
+        }
+
+        fn into_error(self: Box<Self>) -> Box<dyn StdError + Send + Sync + 'static> {
+            self
+        }
+
+        fn kind(&self) -> ErrorKind {
+            ErrorKind::Other
+        }
+    }
 
     #[tokio::test]
     async fn retries_a_transient_invalid_savepoint_before_begin_immediate() {
@@ -783,6 +1813,131 @@ mod begin_write_tests {
         .unwrap();
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
         transaction.rollback().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn diagnosed_begin_reports_bounded_exhaustion_and_preserves_busy_code() {
+        let failure = match begin_write_attempts_with(
+            || async {
+                Err(sqlx::Error::database(TestDatabaseError {
+                    code: "5",
+                    message: "database is locked",
+                }))
+            },
+            Duration::ZERO,
+        )
+        .await
+        {
+            Ok(_) => panic!("zero-length busy retry unexpectedly succeeded"),
+            Err(failure) => failure,
+        };
+        assert_eq!(failure.retry_count, 0);
+        assert_eq!(failure.retry_outcome, "exhausted");
+
+        let error = contextualize_write_error(
+            write_diagnostic_context(
+                "reserve_migration_attempt",
+                "begin",
+                None,
+                Duration::from_millis(3),
+                failure.retry_outcome,
+                failure.retry_count,
+            ),
+            failure.error,
+        );
+        assert!(error.is_busy());
+        let message = error.to_string();
+        assert!(message.contains("operation=reserve_migration_attempt stage=begin"));
+        assert!(message.contains("elapsed_ms=3"));
+        assert!(message.contains("begin_retry_outcome=exhausted begin_retry_count=0"));
+        let Error::Sqlx(sqlx::Error::Database(database)) = error else {
+            panic!("diagnosed busy error lost its database variant");
+        };
+        assert_eq!(database.code().as_deref(), Some("5"));
+        assert!(database.try_downcast_ref::<TestDatabaseError>().is_some());
+    }
+
+    #[tokio::test]
+    async fn diagnosed_write_carries_successful_begin_retry_into_later_stages() {
+        let db = create_database(":memory:").await.unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let begin = match begin_write_attempts_with(
+            || {
+                let pool = db.write_pool().clone();
+                let attempts = attempts.clone();
+                async move {
+                    if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                        Err(sqlx::Error::InvalidSavePointStatement)
+                    } else {
+                        pool.begin_with("BEGIN IMMEDIATE").await
+                    }
+                }
+            },
+            Duration::from_secs(1),
+        )
+        .await
+        {
+            Ok(begin) => begin,
+            Err(_) => panic!("transient invalid savepoint was not retried"),
+        };
+        assert_eq!(begin.retry_count, 1);
+        let write = DiagnosedHostControlPlaneSqliteWrite {
+            transaction: begin.transaction,
+            operation: "finalize_migration_attempt",
+            started_at: Instant::now(),
+            begin_retry_count: begin.retry_count,
+        };
+
+        let statement = write.statement_error(
+            "finalize_prepared_attempt",
+            sqlx::Error::Protocol("statement failed".into()),
+        );
+        let statement = statement.to_string();
+        assert!(statement.contains(
+            "operation=finalize_migration_attempt stage=statement statement=finalize_prepared_attempt"
+        ));
+        assert!(statement.contains("begin_retry_outcome=succeeded_after_retry begin_retry_count=1"));
+        assert!(statement.ends_with(": encountered unexpected or invalid data: statement failed"));
+
+        write.transaction.rollback().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn diagnosed_write_contextualizes_an_actual_commit_failure() {
+        let db = create_database(":memory:").await.unwrap();
+        let mut setup = begin_write(db.write_pool()).await.unwrap();
+        sqlx::query("CREATE TABLE diagnostic_parent (id INTEGER PRIMARY KEY)")
+            .execute(&mut *setup)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE diagnostic_child (
+                 parent_id INTEGER REFERENCES diagnostic_parent(id)
+                     DEFERRABLE INITIALLY DEFERRED
+             )",
+        )
+        .execute(&mut *setup)
+        .await
+        .unwrap();
+        setup.commit().await.unwrap();
+
+        let mut write = begin_diagnosed_host_control_plane_sqlite_write(
+            db.write_pool(),
+            "finish_migration_run",
+        )
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO diagnostic_child (parent_id) VALUES (42)")
+            .execute(write.connection())
+            .await
+            .unwrap();
+        let error = write.commit().await.unwrap_err();
+        assert!(!error.is_busy());
+        let message = error.to_string();
+        assert!(message.contains("operation=finish_migration_run stage=commit"));
+        assert!(message.contains("elapsed_ms="));
+        assert!(message.contains("begin_retry_outcome=not_needed begin_retry_count=0"));
+        assert!(message.contains("FOREIGN KEY constraint failed"));
     }
 }
 
@@ -922,7 +2077,9 @@ mod wal_journal_size_limit_tests {
     async fn write_pool_connections_carry_the_journal_size_limit() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("journal-size-limit.db");
-        let pool = open_pool(path.to_str().unwrap(), true).await.unwrap();
+        let pool = open_pool(path.to_str().unwrap(), true, WritePoolKind::Workspace)
+            .await
+            .unwrap();
 
         let limit: i64 = sqlx::query_scalar("PRAGMA journal_size_limit")
             .fetch_one(&pool)
@@ -948,7 +2105,9 @@ mod wal_journal_size_limit_tests {
 
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("truncation.db");
-        let pool = open_pool(path.to_str().unwrap(), true).await.unwrap();
+        let pool = open_pool(path.to_str().unwrap(), true, WritePoolKind::Workspace)
+            .await
+            .unwrap();
         let wal = directory.path().join("truncation.db-wal");
         // Every statement below must land on one physical connection:
         // `journal_size_limit` and `wal_autocheckpoint` are per-connection
@@ -1008,16 +2167,41 @@ mod wal_journal_size_limit_tests {
     }
 }
 
-async fn open_pool(path: &str, create_if_missing: bool) -> Result<SqlitePool> {
-    let pool = SqlitePoolOptions::new()
-        .max_connections(5)
+#[derive(Clone, Copy)]
+enum WritePoolKind {
+    Workspace,
+    HostCatalog,
+}
+
+async fn open_pool(path: &str, create_if_missing: bool, kind: WritePoolKind) -> Result<SqlitePool> {
+    let options = match kind {
+        WritePoolKind::Workspace => SqlitePoolOptions::new()
+            .max_connections(5)
+            // Both hooks are required: SQLx uses `before_acquire` for an idle
+            // connection and `after_connect` for a newly opened one.
+            .before_acquire(count_write_pool_reuse)
+            .after_connect(count_write_pool_new_connection),
+        WritePoolKind::HostCatalog => SqlitePoolOptions::new()
+            .max_connections(5)
+            .before_acquire(attach_catalog_trace_on_reuse)
+            .after_connect(attach_catalog_trace_on_connect),
+    };
+    let pool = options
         // `query_sql` installs connection-local views, principal state, and a
         // SQLite progress callback. This hook is the structural cleanup and
         // cancellation/unwind backstop before a pooled physical connection can
         // serve any later request, including an ordinary non-SQL query whose
         // unqualified relation names must never resolve to the TEMP contract.
-        .after_release(|connection, _metadata| {
-            Box::pin(sanitize_released_write_connection(connection))
+        .after_release(move |connection, _metadata| {
+            Box::pin(async move {
+                if matches!(kind, WritePoolKind::HostCatalog) {
+                    // The snapshot counts statements executed while this
+                    // request owns the checkout. Pool housekeeping below is
+                    // deliberately outside that interval.
+                    detach_catalog_trace(connection).await?;
+                }
+                sanitize_released_write_connection(connection).await
+            })
         })
         .connect_with(connect_options(path, create_if_missing)?)
         .await?;
@@ -1171,9 +2355,13 @@ async fn open_immutable_read_pool(path: &str) -> Result<SqlitePool> {
 ///
 /// Both are WAL-journalled with foreign keys enforced.
 pub async fn open_database(url: &str) -> Result<Db> {
+    open_database_with_write_pool_kind(url, WritePoolKind::Workspace).await
+}
+
+async fn open_database_with_write_pool_kind(url: &str, kind: WritePoolKind) -> Result<Db> {
     if url == ":memory:" {
         let (path, tmp) = ephemeral_file()?;
-        let write_pool = open_pool(&path, true).await?;
+        let write_pool = open_pool(&path, true, kind).await?;
         let read_pool = open_read_pool(&path).await?;
         return Ok(Db {
             write_pool,
@@ -1188,10 +2376,12 @@ pub async fn open_database(url: &str) -> Result<Db> {
             inbox_snapshots: Arc::new(Mutex::new(HashMap::new())),
             realtime_hub: None,
             portability_policy_gate: Arc::new(tokio::sync::RwLock::new(())),
+            capture_queue: crate::mcp::interactions::CaptureQueue::spawn(),
+            database_id_cache: Arc::new(tokio::sync::OnceCell::new()),
             _tmp: Some(tmp),
         });
     }
-    let write_pool = open_pool(url, true).await?;
+    let write_pool = open_pool(url, true, kind).await?;
     let read_pool = open_read_pool(url).await?;
     Ok(Db {
         write_pool,
@@ -1206,6 +2396,8 @@ pub async fn open_database(url: &str) -> Result<Db> {
         inbox_snapshots: Arc::new(Mutex::new(HashMap::new())),
         realtime_hub: None,
         portability_policy_gate: Arc::new(tokio::sync::RwLock::new(())),
+        capture_queue: crate::mcp::interactions::CaptureQueue::spawn(),
+        database_id_cache: Arc::new(tokio::sync::OnceCell::new()),
         _tmp: None,
     })
 }
@@ -1221,9 +2413,13 @@ pub async fn open_database_at(path: &Path) -> Result<Db> {
 /// catalogue path: open the database through Native's write/read-pool
 /// configuration, retain the write pool, and await physical shutdown of the
 /// read-only observation pool before dropping the temporary [`Db`] handle.
+/// This pool owns its SQLite trace slot while a measured checkout is active;
+/// test tracing uses separate, dedicated pools and never shares this pool.
 #[doc(hidden)]
 pub async fn open_host_control_plane_sqlite_pool(path: &Path) -> Result<SqlitePool> {
-    let database = open_database_at(path).await?;
+    let database =
+        open_database_with_write_pool_kind(&path.to_string_lossy(), WritePoolKind::HostCatalog)
+            .await?;
     Ok(retain_host_control_plane_sqlite_pool(database).await)
 }
 
@@ -1236,6 +2432,83 @@ async fn retain_host_control_plane_sqlite_pool(database: Db) -> SqlitePool {
 #[cfg(test)]
 mod host_control_plane_pool_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn catalog_trace_counts_every_statement_in_one_checkout() {
+        let directory = tempfile::tempdir().unwrap();
+        let pool = open_host_control_plane_sqlite_pool(&directory.path().join("catalog.db"))
+            .await
+            .unwrap();
+        let work = crate::request_work::RequestWork::new();
+        work.scope(async {
+            sqlx::raw_sql("SELECT 1; SELECT 2; SELECT 3;")
+                .execute(&pool)
+                .await
+                .unwrap();
+        })
+        .await;
+        assert_eq!(work.snapshot().catalog_statements, 3);
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn catalog_trace_is_request_local_and_detaches_on_release() {
+        let directory = tempfile::tempdir().unwrap();
+        let pool = open_host_control_plane_sqlite_pool(&directory.path().join("catalog.db"))
+            .await
+            .unwrap();
+        let first = crate::request_work::RequestWork::new();
+        let second = crate::request_work::RequestWork::new();
+        tokio::join!(
+            first.scope(async {
+                sqlx::query("SELECT 1").execute(&pool).await.unwrap();
+                sqlx::query("SELECT 2").execute(&pool).await.unwrap();
+            }),
+            second.scope(async {
+                sqlx::query("SELECT 3").execute(&pool).await.unwrap();
+            }),
+        );
+        assert_eq!(first.snapshot().catalog_statements, 2);
+        assert_eq!(second.snapshot().catalog_statements, 1);
+
+        sqlx::query("SELECT 4").execute(&pool).await.unwrap();
+        assert_eq!(first.snapshot().catalog_statements, 2);
+        assert_eq!(second.snapshot().catalog_statements, 1);
+
+        let third = crate::request_work::RequestWork::new();
+        third
+            .scope(async {
+                sqlx::query("SELECT 5").execute(&pool).await.unwrap();
+            })
+            .await;
+        assert_eq!(third.snapshot().catalog_statements, 1);
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn closing_a_traced_catalog_connection_releases_its_counter_arc() {
+        let directory = tempfile::tempdir().unwrap();
+        let pool = open_host_control_plane_sqlite_pool(&directory.path().join("catalog.db"))
+            .await
+            .unwrap();
+        let work = crate::request_work::RequestWork::new();
+        let weak = work
+            .scope(async {
+                let counters = crate::request_work::current().unwrap();
+                let weak = Arc::downgrade(&counters);
+                drop(counters);
+                let connection = pool.acquire().await.unwrap();
+                connection.close().await.unwrap();
+                weak
+            })
+            .await;
+        drop(work);
+        assert!(
+            weak.upgrade().is_none(),
+            "SQLite close retained the trace-owned request counter Arc"
+        );
+        pool.close().await;
+    }
 
     #[tokio::test]
     async fn opening_a_host_control_plane_pool_awaits_unused_read_pool_shutdown() {
@@ -1401,7 +2674,10 @@ pub(crate) async fn validate_supported_engine_migration_source(
     Ok(())
 }
 
-async fn validate_engine_shape_on(actual: &mut SqliteConnection, version: i64) -> Result<bool> {
+pub(crate) async fn validate_engine_shape_on(
+    actual: &mut SqliteConnection,
+    version: i64,
+) -> Result<bool> {
     let actual_contract = schema_shape_contract(actual).await?;
     if version == 39 {
         return Ok(
@@ -1458,21 +2734,62 @@ async fn validate_engine_shape_on(actual: &mut SqliteConnection, version: i64) -
             schema_shape_contract_sha256(&actual_contract) == ENGINE_49_SHAPE_CONTRACT_SHA256
         );
     }
+    if version == 50 {
+        return Ok(
+            schema_shape_contract_sha256(&actual_contract) == ENGINE_50_SHAPE_CONTRACT_SHA256
+        );
+    }
+    if version == 51 {
+        return Ok(
+            schema_shape_contract_sha256(&actual_contract) == ENGINE_51_SHAPE_CONTRACT_SHA256
+        );
+    }
+    if version == 52 {
+        return Ok(
+            schema_shape_contract_sha256(&actual_contract) == ENGINE_52_SHAPE_CONTRACT_SHA256
+        );
+    }
+    if version == 53 {
+        return Ok(
+            schema_shape_contract_sha256(&actual_contract) == ENGINE_53_SHAPE_CONTRACT_SHA256
+        );
+    }
+    if version == 54 {
+        return Ok(
+            schema_shape_contract_sha256(&actual_contract) == ENGINE_54_SHAPE_CONTRACT_SHA256
+        );
+    }
     if version != CURRENT_ENGINE_SCHEMA_VERSION {
         return Err(Error::engine(format!(
             "no frozen engine structural shape is registered for schema {version}"
         )));
     }
-    let reference_options = SqliteConnectOptions::from_str("sqlite::memory:")?
-        .create_if_missing(true)
-        .foreign_keys(true);
-    let mut reference = SqliteConnection::connect_with(&reference_options).await?;
-    for statement in DDL_STATEMENTS {
-        sqlx::query(statement).execute(&mut reference).await?;
-    }
-    let reference_contract = schema_shape_contract(&mut reference).await;
-    reference.close().await?;
-    Ok(actual_contract == reference_contract?)
+    let reference_contract = current_reference_shape_contract().await?;
+    Ok(actual_contract == *reference_contract)
+}
+
+/// Caches the successful immutable compiled reference only; each actual
+/// database is freshly inspected; failed or cancelled init retries.
+type CurrentShapeContract = BTreeMap<(String, String), Vec<String>>;
+
+static CURRENT_REFERENCE_SHAPE: tokio::sync::OnceCell<CurrentShapeContract> =
+    tokio::sync::OnceCell::const_new();
+
+async fn current_reference_shape_contract() -> Result<&'static CurrentShapeContract> {
+    CURRENT_REFERENCE_SHAPE
+        .get_or_try_init(|| async {
+            let reference_options = SqliteConnectOptions::from_str("sqlite::memory:")?
+                .create_if_missing(true)
+                .foreign_keys(true);
+            let mut reference = SqliteConnection::connect_with(&reference_options).await?;
+            for statement in DDL_STATEMENTS {
+                sqlx::query(statement).execute(&mut reference).await?;
+            }
+            let contract = schema_shape_contract(&mut reference).await?;
+            reference.close().await?;
+            Ok(contract)
+        })
+        .await
 }
 
 fn schema_shape_contract_sha256(contract: &BTreeMap<(String, String), Vec<String>>) -> String {
@@ -1784,7 +3101,7 @@ pub async fn open_existing_database(url: &str) -> Result<Db> {
             path.display()
         )));
     }
-    let write_pool = open_pool(url, false).await?;
+    let write_pool = open_pool(url, false, WritePoolKind::Workspace).await?;
     let read_pool = open_read_pool(url).await?;
     let db = Db {
         write_pool,
@@ -1799,6 +3116,8 @@ pub async fn open_existing_database(url: &str) -> Result<Db> {
         inbox_snapshots: Arc::new(Mutex::new(HashMap::new())),
         realtime_hub: None,
         portability_policy_gate: Arc::new(tokio::sync::RwLock::new(())),
+        capture_queue: crate::mcp::interactions::CaptureQueue::spawn(),
+        database_id_cache: Arc::new(tokio::sync::OnceCell::new()),
         _tmp: None,
     };
     let revision_violations = crate::authorization_revision::state_violations(&db).await?;
@@ -1889,6 +3208,8 @@ pub async fn open_existing_database_standby_read_only(url: &str) -> Result<Db> {
         inbox_snapshots: Arc::new(Mutex::new(HashMap::new())),
         realtime_hub: None,
         portability_policy_gate: Arc::new(tokio::sync::RwLock::new(())),
+        capture_queue: crate::mcp::interactions::CaptureQueue::spawn(),
+        database_id_cache: Arc::new(tokio::sync::OnceCell::new()),
         _tmp: None,
     };
     for (label, violations) in [
@@ -2423,5 +3744,54 @@ mod release_preflight_shape_tests {
             "'Policy. Replaced'",
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn warmed_reference_still_rejects_later_corruption() {
+        let directory = tempfile::tempdir().unwrap();
+        let valid = directory.path().join("warmed-valid.db");
+        let invalid = directory.path().join("warmed-invalid.db");
+
+        let database = create_database(valid.to_str().unwrap()).await.unwrap();
+        database.close().await;
+        checkpoint_fixture_wal(&valid).await;
+        validate_current_engine_shape_read_only(&valid)
+            .await
+            .unwrap();
+
+        let database = create_database(invalid.to_str().unwrap()).await.unwrap();
+        database.close().await;
+        let options = SqliteConnectOptions::from_str(&format!("sqlite:{}", invalid.display()))
+            .unwrap()
+            .create_if_missing(false);
+        let mut connection = SqliteConnection::connect_with(&options).await.unwrap();
+        sqlx::query("DROP INDEX idx_records_type")
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        sqlx::query("CREATE INDEX idx_records_type ON records(kind)")
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        connection.close().await.unwrap();
+        checkpoint_fixture_wal(&invalid).await;
+
+        assert_eq!(
+            probe_database(&invalid, CURRENT_ENGINE_SCHEMA_VERSION).await,
+            DatabaseVersionState::Known(CURRENT_ENGINE_SCHEMA_VERSION),
+            "the shallow probe cannot see the corruption; only the cached reference comparison can"
+        );
+        let before = std::fs::read(&invalid).unwrap();
+        assert!(
+            validate_current_engine_shape_read_only(&invalid)
+                .await
+                .is_err(),
+            "a warmed reference must still reject a later-corrupted shape"
+        );
+        assert_main_file_unchanged(&invalid, &before);
+
+        validate_current_engine_shape_read_only(&valid)
+            .await
+            .unwrap();
     }
 }

@@ -4,6 +4,10 @@ This slice gives Codex, Claude Code, and other MCP harnesses one registry-owned
 path for autonomous same-database messaging:
 
 1. Call `bootstrap` once and retain its `run_key` and active instructions.
+   `bootstrap` is read-only: if the call fails with a transient transport or
+   pool error (HTTP 502/503/504), retry the initial call at most twice, then
+   stop. Never retry auth, validation, or instruction-readiness failures, and
+   retain the run key once received and reuse it on every call.
 2. Call `manage_messages` with `action: "send"` for delivery. Include a concise,
    disclosure-safe `preview` of at most 500 characters whenever policy may block
    and request authority. The preview is sender-authored, immutable, and bound

@@ -818,12 +818,11 @@ async fn production_read_cancellation_releases_snapshots_for_reuse() {
             .is_object());
     }
 
-    db.contract_arm_snapshot_block("describe_schema");
-    let schema = spawn_local_call(db.clone(), "describe_schema", json!({}));
-    db.contract_wait_for_snapshot_block().await;
-    schema.abort();
-    assert!(schema.await.unwrap_err().is_cancelled());
-    let reused = registry()
+    // describe_schema no longer appears here. Now that it reports the physical
+    // table listing only, it reads the catalog over a plain connection and
+    // opens no domain snapshot, so it has no domain-transaction boundary to
+    // cancel at. Its physical-contract coverage lives in turso_contract.rs.
+    let schema = registry()
         .call_engine(
             EngineHandle::TursoLocal(db.clone()),
             Caller::local(),
@@ -832,7 +831,7 @@ async fn production_read_cancellation_releases_snapshots_for_reuse() {
         )
         .await
         .unwrap();
-    assert_eq!(reused["engine"]["storage_profile"], "turso-local");
+    assert_eq!(schema["engine"]["storage_profile"], "turso-local");
 
     db.contract_arm_snapshot_block("get_history");
     db.contract_release_snapshot_block();
@@ -1622,7 +1621,8 @@ async fn production_update_record_cas_composes_with_body_digest_and_rejects_with
                 "kind":"note",
                 "name":"CAS",
                 "body":"v1",
-                "reason":"Create the CAS fixture."
+                "reason":"Create the CAS fixture.",
+                "response_mode":"verbose"
             }),
         )
         .await
@@ -1664,7 +1664,8 @@ async fn production_update_record_cas_composes_with_body_digest_and_rejects_with
                 "facets":{"priority":"high"},
                 "if_body_digest":digest,
                 "if_unmodified_since":equivalent_offset,
-                "reason":"Apply matching record-wide and body guards together."
+                "reason":"Apply matching record-wide and body guards together.",
+                "response_mode":"verbose"
             }),
         )
         .await
@@ -1684,7 +1685,8 @@ async fn production_update_record_cas_composes_with_body_digest_and_rejects_with
                 "id":"70250000-0000-4000-8000-005000000018",
                 "facets":{"priority":"urgent"},
                 "if_unmodified_since":second_token,
-                "reason":"Advance the record token through a facet-only mutation."
+                "reason":"Advance the record token through a facet-only mutation.",
+                "response_mode":"verbose"
             }),
         )
         .await
@@ -2011,7 +2013,8 @@ async fn production_comment_threads_cover_aliases_replies_resolution_and_immutab
                 "body":"And the caller identity owns this automatically.",
                 "links":[{"target_id":"70250000-0000-4000-8000-005000000021","relationship":"part_of"}],
                 "reason":"Prove omitted owner auto-attribution.",
-                "run_key":"heron-river-c748b2"
+                "run_key":"heron-river-c748b2",
+                "response_mode":"verbose"
             }),
         )
         .await
@@ -2103,7 +2106,8 @@ async fn production_comment_threads_cover_aliases_replies_resolution_and_immutab
                 "lifecycle":"resolved",
                 "summary":"The guarded transition is in place.",
                 "reason":"Resolve the root atomically.",
-                "run_key":"scout-chair-a748b2"
+                "run_key":"scout-chair-a748b2",
+                "response_mode":"verbose"
             }),
         )
         .await
@@ -2689,7 +2693,8 @@ async fn engine_handle_routes_the_qualified_domain_slice_and_isolated_query_sql(
                 "name":"Runtime",
                 "body":"v1",
                 "facets":{"estimate":3,"priority":"high"},
-                "reason":"Exercise the promoted Turso-local route."
+                "reason":"Exercise the promoted Turso-local route.",
+                "response_mode":"verbose"
             }),
         )
         .await
@@ -2707,7 +2712,8 @@ async fn engine_handle_routes_the_qualified_domain_slice_and_isolated_query_sql(
                 "body":"v2",
                 "facets":{"priority":"urgent"},
                 "if_body_digest":body_digest("v1"),
-                "reason":"Exercise an atomic event and projection update."
+                "reason":"Exercise an atomic event and projection update.",
+                "response_mode":"verbose"
             }),
         )
         .await

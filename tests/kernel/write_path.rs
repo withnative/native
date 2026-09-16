@@ -446,6 +446,9 @@ async fn actor_is_the_credential_with_or_without_a_run_key() {
     .unwrap();
     assert_eq!(actors, ["local", "local"]);
 
+    // Captures leave the response path on the background queue; drain before
+    // asserting both rows landed.
+    db.drain_captures_for_tests().await;
     let calls = sqlx::query_as::<_, (String, Option<String>)>(
         "SELECT actor, run_key FROM read_log_calls ORDER BY seq",
     )
@@ -1140,5 +1143,46 @@ async fn parent_key_is_accepted_unverified_and_echoed() {
     )
     .await;
     assert_eq!(out["run_context"]["parent_key"], "heron-river-c748b2");
+    db.close().await;
+}
+
+/// The closed-spine-type refusal for `correct_record_type` lives in
+/// `correction_snapshot_in`, which the direct tool only reaches through a
+/// claimed plan — so no registry-level call can exercise that branch. It is
+/// pinned instead by the in-crate prepare test
+/// `correction_spine_tests::prepare_with_unknown_target_type_lists_the_closed_spine_set`
+/// in `src/mcp/tools/lifecycle.rs`, which drives the real prepare entry
+/// point. This test keeps the tool-surface half: an unknown `target_type`
+/// without a plan is refused before any mutation.
+#[tokio::test]
+async fn correct_record_type_with_unknown_target_type_is_refused_before_mutation() {
+    let db = db().await;
+    let registry = registry();
+    let record_id = seed(&registry, &db).await;
+    let before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM content_events")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    let err = call_err(
+        &registry,
+        &db,
+        "correct_record_type",
+        json!({
+            "record_id": record_id,
+            "target_type": "Nope",
+            "target_kind": "note",
+            "reason": "Exercise the unknown-type refusal."
+        }),
+    )
+    .await;
+    assert!(
+        err.contains("correct_record_type"),
+        "refusal must identify the tool: {err}"
+    );
+    let after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM content_events")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(before, after, "a refused correction must append nothing");
     db.close().await;
 }

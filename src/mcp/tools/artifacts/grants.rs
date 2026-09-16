@@ -944,8 +944,8 @@ pub(super) async fn manage_artifact_module_grants(
         "requests": artifact_manifest.capability_requests,
     })];
     for release in closure.values() {
-        if !can_record(
-            &db,
+        if !super::super::can_record_in(
+            &mut snapshot,
             &caller,
             &release.address.module_record_id,
             Capability::View,
@@ -969,6 +969,7 @@ pub(super) async fn manage_artifact_module_grants(
             subject["subject_event_id"].as_str().unwrap_or("")
         )
     });
+    snapshot.rollback().await?;
     Ok(json!({ "status": "ok", "artifact_id": artifact_id,
         "subjects": subjects, "grants": grants,
         "verification": verification_state(mdx_v2::RUNTIME_ID) }))

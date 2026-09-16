@@ -440,10 +440,52 @@ async fn governed_types_for_token_with<E: DomainStatementExecutor>(
         .collect())
 }
 
-fn unknown_kind_warning(record_type: &str, raw_kind: &str, governed_types: &[String]) -> String {
+/// Active kind tokens for one record type, capped at `limit_plus_one` rows
+/// so the unknown-kind warning can tell "small, list inline" from "large,
+/// point at the preview call" without loading and parsing every definition.
+pub(crate) async fn active_kind_tokens_with<E: DomainStatementExecutor>(
+    executor: &mut E,
+    record_type: &str,
+    limit_plus_one: i64,
+) -> Result<Vec<String>> {
+    let statement = StatementTemplate::new(
+        StatementKind::Select,
+        "vocabularies",
+        &[
+            "SELECT vv.value FROM {{relation}} v JOIN vocabulary_values vv ON vv.vocabulary_id = v.id WHERE v.name = ",
+            " AND vv.status = 'active' AND vv.alias_of IS NULL ORDER BY vv.value, vv.id LIMIT ",
+            "",
+        ],
+    )
+    .map_err(|error| crate::domain_transaction::stable_storage_error("list active kind tokens", &error))?;
+    let rows = executor
+        .fetch_all(
+            &statement,
+            &[
+                BindValue::Text(kind_vocabulary_name(record_type)),
+                BindValue::Integer(limit_plus_one),
+            ],
+            &[ColumnSpec::required("value", LogicalType::Text)],
+        )
+        .await
+        .map_err(|error| {
+            crate::domain_transaction::stable_storage_error("list active kind tokens", &error)
+        })?;
+    rows.into_iter()
+        .map(|row| kind_row_text(&row, "value"))
+        .collect()
+}
+
+fn unknown_kind_warning(
+    record_type: &str,
+    raw_kind: &str,
+    governed_types: &[String],
+    active_kind_tokens: &[String],
+) -> String {
+    use crate::schema::GOVERNANCE_INLINE_ALTERNATIVES_LIMIT as LIMIT;
     let rejected = format!("kind '{raw_kind}' is not governed by kind:{record_type}");
     let consequence = "stored for interoperability but quarantined from governed dispatch";
-    match governed_types {
+    let base = match governed_types {
         [] => format!("{rejected}; {consequence}"),
         [governed_type] => format!(
             "{rejected}. It is governed under type {governed_type} (kind:{governed_type}); did you mean that type? The record was {consequence}"
@@ -458,6 +500,23 @@ fn unknown_kind_warning(record_type: &str, raw_kind: &str, governed_types: &[Str
                 "{rejected}. It is governed under multiple types: {candidates}; choose the intended type. The record was {consequence}"
             )
         }
+    };
+    // SQLite/Turso order text bytewise; Postgres follows the database locale.
+    // Sort here so the message is identical on every backend.
+    let mut ordered: Vec<&String> = active_kind_tokens.iter().collect();
+    ordered.sort();
+    if ordered.len() <= LIMIT && !ordered.is_empty() {
+        let kinds = ordered
+            .iter()
+            .map(|token| token.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("{base}. Active kinds for {record_type}: {kinds}")
+    } else {
+        let arguments = serde_json::json!({ "type": record_type });
+        format!(
+            "{base}. List the active kinds with schema_read preview_record_shape arguments {arguments}"
+        )
     }
 }
 
@@ -530,6 +589,12 @@ pub(crate) async fn resolve_with<E: DomainStatementExecutor>(
 
     let Some(row) = rows.first() else {
         let governed_types = governed_types_for_token_with(executor, raw_kind).await?;
+        let active_kind_tokens = active_kind_tokens_with(
+            executor,
+            record_type,
+            crate::schema::GOVERNANCE_INLINE_ALTERNATIVES_LIMIT as i64 + 1,
+        )
+        .await?;
         return Ok(KindResolution {
             record_type: record_type.into(),
             raw_kind: raw_kind.into(),
@@ -539,7 +604,12 @@ pub(crate) async fn resolve_with<E: DomainStatementExecutor>(
             lifecycle_status: None,
             metadata: None,
             quarantined: true,
-            warning: Some(unknown_kind_warning(record_type, raw_kind, &governed_types)),
+            warning: Some(unknown_kind_warning(
+                record_type,
+                raw_kind,
+                &governed_types,
+                &active_kind_tokens,
+            )),
         });
     };
 

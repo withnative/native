@@ -32,27 +32,26 @@ pub fn register_record_shape_tool(registry: &mut ToolRegistry) -> Result<()> {
     registry.register(
         ToolKind::PreviewRecordShape,
         "Preview the live effective record shape for an optional spine type and kind, and \
-         deterministically assess supplied open-facet values. Facet acceptance covers only the \
-         facet-specific predicates create_record applies under this snapshot. This remains \
-         advisory schema guidance: create_record independently revalidates current state, and no \
-         preview token or field is accepted by create_record.",
+         assess supplied open-facet values with the facet-specific predicates create_record \
+         applies under this snapshot; advisory only: create_record revalidates current state and \
+         accepts no preview token or field.",
         json!({
             "type": "object",
             "properties": {
                 "type": {
                     "type": "string",
                     "enum": SPINE_TYPES,
-                    "description": "Optional spine type to preview."
+                    "description": "Optional spine type."
                 },
                 "kind": {
                     "type": "string",
                     "minLength": 1,
-                    "description": "Optional nonblank open subtype. Requires type when supplied."
+                    "description": "Optional nonblank open subtype. Requires type."
                 },
                 "facets": {
                     "type": "object",
                     "maxProperties": 100,
-                    "description": "Optional proposed open facets using create_record's scalar, atomic-object, or {value,vocab_ref} grammar. Requires type. Spine requirements are reported informationally through their top-level create_record paths.",
+                    "description": "Optional proposed open facets in create_record's grammar (scalar, atomic object, or {value,vocab_ref}). Requires type. Spine requirements are reported via their top-level create_record paths.",
                     "additionalProperties": true
                 }
             },

@@ -16,6 +16,8 @@ const GOAL: &str = "facebb00-0000-4000-8000-000000000003";
 const PARENT: &str = "facebb00-0000-4000-8000-000000000004";
 const RACED: &str = "facebb00-0000-4000-8000-000000000005";
 const RESULT_KIND: &str = "facebb00-0000-4000-8000-000000000006";
+const BIG_FALLBACK: &str = "facebb00-0000-4000-8000-000000000007";
+const EMPTY_FALLBACK: &str = "facebb00-0000-4000-8000-000000000008";
 
 async fn db() -> Db {
     create_database(":memory:").await.unwrap()
@@ -143,6 +145,10 @@ async fn values_and_governing_vocab_bind_on_create_update_and_attachment_paths()
     )
     .await;
     assert!(err.contains("not an active member"), "{err}");
+    assert!(
+        err.contains("active values of 'theme': offsite, planning"),
+        "non-member facet write names the small active set inline: {err}"
+    );
     call(
         &registry,
         &db,
@@ -188,6 +194,10 @@ async fn values_and_governing_vocab_bind_on_create_update_and_attachment_paths()
     )
     .await;
     assert!(err.contains("not an active member"), "{err}");
+    assert!(
+        err.contains("active values of 'theme': offsite, planning"),
+        "non-member facet update names the small active set inline: {err}"
+    );
     let err = call_err(
         &registry,
         &db,
@@ -384,4 +394,124 @@ async fn update_value_predicates_use_the_resulting_kind_and_roll_back_together()
         .await
         .unwrap();
     assert_eq!(kind, "objective");
+}
+
+/// Extract the first balanced `{...}` JSON object following `marker`.
+fn args_after(message: &str, marker: &str) -> Value {
+    let start = message
+        .find(marker)
+        .unwrap_or_else(|| panic!("missing {marker}: {message}"))
+        + marker.len();
+    let slice = &message[start..];
+    let open = slice.find('{').unwrap();
+    let mut depth = 0;
+    let mut end = None;
+    for (index, character) in slice[open..].char_indices() {
+        match character {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = Some(open + index + character.len_utf8());
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    serde_json::from_str(&slice[open..end.unwrap()]).unwrap()
+}
+
+#[tokio::test]
+async fn non_member_fallback_advertises_a_callable_list_values_call() {
+    let db = db().await;
+    let registry = registry();
+    call(
+        &registry,
+        &db,
+        "manage_vocabularies",
+        json!({ "action": "create_vocabulary", "name": "big" }),
+    )
+    .await;
+    for ordinal in 0..11 {
+        active_value(&registry, &db, "big", &format!("v{ordinal:02}")).await;
+    }
+    // The shape spells the vocabulary with the `rec:`-prefixed ref form; the
+    // refusal must still advertise the resolved name, which is what
+    // `list_values` matches on.
+    call(
+        &registry,
+        &db,
+        "manage_schema_config",
+        json!({ "action": "write", "data": { "shapes": {
+            "Outcome": { "facets": { "big": { "vocab_ref": "rec:voc:big" } } }
+        } } }),
+    )
+    .await;
+
+    let err = call_err(
+        &registry,
+        &db,
+        "create_record",
+        json!({ "id": BIG_FALLBACK, "type": "Outcome", "facets": { "big": "nope" } }),
+    )
+    .await;
+    assert!(err.contains("not an active member"), "{err}");
+    let marker = "manage_vocabularies.list_values arguments ";
+    assert!(
+        err.contains(marker),
+        "large set must point at list_values: {err}"
+    );
+    let args = args_after(&err, marker);
+    assert_eq!(args["vocabulary"], json!("big"), "{err}");
+    assert_eq!(args["status"], json!("active"), "{err}");
+    // Prove the advertised call works: replay the parsed arguments through
+    // the real tool.
+    let listed = call(
+        &registry,
+        &db,
+        "manage_vocabularies",
+        json!({
+            "action": "list_values",
+            "vocabulary": args["vocabulary"],
+            "status": args["status"],
+        }),
+    )
+    .await;
+    assert_eq!(listed["values"].as_array().unwrap().len(), 11);
+
+    // A vocabulary with no active values has nothing to list inline, so it
+    // takes the same fallback branch rather than emitting an empty list.
+    call(
+        &registry,
+        &db,
+        "manage_vocabularies",
+        json!({ "action": "create_vocabulary", "name": "empty" }),
+    )
+    .await;
+    call(
+        &registry,
+        &db,
+        "manage_schema_config",
+        json!({ "action": "write", "data": { "shapes": {
+            "Outcome": { "facets": { "drained": { "vocab": "empty" } } }
+        } } }),
+    )
+    .await;
+    let err = call_err(
+        &registry,
+        &db,
+        "create_record",
+        json!({ "id": EMPTY_FALLBACK, "type": "Outcome", "facets": { "drained": "nope" } }),
+    )
+    .await;
+    assert!(err.contains("not an active member"), "{err}");
+    assert!(
+        err.contains(marker),
+        "empty set must fall back to the listing call: {err}"
+    );
+    assert!(
+        !err.contains("active values of"),
+        "empty set must not claim an inline list: {err}"
+    );
 }

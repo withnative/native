@@ -58,7 +58,7 @@ fn registry() -> ToolRegistry {
 }
 
 async fn call(registry: &ToolRegistry, db: &Db, tool: &str, args: Value) -> Value {
-    registry
+    let result = registry
         .call(
             db.clone(),
             Caller::local(),
@@ -66,11 +66,13 @@ async fn call(registry: &ToolRegistry, db: &Db, tool: &str, args: Value) -> Valu
             crate::common::with_test_reason(tool, args),
         )
         .await
-        .unwrap()
+        .unwrap();
+    db.drain_captures_for_tests().await;
+    result
 }
 
 async fn call_err(registry: &ToolRegistry, db: &Db, tool: &str, args: Value) -> String {
-    registry
+    let error = registry
         .call(
             db.clone(),
             Caller::local(),
@@ -79,7 +81,9 @@ async fn call_err(registry: &ToolRegistry, db: &Db, tool: &str, args: Value) -> 
         )
         .await
         .unwrap_err()
-        .to_string()
+        .to_string();
+    db.drain_captures_for_tests().await;
+    error
 }
 
 fn facet(key: &str, value: &str) -> FacetSetPayload {
@@ -576,12 +580,19 @@ async fn get_run_activity_is_per_run_aggregate_only_and_degrades_to_empty() {
     .fetch_one(db.pool())
     .await
     .unwrap();
+    let fixture_pool = crate::common::fixture_write_pool(&db).await;
+    sqlx::query("INSERT OR IGNORE INTO read_log_record_ids (record_id) VALUES (?)")
+        .bind("missing-record")
+        .execute(&fixture_pool)
+        .await
+        .unwrap();
     sqlx::query(
-        "INSERT INTO read_log_touches(call_seq,record_id,interaction,result_rank)
-         VALUES(?,'missing-record','opened',NULL)",
+        "INSERT INTO read_log_touches(call_seq,record_ref,interaction,result_rank)
+         VALUES(?,(SELECT record_ref FROM read_log_record_ids WHERE record_id = ?),'opened',NULL)",
     )
     .bind(root_search_seq)
-    .execute(&crate::common::fixture_write_pool(&db).await)
+    .bind("missing-record")
+    .execute(&fixture_pool)
     .await
     .unwrap();
 

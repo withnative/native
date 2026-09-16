@@ -1,6 +1,7 @@
 //! Stage-1 read layer (`query::*`) + the new `store` primitives (batch append,
 //! conditional lifecycle write). Task dd515a9.
 
+use native_ce::authorization::{replace_explicit_policy, AllowEntry, Capability, Principal};
 use native_ce::conformance::rebuild_and_diff;
 use native_ce::events::{FacetSetPayload, LinkAddedPayload};
 use native_ce::mcp::Caller;
@@ -693,6 +694,106 @@ async fn tree_walk_survives_a_malformed_home_cycle() {
     assert_eq!(nodes.len(), 2);
     let ancestors = tree::ancestors(&db, &x).await.unwrap();
     assert!(ancestors.len() <= 2);
+}
+
+#[tokio::test]
+async fn tree_authorized_walk_filters_counts_and_caps_after_policy() {
+    // Direct `descendants_as` coverage for the batched authorization fold:
+    // policy-denied rows never appear and never count, archived rows count
+    // only when included, and the sibling cap is a window onto the filtered
+    // set — never consumed by rows the caller cannot see.
+    let db = db().await;
+    let root = create_record(
+        &db,
+        json!({ "type": "Collection", "kind": "folder", "name": "Visible root" }),
+    )
+    .await
+    .unwrap();
+    let visible = create_record(
+        &db,
+        json!({ "type": "WorkItem", "kind": "task", "name": "B visible child", "home_id": root }),
+    )
+    .await
+    .unwrap();
+    let hidden = create_record(
+        &db,
+        json!({ "type": "WorkItem", "kind": "task", "name": "A hidden child", "home_id": root }),
+    )
+    .await
+    .unwrap();
+    let archived = create_record(
+        &db,
+        json!({ "type": "Document", "kind": "note", "name": "C archived child", "home_id": root }),
+    )
+    .await
+    .unwrap();
+    archive_record(&db, &archived).await.unwrap();
+    replace_explicit_policy(
+        &db,
+        "test:policy",
+        &hidden,
+        vec![AllowEntry::account("acct:alice", Capability::Manage)],
+    )
+    .await
+    .unwrap();
+    let bea = Principal::bound("acct:bea", true);
+
+    let nodes = tree::descendants_as(
+        &db,
+        &root,
+        tree::TreeOptions {
+            max_depth: 1,
+            ..Default::default()
+        },
+        bea,
+    )
+    .await
+    .unwrap();
+    let ids: Vec<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
+    assert!(ids.contains(&root.as_str()));
+    assert!(ids.contains(&visible.as_str()));
+    assert!(!ids.contains(&hidden.as_str()));
+    assert!(!ids.contains(&archived.as_str()));
+    // The denied child and the archived child contribute nothing to the count.
+    assert_eq!(nodes[0].child_count, 1);
+
+    let nodes = tree::descendants_as(
+        &db,
+        &root,
+        tree::TreeOptions {
+            max_depth: 1,
+            include_archived: true,
+            ..Default::default()
+        },
+        bea,
+    )
+    .await
+    .unwrap();
+    let ids: Vec<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
+    assert!(ids.contains(&visible.as_str()));
+    assert!(ids.contains(&archived.as_str()));
+    assert!(!ids.contains(&hidden.as_str()));
+    assert_eq!(nodes[0].child_count, 2);
+
+    // The cap applies after policy filtering: the denied "A hidden child"
+    // sorts first but consumes no slot, so the single emitted row is the
+    // visible child while the count still describes both authorized children.
+    let nodes = tree::descendants_as(
+        &db,
+        &root,
+        tree::TreeOptions {
+            max_depth: 1,
+            include_archived: true,
+            max_children_per_node: 1,
+            ..Default::default()
+        },
+        bea,
+    )
+    .await
+    .unwrap();
+    assert_eq!(nodes.len(), 2);
+    assert_eq!(nodes[0].child_count, 2);
+    assert_eq!(nodes[1].id, visible);
 }
 
 // ---- query::events ---------------------------------------------------------

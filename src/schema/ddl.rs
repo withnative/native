@@ -87,10 +87,10 @@
 //!    `intent` onto `records` would make a forgeable value load-bearing for
 //!    truth. `tests/records/annotations.rs` asserts the isolation directly rather than
 //!    trusting rebuild-and-diff to notice.
-//! 2. `read_log_touches.record_id` carries NO foreign key, deliberately. A touch
+//! 2. Historical read-log IDs carry NO foreign key to `records`. A touch
 //!    is evidence that a record was consulted; deleting the record must not
 //!    erase the evidence, and `ON DELETE CASCADE` would do exactly that. It also
-//!    keeps the read log droppable with no referential-integrity interaction.
+//!    keeps the read log independent of the canonical records table.
 //!    Dangling ids are the correct cost for a log of past observations.
 //! 3. `interaction` is part of `read_log_touches`' PRIMARY KEY, so one call can
 //!    record a record as both `surfaced` and `opened`. Collapsing to one row per
@@ -246,6 +246,32 @@
 //! migration appends explicit communication-origin declarations for the 13
 //! identity-bound, human-reviewed legacy Messages in the Native HQ dogfood
 //! database. Other databases receive only the version transition.
+//!
+//! ENGINE SCHEMA 52 (12 Sep 2026): `read_log_touches` becomes a WITHOUT ROWID
+//! table on the supported SQLite engine. Its composite PRIMARY KEY
+//! (`call_seq`, `record_id`, `interaction`) was stored twice — once in the
+//! table b-tree keyed by hidden rowid and once in a `sqlite_autoindex`
+//! implementing the PK. WITHOUT ROWID clusters the table b-tree on the
+//! primary key instead, eliminating the autoindex. Nothing observable moves
+//! with it: no consumer query references the touches rowid (all consumers are
+//! column-based), `last_insert_rowid()` belongs to `read_log_calls` and that
+//! table is untouched, the canonical interchange exports `ORDER BY
+//! <primary-key>` (storage order now aligns with export order), and the FK to
+//! `read_log_calls(seq) ON DELETE CASCADE` is preserved verbatim. `record_id`
+//! still carries NO foreign key and `interaction` stays in the primary key —
+//! see the module header notes above; the 51→52 edge preserves every row
+//! including `result_rank`. The 52→53 edge reclaims the rebuild's freed pages
+//! and carries no DDL of its own. Turso-local keeps the released rowid
+//! physical form of this table (install_schema / compiled schema overlay);
+//! turso_core 0.7.2 refuses CREATE INDEX on WITHOUT ROWID. Logical columns,
+//! PK, FK, and the secondary index stay identical.
+//!
+//! ENGINE SCHEMA 54 (12 Sep 2026): exact historical TEXT IDs move to the
+//! per-database `read_log_record_ids` dictionary. Touches use an INTEGER
+//! `record_ref` with a dictionary FK; there is still no FK to `records`.
+//! Dictionary inserts follow call-sequence capture so last_insert_rowid stays
+//! bound to the call. Readers and canonical interchange decode to TEXT IDs
+//! and preserve their logical order. Engine 55 compacts the displaced pages.
 
 pub(crate) const PROVENANCE_ACTION_ATTESTATIONS_DDL: &str = r#"CREATE TABLE provenance_action_attestations (
      id                      TEXT PRIMARY KEY,
@@ -323,7 +349,7 @@ pub(crate) const ENGINE_50_WEBHOOK_DDL: [&str; 6] = [
 ];
 
 /// The ordered, frozen v1 DDL. One statement per entry.
-pub const DDL_STATEMENTS: [&str; 292] = [
+pub const DDL_STATEMENTS: [&str; 294] = [
     r#"CREATE TABLE content_events (
      seq                     INTEGER PRIMARY KEY AUTOINCREMENT,
      id                      TEXT NOT NULL UNIQUE,
@@ -1111,20 +1137,39 @@ pub const DDL_STATEMENTS: [&str; 292] = [
      result_count INTEGER,
      result_bytes INTEGER,
      started_at   TEXT NOT NULL,
-     ended_at     TEXT NOT NULL
+     ended_at     TEXT NOT NULL,
+     -- Bounded, response-derived evidence for a notice that was actually
+     -- emitted.  It is intentionally nullable: ordinary calls do not acquire
+     -- a synthetic annotation, and this disposable log never reconstructs one
+     -- later from changing claim state.
+     result_annotation TEXT CHECK (result_annotation IS NULL OR json_valid(result_annotation))
    )"#,
     r#"CREATE INDEX idx_read_log_calls_run     ON read_log_calls(run_key, seq)"#,
     r#"CREATE INDEX idx_read_log_calls_started ON read_log_calls(started_at)"#,
-    // NO foreign key on `record_id`, and `interaction` IS in the primary key.
-    // Both are deliberate; see the module header before changing either.
+    // The retained annotation is the admission fence for evaluation: a
+    // historical claim is not a notice-bearing call unless this column says
+    // one was emitted.  Own-account scans start from actor and completion.
+    r#"CREATE INDEX idx_read_log_calls_overlap_annotation
+       ON read_log_calls(actor, ended_at, seq) WHERE result_annotation IS NOT NULL"#,
+    // Intern exact historical IDs inside this database. There is deliberately
+    // no foreign key to records: deleting a record must not erase past touches.
+    // IDs are arbitrary TEXT, not normalized UUIDs. The dictionary and touches
+    // remain disposable read-log bookkeeping and never become canonical state.
+    r#"CREATE TABLE read_log_record_ids (
+     record_ref   INTEGER PRIMARY KEY,
+     record_id    TEXT NOT NULL UNIQUE
+   )"#,
+    // Keep interaction in the key: a call can both surface and open a record.
+    // Compact integer references replace repeated strings in both b-trees.
+    // Turso-local substitutes a rowid table at install time.
     r#"CREATE TABLE read_log_touches (
      call_seq     INTEGER NOT NULL REFERENCES read_log_calls(seq) ON DELETE CASCADE,
-     record_id    TEXT NOT NULL,
+     record_ref   INTEGER NOT NULL REFERENCES read_log_record_ids(record_ref),
      interaction  TEXT NOT NULL CHECK (interaction IN ('surfaced','opened','mutated')),
      result_rank  INTEGER,
-     PRIMARY KEY (call_seq, record_id, interaction)
-   )"#,
-    r#"CREATE INDEX idx_read_log_touches_record ON read_log_touches(record_id, call_seq)"#,
+     PRIMARY KEY (call_seq, record_ref, interaction)
+   ) WITHOUT ROWID"#,
+    r#"CREATE INDEX idx_read_log_touches_record ON read_log_touches(record_ref, call_seq)"#,
     r#"CREATE TABLE IF NOT EXISTS authorization_revision (
      id     INTEGER PRIMARY KEY CHECK (id = 1),
      epoch  INTEGER NOT NULL
@@ -2311,7 +2356,7 @@ pub const DDL_STATEMENTS: [&str; 292] = [
        BEGIN SELECT RAISE(ABORT, 'engine_migration_drills is append-only'); END"#,
     r#"CREATE TRIGGER engine_migration_drills_no_delete BEFORE DELETE ON engine_migration_drills
        BEGIN SELECT RAISE(ABORT, 'engine_migration_drills is append-only'); END"#,
-    r#"PRAGMA user_version = 50"#,
+    r#"PRAGMA user_version = 55"#,
 ];
 
 /// The policy-log projections — independently replayed from `policy_events`.

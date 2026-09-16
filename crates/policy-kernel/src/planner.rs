@@ -83,6 +83,7 @@ pub(super) fn plan_policy_transition(
                 .iter()
                 .filter(|entry| subject_key(&entry.subject) == key)
                 .map(|entry| entry.capability)
+                .filter(|capability| *capability != Capability::None)
                 .max();
             if current == requested {
                 Ok(no_change())
@@ -276,6 +277,46 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(members_manage, PlanError::MembersManageMutation);
+
+        // `Capability::None` entries normalize to absence. The storage-free
+        // kernel accepts snapshots directly even though current database
+        // adapters cannot persist such an entry, so exact Set must compare
+        // the same normalized meaning for both supported absence spellings.
+        for mode in [PolicyMode::Inherit, PolicyMode::Explicit] {
+            let none_entry = snapshot(
+                mode,
+                if mode == PolicyMode::Inherit {
+                    "native:root"
+                } else {
+                    RECORD_ID
+                },
+                vec![
+                    account("acct:none", Capability::None),
+                    account("acct:other", Capability::Edit),
+                ],
+            );
+            for capability in [None, Some(Capability::None)] {
+                let transition = plan(
+                    &none_entry,
+                    PolicyMutation::Set {
+                        subject: PolicySubject::Account("acct:none".into()),
+                        capability,
+                    },
+                )
+                .unwrap();
+                assert!(
+                    !transition.changed(),
+                    "{mode:?} normalized absence must be unchanged: {transition:?}"
+                );
+                assert!(!transition.boundary_created());
+                assert_eq!(transition.after_mode(), mode);
+                assert_eq!(transition.after_anchor_id(), none_entry.anchor_id);
+                assert_eq!(
+                    transition.after_normalized(),
+                    normalize_entries(none_entry.entries.clone()).unwrap()
+                );
+            }
+        }
     }
 
     #[test]
@@ -520,6 +561,10 @@ mod tests {
         )
         .unwrap();
         assert!(revoked.boundary_created());
+        assert_eq!(
+            replacement_entries(&revoked),
+            &[AllowEntry::members(Capability::View)]
+        );
 
         let inherited_new_grant = plan(
             &inherited,
@@ -554,6 +599,17 @@ mod tests {
                 account("acct:a", Capability::Edit),
                 AllowEntry::members(Capability::Edit),
             ]
+        );
+
+        let removed_baseline = plan(
+            &inherited,
+            PolicyMutation::SetMembersBaseline { capability: None },
+        )
+        .unwrap();
+        assert!(removed_baseline.boundary_created());
+        assert_eq!(
+            replacement_entries(&removed_baseline),
+            &[account("acct:a", Capability::Edit)]
         );
 
         let equal_but_inherited = plan(

@@ -12,7 +12,7 @@ Use a run key consistently so writes, reads, and intent can be reconstructed as 
 
 `start_work` owns the claim protocol. Its default action claims a record, `preview` returns working context without writing, and `release` hands back a claim. Claim and release each append one ordinary `record.updated` event that projects an engine-owned account/run/timestamp tuple. The record's lifecycle is unchanged.
 
-Claims do not expire and are not auto-released when a client disconnects. The exact stored account-and-run holder must call `release`; run context is optional, so an account-only holder is valid. The trusted-local operator is the recovery path for a stuck current claim.
+Claims do not expire and are not auto-released when a client disconnects. The exact stored account-and-run holder releases normally with `action: "release"` and no extra argument; run context is optional, so an account-only holder is valid. Another run of the SAME account can take the claim back by passing `expected_holder_run_key` with the currently holding run key (explicit null for an account-only holder): the release succeeds only when it equals the stored holder, inside the same write transaction, so a stale expectation cannot clear a later claim. Any other principal is still refused with `claimed by another caller` and learns nothing about the holder. The trusted-local operator is the recovery path for a stuck current claim.
 
 The claim path checks `claimed_by_account IS NULL` inside one write transaction. A second claimant is refused rather than queued. Release checks the current stored account/run tuple in that same transaction, so a stale or non-holder release cannot clear a later claim.
 

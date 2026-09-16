@@ -552,29 +552,13 @@ pub(crate) async fn body_at_event_in(
             .fetch_optional(&mut **tx)
             .await?;
     let Some(seq) = seq else { return Ok(None) };
-    // Fold only body-bearing record events up to the immutable source event.
-    let events = sqlx::query(
-        "SELECT type, payload FROM content_events
-          WHERE record_id = ? AND seq <= ?
-            AND (type = 'record.created' OR type = 'record.updated')
-          ORDER BY seq",
-    )
-    .bind(record_id)
-    .bind(seq)
-    .fetch_all(&mut **tx)
-    .await?;
-    let mut body: Option<String> = None;
-    for event in events {
-        let payload: Value = serde_json::from_str(&event.try_get::<String, _>("payload")?)?;
-        if event.try_get::<String, _>("type")? == "record.created" || payload.get("body").is_some()
-        {
-            body = payload
-                .get("body")
-                .and_then(Value::as_str)
-                .map(str::to_owned);
-        }
-    }
-    Ok(Some(body.unwrap_or_default().into_bytes()))
+    // One indexed per-record fold, shared with body-anchored citations: the
+    // body at an event is the last body-bearing write for this record at or
+    // before the event's seq. See `crate::record_body` for the exact
+    // event-type contract (it additionally honours receipt and unit-revision
+    // body writers, which predate no attribution source the projector would
+    // have admitted, so every creatable state folds identically).
+    crate::record_body::body_at_seq_in(tx, record_id, seq).await
 }
 
 pub(crate) async fn read_window_in(

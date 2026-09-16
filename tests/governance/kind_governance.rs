@@ -58,9 +58,47 @@ async fn call(
     registry: &ToolRegistry,
     db: &Db,
     tool: &str,
-    args: Value,
+    mut args: Value,
 ) -> native_ce::Result<Value> {
+    // These governance tests inspect the complete record shape. Keep that
+    // fixture contract explicit now singleton writes default to summaries.
+    if (tool == "create_record" || tool == "update_record")
+        && args.get("ids").is_none()
+        && args.get("response_mode").is_none()
+    {
+        args["response_mode"] = json!("verbose");
+    }
     registry.call(db.clone(), Caller::local(), tool, args).await
+}
+
+/// The governed kinds `preview_record_shape` advertises for one spine type.
+/// This is the tool surface that replaced `describe_schema`'s removed
+/// `kind_registry` / `resolved_schema_config` blocks.
+async fn preview_active_kinds(registry: &ToolRegistry, db: &Db, record_type: &str) -> Vec<Value> {
+    let preview = call(
+        registry,
+        db,
+        "preview_record_shape",
+        json!({ "type": record_type }),
+    )
+    .await
+    .unwrap();
+    preview["selection"]["active_kinds"]
+        .as_array()
+        .unwrap_or_else(|| panic!("preview_record_shape has no active_kinds for {record_type}"))
+        .clone()
+}
+
+async fn preview_active_kind_tokens(
+    registry: &ToolRegistry,
+    db: &Db,
+    record_type: &str,
+) -> Vec<String> {
+    preview_active_kinds(registry, db, record_type)
+        .await
+        .iter()
+        .map(|kind| kind["token"].as_str().expect("kind token").to_string())
+        .collect()
 }
 
 async fn install_kind(db: &Db, record_type: &str, token: &str, promote: bool) -> String {
@@ -108,6 +146,10 @@ async fn unknown_kind_warning_names_other_governed_types_and_preserves_the_fallb
     assert!(warning.contains("governed under type Resolution (kind:Resolution)"));
     assert!(warning.contains("did you mean that type?"));
     assert!(warning.contains("stored for interoperability but quarantined"));
+    assert!(
+        warning.contains("Active kinds for Document: artifact, attachment"),
+        "unknown-kind create names the requested type's active kinds: {warning}"
+    );
 
     install_kind(&db, "Entity", "decision", true).await;
     let multiple = native_ce::meta::kind::resolve(&db, "Document", "decision")
@@ -116,7 +158,7 @@ async fn unknown_kind_warning_names_other_governed_types_and_preserves_the_fallb
     assert_eq!(
         multiple.warning.as_deref(),
         Some(
-            "kind 'decision' is not governed by kind:Document. It is governed under multiple types: Entity (kind:Entity), Resolution (kind:Resolution); choose the intended type. The record was stored for interoperability but quarantined from governed dispatch"
+            "kind 'decision' is not governed by kind:Document. It is governed under multiple types: Entity (kind:Entity), Resolution (kind:Resolution); choose the intended type. The record was stored for interoperability but quarantined from governed dispatch. Active kinds for Document: artifact, attachment, canvas, definition, handoff, note, sheet, slides"
         )
     );
 
@@ -139,7 +181,7 @@ async fn unknown_kind_warning_names_other_governed_types_and_preserves_the_fallb
     assert_eq!(
         retired_alias.warning.as_deref(),
         Some(
-            "kind 'verdict' is not governed by kind:Document; stored for interoperability but quarantined from governed dispatch"
+            "kind 'verdict' is not governed by kind:Document; stored for interoperability but quarantined from governed dispatch. Active kinds for Document: artifact, attachment, canvas, definition, handoff, note, sheet, slides"
         )
     );
 
@@ -160,7 +202,7 @@ async fn unknown_kind_warning_names_other_governed_types_and_preserves_the_fallb
     let fallback = ungoverned["kind_governance"]["warning"].as_str().unwrap();
     assert_eq!(
         fallback,
-        "kind 'x-unknown-kind' is not governed by kind:Document; stored for interoperability but quarantined from governed dispatch"
+        "kind 'x-unknown-kind' is not governed by kind:Document; stored for interoperability but quarantined from governed dispatch. Active kinds for Document: artifact, attachment, canvas, definition, handoff, note, sheet, slides"
     );
 }
 
@@ -368,15 +410,6 @@ async fn reconciled_core_kinds_resolve_and_project_from_governed_registry() {
         ),
     ];
 
-    let described = call(
-        &registry,
-        &db,
-        "describe_schema",
-        json!({ "include_ddl": false }),
-    )
-    .await
-    .unwrap();
-
     for record_type in native_ce::schema::SPINE_TYPES {
         let active = native_ce::meta::kind::list_active(&db, record_type)
             .await
@@ -386,18 +419,10 @@ async fn reconciled_core_kinds_resolve_and_project_from_governed_registry() {
             "pristine list_active has no governed kind for {record_type}"
         );
         assert!(
-            !described["kind_registry"][record_type]
-                .as_array()
-                .unwrap()
+            !preview_active_kinds(&registry, &db, record_type)
+                .await
                 .is_empty(),
-            "pristine describe_schema has no governed kind for {record_type}"
-        );
-        assert!(
-            !described["resolved_schema_config"]["shapes"][record_type]["kinds"]
-                .as_array()
-                .unwrap()
-                .is_empty(),
-            "pristine resolved schema has no governed kind for {record_type}"
+            "pristine preview_record_shape has no governed kind for {record_type}"
         );
     }
 
@@ -421,11 +446,10 @@ async fn reconciled_core_kinds_resolve_and_project_from_governed_registry() {
     }
 
     assert!(
-        described["resolved_schema_config"]["shapes"]["Collection"]["kinds"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|kind| kind != "view")
+        !preview_active_kind_tokens(&registry, &db, "Collection")
+            .await
+            .contains(&"view".to_string()),
+        "a deprecated kind must not be advertised by preview_record_shape"
     );
 
     for (record_type, token, provenance, definition, criterion, dedup_mode) in cases {
@@ -450,11 +474,10 @@ async fn reconciled_core_kinds_resolve_and_project_from_governed_registry() {
         assert!(metadata.identity.dedup.keys.is_empty());
 
         assert!(
-            described["resolved_schema_config"]["shapes"][record_type]["kinds"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|kind| kind == token)
+            preview_active_kind_tokens(&registry, &db, record_type)
+                .await
+                .contains(&token.to_string()),
+            "preview_record_shape must advertise governed kind {record_type}:{token}"
         );
     }
 }
@@ -899,17 +922,10 @@ async fn metadata_events_replay_bytes_and_schema_advertises_active_only() {
     assert!(rebuild_and_diff_meta(&db).await.unwrap().equal);
 
     let proposed = install_kind(&db, "WorkItem", "not_yet", false).await;
-    let described = call(
-        &registry,
-        &db,
-        "describe_schema",
-        json!({ "include_ddl": false }),
-    )
-    .await
-    .unwrap();
     assert_eq!(
-        described["resolved_schema_config"]["shapes"]["WorkItem"]["kinds"],
-        json!(["epic", "review", "task"])
+        preview_active_kind_tokens(&registry, &db, "WorkItem").await,
+        ["epic", "review", "task"],
+        "preview_record_shape must advertise active kinds only"
     );
     let _ = proposed;
 }
@@ -1074,25 +1090,12 @@ async fn document_handoff_seeds_resolves_projects_and_writes_without_quarantine(
             .unwrap();
     assert_eq!(gloss.as_deref(), Some(HANDOFF_GLOSS));
 
-    let described = call(
-        &registry,
-        &db,
-        "describe_schema",
-        json!({ "include_ddl": false }),
-    )
-    .await
-    .unwrap();
-    assert!(described["kind_registry"]["Document"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|kind| kind["token"] == "handoff"));
     assert!(
-        described["resolved_schema_config"]["shapes"]["Document"]["kinds"]
-            .as_array()
-            .unwrap()
+        preview_active_kinds(&registry, &db, "Document")
+            .await
             .iter()
-            .any(|kind| kind == "handoff")
+            .any(|kind| kind["token"] == "handoff"),
+        "preview_record_shape must advertise the seeded handoff kind"
     );
 
     let created = call(
@@ -1265,4 +1268,64 @@ async fn proposed_core_kind_reconciliation_clears_stale_gloss_without_manifest_a
             .unwrap();
     assert_eq!(status, "active");
     assert_eq!(gloss, None);
+}
+
+#[tokio::test]
+async fn unknown_kind_warning_lists_ten_kinds_inline_and_points_past_ten_at_preview() {
+    let db = db().await;
+    let registry = registry();
+
+    // Document seeds 8 active kinds; two more make exactly 10: inline,
+    // sorted bytewise.
+    install_kind(&db, "Document", "zz-doc-00", true).await;
+    install_kind(&db, "Document", "zz-doc-01", true).await;
+    let inline = native_ce::meta::kind::resolve(&db, "Document", "zz-no-such-kind")
+        .await
+        .unwrap();
+    let warning = inline.warning.as_deref().unwrap();
+    assert!(
+        warning.contains(
+            "Active kinds for Document: artifact, attachment, canvas, definition, \
+             handoff, note, sheet, slides, zz-doc-00, zz-doc-01"
+        ),
+        "ten kinds must list inline sorted bytewise: {warning}"
+    );
+
+    // Entity seeds 2; eleven more push it past the limit: preview call.
+    for ordinal in 0..11 {
+        install_kind(&db, "Entity", &format!("zz-ent-{ordinal:02}"), true).await;
+    }
+    let fallback = native_ce::meta::kind::resolve(&db, "Entity", "zz-no-such-kind")
+        .await
+        .unwrap();
+    let warning = fallback.warning.as_deref().unwrap();
+    assert!(
+        warning.contains("preview_record_shape arguments {\"type\":\"Entity\"}"),
+        "eleven-plus kinds must name the preview call: {warning}"
+    );
+    assert!(
+        !warning.contains("Active kinds for Entity:"),
+        "eleven-plus kinds must not list inline: {warning}"
+    );
+
+    // The same fallback surfaces on the create path.
+    let created = call(
+        &registry,
+        &db,
+        "create_record",
+        json!({
+            "id": UNKNOWN_KIND,
+            "type": "Entity",
+            "kind": "zz-no-such-kind",
+            "name": "Ungoverned entity",
+            "reason": "Exercise the kind fallback branch on the write path."
+        }),
+    )
+    .await
+    .unwrap();
+    let warning = created["kind_governance"]["warning"].as_str().unwrap();
+    assert!(
+        warning.contains("preview_record_shape arguments {\"type\":\"Entity\"}"),
+        "{warning}"
+    );
 }

@@ -8,6 +8,10 @@
 
 mod common;
 
+#[path = "records/anchored_body_fold.rs"]
+mod anchored_body_fold;
+#[path = "records/anchored_body_scale.rs"]
+mod anchored_body_scale;
 #[path = "records/annotations.rs"]
 mod annotations;
 #[path = "records/artifact_interactions.rs"]
@@ -54,5 +58,7 @@ mod read_log_capture;
 mod render;
 #[path = "records/search_semantics.rs"]
 mod search_semantics;
+#[path = "records/superseded_by.rs"]
+mod superseded_by;
 #[path = "records/wordlist.rs"]
 mod wordlist;

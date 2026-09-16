@@ -29,6 +29,19 @@ pub trait EngineMigrationStep: std::fmt::Debug + Send + Sync {
     fn requires_foreign_keys_disabled(&self) -> bool {
         false
     }
+    /// Whether the runner must `VACUUM` this file in autocommit *before*
+    /// opening the step's ordinary `BEGIN IMMEDIATE` apply transaction.
+    ///
+    /// SQLite refuses `VACUUM` inside a transaction. The compacting 52→53
+    /// and 54→55 edges return true. The runner then
+    /// keeps every ordinary contract: fenced apply, version stamp inside
+    /// `BEGIN IMMEDIATE`, and `ROLLBACK` if a later fence or apply fails so
+    /// `user_version` cannot advance in autocommit. Failure or kill leaves
+    /// the file at `from()`. Ordinary current boots take no pending
+    /// steps and never vacuum.
+    fn requires_pre_apply_compaction(&self) -> bool {
+        false
+    }
     /// Inspect the migration source before any mutation.
     ///
     /// The runner hands EVERY pending step the same physically read-only
@@ -180,6 +193,11 @@ fn production_migrations() -> Vec<Arc<dyn EngineMigrationStep>> {
         Arc::new(Engine47To48Migration),
         Arc::new(Engine48To49Migration),
         Arc::new(Engine49To50Migration),
+        Arc::new(Engine50To51Migration),
+        Arc::new(Engine51To52Migration),
+        Arc::new(Engine52To53Migration),
+        Arc::new(Engine53To54Migration),
+        Arc::new(Engine54To55Migration),
     ]
 }
 
@@ -1245,6 +1263,314 @@ impl EngineMigrationStep for Engine49To50Migration {
     }
 }
 
+/// Read-log result annotations are additive, nullable operational evidence.
+/// Existing raw call rows did not emit an annotation, so the migration must
+/// retain them as NULL rather than attempting to infer a historical notice
+/// from present-day overlap state.
+#[derive(Debug)]
+struct Engine50To51Migration;
+
+impl EngineMigrationStep for Engine50To51Migration {
+    fn from(&self) -> i64 {
+        50
+    }
+
+    fn to(&self) -> i64 {
+        51
+    }
+
+    fn name(&self) -> &str {
+        "engine-50-to-51-read-log-result-annotations"
+    }
+
+    fn preflight<'a>(&'a self, connection: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move {
+            let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+                .fetch_one(&mut *connection)
+                .await?;
+            if version == 50 {
+                crate::db::validate_supported_engine_migration_source(connection, 50).await?;
+            }
+            Ok(())
+        }
+        .boxed()
+    }
+
+    fn apply<'a>(&'a self, connection: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move {
+            // Appending is deliberate: it produces the exact same physical
+            // table shape as fresh engine-51 DDL and leaves old calls NULL.
+            sqlx::query(
+                "ALTER TABLE read_log_calls ADD COLUMN result_annotation TEXT CHECK (result_annotation IS NULL OR json_valid(result_annotation))",
+            )
+            .execute(&mut *connection)
+            .await?;
+            sqlx::query(
+                "CREATE INDEX idx_read_log_calls_overlap_annotation ON read_log_calls(actor, ended_at, seq) WHERE result_annotation IS NOT NULL",
+            )
+            .execute(&mut *connection)
+            .await?;
+            Ok(())
+        }
+        .boxed()
+    }
+}
+
+/// Engine 52 rebuilds `read_log_touches` as a WITHOUT ROWID table, clustered
+/// on its composite primary key. The rowid form stored the key twice (table
+/// b-tree plus a `sqlite_autoindex` implementing the PK); the clustered form
+/// eliminates the autoindex and aligns physical order with the canonical
+/// interchange export's `ORDER BY <primary-key>`. No consumer references the
+/// touches rowid and `last_insert_rowid()` reads `read_log_calls`, which this
+/// edge does not touch. Every row — including `result_rank` — is copied.
+/// Turso-local does not run this rebuild: turso_core 0.7.2 refuses CREATE
+/// INDEX on WITHOUT ROWID, so it keeps the released rowid table.
+pub(crate) const ENGINE_51_TO_52_STATEMENTS: [&str; 7] = [
+    "PRAGMA legacy_alter_table=ON",
+    "ALTER TABLE read_log_touches RENAME TO read_log_touches_v51",
+    r#"CREATE TABLE read_log_touches (
+     call_seq     INTEGER NOT NULL REFERENCES read_log_calls(seq) ON DELETE CASCADE,
+     record_id    TEXT NOT NULL,
+     interaction  TEXT NOT NULL CHECK (interaction IN ('surfaced','opened','mutated')),
+     result_rank  INTEGER,
+     PRIMARY KEY (call_seq, record_id, interaction)
+   ) WITHOUT ROWID"#,
+    // Sorted inserts build the clustered b-tree left-to-right at full page
+    // fill instead of splitting pages at random PK positions; the logical
+    // content is identical either way because the b-tree IS the primary key.
+    r#"INSERT INTO read_log_touches
+         (call_seq, record_id, interaction, result_rank)
+       SELECT call_seq, record_id, interaction, result_rank
+         FROM read_log_touches_v51
+        ORDER BY call_seq, record_id, interaction"#,
+    // The renamed table carries the old rowid-form index; dropping the table
+    // drops that index and frees the name for the identical index on the
+    // clustered table.
+    "DROP TABLE read_log_touches_v51",
+    r#"CREATE INDEX idx_read_log_touches_record ON read_log_touches(record_id, call_seq)"#,
+    "PRAGMA legacy_alter_table=OFF",
+];
+
+#[derive(Debug)]
+struct Engine51To52Migration;
+
+impl EngineMigrationStep for Engine51To52Migration {
+    fn from(&self) -> i64 {
+        51
+    }
+
+    fn to(&self) -> i64 {
+        52
+    }
+
+    fn name(&self) -> &str {
+        "engine-51-to-52-read-log-touches-without-rowid"
+    }
+
+    fn requires_foreign_keys_disabled(&self) -> bool {
+        // Same fence as the 39→40 and 49→50 table rebuilds: the copied table
+        // REFERENCES `read_log_calls(seq)` and the rename must not rewrite
+        // or enforce referencing clauses mid-rebuild.
+        true
+    }
+
+    fn preflight<'a>(&'a self, connection: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move {
+            let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+                .fetch_one(&mut *connection)
+                .await?;
+            if version == 51 {
+                crate::db::validate_supported_engine_migration_source(connection, 51).await?;
+            }
+            Ok(())
+        }
+        .boxed()
+    }
+
+    fn apply<'a>(&'a self, connection: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move {
+            // Shared SQLite rebuild statements. The runner checks
+            // `pragma_foreign_key_check` before committing while foreign keys
+            // are fenced off, so a source with dangling `call_seq` rows
+            // refuses here rather than silently shipping them forward.
+            // Turso-local does not apply this rebuild; it keeps the released
+            // rowid table (turso_core 0.7.2 refuses CREATE INDEX on WITHOUT
+            // ROWID).
+            for statement in ENGINE_51_TO_52_STATEMENTS {
+                sqlx::query(statement).execute(&mut *connection).await?;
+            }
+            Ok(())
+        }
+        .boxed()
+    }
+}
+
+/// Engine 53 reclaims the pages the 51→52 rebuild freed. Copying rows into
+/// the clustered b-tree inside one transaction leaves the displaced pages on
+/// the freelist, so a migrated file keeps its previous allocated size — and
+/// startup prefetch and staging volume checks read allocated bytes — until a
+/// VACUUM. SQLite refuses VACUUM inside a transaction, so the runner runs
+/// in-place VACUUM in autocommit via [`EngineMigrationStep::requires_pre_apply_compaction`]
+/// *before* this step's ordinary `BEGIN IMMEDIATE` apply. `apply` itself is
+/// a no-op: the version stamp stays inside that transaction so a lost fence
+/// can `ROLLBACK` rather than leaving `user_version=53` in autocommit.
+/// Failure or kill leaves the file stamped 52 (VACUUM's own journal/WAL
+/// transaction recovers like any other write) so the edge simply runs again.
+/// Ordinary serving never vacuums: current databases take no migration steps.
+#[derive(Debug)]
+struct Engine52To53Migration;
+
+impl EngineMigrationStep for Engine52To53Migration {
+    fn from(&self) -> i64 {
+        52
+    }
+
+    fn to(&self) -> i64 {
+        53
+    }
+
+    fn name(&self) -> &str {
+        "engine-52-to-53-read-log-freelist-compaction"
+    }
+
+    fn requires_pre_apply_compaction(&self) -> bool {
+        true
+    }
+
+    fn preflight<'a>(&'a self, connection: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move {
+            let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+                .fetch_one(&mut *connection)
+                .await?;
+            if version == 52 {
+                crate::db::validate_supported_engine_migration_source(connection, 52).await?;
+            }
+            Ok(())
+        }
+        .boxed()
+    }
+
+    fn apply<'a>(&'a self, _connection: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move { Ok(()) }.boxed()
+    }
+}
+
+/// Intern repeated historical record IDs without discarding any read-log row.
+/// The dictionary is tenant-local and deliberately has no relation to current
+/// records: arbitrary and dangling historical IDs retain their exact strings.
+#[derive(Debug)]
+struct Engine53To54Migration;
+
+impl EngineMigrationStep for Engine53To54Migration {
+    fn from(&self) -> i64 {
+        53
+    }
+    fn to(&self) -> i64 {
+        54
+    }
+    fn name(&self) -> &str {
+        "engine-53-to-54-read-log-record-dictionary"
+    }
+    fn requires_foreign_keys_disabled(&self) -> bool {
+        true
+    }
+
+    fn preflight<'a>(&'a self, connection: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move {
+            let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+                .fetch_one(&mut *connection)
+                .await?;
+            if version == 53 {
+                crate::db::validate_supported_engine_migration_source(connection, 53).await?;
+            }
+            Ok(())
+        }
+        .boxed()
+    }
+
+    fn apply<'a>(&'a self, connection: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move {
+            sqlx::query("PRAGMA legacy_alter_table=ON").execute(&mut *connection).await?;
+            let rebuilt: Result<()> = async {
+                for statement in [
+                    "ALTER TABLE read_log_touches RENAME TO read_log_touches_v53",
+                    "CREATE TABLE read_log_record_ids (record_ref INTEGER PRIMARY KEY, record_id TEXT NOT NULL UNIQUE)",
+                    // Ascending exact strings assign ascending references. Scanning
+                    // the old clustered key below therefore inserts the new key
+                    // in order without a second full-table sort by reference.
+                    "INSERT INTO read_log_record_ids (record_id) SELECT DISTINCT record_id FROM read_log_touches_v53 ORDER BY record_id",
+                    "CREATE TABLE read_log_touches (call_seq INTEGER NOT NULL REFERENCES read_log_calls(seq) ON DELETE CASCADE, record_ref INTEGER NOT NULL REFERENCES read_log_record_ids(record_ref), interaction TEXT NOT NULL CHECK (interaction IN ('surfaced','opened','mutated')), result_rank INTEGER, PRIMARY KEY (call_seq, record_ref, interaction)) WITHOUT ROWID",
+                    "INSERT INTO read_log_touches (call_seq, record_ref, interaction, result_rank) SELECT t.call_seq, d.record_ref, t.interaction, t.result_rank FROM read_log_touches_v53 t JOIN read_log_record_ids d ON d.record_id=t.record_id ORDER BY t.call_seq, t.record_id, t.interaction",
+                ] {
+                    sqlx::query(statement).execute(&mut *connection).await?;
+                }
+                // Within the runner's fenced transaction, equal counts plus an
+                // injective full-primary-key mapping prove equality in both
+                // directions. BINARY UNIQUE dictionary strings preserve identity;
+                // IS NOT compares nullable ranks without dropping NULL mismatches.
+                // Indexed lookups avoid materializing two full EXCEPT results.
+                let counts_match: i64 = sqlx::query_scalar(
+                    "SELECT (SELECT COUNT(*) FROM read_log_touches_v53) = (SELECT COUNT(*) FROM read_log_touches)",
+                ).fetch_one(&mut *connection).await?;
+                let differs: i64 = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM read_log_touches_v53 o LEFT JOIN read_log_record_ids d ON d.record_id=o.record_id COLLATE BINARY LEFT JOIN read_log_touches n ON n.call_seq=o.call_seq AND n.record_ref=d.record_ref AND n.interaction=o.interaction WHERE n.call_seq IS NULL OR n.result_rank IS NOT o.result_rank)",
+                ).fetch_one(&mut *connection).await?;
+                if counts_match != 1 || differs != 0 {
+                    return Err(Error::engine("read-log dictionary migration changed decoded touches"));
+                }
+                // The runner verifies foreign keys before committing this edge.
+                // Dropping the renamed table frees its old secondary-index name.
+                sqlx::query("DROP TABLE read_log_touches_v53").execute(&mut *connection).await?;
+                sqlx::query("CREATE INDEX idx_read_log_touches_record ON read_log_touches(record_ref, call_seq)")
+                    .execute(&mut *connection).await?;
+                Ok(())
+            }.await;
+            let reset = sqlx::query("PRAGMA legacy_alter_table=OFF").execute(&mut *connection).await;
+            rebuilt?;
+            reset?;
+            Ok(())
+        }.boxed()
+    }
+}
+
+/// Reclaim the old text-key pages after the transactional dictionary rebuild.
+/// As with 52→53, an interrupted VACUUM leaves the prior version stamped and
+/// retryable; the final version stamp remains in the runner's fenced transaction.
+#[derive(Debug)]
+struct Engine54To55Migration;
+
+impl EngineMigrationStep for Engine54To55Migration {
+    fn from(&self) -> i64 {
+        54
+    }
+    fn to(&self) -> i64 {
+        55
+    }
+    fn name(&self) -> &str {
+        "engine-54-to-55-read-log-dictionary-compaction"
+    }
+    fn requires_pre_apply_compaction(&self) -> bool {
+        true
+    }
+
+    fn preflight<'a>(&'a self, connection: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move {
+            let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+                .fetch_one(&mut *connection)
+                .await?;
+            if version == 54 {
+                crate::db::validate_supported_engine_migration_source(connection, 54).await?;
+            }
+            Ok(())
+        }
+        .boxed()
+    }
+
+    fn apply<'a>(&'a self, _connection: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move { Ok(()) }.boxed()
+    }
+}
+
 async fn planned_dogfood_message_origin_repair(
     connection: &mut SqliteConnection,
     repair: DogfoodMessageOriginRepair,
@@ -1637,6 +1963,34 @@ fn single_connection_options(path: &Path) -> Result<SqliteConnectOptions> {
     )
 }
 
+/// In-place VACUUM plus the checks that must pass before the compacting
+/// edge is allowed to open its stamp transaction. Must not be called with
+/// an open transaction on `connection`.
+async fn compact_database_in_place(
+    connection: &mut SqliteConnection,
+    migration: &dyn EngineMigrationStep,
+) -> Result<()> {
+    sqlx::query("VACUUM").execute(&mut *connection).await?;
+    let integrity: String = sqlx::query("PRAGMA integrity_check")
+        .fetch_one(&mut *connection)
+        .await?
+        .get(0);
+    if integrity != "ok" {
+        return Err(Error::engine(format!(
+            "{} left integrity_check '{integrity}'",
+            migration.name()
+        )));
+    }
+    if !crate::db::validate_engine_shape_on(connection, migration.to()).await? {
+        return Err(Error::engine(format!(
+            "{} left a shape that does not match schema {}",
+            migration.name(),
+            migration.to()
+        )));
+    }
+    Ok(())
+}
+
 async fn capture_preimage(
     connection: &mut SqliteConnection,
     path: &Path,
@@ -1817,6 +2171,28 @@ async fn migrate_database_with_reservation(
         if let Err(err) = fence().await {
             let _ = connection.close().await;
             return failed_with_backup(path, from, target, "fence", err.to_string(), backup);
+        }
+        if migration.requires_pre_apply_compaction() {
+            // In-place VACUUM cannot run inside BEGIN IMMEDIATE. Do it in
+            // autocommit, still fenced and still before any version stamp;
+            // then fall through to the ordinary transactional apply so a
+            // lost fence can ROLLBACK the stamp. A second connection holding
+            // a write-preventing lock fails this hop closed (stay on from()).
+            if let Err(err) = compact_database_in_place(&mut connection, migration.as_ref()).await {
+                let _ = connection.close().await;
+                return failed_with_backup(
+                    path,
+                    from,
+                    target,
+                    "compact",
+                    format!("{}: {err}", migration.name()),
+                    backup,
+                );
+            }
+            if let Err(err) = fence().await {
+                let _ = connection.close().await;
+                return failed_with_backup(path, from, target, "fence", err.to_string(), backup);
+            }
         }
         let foreign_keys_disabled = migration.requires_foreign_keys_disabled();
         if foreign_keys_disabled {
@@ -2094,6 +2470,9 @@ mod tests {
     use super::*;
     use crate::backup::{BackupSink, FsSink};
     use sha2::{Digest, Sha256};
+    use sqlx::Row;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
 
     #[derive(Clone)]
     struct TestPreimageStore {
@@ -2161,6 +2540,50 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap()
+    }
+
+    /// Apply remaining production `apply` bodies and stamp `user_version` on
+    /// this already-open connection so later `open_existing_database_at` sees
+    /// the current header.
+    ///
+    /// This is not the production runner: it does not `BEGIN IMMEDIATE` /
+    /// `COMMIT` around each step, capture a preimage, or fence. Compaction
+    /// still runs in autocommit when a step asks for it, and foreign keys
+    /// are toggled around rebuilds. Tests that need the runner's transactional
+    /// stamp/rollback contract use `migrate_database_with_reservation`.
+    async fn apply_remaining_production_steps(connection: &mut SqliteConnection, from: i64) {
+        let mut version = from;
+        for step in EngineMigrationRegistry::production()
+            .pending(from, CURRENT_ENGINE_SCHEMA_VERSION)
+            .unwrap()
+        {
+            assert_eq!(step.from(), version);
+            if step.requires_pre_apply_compaction() {
+                compact_database_in_place(connection, step.as_ref())
+                    .await
+                    .unwrap();
+            }
+            let foreign_keys_disabled = step.requires_foreign_keys_disabled();
+            if foreign_keys_disabled {
+                sqlx::query("PRAGMA foreign_keys=OFF")
+                    .execute(&mut *connection)
+                    .await
+                    .unwrap();
+            }
+            step.apply(connection).await.unwrap();
+            if foreign_keys_disabled {
+                sqlx::query("PRAGMA foreign_keys=ON")
+                    .execute(&mut *connection)
+                    .await
+                    .unwrap();
+            }
+            sqlx::query(&format!("PRAGMA user_version = {}", step.to()))
+                .execute(&mut *connection)
+                .await
+                .unwrap();
+            version = step.to();
+        }
+        assert_eq!(version, CURRENT_ENGINE_SCHEMA_VERSION);
     }
 
     #[tokio::test]
@@ -2266,6 +2689,7 @@ mod tests {
     /// Undo engine 50's webhook storage and attestation vocabulary, leaving
     /// the released engine-49 shape.
     async fn revert_to_engine_49(connection: &mut SqliteConnection) {
+        revert_to_engine_50(connection).await;
         let enforcing: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
             .fetch_one(&mut *connection)
             .await
@@ -2332,6 +2756,140 @@ mod tests {
             r#"CREATE TRIGGER provenance_action_attestations_no_delete
                  BEFORE DELETE ON provenance_action_attestations
                  BEGIN SELECT RAISE(ABORT, 'provenance_action_attestations is append-only'); END"#,
+            "PRAGMA legacy_alter_table=OFF",
+        ] {
+            sqlx::query(statement)
+                .execute(&mut *connection)
+                .await
+                .unwrap();
+        }
+        if enforcing != 0 {
+            sqlx::query("PRAGMA foreign_keys=ON")
+                .execute(&mut *connection)
+                .await
+                .unwrap();
+        }
+    }
+
+    /// Reconstruct the released TEXT-key shape before dictionary interning.
+    /// Test fixtures retain every decoded touch; this is not a rollback API.
+    async fn revert_to_engine_53(connection: &mut SqliteConnection) {
+        let enforcing: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
+            .fetch_one(&mut *connection)
+            .await
+            .unwrap();
+        sqlx::query("PRAGMA foreign_keys=OFF")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        for statement in [
+            "PRAGMA legacy_alter_table=ON",
+            "ALTER TABLE read_log_touches RENAME TO read_log_touches_v54",
+            "CREATE TABLE read_log_touches (call_seq INTEGER NOT NULL REFERENCES read_log_calls(seq) ON DELETE CASCADE, record_id TEXT NOT NULL, interaction TEXT NOT NULL CHECK (interaction IN ('surfaced','opened','mutated')), result_rank INTEGER, PRIMARY KEY (call_seq, record_id, interaction)) WITHOUT ROWID",
+            "INSERT INTO read_log_touches SELECT t.call_seq,d.record_id,t.interaction,t.result_rank FROM read_log_touches_v54 t JOIN read_log_record_ids d ON d.record_ref=t.record_ref ORDER BY t.call_seq,d.record_id,t.interaction",
+            "DROP TABLE read_log_touches_v54",
+            "DROP TABLE read_log_record_ids",
+            "CREATE INDEX idx_read_log_touches_record ON read_log_touches(record_id, call_seq)",
+            "PRAGMA legacy_alter_table=OFF",
+            "PRAGMA user_version=53",
+        ] {
+            sqlx::query(statement).execute(&mut *connection).await.unwrap();
+        }
+        if enforcing != 0 {
+            sqlx::query("PRAGMA foreign_keys=ON")
+                .execute(&mut *connection)
+                .await
+                .unwrap();
+        }
+    }
+
+    /// Undo engine 52's WITHOUT ROWID rebuild, leaving the released
+    /// engine-51 rowid physical shape (autoindex-backed composite PK).
+    async fn revert_to_engine_51(connection: &mut SqliteConnection) {
+        revert_to_engine_53(connection).await;
+        let enforcing: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
+            .fetch_one(&mut *connection)
+            .await
+            .unwrap();
+        sqlx::query("PRAGMA foreign_keys=OFF")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        for statement in [
+            "PRAGMA legacy_alter_table=ON",
+            "ALTER TABLE read_log_touches RENAME TO read_log_touches_v52",
+            r#"CREATE TABLE read_log_touches (
+     call_seq     INTEGER NOT NULL REFERENCES read_log_calls(seq) ON DELETE CASCADE,
+     record_id    TEXT NOT NULL,
+     interaction  TEXT NOT NULL CHECK (interaction IN ('surfaced','opened','mutated')),
+     result_rank  INTEGER,
+     PRIMARY KEY (call_seq, record_id, interaction)
+   )"#,
+            r#"INSERT INTO read_log_touches
+                 (call_seq, record_id, interaction, result_rank)
+               SELECT call_seq, record_id, interaction, result_rank
+                 FROM read_log_touches_v52
+                ORDER BY call_seq, record_id, interaction"#,
+            "DROP TABLE read_log_touches_v52",
+            r#"CREATE INDEX idx_read_log_touches_record ON read_log_touches(record_id, call_seq)"#,
+            "PRAGMA legacy_alter_table=OFF",
+        ] {
+            sqlx::query(statement)
+                .execute(&mut *connection)
+                .await
+                .unwrap();
+        }
+        if enforcing != 0 {
+            sqlx::query("PRAGMA foreign_keys=ON")
+                .execute(&mut *connection)
+                .await
+                .unwrap();
+        }
+    }
+
+    /// Undo engine 51's nullable read-log result annotation, leaving the
+    /// released engine-50 physical shape.  It is intentionally a schema-only
+    /// reversal for test reconstruction: historical annotations are not
+    /// inferred or backfilled by the real forward migration.
+    async fn revert_to_engine_50(connection: &mut SqliteConnection) {
+        revert_to_engine_51(connection).await;
+        let enforcing: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
+            .fetch_one(&mut *connection)
+            .await
+            .unwrap();
+        sqlx::query("PRAGMA foreign_keys=OFF")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        for statement in [
+            "DROP INDEX idx_read_log_calls_overlap_annotation",
+            "PRAGMA legacy_alter_table=ON",
+            "ALTER TABLE read_log_calls RENAME TO read_log_calls_v51",
+            r#"CREATE TABLE read_log_calls (
+     seq          INTEGER PRIMARY KEY AUTOINCREMENT,
+     id           TEXT NOT NULL UNIQUE,
+     tool         TEXT NOT NULL,
+     run_key      TEXT,
+     parent_key   TEXT,
+     intent       TEXT,
+     actor        TEXT,
+     arguments    TEXT,
+     outcome      TEXT NOT NULL CHECK (outcome IN ('ok','error')),
+     error_kind   TEXT,
+     result_count INTEGER,
+     result_bytes INTEGER,
+     started_at   TEXT NOT NULL,
+     ended_at     TEXT NOT NULL
+   )"#,
+            r#"INSERT INTO read_log_calls
+                 (seq,id,tool,run_key,parent_key,intent,actor,arguments,outcome,error_kind,
+                  result_count,result_bytes,started_at,ended_at)
+              SELECT seq,id,tool,run_key,parent_key,intent,actor,arguments,outcome,error_kind,
+                     result_count,result_bytes,started_at,ended_at
+                FROM read_log_calls_v51"#,
+            "DROP TABLE read_log_calls_v51",
+            "CREATE INDEX idx_read_log_calls_run ON read_log_calls(run_key, seq)",
+            "CREATE INDEX idx_read_log_calls_started ON read_log_calls(started_at)",
             "PRAGMA legacy_alter_table=OFF",
         ] {
             sqlx::query(statement)
@@ -3144,7 +3702,7 @@ mod tests {
             .await
             .unwrap();
         let successor = EngineMigrationRegistry::production()
-            .pending(49, CURRENT_ENGINE_SCHEMA_VERSION)
+            .pending(49, 50)
             .unwrap()
             .pop()
             .unwrap();
@@ -3154,6 +3712,14 @@ mod tests {
             .execute(&mut conn)
             .await
             .unwrap();
+        let annotation = EngineMigrationRegistry::production()
+            .pending(50, 51)
+            .unwrap()
+            .pop()
+            .unwrap();
+        annotation.preflight(&mut conn).await.unwrap();
+        annotation.apply(&mut conn).await.unwrap();
+        apply_remaining_production_steps(&mut conn, 51).await;
         conn.close().await.unwrap();
 
         // The first ordinary post-cutover append consumes every legacy head;
@@ -3399,7 +3965,7 @@ mod tests {
             .await
             .unwrap();
         let successor = EngineMigrationRegistry::production()
-            .pending(49, CURRENT_ENGINE_SCHEMA_VERSION)
+            .pending(49, 50)
             .unwrap()
             .pop()
             .unwrap();
@@ -3414,6 +3980,17 @@ mod tests {
             .await
             .unwrap();
         sqlx::query("PRAGMA user_version=50")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        let annotation = EngineMigrationRegistry::production()
+            .pending(50, 51)
+            .unwrap()
+            .pop()
+            .unwrap();
+        annotation.preflight(&mut conn).await.unwrap();
+        annotation.apply(&mut conn).await.unwrap();
+        sqlx::query("PRAGMA user_version=51")
             .execute(&mut conn)
             .await
             .unwrap();
@@ -3479,6 +4056,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(first_frontier, old_heads);
+        apply_remaining_production_steps(&mut conn, 51).await;
         conn.close().await.unwrap();
 
         let db = crate::open_existing_database_at(&path).await.unwrap();
@@ -3555,7 +4133,7 @@ mod tests {
             .await
             .unwrap());
         let successor = EngineMigrationRegistry::production()
-            .pending(49, CURRENT_ENGINE_SCHEMA_VERSION)
+            .pending(49, 50)
             .unwrap()
             .pop()
             .unwrap();
@@ -3572,6 +4150,14 @@ mod tests {
             .execute(&mut conn)
             .await
             .unwrap();
+        let annotation = EngineMigrationRegistry::production()
+            .pending(50, 51)
+            .unwrap()
+            .pop()
+            .unwrap();
+        annotation.preflight(&mut conn).await.unwrap();
+        annotation.apply(&mut conn).await.unwrap();
+        apply_remaining_production_steps(&mut conn, 51).await;
         conn.close().await.unwrap();
 
         let db = crate::open_existing_database_at(&path).await.unwrap();
@@ -3668,6 +4254,64 @@ mod tests {
             )
         );
         assert!(crate::db::validate_engine_shape_on_for_test(&mut conn, 50)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn engine_50_to_51_adds_nullable_read_log_result_annotations() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("read-log-result-annotations.db");
+        create_current_schema(&path).await;
+
+        let options = SqliteConnectOptions::from_str(&format!("sqlite:{}", path.display()))
+            .unwrap()
+            .foreign_keys(true);
+        let mut conn = SqliteConnection::connect_with(&options).await.unwrap();
+        revert_to_engine_50(&mut conn).await;
+        sqlx::query("PRAGMA user_version=50")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        let digest = crate::db::schema_shape_contract_sha256_for_test(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(digest, crate::db::ENGINE_50_SHAPE_CONTRACT_SHA256);
+        sqlx::query(
+            "INSERT INTO read_log_calls (id,tool,outcome,started_at,ended_at) VALUES ('pre-annotation-call','get_record','ok','2026-09-10T00:00:00.000Z','2026-09-10T00:00:00.000Z')",
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+        let step = EngineMigrationRegistry::production()
+            .pending(50, 51)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(step.name(), "engine-50-to-51-read-log-result-annotations");
+        step.preflight(&mut conn).await.unwrap();
+        step.apply(&mut conn).await.unwrap();
+        sqlx::query("PRAGMA user_version=51")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+
+        let retained: Option<String> = sqlx::query_scalar(
+            "SELECT result_annotation FROM read_log_calls WHERE id='pre-annotation-call'",
+        )
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+        assert_eq!(retained, None, "old calls are not inferred or backfilled");
+        let index_sql: String = sqlx::query_scalar(
+            "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_read_log_calls_overlap_annotation'",
+        )
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+        assert!(index_sql.contains("WHERE result_annotation IS NOT NULL"));
+        assert!(crate::db::validate_engine_shape_on_for_test(&mut conn, 51)
             .await
             .unwrap());
     }
@@ -3789,5 +4433,1156 @@ mod tests {
             error.to_string(),
             "content event causal state has no heads for a nonempty log"
         );
+    }
+
+    fn always_fenced() -> FenceFn {
+        Arc::new(|| async { Ok(()) }.boxed())
+    }
+
+    async fn checkpoint_file_bytes(connection: &mut SqliteConnection, path: &Path) -> u64 {
+        let _ = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+            .execute(&mut *connection)
+            .await;
+        std::fs::metadata(path).unwrap().len()
+    }
+
+    /// Presence + length framing so NULL cannot alias `i64::MIN` / empty /
+    /// embedded-NUL strings. Evidence-only: not a product digest.
+    fn digest_opt_text(digest: &mut Sha256, value: Option<&str>) {
+        match value {
+            Some(value) => {
+                digest.update([1]);
+                digest.update((value.len() as u64).to_be_bytes());
+                digest.update(value.as_bytes());
+            }
+            None => digest.update([0]),
+        }
+    }
+
+    fn digest_opt_i64(digest: &mut Sha256, value: Option<i64>) {
+        match value {
+            Some(value) => {
+                digest.update([1]);
+                digest.update(value.to_be_bytes());
+            }
+            None => digest.update([0]),
+        }
+    }
+
+    async fn read_log_logical_digest(connection: &mut SqliteConnection) -> String {
+        let mut digest = Sha256::new();
+        let calls = sqlx::query(
+            "SELECT seq, id, tool, run_key, parent_key, intent, actor, arguments,
+                    outcome, error_kind, result_count, result_bytes, started_at,
+                    ended_at, result_annotation
+               FROM read_log_calls ORDER BY seq",
+        )
+        .fetch_all(&mut *connection)
+        .await
+        .unwrap();
+        for row in calls {
+            let seq: i64 = row.get("seq");
+            digest.update(seq.to_be_bytes());
+            for column in [
+                "id",
+                "tool",
+                "run_key",
+                "parent_key",
+                "intent",
+                "actor",
+                "arguments",
+                "outcome",
+                "error_kind",
+                "started_at",
+                "ended_at",
+                "result_annotation",
+            ] {
+                let value: Option<String> = row.get(column);
+                digest_opt_text(&mut digest, value.as_deref());
+            }
+            digest_opt_i64(&mut digest, row.get("result_count"));
+            digest_opt_i64(&mut digest, row.get("result_bytes"));
+        }
+        digest.update([1]);
+        let normalized: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pragma_table_info('read_log_touches') WHERE name='record_ref'",
+        )
+        .fetch_one(&mut *connection)
+        .await
+        .unwrap();
+        let touch_sql = if normalized != 0 {
+            "SELECT t.call_seq,d.record_id,t.interaction,t.result_rank
+               FROM read_log_touches t JOIN read_log_record_ids d ON d.record_ref=t.record_ref
+              ORDER BY t.call_seq,d.record_id,t.interaction"
+        } else {
+            "SELECT call_seq, record_id, interaction, result_rank
+               FROM read_log_touches
+              ORDER BY call_seq, record_id, interaction"
+        };
+        let touches = sqlx::query(touch_sql)
+            .fetch_all(&mut *connection)
+            .await
+            .unwrap();
+        for row in touches {
+            let call_seq: i64 = row.get("call_seq");
+            let record_id: String = row.get("record_id");
+            let interaction: String = row.get("interaction");
+            digest.update(call_seq.to_be_bytes());
+            digest_opt_text(&mut digest, Some(&record_id));
+            digest_opt_text(&mut digest, Some(&interaction));
+            digest_opt_i64(&mut digest, row.get("result_rank"));
+        }
+        hex::encode(digest.finalize())
+    }
+
+    async fn insert_read_log_rows(connection: &mut SqliteConnection, count: i64) {
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        for i in 1..=count {
+            sqlx::query(
+                "INSERT INTO read_log_calls (seq,id,tool,outcome,started_at,ended_at)
+                 VALUES (?, ?, 'get_record', 'ok', '2026-09-12T00:00:00.000Z', '2026-09-12T00:00:00.000Z')",
+            )
+            .bind(i)
+            .bind(format!("call-{i:04}"))
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+            for (record_id, interaction, rank) in [
+                (
+                    format!("aaaaaaaa-aaaa-4aaa-8aaa-{i:012x}"),
+                    "opened",
+                    Some(i),
+                ),
+                (
+                    format!("aaaaaaaa-aaaa-4aaa-8aaa-{i:012x}"),
+                    "surfaced",
+                    None,
+                ),
+                ("native:root".into(), "opened", None),
+                ("café-record".into(), "mutated", Some(0)),
+            ] {
+                sqlx::query(
+                    "INSERT INTO read_log_touches (call_seq, record_id, interaction, result_rank)
+                     VALUES (?, ?, ?, ?)",
+                )
+                .bind(i)
+                .bind(record_id)
+                .bind(interaction)
+                .bind(rank)
+                .execute(&mut *connection)
+                .await
+                .unwrap();
+            }
+        }
+        sqlx::query("COMMIT")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+    }
+
+    async fn relocate_record_rowid(connection: &mut SqliteConnection, id: &str, rowid: i64) {
+        sqlx::query("CREATE TEMP TABLE rec_move AS SELECT * FROM records WHERE id=?")
+            .bind(id)
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM records WHERE id=?")
+            .bind(id)
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO records (
+                rowid, id, type, kind, name, body, home_id, lifecycle, owner_id,
+                claimed_by_account, claimed_run_key, claimed_at, policy_anchor_id,
+                persistence, maturity, summary, last_activity_at, created_at,
+                updated_at, deleted_at
+             )
+             SELECT ?, id, type, kind, name, body, home_id, lifecycle, owner_id,
+                    claimed_by_account, claimed_run_key, claimed_at, policy_anchor_id,
+                    persistence, maturity, summary, last_activity_at, created_at,
+                    updated_at, deleted_at
+               FROM rec_move",
+        )
+        .bind(rowid)
+        .execute(&mut *connection)
+        .await
+        .unwrap();
+        sqlx::query("DROP TABLE rec_move")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+    }
+
+    async fn fts_rank1_ok(connection: &mut SqliteConnection, table: &str) -> bool {
+        sqlx::query(&format!(
+            "INSERT INTO {table}({table}, rank) VALUES('integrity-check', 1)"
+        ))
+        .execute(&mut *connection)
+        .await
+        .is_ok()
+    }
+
+    async fn match_record_ids(
+        connection: &mut SqliteConnection,
+        sql: &str,
+        query: &str,
+    ) -> Vec<String> {
+        sqlx::query_scalar(sql)
+            .bind(query)
+            .fetch_all(&mut *connection)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn engine_51_to_52_rebuilds_read_log_touches_without_rowid() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("read-log-without-rowid.db");
+        create_current_schema(&path).await;
+        let options = SqliteConnectOptions::from_str(&format!("sqlite:{}", path.display()))
+            .unwrap()
+            .foreign_keys(true);
+        let mut conn = SqliteConnection::connect_with(&options).await.unwrap();
+        revert_to_engine_51(&mut conn).await;
+        sqlx::query("PRAGMA user_version=51")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        let digest = crate::db::schema_shape_contract_sha256_for_test(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(digest, crate::db::ENGINE_51_SHAPE_CONTRACT_SHA256);
+
+        sqlx::query(
+            "INSERT INTO read_log_calls (id,tool,outcome,started_at,ended_at)
+             VALUES ('call-a','get_record','ok','2026-09-12T00:00:00.000Z','2026-09-12T00:00:00.000Z')",
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        let seq: i64 = sqlx::query_scalar("SELECT seq FROM read_log_calls WHERE id='call-a'")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        for (record_id, interaction, rank) in [
+            ("native:root", "opened", None),
+            ("native:root", "surfaced", Some(1_i64)),
+            ("café-record", "mutated", Some(2)),
+            ("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "opened", None),
+        ] {
+            sqlx::query(
+                "INSERT INTO read_log_touches (call_seq, record_id, interaction, result_rank)
+                 VALUES (?, ?, ?, ?)",
+            )
+            .bind(seq)
+            .bind(record_id)
+            .bind(interaction)
+            .bind(rank)
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        }
+        let before = read_log_logical_digest(&mut conn).await;
+
+        let step = EngineMigrationRegistry::production()
+            .pending(51, 52)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(
+            step.name(),
+            "engine-51-to-52-read-log-touches-without-rowid"
+        );
+        assert!(step.requires_foreign_keys_disabled());
+        assert!(!step.requires_pre_apply_compaction());
+        sqlx::query("PRAGMA foreign_keys=OFF")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        step.preflight(&mut conn).await.unwrap();
+        step.apply(&mut conn).await.unwrap();
+        sqlx::query("PRAGMA foreign_keys=ON")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        sqlx::query("PRAGMA user_version=52")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+
+        let sql: String = sqlx::query_scalar(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='read_log_touches'",
+        )
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+        assert!(
+            sql.to_uppercase().contains("WITHOUT ROWID"),
+            "clustered table sql: {sql}"
+        );
+        let autoindex: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master
+              WHERE name = 'sqlite_autoindex_read_log_touches_1'",
+        )
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+        assert_eq!(autoindex, 0);
+        assert_eq!(read_log_logical_digest(&mut conn).await, before);
+        let after = crate::db::schema_shape_contract_sha256_for_test(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(after, crate::db::ENGINE_52_SHAPE_CONTRACT_SHA256);
+        assert!(crate::db::validate_engine_shape_on_for_test(&mut conn, 52)
+            .await
+            .unwrap());
+
+        let dangling = sqlx::query(
+            "INSERT INTO read_log_touches (call_seq, record_id, interaction)
+             VALUES (999999, 'missing', 'opened')",
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap_err();
+        assert!(dangling.to_string().contains("FOREIGN KEY"), "{dangling}");
+        sqlx::query("DELETE FROM read_log_calls WHERE id='call-a'")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        let leftover: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM read_log_touches WHERE call_seq=?")
+                .bind(seq)
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+        assert_eq!(leftover, 0);
+    }
+
+    /// Same-invocation 51→CURRENT: one `migrate_database_with_reservation`
+    /// so the runner sees the original `(from=51, to=CURRENT)` preimage
+    /// reservation and compact immediately after rebuild on that connection.
+    /// Intermediate 52 bytes/freelist live in
+    /// [`engine_51_to_53_split_exposes_rebuild_freelist_then_compacts`].
+    #[tokio::test]
+    async fn engine_51_to_current_runner_preserves_read_log_compacts_and_keeps_fts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("read-log-compact.db");
+        create_current_schema(&path).await;
+        let options = SqliteConnectOptions::from_str(&format!("sqlite:{}", path.display()))
+            .unwrap()
+            .foreign_keys(true);
+        const HIGH_0: &str = "aaaaaaaa-aaaa-4aaa-8aaa-00000000aaa0";
+        const HIGH_1: &str = "aaaaaaaa-aaaa-4aaa-8aaa-00000000aaa1";
+        const HOLE_1: &str = "aaaaaaaa-aaaa-4aaa-8aaa-00000000bbb1";
+        const HOLE_2: &str = "aaaaaaaa-aaaa-4aaa-8aaa-00000000bbb2";
+        const HOLE_3: &str = "aaaaaaaa-aaaa-4aaa-8aaa-00000000bbb3";
+        const AFTER: &str = "aaaaaaaa-aaaa-4aaa-8aaa-00000000ccc0";
+
+        let db = crate::open_existing_database_at(&path).await.unwrap();
+        for (id, name, body) in [
+            (HIGH_0, "zebraprefix high", "padding"),
+            (HIGH_1, "other", "xylophone high"),
+        ] {
+            crate::store::create_record(
+                &db,
+                serde_json::json!({
+                    "id": id,
+                    "type": "Document",
+                    "kind": "note",
+                    "name": name,
+                    "body": body,
+                    "home_id": crate::schema::ROOT_RECORD_ID,
+                }),
+            )
+            .await
+            .unwrap();
+        }
+        crate::store::create_record(
+            &db,
+            serde_json::json!({
+                "id": HOLE_1,
+                "type": "Document",
+                "kind": "note",
+                "name": "zebraprefix low",
+                "body": "padding",
+                "home_id": crate::schema::ROOT_RECORD_ID,
+            }),
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO records (id, type, kind, name, body, home_id, policy_anchor_id)
+             VALUES (?, 'Document', 'note', 'gone', 'xylophone gone', ?, ?)",
+        )
+        .bind(HOLE_2)
+        .bind(crate::schema::ROOT_RECORD_ID)
+        .bind(crate::schema::ROOT_RECORD_ID)
+        .execute(db.write_pool())
+        .await
+        .unwrap();
+        sqlx::query("DELETE FROM records WHERE id=?")
+            .bind(HOLE_2)
+            .execute(db.write_pool())
+            .await
+            .unwrap();
+        crate::store::create_record(
+            &db,
+            serde_json::json!({
+                "id": HOLE_3,
+                "type": "Document",
+                "kind": "note",
+                "name": "keep",
+                "body": "xylophone keep",
+                "home_id": crate::schema::ROOT_RECORD_ID,
+            }),
+        )
+        .await
+        .unwrap();
+        db.close().await;
+
+        let mut conn = SqliteConnection::connect_with(&options).await.unwrap();
+        relocate_record_rowid(&mut conn, HIGH_0, 1_000_000_008).await;
+        relocate_record_rowid(&mut conn, HIGH_1, 1_000_000_009).await;
+        relocate_record_rowid(&mut conn, HOLE_1, 2_000_000_001).await;
+        relocate_record_rowid(&mut conn, HOLE_3, 2_000_000_003).await;
+        let rowids: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT id, rowid FROM records
+              WHERE id IN (?, ?, ?, ?)
+              ORDER BY id",
+        )
+        .bind(HIGH_0)
+        .bind(HIGH_1)
+        .bind(HOLE_1)
+        .bind(HOLE_3)
+        .fetch_all(&mut conn)
+        .await
+        .unwrap();
+        assert_eq!(
+            rowids.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+            [HIGH_0, HIGH_1, HOLE_1, HOLE_3]
+        );
+        assert!(
+            rowids[0].1 > 1_000_000_000 && rowids[1].1 > 1_000_000_000,
+            "high-range FTS docs must land above 1e9: {rowids:?}"
+        );
+        assert!(
+            rowids[2].1 > 1_999_000_000 && rowids[3].1 > 1_999_000_000,
+            "hole-range FTS docs must land above 2e9: {rowids:?}"
+        );
+        assert!(
+            rowids[3].1 > rowids[2].1 + 1,
+            "rec-hole-3 must sit past the deleted FTS hole: {rowids:?}"
+        );
+        revert_to_engine_51(&mut conn).await;
+        sqlx::query("PRAGMA user_version=51")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+
+        insert_read_log_rows(&mut conn, 2_000).await;
+
+        let body_sql = "SELECT r.id FROM records_fts
+             JOIN records r ON r.rowid = records_fts.rowid
+             WHERE records_fts MATCH ?
+             ORDER BY r.id";
+        let name_sql = "SELECT r.id FROM records_name_idx
+             JOIN records r ON r.rowid = records_name_idx.rowid
+             WHERE records_name_idx MATCH ?
+             ORDER BY r.id";
+        let expected_body = match_record_ids(&mut conn, body_sql, "\"xylophone\"").await;
+        let expected_name = match_record_ids(&mut conn, name_sql, "\"zebraprefix\"*").await;
+        assert_eq!(expected_body, vec![HIGH_1.to_string(), HOLE_3.to_string()]);
+        assert_eq!(expected_name, vec![HIGH_0.to_string(), HOLE_1.to_string()]);
+        assert!(fts_rank1_ok(&mut conn, "records_fts").await);
+        assert!(fts_rank1_ok(&mut conn, "records_name_idx").await);
+
+        let logical_before = read_log_logical_digest(&mut conn).await;
+        let size_before = checkpoint_file_bytes(&mut conn, &path).await;
+        conn.close().await.unwrap();
+
+        let offbox = tempfile::tempdir().unwrap();
+        let backup = test_preimage_store(offbox.path(), dir.path());
+        let reserved = Arc::new(Mutex::new(None::<(i64, i64, String)>));
+        let reserve: AttemptReservationFn = Arc::new({
+            let reserved = reserved.clone();
+            move |from, to, preimage: PreimageBackup| {
+                *reserved.lock().unwrap() = Some((from, to, preimage.key.clone()));
+                async { Ok(()) }.boxed()
+            }
+        });
+        let report = migrate_database_with_reservation(
+            &path,
+            "readlog-user",
+            "readlog-run-51-to-current",
+            CURRENT_ENGINE_SCHEMA_VERSION,
+            &EngineMigrationRegistry::production(),
+            &backup,
+            always_fenced(),
+            Some(reserve),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(report.outcome, "migrated", "{report:?}");
+        assert!(report.backup.is_some());
+        {
+            let held = reserved.lock().unwrap();
+            assert_eq!(
+                held.as_ref().map(|(from, to, _)| (*from, *to)),
+                Some((51, CURRENT_ENGINE_SCHEMA_VERSION))
+            );
+        }
+        assert_eq!(header_version(&path), CURRENT_ENGINE_SCHEMA_VERSION);
+
+        let mut at_53 = SqliteConnection::connect_with(&options).await.unwrap();
+        assert_eq!(read_log_logical_digest(&mut at_53).await, logical_before);
+        assert!(crate::db::validate_engine_shape_on_for_test(
+            &mut at_53,
+            CURRENT_ENGINE_SCHEMA_VERSION
+        )
+        .await
+        .unwrap());
+        let current_digest = crate::db::schema_shape_contract_sha256_for_test(&mut at_53)
+            .await
+            .unwrap();
+        assert_eq!(current_digest, crate::db::ENGINE_54_SHAPE_CONTRACT_SHA256);
+        let sql: String = sqlx::query_scalar(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='read_log_touches'",
+        )
+        .fetch_one(&mut at_53)
+        .await
+        .unwrap();
+        assert!(sql.to_uppercase().contains("WITHOUT ROWID"));
+        let size_53 = checkpoint_file_bytes(&mut at_53, &path).await;
+        assert!(
+            size_53 <= size_before,
+            "compacted live file must not exceed pre-rebuild bytes; before={size_before} at-53={size_53}"
+        );
+        assert_eq!(
+            match_record_ids(&mut at_53, body_sql, "\"xylophone\"").await,
+            expected_body
+        );
+        assert_eq!(
+            match_record_ids(&mut at_53, name_sql, "\"zebraprefix\"*").await,
+            expected_name
+        );
+        assert!(fts_rank1_ok(&mut at_53, "records_fts").await);
+        assert!(fts_rank1_ok(&mut at_53, "records_name_idx").await);
+        at_53.close().await.unwrap();
+
+        crate::open_existing_database_at(&path)
+            .await
+            .unwrap()
+            .close()
+            .await;
+
+        let mut after = SqliteConnection::connect_with(&options).await.unwrap();
+        sqlx::query(
+            "INSERT INTO records (id, type, kind, name, body, home_id, policy_anchor_id)
+             VALUES (?, 'Document', 'note', 'zebraprefix after', 'xylophone after', ?, ?)",
+        )
+        .bind(AFTER)
+        .bind(crate::schema::ROOT_RECORD_ID)
+        .bind(crate::schema::ROOT_RECORD_ID)
+        .execute(&mut after)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE records SET body='xylophone updated' WHERE id=?")
+            .bind(HOLE_3)
+            .execute(&mut after)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM records WHERE id=?")
+            .bind(HIGH_1)
+            .execute(&mut after)
+            .await
+            .unwrap();
+        assert_eq!(
+            match_record_ids(&mut after, body_sql, "\"xylophone\"").await,
+            vec![HOLE_3.to_string(), AFTER.to_string()]
+        );
+        assert!(match_record_ids(&mut after, name_sql, "\"zebraprefix\"*")
+            .await
+            .contains(&AFTER.to_string()));
+        assert!(fts_rank1_ok(&mut after, "records_fts").await);
+        assert!(fts_rank1_ok(&mut after, "records_name_idx").await);
+        after.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn engine_51_to_53_split_exposes_rebuild_freelist_then_compacts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("read-log-split.db");
+        create_current_schema(&path).await;
+        let options = SqliteConnectOptions::from_str(&format!("sqlite:{}", path.display()))
+            .unwrap()
+            .foreign_keys(true);
+        let mut conn = SqliteConnection::connect_with(&options).await.unwrap();
+        revert_to_engine_51(&mut conn).await;
+        sqlx::query("PRAGMA user_version=51")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        insert_read_log_rows(&mut conn, 800).await;
+        let logical_before = read_log_logical_digest(&mut conn).await;
+        let size_before = checkpoint_file_bytes(&mut conn, &path).await;
+        let freelist_before: i64 = sqlx::query_scalar("PRAGMA freelist_count")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        conn.close().await.unwrap();
+
+        let offbox = tempfile::tempdir().unwrap();
+        let backup = test_preimage_store(offbox.path(), dir.path());
+        let reserved = Arc::new(Mutex::new(None::<(i64, i64, String)>));
+        let reserve: AttemptReservationFn = Arc::new({
+            let reserved = reserved.clone();
+            move |from, to, preimage: PreimageBackup| {
+                *reserved.lock().unwrap() = Some((from, to, preimage.key.clone()));
+                async { Ok(()) }.boxed()
+            }
+        });
+        let to_52 = migrate_database_with_reservation(
+            &path,
+            "readlog-user",
+            "readlog-run-split-52",
+            52,
+            &EngineMigrationRegistry::production(),
+            &backup,
+            always_fenced(),
+            Some(reserve.clone()),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(to_52.outcome, "migrated", "{to_52:?}");
+        {
+            let held = reserved.lock().unwrap();
+            assert_eq!(
+                held.as_ref().map(|(from, to, _)| (*from, *to)),
+                Some((51, 52))
+            );
+        }
+        assert_eq!(header_version(&path), 52);
+
+        let mut at_52 = SqliteConnection::connect_with(&options).await.unwrap();
+        assert_eq!(read_log_logical_digest(&mut at_52).await, logical_before);
+        let sql: String = sqlx::query_scalar(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='read_log_touches'",
+        )
+        .fetch_one(&mut at_52)
+        .await
+        .unwrap();
+        assert!(sql.to_uppercase().contains("WITHOUT ROWID"));
+        let size_52 = checkpoint_file_bytes(&mut at_52, &path).await;
+        let freelist_52: i64 = sqlx::query_scalar("PRAGMA freelist_count")
+            .fetch_one(&mut at_52)
+            .await
+            .unwrap();
+        assert!(
+            freelist_52 > freelist_before,
+            "rebuild must leave freelist pages; before={freelist_before} at-52={freelist_52}"
+        );
+        at_52.close().await.unwrap();
+
+        let to_53 = migrate_database_with_reservation(
+            &path,
+            "readlog-user",
+            "readlog-run-split-53",
+            53,
+            &EngineMigrationRegistry::production(),
+            &backup,
+            always_fenced(),
+            Some(reserve),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(to_53.outcome, "migrated", "{to_53:?}");
+        {
+            let held = reserved.lock().unwrap();
+            assert_eq!(
+                held.as_ref().map(|(from, to, _)| (*from, *to)),
+                Some((52, 53))
+            );
+        }
+        assert_eq!(header_version(&path), 53);
+
+        let mut at_53 = SqliteConnection::connect_with(&options).await.unwrap();
+        assert_eq!(read_log_logical_digest(&mut at_53).await, logical_before);
+        let size_53 = checkpoint_file_bytes(&mut at_53, &path).await;
+        let freelist_53: i64 = sqlx::query_scalar("PRAGMA freelist_count")
+            .fetch_one(&mut at_53)
+            .await
+            .unwrap();
+        assert!(
+            size_53 <= size_before,
+            "compacted live file must not exceed pre-rebuild bytes; before={size_before} at-52={size_52} at-53={size_53}"
+        );
+        assert!(
+            freelist_53 < freelist_52,
+            "compaction must reclaim freelist; at-52={freelist_52} at-53={freelist_53}"
+        );
+        at_53.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn engine_52_to_53_compact_write_lock_retains_pending_version_and_retries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("compact-lock.db");
+        create_current_schema(&path).await;
+        let options = SqliteConnectOptions::from_str(&format!("sqlite:{}", path.display()))
+            .unwrap()
+            .foreign_keys(true);
+        let mut conn = SqliteConnection::connect_with(&options).await.unwrap();
+        revert_to_engine_53(&mut conn).await;
+        sqlx::query("PRAGMA user_version=52")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        conn.close().await.unwrap();
+
+        let held = Arc::new(Mutex::new(None::<rusqlite::Connection>));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let fence: FenceFn = Arc::new({
+            let held = held.clone();
+            let calls = calls.clone();
+            let path = path.clone();
+            move || {
+                let call = calls.fetch_add(1, Ordering::SeqCst);
+                let held = held.clone();
+                let path = path.clone();
+                async move {
+                    if call == 1 {
+                        let locker = rusqlite::Connection::open(&path).unwrap();
+                        locker
+                            .busy_timeout(std::time::Duration::from_millis(1))
+                            .unwrap();
+                        locker.execute_batch("BEGIN EXCLUSIVE").unwrap();
+                        *held.lock().unwrap() = Some(locker);
+                    }
+                    Ok(())
+                }
+                .boxed()
+            }
+        });
+        let offbox = tempfile::tempdir().unwrap();
+        let backup = test_preimage_store(offbox.path(), dir.path());
+        let failed = migrate_database_with_reservation(
+            &path,
+            "lock-user",
+            "lock-run",
+            53,
+            &EngineMigrationRegistry::production(),
+            &backup,
+            fence,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(failed.outcome, "failed", "{failed:?}");
+        assert_eq!(failed.error_kind.as_deref(), Some("compact"));
+        assert!(failed.backup.is_some());
+        drop(held.lock().unwrap().take());
+        assert_eq!(header_version(&path), 52);
+
+        let retry = migrate_database_with_reservation(
+            &path,
+            "lock-user",
+            "lock-retry",
+            53,
+            &EngineMigrationRegistry::production(),
+            &backup,
+            always_fenced(),
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(retry.outcome, "migrated", "{retry:?}");
+        assert_eq!(header_version(&path), 53);
+    }
+
+    #[tokio::test]
+    async fn engine_52_to_53_post_stamp_fence_loss_rolls_back_and_retries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("compact-fence.db");
+        create_current_schema(&path).await;
+        let options = SqliteConnectOptions::from_str(&format!("sqlite:{}", path.display()))
+            .unwrap()
+            .foreign_keys(true);
+        let mut conn = SqliteConnection::connect_with(&options).await.unwrap();
+        revert_to_engine_53(&mut conn).await;
+        sqlx::query("PRAGMA user_version=52")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        conn.close().await.unwrap();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let fence: FenceFn = Arc::new({
+            let calls = calls.clone();
+            move || {
+                let call = calls.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    // 0 pre-backup, 1 pre-step, 2 post-VACUUM, 3 pre-stamp,
+                    // 4 post-stamp — the autocommit hatch could not roll this
+                    // last one back.
+                    if call == 4 {
+                        Err(Error::engine("lease taken over after stamp"))
+                    } else {
+                        Ok(())
+                    }
+                }
+                .boxed()
+            }
+        });
+        let offbox = tempfile::tempdir().unwrap();
+        let backup = test_preimage_store(offbox.path(), dir.path());
+        let failed = migrate_database_with_reservation(
+            &path,
+            "fence-user",
+            "fence-run",
+            53,
+            &EngineMigrationRegistry::production(),
+            &backup,
+            fence,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(failed.outcome, "failed", "{failed:?}");
+        assert_eq!(failed.error_kind.as_deref(), Some("apply"));
+        assert!(failed.backup.is_some());
+        assert_eq!(header_version(&path), 52);
+
+        let retry = migrate_database_with_reservation(
+            &path,
+            "fence-user",
+            "fence-retry",
+            53,
+            &EngineMigrationRegistry::production(),
+            &backup,
+            always_fenced(),
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(retry.outcome, "migrated", "{retry:?}");
+        assert_eq!(header_version(&path), 53);
+    }
+
+    #[tokio::test]
+    async fn engine_53_to_55_dictionary_preserves_exact_touches_preimage_and_compacts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dictionary.db");
+        create_current_schema(&path).await;
+        let options = SqliteConnectOptions::from_str(&format!("sqlite:{}", path.display()))
+            .unwrap()
+            .foreign_keys(true);
+        let mut conn = SqliteConnection::connect_with(&options).await.unwrap();
+        revert_to_engine_53(&mut conn).await;
+        insert_read_log_rows(&mut conn, 2_000).await;
+        let historical_ids = [
+            "",
+            "not-a-uuid",
+            "quote'identifier",
+            "café/历史",
+            "ABCDEF01-ABCD-ABCD-ABCD-ABCDEF012345",
+            "abcdef01-abcd-abcd-abcd-abcdef012345",
+        ];
+        for id in historical_ids {
+            for (interaction, rank) in [
+                ("surfaced", None),
+                ("opened", Some(0_i64)),
+                ("mutated", Some(-1)),
+            ] {
+                sqlx::query("INSERT INTO read_log_touches(call_seq,record_id,interaction,result_rank) VALUES(1,?,?,?)")
+                    .bind(id).bind(interaction).bind(rank).execute(&mut conn).await.unwrap();
+            }
+        }
+        // AUTOINCREMENT may legitimately be ahead of every retained call.
+        // A dictionary rebuild must preserve the next allocation as well.
+        sqlx::query("UPDATE sqlite_sequence SET seq=42000 WHERE name='read_log_calls'")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        let before = read_log_logical_digest(&mut conn).await;
+        let before_count: i64 = sqlx::query_scalar("SELECT count(*) FROM read_log_touches")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        let before_size = checkpoint_file_bytes(&mut conn, &path).await;
+        assert_eq!(
+            crate::db::schema_shape_contract_sha256_for_test(&mut conn)
+                .await
+                .unwrap(),
+            crate::db::ENGINE_53_SHAPE_CONTRACT_SHA256
+        );
+        conn.close().await.unwrap();
+
+        let offbox = tempfile::tempdir().unwrap();
+        let backup = test_preimage_store(offbox.path(), dir.path());
+        let to_54 = migrate_database_with_reservation(
+            &path,
+            "dictionary-user",
+            "dictionary-54",
+            54,
+            &EngineMigrationRegistry::production(),
+            &backup,
+            always_fenced(),
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(to_54.outcome, "migrated", "{to_54:?}");
+        assert_eq!(header_version(&path), 54);
+        let preimage = offbox.path().join(&to_54.backup.unwrap().key);
+        assert_eq!(header_version(&preimage), 53);
+        let pre_options = SqliteConnectOptions::new()
+            .filename(&preimage)
+            .read_only(true);
+        let mut restored = SqliteConnection::connect_with(&pre_options).await.unwrap();
+        assert_eq!(read_log_logical_digest(&mut restored).await, before);
+        restored.close().await.unwrap();
+
+        let mut at_54 = SqliteConnection::connect_with(&options).await.unwrap();
+        assert_eq!(read_log_logical_digest(&mut at_54).await, before);
+        assert_eq!(
+            crate::db::schema_shape_contract_sha256_for_test(&mut at_54)
+                .await
+                .unwrap(),
+            crate::db::ENGINE_54_SHAPE_CONTRACT_SHA256
+        );
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM read_log_touches")
+            .fetch_one(&mut at_54)
+            .await
+            .unwrap();
+        assert_eq!(count, before_count);
+        for id in historical_ids {
+            let rows: Vec<(String, Option<i64>)> = sqlx::query_as(
+                "SELECT t.interaction,t.result_rank FROM read_log_touches t JOIN read_log_record_ids d USING(record_ref) WHERE t.call_seq=1 AND d.record_id=? ORDER BY t.interaction",
+            ).bind(id).fetch_all(&mut at_54).await.unwrap();
+            assert_eq!(
+                rows,
+                vec![
+                    ("mutated".into(), Some(-1)),
+                    ("opened".into(), Some(0)),
+                    ("surfaced".into(), None)
+                ]
+            );
+        }
+        let missing_dictionary =
+            sqlx::query("INSERT INTO read_log_touches VALUES(1,9223372036854775807,'opened',NULL)")
+                .execute(&mut at_54)
+                .await
+                .unwrap_err();
+        assert!(missing_dictionary.to_string().contains("FOREIGN KEY"));
+        let allocated_54 = checkpoint_file_bytes(&mut at_54, &path).await;
+        let free_54: i64 = sqlx::query_scalar("PRAGMA freelist_count")
+            .fetch_one(&mut at_54)
+            .await
+            .unwrap();
+        assert!(
+            free_54 > 0,
+            "rebuild should leave displaced pages before compaction"
+        );
+        at_54.close().await.unwrap();
+
+        let to_55 = migrate_database_with_reservation(
+            &path,
+            "dictionary-user",
+            "dictionary-55",
+            55,
+            &EngineMigrationRegistry::production(),
+            &backup,
+            always_fenced(),
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(to_55.outcome, "migrated", "{to_55:?}");
+        assert_eq!(header_version(&path), 55);
+        let mut at_55 = SqliteConnection::connect_with(&options).await.unwrap();
+        assert_eq!(read_log_logical_digest(&mut at_55).await, before);
+        assert!(crate::db::validate_engine_shape_on_for_test(&mut at_55, 55)
+            .await
+            .unwrap());
+        let size_55 = checkpoint_file_bytes(&mut at_55, &path).await;
+        assert!(
+            size_55 < allocated_54 && size_55 < before_size,
+            "before={before_size}, rebuilt={allocated_54}, compacted={size_55}"
+        );
+        let free_55: i64 = sqlx::query_scalar("PRAGMA freelist_count")
+            .fetch_one(&mut at_55)
+            .await
+            .unwrap();
+        assert_eq!(free_55, 0);
+        let integrity: String = sqlx::query_scalar("PRAGMA integrity_check")
+            .fetch_one(&mut at_55)
+            .await
+            .unwrap();
+        assert_eq!(integrity, "ok");
+        let next_call = sqlx::query("INSERT INTO read_log_calls(id,tool,outcome,started_at,ended_at) VALUES('after-dictionary','test','ok','2026-09-12','2026-09-12')")
+            .execute(&mut at_55).await.unwrap().last_insert_rowid();
+        assert_eq!(next_call, 42001);
+
+        sqlx::query("DELETE FROM read_log_calls WHERE seq=1")
+            .execute(&mut at_55)
+            .await
+            .unwrap();
+        let remaining: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM read_log_touches WHERE call_seq=1")
+                .fetch_one(&mut at_55)
+                .await
+                .unwrap();
+        assert_eq!(remaining, 0);
+        // History is independent of current records; interning is not record ownership.
+        let retained: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM read_log_record_ids WHERE record_id='not-a-uuid'",
+        )
+        .fetch_one(&mut at_55)
+        .await
+        .unwrap();
+        assert_eq!(retained, 1);
+        at_55.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dictionary_and_compaction_post_stamp_fence_loss_roll_back_and_retry() {
+        for from in [53, 54] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("dictionary-fence.db");
+            create_current_schema(&path).await;
+            let options = SqliteConnectOptions::from_str(&format!("sqlite:{}", path.display()))
+                .unwrap()
+                .foreign_keys(true);
+            let mut conn = SqliteConnection::connect_with(&options).await.unwrap();
+            revert_to_engine_53(&mut conn).await;
+            insert_read_log_rows(&mut conn, 40).await;
+            let before = read_log_logical_digest(&mut conn).await;
+            conn.close().await.unwrap();
+            let offbox = tempfile::tempdir().unwrap();
+            let backup = test_preimage_store(offbox.path(), dir.path());
+            if from == 54 {
+                let preparation = migrate_database_with_reservation(
+                    &path,
+                    "fence-user",
+                    "prepare-54",
+                    54,
+                    &EngineMigrationRegistry::production(),
+                    &backup,
+                    always_fenced(),
+                    None,
+                    None,
+                    None,
+                )
+                .await;
+                assert_eq!(preparation.outcome, "migrated", "{preparation:?}");
+            }
+            let calls = Arc::new(AtomicUsize::new(0));
+            let fence: FenceFn = Arc::new(move || {
+                let call = calls.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    // Compaction adds one fence after its autocommit VACUUM.
+                    if call == if from == 53 { 3 } else { 4 } {
+                        Err(Error::engine(
+                            "lease lost after dictionary/compaction stamp",
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                }
+                .boxed()
+            });
+            let failed = migrate_database_with_reservation(
+                &path,
+                "fence-user",
+                "fail-after-stamp",
+                from + 1,
+                &EngineMigrationRegistry::production(),
+                &backup,
+                fence,
+                None,
+                None,
+                None,
+            )
+            .await;
+            assert_eq!(failed.outcome, "failed", "{failed:?}");
+            assert_eq!(failed.error_kind.as_deref(), Some("apply"));
+            assert!(failed.backup.is_some());
+            assert_eq!(header_version(&path), from);
+            let mut rolled_back = SqliteConnection::connect_with(&options).await.unwrap();
+            assert_eq!(read_log_logical_digest(&mut rolled_back).await, before);
+            let dictionary_present: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM sqlite_schema WHERE type='table' AND name='read_log_record_ids'",
+            ).fetch_one(&mut rolled_back).await.unwrap();
+            assert_eq!(dictionary_present, i64::from(from == 54));
+            rolled_back.close().await.unwrap();
+            let retry = migrate_database_with_reservation(
+                &path,
+                "fence-user",
+                "retry-after-stamp",
+                55,
+                &EngineMigrationRegistry::production(),
+                &backup,
+                always_fenced(),
+                None,
+                None,
+                None,
+            )
+            .await;
+            assert_eq!(retry.outcome, "migrated", "{retry:?}");
+            assert_eq!(header_version(&path), 55);
+            let mut retried = SqliteConnection::connect_with(&options).await.unwrap();
+            assert_eq!(read_log_logical_digest(&mut retried).await, before);
+            retried.close().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn current_engine_migration_is_a_no_op_without_vacuum() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("current.db");
+        create_current_schema(&path).await;
+        let options = SqliteConnectOptions::from_str(&format!("sqlite:{}", path.display()))
+            .unwrap()
+            .foreign_keys(true);
+        let mut conn = SqliteConnection::connect_with(&options).await.unwrap();
+        let size_before = checkpoint_file_bytes(&mut conn, &path).await;
+        let mtime_before = std::fs::metadata(&path).unwrap().modified().unwrap();
+        conn.close().await.unwrap();
+
+        let offbox = tempfile::tempdir().unwrap();
+        let backup = test_preimage_store(offbox.path(), dir.path());
+        let report = migrate_database_with_reservation(
+            &path,
+            "current-user",
+            "current-run",
+            CURRENT_ENGINE_SCHEMA_VERSION,
+            &EngineMigrationRegistry::production(),
+            &backup,
+            always_fenced(),
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(report.outcome, "current", "{report:?}");
+        assert!(report.backup.is_none());
+        assert_eq!(header_version(&path), CURRENT_ENGINE_SCHEMA_VERSION);
+        let size_after = std::fs::metadata(&path).unwrap().len();
+        let mtime_after = std::fs::metadata(&path).unwrap().modified().unwrap();
+        assert_eq!(size_after, size_before);
+        assert_eq!(mtime_after, mtime_before);
     }
 }

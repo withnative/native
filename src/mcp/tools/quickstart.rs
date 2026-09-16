@@ -215,6 +215,9 @@ mod tests {
             .await
             .unwrap();
 
+        // Capture runs on the handle's background queue; drain before reading
+        // the row back.
+        db.drain_captures().await;
         let captured: (Option<String>, Option<String>, Option<String>) = sqlx::query_as(
             "SELECT run_key,parent_key,intent FROM read_log_calls WHERE tool='quickstart'",
         )

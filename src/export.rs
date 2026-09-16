@@ -273,6 +273,7 @@ pub async fn validate_hosted_adoption_portability(conn: &mut SqliteConnection) -
 pub(crate) const STANDBY_DISPOSABLE_TABLES: &[&str] = &[
     "read_log_calls",
     "read_log_touches",
+    "read_log_record_ids",
     "jobs",
     "agent_runs",
     "relationship_federation_quarantine",

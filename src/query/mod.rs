@@ -44,6 +44,9 @@ pub mod principal;
 pub mod read;
 pub mod sql;
 pub mod sql_contract;
+pub(crate) mod stage_timing;
+#[cfg(test)]
+pub(crate) mod test_sqlite;
 pub mod tree;
 #[cfg(feature = "turso-local")]
 pub(crate) mod turso_sql;

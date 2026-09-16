@@ -1494,7 +1494,7 @@ where
     F: Future<Output = Result<T>>,
 {
     let _lease = db.portability_policy_gate().read().await;
-    let policy = load_policy_from_pool(db.write_pool()).await?;
+    let policy = load_policy_from_pool(db.pool()).await?;
     admit_request_operation(policy.as_ref(), &active_target(), operation, capability)?;
     PORTABILITY_OPERATION
         .scope(
@@ -1507,6 +1507,37 @@ where
         .await
 }
 
+/// Admit one response-independent capture without the duplicate
+/// pre-transaction policy read. Holds the policy read lease and establishes
+/// the operation context, then relies on `enforce_write_boundary` inside the
+/// capture's `BEGIN IMMEDIATE` for fresh authoritative enforcement.
+///
+/// Unlike [`with_operation`], nothing is loaded or decided up front: the
+/// background delay between response and capture must not reuse a stale
+/// request-time policy, so the boundary check after BEGIN is the single
+/// enforcement point — a strict policy installed after the response still
+/// rejects the delayed capture. Never skip that check; this helper only
+/// scopes the context it reads.
+pub(crate) async fn with_capture_operation<F, T>(
+    db: &crate::Db,
+    operation: &str,
+    capability: Option<&str>,
+    future: F,
+) -> Result<T>
+where
+    F: Future<Output = Result<T>>,
+{
+    let _lease = db.portability_policy_gate().read().await;
+    PORTABILITY_OPERATION
+        .scope(
+            OperationContext {
+                operation: operation.into(),
+                capability: capability.map(str::to_string),
+            },
+            future,
+        )
+        .await
+}
 /// Authoritative boundary called after `BEGIN IMMEDIATE` and before the first
 /// mutation. An unclassified direct writer fails closed only when strict mode
 /// is actually enabled; legacy/default databases retain their old behavior.
@@ -1798,6 +1829,40 @@ mod tests {
             error.to_string(),
             "strict_portability_blocked: operation=unclassified-write; capability=unclassified; target=policy; reason=unclassified_write"
         );
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn admission_reads_current_policy_without_a_writer_pool_slot() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        with_operation(&db, "search", Some("native.search.lexical.v1"), async {
+            Ok(())
+        })
+        .await
+        .unwrap();
+        update_portability_policy(
+            &db,
+            strict_update(0, vec![target("postgres-server", "network")], vec![]),
+        )
+        .await
+        .unwrap();
+        let mut held = Vec::new();
+        for _ in 0..5 {
+            held.push(db.write_pool().acquire().await.unwrap());
+        }
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            with_operation(&db, "search", Some("native.search.lexical.v1"), async {
+                Ok(())
+            }),
+        )
+        .await
+        .expect("policy admission must not wait for a writer-pool slot");
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("strict_portability_blocked"));
+        drop(held);
         db.close().await;
     }
 

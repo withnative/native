@@ -234,21 +234,57 @@ fn schema_to_ts(schema: &Value, context: &str) -> Result<String> {
             .collect::<Result<Vec<_>>>()
             .map(|values| values.join(" | "));
     }
-    for keyword in ["oneOf", "anyOf"] {
-        if let Some(branches) = object.get(keyword) {
-            let branches = branches
-                .as_array()
-                .ok_or_else(|| Error::engine(format!("{keyword} is not an array at {context}")))?;
-            return branches
-                .iter()
-                .enumerate()
-                .map(|(index, branch)| {
-                    schema_to_ts(branch, &format!("{context}.{keyword}[{index}]"))
-                        .map(|value| format!("({value})"))
-                })
-                .collect::<Result<Vec<_>>>()
-                .map(|values| values.join(" | "));
+    if let Some(branches) = object.get("oneOf") {
+        let branches = branches
+            .as_array()
+            .ok_or_else(|| Error::engine(format!("oneOf is not an array at {context}")))?;
+        let exclusive_names = exclusive_required_names(branches);
+        let union = branches
+            .iter()
+            .enumerate()
+            .map(|(index, branch)| {
+                let mut value = schema_to_ts(branch, &format!("{context}.oneOf[{index}]"))?;
+                if let Some(names) = &exclusive_names {
+                    let forbidden = names
+                        .iter()
+                        .enumerate()
+                        .filter(|(other, _)| *other != index)
+                        .map(|(_, name)| format!("{}?: never", quoted(name)))
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    value = format!("{value} & {{ {forbidden} }}");
+                }
+                Ok(format!("({value})"))
+            })
+            .collect::<Result<Vec<_>>>()?
+            .join(" | ");
+        let carries_base_object = exclusive_names.is_some()
+            && (object.contains_key("properties")
+                || object.contains_key("required")
+                || object.contains_key("additionalProperties"));
+        if carries_base_object {
+            let mut base = object.clone();
+            base.remove("oneOf");
+            return Ok(format!(
+                "({}) & ({union})",
+                schema_to_ts(&Value::Object(base), context)?
+            ));
         }
+        return Ok(union);
+    }
+    if let Some(branches) = object.get("anyOf") {
+        let branches = branches
+            .as_array()
+            .ok_or_else(|| Error::engine(format!("anyOf is not an array at {context}")))?;
+        return branches
+            .iter()
+            .enumerate()
+            .map(|(index, branch)| {
+                schema_to_ts(branch, &format!("{context}.anyOf[{index}]"))
+                    .map(|value| format!("({value})"))
+            })
+            .collect::<Result<Vec<_>>>()
+            .map(|values| values.join(" | "));
     }
     if let Some(branches) = object.get("allOf") {
         let branches = branches
@@ -275,7 +311,8 @@ fn schema_to_ts(schema: &Value, context: &str) -> Result<String> {
         Some(kind) => type_name(kind, object, context),
         None if object.contains_key("properties")
             || object.contains_key("required")
-            || object.contains_key("additionalProperties") =>
+            || object.contains_key("additionalProperties")
+            || object.contains_key("not") =>
         {
             object_type(object, context)
         }
@@ -293,6 +330,30 @@ fn schema_to_ts(schema: &Value, context: &str) -> Result<String> {
             "schema has no representable type at {context}: {schema}"
         ))),
     }
+}
+
+/// A `oneOf` made solely from distinct singleton `required` branches is the
+/// compact JSON Schema spelling of exactly one property. Preserve that
+/// exclusivity in TypeScript, whose structural unions otherwise admit objects
+/// carrying two branches' fields.
+fn exclusive_required_names(branches: &[Value]) -> Option<Vec<String>> {
+    let mut names = Vec::with_capacity(branches.len());
+    for branch in branches {
+        let object = branch.as_object()?;
+        if object.len() != 1 {
+            return None;
+        }
+        let required = object.get("required")?.as_array()?;
+        if required.len() != 1 {
+            return None;
+        }
+        let name = required[0].as_str()?.to_string();
+        if names.contains(&name) {
+            return None;
+        }
+        names.push(name);
+    }
+    (names.len() >= 2).then_some(names)
 }
 
 fn type_name(
@@ -493,6 +554,46 @@ mod tests {
         assert!(rendered.contains("\"action\": \"list\""));
         assert!(rendered.contains("\"action\": \"set_role\""));
         assert!(rendered.contains("\"action\": \"remove\""));
+    }
+
+    #[test]
+    fn standalone_not_required_schema_renders_an_excluded_property() {
+        assert_eq!(
+            schema_to_ts(
+                &serde_json::json!({"not":{"required":["record_id"]}}),
+                "selector exclusion"
+            )
+            .unwrap(),
+            "{  } & ({ \"record_id\"?: never })"
+        );
+    }
+
+    #[test]
+    fn singleton_required_one_of_keeps_base_fields_and_excludes_siblings() {
+        let rendered = schema_to_ts(
+            &serde_json::json!({
+                "type":"object",
+                "properties":{
+                    "id":{"type":"string"},
+                    "record_id":{"type":"string"},
+                    "ids":{"type":"array","items":{"type":"string"}},
+                    "limit":{"type":"integer"}
+                },
+                "required":["limit"],
+                "oneOf":[
+                    {"required":["id"]},
+                    {"required":["record_id"]},
+                    {"required":["ids"]}
+                ]
+            }),
+            "record selector",
+        )
+        .unwrap();
+
+        assert!(rendered.contains("\"limit\": number"), "{rendered}");
+        assert!(rendered.contains("\"id\": unknown"), "{rendered}");
+        assert!(rendered.contains("\"record_id\"?: never"), "{rendered}");
+        assert!(rendered.contains("\"ids\"?: never"), "{rendered}");
     }
 
     #[test]

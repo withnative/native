@@ -17,7 +17,7 @@
 //!     database whose schema lost a constraint (or predates it) still fails on
 //!     the bad rows themselves.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use futures::future::BoxFuture;
 use sqlx::{Row, SqliteConnection};
@@ -210,6 +210,47 @@ pub async fn check_event_log_shape(db: &Db) -> Result<CheckResult> {
     })
 }
 
+/// Detect cycles in the raw frontier graph in O(V+E), without recursion.
+/// Parents absent locally are sinks; duplicate edges do not affect the result.
+fn frontier_has_cycle(edges: &[(String, String)]) -> bool {
+    // Kahn sink-peeling over child→parent edges: repeatedly remove nodes
+    // with no remaining parents. Anything left held a directed cycle.
+    let mut children: HashMap<&str, Vec<&str>> = HashMap::new();
+    let mut outstanding_parents: HashMap<&str, usize> = HashMap::new();
+    let mut seen: HashSet<(&str, &str)> = HashSet::new();
+    for (event_id, parent_id) in edges {
+        let (event_id, parent_id) = (event_id.as_str(), parent_id.as_str());
+        if !seen.insert((event_id, parent_id)) {
+            continue;
+        }
+        children.entry(parent_id).or_default().push(event_id);
+        *outstanding_parents.entry(event_id).or_insert(0) += 1;
+        outstanding_parents.entry(parent_id).or_insert(0);
+    }
+    let mut queue: VecDeque<&str> = outstanding_parents
+        .iter()
+        .filter(|(_, parents)| **parents == 0)
+        .map(|(node, _)| *node)
+        .collect();
+    // Every node is queued at most once (degrees only decrease), so each
+    // node and each deduplicated edge is processed at most once: O(V+E).
+    let mut remaining = outstanding_parents.len();
+    while let Some(node) = queue.pop_front() {
+        remaining -= 1;
+        if let Some(dependents) = children.get(node) {
+            for child in dependents {
+                if let Some(parents) = outstanding_parents.get_mut(child) {
+                    *parents -= 1;
+                    if *parents == 0 {
+                        queue.push_back(child);
+                    }
+                }
+            }
+        }
+    }
+    remaining != 0
+}
+
 /// Stored causal facts remain coherent with the database-local cutover and
 /// retained import provenance. Parent ids may be absent locally, but the
 /// locally present portion of the graph must be acyclic.
@@ -287,22 +328,13 @@ pub async fn check_content_event_causality(db: &Db) -> Result<CheckResult> {
         }
     }
 
-    let has_cycle: bool = sqlx::query_scalar(
-        "WITH RECURSIVE reach(start_event_id,event_id) AS (
-             SELECT event_id,parent_event_id FROM content_event_causal_frontier
-             UNION
-             SELECT reach.start_event_id,frontier.parent_event_id
-               FROM reach
-               JOIN content_event_causal_frontier frontier
-                 ON frontier.event_id=reach.event_id
-         )
-         SELECT EXISTS(
-             SELECT 1 FROM reach WHERE start_event_id=event_id
-         )",
-    )
-    .fetch_one(db.write_pool())
-    .await?;
-    if has_cycle {
+    // The frontier edge relation is read once; cycle detection runs as an
+    // iterative O(V+E) walk in Rust rather than an all-pairs SQL closure.
+    let frontier_edges: Vec<(String, String)> =
+        sqlx::query_as("SELECT event_id,parent_event_id FROM content_event_causal_frontier")
+            .fetch_all(db.write_pool())
+            .await?;
+    if frontier_has_cycle(&frontier_edges) {
         violations.push("locally present causal frontier graph contains a cycle".into());
     }
 
@@ -1045,5 +1077,229 @@ mod causal_conformance_tests {
             .iter()
             .any(|violation| violation
                 .contains("post-cutover locally authored event is not complete")));
+    }
+
+    fn edges(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(event_id, parent_id)| (event_id.to_string(), parent_id.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn frontier_cycle_predicate_adversarial_graphs() {
+        // (edges, expected); parent ids absent from content_events are sinks.
+        let cases: &[(&[(&str, &str)], bool)] = &[
+            (&[], false),
+            (&[("e0", "absent-parent")], false),
+            (&[("e0", "e0")], true),
+            (&[("e0", "e1"), ("e1", "e0")], true),
+            (&[("e0", "e1"), ("e1", "e2"), ("e2", "e0")], true),
+            // Diamond: shared ancestry, no cycle.
+            (
+                &[("e0", "e1"), ("e0", "e2"), ("e1", "e3"), ("e2", "e3")],
+                false,
+            ),
+            // Disconnected components, one cyclic.
+            (
+                &[("a0", "a1"), ("a1", "a2"), ("b0", "b1"), ("b1", "b0")],
+                true,
+            ),
+            // Duplicate edges do not change the answer either way.
+            (
+                &[("e0", "e1"), ("e0", "e1"), ("e1", "e2"), ("e1", "e2")],
+                false,
+            ),
+            (&[("e0", "e1"), ("e0", "e1"), ("e1", "e0")], true),
+            // Multi-parent DAG converging on one sink.
+            (
+                &[("e0", "root"), ("e1", "root"), ("e2", "e0"), ("e2", "e1")],
+                false,
+            ),
+        ];
+        for (pairs, expected) in cases {
+            assert_eq!(
+                frontier_has_cycle(&edges(pairs)),
+                *expected,
+                "graph {pairs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn frontier_cycle_predicate_long_chain_without_recursion() {
+        // Depth chosen so any recursive walk would overflow the stack;
+        // correctness here (not timing) exercises the iterative worklist.
+        // No wall-clock assertions: speed is not the contract.
+        const DEPTH: usize = 100_000;
+        let chain: Vec<(String, String)> = (0..DEPTH)
+            .map(|index| (format!("e{index}"), format!("e{}", index + 1)))
+            .collect();
+        assert!(!frontier_has_cycle(&chain));
+        let mut late_cycle = chain;
+        late_cycle.push((format!("e{DEPTH}"), "e0".to_string()));
+        assert!(frontier_has_cycle(&late_cycle));
+    }
+
+    /// Brute-force oracle: a cycle exists iff some node reaches itself in
+    /// one or more steps. O(V*E); only for small generated graphs.
+    fn brute_force_has_cycle(edges: &[(String, String)]) -> bool {
+        use std::collections::{HashMap, HashSet};
+        let mut adjacency: HashMap<&str, Vec<&str>> = HashMap::new();
+        for (event_id, parent_id) in edges {
+            adjacency
+                .entry(event_id.as_str())
+                .or_default()
+                .push(parent_id.as_str());
+        }
+        for start in adjacency.keys() {
+            let mut visited = HashSet::from([*start]);
+            let mut stack: Vec<&str> = adjacency.get(start).cloned().unwrap_or_default();
+            while let Some(node) = stack.pop() {
+                if node == *start {
+                    return true;
+                }
+                if visited.insert(node) {
+                    if let Some(next) = adjacency.get(node) {
+                        stack.extend(next.iter().copied());
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn frontier_cycle_predicate_matches_brute_force_on_generated_graphs() {
+        // Deterministic xorshift; std-only, no new dependencies.
+        let mut state: u64 = 0x9E3779B97F4A7C15;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for round in 0..200 {
+            let nodes = 1 + (next() % 8) as usize;
+            let edge_count = (next() % 16) as usize;
+            let graph: Vec<(String, String)> = (0..edge_count)
+                .map(|_| {
+                    (
+                        format!("g{}", next() % (nodes as u64)),
+                        format!("g{}", next() % (nodes as u64)),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                frontier_has_cycle(&graph),
+                brute_force_has_cycle(&graph),
+                "round {round}: {graph:?}"
+            );
+        }
+    }
+
+    /// The exact historical all-pairs SQL predicate, kept as the test
+    /// oracle for the replacement (never used in production paths).
+    const HISTORICAL_CYCLE_SQL: &str = "WITH RECURSIVE reach(start_event_id,event_id) AS (
+             SELECT event_id,parent_event_id FROM content_event_causal_frontier
+             UNION
+             SELECT reach.start_event_id,frontier.parent_event_id
+               FROM reach
+               JOIN content_event_causal_frontier frontier
+                 ON frontier.event_id=reach.event_id
+         )
+         SELECT EXISTS(
+             SELECT 1 FROM reach WHERE start_event_id=event_id
+         )";
+
+    async fn historical_has_cycle(db: &Db) -> bool {
+        sqlx::query_scalar(HISTORICAL_CYCLE_SQL)
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap()
+    }
+
+    async fn replacement_has_cycle(db: &Db) -> bool {
+        let frontier_edges: Vec<(String, String)> =
+            sqlx::query_as("SELECT event_id,parent_event_id FROM content_event_causal_frontier")
+                .fetch_all(db.write_pool())
+                .await
+                .unwrap();
+        frontier_has_cycle(&frontier_edges)
+    }
+
+    async fn seed_events(db: &Db, count: usize) -> Vec<String> {
+        let mut ids = Vec::with_capacity(count);
+        for index in 0..count {
+            let id = format!("cycle-probe-{index:04}");
+            sqlx::query(
+                "INSERT INTO content_events(id,record_id,type,causal_envelope_version,causal_status)
+                 VALUES (?,?,?,1,'complete')",
+            )
+            .bind(&id)
+            .bind(format!("record-{index:04}"))
+            .bind("probe.v1")
+            .execute(db.write_pool())
+            .await
+            .unwrap();
+            ids.push(id);
+        }
+        ids
+    }
+
+    async fn assert_predicates_agree(db: &Db, pairs: &[(&str, &str)]) {
+        sqlx::query("DELETE FROM content_event_causal_frontier")
+            .execute(db.write_pool())
+            .await
+            .unwrap();
+        for (event_id, parent_id) in pairs {
+            sqlx::query(
+                "INSERT INTO content_event_causal_frontier(event_id,parent_event_id)
+                 VALUES (?,?)",
+            )
+            .bind(event_id)
+            .bind(parent_id)
+            .execute(db.write_pool())
+            .await
+            .unwrap();
+        }
+        assert_eq!(
+            replacement_has_cycle(db).await,
+            historical_has_cycle(db).await,
+            "edge set {pairs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn frontier_cycle_replacement_matches_historical_sql() {
+        let db = crate::db::create_database(":memory:").await.unwrap();
+        let ids = seed_events(&db, 8).await;
+        let id = |index: usize| ids[index].as_str();
+        // Chain with an absent (sink) parent.
+        assert_predicates_agree(
+            &db,
+            &[(id(0), id(1)), (id(1), id(2)), (id(2), "absent-parent")],
+        )
+        .await;
+        // Diamond, acyclic.
+        assert_predicates_agree(
+            &db,
+            &[
+                (id(0), id(1)),
+                (id(0), id(2)),
+                (id(1), id(3)),
+                (id(2), id(3)),
+            ],
+        )
+        .await;
+        // Two-cycle.
+        assert_predicates_agree(&db, &[(id(4), id(5)), (id(5), id(4))]).await;
+        // Disconnected acyclic component beside a self-contained cycle.
+        // Duplicate pairs are forbidden by the table PK and covered above.
+        assert_predicates_agree(&db, &[(id(0), id(1)), (id(6), id(7)), (id(7), id(6))]).await;
+        // Empty relation.
+        assert_predicates_agree(&db, &[]).await;
+        // Self-loops cannot be inserted (schema CHECK event_id <>
+        // parent_event_id); covered at the unit level above.
     }
 }

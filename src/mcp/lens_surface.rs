@@ -326,6 +326,16 @@ fn overlay_top_level_property(schema: &mut Map<String, Value>, name: &str, prope
         };
         for branch in branches {
             if let Some(branch) = branch.as_object_mut() {
+                // Pure negation and required clauses only constrain which
+                // fields are present; neither closes the object. The
+                // enclosing object already validates the routing property;
+                // repeating it here adds no constraint and inflates composed
+                // contracts such as update_record's body-operation exclusions.
+                if branch.len() == 1
+                    && (branch.contains_key("not") || branch.contains_key("required"))
+                {
+                    continue;
+                }
                 overlay_top_level_property(branch, name, property);
             }
         }
@@ -415,4 +425,60 @@ fn materialize_descriptor(tool: &LensToolSpec) -> Value {
             "additionalProperties": false
         }
     })
+}
+
+#[cfg(test)]
+mod overlay_tests {
+    use super::*;
+
+    #[test]
+    fn routing_overlay_preserves_selector_clauses_without_repeating_routing_schema() {
+        let selectors = json!([{"required": ["id"]}, {"required": ["record_id"]}]);
+        let mut schema = json!({
+            "type": "object",
+            "properties": {"id": {"type": "string"}, "record_id": {"type": "string"}},
+            "additionalProperties": false,
+            "oneOf": selectors.clone()
+        });
+        overlay_top_level_property(
+            schema.as_object_mut().unwrap(),
+            "destination_db_id",
+            &destination_schema(),
+        );
+        assert_eq!(schema["oneOf"], selectors);
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        for field in ["id", "record_id"] {
+            let mut arguments = json!({"destination_db_id": "db"});
+            arguments[field] = json!("record");
+            assert!(validator.is_valid(&arguments));
+            arguments["destination_db_id"] = json!(42);
+            assert!(!validator.is_valid(&arguments));
+        }
+        assert!(!validator.is_valid(&json!({"destination_db_id": "db"})));
+        assert!(
+            !validator.is_valid(&json!({"id": "a", "record_id": "b", "destination_db_id": "db"}))
+        );
+    }
+
+    #[test]
+    fn routing_overlay_preserves_exclusions_without_repeating_routing_schema() {
+        let exclusion = json!({"not": {"required": ["body_set", "body_append"]}});
+        let mut schema = json!({"allOf": [
+            {"type": "object", "properties": {
+                "body_set": {"type": "string"}, "body_append": {"type": "string"}
+            }, "additionalProperties": false},
+            exclusion.clone()
+        ]});
+        overlay_top_level_property(
+            schema.as_object_mut().unwrap(),
+            "destination_db_id",
+            &destination_schema(),
+        );
+        assert_eq!(schema["allOf"][1], exclusion);
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        assert!(validator.is_valid(&json!({"body_append":"text", "destination_db_id":"db"})));
+        assert!(!validator
+            .is_valid(&json!({"body_set":"x", "body_append":"y", "destination_db_id":"db"})));
+        assert!(!validator.is_valid(&json!({"body_append":"text", "destination_db_id":42})));
+    }
 }

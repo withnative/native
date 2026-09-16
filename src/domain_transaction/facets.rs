@@ -1549,6 +1549,39 @@ pub(crate) async fn active_vocabulary_value<E: DomainStatementExecutor>(
     boolean(&rows[0], "active", "facet vocabulary")
 }
 
+/// Active values of one governing vocabulary, oldest-first, capped at
+/// `limit_plus_one` rows so callers can tell "small, list inline" from
+/// "large, point at the listing call" without reading the whole set.
+async fn active_vocabulary_value_names<E: DomainStatementExecutor>(
+    executor: &mut E,
+    vocabulary_id: &str,
+    limit_plus_one: i64,
+) -> Result<Vec<String>> {
+    let statement = statement(
+        "list active facet vocabulary values",
+        "vocabulary_values",
+        &[
+            "SELECT value FROM {{relation}} WHERE vocabulary_id = ",
+            " AND status = 'active' ORDER BY ordinal, value, id LIMIT ",
+            "",
+        ],
+    )?;
+    let rows = fetch(
+        executor,
+        "list active facet vocabulary values",
+        &statement,
+        &[
+            BindValue::Text(vocabulary_id.into()),
+            BindValue::Integer(limit_plus_one),
+        ],
+        &[ColumnSpec::required("value", LogicalType::Text)],
+    )
+    .await?;
+    rows.iter()
+        .map(|row| text(row, "value", "facet vocabulary value"))
+        .collect()
+}
+
 fn predicate_issue(code: &'static str, message: String) -> FacetPredicateIssue {
     FacetPredicateIssue { code, message }
 }
@@ -1720,10 +1753,49 @@ pub(crate) async fn assess_facet_write<E: DomainStatementExecutor>(
                 )
                 .await?;
                 if resolution.status.as_deref() != Some("active") {
+                    let limit = crate::schema::GOVERNANCE_INLINE_ALTERNATIVES_LIMIT as i64;
+                    let mut names =
+                        active_vocabulary_value_names(executor, &identity.id, limit + 1).await?;
+                    // SQLite/Turso order text bytewise; Postgres follows the
+                    // database locale. Sort here so the message is identical
+                    // on every backend.
+                    names.sort();
+                    // Name the resolved vocabulary, not the raw caller
+                    // designator: `manage_vocabularies.list_values` matches
+                    // exact id or name, so a `rec:`-prefixed spelling would
+                    // advertise an unusable call.
+                    let detail = if names.len() as i64 <= limit && !names.is_empty() {
+                        format!(
+                            "active values of '{}': {}",
+                            identity.name,
+                            names.join(", ")
+                        )
+                    } else {
+                        let list_arguments = serde_json::json!({
+                            "vocabulary": identity.name,
+                            "status": "active",
+                        });
+                        let mut preview =
+                            serde_json::Map::from_iter([(String::from("type"), Value::String(record_type.into()))]);
+                        if let Some(kind) = kind {
+                            preview.insert(String::from("kind"), Value::String(kind.into()));
+                        }
+                        preview.insert(
+                            String::from("facets"),
+                            Value::Object(serde_json::Map::from_iter([(
+                                facet.key.clone(),
+                                facet.value.clone(),
+                            )])),
+                        );
+                        format!(
+                            "list the active values with schema_read manage_vocabularies.list_values arguments {list_arguments} or schema_read preview_record_shape arguments {}",
+                            Value::Object(preview),
+                        )
+                    };
                     issues.push(predicate_issue(
                         "not_active_vocabulary_member",
                         format!(
-                            "{tool}: facet '{}' value {} is not an active member of governing vocabulary '{governing}'",
+                            "{tool}: facet '{}' value {} is not an active member of governing vocabulary '{governing}'; {detail}",
                             facet.key, facet.value
                         ),
                     ));

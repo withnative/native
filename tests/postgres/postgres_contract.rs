@@ -166,8 +166,6 @@ async fn postgres_describe_schema_is_normalized_allowlisted_and_owner_gated() {
         .unwrap();
     assert_eq!(archived["type"], "BOOLEAN");
     assert_eq!(archived["physical_type"], "boolean");
-    assert!(owner["resolved_schema_config"]["shapes"].is_object());
-    assert!(owner["kind_registry"]["Document"].is_array());
     let encoded = serde_json::to_string(&owner).unwrap();
     assert!(!encoded.contains(database.schema()));
     assert!(!encoded.contains("pg_catalog"));
@@ -177,7 +175,6 @@ async fn postgres_describe_schema_is_normalized_allowlisted_and_owner_gated() {
         .await
         .unwrap();
     assert_eq!(repeated["tables"], owner["tables"]);
-    assert_eq!(repeated["kind_registry"], owner["kind_registry"]);
     assert_eq!(
         repeated["engine"]["ddl_fingerprint"],
         owner["engine"]["ddl_fingerprint"]
@@ -193,6 +190,28 @@ async fn postgres_describe_schema_is_normalized_allowlisted_and_owner_gated() {
         .await
         .unwrap();
     scenarios::assert_describe_schema_shared_contract(&owner, &member);
+    // The governed record-shape half of the same fixture now lives in
+    // preview_record_shape, the tool that owns effective write shape.
+    let shape_arguments = json!({"type":"Document","kind":scenarios::DESCRIBE_SCHEMA_KIND_TOKEN});
+    let owner_shape = harness
+        .call(
+            &database,
+            TestCaller::Local,
+            "preview_record_shape",
+            shape_arguments.clone(),
+        )
+        .await
+        .unwrap();
+    let member_shape = harness
+        .call(
+            &database,
+            TestCaller::member("acct:schema-reader"),
+            "preview_record_shape",
+            shape_arguments,
+        )
+        .await
+        .unwrap();
+    scenarios::assert_record_shape_shared_contract(&owner_shape, &member_shape);
     assert!(member["tables"]
         .as_array()
         .unwrap()
@@ -3474,13 +3493,13 @@ async fn postgres_same_id_concurrent_create_has_one_gapless_durable_winner() {
         &database,
         TestCaller::Local,
         "create_record",
-        json!({"id":"9c150000-0000-4000-8000-002000000010","type":"Document","kind":"note","body":"left","reason":"Race the same identifier."}),
+        json!({"id":"9c150000-0000-4000-8000-002000000010","type":"Document","kind":"note","body":"left","reason":"Race the same identifier.","response_mode":"verbose"}),
     );
     let right = harness.call(
         &database,
         TestCaller::Local,
         "create_record",
-        json!({"id":"9c150000-0000-4000-8000-002000000010","type":"Document","kind":"note","body":"right","reason":"Race the same identifier."}),
+        json!({"id":"9c150000-0000-4000-8000-002000000010","type":"Document","kind":"note","body":"right","reason":"Race the same identifier.","response_mode":"verbose"}),
     );
     let (left, right) = tokio::join!(left, right);
     let (winner, loser) = match (left, right) {

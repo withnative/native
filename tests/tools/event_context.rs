@@ -121,7 +121,7 @@ fn in_run(run_key: &str, mut args: Value) -> Value {
 }
 
 async fn call(registry: &ToolRegistry, db: &Db, tool: &str, args: Value) -> Value {
-    registry
+    let result = registry
         .call(
             db.clone(),
             agent(),
@@ -129,7 +129,9 @@ async fn call(registry: &ToolRegistry, db: &Db, tool: &str, args: Value) -> Valu
             crate::common::with_test_reason(tool, args),
         )
         .await
-        .unwrap_or_else(|error| panic!("{tool} failed: {error}"))
+        .unwrap_or_else(|error| panic!("{tool} failed: {error}"));
+    db.drain_captures_for_tests().await;
+    result
 }
 
 async fn note(registry: &ToolRegistry, db: &Db, run: &str, id: &str, body: &str) -> Value {

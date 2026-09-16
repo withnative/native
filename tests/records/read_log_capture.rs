@@ -31,10 +31,14 @@ fn registry() -> ToolRegistry {
 }
 
 async fn call(registry: &ToolRegistry, db: &Db, tool: &str, arguments: Value) -> Value {
-    registry
+    let result = registry
         .call(db.clone(), Caller::local(), tool, arguments)
         .await
-        .unwrap()
+        .unwrap();
+    // Captures run on the handle's background queue; the file's assertions
+    // read them back, so drain each sequential call before returning.
+    db.drain_captures_for_tests().await;
+    result
 }
 
 async fn create(registry: &ToolRegistry, db: &Db, id: &str, name: &str, parent: Option<&str>) {
@@ -53,6 +57,39 @@ async fn create(registry: &ToolRegistry, db: &Db, id: &str, name: &str, parent: 
             .insert("home_id".into(), json!(parent));
     }
     call(registry, db, "create_record", arguments).await;
+}
+
+/// Read touches through the per-database dictionary so assertions stay in
+/// terms of the exact logical TEXT ids, never the internal integer refs.
+async fn touches_for_tool(
+    db: &Db,
+    tool: &str,
+    order_by: &str,
+) -> Vec<(String, String, Option<i64>)> {
+    let sql = format!(
+        "SELECT dictionary.record_id AS record_id,
+                touch.interaction AS interaction,
+                touch.result_rank AS result_rank
+           FROM read_log_touches touch
+           JOIN read_log_record_ids dictionary ON dictionary.record_ref = touch.record_ref
+           JOIN read_log_calls call ON call.seq = touch.call_seq
+          WHERE call.tool = ?
+          ORDER BY {order_by}"
+    );
+    sqlx::query(&sql)
+        .bind(tool)
+        .fetch_all(db.pool())
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| {
+            (
+                row.get::<String, _>("record_id"),
+                row.get::<String, _>("interaction"),
+                row.get::<Option<i64>, _>("result_rank"),
+            )
+        })
+        .collect()
 }
 
 #[test]
@@ -113,6 +150,23 @@ fn every_local_registration_uses_the_exhaustive_tool_kind_path() {
         .expect("both named production profiles fit their exact byte budgets");
 }
 
+#[test]
+fn focused_profile_routes_record_work_to_the_shape_preview() {
+    let registry = registry();
+    let focused: HashSet<String> = registry
+        .specs_for_profile(ExposureProfile::Focused)
+        .map(|spec| spec.name.clone())
+        .collect();
+    assert!(
+        focused.contains("preview_record_shape"),
+        "focused must advertise the record-shape preview"
+    );
+    assert!(
+        !focused.contains("describe_schema"),
+        "focused must not advertise the physical table listing"
+    );
+}
+
 #[tokio::test]
 async fn success_error_and_zero_result_calls_are_raw_rows() {
     let db = create_database(":memory:").await.unwrap();
@@ -157,21 +211,18 @@ async fn success_error_and_zero_result_calls_are_raw_rows() {
         "the call interval must be ordered"
     );
 
-    let touch = sqlx::query(
-        "SELECT t.record_id, t.interaction, t.result_rank
-           FROM read_log_touches t
-           JOIN read_log_calls c ON c.seq = t.call_seq
-          WHERE c.tool = 'create_record'",
-    )
-    .fetch_one(db.pool())
-    .await
-    .unwrap();
     assert_eq!(
-        touch.get::<String, _>("record_id"),
-        "4ead1096-0000-4000-8000-000000000002"
+        touches_for_tool(&db, "create_record", "touch.result_rank")
+            .await
+            .into_iter()
+            .filter(|(_, interaction, _)| interaction == "mutated")
+            .collect::<Vec<_>>(),
+        vec![(
+            "4ead1096-0000-4000-8000-000000000002".to_string(),
+            "mutated".to_string(),
+            None,
+        )]
     );
-    assert_eq!(touch.get::<String, _>("interaction"), "mutated");
-    assert_eq!(touch.get::<Option<i64>, _>("result_rank"), None);
 
     let error_arguments = json!({
         "id": "4ead1096-0000-4000-8000-000000000003",
@@ -188,6 +239,8 @@ async fn success_error_and_zero_result_calls_are_raw_rows() {
         .await
         .unwrap_err();
     assert!(error.to_string().contains("missing field `reason`"));
+    // Error outcomes capture too, on the background queue.
+    db.drain_captures_for_tests().await;
     let error_row = sqlx::query(
         "SELECT arguments, outcome, error_kind, result_count, result_bytes
            FROM read_log_calls WHERE tool = 'update_record'",
@@ -334,6 +387,9 @@ async fn reach_read_log_never_persists_queries_or_unrecognized_arguments() {
         .await
         .is_err());
 
+    // Both the valid and the rejected reach calls capture (the latter with
+    // an error outcome); drain the direct dispatches above before reading.
+    db.drain_captures_for_tests().await;
     let rows = sqlx::query(
         "SELECT tool, arguments, outcome FROM read_log_calls
           WHERE tool IN ('reach_read', 'reach_connect') ORDER BY seq",
@@ -424,26 +480,12 @@ async fn extraction_distinguishes_opened_surfaced_and_mutated_with_rank() {
         json!({ "ids": ["4ead1096-0000-4000-8000-000000000001"], "run_key": RUN_KEY }),
     )
     .await;
-    let touches = sqlx::query(
-        "SELECT t.record_id, t.interaction, t.result_rank
-           FROM read_log_touches t
-           JOIN read_log_calls c ON c.seq = t.call_seq
-          WHERE c.tool = 'get_record'
-          ORDER BY CASE t.interaction WHEN 'opened' THEN 0 ELSE 1 END, t.result_rank",
+    let actual = touches_for_tool(
+        &db,
+        "get_record",
+        "CASE touch.interaction WHEN 'opened' THEN 0 ELSE 1 END, touch.result_rank",
     )
-    .fetch_all(db.pool())
-    .await
-    .unwrap();
-    let actual = touches
-        .iter()
-        .map(|row| {
-            (
-                row.get::<String, _>("record_id"),
-                row.get::<String, _>("interaction"),
-                row.get::<Option<i64>, _>("result_rank"),
-            )
-        })
-        .collect::<Vec<_>>();
+    .await;
     assert_eq!(
         actual,
         vec![
@@ -481,30 +523,18 @@ async fn extraction_distinguishes_opened_surfaced_and_mutated_with_rank() {
                 "target_id": "4ead1096-0000-4000-8000-000000000004",
                 "relationship": "relates_to",
             }],
+            "response_mode": "verbose",
             "reason": REASON,
             "run_key": RUN_KEY,
         }),
     )
     .await;
-    let created_touches = sqlx::query(
-        "SELECT t.record_id, t.interaction, t.result_rank
-           FROM read_log_touches t
-           JOIN read_log_calls c ON c.seq = t.call_seq
-          WHERE c.tool = 'create_record'
-          ORDER BY CASE t.interaction WHEN 'mutated' THEN 0 ELSE 1 END, t.result_rank",
+    let created_touches = touches_for_tool(
+        &db,
+        "create_record",
+        "CASE touch.interaction WHEN 'mutated' THEN 0 ELSE 1 END, touch.result_rank",
     )
-    .fetch_all(db.pool())
-    .await
-    .unwrap()
-    .iter()
-    .map(|row| {
-        (
-            row.get::<String, _>("record_id"),
-            row.get::<String, _>("interaction"),
-            row.get::<Option<i64>, _>("result_rank"),
-        )
-    })
-    .collect::<Vec<_>>();
+    .await;
     assert_eq!(
         created_touches,
         vec![
@@ -524,30 +554,18 @@ async fn extraction_distinguishes_opened_surfaced_and_mutated_with_rank() {
         json!({
             "id": "4ead1096-0000-4000-8000-000000000001",
             "summary": "changed",
+            "response_mode": "verbose",
             "reason": REASON,
             "run_key": RUN_KEY,
         }),
     )
     .await;
-    let update_touches = sqlx::query(
-        "SELECT t.record_id, t.interaction, t.result_rank
-           FROM read_log_touches t
-           JOIN read_log_calls c ON c.seq = t.call_seq
-          WHERE c.tool = 'update_record'
-          ORDER BY CASE t.interaction WHEN 'mutated' THEN 0 ELSE 1 END, t.result_rank",
+    let update_touches = touches_for_tool(
+        &db,
+        "update_record",
+        "CASE touch.interaction WHEN 'mutated' THEN 0 ELSE 1 END, touch.result_rank",
     )
-    .fetch_all(db.pool())
-    .await
-    .unwrap()
-    .iter()
-    .map(|row| {
-        (
-            row.get::<String, _>("record_id"),
-            row.get::<String, _>("interaction"),
-            row.get::<Option<i64>, _>("result_rank"),
-        )
-    })
-    .collect::<Vec<_>>();
+    .await;
     assert_eq!(
         update_touches,
         vec![

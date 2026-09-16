@@ -6,21 +6,23 @@
 //! wildcard.  Adding another shipped tool therefore requires deciding what its
 //! result means before the crate compiles.
 //!
-//! Capture is deliberately fail-open.  Extraction is pure and defensive, and
-//! every database error from the call/touch insert is discarded by the caller.
+//! Capture is deliberately fail-open.  Extraction is pure and defensive; a
+//! failed or dropped capture write is counted on the handle's background
+//! stats and reported to stderr, never raised to the caller.
 //! The handler result is never changed by this module.
 
 use std::collections::HashSet;
-#[cfg(test)]
+use std::panic::AssertUnwindSafe;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use chrono::{SecondsFormat, Utc};
 use std::collections::BTreeMap;
 
+use futures::FutureExt as _;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-#[cfg(test)]
-use tokio::sync::Notify;
+use tokio::sync::{mpsc, Notify};
 
 use crate::db::Db;
 use crate::error::{Error, Result};
@@ -612,6 +614,7 @@ impl ToolKind {
                 "list_destinations",
                 "list_inbox",
                 "list_notification_candidates",
+                "get_attention",
             ]),
             Self::ManageInterventions => Actions(&["get", "query"]),
             Self::ManageRendererBinding
@@ -685,9 +688,9 @@ impl ToolKind {
             ToolKind::CloseRun => ToolExposure::new(Coordination, false, Atomicity),
             ToolKind::GetStructure => ToolExposure::new(Records, true, BoundedContextOrCalls),
             ToolKind::GetDashboard => ToolExposure::new(Records, false, BoundedContextOrCalls),
-            ToolKind::DescribeSchema => ToolExposure::new(Schema, true, CorrectnessUnderIgnorance),
+            ToolKind::DescribeSchema => ToolExposure::new(Schema, false, CorrectnessUnderIgnorance),
             ToolKind::PreviewRecordShape => {
-                ToolExposure::new(Schema, false, CorrectnessUnderIgnorance)
+                ToolExposure::new(Schema, true, CorrectnessUnderIgnorance)
             }
             ToolKind::CreateRecord => ToolExposure::new(Records, true, Atomicity),
             ToolKind::CreateMany => ToolExposure::new(Records, false, Atomicity),
@@ -1895,7 +1898,7 @@ fn captured_arguments(extractor: Extractor, original: &Value) -> Value {
     }
 }
 
-struct PendingCapture {
+pub(crate) struct PendingCapture {
     db: Db,
     tool_name: String,
     interaction_capability: Option<String>,
@@ -1907,12 +1910,93 @@ struct PendingCapture {
     outcome_name: &'static str,
     error: Option<&'static str>,
     extraction: Extraction,
+    result_annotation: Option<String>,
     result_bytes: Option<i64>,
     started_at: String,
     ended_at: String,
     _deployment_persistence_lease: Option<super::DeploymentPersistenceLease>,
     #[cfg(test)]
     gate: Option<Arc<CaptureTestGate>>,
+    /// Test-only park point before the policy read lease and `BEGIN
+    /// IMMEDIATE`. Distinct from `gate` (which parks inside the write
+    /// transaction): a capture parked here holds no lease and no write lock,
+    /// so a strict policy update can install while it waits.
+    #[cfg(test)]
+    pre_gate: Option<Arc<CaptureTestGate>>,
+}
+
+const WORK_OVERLAP_EMISSION_KIND: &str = "work_overlap_emission";
+const WORK_OVERLAP_EMISSION_VERSION: u8 = 1;
+
+/// Produce the bounded, privacy-safe evidence for a notice that the result
+/// actually disclosed.  This deliberately reads only record ids and counts
+/// from the already-shaped response: holder account/intent/run/timestamp
+/// fields never cross the read-log boundary.
+fn work_overlap_result_annotation(kind: ToolKind, result: &Value) -> Option<String> {
+    let (surface, anchors) = match kind {
+        ToolKind::StartWork if string_at(result, "action") == Some("claim") => {
+            let overlap = result.get("work_overlap")?;
+            let anchor = overlap_annotation_anchor(string_at(result, "record_id")?, overlap)?;
+            ("claim", vec![anchor])
+        }
+        ToolKind::CreateRecord => {
+            // `work_overlap` is attached only after a fresh receipt is
+            // produced.  A replay has no key, so it cannot acquire a second
+            // emission simply by being captured as another call.
+            let overlap = result.get("work_overlap")?;
+            let anchor = overlap_annotation_anchor(string_at(result, "id")?, overlap)?;
+            ("create", vec![anchor])
+        }
+        ToolKind::SetIntent => {
+            let windows = result
+                .pointer("/briefing/overlapping_claims/items")?
+                .as_array()?;
+            let anchors = windows
+                .iter()
+                .map(|window| {
+                    overlap_annotation_anchor(
+                        string_at(window, "record_id")?,
+                        window.get("overlap")?,
+                    )
+                })
+                .collect::<Option<Vec<_>>>()?;
+            if anchors.is_empty() {
+                return None;
+            }
+            ("set_intent", anchors)
+        }
+        _ => return None,
+    };
+    serde_json::to_string(&serde_json::json!({
+        "kind": WORK_OVERLAP_EMISSION_KIND,
+        "version": WORK_OVERLAP_EMISSION_VERSION,
+        "surface": surface,
+        "anchors": anchors,
+    }))
+    .ok()
+}
+
+fn overlap_annotation_anchor(record_id: &str, overlap: &Value) -> Option<Value> {
+    let items = overlap.get("items")?.as_array()?;
+    let overlap_record_ids = items
+        .iter()
+        .map(|item| string_at(item, "record_id").map(str::to_owned))
+        .collect::<Option<Vec<_>>>()?;
+    let overlap_total_count = overlap.get("total_count")?.as_u64()?;
+    let truncated = overlap.get("truncated")?.as_bool()?;
+    if overlap_record_ids.is_empty()
+        || overlap_total_count < overlap_record_ids.len() as u64
+        || truncated != (overlap_total_count > overlap_record_ids.len() as u64)
+    {
+        return None;
+    }
+    Some(serde_json::json!({
+        "record_id": record_id,
+        "overlap_record_ids": overlap_record_ids,
+        "overlap_item_count": overlap_record_ids.len(),
+        "overlap_total_count": overlap_total_count,
+        "truncated": truncated,
+    }))
 }
 
 #[cfg(test)]
@@ -1951,13 +2035,398 @@ where
     CAPTURE_TEST_GATE.scope(gate, future).await
 }
 
-/// Prepare and start best-effort capture in an owned task. Dropping the
-/// transport request drops only its [`tokio::task::JoinHandle`], not the
-/// capture task or an in-progress SQLite transaction. Normal calls await the
-/// handle, preserving the historical ordering where capture finishes before
-/// the tool result is returned.
+#[cfg(test)]
+tokio::task_local! {
+    static CAPTURE_PRE_POLICY_GATE: Arc<CaptureTestGate>;
+}
+
+/// Test-only scope for the pre-admission park point: the capture waits before
+/// taking the policy read lease or beginning its write, holding neither.
+/// Never mixed with [`with_capture_test_gate`] on the same request; the two
+/// park points are distinct by construction.
+#[cfg(test)]
+pub(crate) async fn with_capture_pre_policy_gate<F>(
+    gate: Arc<CaptureTestGate>,
+    future: F,
+) -> F::Output
+where
+    F: std::future::Future,
+{
+    CAPTURE_PRE_POLICY_GATE.scope(gate, future).await
+}
+
+/// Depth of the per-handle capture queue. Bounded so a stalled writer cannot
+/// grow memory without limit: beyond this many queued captures new work is
+/// refused and counted, never awaited by the response path.
+pub(crate) const CAPTURE_QUEUE_DEPTH: usize = 512;
+
+/// Total time `Db::close` waits for queued captures before closing the pools.
+/// Each capture also carries its own [`CAPTURE_BUDGET`]; this caps the
+/// shutdown path when the queue is deep.
+pub(crate) const CAPTURE_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Monotonic counters for one handle's capture queue. Queue counters are
+/// queue-only: once settled `enqueued == completed` and `failed <= completed`.
+/// Declarations bypass the queue entirely and use the separate
+/// `declarations_*` counters, so a declaration completing after shutdown can
+/// never satisfy the queue shutdown frontier.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct CaptureStats {
+    pub enqueued: u64,
+    pub completed: u64,
+    pub failed: u64,
+    pub dropped_full: u64,
+    pub dropped_shutdown: u64,
+    pub declarations_completed: u64,
+    pub declarations_failed: u64,
+}
+
+/// Completion accounting shared with the worker. Deliberately separate from
+/// [`CaptureQueue`] (and holding no sender): the worker must not own the
+/// queue, or the channel could never close and every handle would leak.
+struct CaptureWorkerState {
+    completed: AtomicU64,
+    failed: AtomicU64,
+    settled: Notify,
+}
+
+/// Bounded FIFO capture queue owned by one open handle (clones share it). A
+/// single worker executes captures in enqueue order, so at most one capture
+/// holds a write-pool slot at a time and global insertion order is preserved.
+/// Failures and drops are counted and reported to stderr with a stable
+/// prefix; they never fail the call that produced them.
+pub(crate) struct CaptureQueue {
+    sender: mpsc::Sender<PendingCapture>,
+    shutdown: AtomicBool,
+    /// Serializes admission, the send, and accepted accounting against
+    /// `initiate_shutdown`, so the shutdown frontier provably includes every
+    /// accepted capture. Held only across synchronous channel operations,
+    /// never across an await.
+    admission: std::sync::Mutex<()>,
+    depth: usize,
+    enqueued: AtomicU64,
+    dropped_full: AtomicU64,
+    dropped_shutdown: AtomicU64,
+    declarations_completed: AtomicU64,
+    declarations_failed: AtomicU64,
+    worker: Arc<CaptureWorkerState>,
+}
+
+impl std::fmt::Debug for CaptureQueue {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CaptureQueue")
+            .field("stats", &self.stats())
+            .field("shutdown", &self.shutdown.load(Ordering::Relaxed))
+            .finish()
+    }
+}
+
+impl CaptureQueue {
+    pub(crate) fn spawn() -> Arc<Self> {
+        Self::with_depth(CAPTURE_QUEUE_DEPTH)
+    }
+
+    fn with_depth(depth: usize) -> Arc<Self> {
+        let depth = depth.max(1);
+        let (sender, receiver) = mpsc::channel(depth);
+        let queue = Arc::new(Self {
+            sender,
+            shutdown: AtomicBool::new(false),
+            admission: std::sync::Mutex::new(()),
+            depth,
+            enqueued: AtomicU64::new(0),
+            dropped_full: AtomicU64::new(0),
+            dropped_shutdown: AtomicU64::new(0),
+            declarations_completed: AtomicU64::new(0),
+            declarations_failed: AtomicU64::new(0),
+            worker: Arc::new(CaptureWorkerState {
+                completed: AtomicU64::new(0),
+                failed: AtomicU64::new(0),
+                settled: Notify::new(),
+            }),
+        });
+        tokio::spawn({
+            let worker = Arc::clone(&queue.worker);
+            async move { drive_captures(receiver, worker).await }
+        });
+        queue
+    }
+
+    /// Enqueue one prepared capture without blocking. Admission, the send,
+    /// and accepted accounting happen under one short mutex, so a capture
+    /// accepted before shutdown is always inside the shutdown frontier and a
+    /// capture refused by shutdown never is. Returns false (counted and
+    /// stderr-reported) when shut down or full.
+    pub(crate) fn enqueue(&self, capture: PendingCapture) -> bool {
+        let _admission = self
+            .admission
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.shutdown.load(Ordering::Acquire) {
+            self.dropped_shutdown.fetch_add(1, Ordering::Relaxed);
+            eprintln!(
+                "interaction_capture dropped_shutdown tool={}",
+                capture.tool_name
+            );
+            return false;
+        }
+        self.enqueued.fetch_add(1, Ordering::Relaxed);
+        match self.sender.try_send(capture) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(capture)) => {
+                self.enqueued.fetch_sub(1, Ordering::Relaxed);
+                self.dropped_full.fetch_add(1, Ordering::Relaxed);
+                self.worker.settled.notify_waiters();
+                let depth = self.depth;
+                eprintln!(
+                    "interaction_capture dropped_full tool={} depth={depth}",
+                    capture.tool_name
+                );
+                false
+            }
+            Err(mpsc::error::TrySendError::Closed(capture)) => {
+                self.enqueued.fetch_sub(1, Ordering::Relaxed);
+                self.dropped_shutdown.fetch_add(1, Ordering::Relaxed);
+                self.worker.settled.notify_waiters();
+                eprintln!(
+                    "interaction_capture dropped_shutdown tool={} reason=worker_gone",
+                    capture.tool_name
+                );
+                false
+            }
+        }
+    }
+
+    pub(crate) fn stats(&self) -> CaptureStats {
+        CaptureStats {
+            enqueued: self.enqueued.load(Ordering::Relaxed),
+            completed: self.worker.completed.load(Ordering::Relaxed),
+            failed: self.worker.failed.load(Ordering::Relaxed),
+            dropped_full: self.dropped_full.load(Ordering::Relaxed),
+            dropped_shutdown: self.dropped_shutdown.load(Ordering::Relaxed),
+            declarations_completed: self.declarations_completed.load(Ordering::Relaxed),
+            declarations_failed: self.declarations_failed.load(Ordering::Relaxed),
+        }
+    }
+
+    fn settled_now(&self) -> bool {
+        let stats = self.stats();
+        stats.completed >= stats.enqueued
+    }
+
+    /// Wait until every accepted capture has completed. Returns immediately
+    /// when settled. Unbounded on its own; `close` applies the shutdown cap.
+    pub(crate) async fn drain(&self) {
+        loop {
+            let notified = self.worker.settled.notified();
+            if self.settled_now() {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// Drain after shutdown against a stable frontier: `initiate_shutdown`
+    /// ran first under the same admission mutex, so `enqueued` can no longer
+    /// move and every accepted capture is inside this snapshot. The worker
+    /// runs each one exactly once (panics included), so the frontier is
+    /// always reachable and the wait always terminates.
+    pub(crate) async fn drain_after_shutdown(&self) {
+        let frontier = {
+            let _admission = self
+                .admission
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            self.enqueued.load(Ordering::Relaxed)
+        };
+        loop {
+            let notified = self.worker.settled.notified();
+            if self.worker.completed.load(Ordering::Relaxed) >= frontier {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    pub(crate) async fn drain_capped(&self) {
+        if tokio::time::timeout(CAPTURE_DRAIN_TIMEOUT, self.drain_after_shutdown())
+            .await
+            .is_err()
+        {
+            let stats = self.stats();
+            eprintln!(
+                "interaction_capture drain_timeout pending={} enqueued={} completed={} failed={} dropped_full={} dropped_shutdown={}",
+                stats.enqueued.saturating_sub(stats.completed),
+                stats.enqueued,
+                stats.completed,
+                stats.failed,
+                stats.dropped_full,
+                stats.dropped_shutdown
+            );
+        }
+    }
+
+    pub(crate) fn initiate_shutdown(&self) {
+        let _admission = self
+            .admission
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.shutdown.store(true, Ordering::Release);
+    }
+
+    /// Run one semantic declaration to durability in an owned task and await
+    /// it. The declaration bypasses the lossy queue (which can refuse work
+    /// when full or shut down), but like the queue path it never executes on
+    /// the cancellable transport task: dropping the awaiting request drops
+    /// only this `JoinHandle`, and the declaration still lands. Accounting is
+    /// deliberately separate from the queue frontier: declarations increment
+    /// only `declarations_*`, so a declaration completing after shutdown can
+    /// never satisfy `drain_after_shutdown`'s queue-only frontier early.
+    pub(crate) async fn record_declaration(self: &Arc<Self>, capture: PendingCapture) {
+        let task = tokio::spawn({
+            let this = Arc::clone(self);
+            async move { execute_declaration(capture, this).await }
+        });
+        if task.await.is_err() {
+            // `execute_declaration` guards its own panics, so this is the
+            // spawn machinery itself failing. Count it on the declaration
+            // ledger, never on the queue frontier.
+            self.declarations_failed.fetch_add(1, Ordering::Relaxed);
+            self.declarations_completed.fetch_add(1, Ordering::Relaxed);
+            eprintln!("interaction_capture declaration task failed");
+        }
+    }
+}
+
+async fn drive_captures(
+    mut receiver: mpsc::Receiver<PendingCapture>,
+    worker: Arc<CaptureWorkerState>,
+) {
+    while let Some(capture) = receiver.recv().await {
+        execute_capture(capture, Arc::clone(&worker)).await;
+    }
+}
+
+/// Execute one queued capture with panic guard and queue-only completion
+/// accounting. A panicking capture is counted and reported and never takes
+/// the worker down with it; every accepted queued capture completes exactly
+/// once, which is what the shutdown frontier waits on.
+async fn execute_capture(capture: PendingCapture, worker: Arc<CaptureWorkerState>) {
+    #[cfg(test)]
+    let completed_gate = capture.gate.clone();
+    // `FutureExt` runs the future to completion inside the `catch_unwind`
+    // boundary, so an async panic is caught here rather than unwinding the
+    // worker.
+    let outcome = AssertUnwindSafe(perform_capture(capture))
+        .catch_unwind()
+        .await;
+    match outcome {
+        Ok(Ok(())) => {}
+        Ok(Err(message)) => {
+            worker.failed.fetch_add(1, Ordering::Relaxed);
+            eprintln!("{message}");
+        }
+        Err(_) => {
+            worker.failed.fetch_add(1, Ordering::Relaxed);
+            eprintln!("interaction_capture panicked");
+        }
+    }
+    worker.completed.fetch_add(1, Ordering::Relaxed);
+    worker.settled.notify_waiters();
+    #[cfg(test)]
+    if let Some(gate) = completed_gate {
+        gate.completed.notify_one();
+    }
+}
+
+/// Execute one semantic declaration with panic guard and declaration-only
+/// accounting. Never touches the queue's `completed`/`failed`, so the queue
+/// shutdown frontier stays queue-only.
+async fn execute_declaration(capture: PendingCapture, queue: Arc<CaptureQueue>) {
+    #[cfg(test)]
+    let completed_gate = capture.gate.clone();
+    let outcome = AssertUnwindSafe(perform_capture(capture))
+        .catch_unwind()
+        .await;
+    match outcome {
+        Ok(Ok(())) => {}
+        Ok(Err(message)) => {
+            queue.declarations_failed.fetch_add(1, Ordering::Relaxed);
+            eprintln!("{message}");
+        }
+        Err(_) => {
+            queue.declarations_failed.fetch_add(1, Ordering::Relaxed);
+            eprintln!("interaction_capture panicked");
+        }
+    }
+    queue.declarations_completed.fetch_add(1, Ordering::Relaxed);
+    #[cfg(test)]
+    if let Some(gate) = completed_gate {
+        gate.completed.notify_one();
+    }
+}
+
+/// Run one capture write under its budget, returning the stderr-ready outcome.
+/// Shared by the queue worker and the declaration path; accounting stays with
+/// the caller so the two lifecycles never mix.
+async fn perform_capture(capture: PendingCapture) -> std::result::Result<(), String> {
+    #[cfg(test)]
+    if let Some(pre_gate) = &capture.pre_gate {
+        pre_gate.entered.notify_one();
+        pre_gate.release.notified().await;
+    }
+    let tool = capture.tool_name.clone();
+    let operation = capture.tool_name.clone();
+    let capability = capture.interaction_capability.clone();
+    let db = capture.db.clone();
+    let budgeted = tokio::time::timeout(
+        CAPTURE_BUDGET,
+        crate::storage_profile::with_capture_operation(
+            &db,
+            &operation,
+            capability.as_deref(),
+            record_call(capture),
+        ),
+    )
+    .await;
+    match budgeted {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(format!(
+            "interaction_capture failed tool={tool} error={error}"
+        )),
+        Err(_) => Err(format!(
+            "interaction_capture timeout tool={tool} budget_ms={}",
+            CAPTURE_BUDGET.as_millis()
+        )),
+    }
+}
+
+/// Own execution budget for one background capture: the 15 s `BEGIN IMMEDIATE`
+/// retry plus inserts and commit must fit inside this, or the capture is
+/// counted failed and the single worker moves on. A stuck capture must not
+/// wedge the queue behind it.
+pub(crate) const CAPTURE_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Prepare best-effort capture and hand it to the handle's bounded background
+/// queue, returning immediately. The response path never awaits the capture
+/// write: a slow or blocked writer delays only later captures, never the
+/// caller. Returns false when the queue refused the job (full or shut down);
+/// the drop is counted on the handle and reported to stderr there. A `true`
+/// return with nothing enqueued means there was nothing to capture
+/// (uncapturable serialization), not a successful write — durability is only
+/// observable via [`crate::db::Db::capture_stats`] and `drain_captures`.
+///
+/// Authorization context is snapshotted into owned strings at enqueue time
+/// (credential actor, validated run/parent keys, arguments JSON), so the
+/// background write carries exactly what the request saw. The deployment
+/// persistence lease travels with the job, so a deployment freeze still
+/// drains in-flight captures rather than cutting them off.
+///
+/// Semantic declarations (`set_intent`) never take this path: see
+/// [`record_declaration_call`].
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn spawn_record_call(
+pub(crate) fn enqueue_record_call(
     db: &Db,
     extractor: Extractor,
     tool_name: &str,
@@ -1969,7 +2438,95 @@ pub(crate) fn spawn_record_call(
     ended_at: &str,
     interaction_capability: Option<&str>,
     deployment_persistence_lease: Option<super::DeploymentPersistenceLease>,
-) -> Option<tokio::task::JoinHandle<()>> {
+) -> bool {
+    let Some(capture) = prepare_capture(
+        db,
+        extractor,
+        tool_name,
+        caller,
+        original_arguments,
+        run_context,
+        outcome,
+        started_at,
+        ended_at,
+        interaction_capability,
+        deployment_persistence_lease,
+    ) else {
+        // Unserializable arguments mean there is no envelope to persist.
+        // Report enqueue success: no work was lost, there was no work.
+        return true;
+    };
+    // The test gate (if any) was read on this task before the handoff; the
+    // queue worker never observes task-locals.
+    db.enqueue_capture(capture)
+}
+
+/// Run one semantic declaration (`set_intent`) to durability in an owned
+/// task, bypassing the lossy queue entirely. The queue can refuse work when
+/// full or shut down, and a global drain can stall behind continuous
+/// traffic — either would leave an acknowledged intent silently absent, the
+/// exact failure the declaration exception exists to prevent. This path has
+/// neither property: admission is guaranteed and latency is only the
+/// declaration's own write under [`CAPTURE_BUDGET`]. Dropping the awaiting
+/// request drops only the task handle, not the declaration.
+///
+/// Fail-open like the queue: a failed declaration is counted and reported,
+/// never raised to the caller. Ordering note: the declaration may sequence
+/// ahead of earlier-queued ordinary captures. Consumers do not rely on
+/// insertion order across the two paths: episode evidence compares each
+/// read's request `started_at` against the declaration's `ended_at` (the
+/// boundary `seq` is identity exclusion only), and declaration lookup orders
+/// declarations by their own timestamps.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn record_declaration_call(
+    db: &Db,
+    extractor: Extractor,
+    tool_name: &str,
+    caller: &Caller,
+    original_arguments: &Value,
+    run_context: &Value,
+    outcome: std::result::Result<&Value, &Error>,
+    started_at: &str,
+    ended_at: &str,
+    interaction_capability: Option<&str>,
+    deployment_persistence_lease: Option<super::DeploymentPersistenceLease>,
+) {
+    let Some(capture) = prepare_capture(
+        db,
+        extractor,
+        tool_name,
+        caller,
+        original_arguments,
+        run_context,
+        outcome,
+        started_at,
+        ended_at,
+        interaction_capability,
+        deployment_persistence_lease,
+    ) else {
+        return;
+    };
+    db.record_declaration(capture).await;
+}
+
+/// Build the owned capture envelope for one finished call, snapshotting the
+/// authorization context (credential actor, validated run/parent keys,
+/// arguments JSON) on the calling task. `None` means unserializable
+/// arguments: there is no envelope to persist.
+#[allow(clippy::too_many_arguments)]
+fn prepare_capture(
+    db: &Db,
+    extractor: Extractor,
+    tool_name: &str,
+    caller: &Caller,
+    original_arguments: &Value,
+    run_context: &Value,
+    outcome: std::result::Result<&Value, &Error>,
+    started_at: &str,
+    ended_at: &str,
+    interaction_capability: Option<&str>,
+    deployment_persistence_lease: Option<super::DeploymentPersistenceLease>,
+) -> Option<PendingCapture> {
     let extraction = match (extractor, outcome) {
         (Extractor::Shipped(kind), Ok(result)) => extract(kind, original_arguments, result),
         (Extractor::Custom(CustomInteractionPolicy::NoRecordInteractions), Ok(_)) => {
@@ -1980,8 +2537,15 @@ pub(crate) fn spawn_record_call(
         // turn an attempt into an interaction that did not happen.
         (_, Err(_)) => Extraction::default(),
     };
-    let arguments =
-        serde_json::to_string(&captured_arguments(extractor, original_arguments)).ok()?;
+    let result_annotation = match (extractor, outcome) {
+        (Extractor::Shipped(kind), Ok(result)) => work_overlap_result_annotation(kind, result),
+        _ => None,
+    };
+    let arguments = match serde_json::to_string(&captured_arguments(extractor, original_arguments))
+    {
+        Ok(arguments) => arguments,
+        Err(_) => return None,
+    };
     // Only a successfully handled `set_intent` call is a declaration. Other
     // tools may happen to have an argument named `intent`, and a rejected
     // declaration must remain an attempt rather than becoming current state.
@@ -2008,36 +2572,31 @@ pub(crate) fn spawn_record_call(
         outcome_name,
         error,
         extraction,
+        result_annotation,
         result_bytes: response_bytes(outcome, run_context),
         started_at: started_at.to_string(),
         ended_at: ended_at.to_string(),
         _deployment_persistence_lease: deployment_persistence_lease,
         #[cfg(test)]
         gate: CAPTURE_TEST_GATE.try_with(Arc::clone).ok(),
-    };
-    #[cfg(test)]
-    let completed_gate = capture.gate.clone();
-    Some(tokio::spawn(async move {
-        let operation = capture.tool_name.clone();
-        let capability = capture.interaction_capability.clone();
-        let db = capture.db.clone();
-        let _ = crate::storage_profile::with_operation(
-            &db,
-            &operation,
-            capability.as_deref(),
-            record_call(capture),
-        )
-        .await;
         #[cfg(test)]
-        if let Some(gate) = completed_gate {
-            gate.completed.notify_one();
-        }
-    }))
+        pre_gate: CAPTURE_PRE_POLICY_GATE.try_with(Arc::clone).ok(),
+    };
+    // The deployment persistence lease travels inside the capture, so a
+    // deployment freeze still drains in-flight captures rather than cutting
+    // them off. The test gate (if any) was read on this task before any
+    // handoff; the queue worker never observes task-locals.
+    Some(capture)
 }
 
 /// Atomically insert one prepared call envelope and all extracted touches.
 async fn record_call(capture: PendingCapture) -> Result<()> {
-    let mut tx = crate::db::begin_write(capture.db.write_pool()).await?;
+    let begun = crate::db::begin_capture_write(capture.db.write_pool()).await?;
+    // Success-path retry counts are intentionally unreported: capture is
+    // silent on success. Only exhaustion is reported, via the error string
+    // `begin_capture_write` already carries.
+    let _ = begun.retry_count;
+    let mut tx = begun.transaction;
     #[cfg(test)]
     if let Some(gate) = &capture.gate {
         gate.entered.notify_one();
@@ -2046,8 +2605,8 @@ async fn record_call(capture: PendingCapture) -> Result<()> {
     let inserted = sqlx::query(
         "INSERT INTO read_log_calls
          (id, tool, run_key, parent_key, intent, actor, arguments, outcome,
-          error_kind, result_count, result_bytes, started_at, ended_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          error_kind, result_count, result_bytes, started_at, ended_at, result_annotation)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(uuid::Uuid::new_v4().to_string())
     .bind(capture.tool_name)
@@ -2062,21 +2621,56 @@ async fn record_call(capture: PendingCapture) -> Result<()> {
     .bind(capture.result_bytes)
     .bind(capture.started_at)
     .bind(capture.ended_at)
+    .bind(capture.result_annotation)
     .execute(&mut *tx)
     .await?;
+    // Save the call's sequence BEFORE interning any dictionary row: once the
+    // `read_log_record_ids` inserts below run, `last_insert_rowid()` reports a
+    // dictionary row rather than the call we just wrote.
     let call_seq = inserted.last_insert_rowid();
     // Multi-row inserts: a read that surfaces a large folder records one touch
     // per child, and one statement round trip per touch held the write lock
     // for the whole walk. Chunked so the bind count stays well inside every
     // SQLite build's parameter limit.
     const TOUCH_INSERT_CHUNK: usize = 200;
-    for chunk in capture.extraction.touches.chunks(TOUCH_INSERT_CHUNK) {
-        let placeholders = std::iter::repeat_n("(?, ?, ?, ?)", chunk.len())
+    // Intern every distinct exact id in the SAME transaction as the call and
+    // its touches. `INSERT OR IGNORE` keeps the first ref ever assigned to a
+    // string, so a dangling id (one with no `records` row) still gets a home
+    // and case-distinct or non-UUID ids stay distinct rows. The dictionary is
+    // per database and shared across runs.
+    let mut distinct_ids = capture
+        .extraction
+        .touches
+        .iter()
+        .map(|touch| touch.record_id.as_str())
+        .collect::<Vec<_>>();
+    distinct_ids.sort_unstable();
+    distinct_ids.dedup();
+    for chunk in distinct_ids.chunks(TOUCH_INSERT_CHUNK) {
+        let placeholders = std::iter::repeat_n("(?)", chunk.len())
             .collect::<Vec<_>>()
             .join(", ");
+        let sql =
+            format!("INSERT OR IGNORE INTO read_log_record_ids (record_id) VALUES {placeholders}");
+        let mut statement = sqlx::query(&sql);
+        for record_id in chunk {
+            statement = statement.bind(*record_id);
+        }
+        statement.execute(&mut *tx).await?;
+    }
+    for chunk in capture.extraction.touches.chunks(TOUCH_INSERT_CHUNK) {
+        // The reference is resolved by subquery rather than bound, so a
+        // missing mapping yields NULL and trips `record_ref NOT NULL` instead
+        // of silently dropping the touch.
+        let placeholders = std::iter::repeat_n(
+            "(?, (SELECT record_ref FROM read_log_record_ids WHERE record_id = ?), ?, ?)",
+            chunk.len(),
+        )
+        .collect::<Vec<_>>()
+        .join(", ");
         let sql = format!(
             "INSERT INTO read_log_touches
-             (call_seq, record_id, interaction, result_rank)
+             (call_seq, record_ref, interaction, result_rank)
              VALUES {placeholders}"
         );
         let mut statement = sqlx::query(&sql);
@@ -2097,6 +2691,82 @@ async fn record_call(capture: PendingCapture) -> Result<()> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn work_overlap_annotation_keeps_only_disclosed_ids_and_counts() {
+        let annotation = work_overlap_result_annotation(
+            ToolKind::StartWork,
+            &json!({
+                "record_id": "anchor",
+                "action": "claim",
+                "work_overlap": {
+                    "items": [{
+                        "record_id": "overlap",
+                        "holder_tier": "another_principal",
+                        "intent": "must never be retained",
+                        "run_key": "must-never-be-retained",
+                        "claimed_at": "must-never-be-retained"
+                    }],
+                    "total_count": 2,
+                    "truncated": true
+                }
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&annotation).unwrap(),
+            json!({
+                "kind": "work_overlap_emission",
+                "version": 1,
+                "surface": "claim",
+                "anchors": [{
+                    "record_id": "anchor",
+                    "overlap_record_ids": ["overlap"],
+                    "overlap_item_count": 1,
+                    "overlap_total_count": 2,
+                    "truncated": true
+                }]
+            })
+        );
+        assert!(!annotation.contains("another_principal"));
+        assert!(!annotation.contains("must-never-be-retained"));
+    }
+
+    #[test]
+    fn work_overlap_annotation_requires_the_eligible_notice_surface() {
+        let overlap = json!({
+            "items": [{"record_id": "overlap"}],
+            "total_count": 1,
+            "truncated": false
+        });
+        assert!(work_overlap_result_annotation(
+            ToolKind::StartWork,
+            &json!({"record_id":"anchor","action":"preview","work_overlap":overlap})
+        )
+        .is_none());
+        assert!(work_overlap_result_annotation(
+            ToolKind::SetIntent,
+            &json!({"briefing":{"overlapping_claims":{"items":[]}}})
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn set_intent_overlap_annotation_is_all_or_nothing_across_anchors() {
+        let valid_window = json!({
+            "items": [{"record_id": "overlap"}],
+            "total_count": 1,
+            "truncated": false
+        });
+        assert!(work_overlap_result_annotation(
+            ToolKind::SetIntent,
+            &json!({"briefing":{"overlapping_claims":{"items":[
+                {"record_id":"valid-anchor","overlap":valid_window},
+                {"record_id":"malformed-anchor","overlap":{"items":[]}}
+            ]}}})
+        )
+        .is_none());
+    }
 
     #[test]
     fn reach_capture_keeps_only_valid_routing_metadata() {
@@ -3494,5 +4164,235 @@ mod tests {
             ToolKind::ALL.into_iter().collect(),
             "the semantic policy table must cover every shipped tool kind"
         );
+    }
+
+    /// The serving writer interns exact, case-sensitive TEXT ids and resolves
+    /// touches by ref in one transaction. This drives the private `record_call`
+    /// directly because no shipped handler can emit an arbitrary or
+    /// case-distinct id: handlers only ever surface ids they authorized.
+    #[tokio::test]
+    async fn record_call_interns_arbitrary_case_distinct_ids_and_all_interactions() {
+        use sqlx::Row as _;
+
+        fn pending(db: &Db, extraction: Extraction) -> PendingCapture {
+            PendingCapture {
+                db: db.clone(),
+                tool_name: "fixture_capture".to_string(),
+                interaction_capability: None,
+                run_key: Some("scout-chair-a748b2".to_string()),
+                parent_key: None,
+                intent: None,
+                actor: "local".to_string(),
+                arguments: "{}".to_string(),
+                outcome_name: "ok",
+                error: None,
+                extraction,
+                result_annotation: None,
+                result_bytes: None,
+                started_at: "2026-01-01T00:00:00.000Z".to_string(),
+                ended_at: "2026-01-01T00:00:00.001Z".to_string(),
+                _deployment_persistence_lease: None,
+                gate: None,
+                pre_gate: None,
+            }
+        }
+
+        let db = crate::db::create_database(":memory:").await.unwrap();
+
+        let mut extraction = Extraction::success();
+        extraction.surfaced(Some("CaseDistinct"));
+        extraction.surfaced(Some("caseDistinct"));
+        extraction.opened(Some("casedistinct"));
+        extraction.mutated(Some("native:root"));
+        extraction.mutated(Some("dangling-record-with-no-row"));
+        extraction.count(5);
+        record_call(pending(&db, extraction)).await.unwrap();
+
+        let rows = sqlx::query(
+            "SELECT dictionary.record_id AS record_id,
+                    touch.interaction AS interaction,
+                    touch.result_rank AS result_rank
+               FROM read_log_touches touch
+               JOIN read_log_record_ids dictionary
+                 ON dictionary.record_ref = touch.record_ref
+              ORDER BY dictionary.record_id, touch.interaction",
+        )
+        .fetch_all(db.pool())
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| {
+            (
+                row.get::<String, _>("record_id"),
+                row.get::<String, _>("interaction"),
+                row.get::<Option<i64>, _>("result_rank"),
+            )
+        })
+        .collect::<Vec<_>>();
+        assert_eq!(
+            rows,
+            vec![
+                ("CaseDistinct".to_string(), "surfaced".to_string(), Some(1)),
+                ("caseDistinct".to_string(), "surfaced".to_string(), Some(2)),
+                ("casedistinct".to_string(), "opened".to_string(), None),
+                (
+                    "dangling-record-with-no-row".to_string(),
+                    "mutated".to_string(),
+                    None,
+                ),
+                ("native:root".to_string(), "mutated".to_string(), None),
+            ]
+        );
+
+        // Case-distinct strings occupy separate rows; the dictionary never
+        // folds case, and a dangling id (no `records` row) still gets a home.
+        let dictionary_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM read_log_record_ids
+              WHERE record_id IN ('CaseDistinct', 'caseDistinct', 'casedistinct')",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(dictionary_rows, 3);
+
+        // A later call reuses the existing ref instead of adding a duplicate.
+        let mut repeat = Extraction::success();
+        repeat.surfaced(Some("CaseDistinct"));
+        record_call(pending(&db, repeat)).await.unwrap();
+        let repeat_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM read_log_record_ids WHERE record_id = 'CaseDistinct'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(repeat_rows, 1);
+    }
+
+    fn test_capture(db: &Db, tool: &str) -> PendingCapture {
+        PendingCapture {
+            db: db.clone(),
+            tool_name: tool.to_string(),
+            interaction_capability: Some("native.interaction-log.v1".to_string()),
+            run_key: None,
+            parent_key: None,
+            intent: None,
+            actor: "local".to_string(),
+            arguments: "{}".to_string(),
+            outcome_name: "ok",
+            error: None,
+            extraction: Extraction::success(),
+            result_annotation: None,
+            result_bytes: None,
+            started_at: "2026-09-16T00:00:00.000Z".to_string(),
+            ended_at: "2026-09-16T00:00:00.001Z".to_string(),
+            _deployment_persistence_lease: None,
+            gate: None,
+            pre_gate: None,
+        }
+    }
+
+    /// A full queue refuses without blocking: depth 1 with the worker parked
+    /// inside the blocker's transaction fits exactly one more capture, and
+    /// the overflow is counted, never awaited.
+    #[tokio::test]
+    async fn full_capture_queue_drops_and_counts_without_blocking() {
+        let db = crate::db::create_database(":memory:").await.unwrap();
+        let queue = CaptureQueue::with_depth(1);
+        let gate = Arc::new(CaptureTestGate::default());
+        let mut blocker = test_capture(&db, "blocker");
+        blocker.gate = Some(Arc::clone(&gate));
+        assert!(queue.enqueue(blocker));
+        gate.wait_until_entered().await;
+        assert!(queue.enqueue(test_capture(&db, "parked")));
+        assert!(!queue.enqueue(test_capture(&db, "overflow")));
+        let stats = queue.stats();
+        assert_eq!(stats.enqueued, 2);
+        assert_eq!(stats.dropped_full, 1);
+        gate.release();
+        queue.drain().await;
+        let stats = queue.stats();
+        assert_eq!(stats.completed, 2);
+        assert_eq!(stats.failed, 0);
+        db.close().await;
+    }
+
+    /// Shutdown refuses new work while accepted captures still drain:
+    /// `drain_after_shutdown` settles on the stable frontier.
+    #[tokio::test]
+    async fn capture_shutdown_refuses_new_work_and_drain_settles() {
+        let db = crate::db::create_database(":memory:").await.unwrap();
+        let queue = CaptureQueue::with_depth(8);
+        assert!(queue.enqueue(test_capture(&db, "one")));
+        queue.initiate_shutdown();
+        assert!(!queue.enqueue(test_capture(&db, "two")));
+        queue.drain_after_shutdown().await;
+        assert_eq!(
+            queue.stats(),
+            CaptureStats {
+                enqueued: 1,
+                completed: 1,
+                failed: 0,
+                dropped_full: 0,
+                dropped_shutdown: 1,
+                declarations_completed: 0,
+                declarations_failed: 0,
+            }
+        );
+        db.close().await;
+    }
+
+    /// A declaration completing after shutdown must never satisfy the queue
+    /// frontier: queue counters stay queue-only on a separate ledger. Park a
+    /// queued capture, shut down, complete a declaration on an uncontended
+    /// handle, and prove the queue drain is still pending until the parked
+    /// capture itself finishes. The declaration uses a second handle so its
+    /// write does not block on the parked capture's held write lock; ledger
+    /// separation is what is under test, not write-lock queuing.
+    #[tokio::test]
+    async fn declaration_after_shutdown_does_not_satisfy_queue_frontier() {
+        let db = crate::db::create_database(":memory:").await.unwrap();
+        let declaration_db = crate::db::create_database(":memory:").await.unwrap();
+        let queue = CaptureQueue::with_depth(8);
+        let gate = Arc::new(CaptureTestGate::default());
+        let mut parked = test_capture(&db, "parked");
+        parked.gate = Some(Arc::clone(&gate));
+        assert!(queue.enqueue(parked));
+        gate.wait_until_entered().await;
+        queue.initiate_shutdown();
+
+        let draining = tokio::spawn({
+            let queue = Arc::clone(&queue);
+            async move { queue.drain_after_shutdown().await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            !draining.is_finished(),
+            "queue drain settled with the parked capture still pending"
+        );
+
+        queue
+            .record_declaration(test_capture(&declaration_db, "declaration"))
+            .await;
+        let stats = queue.stats();
+        assert_eq!(stats.completed, 0);
+        assert_eq!(stats.declarations_completed, 1);
+        assert_eq!(stats.declarations_failed, 0);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            !draining.is_finished(),
+            "declaration completion satisfied the queue-only frontier"
+        );
+
+        gate.release();
+        tokio::time::timeout(std::time::Duration::from_secs(5), draining)
+            .await
+            .expect("queue drain did not settle after the parked capture")
+            .unwrap();
+        let stats = queue.stats();
+        assert_eq!(stats.enqueued, 1);
+        assert_eq!(stats.completed, 1);
+        assert_eq!(stats.declarations_completed, 1);
+        db.close().await;
+        declaration_db.close().await;
     }
 }

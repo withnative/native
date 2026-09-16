@@ -13,7 +13,8 @@ use uuid::Uuid;
 use crate::db::Db;
 use crate::error::Result;
 use crate::identity::account::{
-    identity_invariant, is_account_token, require_canonical_account, require_live_person,
+    canonical_account_from_rows, identity_invariant, is_account_token, require_canonical_account,
+    require_live_person,
 };
 use crate::store::{append_in, AppendSpec};
 
@@ -106,10 +107,9 @@ pub fn validate_hosted_principal(principal: &str) -> Result<String> {
 /// Resolve `email` to the file's canonical account token, provisioning the
 /// first person identity when necessary.
 ///
-/// The complete lookup/create/legacy-alias operation is serialized by one
-/// `BEGIN IMMEDIATE` transaction. This is deliberately not implemented as a
-/// read followed by a retrying insert: the transaction is also the boundary
-/// that keeps malformed-state failures from partially repairing the file.
+/// Established identities validate in a read snapshot. Provisioning and repair
+/// re-read all state in one `BEGIN IMMEDIATE` transaction, keeping malformed
+/// state failures from partially repairing the file.
 #[cfg(test)]
 pub(crate) async fn resolve_account_identity(
     db: &Db,
@@ -162,7 +162,11 @@ pub async fn existing_hosted_identity(
     db: &Db,
     email: &str,
 ) -> Result<Option<HostedPortableIdentity>> {
-    let mut connection = db.write_pool().begin().await?;
+    // Read-only observation: roster/offboarding must never take the
+    // serialised writer. The read pool is a different snapshot, which is
+    // safe here because no caller holds an open write transaction whose
+    // uncommitted writes this lookup must observe.
+    let mut connection = db.pool().begin().await?;
     let identity = existing_hosted_identity_in_snapshot(&mut connection, email).await?;
     connection.rollback().await?;
     Ok(identity)
@@ -291,6 +295,14 @@ async fn resolve_account_identity_inner_with_principal(
     arrival: Option<&HostedMembershipArrival>,
     public_principal: Option<&str>,
 ) -> Result<String> {
+    if let Some(account) =
+        reconciled_identity_in_read_snapshot(db, email, catalog_user_id, arrival, public_principal)
+            .await?
+    {
+        return Ok(account);
+    }
+    // Never upgrade the read snapshot: repair re-reads all state under the
+    // existing serialized transaction, preserving atomic invariant checks.
     let mut tx = crate::db::begin_write(db.write_pool()).await?;
 
     let email_binding =
@@ -412,6 +424,86 @@ async fn resolve_account_identity_inner_with_principal(
     Ok(account_token)
 }
 
+/// Established requests use the independent read pool. Missing repairable
+/// state returns None; malformed established state still fails validation.
+async fn reconciled_identity_in_read_snapshot(
+    db: &Db,
+    email: &str,
+    catalog_user_id: &str,
+    arrival: Option<&HostedMembershipArrival>,
+    public_principal: Option<&str>,
+) -> Result<Option<String>> {
+    let mut tx = db.pool().begin().await?;
+    let person: Option<String> =
+        sqlx::query_scalar("SELECT record_id FROM bindings WHERE system='email' AND identifier=?")
+            .bind(email)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let Some(person) = person else {
+        tx.rollback().await?;
+        return Ok(None);
+    };
+    // One optional fetch replaces the old EXISTS-then-SELECT pair: the same
+    // snapshot answers both, so an empty result still means "repairable" and
+    // falls back to the repair path below. Liveness is checked before row
+    // validation, preserving the established error ordering (live-person
+    // failures precede malformed/multiple-account failures).
+    let account_rows: Vec<String> = sqlx::query_scalar(
+        "SELECT identifier FROM bindings WHERE record_id=? AND system='account' AND is_canonical=1",
+    )
+    .bind(&person)
+    .fetch_all(&mut *tx)
+    .await?;
+    if account_rows.is_empty() {
+        tx.rollback().await?;
+        return Ok(None);
+    }
+    require_live_person(&mut tx, &format!("email '{email}'"), &person).await?;
+    let Some(account) = canonical_account_from_rows(&person, &account_rows)? else {
+        // Unreachable: empty input was returned as repairable above, and the
+        // shared validator only yields None for empty input. Stay repair-safe
+        // rather than panicking if that contract ever changes.
+        tx.rollback().await?;
+        return Ok(None);
+    };
+    validate_existing_legacy_alias(&mut tx, catalog_user_id, &person).await?;
+    if let Some(principal) = public_principal {
+        // Same EXISTS-then-SELECT fold for the principal: one fetch, empty
+        // still repairs, non-empty validates read-only (never writes here).
+        let canonical: Vec<String> = sqlx::query_scalar(
+            "SELECT identifier FROM bindings WHERE record_id=? AND system='native-principal' AND is_canonical=1 ORDER BY identifier",
+        ).bind(&person).fetch_all(&mut *tx).await?;
+        if canonical.is_empty() {
+            tx.rollback().await?;
+            return Ok(None);
+        }
+        validate_canonical_principal(&person, principal, &canonical)?;
+    }
+    if let Some(arrival) = arrival {
+        if !crate::instruction_templates::member_provisioning_is_read_only_in(
+            &mut tx, &account, &arrival.0,
+        )
+        .await?
+        {
+            tx.rollback().await?;
+            return Ok(None);
+        }
+        // Run the same validation as the repair path. The readiness check
+        // excludes every provisioning branch; SQLite's read-only connection
+        // additionally prevents an accidental write if those branches change.
+        crate::instruction_templates::provision_member_in(
+            db,
+            &mut tx,
+            &account,
+            &person,
+            crate::instruction_templates::MemberProvisioningAuthority::Hosted(&arrival.0),
+        )
+        .await?;
+    }
+    tx.rollback().await?;
+    Ok(Some(account))
+}
+
 async fn ensure_canonical_account(
     tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
     catalog_user_id: &str,
@@ -496,21 +588,59 @@ async fn ensure_canonical_principal(
     .fetch_all(&mut **tx)
     .await?;
     match canonical.as_slice() {
-        [] => crate::identity::add_binding_internal_in(
-            tx,
-            actor,
-            "bind account-scoped federation principal to hosted member",
-            record_id,
-            "native-principal",
-            &normalized,
-            true,
-        )
-        .await,
-        [existing] if existing == &normalized => Ok(false),
+        [] => {
+            crate::identity::add_binding_internal_in(
+                tx,
+                actor,
+                "bind account-scoped federation principal to hosted member",
+                record_id,
+                "native-principal",
+                &normalized,
+                true,
+            )
+            .await
+        }
+        rows => validate_canonical_principal_rows(record_id, &normalized, rows).map(|()| false),
+    }
+}
+
+/// Read-only half of [`ensure_canonical_principal`]: check an already
+/// normalized custody principal against already-fetched canonical rows.
+///
+/// Callers never pass empty input: the repair path normalizes before fetching
+/// (so an invalid provider string errors there even with no established
+/// state), and the read probe returns missing state as repairable before
+/// normalizing (so only the probe defers provider validation until state is
+/// known to exist). A single normalized match is a no-op; multiples or a
+/// mismatch refuse without writing. Shared by the warm read probe and the
+/// repair path so both enforce the same refusal.
+fn validate_canonical_principal_rows(
+    record_id: &str,
+    normalized: &str,
+    canonical: &[String],
+) -> Result<()> {
+    match canonical {
+        [existing] if existing == normalized => Ok(()),
         [..] => Err(identity_invariant(format!(
             "person record '{record_id}' has a canonical native-principal inconsistent with account custody"
         ))),
     }
+}
+
+/// Probe-side adapter: normalize the provider output (even on a no-op, as the
+/// repair path does), then run the shared read-only check. Never writes.
+/// Missing rows never reach this adapter — the probe returns `Ok(None)`
+/// first — so deferring normalization past the empty check is a probe-only
+/// repair behavior, not leniency in the shared refusal logic.
+fn validate_canonical_principal(
+    record_id: &str,
+    public_principal: &str,
+    canonical: &[String],
+) -> Result<()> {
+    // Validate the provider output even on a no-op, rather than trusting an
+    // injected or future remote provider to obey the binding grammar.
+    let normalized = crate::identity::normalize_identifier("native-principal", public_principal)?;
+    validate_canonical_principal_rows(record_id, &normalized, canonical)
 }
 
 async fn validate_existing_legacy_alias(
@@ -613,6 +743,102 @@ mod tests {
             .await
             .unwrap();
         (records, events, bindings)
+    }
+
+    #[tokio::test]
+    async fn established_hosted_identity_does_not_wait_for_an_active_writer() {
+        let db = db().await;
+        let arrival = HostedMembershipArrival::new(
+            HostedMembershipRole::Owner,
+            HostedMembershipSource::Personal,
+            crate::store::now_iso(),
+        )
+        .unwrap();
+        let account = reconcile_hosted_identity(
+            &db,
+            "ada@example.com",
+            "catalog-ada",
+            &arrival,
+            Some("native/ada"),
+        )
+        .await
+        .unwrap();
+        let before = counts(&db).await;
+        let writer = crate::db::begin_write(db.write_pool()).await.unwrap();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            reconcile_hosted_identity(
+                &db,
+                "ada@example.com",
+                "catalog-ada",
+                &arrival,
+                Some("native/ada"),
+            ),
+        )
+        .await;
+        writer.rollback().await.unwrap();
+        assert_eq!(
+            result
+                .expect("established identity waited for the writer")
+                .unwrap(),
+            account
+        );
+        assert_eq!(counts(&db).await, before);
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn read_probe_preserves_repair_and_rejects_inconsistent_member_context() {
+        let db = db().await;
+        let arrival = HostedMembershipArrival::new(
+            HostedMembershipRole::Owner,
+            HostedMembershipSource::Personal,
+            crate::store::now_iso(),
+        )
+        .unwrap();
+        let account =
+            reconcile_hosted_identity(&db, "ada@example.com", "catalog-ada", &arrival, None)
+                .await
+                .unwrap();
+        sqlx::query("UPDATE records SET name='drifted' WHERE id=?")
+            .bind(crate::instruction_templates::INSTRUCTIONS_FOLDER_ID)
+            .execute(db.write_pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            reconcile_hosted_identity(&db, "ada@example.com", "catalog-ada", &arrival, None,)
+                .await
+                .unwrap(),
+            account
+        );
+        let name: String = sqlx::query_scalar("SELECT name FROM records WHERE id=?")
+            .bind(crate::instruction_templates::INSTRUCTIONS_FOLDER_ID)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(name, "Agent instructions");
+        sqlx::query(
+            "UPDATE member_contexts SET person_record_id=root_record_id WHERE account_id=?",
+        )
+        .bind(&account)
+        .execute(db.write_pool())
+        .await
+        .unwrap();
+        let writer = crate::db::begin_write(db.write_pool()).await.unwrap();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            reconcile_hosted_identity(&db, "ada@example.com", "catalog-ada", &arrival, None),
+        )
+        .await;
+        writer.rollback().await.unwrap();
+        let error = result
+            .expect("invariant validation waited for the writer")
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("different person identity"),
+            "{error}"
+        );
+        db.close().await;
     }
 
     #[tokio::test]
@@ -1164,6 +1390,251 @@ mod tests {
             .unwrap(),
             0
         );
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn existing_hosted_identity_miss_returns_none_without_provisioning() {
+        let db = db().await;
+        let before = counts(&db).await;
+        assert!(existing_hosted_identity(&db, "nobody@example.com")
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(counts(&db).await, before);
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn existing_hosted_identity_reads_without_a_writer_pool_slot() {
+        let db = db().await;
+        let account = resolve_account_identity(&db, "ada@example.com", "catalog-ada")
+            .await
+            .unwrap();
+        // Occupy every write-pool slot (five; see open_pool): a read that
+        // touched the writer pool would wait and time out.
+        let mut held = Vec::new();
+        for _ in 0..5 {
+            held.push(db.write_pool().acquire().await.unwrap());
+        }
+        let found = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            existing_hosted_identity(&db, "ada@example.com"),
+        )
+        .await
+        .expect("established identity read must not acquire a writer-pool slot")
+        .unwrap()
+        .expect("established identity must resolve");
+        drop(held);
+        assert_eq!(found.account_id, account);
+        db.close().await;
+    }
+
+    async fn probe_arrival() -> HostedMembershipArrival {
+        HostedMembershipArrival::new(
+            HostedMembershipRole::Member,
+            HostedMembershipSource::Invitation,
+            crate::store::now_iso(),
+        )
+        .unwrap()
+    }
+
+    async fn person_with_email(db: &Db, email: &str) -> String {
+        let record_id = create_record_as(
+            db,
+            json!({ "type": "Entity", "kind": "person", "name": "Ada" }),
+            Some("fixture"),
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO bindings (record_id, system, identifier, is_canonical)
+             VALUES (?, 'email', ?, 1)",
+        )
+        .bind(&record_id)
+        .bind(email)
+        .execute(db.write_pool())
+        .await
+        .unwrap();
+        record_id
+    }
+
+    async fn add_canonical_account(db: &Db, record_id: &str, identifier: &str) {
+        sqlx::query(
+            "INSERT INTO bindings (record_id, system, identifier, is_canonical)
+             VALUES (?, 'account', ?, 1)",
+        )
+        .bind(record_id)
+        .bind(identifier)
+        .execute(db.write_pool())
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_probe_repairs_missing_canonical_but_rejects_corrupt_state() {
+        // Anchor custody principals to the existing binding grammar rather
+        // than bare literals (normalization is identity for valid input).
+        let principal = validate_hosted_principal("native/ada").unwrap();
+        let mismatch = validate_hosted_principal("native/not-ada").unwrap();
+        // Each case runs in its own block: the module's `db()` helper is
+        // shadowed by a `let db` binding within a block, as in the existing
+        // malformed-hit test.
+        {
+            // Control: missing canonical account repairs through the probe.
+            let db = db().await;
+            let record_id = person_with_email(&db, "ada@example.com").await;
+            let account = reconcile_hosted_identity(
+                &db,
+                "ada@example.com",
+                "catalog-ada",
+                &probe_arrival().await,
+                Some(principal.as_str()),
+            )
+            .await
+            .unwrap();
+            assert!(is_account_token(&account));
+            assert_eq!(
+                sqlx::query_scalar::<_, String>(
+                    "SELECT identifier FROM bindings
+                      WHERE record_id=? AND system='native-principal' AND is_canonical=1",
+                )
+                .bind(&record_id)
+                .fetch_one(db.write_pool())
+                .await
+                .unwrap(),
+                principal
+            );
+            db.close().await;
+        }
+
+        // Malformed, multiple, non-person, and deleted states fail closed with
+        // no writes; the legacy-alias conflict refuses as well.
+        for case in [
+            "malformed_account",
+            "multiple_accounts",
+            "wrong_kind",
+            "deleted_person",
+            "legacy_alias_conflict",
+        ] {
+            let db = db().await;
+            let record_id = if case == "wrong_kind" {
+                let record_id = create_record_as(
+                    &db,
+                    json!({ "type": "Entity", "kind": "organization", "name": "Not a person" }),
+                    Some("fixture"),
+                )
+                .await
+                .unwrap();
+                sqlx::query(
+                    "INSERT INTO bindings (record_id, system, identifier, is_canonical)
+                     VALUES (?, 'email', 'ada@example.com', 1)",
+                )
+                .bind(&record_id)
+                .execute(db.write_pool())
+                .await
+                .unwrap();
+                record_id
+            } else {
+                person_with_email(&db, "ada@example.com").await
+            };
+            match case {
+                "malformed_account" => {
+                    add_canonical_account(&db, &record_id, "catalog-shaped-not-portable").await
+                }
+                "multiple_accounts" => {
+                    // A healthy schema prevents this state. Remove only the
+                    // test fixture's uniqueness guard to exercise defensive
+                    // validation of an already-corrupt canonical projection.
+                    sqlx::query("DROP INDEX idx_bindings_one_canonical_per_system")
+                        .execute(db.write_pool())
+                        .await
+                        .unwrap();
+                    add_canonical_account(&db, &record_id, "acct_00000000000000000000000000000000")
+                        .await;
+                    add_canonical_account(&db, &record_id, "acct_11111111111111111111111111111111")
+                        .await;
+                }
+                "wrong_kind" | "deleted_person" => {
+                    add_canonical_account(&db, &record_id, "acct_00000000000000000000000000000000")
+                        .await
+                }
+                "legacy_alias_conflict" => {
+                    add_canonical_account(&db, &record_id, "acct_00000000000000000000000000000000")
+                        .await;
+                    let other = create_record_as(
+                        &db,
+                        json!({ "type": "Entity", "kind": "person", "name": "other" }),
+                        Some("fixture"),
+                    )
+                    .await
+                    .unwrap();
+                    sqlx::query(
+                        "INSERT INTO bindings (record_id, system, identifier, is_canonical)
+                         VALUES (?, 'account', 'catalog-ada', 0)",
+                    )
+                    .bind(other)
+                    .execute(db.write_pool())
+                    .await
+                    .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            if case == "deleted_person" {
+                delete_record_as(&db, &record_id, Some("fixture"))
+                    .await
+                    .unwrap();
+            }
+            let before = counts(&db).await;
+            let error = reconcile_hosted_identity(
+                &db,
+                "ada@example.com",
+                "catalog-ada",
+                &probe_arrival().await,
+                Some(principal.as_str()),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+            let expected = match case {
+                "multiple_accounts" => "exactly one canonical account binding",
+                "legacy_alias_conflict" => "already bound incompatibly",
+                _ => "identity invariant failed",
+            };
+            assert!(error.contains(expected), "{case}: {error}");
+            assert_eq!(counts(&db).await, before, "{case}");
+            db.close().await;
+        }
+
+        // An established principal inconsistent with custody refuses without
+        // rewriting, through the same deduped probe.
+        let db = db().await;
+        let arrival_value = probe_arrival().await;
+        reconcile_hosted_identity(
+            &db,
+            "ada@example.com",
+            "catalog-ada",
+            &arrival_value,
+            Some(principal.as_str()),
+        )
+        .await
+        .unwrap();
+        let before = counts(&db).await;
+        let error = reconcile_hosted_identity(
+            &db,
+            "ada@example.com",
+            "catalog-ada",
+            &arrival_value,
+            Some(mismatch.as_str()),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("inconsistent with account custody"),
+            "{error}"
+        );
+        assert_eq!(counts(&db).await, before);
         db.close().await;
     }
 

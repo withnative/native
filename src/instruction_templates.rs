@@ -921,6 +921,88 @@ async fn ensure_arrival_obligation_in(
     Ok(())
 }
 
+/// Check the conditions under which provisioning only validates existing rows.
+/// The caller keeps this snapshot open while running `provision_member_in`, so
+/// its ordinary invariant checks remain authoritative without taking a writer.
+/// A false result requires a fresh write transaction and full reconciliation.
+pub(crate) async fn member_provisioning_is_read_only_in(
+    tx: &mut Transaction<'static, Sqlite>,
+    account_id: &str,
+    arrival: &TrustedMembershipArrival,
+) -> Result<bool> {
+    let programmes: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM onboarding_programmes WHERE id IN (?,?)")
+            .bind(OWNER_PROGRAMME_ID)
+            .bind(MEMBER_PROGRAMME_ID)
+            .fetch_one(&mut **tx)
+            .await?;
+    if programmes != 2 {
+        return Ok(false);
+    }
+    let folder_ready: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM records WHERE id=? AND type='Collection'
+         AND kind='folder' AND name='Agent instructions' AND home_id=?
+         AND owner_id IS NULL AND deleted_at IS NULL)",
+    )
+    .bind(INSTRUCTIONS_FOLDER_ID)
+    .bind(ROOT_RECORD_ID)
+    .fetch_one(&mut **tx)
+    .await?;
+    if !folder_ready {
+        return Ok(false);
+    }
+    for (id, key) in [
+        (WORKSPACE_INSTRUCTIONS_ID, "workspace-agent-instructions"),
+        (OWNER_GUIDANCE_ID, "owner-onboarding-guidance"),
+        (OWNER_CRITERIA_ID, "owner-onboarding-completion"),
+        (MEMBER_GUIDANCE_ID, "member-onboarding-guidance"),
+        (MEMBER_CRITERIA_ID, "member-onboarding-completion"),
+    ] {
+        let template = instruction_template(key).expect("registered global template");
+        let ready: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM seeded_instruction_sources s
+             JOIN records r ON r.id=s.source_record_id
+             WHERE s.source_record_id=? AND s.template_key=? AND s.template_version=?)",
+        )
+        .bind(id)
+        .bind(key)
+        .bind(template.version)
+        .fetch_one(&mut **tx)
+        .await?;
+        if !ready {
+            return Ok(false);
+        }
+    }
+    if arrival.role == TrustedMembershipRole::Owner {
+        let owner_ready: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM policy_entries WHERE policy_anchor_id=?
+             AND subject_kind='account' AND subject_id=? AND capability='manage')",
+        )
+        .bind(INSTRUCTIONS_FOLDER_ID)
+        .bind(account_id)
+        .fetch_one(&mut **tx)
+        .await?;
+        if !owner_ready {
+            return Ok(false);
+        }
+    }
+    let programme = if arrival.role == TrustedMembershipRole::Owner {
+        OWNER_PROGRAMME_ID
+    } else {
+        MEMBER_PROGRAMME_ID
+    };
+    let member_ready: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM member_contexts WHERE account_id=?)
+         AND EXISTS(SELECT 1 FROM member_obligations WHERE account_id=? AND programme_id=?)",
+    )
+    .bind(account_id)
+    .bind(account_id)
+    .bind(programme)
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(member_ready)
+}
+
 /// Compose all member-specific and database-default provisioning into the
 /// caller's identity transaction. Repeated calls are read-mostly no-ops; a
 /// partial committed shape is treated as corruption because this function's

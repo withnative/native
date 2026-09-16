@@ -287,9 +287,10 @@ async fn attach_text_rejects_bad_arguments_and_dead_targets() {
     let err = call(&registry, &db, "attach_text", json!({ "text": "x" }))
         .await
         .unwrap_err();
-    assert_eq!(
-        err.to_string(),
-        "invalid arguments for attach_text: missing field `record_id`"
+    assert!(
+        err.to_string()
+            .contains("attach_text accepts exactly one selector"),
+        "{err}"
     );
     let err = call(&registry, &db, "attach_text", json!({ "record_id": root }))
         .await

@@ -26,9 +26,6 @@ use crate::schema::ARCHIVED_FACET_KEY;
 
 // The preserved-id compiler is a private child of the append kernel so it can
 // reach `PreparedEvent` without exposing that authority to sibling modules.
-#[path = "replication.rs"]
-#[allow(dead_code)]
-mod replication;
 #[path = "replication_v1.rs"]
 #[allow(dead_code)]
 mod replication_v1;
@@ -1520,5 +1517,38 @@ mod sealed_append_seam_tests {
         assert_eq!(event.record_id, record_id);
         assert_eq!(event.event_type, "record.created");
         tx.rollback().await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod append_identity_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn ordinary_append_still_mints_and_has_no_source_sidecar() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let event = append(
+            &db,
+            AppendSpec {
+                record_id: "4e900000-0000-4000-8000-000000000002".into(),
+                event_type: "record.created".into(),
+                payload: json!({
+                    "type": "Message",
+                    "kind": "text",
+                    "name": "minted"
+                }),
+                actor: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(Uuid::parse_str(&event.id).unwrap().get_version_num(), 4);
+        let sources: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM content_event_sources WHERE event_id = ?")
+                .bind(event.id)
+                .fetch_one(db.write_pool())
+                .await
+                .unwrap();
+        assert_eq!(sources, 0);
     }
 }

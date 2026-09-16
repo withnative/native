@@ -4,7 +4,12 @@ This document records the repository-side amendment to Native records
 `2058a99`, `abf4527`, and decision `02b8683`. The relay/cryptographic envelope
 remains specified separately in `federation-transport-v1.md`; this is the
 decrypted semantic-content contract consumed by the sealed ingest seam in
-`src/replication.rs`.
+`src/replication_v1.rs`.
+
+Authenticated v1 and v2 ingress require a closed-vocabulary expectation.
+Omission or null is rejected during preflight, before any batch mutation. This
+requirement does not backfill historical stored Messages or silently rewrite
+preserved export content.
 
 ## MessageUnitV1 expectation field
 

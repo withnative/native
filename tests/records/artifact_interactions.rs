@@ -1752,7 +1752,7 @@ async fn a_stale_source_digest_cannot_invoke_against_an_edited_manifest() {
         &registry,
         &db,
         "update_record",
-        json!({ "id": ARTIFACT, "body": edited, "if_body_digest": digest,
+        json!({ "id": ARTIFACT, "body_set": edited, "if_body_digest": digest,
                 "reason": "Edit the artifact under a rendered client." }),
     )
     .await;
@@ -1935,7 +1935,7 @@ async fn a_v2_body_edit_without_an_exact_snapshot_reports_no_existing_state() {
         &registry,
         &db,
         "update_record",
-        json!({ "id": ARTIFACT, "body": artifact_source("No prior snapshot"),
+        json!({ "id": ARTIFACT, "body_set": artifact_source("No prior snapshot"),
                 "if_body_digest": digest,
                 "reason": "Exercise a legacy v2 source without exact projected input state." }),
     )

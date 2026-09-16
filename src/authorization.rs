@@ -1605,8 +1605,7 @@ pub async fn state_violations_on(transaction: &mut Transaction<'_, Sqlite>) -> R
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::c_void;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use crate::query::test_sqlite::SqliteTrace;
     use std::time::{Duration, Instant};
 
     use serde_json::json;
@@ -2392,40 +2391,12 @@ mod tests {
         }
     }
 
-    unsafe extern "C" fn count_traced_statements(
-        _event: u32,
-        context: *mut c_void,
-        _statement: *mut c_void,
-        _sql: *mut c_void,
-    ) -> i32 {
-        // SAFETY: the trace is cleared before the boxed counter is dropped,
-        // and `lock_handle` prevents concurrent use of this SQLite handle
-        // while the callback is installed or removed.
-        let counter = unsafe { &*context.cast::<AtomicUsize>() };
-        counter.fetch_add(1, Ordering::Relaxed);
-        0
-    }
-
     async fn traced_preloaded_view_ids(
         db: &Db,
         ids: Vec<String>,
     ) -> (Vec<String>, usize, Duration) {
         let mut tx = db.write_pool().begin().await.unwrap();
-        let statements = Box::new(AtomicUsize::new(0));
-        {
-            let mut handle = tx.lock_handle().await.unwrap();
-            // SAFETY: the boxed context has a stable address and remains alive
-            // until the callback is explicitly cleared below.
-            let status = unsafe {
-                libsqlite3_sys::sqlite3_trace_v2(
-                    handle.as_raw_handle().as_ptr(),
-                    libsqlite3_sys::SQLITE_TRACE_STMT as u32,
-                    Some(count_traced_statements),
-                    (&*statements as *const AtomicUsize).cast_mut().cast(),
-                )
-            };
-            assert_eq!(status, libsqlite3_sys::SQLITE_OK);
-        }
+        let trace = SqliteTrace::install(&mut tx).await.unwrap();
         let started = Instant::now();
         let result = ids_with_capability_preloaded_on(
             &mut tx,
@@ -2436,20 +2407,12 @@ mod tests {
         )
         .await;
         let elapsed = started.elapsed();
-        {
-            let mut handle = tx.lock_handle().await.unwrap();
-            // SAFETY: clearing the callback while holding the connection lock
-            // ends SQLite's access to the context before it is dropped.
-            unsafe {
-                libsqlite3_sys::sqlite3_trace_v2(
-                    handle.as_raw_handle().as_ptr(),
-                    0,
-                    None,
-                    std::ptr::null_mut(),
-                )
-            };
-        }
-        let statement_count = statements.load(Ordering::Relaxed);
+        let work = trace.finish(&mut tx).await.unwrap();
+        assert!(
+            work.max_bind_parameters <= 3,
+            "the closure binds only the seed set and two depth limits; other set loads use at most two binds"
+        );
+        let statement_count = work.statements;
         let result = result.unwrap();
         tx.rollback().await.unwrap();
         (result, statement_count, elapsed)
@@ -2457,20 +2420,7 @@ mod tests {
 
     async fn traced_scalar_view_ids(db: &Db, ids: &[String]) -> (Vec<String>, usize, Duration) {
         let mut tx = db.write_pool().begin().await.unwrap();
-        let statements = Box::new(AtomicUsize::new(0));
-        {
-            let mut handle = tx.lock_handle().await.unwrap();
-            // SAFETY: see `traced_preloaded_view_ids`.
-            let status = unsafe {
-                libsqlite3_sys::sqlite3_trace_v2(
-                    handle.as_raw_handle().as_ptr(),
-                    libsqlite3_sys::SQLITE_TRACE_STMT as u32,
-                    Some(count_traced_statements),
-                    (&*statements as *const AtomicUsize).cast_mut().cast(),
-                )
-            };
-            assert_eq!(status, libsqlite3_sys::SQLITE_OK);
-        }
+        let trace = SqliteTrace::install(&mut tx).await.unwrap();
         let started = Instant::now();
         let mut visible = Vec::new();
         for id in ids {
@@ -2482,19 +2432,7 @@ mod tests {
             }
         }
         let elapsed = started.elapsed();
-        {
-            let mut handle = tx.lock_handle().await.unwrap();
-            // SAFETY: see `traced_preloaded_view_ids`.
-            unsafe {
-                libsqlite3_sys::sqlite3_trace_v2(
-                    handle.as_raw_handle().as_ptr(),
-                    0,
-                    None,
-                    std::ptr::null_mut(),
-                )
-            };
-        }
-        let statement_count = statements.load(Ordering::Relaxed);
+        let statement_count = trace.finish(&mut tx).await.unwrap().statements;
         tx.rollback().await.unwrap();
         (visible, statement_count, elapsed)
     }

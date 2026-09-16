@@ -7,7 +7,7 @@
   "candidate_surfaces": {
     "stable": {
       "ordinary": {
-        "descriptor_bytes": 41262,
+        "descriptor_bytes": 41663,
         "descriptors": [
           {
             "name": "bootstrap",
@@ -1191,7 +1191,7 @@
           {
             "name": "schema_read",
             "title": "Schema read",
-            "description": "Inspect schema, vocabulary and value configuration.",
+            "description": "Record shape first: preview_record_shape for types, kinds, facets and vocabularies; manage_vocabularies.list_values for values. describe_schema is the physical table schema for sql_read.",
             "inputSchema": {
               "type": "object",
               "properties": {
@@ -1534,6 +1534,7 @@
                   "enum": [
                     "manage_interventions.get",
                     "manage_interventions.query",
+                    "manage_messages.get_attention",
                     "manage_messages.list_context",
                     "manage_messages.list_conversation",
                     "manage_messages.list_destinations",
@@ -1702,7 +1703,7 @@
           {
             "name": "artifacts_write",
             "title": "Artifacts write",
-            "description": "Instantiate, bind, publish or change artifact definitions and change-summary state.",
+            "description": "Copy, bind or publish artifacts and manage change-summary state. Author from scratch with records_write.create_record: type Document, kind artifact, facets.runtime. For runtime choice and create/bind/grant/render steps, read guidance_read.read_guide topic compositions. instantiate_artifact copies an existing source.",
             "inputSchema": {
               "type": "object",
               "properties": {
@@ -2356,7 +2357,7 @@
         ]
       },
       "lens": {
-        "descriptor_bytes": 47293,
+        "descriptor_bytes": 47694,
         "descriptors": [
           {
             "name": "bootstrap",
@@ -3691,7 +3692,7 @@
           {
             "name": "schema_read",
             "title": "Schema read",
-            "description": "Inspect schema, vocabulary and value configuration.",
+            "description": "Record shape first: preview_record_shape for types, kinds, facets and vocabularies; manage_vocabularies.list_values for values. describe_schema is the physical table schema for sql_read.",
             "inputSchema": {
               "type": "object",
               "properties": {
@@ -4070,6 +4071,7 @@
                   "enum": [
                     "manage_interventions.get",
                     "manage_interventions.query",
+                    "manage_messages.get_attention",
                     "manage_messages.list_context",
                     "manage_messages.list_conversation",
                     "manage_messages.list_destinations",
@@ -4270,7 +4272,7 @@
           {
             "name": "artifacts_write",
             "title": "Artifacts write",
-            "description": "Instantiate, bind, publish or change artifact definitions and change-summary state.",
+            "description": "Copy, bind or publish artifacts and manage change-summary state. Author from scratch with records_write.create_record: type Document, kind artifact, facets.runtime. For runtime choice and create/bind/grant/render steps, read guidance_read.read_guide topic compositions. instantiate_artifact copies an existing source.",
             "inputSchema": {
               "type": "object",
               "properties": {
@@ -4910,6 +4912,5005 @@
               "readOnlyHint": false,
               "destructiveHint": false,
               "idempotentHint": true,
+              "openWorldHint": false
+            }
+          }
+        ]
+      }
+    },
+    "build_enabled_experimental": {
+      "ordinary": {
+        "descriptor_bytes": 42615,
+        "descriptors": [
+          {
+            "name": "bootstrap",
+            "title": "Bootstrap",
+            "description": "Establish caller, workspace and run context.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {},
+              "additionalProperties": false
+            },
+            "annotations": {
+              "readOnlyHint": true,
+              "destructiveHint": false,
+              "idempotentHint": true,
+              "openWorldHint": false
+            }
+          },
+          {
+            "name": "describe_operation",
+            "title": "Describe operation",
+            "description": "Return one authoritative operation contract addressed by executor and operation.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "executor": {
+                  "type": "string",
+                  "enum": [
+                    "bootstrap",
+                    "describe_operation",
+                    "system_read",
+                    "guidance_read",
+                    "guidance_admin",
+                    "records_read",
+                    "records_write",
+                    "records_lifecycle",
+                    "records_delete",
+                    "coordination_read",
+                    "coordination_write",
+                    "sql_read",
+                    "external_import",
+                    "identity_read",
+                    "identity_resolve",
+                    "identity_admin",
+                    "access_read",
+                    "access_admin",
+                    "schema_read",
+                    "schema_admin",
+                    "schema_delete",
+                    "messaging_read",
+                    "messaging_write",
+                    "artifacts_read",
+                    "artifacts_execute",
+                    "artifacts_write",
+                    "membership_read",
+                    "membership_admin",
+                    "membership_remove",
+                    "export",
+                    "canvas_read",
+                    "canvas_write",
+                    "reach_read",
+                    "reach_connect"
+                  ]
+                },
+                "operation": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "executor",
+                "operation"
+              ],
+              "additionalProperties": false
+            },
+            "annotations": {
+              "readOnlyHint": true,
+              "destructiveHint": false,
+              "idempotentHint": true,
+              "openWorldHint": false
+            }
+          },
+          {
+            "name": "system_read",
+            "title": "System information",
+            "description": "Read health, engine and protocol information.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "operation": {
+                  "type": "string",
+                  "enum": [
+                    "engine_info",
+                    "ping"
+                  ]
+                },
+                "arguments": {
+                  "type": "object",
+                  "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                },
+                "run_key": {
+                  "type": "string"
+                },
+                "parent_key": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "operation"
+              ],
+              "additionalProperties": false
+            },
+            "annotations": {
+              "readOnlyHint": true,
+              "destructiveHint": false,
+              "idempotentHint": true,
+              "openWorldHint": false
+            }
+          },
+          {
+            "name": "guidance_read",
+            "title": "Guidance read",
+            "description": "Read product guidance, quickstart, instructions and onboarding configuration.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "operation": {
+                  "type": "string",
+                  "enum": [
+                    "manage_instructions.compare_seeded_default",
+                    "manage_instructions.list",
+                    "manage_onboarding.list_programmes",
+                    "manage_onboarding.preview_generation",
+                    "quickstart",
+                    "read_guide"
+                  ]
+                },
+                "arguments": {
+                  "type": "object",
+                  "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                },
+                "run_key": {
+                  "type": "string"
+                },
+                "parent_key": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "operation"
+              ],
+              "additionalProperties": false
+            },
+            "annotations": {
+              "readOnlyHint": true,
+              "destructiveHint": false,
+              "idempotentHint": true,
+              "openWorldHint": false
+            }
+          },
+          {
+            "name": "guidance_admin",
+            "title": "Guidance administration",
+            "description": "Create or change instruction bindings and onboarding programmes.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "operation": {
+                  "type": "string",
+                  "enum": [
+                    "manage_instructions.apply_seeded_default",
+                    "manage_instructions.create_binding",
+                    "manage_instructions.disable_binding",
+                    "manage_instructions.enable_binding",
+                    "manage_instructions.remove_binding",
+                    "manage_instructions.reorder_binding",
+                    "manage_instructions.reset_seeded_default",
+                    "manage_instructions.retarget_binding",
+                    "manage_onboarding.add_source",
+                    "manage_onboarding.change_source",
+                    "manage_onboarding.configure_programme",
+                    "manage_onboarding.create_programme",
+                    "manage_onboarding.publish_generation",
+                    "manage_onboarding.record_progress",
+                    "manage_onboarding.remove_source",
+                    "manage_onboarding.reopen_obligation",
+                    "manage_onboarding.reorder_source",
+                    "manage_onboarding.resolve_obligation"
+                  ]
+                },
+                "arguments": {
+                  "type": "object",
+                  "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                },
+                "run_key": {
+                  "type": "string"
+                },
+                "parent_key": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "operation"
+              ],
+              "additionalProperties": false
+            },
+            "annotations": {
+              "readOnlyHint": false,
+              "destructiveHint": false,
+              "idempotentHint": false,
+              "openWorldHint": false
+            }
+          },
+          {
+            "name": "records_read",
+            "title": "Records read",
+            "description": "Read, search, query and explain authorized records and their derived evidence. Known full id or short record reference: {operation:'get_record', arguments:{ids:[reference]}}. Lexical text: {operation:'search', arguments:{query:'...'}}. Direct query_record shape: {operation:'query_record', arguments:{steps:[{step:'filter', ...}], ...}}. Call directly when known; describe_operation is optional.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "operation": {
+                  "type": "string",
+                  "enum": [
+                    "get_dashboard",
+                    "get_history",
+                    "get_record",
+                    "get_structure",
+                    "manage_attachments.inspect",
+                    "manage_attachments.list",
+                    "manage_facet_observations.list",
+                    "manage_links.list",
+                    "manage_relationships.find",
+                    "manage_relationships.read",
+                    "manage_relationships.why",
+                    "query_record",
+                    "read_attachment",
+                    "read_attributions",
+                    "render_record",
+                    "render_record_version_diff",
+                    "render_suggestion_review",
+                    "resolve_citation",
+                    "resolve_facets",
+                    "resolve_many",
+                    "resolve_rollup",
+                    "scan",
+                    "search",
+                    "suggest_facet_values",
+                    "whats_changed"
+                  ]
+                },
+                "arguments": {
+                  "type": "object",
+                  "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                },
+                "run_key": {
+                  "type": "string"
+                },
+                "parent_key": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "operation"
+              ],
+              "additionalProperties": false
+            },
+            "annotations": {
+              "readOnlyHint": true,
+              "destructiveHint": false,
+              "idempotentHint": true,
+              "openWorldHint": false
+            }
+          },
+          {
+            "name": "records_write",
+            "title": "Records write",
+            "description": "For plan-required operations, prepare first; preparation does not mutate. Prepare with {operation, arguments}. Execute only with the returned {operation, plan_id, target, effect_summary}; never combine preparation and execution fields. Create and edit ordinary record content, links, observations and governed annotations.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "operation": {
+                  "type": "string",
+                  "enum": [
+                    "attach_text",
+                    "claim_unowned_record",
+                    "correct_record_type",
+                    "create_attribution",
+                    "create_exploration",
+                    "create_many",
+                    "create_record",
+                    "manage_attributions.add_evidence",
+                    "manage_attributions.retract",
+                    "manage_citations.reanchor",
+                    "manage_facet_observations.set",
+                    "manage_facet_observations.unset",
+                    "manage_links.add",
+                    "manage_links.remove",
+                    "manage_relationships.add_evidence",
+                    "manage_relationships.assert",
+                    "manage_relationships.contest",
+                    "manage_relationships.retract",
+                    "resolve_suggestions.accept",
+                    "resolve_suggestions.reject",
+                    "update_record"
+                  ]
+                },
+                "arguments": {
+                  "type": "object",
+                  "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                },
+                "run_key": {
+                  "type": "string"
+                },
+                "parent_key": {
+                  "type": "string"
+                },
+                "plan_id": {
+                  "type": "string",
+                  "description": "Opaque id returned by preparation."
+                },
+                "target": {
+                  "type": "string",
+                  "description": "Exact visible target returned by preparation."
+                },
+                "effect_summary": {
+                  "type": "string",
+                  "description": "Exact visible effect returned by preparation."
+                }
+              },
+              "required": [
+                "operation"
+              ],
+              "additionalProperties": false,
+              "oneOf": [
+                {
+                  "title": "Prepare or direct",
+                  "properties": {
+                    "operation": {
+                      "type": "string",
+                      "enum": [
+                        "attach_text",
+                        "claim_unowned_record",
+                        "correct_record_type",
+                        "create_attribution",
+                        "create_exploration",
+                        "create_many",
+                        "create_record",
+                        "manage_attributions.add_evidence",
+                        "manage_attributions.retract",
+                        "manage_citations.reanchor",
+                        "manage_facet_observations.set",
+                        "manage_facet_observations.unset",
+                        "manage_links.add",
+                        "manage_links.remove",
+                        "manage_relationships.add_evidence",
+                        "manage_relationships.assert",
+                        "manage_relationships.contest",
+                        "manage_relationships.retract",
+                        "resolve_suggestions.accept",
+                        "resolve_suggestions.reject",
+                        "update_record"
+                      ]
+                    },
+                    "arguments": {
+                      "type": "object",
+                      "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                    },
+                    "run_key": {
+                      "type": "string"
+                    },
+                    "parent_key": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "operation",
+                    "arguments"
+                  ],
+                  "not": {
+                    "anyOf": [
+                      {
+                        "required": [
+                          "plan_id"
+                        ]
+                      },
+                      {
+                        "required": [
+                          "target"
+                        ]
+                      },
+                      {
+                        "required": [
+                          "effect_summary"
+                        ]
+                      }
+                    ]
+                  }
+                },
+                {
+                  "title": "Execute prepared plan",
+                  "properties": {
+                    "operation": {
+                      "type": "string",
+                      "enum": [
+                        "correct_record_type"
+                      ]
+                    },
+                    "run_key": {
+                      "type": "string"
+                    },
+                    "parent_key": {
+                      "type": "string"
+                    },
+                    "plan_id": {
+                      "type": "string",
+                      "description": "Opaque id returned by preparation."
+                    },
+                    "target": {
+                      "type": "string",
+                      "description": "Exact visible target returned by preparation."
+                    },
+                    "effect_summary": {
+                      "type": "string",
+                      "description": "Exact visible effect returned by preparation."
+                    }
+                  },
+                  "required": [
+                    "operation",
+                    "plan_id",
+                    "target",
+                    "effect_summary"
+                  ],
+                  "not": {
+                    "required": [
+                      "arguments"
+                    ]
+                  }
+                }
+              ]
+            },
+            "annotations": {
+              "readOnlyHint": false,
+              "destructiveHint": false,
+              "idempotentHint": false,
+              "openWorldHint": false
+            }
+          },
+          {
+            "name": "records_lifecycle",
+            "title": "Records lifecycle",
+            "description": "Archive or restore records without deleting identity or history.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "operation": {
+                  "type": "string",
+                  "enum": [
+                    "archive_record"
+                  ]
+                },
+                "arguments": {
+                  "type": "object",
+                  "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                },
+                "run_key": {
+                  "type": "string"
+                },
+                "parent_key": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "operation"
+              ],
+              "additionalProperties": false
+            },
+            "annotations": {
+              "readOnlyHint": false,
+              "destructiveHint": false,
+              "idempotentHint": true,
+              "openWorldHint": false
+            }
+          },
+          {
+            "name": "records_delete",
+            "title": "Records delete",
+            "description": "For plan-required operations, prepare first; preparation does not mutate. Prepare with {operation, arguments}. Execute only with the returned {operation, plan_id, target, effect_summary}; never combine preparation and execution fields. Delete or detach record-scoped content.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "operation": {
+                  "type": "string",
+                  "enum": [
+                    "delete_record",
+                    "manage_attachments.detach",
+                    "manage_citations.remove"
+                  ]
+                },
+                "arguments": {
+                  "type": "object",
+                  "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                },
+                "run_key": {
+                  "type": "string"
+                },
+                "parent_key": {
+                  "type": "string"
+                },
+                "plan_id": {
+                  "type": "string",
+                  "description": "Opaque id returned by preparation."
+                },
+                "target": {
+                  "type": "string",
+                  "description": "Exact visible target returned by preparation."
+                },
+                "effect_summary": {
+                  "type": "string",
+                  "description": "Exact visible effect returned by preparation."
+                }
+              },
+              "required": [
+                "operation"
+              ],
+              "additionalProperties": false,
+              "oneOf": [
+                {
+                  "title": "Prepare or direct",
+                  "properties": {
+                    "operation": {
+                      "type": "string",
+                      "enum": [
+                        "delete_record",
+                        "manage_attachments.detach",
+                        "manage_citations.remove"
+                      ]
+                    },
+                    "arguments": {
+                      "type": "object",
+                      "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                    },
+                    "run_key": {
+                      "type": "string"
+                    },
+                    "parent_key": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "operation",
+                    "arguments"
+                  ],
+                  "not": {
+                    "anyOf": [
+                      {
+                        "required": [
+                          "plan_id"
+                        ]
+                      },
+                      {
+                        "required": [
+                          "target"
+                        ]
+                      },
+                      {
+                        "required": [
+                          "effect_summary"
+                        ]
+                      }
+                    ]
+                  }
+                },
+                {
+                  "title": "Execute prepared plan",
+                  "properties": {
+                    "operation": {
+                      "type": "string",
+                      "enum": [
+                        "delete_record",
+                        "manage_attachments.detach",
+                        "manage_citations.remove"
+                      ]
+                    },
+                    "run_key": {
+                      "type": "string"
+                    },
+                    "parent_key": {
+                      "type": "string"
+                    },
+                    "plan_id": {
+                      "type": "string",
+                      "description": "Opaque id returned by preparation."
+                    },
+                    "target": {
+                      "type": "string",
+                      "description": "Exact visible target returned by preparation."
+                    },
+                    "effect_summary": {
+                      "type": "string",
+                      "description": "Exact visible effect returned by preparation."
+                    }
+                  },
+                  "required": [
+                    "operation",
+                    "plan_id",
+                    "target",
+                    "effect_summary"
+                  ],
+                  "not": {
+                    "required": [
+                      "arguments"
+                    ]
+                  }
+                }
+              ]
+            },
+            "annotations": {
+              "readOnlyHint": false,
+              "destructiveHint": true,
+              "idempotentHint": true,
+              "openWorldHint": false
+            }
+          },
+          {
+            "name": "coordination_read",
+            "title": "Coordination read",
+            "description": "Inspect run activity and preview claimable work.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "operation": {
+                  "type": "string",
+                  "enum": [
+                    "get_event_context",
+                    "get_run_activity",
+                    "start_work.preview"
+                  ]
+                },
+                "arguments": {
+                  "type": "object",
+                  "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                },
+                "run_key": {
+                  "type": "string"
+                },
+                "parent_key": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "operation"
+              ],
+              "additionalProperties": false
+            },
+            "annotations": {
+              "readOnlyHint": true,
+              "destructiveHint": false,
+              "idempotentHint": true,
+              "openWorldHint": false
+            }
+          },
+          {
+            "name": "coordination_write",
+            "title": "Coordination write",
+            "description": "Declare intent and claim or release work.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "operation": {
+                  "type": "string",
+                  "enum": [
+                    "close_run",
+                    "set_intent",
+                    "start_work.claim",
+                    "start_work.release"
+                  ]
+                },
+                "arguments": {
+                  "type": "object",
+                  "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                },
+                "run_key": {
+                  "type": "string"
+                },
+                "parent_key": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "operation"
+              ],
+              "additionalProperties": false
+            },
+            "annotations": {
+              "readOnlyHint": false,
+              "destructiveHint": false,
+              "idempotentHint": true,
+              "openWorldHint": false
+            }
+          },
+          {
+            "name": "sql_read",
+            "title": "SQL read",
+            "description": "Run explicitly authorized read-only SQL against the current database.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "operation": {
+                  "type": "string",
+                  "enum": [
+                    "query_sql"
+                  ]
+                },
+                "arguments": {
+                  "type": "object",
+                  "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                },
+                "run_key": {
+                  "type": "string"
+                },
+                "parent_key": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "operation"
+              ],
+              "additionalProperties": false
+            },
+            "annotations": {
+              "readOnlyHint": true,
+              "destructiveHint": false,
+              "idempotentHint": true,
+              "openWorldHint": true
+            }
+          },
+          {
+            "name": "external_import",
+            "title": "External import",
+            "description": "Fetch external content into an authorized record.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "operation": {
+                  "type": "string",
+                  "enum": [
+                    "attach_from_url"
+                  ]
+                },
+                "arguments": {
+                  "type": "object",
+                  "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                },
+                "run_key": {
+                  "type": "string"
+                },
+                "parent_key": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "operation"
+              ],
+              "additionalProperties": false
+            },
+            "annotations": {
+              "readOnlyHint": false,
+              "destructiveHint": false,
+              "idempotentHint": false,
+              "openWorldHint": true
+            }
+          },
+          {
+            "name": "identity_read",
+            "title": "Identity read",
+            "description": "Inspect governed external identity bindings and observations.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "operation": {
+                  "type": "string",
+                  "enum": [
+                    "manage_bindings.list",
+                    "manage_bindings.observations"
+                  ]
+                },
+                "arguments": {
+                  "type": "object",
+                  "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                },
+                "run_key": {
+                  "type": "string"
+                },
+                "parent_key": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "operation"
+              ],
+              "additionalProperties": false
+            },
+            "annotations": {
+              "readOnlyHint": true,
+              "destructiveHint": false,
+              "idempotentHint": true,
+              "openWorldHint": false
+            }
+          },
+          {
+            "name": "identity_resolve",
+            "title": "Identity resolve",
+            "description": "Resolve or observe external identities and materialize authorized lens records.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "operation": {
+                  "type": "string",
+                  "enum": [
+                    "observe_external",
+                    "resolve_external"
+                  ]
+                },
+                "arguments": {
+                  "type": "object",
+                  "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                },
+                "run_key": {
+                  "type": "string"
+                },
+                "parent_key": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "operation"
+              ],
+              "additionalProperties": false
+            },
+            "annotations": {
+              "readOnlyHint": false,
+              "destructiveHint": false,
+              "idempotentHint": true,
+              "openWorldHint": true
+            }
+          },
+          {
+            "name": "identity_admin",
+            "title": "Identity administration",
+            "description": "For plan-required operations, prepare first; preparation does not mutate. Prepare with {operation, arguments}. Execute only with the returned {operation, plan_id, target, effect_summary}; never combine preparation and execution fields. Add, remove, canonicalize or reconcile governed identity bindings.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "operation": {
+                  "type": "string",
+                  "enum": [
+                    "manage_bindings.add",
+                    "manage_bindings.canonicalize",
+                    "manage_bindings.reconcile",
+                    "manage_bindings.remove"
+                  ]
+                },
+                "arguments": {
+                  "type": "object",
+                  "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                },
+                "run_key": {
+                  "type": "string"
+                },
+                "parent_key": {
+                  "type": "string"
+                },
+                "plan_id": {
+                  "type": "string",
+                  "description": "Opaque id returned by preparation."
+                },
+                "target": {
+                  "type": "string",
+                  "description": "Exact visible target returned by preparation."
+                },
+                "effect_summary": {
+                  "type": "string",
+                  "description": "Exact visible effect returned by preparation."
+                }
+              },
+              "required": [
+                "operation"
+              ],
+              "additionalProperties": false,
+              "oneOf": [
+                {
+                  "title": "Prepare or direct",
+                  "properties": {
+                    "operation": {
+                      "type": "string",
+                      "enum": [
+                        "manage_bindings.add",
+                        "manage_bindings.canonicalize",
+                        "manage_bindings.reconcile",
+                        "manage_bindings.remove"
+                      ]
+                    },
+                    "arguments": {
+                      "type": "object",
+                      "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                    },
+                    "run_key": {
+                      "type": "string"
+                    },
+                    "parent_key": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "operation",
+                    "arguments"
+                  ],
+                  "not": {
+                    "anyOf": [
+                      {
+                        "required": [
+                          "plan_id"
+                        ]
+                      },
+                      {
+                        "required": [
+                          "target"
+                        ]
+                      },
+                      {
+                        "required": [
+                          "effect_summary"
+                        ]
+                      }
+                    ]
+                  }
+                },
+                {
+                  "title": "Execute prepared plan",
+                  "properties": {
+                    "operation": {
+                      "type": "string",
+                      "enum": [
+                        "manage_bindings.add",
+                        "manage_bindings.canonicalize",
+                        "manage_bindings.reconcile",
+                        "manage_bindings.remove"
+                      ]
+                    },
+                    "run_key": {
+                      "type": "string"
+                    },
+                    "parent_key": {
+                      "type": "string"
+                    },
+                    "plan_id": {
+                      "type": "string",
+                      "description": "Opaque id returned by preparation."
+                    },
+                    "target": {
+                      "type": "string",
+                      "description": "Exact visible target returned by preparation."
+                    },
+                    "effect_summary": {
+                      "type": "string",
+                      "description": "Exact visible effect returned by preparation."
+                    }
+                  },
+                  "required": [
+                    "operation",
+                    "plan_id",
+                    "target",
+                    "effect_summary"
+                  ],
+                  "not": {
+                    "required": [
+                      "arguments"
+                    ]
+                  }
+                }
+              ]
+            },
+            "annotations": {
+              "readOnlyHint": false,
+              "destructiveHint": true,
+              "idempotentHint": true,
+              "openWorldHint": false
+            }
+          },
+          {
+            "name": "access_read",
+            "title": "Access read",
+            "description": "Inspect record and artifact access policy.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "operation": {
+                  "type": "string",
+                  "enum": [
+                    "manage_artifact_module_grants.read",
+                    "manage_record_policy.inspect",
+                    "manage_record_policy.list"
+                  ]
+                },
+                "arguments": {
+                  "type": "object",
+                  "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                },
+                "run_key": {
+                  "type": "string"
+                },
+                "parent_key": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "operation"
+              ],
+              "additionalProperties": false
+            },
+            "annotations": {
+              "readOnlyHint": true,
+              "destructiveHint": false,
+              "idempotentHint": true,
+              "openWorldHint": false
+            }
+          },
+          {
+            "name": "access_admin",
+            "title": "Access administration",
+            "description": "For plan-required operations, prepare first; preparation does not mutate. Prepare with {operation, arguments}. Execute only with the returned {operation, plan_id, target, effect_summary}; never combine preparation and execution fields. Grant, revoke or replace record and artifact access policy.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "operation": {
+                  "type": "string",
+                  "enum": [
+                    "manage_artifact_module_grants.grant",
+                    "manage_artifact_module_grants.revoke",
+                    "manage_record_policy.grant",
+                    "manage_record_policy.replace",
+                    "manage_record_policy.restore_inheritance",
+                    "manage_record_policy.revoke",
+                    "manage_record_policy.set_many",
+                    "manage_record_policy.set_members_baseline"
+                  ]
+                },
+                "arguments": {
+                  "type": "object",
+                  "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                },
+                "run_key": {
+                  "type": "string"
+                },
+                "parent_key": {
+                  "type": "string"
+                },
+                "plan_id": {
+                  "type": "string",
+                  "description": "Opaque id returned by preparation."
+                },
+                "target": {
+                  "type": "string",
+                  "description": "Exact visible target returned by preparation."
+                },
+                "effect_summary": {
+                  "type": "string",
+                  "description": "Exact visible effect returned by preparation."
+                }
+              },
+              "required": [
+                "operation"
+              ],
+              "additionalProperties": false,
+              "oneOf": [
+                {
+                  "title": "Prepare or direct",
+                  "properties": {
+                    "operation": {
+                      "type": "string",
+                      "enum": [
+                        "manage_artifact_module_grants.grant",
+                        "manage_artifact_module_grants.revoke",
+                        "manage_record_policy.grant",
+                        "manage_record_policy.replace",
+                        "manage_record_policy.restore_inheritance",
+                        "manage_record_policy.revoke",
+                        "manage_record_policy.set_many",
+                        "manage_record_policy.set_members_baseline"
+                      ]
+                    },
+                    "arguments": {
+                      "type": "object",
+                      "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                    },
+                    "run_key": {
+                      "type": "string"
+                    },
+                    "parent_key": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "operation",
+                    "arguments"
+                  ],
+                  "not": {
+                    "anyOf": [
+                      {
+                        "required": [
+                          "plan_id"
+                        ]
+                      },
+                      {
+                        "required": [
+                          "target"
+                        ]
+                      },
+                      {
+                        "required": [
+                          "effect_summary"
+                        ]
+                      }
+                    ]
+                  }
+                },
+                {
+                  "title": "Execute prepared plan",
+                  "properties": {
+                    "operation": {
+                      "type": "string",
+                      "enum": [
+                        "manage_artifact_module_grants.grant",
+                        "manage_artifact_module_grants.revoke",
+                        "manage_record_policy.grant",
+                        "manage_record_policy.replace",
+                        "manage_record_policy.restore_inheritance",
+                        "manage_record_policy.revoke",
+                        "manage_record_policy.set_many",
+                        "manage_record_policy.set_members_baseline"
+                      ]
+                    },
+                    "run_key": {
+                      "type": "string"
+                    },
+                    "parent_key": {
+                      "type": "string"
+                    },
+                    "plan_id": {
+                      "type": "string",
+                      "description": "Opaque id returned by preparation."
+                    },
+                    "target": {
+                      "type": "string",
+                      "description": "Exact visible target returned by preparation."
+                    },
+                    "effect_summary": {
+                      "type": "string",
+                      "description": "Exact visible effect returned by preparation."
+                    }
+                  },
+                  "required": [
+                    "operation",
+                    "plan_id",
+                    "target",
+                    "effect_summary"
+                  ],
+                  "not": {
+                    "required": [
+                      "arguments"
+                    ]
+                  }
+                }
+              ]
+            },
+            "annotations": {
+              "readOnlyHint": false,
+              "destructiveHint": true,
+              "idempotentHint": true,
+              "openWorldHint": false
+            }
+          },
+          {
+            "name": "schema_read",
+            "title": "Schema read",
+            "description": "Record shape first: preview_record_shape for types, kinds, facets and vocabularies; manage_vocabularies.list_values for values. describe_schema is the physical table schema for sql_read.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "operation": {
+                  "type": "string",
+                  "enum": [
+                    "describe_schema",
+                    "manage_schema_config.read",
+                    "manage_vocabularies.list_values",
+                    "preview_record_shape"
+                  ]
+                },
+                "arguments": {
+                  "type": "object",
+                  "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                },
+                "run_key": {
+                  "type": "string"
+                },
+                "parent_key": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "operation"
+              ],
+              "additionalProperties": false
+            },
+            "annotations": {
+              "readOnlyHint": true,
+              "destructiveHint": false,
+              "idempotentHint": true,
+              "openWorldHint": false
+            }
+          },
+          {
+            "name": "schema_admin",
+            "title": "Schema administration",
+            "description": "For plan-required operations, prepare first; preparation does not mutate. Prepare with {operation, arguments}. Execute only with the returned {operation, plan_id, target, effect_summary}; never combine preparation and execution fields. Create or change schema and vocabulary configuration.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "operation": {
+                  "type": "string",
+                  "enum": [
+                    "manage_schema_config.write",
+                    "manage_vocabularies.alias_value",
+                    "manage_vocabularies.create_vocabulary",
+                    "manage_vocabularies.deprecate_value",
+                    "manage_vocabularies.promote_value",
+                    "manage_vocabularies.propose_value",
+                    "manage_vocabularies.reorder_value",
+                    "manage_vocabularies.set_gloss",
+                    "manage_vocabularies.set_metadata"
+                  ]
+                },
+                "arguments": {
+                  "type": "object",
+                  "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                },
+                "run_key": {
+                  "type": "string"
+                },
+                "parent_key": {
+                  "type": "string"
+                },
+                "plan_id": {
+                  "type": "string",
+                  "description": "Opaque id returned by preparation."
+                },
+                "target": {
+                  "type": "string",
+                  "description": "Exact visible target returned by preparation."
+                },
+                "effect_summary": {
+                  "type": "string",
+                  "description": "Exact visible effect returned by preparation."
+                }
+              },
+              "required": [
+                "operation"
+              ],
+              "additionalProperties": false,
+              "oneOf": [
+                {
+                  "title": "Prepare or direct",
+                  "properties": {
+                    "operation": {
+                      "type": "string",
+                      "enum": [
+                        "manage_schema_config.write",
+                        "manage_vocabularies.alias_value",
+                        "manage_vocabularies.create_vocabulary",
+                        "manage_vocabularies.deprecate_value",
+                        "manage_vocabularies.promote_value",
+                        "manage_vocabularies.propose_value",
+                        "manage_vocabularies.reorder_value",
+                        "manage_vocabularies.set_gloss",
+                        "manage_vocabularies.set_metadata"
+                      ]
+                    },
+                    "arguments": {
+                      "type": "object",
+                      "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                    },
+                    "run_key": {
+                      "type": "string"
+                    },
+                    "parent_key": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "operation",
+                    "arguments"
+                  ],
+                  "not": {
+                    "anyOf": [
+                      {
+                        "required": [
+                          "plan_id"
+                        ]
+                      },
+                      {
+                        "required": [
+                          "target"
+                        ]
+                      },
+                      {
+                        "required": [
+                          "effect_summary"
+                        ]
+                      }
+                    ]
+                  }
+                },
+                {
+                  "title": "Execute prepared plan",
+                  "properties": {
+                    "operation": {
+                      "type": "string",
+                      "enum": [
+                        "manage_schema_config.write",
+                        "manage_vocabularies.alias_value",
+                        "manage_vocabularies.create_vocabulary",
+                        "manage_vocabularies.deprecate_value",
+                        "manage_vocabularies.promote_value",
+                        "manage_vocabularies.propose_value",
+                        "manage_vocabularies.reorder_value",
+                        "manage_vocabularies.set_gloss",
+                        "manage_vocabularies.set_metadata"
+                      ]
+                    },
+                    "run_key": {
+                      "type": "string"
+                    },
+                    "parent_key": {
+                      "type": "string"
+                    },
+                    "plan_id": {
+                      "type": "string",
+                      "description": "Opaque id returned by preparation."
+                    },
+                    "target": {
+                      "type": "string",
+                      "description": "Exact visible target returned by preparation."
+                    },
+                    "effect_summary": {
+                      "type": "string",
+                      "description": "Exact visible effect returned by preparation."
+                    }
+                  },
+                  "required": [
+                    "operation",
+                    "plan_id",
+                    "target",
+                    "effect_summary"
+                  ],
+                  "not": {
+                    "required": [
+                      "arguments"
+                    ]
+                  }
+                }
+              ]
+            },
+            "annotations": {
+              "readOnlyHint": false,
+              "destructiveHint": true,
+              "idempotentHint": true,
+              "openWorldHint": false
+            }
+          },
+          {
+            "name": "schema_delete",
+            "title": "Schema deletion",
+            "description": "For plan-required operations, prepare first; preparation does not mutate. Prepare with {operation, arguments}. Execute only with the returned {operation, plan_id, target, effect_summary}; never combine preparation and execution fields. Delete vocabulary values or vocabularies.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "operation": {
+                  "type": "string",
+                  "enum": [
+                    "manage_vocabularies.delete_value",
+                    "manage_vocabularies.delete_vocabulary"
+                  ]
+                },
+                "arguments": {
+                  "type": "object",
+                  "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                },
+                "run_key": {
+                  "type": "string"
+                },
+                "parent_key": {
+                  "type": "string"
+                },
+                "plan_id": {
+                  "type": "string",
+                  "description": "Opaque id returned by preparation."
+                },
+                "target": {
+                  "type": "string",
+                  "description": "Exact visible target returned by preparation."
+                },
+                "effect_summary": {
+                  "type": "string",
+                  "description": "Exact visible effect returned by preparation."
+                }
+              },
+              "required": [
+                "operation"
+              ],
+              "additionalProperties": false,
+              "oneOf": [
+                {
+                  "title": "Prepare or direct",
+                  "properties": {
+                    "operation": {
+                      "type": "string",
+                      "enum": [
+                        "manage_vocabularies.delete_value",
+                        "manage_vocabularies.delete_vocabulary"
+                      ]
+                    },
+                    "arguments": {
+                      "type": "object",
+                      "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                    },
+                    "run_key": {
+                      "type": "string"
+                    },
+                    "parent_key": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "operation",
+                    "arguments"
+                  ],
+                  "not": {
+                    "anyOf": [
+                      {
+                        "required": [
+                          "plan_id"
+                        ]
+                      },
+                      {
+                        "required": [
+                          "target"
+                        ]
+                      },
+                      {
+                        "required": [
+                          "effect_summary"
+                        ]
+                      }
+                    ]
+                  }
+                },
+                {
+                  "title": "Execute prepared plan",
+                  "properties": {
+                    "operation": {
+                      "type": "string",
+                      "enum": [
+                        "manage_vocabularies.delete_value",
+                        "manage_vocabularies.delete_vocabulary"
+                      ]
+                    },
+                    "run_key": {
+                      "type": "string"
+                    },
+                    "parent_key": {
+                      "type": "string"
+                    },
+                    "plan_id": {
+                      "type": "string",
+                      "description": "Opaque id returned by preparation."
+                    },
+                    "target": {
+                      "type": "string",
+                      "description": "Exact visible target returned by preparation."
+                    },
+                    "effect_summary": {
+                      "type": "string",
+                      "description": "Exact visible effect returned by preparation."
+                    }
+                  },
+                  "required": [
+                    "operation",
+                    "plan_id",
+                    "target",
+                    "effect_summary"
+                  ],
+                  "not": {
+                    "required": [
+                      "arguments"
+                    ]
+                  }
+                }
+              ]
+            },
+            "annotations": {
+              "readOnlyHint": false,
+              "destructiveHint": true,
+              "idempotentHint": true,
+              "openWorldHint": false
+            }
+          },
+          {
+            "name": "messaging_read",
+            "title": "Messaging read",
+            "description": "Read authorized conversations, inbox state and interventions.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "operation": {
+                  "type": "string",
+                  "enum": [
+                    "manage_interventions.get",
+                    "manage_interventions.query",
+                    "manage_messages.get_attention",
+                    "manage_messages.list_context",
+                    "manage_messages.list_conversation",
+                    "manage_messages.list_destinations",
+                    "manage_messages.list_inbox",
+                    "manage_messages.list_message_state",
+                    "manage_messages.list_my_conversations",
+                    "manage_messages.list_notification_candidates",
+                    "manage_messages.list_unclassified"
+                  ]
+                },
+                "arguments": {
+                  "type": "object",
+                  "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                },
+                "run_key": {
+                  "type": "string"
+                },
+                "parent_key": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "operation"
+              ],
+              "additionalProperties": false
+            },
+            "annotations": {
+              "readOnlyHint": true,
+              "destructiveHint": false,
+              "idempotentHint": true,
+              "openWorldHint": true
+            }
+          },
+          {
+            "name": "messaging_write",
+            "title": "Messaging write",
+            "description": "Send new messages and replies; classify, route or otherwise change externally visible messaging state.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "operation": {
+                  "type": "string",
+                  "enum": [
+                    "manage_interventions.cancel",
+                    "manage_interventions.resume_delivery",
+                    "manage_messages.add_reaction",
+                    "manage_messages.classify",
+                    "manage_messages.move",
+                    "manage_messages.mutate_human_awareness",
+                    "manage_messages.remove_reaction",
+                    "manage_messages.satisfy_acknowledgement_expectation_with_reaction",
+                    "manage_messages.send",
+                    "manage_messages.set_agent_disposition",
+                    "manage_messages.set_destination",
+                    "manage_messages.set_preference",
+                    "manage_messages.set_routing",
+                    "manage_messages.share_history",
+                    "manage_messages.unclassify"
+                  ]
+                },
+                "arguments": {
+                  "type": "object",
+                  "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                },
+                "run_key": {
+                  "type": "string"
+                },
+                "parent_key": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "operation"
+              ],
+              "additionalProperties": false
+            },
+            "annotations": {
+              "readOnlyHint": false,
+              "destructiveHint": false,
+              "idempotentHint": false,
+              "openWorldHint": true
+            }
+          },
+          {
+            "name": "artifacts_read",
+            "title": "Artifacts read",
+            "description": "Inspect and verify artifacts, modules, inputs and confirmed change summaries.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "operation": {
+                  "type": "string",
+                  "enum": [
+                    "manage_artifact_inputs.read",
+                    "manage_change_summaries.inspect",
+                    "manage_mdx_modules.impact",
+                    "manage_mdx_modules.inspect",
+                    "manage_renderer_binding.read",
+                    "query_change_summaries.drill",
+                    "query_change_summaries.get",
+                    "query_change_summaries.list",
+                    "verify_artifact"
+                  ]
+                },
+                "arguments": {
+                  "type": "object",
+                  "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                },
+                "run_key": {
+                  "type": "string"
+                },
+                "parent_key": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "operation"
+              ],
+              "additionalProperties": false
+            },
+            "annotations": {
+              "readOnlyHint": true,
+              "destructiveHint": false,
+              "idempotentHint": true,
+              "openWorldHint": false
+            }
+          },
+          {
+            "name": "artifacts_execute",
+            "title": "Artifacts execute",
+            "description": "Render or open executable/interactive artifact output.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "operation": {
+                  "type": "string",
+                  "enum": [
+                    "invoke_artifact_interaction",
+                    "open_collection",
+                    "render_artifact"
+                  ]
+                },
+                "arguments": {
+                  "type": "object",
+                  "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                },
+                "run_key": {
+                  "type": "string"
+                },
+                "parent_key": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "operation"
+              ],
+              "additionalProperties": false
+            },
+            "annotations": {
+              "readOnlyHint": false,
+              "destructiveHint": false,
+              "idempotentHint": false,
+              "openWorldHint": true
+            }
+          },
+          {
+            "name": "artifacts_write",
+            "title": "Artifacts write",
+            "description": "Copy, bind or publish artifacts and manage change-summary state. Author from scratch with records_write.create_record: type Document, kind artifact, facets.runtime. For runtime choice and create/bind/grant/render steps, read guidance_read.read_guide topic compositions. instantiate_artifact copies an existing source.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "operation": {
+                  "type": "string",
+                  "enum": [
+                    "instantiate_artifact",
+                    "manage_artifact_inputs.bind",
+                    "manage_artifact_inputs.unbind",
+                    "manage_change_summaries.confirm",
+                    "manage_change_summaries.create_or_reuse",
+                    "manage_change_summaries.derive",
+                    "manage_change_summaries.revoke",
+                    "manage_mdx_modules.deprecate",
+                    "manage_mdx_modules.publish",
+                    "manage_mdx_modules.withdraw",
+                    "manage_renderer_binding.bind",
+                    "manage_renderer_binding.unbind"
+                  ]
+                },
+                "arguments": {
+                  "type": "object",
+                  "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                },
+                "run_key": {
+                  "type": "string"
+                },
+                "parent_key": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "operation"
+              ],
+              "additionalProperties": false
+            },
+            "annotations": {
+              "readOnlyHint": false,
+              "destructiveHint": false,
+              "idempotentHint": false,
+              "openWorldHint": false
+            }
+          },
+          {
+            "name": "membership_read",
+            "title": "Membership read",
+            "description": "List the hosted database roster.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "operation": {
+                  "type": "string",
+                  "enum": [
+                    "manage_memberships.invitations_inspect",
+                    "manage_memberships.invitations_list",
+                    "manage_memberships.list"
+                  ]
+                },
+                "arguments": {
+                  "type": "object",
+                  "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                },
+                "run_key": {
+                  "type": "string"
+                },
+                "parent_key": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "operation"
+              ],
+              "additionalProperties": false
+            },
+            "annotations": {
+              "readOnlyHint": true,
+              "destructiveHint": false,
+              "idempotentHint": true,
+              "openWorldHint": false
+            }
+          },
+          {
+            "name": "membership_admin",
+            "title": "Membership administration",
+            "description": "For plan-required operations, prepare first; preparation does not mutate. Prepare with {operation, arguments}. Execute only with the returned {operation, plan_id, target, effect_summary}; never combine preparation and execution fields. Change hosted member roles.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "operation": {
+                  "type": "string",
+                  "enum": [
+                    "manage_memberships.invitations_copy_link",
+                    "manage_memberships.invitations_create",
+                    "manage_memberships.invitations_revoke",
+                    "manage_memberships.invitations_send",
+                    "manage_memberships.set_role"
+                  ]
+                },
+                "arguments": {
+                  "type": "object",
+                  "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                },
+                "run_key": {
+                  "type": "string"
+                },
+                "parent_key": {
+                  "type": "string"
+                },
+                "plan_id": {
+                  "type": "string",
+                  "description": "Opaque id returned by preparation."
+                },
+                "target": {
+                  "type": "string",
+                  "description": "Exact visible target returned by preparation."
+                },
+                "effect_summary": {
+                  "type": "string",
+                  "description": "Exact visible effect returned by preparation."
+                }
+              },
+              "required": [
+                "operation"
+              ],
+              "additionalProperties": false,
+              "oneOf": [
+                {
+                  "title": "Prepare or direct",
+                  "properties": {
+                    "operation": {
+                      "type": "string",
+                      "enum": [
+                        "manage_memberships.invitations_copy_link",
+                        "manage_memberships.invitations_create",
+                        "manage_memberships.invitations_revoke",
+                        "manage_memberships.invitations_send",
+                        "manage_memberships.set_role"
+                      ]
+                    },
+                    "arguments": {
+                      "type": "object",
+                      "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                    },
+                    "run_key": {
+                      "type": "string"
+                    },
+                    "parent_key": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "operation",
+                    "arguments"
+                  ],
+                  "not": {
+                    "anyOf": [
+                      {
+                        "required": [
+                          "plan_id"
+                        ]
+                      },
+                      {
+                        "required": [
+                          "target"
+                        ]
+                      },
+                      {
+                        "required": [
+                          "effect_summary"
+                        ]
+                      }
+                    ]
+                  }
+                },
+                {
+                  "title": "Execute prepared plan",
+                  "properties": {
+                    "operation": {
+                      "type": "string",
+                      "enum": [
+                        "manage_memberships.invitations_copy_link",
+                        "manage_memberships.invitations_create",
+                        "manage_memberships.invitations_revoke",
+                        "manage_memberships.invitations_send",
+                        "manage_memberships.set_role"
+                      ]
+                    },
+                    "run_key": {
+                      "type": "string"
+                    },
+                    "parent_key": {
+                      "type": "string"
+                    },
+                    "plan_id": {
+                      "type": "string",
+                      "description": "Opaque id returned by preparation."
+                    },
+                    "target": {
+                      "type": "string",
+                      "description": "Exact visible target returned by preparation."
+                    },
+                    "effect_summary": {
+                      "type": "string",
+                      "description": "Exact visible effect returned by preparation."
+                    }
+                  },
+                  "required": [
+                    "operation",
+                    "plan_id",
+                    "target",
+                    "effect_summary"
+                  ],
+                  "not": {
+                    "required": [
+                      "arguments"
+                    ]
+                  }
+                }
+              ]
+            },
+            "annotations": {
+              "readOnlyHint": false,
+              "destructiveHint": true,
+              "idempotentHint": true,
+              "openWorldHint": false
+            }
+          },
+          {
+            "name": "membership_remove",
+            "title": "Membership removal",
+            "description": "For plan-required operations, prepare first; preparation does not mutate. Prepare with {operation, arguments}. Execute only with the returned {operation, plan_id, target, effect_summary}; never combine preparation and execution fields. Remove a hosted member with governed offboarding.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "operation": {
+                  "type": "string",
+                  "enum": [
+                    "manage_memberships.remove"
+                  ]
+                },
+                "arguments": {
+                  "type": "object",
+                  "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                },
+                "run_key": {
+                  "type": "string"
+                },
+                "parent_key": {
+                  "type": "string"
+                },
+                "plan_id": {
+                  "type": "string",
+                  "description": "Opaque id returned by preparation."
+                },
+                "target": {
+                  "type": "string",
+                  "description": "Exact visible target returned by preparation."
+                },
+                "effect_summary": {
+                  "type": "string",
+                  "description": "Exact visible effect returned by preparation."
+                }
+              },
+              "required": [
+                "operation"
+              ],
+              "additionalProperties": false,
+              "oneOf": [
+                {
+                  "title": "Prepare or direct",
+                  "properties": {
+                    "operation": {
+                      "type": "string",
+                      "enum": [
+                        "manage_memberships.remove"
+                      ]
+                    },
+                    "arguments": {
+                      "type": "object",
+                      "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                    },
+                    "run_key": {
+                      "type": "string"
+                    },
+                    "parent_key": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "operation",
+                    "arguments"
+                  ],
+                  "not": {
+                    "anyOf": [
+                      {
+                        "required": [
+                          "plan_id"
+                        ]
+                      },
+                      {
+                        "required": [
+                          "target"
+                        ]
+                      },
+                      {
+                        "required": [
+                          "effect_summary"
+                        ]
+                      }
+                    ]
+                  }
+                },
+                {
+                  "title": "Execute prepared plan",
+                  "properties": {
+                    "operation": {
+                      "type": "string",
+                      "enum": [
+                        "manage_memberships.remove"
+                      ]
+                    },
+                    "run_key": {
+                      "type": "string"
+                    },
+                    "parent_key": {
+                      "type": "string"
+                    },
+                    "plan_id": {
+                      "type": "string",
+                      "description": "Opaque id returned by preparation."
+                    },
+                    "target": {
+                      "type": "string",
+                      "description": "Exact visible target returned by preparation."
+                    },
+                    "effect_summary": {
+                      "type": "string",
+                      "description": "Exact visible effect returned by preparation."
+                    }
+                  },
+                  "required": [
+                    "operation",
+                    "plan_id",
+                    "target",
+                    "effect_summary"
+                  ],
+                  "not": {
+                    "required": [
+                      "arguments"
+                    ]
+                  }
+                }
+              ]
+            },
+            "annotations": {
+              "readOnlyHint": false,
+              "destructiveHint": true,
+              "idempotentHint": true,
+              "openWorldHint": false
+            }
+          },
+          {
+            "name": "export",
+            "title": "Export",
+            "description": "Create a verified complete database snapshot.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "operation": {
+                  "type": "string",
+                  "enum": [
+                    "export_snapshot"
+                  ]
+                },
+                "arguments": {
+                  "type": "object",
+                  "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                },
+                "run_key": {
+                  "type": "string"
+                },
+                "parent_key": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "operation"
+              ],
+              "additionalProperties": false
+            },
+            "annotations": {
+              "readOnlyHint": true,
+              "destructiveHint": false,
+              "idempotentHint": true,
+              "openWorldHint": true
+            }
+          },
+          {
+            "name": "canvas_read",
+            "title": "Canvas read",
+            "description": "Read a canvas scene or the accepted batches after a version.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "operation": {
+                  "type": "string",
+                  "enum": [
+                    "read_canvas.changes",
+                    "read_canvas.describe",
+                    "read_canvas.export",
+                    "read_canvas.get_scene"
+                  ]
+                },
+                "arguments": {
+                  "type": "object",
+                  "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                },
+                "run_key": {
+                  "type": "string"
+                },
+                "parent_key": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "operation"
+              ],
+              "additionalProperties": false
+            },
+            "annotations": {
+              "readOnlyHint": true,
+              "destructiveHint": false,
+              "idempotentHint": true,
+              "openWorldHint": false
+            }
+          },
+          {
+            "name": "canvas_write",
+            "title": "Canvas write",
+            "description": "For plan-required operations, prepare first; preparation does not mutate. Prepare with {operation, arguments}. Execute only with the returned {operation, plan_id, target, effect_summary}; never combine preparation and execution fields. Commit atomic, precondition-checked batches to a canvas scene.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "operation": {
+                  "type": "string",
+                  "enum": [
+                    "manage_canvas.assert_connector",
+                    "manage_canvas.commit_batch",
+                    "manage_canvas.promote"
+                  ]
+                },
+                "arguments": {
+                  "type": "object",
+                  "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                },
+                "run_key": {
+                  "type": "string"
+                },
+                "parent_key": {
+                  "type": "string"
+                },
+                "plan_id": {
+                  "type": "string",
+                  "description": "Opaque id returned by preparation."
+                },
+                "target": {
+                  "type": "string",
+                  "description": "Exact visible target returned by preparation."
+                },
+                "effect_summary": {
+                  "type": "string",
+                  "description": "Exact visible effect returned by preparation."
+                }
+              },
+              "required": [
+                "operation"
+              ],
+              "additionalProperties": false,
+              "oneOf": [
+                {
+                  "title": "Prepare or direct",
+                  "properties": {
+                    "operation": {
+                      "type": "string",
+                      "enum": [
+                        "manage_canvas.assert_connector",
+                        "manage_canvas.commit_batch",
+                        "manage_canvas.promote"
+                      ]
+                    },
+                    "arguments": {
+                      "type": "object",
+                      "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                    },
+                    "run_key": {
+                      "type": "string"
+                    },
+                    "parent_key": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "operation",
+                    "arguments"
+                  ],
+                  "not": {
+                    "anyOf": [
+                      {
+                        "required": [
+                          "plan_id"
+                        ]
+                      },
+                      {
+                        "required": [
+                          "target"
+                        ]
+                      },
+                      {
+                        "required": [
+                          "effect_summary"
+                        ]
+                      }
+                    ]
+                  }
+                },
+                {
+                  "title": "Execute prepared plan",
+                  "properties": {
+                    "operation": {
+                      "type": "string",
+                      "enum": [
+                        "manage_canvas.promote"
+                      ]
+                    },
+                    "run_key": {
+                      "type": "string"
+                    },
+                    "parent_key": {
+                      "type": "string"
+                    },
+                    "plan_id": {
+                      "type": "string",
+                      "description": "Opaque id returned by preparation."
+                    },
+                    "target": {
+                      "type": "string",
+                      "description": "Exact visible target returned by preparation."
+                    },
+                    "effect_summary": {
+                      "type": "string",
+                      "description": "Exact visible effect returned by preparation."
+                    }
+                  },
+                  "required": [
+                    "operation",
+                    "plan_id",
+                    "target",
+                    "effect_summary"
+                  ],
+                  "not": {
+                    "required": [
+                      "arguments"
+                    ]
+                  }
+                }
+              ]
+            },
+            "annotations": {
+              "readOnlyHint": false,
+              "destructiveHint": false,
+              "idempotentHint": true,
+              "openWorldHint": false
+            }
+          },
+          {
+            "name": "reach_read",
+            "title": "Reach read",
+            "description": "Inspect connected providers and discover bounded pointers from hosted external work sources.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "operation": {
+                  "type": "string",
+                  "enum": [
+                    "reach_read.list_linear_projects",
+                    "reach_read.recent_activity",
+                    "reach_read.search_notion",
+                    "reach_read.search_slack",
+                    "reach_read.source_status"
+                  ]
+                },
+                "arguments": {
+                  "type": "object",
+                  "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                },
+                "run_key": {
+                  "type": "string"
+                },
+                "parent_key": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "operation"
+              ],
+              "additionalProperties": false
+            },
+            "annotations": {
+              "readOnlyHint": true,
+              "destructiveHint": false,
+              "idempotentHint": true,
+              "openWorldHint": true
+            }
+          },
+          {
+            "name": "reach_connect",
+            "title": "Reach connect",
+            "description": "Mint a one-use browser consent URL for a hosted external work source.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "operation": {
+                  "type": "string",
+                  "enum": [
+                    "connect_source"
+                  ]
+                },
+                "arguments": {
+                  "type": "object",
+                  "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                },
+                "run_key": {
+                  "type": "string"
+                },
+                "parent_key": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "operation"
+              ],
+              "additionalProperties": false
+            },
+            "annotations": {
+              "readOnlyHint": false,
+              "destructiveHint": false,
+              "idempotentHint": false,
+              "openWorldHint": true
+            }
+          },
+          {
+            "name": "experimental_freshness",
+            "title": "Experimental freshness",
+            "description": "Run the feature-gated context-freshness development probe.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "operation": {
+                  "type": "string",
+                  "enum": [
+                    "experimental_freshness_agent_intent.assess_exact_change",
+                    "experimental_freshness_agent_intent.bind_exact_expression",
+                    "experimental_freshness_agent_intent.declare_sources",
+                    "experimental_freshness_agent_intent.promote_exact_expression",
+                    "experimental_freshness_agent_intent.reconcile_affected_output",
+                    "experimental_freshness_agent_intent.revise_exact_expression"
+                  ]
+                },
+                "arguments": {
+                  "type": "object",
+                  "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                },
+                "run_key": {
+                  "type": "string"
+                },
+                "parent_key": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "operation"
+              ],
+              "additionalProperties": false
+            },
+            "annotations": {
+              "readOnlyHint": false,
+              "destructiveHint": false,
+              "idempotentHint": false,
+              "openWorldHint": false
+            }
+          }
+        ]
+      },
+      "lens": {
+        "descriptor_bytes": 48779,
+        "descriptors": [
+          {
+            "name": "bootstrap",
+            "title": "Bootstrap",
+            "description": "Establish caller, workspace and run context.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {},
+              "additionalProperties": false
+            },
+            "annotations": {
+              "readOnlyHint": true,
+              "destructiveHint": false,
+              "idempotentHint": true,
+              "openWorldHint": false
+            }
+          },
+          {
+            "name": "describe_operation",
+            "title": "Describe operation",
+            "description": "Return one authoritative operation contract addressed by executor and operation.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "executor": {
+                  "type": "string",
+                  "enum": [
+                    "bootstrap",
+                    "describe_operation",
+                    "system_read",
+                    "guidance_read",
+                    "guidance_admin",
+                    "records_read",
+                    "records_write",
+                    "records_lifecycle",
+                    "records_delete",
+                    "coordination_read",
+                    "coordination_write",
+                    "sql_read",
+                    "external_import",
+                    "identity_read",
+                    "identity_resolve",
+                    "identity_admin",
+                    "access_read",
+                    "access_admin",
+                    "schema_read",
+                    "schema_admin",
+                    "schema_delete",
+                    "messaging_read",
+                    "messaging_write",
+                    "artifacts_read",
+                    "artifacts_execute",
+                    "artifacts_write",
+                    "membership_read",
+                    "membership_admin",
+                    "membership_remove",
+                    "export",
+                    "canvas_read",
+                    "canvas_write"
+                  ]
+                },
+                "operation": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "executor",
+                "operation"
+              ],
+              "additionalProperties": false
+            },
+            "annotations": {
+              "readOnlyHint": true,
+              "destructiveHint": false,
+              "idempotentHint": true,
+              "openWorldHint": false
+            }
+          },
+          {
+            "name": "system_read",
+            "title": "System information",
+            "description": "Read health, engine and protocol information.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "operation": {
+                  "type": "string",
+                  "enum": [
+                    "engine_info",
+                    "ping"
+                  ]
+                },
+                "arguments": {
+                  "type": "object",
+                  "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                },
+                "run_key": {
+                  "type": "string"
+                },
+                "parent_key": {
+                  "type": "string"
+                },
+                "destination_db_id": {
+                  "type": "string",
+                  "description": "Explicit lens destination for pass-through writes or destination-scoped reads."
+                },
+                "cursor": {
+                  "type": "string"
+                },
+                "page_size": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 50
+                }
+              },
+              "required": [
+                "operation"
+              ],
+              "additionalProperties": false
+            },
+            "annotations": {
+              "readOnlyHint": true,
+              "destructiveHint": false,
+              "idempotentHint": true,
+              "openWorldHint": false
+            }
+          },
+          {
+            "name": "guidance_read",
+            "title": "Guidance read",
+            "description": "Read product guidance, quickstart, instructions and onboarding configuration.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "operation": {
+                  "type": "string",
+                  "enum": [
+                    "manage_instructions.compare_seeded_default",
+                    "manage_instructions.list",
+                    "manage_onboarding.list_programmes",
+                    "manage_onboarding.preview_generation",
+                    "quickstart",
+                    "read_guide"
+                  ]
+                },
+                "arguments": {
+                  "type": "object",
+                  "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                },
+                "run_key": {
+                  "type": "string"
+                },
+                "parent_key": {
+                  "type": "string"
+                },
+                "destination_db_id": {
+                  "type": "string",
+                  "description": "Explicit lens destination for pass-through writes or destination-scoped reads."
+                },
+                "cursor": {
+                  "type": "string"
+                },
+                "page_size": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 50
+                }
+              },
+              "required": [
+                "operation"
+              ],
+              "additionalProperties": false
+            },
+            "annotations": {
+              "readOnlyHint": true,
+              "destructiveHint": false,
+              "idempotentHint": true,
+              "openWorldHint": false
+            }
+          },
+          {
+            "name": "guidance_admin",
+            "title": "Guidance administration",
+            "description": "Create or change instruction bindings and onboarding programmes.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "operation": {
+                  "type": "string",
+                  "enum": [
+                    "manage_instructions.apply_seeded_default",
+                    "manage_instructions.create_binding",
+                    "manage_instructions.disable_binding",
+                    "manage_instructions.enable_binding",
+                    "manage_instructions.remove_binding",
+                    "manage_instructions.reorder_binding",
+                    "manage_instructions.reset_seeded_default",
+                    "manage_instructions.retarget_binding",
+                    "manage_onboarding.add_source",
+                    "manage_onboarding.change_source",
+                    "manage_onboarding.configure_programme",
+                    "manage_onboarding.create_programme",
+                    "manage_onboarding.publish_generation",
+                    "manage_onboarding.record_progress",
+                    "manage_onboarding.remove_source",
+                    "manage_onboarding.reopen_obligation",
+                    "manage_onboarding.reorder_source",
+                    "manage_onboarding.resolve_obligation"
+                  ]
+                },
+                "arguments": {
+                  "type": "object",
+                  "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                },
+                "run_key": {
+                  "type": "string"
+                },
+                "parent_key": {
+                  "type": "string"
+                },
+                "destination_db_id": {
+                  "type": "string",
+                  "description": "Explicit lens destination for pass-through writes or destination-scoped reads."
+                }
+              },
+              "required": [
+                "operation"
+              ],
+              "additionalProperties": false
+            },
+            "annotations": {
+              "readOnlyHint": false,
+              "destructiveHint": false,
+              "idempotentHint": false,
+              "openWorldHint": false
+            }
+          },
+          {
+            "name": "records_read",
+            "title": "Records read",
+            "description": "Read, search, query and explain authorized records and their derived evidence. Known full id or short record reference: {operation:'get_record', arguments:{ids:[reference]}}. Lexical text: {operation:'search', arguments:{query:'...'}}. Direct query_record shape: {operation:'query_record', arguments:{steps:[{step:'filter', ...}], ...}}. Call directly when known; describe_operation is optional.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "operation": {
+                  "type": "string",
+                  "enum": [
+                    "get_dashboard",
+                    "get_history",
+                    "get_record",
+                    "get_structure",
+                    "manage_attachments.inspect",
+                    "manage_attachments.list",
+                    "manage_facet_observations.list",
+                    "manage_links.list",
+                    "manage_relationships.find",
+                    "manage_relationships.read",
+                    "manage_relationships.why",
+                    "query_record",
+                    "read_attachment",
+                    "read_attributions",
+                    "render_record",
+                    "render_record_version_diff",
+                    "render_suggestion_review",
+                    "resolve_citation",
+                    "resolve_facets",
+                    "resolve_many",
+                    "resolve_rollup",
+                    "scan",
+                    "search",
+                    "suggest_facet_values",
+                    "whats_changed"
+                  ]
+                },
+                "arguments": {
+                  "type": "object",
+                  "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                },
+                "run_key": {
+                  "type": "string"
+                },
+                "parent_key": {
+                  "type": "string"
+                },
+                "destination_db_id": {
+                  "type": "string",
+                  "description": "Explicit lens destination for pass-through writes or destination-scoped reads."
+                },
+                "cursor": {
+                  "type": "string"
+                },
+                "page_size": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 50
+                }
+              },
+              "required": [
+                "operation"
+              ],
+              "additionalProperties": false
+            },
+            "annotations": {
+              "readOnlyHint": true,
+              "destructiveHint": false,
+              "idempotentHint": true,
+              "openWorldHint": false
+            }
+          },
+          {
+            "name": "records_write",
+            "title": "Records write",
+            "description": "For plan-required operations, prepare first; preparation does not mutate. Prepare with {operation, arguments}. Execute only with the returned {operation, plan_id, target, effect_summary}; never combine preparation and execution fields. Create and edit ordinary record content, links, observations and governed annotations.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "operation": {
+                  "type": "string",
+                  "enum": [
+                    "attach_text",
+                    "claim_unowned_record",
+                    "correct_record_type",
+                    "create_attribution",
+                    "create_exploration",
+                    "create_many",
+                    "create_record",
+                    "manage_attributions.add_evidence",
+                    "manage_attributions.retract",
+                    "manage_citations.reanchor",
+                    "manage_facet_observations.set",
+                    "manage_facet_observations.unset",
+                    "manage_links.add",
+                    "manage_links.remove",
+                    "manage_relationships.add_evidence",
+                    "manage_relationships.assert",
+                    "manage_relationships.contest",
+                    "manage_relationships.retract",
+                    "resolve_suggestions.accept",
+                    "resolve_suggestions.reject",
+                    "update_record"
+                  ]
+                },
+                "arguments": {
+                  "type": "object",
+                  "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                },
+                "run_key": {
+                  "type": "string"
+                },
+                "parent_key": {
+                  "type": "string"
+                },
+                "destination_db_id": {
+                  "type": "string",
+                  "description": "Explicit lens destination for pass-through writes or destination-scoped reads."
+                },
+                "plan_id": {
+                  "type": "string",
+                  "description": "Opaque id returned by preparation."
+                },
+                "target": {
+                  "type": "string",
+                  "description": "Exact visible target returned by preparation."
+                },
+                "effect_summary": {
+                  "type": "string",
+                  "description": "Exact visible effect returned by preparation."
+                }
+              },
+              "required": [
+                "operation"
+              ],
+              "additionalProperties": false,
+              "oneOf": [
+                {
+                  "title": "Prepare or direct",
+                  "properties": {
+                    "operation": {
+                      "type": "string",
+                      "enum": [
+                        "attach_text",
+                        "claim_unowned_record",
+                        "correct_record_type",
+                        "create_attribution",
+                        "create_exploration",
+                        "create_many",
+                        "create_record",
+                        "manage_attributions.add_evidence",
+                        "manage_attributions.retract",
+                        "manage_citations.reanchor",
+                        "manage_facet_observations.set",
+                        "manage_facet_observations.unset",
+                        "manage_links.add",
+                        "manage_links.remove",
+                        "manage_relationships.add_evidence",
+                        "manage_relationships.assert",
+                        "manage_relationships.contest",
+                        "manage_relationships.retract",
+                        "resolve_suggestions.accept",
+                        "resolve_suggestions.reject",
+                        "update_record"
+                      ]
+                    },
+                    "arguments": {
+                      "type": "object",
+                      "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                    },
+                    "run_key": {
+                      "type": "string"
+                    },
+                    "parent_key": {
+                      "type": "string"
+                    },
+                    "destination_db_id": {
+                      "type": "string",
+                      "description": "Explicit lens destination for pass-through writes or destination-scoped reads."
+                    }
+                  },
+                  "required": [
+                    "operation",
+                    "arguments"
+                  ],
+                  "not": {
+                    "anyOf": [
+                      {
+                        "required": [
+                          "plan_id"
+                        ]
+                      },
+                      {
+                        "required": [
+                          "target"
+                        ]
+                      },
+                      {
+                        "required": [
+                          "effect_summary"
+                        ]
+                      }
+                    ]
+                  }
+                },
+                {
+                  "title": "Execute prepared plan",
+                  "properties": {
+                    "operation": {
+                      "type": "string",
+                      "enum": [
+                        "correct_record_type"
+                      ]
+                    },
+                    "run_key": {
+                      "type": "string"
+                    },
+                    "parent_key": {
+                      "type": "string"
+                    },
+                    "destination_db_id": {
+                      "type": "string",
+                      "description": "Explicit lens destination for pass-through writes or destination-scoped reads."
+                    },
+                    "plan_id": {
+                      "type": "string",
+                      "description": "Opaque id returned by preparation."
+                    },
+                    "target": {
+                      "type": "string",
+                      "description": "Exact visible target returned by preparation."
+                    },
+                    "effect_summary": {
+                      "type": "string",
+                      "description": "Exact visible effect returned by preparation."
+                    }
+                  },
+                  "required": [
+                    "operation",
+                    "plan_id",
+                    "target",
+                    "effect_summary"
+                  ],
+                  "not": {
+                    "required": [
+                      "arguments"
+                    ]
+                  }
+                }
+              ]
+            },
+            "annotations": {
+              "readOnlyHint": false,
+              "destructiveHint": false,
+              "idempotentHint": false,
+              "openWorldHint": false
+            }
+          },
+          {
+            "name": "records_lifecycle",
+            "title": "Records lifecycle",
+            "description": "Archive or restore records without deleting identity or history.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "operation": {
+                  "type": "string",
+                  "enum": [
+                    "archive_record"
+                  ]
+                },
+                "arguments": {
+                  "type": "object",
+                  "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                },
+                "run_key": {
+                  "type": "string"
+                },
+                "parent_key": {
+                  "type": "string"
+                },
+                "destination_db_id": {
+                  "type": "string",
+                  "description": "Explicit lens destination for pass-through writes or destination-scoped reads."
+                }
+              },
+              "required": [
+                "operation"
+              ],
+              "additionalProperties": false
+            },
+            "annotations": {
+              "readOnlyHint": false,
+              "destructiveHint": false,
+              "idempotentHint": true,
+              "openWorldHint": false
+            }
+          },
+          {
+            "name": "records_delete",
+            "title": "Records delete",
+            "description": "For plan-required operations, prepare first; preparation does not mutate. Prepare with {operation, arguments}. Execute only with the returned {operation, plan_id, target, effect_summary}; never combine preparation and execution fields. Delete or detach record-scoped content.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "operation": {
+                  "type": "string",
+                  "enum": [
+                    "delete_record",
+                    "manage_attachments.detach",
+                    "manage_citations.remove"
+                  ]
+                },
+                "arguments": {
+                  "type": "object",
+                  "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                },
+                "run_key": {
+                  "type": "string"
+                },
+                "parent_key": {
+                  "type": "string"
+                },
+                "destination_db_id": {
+                  "type": "string",
+                  "description": "Explicit lens destination for pass-through writes or destination-scoped reads."
+                },
+                "plan_id": {
+                  "type": "string",
+                  "description": "Opaque id returned by preparation."
+                },
+                "target": {
+                  "type": "string",
+                  "description": "Exact visible target returned by preparation."
+                },
+                "effect_summary": {
+                  "type": "string",
+                  "description": "Exact visible effect returned by preparation."
+                }
+              },
+              "required": [
+                "operation"
+              ],
+              "additionalProperties": false,
+              "oneOf": [
+                {
+                  "title": "Prepare or direct",
+                  "properties": {
+                    "operation": {
+                      "type": "string",
+                      "enum": [
+                        "delete_record",
+                        "manage_attachments.detach",
+                        "manage_citations.remove"
+                      ]
+                    },
+                    "arguments": {
+                      "type": "object",
+                      "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                    },
+                    "run_key": {
+                      "type": "string"
+                    },
+                    "parent_key": {
+                      "type": "string"
+                    },
+                    "destination_db_id": {
+                      "type": "string",
+                      "description": "Explicit lens destination for pass-through writes or destination-scoped reads."
+                    }
+                  },
+                  "required": [
+                    "operation",
+                    "arguments"
+                  ],
+                  "not": {
+                    "anyOf": [
+                      {
+                        "required": [
+                          "plan_id"
+                        ]
+                      },
+                      {
+                        "required": [
+                          "target"
+                        ]
+                      },
+                      {
+                        "required": [
+                          "effect_summary"
+                        ]
+                      }
+                    ]
+                  }
+                },
+                {
+                  "title": "Execute prepared plan",
+                  "properties": {
+                    "operation": {
+                      "type": "string",
+                      "enum": [
+                        "delete_record",
+                        "manage_attachments.detach",
+                        "manage_citations.remove"
+                      ]
+                    },
+                    "run_key": {
+                      "type": "string"
+                    },
+                    "parent_key": {
+                      "type": "string"
+                    },
+                    "destination_db_id": {
+                      "type": "string",
+                      "description": "Explicit lens destination for pass-through writes or destination-scoped reads."
+                    },
+                    "plan_id": {
+                      "type": "string",
+                      "description": "Opaque id returned by preparation."
+                    },
+                    "target": {
+                      "type": "string",
+                      "description": "Exact visible target returned by preparation."
+                    },
+                    "effect_summary": {
+                      "type": "string",
+                      "description": "Exact visible effect returned by preparation."
+                    }
+                  },
+                  "required": [
+                    "operation",
+                    "plan_id",
+                    "target",
+                    "effect_summary"
+                  ],
+                  "not": {
+                    "required": [
+                      "arguments"
+                    ]
+                  }
+                }
+              ]
+            },
+            "annotations": {
+              "readOnlyHint": false,
+              "destructiveHint": true,
+              "idempotentHint": true,
+              "openWorldHint": false
+            }
+          },
+          {
+            "name": "coordination_read",
+            "title": "Coordination read",
+            "description": "Inspect run activity and preview claimable work.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "operation": {
+                  "type": "string",
+                  "enum": [
+                    "get_event_context",
+                    "get_run_activity",
+                    "start_work.preview"
+                  ]
+                },
+                "arguments": {
+                  "type": "object",
+                  "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                },
+                "run_key": {
+                  "type": "string"
+                },
+                "parent_key": {
+                  "type": "string"
+                },
+                "destination_db_id": {
+                  "type": "string",
+                  "description": "Explicit lens destination for pass-through writes or destination-scoped reads."
+                },
+                "cursor": {
+                  "type": "string"
+                },
+                "page_size": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 50
+                }
+              },
+              "required": [
+                "operation"
+              ],
+              "additionalProperties": false
+            },
+            "annotations": {
+              "readOnlyHint": true,
+              "destructiveHint": false,
+              "idempotentHint": true,
+              "openWorldHint": false
+            }
+          },
+          {
+            "name": "coordination_write",
+            "title": "Coordination write",
+            "description": "Declare intent and claim or release work.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "operation": {
+                  "type": "string",
+                  "enum": [
+                    "close_run",
+                    "set_intent",
+                    "start_work.claim",
+                    "start_work.release"
+                  ]
+                },
+                "arguments": {
+                  "type": "object",
+                  "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                },
+                "run_key": {
+                  "type": "string"
+                },
+                "parent_key": {
+                  "type": "string"
+                },
+                "destination_db_id": {
+                  "type": "string",
+                  "description": "Explicit lens destination for pass-through writes or destination-scoped reads."
+                }
+              },
+              "required": [
+                "operation"
+              ],
+              "additionalProperties": false
+            },
+            "annotations": {
+              "readOnlyHint": false,
+              "destructiveHint": false,
+              "idempotentHint": true,
+              "openWorldHint": false
+            }
+          },
+          {
+            "name": "sql_read",
+            "title": "SQL read",
+            "description": "Run explicitly authorized read-only SQL against the current database.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "operation": {
+                  "type": "string",
+                  "enum": [
+                    "query_sql"
+                  ]
+                },
+                "arguments": {
+                  "type": "object",
+                  "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                },
+                "run_key": {
+                  "type": "string"
+                },
+                "parent_key": {
+                  "type": "string"
+                },
+                "destination_db_id": {
+                  "type": "string",
+                  "description": "Explicit lens destination for pass-through writes or destination-scoped reads."
+                },
+                "cursor": {
+                  "type": "string"
+                },
+                "page_size": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 50
+                }
+              },
+              "required": [
+                "operation"
+              ],
+              "additionalProperties": false
+            },
+            "annotations": {
+              "readOnlyHint": true,
+              "destructiveHint": false,
+              "idempotentHint": true,
+              "openWorldHint": true
+            }
+          },
+          {
+            "name": "external_import",
+            "title": "External import",
+            "description": "Fetch external content into an authorized record.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "operation": {
+                  "type": "string",
+                  "enum": [
+                    "attach_from_url"
+                  ]
+                },
+                "arguments": {
+                  "type": "object",
+                  "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                },
+                "run_key": {
+                  "type": "string"
+                },
+                "parent_key": {
+                  "type": "string"
+                },
+                "destination_db_id": {
+                  "type": "string",
+                  "description": "Explicit lens destination for pass-through writes or destination-scoped reads."
+                }
+              },
+              "required": [
+                "operation"
+              ],
+              "additionalProperties": false
+            },
+            "annotations": {
+              "readOnlyHint": false,
+              "destructiveHint": false,
+              "idempotentHint": false,
+              "openWorldHint": true
+            }
+          },
+          {
+            "name": "identity_read",
+            "title": "Identity read",
+            "description": "Inspect governed external identity bindings and observations.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "operation": {
+                  "type": "string",
+                  "enum": [
+                    "manage_bindings.list",
+                    "manage_bindings.observations"
+                  ]
+                },
+                "arguments": {
+                  "type": "object",
+                  "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                },
+                "run_key": {
+                  "type": "string"
+                },
+                "parent_key": {
+                  "type": "string"
+                },
+                "destination_db_id": {
+                  "type": "string",
+                  "description": "Explicit lens destination for pass-through writes or destination-scoped reads."
+                },
+                "cursor": {
+                  "type": "string"
+                },
+                "page_size": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 50
+                }
+              },
+              "required": [
+                "operation"
+              ],
+              "additionalProperties": false
+            },
+            "annotations": {
+              "readOnlyHint": true,
+              "destructiveHint": false,
+              "idempotentHint": true,
+              "openWorldHint": false
+            }
+          },
+          {
+            "name": "identity_resolve",
+            "title": "Identity resolve",
+            "description": "Resolve or observe external identities and materialize authorized lens records.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "operation": {
+                  "type": "string",
+                  "enum": [
+                    "materialize_record",
+                    "observe_external",
+                    "resolve_external"
+                  ]
+                },
+                "arguments": {
+                  "type": "object",
+                  "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                },
+                "run_key": {
+                  "type": "string"
+                },
+                "parent_key": {
+                  "type": "string"
+                },
+                "destination_db_id": {
+                  "type": "string",
+                  "description": "Explicit lens destination for pass-through writes or destination-scoped reads."
+                }
+              },
+              "required": [
+                "operation"
+              ],
+              "additionalProperties": false
+            },
+            "annotations": {
+              "readOnlyHint": false,
+              "destructiveHint": false,
+              "idempotentHint": true,
+              "openWorldHint": true
+            }
+          },
+          {
+            "name": "identity_admin",
+            "title": "Identity administration",
+            "description": "For plan-required operations, prepare first; preparation does not mutate. Prepare with {operation, arguments}. Execute only with the returned {operation, plan_id, target, effect_summary}; never combine preparation and execution fields. Add, remove, canonicalize or reconcile governed identity bindings.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "operation": {
+                  "type": "string",
+                  "enum": [
+                    "manage_bindings.add",
+                    "manage_bindings.canonicalize",
+                    "manage_bindings.reconcile",
+                    "manage_bindings.remove"
+                  ]
+                },
+                "arguments": {
+                  "type": "object",
+                  "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                },
+                "run_key": {
+                  "type": "string"
+                },
+                "parent_key": {
+                  "type": "string"
+                },
+                "destination_db_id": {
+                  "type": "string",
+                  "description": "Explicit lens destination for pass-through writes or destination-scoped reads."
+                },
+                "plan_id": {
+                  "type": "string",
+                  "description": "Opaque id returned by preparation."
+                },
+                "target": {
+                  "type": "string",
+                  "description": "Exact visible target returned by preparation."
+                },
+                "effect_summary": {
+                  "type": "string",
+                  "description": "Exact visible effect returned by preparation."
+                }
+              },
+              "required": [
+                "operation"
+              ],
+              "additionalProperties": false,
+              "oneOf": [
+                {
+                  "title": "Prepare or direct",
+                  "properties": {
+                    "operation": {
+                      "type": "string",
+                      "enum": [
+                        "manage_bindings.add",
+                        "manage_bindings.canonicalize",
+                        "manage_bindings.reconcile",
+                        "manage_bindings.remove"
+                      ]
+                    },
+                    "arguments": {
+                      "type": "object",
+                      "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                    },
+                    "run_key": {
+                      "type": "string"
+                    },
+                    "parent_key": {
+                      "type": "string"
+                    },
+                    "destination_db_id": {
+                      "type": "string",
+                      "description": "Explicit lens destination for pass-through writes or destination-scoped reads."
+                    }
+                  },
+                  "required": [
+                    "operation",
+                    "arguments"
+                  ],
+                  "not": {
+                    "anyOf": [
+                      {
+                        "required": [
+                          "plan_id"
+                        ]
+                      },
+                      {
+                        "required": [
+                          "target"
+                        ]
+                      },
+                      {
+                        "required": [
+                          "effect_summary"
+                        ]
+                      }
+                    ]
+                  }
+                },
+                {
+                  "title": "Execute prepared plan",
+                  "properties": {
+                    "operation": {
+                      "type": "string",
+                      "enum": [
+                        "manage_bindings.add",
+                        "manage_bindings.canonicalize",
+                        "manage_bindings.reconcile",
+                        "manage_bindings.remove"
+                      ]
+                    },
+                    "run_key": {
+                      "type": "string"
+                    },
+                    "parent_key": {
+                      "type": "string"
+                    },
+                    "destination_db_id": {
+                      "type": "string",
+                      "description": "Explicit lens destination for pass-through writes or destination-scoped reads."
+                    },
+                    "plan_id": {
+                      "type": "string",
+                      "description": "Opaque id returned by preparation."
+                    },
+                    "target": {
+                      "type": "string",
+                      "description": "Exact visible target returned by preparation."
+                    },
+                    "effect_summary": {
+                      "type": "string",
+                      "description": "Exact visible effect returned by preparation."
+                    }
+                  },
+                  "required": [
+                    "operation",
+                    "plan_id",
+                    "target",
+                    "effect_summary"
+                  ],
+                  "not": {
+                    "required": [
+                      "arguments"
+                    ]
+                  }
+                }
+              ]
+            },
+            "annotations": {
+              "readOnlyHint": false,
+              "destructiveHint": true,
+              "idempotentHint": true,
+              "openWorldHint": false
+            }
+          },
+          {
+            "name": "access_read",
+            "title": "Access read",
+            "description": "Inspect record and artifact access policy.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "operation": {
+                  "type": "string",
+                  "enum": [
+                    "manage_artifact_module_grants.read",
+                    "manage_record_policy.inspect",
+                    "manage_record_policy.list"
+                  ]
+                },
+                "arguments": {
+                  "type": "object",
+                  "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                },
+                "run_key": {
+                  "type": "string"
+                },
+                "parent_key": {
+                  "type": "string"
+                },
+                "destination_db_id": {
+                  "type": "string",
+                  "description": "Explicit lens destination for pass-through writes or destination-scoped reads."
+                },
+                "cursor": {
+                  "type": "string"
+                },
+                "page_size": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 50
+                }
+              },
+              "required": [
+                "operation"
+              ],
+              "additionalProperties": false
+            },
+            "annotations": {
+              "readOnlyHint": true,
+              "destructiveHint": false,
+              "idempotentHint": true,
+              "openWorldHint": false
+            }
+          },
+          {
+            "name": "access_admin",
+            "title": "Access administration",
+            "description": "For plan-required operations, prepare first; preparation does not mutate. Prepare with {operation, arguments}. Execute only with the returned {operation, plan_id, target, effect_summary}; never combine preparation and execution fields. Grant, revoke or replace record and artifact access policy.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "operation": {
+                  "type": "string",
+                  "enum": [
+                    "manage_artifact_module_grants.grant",
+                    "manage_artifact_module_grants.revoke",
+                    "manage_record_policy.grant",
+                    "manage_record_policy.replace",
+                    "manage_record_policy.restore_inheritance",
+                    "manage_record_policy.revoke",
+                    "manage_record_policy.set_many",
+                    "manage_record_policy.set_members_baseline"
+                  ]
+                },
+                "arguments": {
+                  "type": "object",
+                  "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                },
+                "run_key": {
+                  "type": "string"
+                },
+                "parent_key": {
+                  "type": "string"
+                },
+                "destination_db_id": {
+                  "type": "string",
+                  "description": "Explicit lens destination for pass-through writes or destination-scoped reads."
+                },
+                "plan_id": {
+                  "type": "string",
+                  "description": "Opaque id returned by preparation."
+                },
+                "target": {
+                  "type": "string",
+                  "description": "Exact visible target returned by preparation."
+                },
+                "effect_summary": {
+                  "type": "string",
+                  "description": "Exact visible effect returned by preparation."
+                }
+              },
+              "required": [
+                "operation"
+              ],
+              "additionalProperties": false,
+              "oneOf": [
+                {
+                  "title": "Prepare or direct",
+                  "properties": {
+                    "operation": {
+                      "type": "string",
+                      "enum": [
+                        "manage_artifact_module_grants.grant",
+                        "manage_artifact_module_grants.revoke",
+                        "manage_record_policy.grant",
+                        "manage_record_policy.replace",
+                        "manage_record_policy.restore_inheritance",
+                        "manage_record_policy.revoke",
+                        "manage_record_policy.set_many",
+                        "manage_record_policy.set_members_baseline"
+                      ]
+                    },
+                    "arguments": {
+                      "type": "object",
+                      "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                    },
+                    "run_key": {
+                      "type": "string"
+                    },
+                    "parent_key": {
+                      "type": "string"
+                    },
+                    "destination_db_id": {
+                      "type": "string",
+                      "description": "Explicit lens destination for pass-through writes or destination-scoped reads."
+                    }
+                  },
+                  "required": [
+                    "operation",
+                    "arguments"
+                  ],
+                  "not": {
+                    "anyOf": [
+                      {
+                        "required": [
+                          "plan_id"
+                        ]
+                      },
+                      {
+                        "required": [
+                          "target"
+                        ]
+                      },
+                      {
+                        "required": [
+                          "effect_summary"
+                        ]
+                      }
+                    ]
+                  }
+                },
+                {
+                  "title": "Execute prepared plan",
+                  "properties": {
+                    "operation": {
+                      "type": "string",
+                      "enum": [
+                        "manage_artifact_module_grants.grant",
+                        "manage_artifact_module_grants.revoke",
+                        "manage_record_policy.grant",
+                        "manage_record_policy.replace",
+                        "manage_record_policy.restore_inheritance",
+                        "manage_record_policy.revoke",
+                        "manage_record_policy.set_many",
+                        "manage_record_policy.set_members_baseline"
+                      ]
+                    },
+                    "run_key": {
+                      "type": "string"
+                    },
+                    "parent_key": {
+                      "type": "string"
+                    },
+                    "destination_db_id": {
+                      "type": "string",
+                      "description": "Explicit lens destination for pass-through writes or destination-scoped reads."
+                    },
+                    "plan_id": {
+                      "type": "string",
+                      "description": "Opaque id returned by preparation."
+                    },
+                    "target": {
+                      "type": "string",
+                      "description": "Exact visible target returned by preparation."
+                    },
+                    "effect_summary": {
+                      "type": "string",
+                      "description": "Exact visible effect returned by preparation."
+                    }
+                  },
+                  "required": [
+                    "operation",
+                    "plan_id",
+                    "target",
+                    "effect_summary"
+                  ],
+                  "not": {
+                    "required": [
+                      "arguments"
+                    ]
+                  }
+                }
+              ]
+            },
+            "annotations": {
+              "readOnlyHint": false,
+              "destructiveHint": true,
+              "idempotentHint": true,
+              "openWorldHint": false
+            }
+          },
+          {
+            "name": "schema_read",
+            "title": "Schema read",
+            "description": "Record shape first: preview_record_shape for types, kinds, facets and vocabularies; manage_vocabularies.list_values for values. describe_schema is the physical table schema for sql_read.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "operation": {
+                  "type": "string",
+                  "enum": [
+                    "describe_schema",
+                    "manage_schema_config.read",
+                    "manage_vocabularies.list_values",
+                    "preview_record_shape"
+                  ]
+                },
+                "arguments": {
+                  "type": "object",
+                  "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                },
+                "run_key": {
+                  "type": "string"
+                },
+                "parent_key": {
+                  "type": "string"
+                },
+                "destination_db_id": {
+                  "type": "string",
+                  "description": "Explicit lens destination for pass-through writes or destination-scoped reads."
+                },
+                "cursor": {
+                  "type": "string"
+                },
+                "page_size": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 50
+                }
+              },
+              "required": [
+                "operation"
+              ],
+              "additionalProperties": false
+            },
+            "annotations": {
+              "readOnlyHint": true,
+              "destructiveHint": false,
+              "idempotentHint": true,
+              "openWorldHint": false
+            }
+          },
+          {
+            "name": "schema_admin",
+            "title": "Schema administration",
+            "description": "For plan-required operations, prepare first; preparation does not mutate. Prepare with {operation, arguments}. Execute only with the returned {operation, plan_id, target, effect_summary}; never combine preparation and execution fields. Create or change schema and vocabulary configuration.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "operation": {
+                  "type": "string",
+                  "enum": [
+                    "manage_schema_config.write",
+                    "manage_vocabularies.alias_value",
+                    "manage_vocabularies.create_vocabulary",
+                    "manage_vocabularies.deprecate_value",
+                    "manage_vocabularies.promote_value",
+                    "manage_vocabularies.propose_value",
+                    "manage_vocabularies.reorder_value",
+                    "manage_vocabularies.set_gloss",
+                    "manage_vocabularies.set_metadata"
+                  ]
+                },
+                "arguments": {
+                  "type": "object",
+                  "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                },
+                "run_key": {
+                  "type": "string"
+                },
+                "parent_key": {
+                  "type": "string"
+                },
+                "destination_db_id": {
+                  "type": "string",
+                  "description": "Explicit lens destination for pass-through writes or destination-scoped reads."
+                },
+                "plan_id": {
+                  "type": "string",
+                  "description": "Opaque id returned by preparation."
+                },
+                "target": {
+                  "type": "string",
+                  "description": "Exact visible target returned by preparation."
+                },
+                "effect_summary": {
+                  "type": "string",
+                  "description": "Exact visible effect returned by preparation."
+                }
+              },
+              "required": [
+                "operation"
+              ],
+              "additionalProperties": false,
+              "oneOf": [
+                {
+                  "title": "Prepare or direct",
+                  "properties": {
+                    "operation": {
+                      "type": "string",
+                      "enum": [
+                        "manage_schema_config.write",
+                        "manage_vocabularies.alias_value",
+                        "manage_vocabularies.create_vocabulary",
+                        "manage_vocabularies.deprecate_value",
+                        "manage_vocabularies.promote_value",
+                        "manage_vocabularies.propose_value",
+                        "manage_vocabularies.reorder_value",
+                        "manage_vocabularies.set_gloss",
+                        "manage_vocabularies.set_metadata"
+                      ]
+                    },
+                    "arguments": {
+                      "type": "object",
+                      "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                    },
+                    "run_key": {
+                      "type": "string"
+                    },
+                    "parent_key": {
+                      "type": "string"
+                    },
+                    "destination_db_id": {
+                      "type": "string",
+                      "description": "Explicit lens destination for pass-through writes or destination-scoped reads."
+                    }
+                  },
+                  "required": [
+                    "operation",
+                    "arguments"
+                  ],
+                  "not": {
+                    "anyOf": [
+                      {
+                        "required": [
+                          "plan_id"
+                        ]
+                      },
+                      {
+                        "required": [
+                          "target"
+                        ]
+                      },
+                      {
+                        "required": [
+                          "effect_summary"
+                        ]
+                      }
+                    ]
+                  }
+                },
+                {
+                  "title": "Execute prepared plan",
+                  "properties": {
+                    "operation": {
+                      "type": "string",
+                      "enum": [
+                        "manage_schema_config.write",
+                        "manage_vocabularies.alias_value",
+                        "manage_vocabularies.create_vocabulary",
+                        "manage_vocabularies.deprecate_value",
+                        "manage_vocabularies.promote_value",
+                        "manage_vocabularies.propose_value",
+                        "manage_vocabularies.reorder_value",
+                        "manage_vocabularies.set_gloss",
+                        "manage_vocabularies.set_metadata"
+                      ]
+                    },
+                    "run_key": {
+                      "type": "string"
+                    },
+                    "parent_key": {
+                      "type": "string"
+                    },
+                    "destination_db_id": {
+                      "type": "string",
+                      "description": "Explicit lens destination for pass-through writes or destination-scoped reads."
+                    },
+                    "plan_id": {
+                      "type": "string",
+                      "description": "Opaque id returned by preparation."
+                    },
+                    "target": {
+                      "type": "string",
+                      "description": "Exact visible target returned by preparation."
+                    },
+                    "effect_summary": {
+                      "type": "string",
+                      "description": "Exact visible effect returned by preparation."
+                    }
+                  },
+                  "required": [
+                    "operation",
+                    "plan_id",
+                    "target",
+                    "effect_summary"
+                  ],
+                  "not": {
+                    "required": [
+                      "arguments"
+                    ]
+                  }
+                }
+              ]
+            },
+            "annotations": {
+              "readOnlyHint": false,
+              "destructiveHint": true,
+              "idempotentHint": true,
+              "openWorldHint": false
+            }
+          },
+          {
+            "name": "schema_delete",
+            "title": "Schema deletion",
+            "description": "For plan-required operations, prepare first; preparation does not mutate. Prepare with {operation, arguments}. Execute only with the returned {operation, plan_id, target, effect_summary}; never combine preparation and execution fields. Delete vocabulary values or vocabularies.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "operation": {
+                  "type": "string",
+                  "enum": [
+                    "manage_vocabularies.delete_value",
+                    "manage_vocabularies.delete_vocabulary"
+                  ]
+                },
+                "arguments": {
+                  "type": "object",
+                  "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                },
+                "run_key": {
+                  "type": "string"
+                },
+                "parent_key": {
+                  "type": "string"
+                },
+                "destination_db_id": {
+                  "type": "string",
+                  "description": "Explicit lens destination for pass-through writes or destination-scoped reads."
+                },
+                "plan_id": {
+                  "type": "string",
+                  "description": "Opaque id returned by preparation."
+                },
+                "target": {
+                  "type": "string",
+                  "description": "Exact visible target returned by preparation."
+                },
+                "effect_summary": {
+                  "type": "string",
+                  "description": "Exact visible effect returned by preparation."
+                }
+              },
+              "required": [
+                "operation"
+              ],
+              "additionalProperties": false,
+              "oneOf": [
+                {
+                  "title": "Prepare or direct",
+                  "properties": {
+                    "operation": {
+                      "type": "string",
+                      "enum": [
+                        "manage_vocabularies.delete_value",
+                        "manage_vocabularies.delete_vocabulary"
+                      ]
+                    },
+                    "arguments": {
+                      "type": "object",
+                      "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                    },
+                    "run_key": {
+                      "type": "string"
+                    },
+                    "parent_key": {
+                      "type": "string"
+                    },
+                    "destination_db_id": {
+                      "type": "string",
+                      "description": "Explicit lens destination for pass-through writes or destination-scoped reads."
+                    }
+                  },
+                  "required": [
+                    "operation",
+                    "arguments"
+                  ],
+                  "not": {
+                    "anyOf": [
+                      {
+                        "required": [
+                          "plan_id"
+                        ]
+                      },
+                      {
+                        "required": [
+                          "target"
+                        ]
+                      },
+                      {
+                        "required": [
+                          "effect_summary"
+                        ]
+                      }
+                    ]
+                  }
+                },
+                {
+                  "title": "Execute prepared plan",
+                  "properties": {
+                    "operation": {
+                      "type": "string",
+                      "enum": [
+                        "manage_vocabularies.delete_value",
+                        "manage_vocabularies.delete_vocabulary"
+                      ]
+                    },
+                    "run_key": {
+                      "type": "string"
+                    },
+                    "parent_key": {
+                      "type": "string"
+                    },
+                    "destination_db_id": {
+                      "type": "string",
+                      "description": "Explicit lens destination for pass-through writes or destination-scoped reads."
+                    },
+                    "plan_id": {
+                      "type": "string",
+                      "description": "Opaque id returned by preparation."
+                    },
+                    "target": {
+                      "type": "string",
+                      "description": "Exact visible target returned by preparation."
+                    },
+                    "effect_summary": {
+                      "type": "string",
+                      "description": "Exact visible effect returned by preparation."
+                    }
+                  },
+                  "required": [
+                    "operation",
+                    "plan_id",
+                    "target",
+                    "effect_summary"
+                  ],
+                  "not": {
+                    "required": [
+                      "arguments"
+                    ]
+                  }
+                }
+              ]
+            },
+            "annotations": {
+              "readOnlyHint": false,
+              "destructiveHint": true,
+              "idempotentHint": true,
+              "openWorldHint": false
+            }
+          },
+          {
+            "name": "messaging_read",
+            "title": "Messaging read",
+            "description": "Read authorized conversations, inbox state and interventions.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "operation": {
+                  "type": "string",
+                  "enum": [
+                    "manage_interventions.get",
+                    "manage_interventions.query",
+                    "manage_messages.get_attention",
+                    "manage_messages.list_context",
+                    "manage_messages.list_conversation",
+                    "manage_messages.list_destinations",
+                    "manage_messages.list_inbox",
+                    "manage_messages.list_message_state",
+                    "manage_messages.list_my_conversations",
+                    "manage_messages.list_notification_candidates",
+                    "manage_messages.list_unclassified"
+                  ]
+                },
+                "arguments": {
+                  "type": "object",
+                  "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                },
+                "run_key": {
+                  "type": "string"
+                },
+                "parent_key": {
+                  "type": "string"
+                },
+                "destination_db_id": {
+                  "type": "string",
+                  "description": "Explicit lens destination for pass-through writes or destination-scoped reads."
+                },
+                "cursor": {
+                  "type": "string"
+                },
+                "page_size": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 50
+                }
+              },
+              "required": [
+                "operation"
+              ],
+              "additionalProperties": false
+            },
+            "annotations": {
+              "readOnlyHint": true,
+              "destructiveHint": false,
+              "idempotentHint": true,
+              "openWorldHint": true
+            }
+          },
+          {
+            "name": "messaging_write",
+            "title": "Messaging write",
+            "description": "Send new messages and replies; classify, route or otherwise change externally visible messaging state.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "operation": {
+                  "type": "string",
+                  "enum": [
+                    "manage_interventions.cancel",
+                    "manage_interventions.resume_delivery",
+                    "manage_messages.add_reaction",
+                    "manage_messages.classify",
+                    "manage_messages.move",
+                    "manage_messages.mutate_human_awareness",
+                    "manage_messages.remove_reaction",
+                    "manage_messages.satisfy_acknowledgement_expectation_with_reaction",
+                    "manage_messages.send",
+                    "manage_messages.set_agent_disposition",
+                    "manage_messages.set_destination",
+                    "manage_messages.set_preference",
+                    "manage_messages.set_routing",
+                    "manage_messages.share_history",
+                    "manage_messages.unclassify"
+                  ]
+                },
+                "arguments": {
+                  "type": "object",
+                  "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                },
+                "run_key": {
+                  "type": "string"
+                },
+                "parent_key": {
+                  "type": "string"
+                },
+                "destination_db_id": {
+                  "type": "string",
+                  "description": "Explicit lens destination for pass-through writes or destination-scoped reads."
+                }
+              },
+              "required": [
+                "operation"
+              ],
+              "additionalProperties": false
+            },
+            "annotations": {
+              "readOnlyHint": false,
+              "destructiveHint": false,
+              "idempotentHint": false,
+              "openWorldHint": true
+            }
+          },
+          {
+            "name": "artifacts_read",
+            "title": "Artifacts read",
+            "description": "Inspect and verify artifacts, modules, inputs and confirmed change summaries.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "operation": {
+                  "type": "string",
+                  "enum": [
+                    "manage_artifact_inputs.read",
+                    "manage_change_summaries.inspect",
+                    "manage_mdx_modules.impact",
+                    "manage_mdx_modules.inspect",
+                    "manage_renderer_binding.read",
+                    "query_change_summaries.drill",
+                    "query_change_summaries.get",
+                    "query_change_summaries.list",
+                    "verify_artifact"
+                  ]
+                },
+                "arguments": {
+                  "type": "object",
+                  "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                },
+                "run_key": {
+                  "type": "string"
+                },
+                "parent_key": {
+                  "type": "string"
+                },
+                "destination_db_id": {
+                  "type": "string",
+                  "description": "Explicit lens destination for pass-through writes or destination-scoped reads."
+                },
+                "cursor": {
+                  "type": "string"
+                },
+                "page_size": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 50
+                }
+              },
+              "required": [
+                "operation"
+              ],
+              "additionalProperties": false
+            },
+            "annotations": {
+              "readOnlyHint": true,
+              "destructiveHint": false,
+              "idempotentHint": true,
+              "openWorldHint": false
+            }
+          },
+          {
+            "name": "artifacts_execute",
+            "title": "Artifacts execute",
+            "description": "Render or open executable/interactive artifact output.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "operation": {
+                  "type": "string",
+                  "enum": [
+                    "invoke_artifact_interaction",
+                    "open_collection",
+                    "render_artifact"
+                  ]
+                },
+                "arguments": {
+                  "type": "object",
+                  "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                },
+                "run_key": {
+                  "type": "string"
+                },
+                "parent_key": {
+                  "type": "string"
+                },
+                "destination_db_id": {
+                  "type": "string",
+                  "description": "Explicit lens destination for pass-through writes or destination-scoped reads."
+                }
+              },
+              "required": [
+                "operation"
+              ],
+              "additionalProperties": false
+            },
+            "annotations": {
+              "readOnlyHint": false,
+              "destructiveHint": false,
+              "idempotentHint": false,
+              "openWorldHint": true
+            }
+          },
+          {
+            "name": "artifacts_write",
+            "title": "Artifacts write",
+            "description": "Copy, bind or publish artifacts and manage change-summary state. Author from scratch with records_write.create_record: type Document, kind artifact, facets.runtime. For runtime choice and create/bind/grant/render steps, read guidance_read.read_guide topic compositions. instantiate_artifact copies an existing source.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "operation": {
+                  "type": "string",
+                  "enum": [
+                    "instantiate_artifact",
+                    "manage_artifact_inputs.bind",
+                    "manage_artifact_inputs.unbind",
+                    "manage_change_summaries.confirm",
+                    "manage_change_summaries.create_or_reuse",
+                    "manage_change_summaries.derive",
+                    "manage_change_summaries.revoke",
+                    "manage_mdx_modules.deprecate",
+                    "manage_mdx_modules.publish",
+                    "manage_mdx_modules.withdraw",
+                    "manage_renderer_binding.bind",
+                    "manage_renderer_binding.unbind"
+                  ]
+                },
+                "arguments": {
+                  "type": "object",
+                  "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                },
+                "run_key": {
+                  "type": "string"
+                },
+                "parent_key": {
+                  "type": "string"
+                },
+                "destination_db_id": {
+                  "type": "string",
+                  "description": "Explicit lens destination for pass-through writes or destination-scoped reads."
+                }
+              },
+              "required": [
+                "operation"
+              ],
+              "additionalProperties": false
+            },
+            "annotations": {
+              "readOnlyHint": false,
+              "destructiveHint": false,
+              "idempotentHint": false,
+              "openWorldHint": false
+            }
+          },
+          {
+            "name": "membership_read",
+            "title": "Membership read",
+            "description": "List the hosted database roster.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "operation": {
+                  "type": "string",
+                  "enum": [
+                    "manage_memberships.invitations_inspect",
+                    "manage_memberships.invitations_list",
+                    "manage_memberships.list"
+                  ]
+                },
+                "arguments": {
+                  "type": "object",
+                  "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                },
+                "run_key": {
+                  "type": "string"
+                },
+                "parent_key": {
+                  "type": "string"
+                },
+                "destination_db_id": {
+                  "type": "string",
+                  "description": "Explicit lens destination for pass-through writes or destination-scoped reads."
+                },
+                "cursor": {
+                  "type": "string"
+                },
+                "page_size": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 50
+                }
+              },
+              "required": [
+                "operation"
+              ],
+              "additionalProperties": false
+            },
+            "annotations": {
+              "readOnlyHint": true,
+              "destructiveHint": false,
+              "idempotentHint": true,
+              "openWorldHint": false
+            }
+          },
+          {
+            "name": "membership_admin",
+            "title": "Membership administration",
+            "description": "For plan-required operations, prepare first; preparation does not mutate. Prepare with {operation, arguments}. Execute only with the returned {operation, plan_id, target, effect_summary}; never combine preparation and execution fields. Change hosted member roles.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "operation": {
+                  "type": "string",
+                  "enum": [
+                    "manage_memberships.invitations_copy_link",
+                    "manage_memberships.invitations_create",
+                    "manage_memberships.invitations_revoke",
+                    "manage_memberships.invitations_send",
+                    "manage_memberships.set_role"
+                  ]
+                },
+                "arguments": {
+                  "type": "object",
+                  "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                },
+                "run_key": {
+                  "type": "string"
+                },
+                "parent_key": {
+                  "type": "string"
+                },
+                "destination_db_id": {
+                  "type": "string",
+                  "description": "Explicit lens destination for pass-through writes or destination-scoped reads."
+                },
+                "plan_id": {
+                  "type": "string",
+                  "description": "Opaque id returned by preparation."
+                },
+                "target": {
+                  "type": "string",
+                  "description": "Exact visible target returned by preparation."
+                },
+                "effect_summary": {
+                  "type": "string",
+                  "description": "Exact visible effect returned by preparation."
+                }
+              },
+              "required": [
+                "operation"
+              ],
+              "additionalProperties": false,
+              "oneOf": [
+                {
+                  "title": "Prepare or direct",
+                  "properties": {
+                    "operation": {
+                      "type": "string",
+                      "enum": [
+                        "manage_memberships.invitations_copy_link",
+                        "manage_memberships.invitations_create",
+                        "manage_memberships.invitations_revoke",
+                        "manage_memberships.invitations_send",
+                        "manage_memberships.set_role"
+                      ]
+                    },
+                    "arguments": {
+                      "type": "object",
+                      "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                    },
+                    "run_key": {
+                      "type": "string"
+                    },
+                    "parent_key": {
+                      "type": "string"
+                    },
+                    "destination_db_id": {
+                      "type": "string",
+                      "description": "Explicit lens destination for pass-through writes or destination-scoped reads."
+                    }
+                  },
+                  "required": [
+                    "operation",
+                    "arguments"
+                  ],
+                  "not": {
+                    "anyOf": [
+                      {
+                        "required": [
+                          "plan_id"
+                        ]
+                      },
+                      {
+                        "required": [
+                          "target"
+                        ]
+                      },
+                      {
+                        "required": [
+                          "effect_summary"
+                        ]
+                      }
+                    ]
+                  }
+                },
+                {
+                  "title": "Execute prepared plan",
+                  "properties": {
+                    "operation": {
+                      "type": "string",
+                      "enum": [
+                        "manage_memberships.invitations_copy_link",
+                        "manage_memberships.invitations_create",
+                        "manage_memberships.invitations_revoke",
+                        "manage_memberships.invitations_send",
+                        "manage_memberships.set_role"
+                      ]
+                    },
+                    "run_key": {
+                      "type": "string"
+                    },
+                    "parent_key": {
+                      "type": "string"
+                    },
+                    "destination_db_id": {
+                      "type": "string",
+                      "description": "Explicit lens destination for pass-through writes or destination-scoped reads."
+                    },
+                    "plan_id": {
+                      "type": "string",
+                      "description": "Opaque id returned by preparation."
+                    },
+                    "target": {
+                      "type": "string",
+                      "description": "Exact visible target returned by preparation."
+                    },
+                    "effect_summary": {
+                      "type": "string",
+                      "description": "Exact visible effect returned by preparation."
+                    }
+                  },
+                  "required": [
+                    "operation",
+                    "plan_id",
+                    "target",
+                    "effect_summary"
+                  ],
+                  "not": {
+                    "required": [
+                      "arguments"
+                    ]
+                  }
+                }
+              ]
+            },
+            "annotations": {
+              "readOnlyHint": false,
+              "destructiveHint": true,
+              "idempotentHint": true,
+              "openWorldHint": false
+            }
+          },
+          {
+            "name": "membership_remove",
+            "title": "Membership removal",
+            "description": "For plan-required operations, prepare first; preparation does not mutate. Prepare with {operation, arguments}. Execute only with the returned {operation, plan_id, target, effect_summary}; never combine preparation and execution fields. Remove a hosted member with governed offboarding.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "operation": {
+                  "type": "string",
+                  "enum": [
+                    "manage_memberships.remove"
+                  ]
+                },
+                "arguments": {
+                  "type": "object",
+                  "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                },
+                "run_key": {
+                  "type": "string"
+                },
+                "parent_key": {
+                  "type": "string"
+                },
+                "destination_db_id": {
+                  "type": "string",
+                  "description": "Explicit lens destination for pass-through writes or destination-scoped reads."
+                },
+                "plan_id": {
+                  "type": "string",
+                  "description": "Opaque id returned by preparation."
+                },
+                "target": {
+                  "type": "string",
+                  "description": "Exact visible target returned by preparation."
+                },
+                "effect_summary": {
+                  "type": "string",
+                  "description": "Exact visible effect returned by preparation."
+                }
+              },
+              "required": [
+                "operation"
+              ],
+              "additionalProperties": false,
+              "oneOf": [
+                {
+                  "title": "Prepare or direct",
+                  "properties": {
+                    "operation": {
+                      "type": "string",
+                      "enum": [
+                        "manage_memberships.remove"
+                      ]
+                    },
+                    "arguments": {
+                      "type": "object",
+                      "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                    },
+                    "run_key": {
+                      "type": "string"
+                    },
+                    "parent_key": {
+                      "type": "string"
+                    },
+                    "destination_db_id": {
+                      "type": "string",
+                      "description": "Explicit lens destination for pass-through writes or destination-scoped reads."
+                    }
+                  },
+                  "required": [
+                    "operation",
+                    "arguments"
+                  ],
+                  "not": {
+                    "anyOf": [
+                      {
+                        "required": [
+                          "plan_id"
+                        ]
+                      },
+                      {
+                        "required": [
+                          "target"
+                        ]
+                      },
+                      {
+                        "required": [
+                          "effect_summary"
+                        ]
+                      }
+                    ]
+                  }
+                },
+                {
+                  "title": "Execute prepared plan",
+                  "properties": {
+                    "operation": {
+                      "type": "string",
+                      "enum": [
+                        "manage_memberships.remove"
+                      ]
+                    },
+                    "run_key": {
+                      "type": "string"
+                    },
+                    "parent_key": {
+                      "type": "string"
+                    },
+                    "destination_db_id": {
+                      "type": "string",
+                      "description": "Explicit lens destination for pass-through writes or destination-scoped reads."
+                    },
+                    "plan_id": {
+                      "type": "string",
+                      "description": "Opaque id returned by preparation."
+                    },
+                    "target": {
+                      "type": "string",
+                      "description": "Exact visible target returned by preparation."
+                    },
+                    "effect_summary": {
+                      "type": "string",
+                      "description": "Exact visible effect returned by preparation."
+                    }
+                  },
+                  "required": [
+                    "operation",
+                    "plan_id",
+                    "target",
+                    "effect_summary"
+                  ],
+                  "not": {
+                    "required": [
+                      "arguments"
+                    ]
+                  }
+                }
+              ]
+            },
+            "annotations": {
+              "readOnlyHint": false,
+              "destructiveHint": true,
+              "idempotentHint": true,
+              "openWorldHint": false
+            }
+          },
+          {
+            "name": "export",
+            "title": "Export",
+            "description": "Create a verified complete database snapshot.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "operation": {
+                  "type": "string",
+                  "enum": [
+                    "export_snapshot"
+                  ]
+                },
+                "arguments": {
+                  "type": "object",
+                  "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                },
+                "run_key": {
+                  "type": "string"
+                },
+                "parent_key": {
+                  "type": "string"
+                },
+                "destination_db_id": {
+                  "type": "string",
+                  "description": "Explicit lens destination for pass-through writes or destination-scoped reads."
+                }
+              },
+              "required": [
+                "operation"
+              ],
+              "additionalProperties": false
+            },
+            "annotations": {
+              "readOnlyHint": true,
+              "destructiveHint": false,
+              "idempotentHint": true,
+              "openWorldHint": true
+            }
+          },
+          {
+            "name": "canvas_read",
+            "title": "Canvas read",
+            "description": "Read a canvas scene or the accepted batches after a version.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "operation": {
+                  "type": "string",
+                  "enum": [
+                    "read_canvas.changes",
+                    "read_canvas.describe",
+                    "read_canvas.export",
+                    "read_canvas.get_scene"
+                  ]
+                },
+                "arguments": {
+                  "type": "object",
+                  "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                },
+                "run_key": {
+                  "type": "string"
+                },
+                "parent_key": {
+                  "type": "string"
+                },
+                "destination_db_id": {
+                  "type": "string",
+                  "description": "Explicit lens destination for pass-through writes or destination-scoped reads."
+                },
+                "cursor": {
+                  "type": "string"
+                },
+                "page_size": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 50
+                }
+              },
+              "required": [
+                "operation"
+              ],
+              "additionalProperties": false
+            },
+            "annotations": {
+              "readOnlyHint": true,
+              "destructiveHint": false,
+              "idempotentHint": true,
+              "openWorldHint": false
+            }
+          },
+          {
+            "name": "canvas_write",
+            "title": "Canvas write",
+            "description": "For plan-required operations, prepare first; preparation does not mutate. Prepare with {operation, arguments}. Execute only with the returned {operation, plan_id, target, effect_summary}; never combine preparation and execution fields. Commit atomic, precondition-checked batches to a canvas scene.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "operation": {
+                  "type": "string",
+                  "enum": [
+                    "manage_canvas.assert_connector",
+                    "manage_canvas.commit_batch",
+                    "manage_canvas.promote"
+                  ]
+                },
+                "arguments": {
+                  "type": "object",
+                  "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                },
+                "run_key": {
+                  "type": "string"
+                },
+                "parent_key": {
+                  "type": "string"
+                },
+                "destination_db_id": {
+                  "type": "string",
+                  "description": "Explicit lens destination for pass-through writes or destination-scoped reads."
+                },
+                "plan_id": {
+                  "type": "string",
+                  "description": "Opaque id returned by preparation."
+                },
+                "target": {
+                  "type": "string",
+                  "description": "Exact visible target returned by preparation."
+                },
+                "effect_summary": {
+                  "type": "string",
+                  "description": "Exact visible effect returned by preparation."
+                }
+              },
+              "required": [
+                "operation"
+              ],
+              "additionalProperties": false,
+              "oneOf": [
+                {
+                  "title": "Prepare or direct",
+                  "properties": {
+                    "operation": {
+                      "type": "string",
+                      "enum": [
+                        "manage_canvas.assert_connector",
+                        "manage_canvas.commit_batch",
+                        "manage_canvas.promote"
+                      ]
+                    },
+                    "arguments": {
+                      "type": "object",
+                      "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                    },
+                    "run_key": {
+                      "type": "string"
+                    },
+                    "parent_key": {
+                      "type": "string"
+                    },
+                    "destination_db_id": {
+                      "type": "string",
+                      "description": "Explicit lens destination for pass-through writes or destination-scoped reads."
+                    }
+                  },
+                  "required": [
+                    "operation",
+                    "arguments"
+                  ],
+                  "not": {
+                    "anyOf": [
+                      {
+                        "required": [
+                          "plan_id"
+                        ]
+                      },
+                      {
+                        "required": [
+                          "target"
+                        ]
+                      },
+                      {
+                        "required": [
+                          "effect_summary"
+                        ]
+                      }
+                    ]
+                  }
+                },
+                {
+                  "title": "Execute prepared plan",
+                  "properties": {
+                    "operation": {
+                      "type": "string",
+                      "enum": [
+                        "manage_canvas.promote"
+                      ]
+                    },
+                    "run_key": {
+                      "type": "string"
+                    },
+                    "parent_key": {
+                      "type": "string"
+                    },
+                    "destination_db_id": {
+                      "type": "string",
+                      "description": "Explicit lens destination for pass-through writes or destination-scoped reads."
+                    },
+                    "plan_id": {
+                      "type": "string",
+                      "description": "Opaque id returned by preparation."
+                    },
+                    "target": {
+                      "type": "string",
+                      "description": "Exact visible target returned by preparation."
+                    },
+                    "effect_summary": {
+                      "type": "string",
+                      "description": "Exact visible effect returned by preparation."
+                    }
+                  },
+                  "required": [
+                    "operation",
+                    "plan_id",
+                    "target",
+                    "effect_summary"
+                  ],
+                  "not": {
+                    "required": [
+                      "arguments"
+                    ]
+                  }
+                }
+              ]
+            },
+            "annotations": {
+              "readOnlyHint": false,
+              "destructiveHint": false,
+              "idempotentHint": true,
+              "openWorldHint": false
+            }
+          },
+          {
+            "name": "experimental_freshness",
+            "title": "Experimental freshness",
+            "description": "Run the feature-gated context-freshness development probe.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "operation": {
+                  "type": "string",
+                  "enum": [
+                    "experimental_freshness_agent_intent.assess_exact_change",
+                    "experimental_freshness_agent_intent.bind_exact_expression",
+                    "experimental_freshness_agent_intent.declare_sources",
+                    "experimental_freshness_agent_intent.promote_exact_expression",
+                    "experimental_freshness_agent_intent.reconcile_affected_output",
+                    "experimental_freshness_agent_intent.revise_exact_expression"
+                  ]
+                },
+                "arguments": {
+                  "type": "object",
+                  "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                },
+                "run_key": {
+                  "type": "string"
+                },
+                "parent_key": {
+                  "type": "string"
+                },
+                "destination_db_id": {
+                  "type": "string",
+                  "description": "Explicit lens destination for pass-through writes or destination-scoped reads."
+                }
+              },
+              "required": [
+                "operation"
+              ],
+              "additionalProperties": false
+            },
+            "annotations": {
+              "readOnlyHint": false,
+              "destructiveHint": false,
+              "idempotentHint": false,
               "openWorldHint": false
             }
           }
@@ -5768,6 +10769,18 @@
       ],
       "candidate_executor": "messaging_write",
       "candidate_operation": "manage_messages.classify",
+      "candidate_plan_policy": "direct"
+    },
+    {
+      "legacy_tool": "manage_messages",
+      "legacy_action": "get_attention",
+      "stability": "stable",
+      "availability": [
+        "ordinary",
+        "lens"
+      ],
+      "candidate_executor": "messaging_read",
+      "candidate_operation": "manage_messages.get_attention",
       "candidate_plan_policy": "direct"
     },
     {
@@ -7230,6 +12243,18 @@
     },
     {
       "legacy_tool": "experimental_freshness_agent_intent",
+      "legacy_action": "bind_exact_expression",
+      "stability": "experimental",
+      "availability": [
+        "ordinary",
+        "lens"
+      ],
+      "candidate_executor": "experimental_freshness",
+      "candidate_operation": "experimental_freshness_agent_intent.bind_exact_expression",
+      "candidate_plan_policy": "direct"
+    },
+    {
+      "legacy_tool": "experimental_freshness_agent_intent",
       "legacy_action": "declare_sources",
       "stability": "experimental",
       "availability": [
@@ -7262,6 +12287,18 @@
       ],
       "candidate_executor": "experimental_freshness",
       "candidate_operation": "experimental_freshness_agent_intent.reconcile_affected_output",
+      "candidate_plan_policy": "direct"
+    },
+    {
+      "legacy_tool": "experimental_freshness_agent_intent",
+      "legacy_action": "revise_exact_expression",
+      "stability": "experimental",
+      "availability": [
+        "ordinary",
+        "lens"
+      ],
+      "candidate_executor": "experimental_freshness",
+      "candidate_operation": "experimental_freshness_agent_intent.revise_exact_expression",
       "candidate_plan_policy": "direct"
     },
     {

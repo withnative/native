@@ -1773,10 +1773,77 @@ async fn family_filter_pages_through_rejected_rows_with_limit_lookahead() {
 }
 
 /// Claim attribution travels with disclosure: an event carrying claim
-/// metadata loses its run key unless the caller is the claim holder, so a
-/// run pre-filter drops it while an ordinary event under the same run stays.
+/// metadata loses its run key unless the caller shares the holder's account,
+/// so a run pre-filter drops it while an ordinary event under the same run
+/// stays — even when the caller may plainly see who the actor is.
 #[tokio::test]
 async fn claim_events_lose_their_run_without_holder_visibility() {
+    let db = db().await;
+    let registry = registry();
+    // Bind the holder to a person record the cross-account caller can View,
+    // so the actor stays disclosed below: only the claim run key must go.
+    insert_record(&db, "person:self", "Self Person", None, false).await;
+    sqlx::query(
+        "INSERT INTO bindings (record_id, system, identifier, is_canonical)
+         VALUES ('person:self', 'account', ?, 1)",
+    )
+    .bind(SELF)
+    .execute(&crate::common::fixture_write_pool(&db).await)
+    .await
+    .unwrap();
+    insert_event(
+        &db,
+        "record:ordinary",
+        "record.updated",
+        Some(json!({ "summary": "ordinary" })),
+        Some(SELF),
+        Some(ROOT_RUN),
+        None,
+    )
+    .await;
+    insert_event(
+        &db,
+        "record:claimed",
+        "record.updated",
+        Some(json!({
+            "summary": "claimed",
+            "claimed_by_account": SELF,
+            "claimed_run_key": ROOT_RUN,
+        })),
+        Some(SELF),
+        Some(ROOT_RUN),
+        None,
+    )
+    .await;
+
+    // The cross-account caller sees the actor but loses the claim run key,
+    // so the run pre-filter drops the claim event only.
+    let run = call_as(&registry, &db, OTHER, json!({ "for_run": ROOT_RUN })).await;
+    assert_eq!(run["matched_event_count"], 1);
+    assert_eq!(run["changes"][0]["record_id"], "record:ordinary");
+
+    let all = call_as(&registry, &db, OTHER, json!({})).await;
+    assert_eq!(all["matched_event_count"], 2);
+    let changes = all["changes"].as_array().unwrap();
+    let claimed = changes
+        .iter()
+        .find(|change| change["record_id"] == "record:claimed")
+        .expect("claim event stays visible, only its run is withheld");
+    assert_eq!(claimed["actor"], SELF);
+    assert_eq!(claimed["actor_name"], "Self Person");
+    assert!(claimed["run_key"].is_null());
+    let ordinary = changes
+        .iter()
+        .find(|change| change["record_id"] == "record:ordinary")
+        .unwrap();
+    assert_eq!(ordinary["run_key"], ROOT_RUN);
+    db.close().await;
+}
+
+/// Same-account callers keep the claim run key: a keyless caller of the
+/// holder's own account still matches the claim event under `for_run`.
+#[tokio::test]
+async fn same_account_keyless_caller_keeps_claim_run_under_for_run() {
     let db = db().await;
     let registry = registry();
     insert_event(
@@ -1804,14 +1871,16 @@ async fn claim_events_lose_their_run_without_holder_visibility() {
     )
     .await;
 
-    // Tool callers carry no run key, so nobody here is the claim holder and
-    // the claimed event's run is nulled before the run check.
     let run = call(&registry, &db, json!({ "for_run": ROOT_RUN })).await;
-    assert_eq!(run["matched_event_count"], 1);
-    assert_eq!(run["changes"][0]["record_id"], "record:ordinary");
-
-    let all = call(&registry, &db, json!({})).await;
-    assert_eq!(all["matched_event_count"], 2);
+    assert_eq!(run["matched_event_count"], 2);
+    let mut ids: Vec<&str> = run["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|change| change["record_id"].as_str().unwrap())
+        .collect();
+    ids.sort_unstable();
+    assert_eq!(ids, ["record:claimed", "record:ordinary"]);
     db.close().await;
 }
 

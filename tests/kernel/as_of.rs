@@ -381,6 +381,14 @@ async fn coordination_projection_pins_claims_but_observes_authorized_targets_liv
         json!({ "record_id": id, "run_key": holder_run }),
     )
     .await;
+    replace_explicit_policy(
+        &db,
+        "test:claim-visibility",
+        id,
+        vec![AllowEntry::account("acct:viewer", Capability::View)],
+    )
+    .await
+    .unwrap();
 
     let owned = call(
         &registry,
@@ -416,7 +424,35 @@ async fn coordination_projection_pins_claims_but_observes_authorized_targets_liv
         "current"
     );
 
-    let withheld = call(
+    // A genuinely different principal still sees nothing beyond existence:
+    // cross-principal non-disclosure is byte-identical to before.
+    let viewer = Caller::authenticated("acct:viewer");
+    let withheld = call_as(
+        &registry,
+        &db,
+        viewer.clone(),
+        "query_record",
+        json!({
+            "steps": [{ "step": "filter", "ids": [id] }],
+            "include_coordination": true,
+            "run_key": "pilot-river-b748b2"
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        withheld["records"][0]["work_state"],
+        json!({
+            "state": "claimed",
+            "details": { "visibility": "withheld" },
+            "target": { "visibility": "withheld" }
+        })
+    );
+
+    // Same account, other run: the claim is visible with the holder's own
+    // run key and tier, while the claim projection stays pinned and the run
+    // target stays live — the intended new behaviour.
+    let same_account = call(
         &registry,
         &db,
         "query_record",
@@ -427,13 +463,30 @@ async fn coordination_projection_pins_claims_but_observes_authorized_targets_liv
         }),
     )
     .await;
+    assert_eq!(same_account["records"][0]["work_state"]["state"], "claimed");
     assert_eq!(
-        withheld["records"][0]["work_state"],
-        json!({
-            "state": "claimed",
-            "details": { "visibility": "withheld" },
-            "target": { "visibility": "withheld" }
-        })
+        same_account["records"][0]["work_state"]["target"]["visibility"],
+        "visible"
+    );
+    assert_eq!(
+        same_account["records"][0]["work_state"]["target"]["run_key"],
+        holder_run
+    );
+    assert_eq!(
+        same_account["records"][0]["work_state"]["target"]["holder_tier"],
+        "another_agent_of_yours"
+    );
+    assert_eq!(
+        same_account["coordination_observation"]["claim_content_boundary"],
+        "response_as_of"
+    );
+    assert_eq!(
+        same_account["coordination_observation"]["run_target_boundary"],
+        "live"
+    );
+    assert_eq!(
+        same_account["coordination_observation"]["authorization_boundary"],
+        "current"
     );
 
     call(
@@ -468,9 +521,10 @@ async fn coordination_projection_pins_claims_but_observes_authorized_targets_liv
     );
     assert_eq!(historical["resolved_content_seq"], pinned);
 
-    let historical_withheld = call(
+    let historical_withheld = call_as(
         &registry,
         &db,
+        viewer,
         "query_record",
         json!({
             "steps": [{ "step": "filter", "ids": [id] }],
@@ -479,7 +533,8 @@ async fn coordination_projection_pins_claims_but_observes_authorized_targets_liv
             "run_key": "pilot-river-b748b2"
         }),
     )
-    .await;
+    .await
+    .unwrap();
     assert_eq!(
         historical_withheld["records"][0]["work_state"],
         json!({

@@ -360,7 +360,11 @@ async fn run_corpus(drop_read_log: bool) -> Result<Vec<Value>> {
     if drop_read_log {
         // Touches first: the FK points at calls, so the reverse order would
         // depend on whether `PRAGMA foreign_keys` happens to be on.
-        for statement in ["DROP TABLE read_log_touches", "DROP TABLE read_log_calls"] {
+        for statement in [
+            "DROP TABLE read_log_touches",
+            "DROP TABLE read_log_record_ids",
+            "DROP TABLE read_log_calls",
+        ] {
             sqlx::query(statement).execute(db.write_pool()).await?;
         }
     }
@@ -384,6 +388,10 @@ async fn run_corpus(drop_read_log: bool) -> Result<Vec<Value>> {
                 }
             )));
         }
+        // Interaction capture runs on the handle's background queue while the
+        // corpus is sequential: each call's capture must have landed before
+        // a later call (e.g. `get_run_activity`) reads it back.
+        db.drain_captures().await;
         if call.tool == "get_run_activity" {
             let value = outcome.as_ref().ok().ok_or_else(|| {
                 crate::error::Error::engine("get_run_activity did not return a value")

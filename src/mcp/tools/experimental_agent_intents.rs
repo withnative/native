@@ -94,6 +94,22 @@ fn promote_input_schema() -> Value {
     })
 }
 
+fn bind_input_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "unit_revision": revision_ref_schema(),
+            "artefact_revision": revision_ref_schema(),
+            "selectors": { "type": "array", "minItems": 1, "items": selector_schema() },
+            "expression_role": { "type": "string", "enum": ["canonical", "paraphrase", "summary", "quotation"] },
+            "requested_occurrence_id": { "type": "string", "minLength": 1, "maxLength": 200 },
+            "idempotency_key": { "type": "string", "minLength": 1, "maxLength": 200 }
+        },
+        "required": ["unit_revision", "artefact_revision", "selectors", "expression_role", "idempotency_key"],
+        "additionalProperties": false
+    })
+}
+
 fn context_request_schema() -> Value {
     json!({
         "type": "object",
@@ -214,6 +230,30 @@ fn reconcile_input_schema() -> Value {
     })
 }
 
+fn revise_input_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "unit_id": { "type": "string", "minLength": 1, "maxLength": 200 },
+            "expected_current": revision_ref_schema(),
+            "content": {
+                "type": "object",
+                "properties": {
+                    "content": { "type": "string", "minLength": 1 },
+                    "content_media_type": { "type": "string", "minLength": 3 },
+                    "encoding_version": { "type": "integer", "minimum": 1 }
+                },
+                "required": ["content", "content_media_type", "encoding_version"],
+                "additionalProperties": false
+            },
+            "rationale": { "type": "string", "minLength": 1 },
+            "idempotency_key": { "type": "string", "minLength": 1, "maxLength": 200 }
+        },
+        "required": ["unit_id", "expected_current", "content", "rationale", "idempotency_key"],
+        "additionalProperties": false
+    })
+}
+
 fn intent_schema() -> Value {
     json!({
         "type": "object",
@@ -223,6 +263,24 @@ fn intent_schema() -> Value {
                 "properties": {
                     "intention": { "const": "promote_exact_expression" },
                     "input": promote_input_schema()
+                },
+                "required": ["intention", "input"],
+                "additionalProperties": false
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "intention": { "const": "bind_exact_expression" },
+                    "input": bind_input_schema()
+                },
+                "required": ["intention", "input"],
+                "additionalProperties": false
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "intention": { "const": "revise_exact_expression" },
+                    "input": revise_input_schema()
                 },
                 "required": ["intention", "input"],
                 "additionalProperties": false
@@ -279,7 +337,7 @@ pub fn register_experimental_agent_intent_tool(registry: &mut ToolRegistry) -> R
         // descriptor. Complete discovery and exact-name dispatch remain
         // available when the feature is enabled.
         ToolExposure::extension(false),
-        "EXPERIMENTAL, feature-gated development probe. Execute exactly one of four freshness intentions through the real Unit/Receipt runtime: promote an exact expression, declare exact sources for one bounded conclusion, assess exact source change for the current task, or reconcile an affected output. Returns exact semantic evidence. This is not a stable public API; it performs no automatic idea extraction, prompt policy, calibration, or background repair.",
+        "EXPERIMENTAL, feature-gated development probe. Execute exactly one of six freshness intentions through the real Unit/Receipt runtime: promote an exact expression, bind an exact expression into another record, revise a Unit's exact content, declare exact sources for one bounded conclusion, assess exact source change for the current task, or reconcile an affected output. Returns exact semantic evidence. This is not a stable public API; it performs no automatic idea extraction, prompt policy, calibration, or background repair.",
         intent_schema(),
         execute,
     )

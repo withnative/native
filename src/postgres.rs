@@ -3947,39 +3947,6 @@ async fn postgres_describe_schema(
 
     let mut snapshot = PostgresDomainTransaction::begin_snapshot(db).await?;
     let result = async {
-        // Read governed logical state before consulting engine catalogs. Apart
-        // from making the authority order explicit, this keeps cancellation
-        // observable at the exact reviewed relation query rather than inside
-        // an implementation-defined information_schema lock acquisition.
-        let all_schema_rows = crate::query::cascade::schema_config_rows_with(&mut snapshot).await?;
-        let mut visible_schema_rows = Vec::with_capacity(all_schema_rows.len());
-        for row in all_schema_rows {
-            let visible = match row.applies_to_collection_id.as_deref() {
-                None => true,
-                Some(bearer) => ordinary_bearer_visible_in(
-                    snapshot.admitted("authorize postgres schema row")?,
-                    db,
-                    caller,
-                    bearer,
-                )
-                .await?,
-            };
-            if visible {
-                visible_schema_rows.push(row);
-            }
-        }
-        let mut resolved = crate::query::cascade::resolve_from_rows(&visible_schema_rows).resolved;
-        let mut kind_registry = Map::new();
-        for record_type in crate::schema::SPINE_TYPES {
-            let kinds = crate::meta::kind::list_active_with(&mut snapshot, record_type).await?;
-            let tokens = kinds
-                .iter()
-                .map(|kind| Value::String(kind.token.clone()))
-                .collect();
-            resolved["shapes"][record_type]["kinds"] = Value::Array(tokens);
-            kind_registry.insert(record_type.into(), serde_json::to_value(kinds)?);
-        }
-
         let (by_table, complete_ddl) =
             postgres_complete_schema_contract(db, &mut snapshot, &REQUIRED_RELATIONS).await?;
         if !crate::schema::discovery::shared_logical_contract_holds(&by_table) {
@@ -4037,8 +4004,6 @@ async fn postgres_describe_schema(
                 "generated_schema_name_exposed":false,
             },
             "tables":tables,
-            "resolved_schema_config":resolved,
-            "kind_registry":kind_registry,
         });
         if let Some(ddl_statements) = ddl_statements {
             out["ddl_statements"] = serde_json::to_value(ddl_statements)?;
@@ -4407,6 +4372,156 @@ struct CreateArgs {
     links: Option<Vec<CreateLink>>,
     addressed_to: Option<Vec<String>>,
     reason: String,
+    #[serde(default)]
+    response_mode: ResponseMode,
+}
+
+/// The direct Postgres adapter keeps the public single-record write response
+/// contract in step with the SQLite lifecycle handler.  Multi-update has its
+/// own receipt and deliberately does not accept this field.
+#[derive(Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ResponseMode {
+    #[default]
+    Summary,
+    Verbose,
+}
+
+struct CompactWriteReceipt {
+    version_seq: i64,
+    previous_seq: Option<i64>,
+    body_receipt: Option<Value>,
+}
+
+fn summarize_write_receipt(result: Value, write: CompactWriteReceipt) -> Result<Value> {
+    const REQUIRED: [&str; 6] = [
+        "id",
+        "type",
+        "kind",
+        "name",
+        "body_digest",
+        "lifecycle_interpretation",
+    ];
+    const OPTIONAL_RECEIPTS: [&str; 7] = [
+        "previous_seq",
+        "body_receipt",
+        "html_body_write",
+        "delivery",
+        "action_attestation_ids",
+        "artifact_input_continuity",
+        "work_overlap",
+    ];
+
+    let object = result
+        .as_object()
+        .ok_or_else(|| Error::engine("single-record write returned a non-object result"))?;
+    let mut receipt = Map::new();
+    for key in REQUIRED {
+        let value = object.get(key).ok_or_else(|| {
+            Error::engine(format!("single-record write receipt is missing '{key}'"))
+        })?;
+        receipt.insert(key.into(), value.clone());
+    }
+    // This adapter does not mint shortest-unique display references, but the
+    // portable compact receipt always carries the address slot explicitly.
+    receipt.insert(
+        "display_reference".into(),
+        object
+            .get("display_reference")
+            .cloned()
+            .unwrap_or(Value::Null),
+    );
+    receipt.insert(
+        "version".into(),
+        Value::String(format!("rec:{}", write.version_seq)),
+    );
+    receipt.insert("previous_seq".into(), json!(write.previous_seq));
+    if let Some(body_receipt) = write.body_receipt {
+        receipt.insert("body_receipt".into(), body_receipt);
+    }
+    receipt.insert(
+        "warnings".into(),
+        object
+            .get("warnings")
+            .cloned()
+            .unwrap_or_else(|| Value::Array(Vec::new())),
+    );
+    for key in OPTIONAL_RECEIPTS {
+        if let Some(value) = object.get(key) {
+            receipt.insert(key.into(), value.clone());
+        }
+    }
+    Ok(Value::Object(receipt))
+}
+
+async fn record_version_in(
+    db: &PostgresDb,
+    transaction: &mut PostgresDomainTransaction<'_>,
+    id: &str,
+) -> Result<i64> {
+    let events = db.qualified_table("content_events")?;
+    Ok(sqlx::query_scalar(&format!(
+        "SELECT COALESCE(MAX(seq),0) FROM {events} WHERE record_id=$1"
+    ))
+    .bind(id)
+    .fetch_one(&mut **transaction.admitted("read compact write version")?)
+    .await?)
+}
+
+/// Build the compact response from the just-written projection, rather than
+/// through ordinary read authorization.  A successful write to a derived
+/// record can intentionally precede an ordinary readable bearer, while its
+/// writer is still entitled to receive its write receipt.
+async fn compact_write_projection_in(
+    db: &PostgresDb,
+    transaction: &mut PostgresDomainTransaction<'_>,
+    caller: &Caller,
+    id: &str,
+) -> Result<Value> {
+    let records = db.qualified_table("records")?;
+    let row = sqlx::query(&format!(
+        "SELECT id, record_type, kind, name, body, home_id, lifecycle \
+         FROM {records} WHERE id=$1"
+    ))
+    .bind(id)
+    .fetch_optional(&mut **transaction.admitted("read compact write projection")?)
+    .await?
+    .ok_or_else(|| Error::engine(format!("compact write projection lost record {id}")))?;
+    let record_type: String = row.try_get("record_type")?;
+    let kind: String = row.try_get("kind")?;
+    let home_id: Option<String> = row.try_get("home_id")?;
+    let lifecycle: Option<String> = row.try_get("lifecycle")?;
+    let lifecycle_interpreter = crate::query::lifecycle::LifecycleInterpreter::load_visible_with(
+        transaction,
+        attachment_principal(caller),
+    )
+    .await?;
+    let mut record = json!({
+        "id": row.try_get::<String, _>("id")?,
+        "type": record_type,
+        "kind": kind,
+        "name": row.try_get::<Option<String>, _>("name")?,
+        "body": row.try_get::<Option<String>, _>("body")?,
+        "lifecycle_interpretation": lifecycle_interpreter.interpret(
+            &record_type,
+            Some(&kind),
+            home_id.as_deref(),
+            lifecycle.as_deref(),
+        ),
+    });
+    crate::mcp::tools::lifecycle::annotate_body_digest(&mut record);
+    Ok(record)
+}
+
+fn render_write_response(
+    response_mode: ResponseMode,
+    result: Value,
+    write: CompactWriteReceipt,
+) -> Result<Value> {
+    if response_mode == ResponseMode::Verbose {
+        return Ok(result);
+    }
+    summarize_write_receipt(result, write)
 }
 
 #[derive(Deserialize)]
@@ -4441,6 +4556,7 @@ fn parse<T: for<'de> Deserialize<'de>>(tool: &str, arguments: Value) -> Result<T
 
 async fn create_record(db: &PostgresDb, caller: &Caller, arguments: Value) -> Result<Value> {
     let args: CreateArgs = parse("create_record", arguments)?;
+    let response_mode = args.response_mode;
     if args.reason.trim().is_empty() {
         return Err(Error::engine("create_record: 'reason' must not be blank"));
     }
@@ -4663,12 +4779,42 @@ async fn create_record(db: &PostgresDb, caller: &Caller, arguments: Value) -> Re
         )
         .await?;
     }
+    // Capture the record-local head while this writer still owns the
+    // transaction. A later writer cannot change the compact receipt's version.
+    let version_seq = record_version_in(db, &mut transaction, &id).await?;
+    let result = if response_mode == ResponseMode::Summary {
+        compact_write_projection_in(db, &mut transaction, caller, &id).await?
+    } else {
+        let lifecycle_interpreter =
+            crate::query::lifecycle::LifecycleInterpreter::load_visible_with(
+                &mut transaction,
+                attachment_principal(caller),
+            )
+            .await?;
+        read_record_in(
+            transaction.admitted("read create_record receipt")?,
+            db,
+            caller,
+            &id,
+            &lifecycle_interpreter,
+        )
+        .await?
+        .ok_or_else(|| {
+            Error::engine(format!(
+                "create_record: record {id} not readable after write"
+            ))
+        })?
+    };
     transaction.commit().await?;
-    read_record(db, caller, &id).await?.ok_or_else(|| {
-        Error::engine(format!(
-            "create_record: record {id} not readable after write"
-        ))
-    })
+    render_write_response(
+        response_mode,
+        result,
+        CompactWriteReceipt {
+            version_seq,
+            previous_seq: None,
+            body_receipt: None,
+        },
+    )
 }
 
 #[derive(Deserialize)]
@@ -5059,9 +5205,10 @@ async fn postgres_correction_snapshot(
         ));
     }
     if !SPINE_TYPES.contains(&args.target_type.as_str()) || args.target_kind.trim().is_empty() {
-        return Err(Error::engine(
-            "correct_record_type: target_type must be a closed spine type and target_kind must be non-empty",
-        ));
+        return Err(Error::engine(format!(
+            "correct_record_type: target_type must be a closed spine type ({}) and target_kind must be non-empty",
+            SPINE_TYPES.join(", "),
+        )));
     }
     let records = db.qualified_table("records")?;
     let events = db.qualified_table("content_events")?;
@@ -5569,6 +5716,8 @@ struct UpdateArgs {
     if_body_digest: Option<String>,
     if_unmodified_since: Option<String>,
     facets: Option<Map<String, Value>>,
+    #[serde(default)]
+    response_mode: ResponseMode,
 }
 
 #[derive(Deserialize)]
@@ -6281,6 +6430,7 @@ async fn update_record_singular(
     arguments: Value,
 ) -> Result<Value> {
     let args: UpdateArgs = parse("update_record", arguments)?;
+    let response_mode = args.response_mode;
     if args.reason.trim().is_empty() {
         return Err(Error::engine("update_record: 'reason' must not be blank"));
     }
@@ -6316,6 +6466,7 @@ async fn update_record_singular(
         row.try_get("owner_id")?,
     )
     .await?;
+    let previous_seq = record_version_in(db, &mut transaction, &args.id).await?;
     let current_body: Option<String> = row.try_get("body")?;
     // The whole-body guard is evaluated under the same `FOR UPDATE` row lock
     // that the write uses, so a concurrent writer cannot establish non-empty
@@ -6367,6 +6518,18 @@ async fn update_record_singular(
     }
     let (set_name, name) = optional_text("update_record", "name", &args.name)?;
     let (set_body, body) = optional_text("update_record", "body", &args.body)?;
+    let body_receipt = set_body.then(|| {
+        let before_chars = current_body.as_deref().unwrap_or("").chars().count() as u64;
+        let after_chars = body.as_deref().unwrap_or("").chars().count() as u64;
+        json!({
+            "operation": "body_set",
+            "requested_as": "body",
+            "before_chars": before_chars,
+            "after_chars": after_chars,
+            "delta_chars": after_chars as i64 - before_chars as i64,
+            "unit": "unicode_scalars",
+        })
+    });
     let (set_summary, summary) = optional_text("update_record", "summary", &args.summary)?;
     let (set_lifecycle, lifecycle) = optional_text("update_record", "lifecycle", &args.lifecycle)?;
     let record_type: String = row.try_get("record_type")?;
@@ -6482,13 +6645,41 @@ async fn update_record_singular(
         &required_before,
         &required_after,
     )?;
+    let version_seq = record_version_in(db, &mut transaction, &args.id).await?;
+    let result = if response_mode == ResponseMode::Summary {
+        compact_write_projection_in(db, &mut transaction, caller, &args.id).await?
+    } else {
+        let lifecycle_interpreter =
+            crate::query::lifecycle::LifecycleInterpreter::load_visible_with(
+                &mut transaction,
+                attachment_principal(caller),
+            )
+            .await?;
+        read_record_in(
+            transaction.admitted("read update_record receipt")?,
+            db,
+            caller,
+            &args.id,
+            &lifecycle_interpreter,
+        )
+        .await?
+        .ok_or_else(|| {
+            Error::engine(format!(
+                "update_record: record {} not readable after write",
+                args.id
+            ))
+        })?
+    };
     transaction.commit().await?;
-    read_record(db, caller, &args.id).await?.ok_or_else(|| {
-        Error::engine(format!(
-            "update_record: record {} not readable after write",
-            args.id
-        ))
-    })
+    render_write_response(
+        response_mode,
+        result,
+        CompactWriteReceipt {
+            version_seq,
+            previous_seq: Some(previous_seq),
+            body_receipt,
+        },
+    )
 }
 
 async fn require_edit(

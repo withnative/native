@@ -487,7 +487,10 @@ fn frozen_records_ddl_carries_the_projected_claim_contract() {
     assert!(ddl.contains(
         "ON records(claimed_by_account, claimed_at DESC)\n       WHERE claimed_by_account IS NOT NULL AND deleted_at IS NULL"
     ));
-    assert!(ddl.ends_with("PRAGMA user_version = 50"));
+    assert!(ddl.ends_with(&format!(
+        "PRAGMA user_version = {}",
+        native_ce::db::CURRENT_ENGINE_SCHEMA_VERSION
+    )));
 }
 
 #[test]

@@ -108,6 +108,9 @@ pub mod provenance;
 pub mod query;
 pub mod realtime;
 pub mod recipe;
+pub mod record_body;
+#[doc(hidden)]
+pub mod request_work;
 pub(crate) use native_record_type_correction_kernel as record_type_correction;
 pub mod record_images;
 pub mod relationship;

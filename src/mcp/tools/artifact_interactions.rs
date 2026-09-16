@@ -251,10 +251,11 @@ async fn maybe_include_next_plan(
     // closed — so the bonus render contends exactly like one concurrent
     // `render_artifact` call. Saturation never waits: it surfaces as a
     // diagnostic, which the status check below turns into no plan.
-    let rendered = match try_render_live_mdx_v2(db, caller, &invocation.artifact_id, false).await {
-        Ok(Some(rendered)) => rendered,
-        Ok(None) | Err(_) => return result,
-    };
+    let rendered =
+        match try_render_live_mdx_v2(db, caller, &invocation.artifact_id, false, None).await {
+            Ok(Some(rendered)) => rendered,
+            Ok(None) | Err(_) => return result,
+        };
     if rendered.get("status").and_then(Value::as_str) != Some("rendered") {
         return result;
     }

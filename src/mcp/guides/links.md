@@ -54,6 +54,15 @@ The source was produced from the target and should retain that provenance.
 
 Use `manage_links` for atomic add/remove/list operations. Use `query_record` traversal for filtered multi-hop work; traversing a link never changes containment.
 
+A record an incoming `supersedes` link points at discloses its successors on
+reads: `get_record`, `query_record`, `search`, `get_structure`,
+`render_record`, `get_dashboard`, and Bootstrap carry a `superseded_by`
+header (`items`: up to three named successors with id, title and short
+reference; `total_count`: every live successor). The superseded record stays
+readable and otherwise unchanged — this is disclosure, not archival. A
+successor you cannot View is counted in `total_count` but never named in
+`items`.
+
 Use `manage_relationships` for governed semantic propositions whose support,
 contest, evidence, admission, provenance, and effective state must remain
 explainable. Its v1 public types are `relates_to`, `depends_on`, `blocks`,

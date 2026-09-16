@@ -36,32 +36,40 @@ fn advertised_schema_is_action_discriminated() {
     let set = by_action("set");
     assert_eq!(
         set["required"],
-        json!([
-            "action",
-            "record_id",
-            "key",
-            "value",
-            "as_of",
-            "reason",
-            "run_key"
-        ])
+        json!(["action", "key", "value", "as_of", "reason", "run_key"]),
+        "one of id, record_id, or ids is required by the selector oneOf"
     );
+    assert_eq!(set["oneOf"].as_array().unwrap().len(), 3);
+    for field in ["id", "record_id", "ids"] {
+        assert!(set["properties"].get(field).is_some(), "missing {field}");
+    }
     assert!(set["properties"].get("vocab_ref").is_some());
     assert!(set["properties"].get("from_as_of").is_none());
 
     let unset = by_action("unset");
     assert_eq!(
         unset["required"],
-        json!(["action", "record_id", "key", "as_of", "reason", "run_key"])
+        json!(["action", "key", "as_of", "reason", "run_key"]),
+        "one of id, record_id, or ids is required by the selector oneOf"
     );
+    assert_eq!(unset["oneOf"].as_array().unwrap().len(), 3);
+    for field in ["id", "record_id", "ids"] {
+        assert!(unset["properties"].get(field).is_some(), "missing {field}");
+    }
     assert!(unset["properties"].get("value").is_none());
     assert!(unset["properties"].get("vocab_ref").is_none());
 
-    let list = by_action("list");
+    let list_contract = by_action("list");
+    let list = list_contract;
     assert_eq!(
         list["required"],
-        json!(["action", "record_id", "key", "run_key"])
+        json!(["action", "key", "run_key"]),
+        "one of id, record_id, or ids is required by the selector oneOf"
     );
+    assert_eq!(list["oneOf"].as_array().unwrap().len(), 3);
+    for field in ["id", "record_id", "ids"] {
+        assert!(list["properties"].get(field).is_some(), "missing {field}");
+    }
     for field in ["from_as_of", "to_as_of", "after_as_of", "limit"] {
         assert!(list["properties"].get(field).is_some(), "missing {field}");
     }
@@ -632,5 +640,77 @@ async fn timestamps_and_write_contract_fail_closed() {
     )
     .await;
     assert!(err.contains("between 1 and 1000"), "{err}");
+    db.close().await;
+}
+
+/// Selector aliases on the set/unset write branches (e674559): each spelling
+/// performs the same observation write, while conflicts reject value-free
+/// and write nothing.
+#[tokio::test]
+async fn write_selector_aliases_cover_set_and_unset() {
+    let db = create_database(":memory:").await.unwrap();
+    let registry = registry();
+    let record_id = create_record(
+        &db,
+        json!({ "type": "Outcome", "kind": "target", "name": "metric" }),
+    )
+    .await
+    .unwrap();
+
+    // set via id writes the observation against the same record.
+    let set = call(
+        &registry,
+        &db,
+        json!({
+            "action": "set", "id": record_id, "key": "current", "value": 10,
+            "as_of": "2026-08-01T00:00:00Z",
+            "reason": "Alias set writes the same observation.",
+        }),
+    )
+    .await;
+    assert_eq!(set["status"], "set");
+    assert_eq!(set["record_id"], record_id);
+
+    // unset via a singleton ids list retracts it on the same record.
+    let unset = call(
+        &registry,
+        &db,
+        json!({
+            "action": "unset", "ids": [record_id], "key": "current",
+            "as_of": "2026-08-02T00:00:00Z",
+            "reason": "Alias unset retracts the same observation.",
+        }),
+    )
+    .await;
+    assert_eq!(unset["status"], "unset");
+    assert_eq!(unset["record_id"], record_id);
+
+    // Conflicting spellings reject without writing and without reflecting
+    // the rejected value.
+    let before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM facet_observations")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    let err = call_err(
+        &registry,
+        &db,
+        json!({
+            "action": "set", "id": record_id, "record_id": record_id,
+            "key": "current", "value": 10,
+            "as_of": "2026-08-03T00:00:00Z",
+            "reason": "Conflicting selectors must reject.",
+        }),
+    )
+    .await;
+    assert!(err.contains("exactly one selector"), "{err}");
+    assert!(
+        !err.contains(&record_id),
+        "the diagnostic must not reflect the rejected value: {err}"
+    );
+    let after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM facet_observations")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(after, before, "a rejected selector must write nothing");
     db.close().await;
 }

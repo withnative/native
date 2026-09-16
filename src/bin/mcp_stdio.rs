@@ -21,8 +21,9 @@ use native_ce::export::{ExportCoordinator, LocalSnapshotSource};
 use native_ce::identity::resolve_stdio_account_identity;
 use native_ce::mcp::{
     register_build_enabled_experimental_tools, register_builtin_tools, register_snapshot_tool,
-    register_standby_status_tool, register_surface_tools, Caller, ExposureProfile, McpSurfaceMode,
-    StatusOnlyStdioServer, StdioServer, ToolRegistry,
+    register_standby_status_tool, register_surface_tools, Caller, ExperimentalExecutors,
+    ExposureProfile, McpSurfaceMode, StatusOnlyStdioServer, StdioServer, ToolRegistry,
+    EXPERIMENTAL_EXECUTORS_ENV,
 };
 #[cfg(feature = "mcp-executor-prototype")]
 use native_ce::mcp::{ExecutorPrototypeStdioServer, ExecutorTelemetryContext};
@@ -334,6 +335,15 @@ async fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    let experimental_executors =
+        match ExperimentalExecutors::from_env_value(std::env::var(EXPERIMENTAL_EXECUTORS_ENV).ok())
+        {
+            Ok(experimental) => experimental,
+            Err(err) => {
+                eprintln!("mcp-stdio: {err}");
+                return ExitCode::from(2);
+            }
+        };
     let db_env = std::env::var("NATIVE_CE_DB").ok();
     let standby_config_env = std::env::var("NATIVE_CE_STANDBY_CONFIG").ok();
     let standby_refresh_config = std::env::var(ENV_STANDBY_REFRESH_CONFIG)
@@ -640,12 +650,13 @@ async fn main() -> ExitCode {
             {
                 match ExecutorTelemetryContext::structured_log() {
                     Ok(telemetry) => {
-                        match ExecutorPrototypeStdioServer::new_with_telemetry(
+                        match ExecutorPrototypeStdioServer::new_with_telemetry_and_experimental(
                             registry,
                             db.clone(),
                             caller,
                             None,
                             telemetry,
+                            experimental_executors,
                         )
                         .await
                         {
@@ -1091,6 +1102,28 @@ mod tests {
         let error = configured_profile(Some("everything".into())).unwrap_err();
         assert!(error.contains("NATIVE_CE_MCP_TOOL_PROFILE"), "{error}");
         assert!(error.contains("everything"), "{error}");
+    }
+
+    #[test]
+    fn experimental_executors_opt_in_is_off_by_default_and_fails_closed() {
+        use native_ce::mcp::EXPERIMENTAL_FRESHNESS_EXECUTOR;
+
+        assert!(ExperimentalExecutors::from_env_value(None)
+            .unwrap()
+            .is_empty());
+        assert!(ExperimentalExecutors::from_env_value(Some(String::new()))
+            .unwrap()
+            .is_empty());
+        assert!(ExperimentalExecutors::from_env_value(Some(" , ".into()))
+            .unwrap()
+            .is_empty());
+        let allowlisted =
+            ExperimentalExecutors::from_env_value(Some("experimental_freshness".into())).unwrap();
+        assert!(allowlisted.contains(EXPERIMENTAL_FRESHNESS_EXECUTOR));
+        let error =
+            ExperimentalExecutors::from_env_value(Some("experimental_nope".into())).unwrap_err();
+        assert!(error.contains(EXPERIMENTAL_EXECUTORS_ENV), "{error}");
+        assert!(error.contains("experimental_nope"), "{error}");
     }
 
     #[cfg(feature = "experimental-agent-intents")]

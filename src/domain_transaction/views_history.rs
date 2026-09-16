@@ -1287,6 +1287,9 @@ pub(crate) async fn render_record<E: DomainStatementExecutor>(
         links_out_count,
         links_in,
         links_in_count,
+        // Portable adapters do not serve this projection: the field stays
+        // absent (never empty) outside the SQLite kernel.
+        superseded_by: None,
         children,
         child_count,
         suggestions: None,
@@ -1306,7 +1309,12 @@ pub(crate) async fn render_record<E: DomainStatementExecutor>(
         // `render_enriched_record_markdown` does not render contribution, so
         // absence here costs this view nothing today.
         contribution: None,
+        // History attribution is opt-in on the live SQLite get_record path.
+        history_summary: None,
         ancestors,
+        // Portable adapters do not serve the freshness projection: the field
+        // stays absent (never empty) outside the SQLite kernel.
+        freshness: None,
     };
     let names = snapshot
         .records

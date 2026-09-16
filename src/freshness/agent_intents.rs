@@ -70,6 +70,12 @@ pub enum ExperimentalAgentIntent {
     PromoteExactExpression {
         input: PromoteIdeaInput,
     },
+    BindExactExpression {
+        input: BindOccurrenceInput,
+    },
+    ReviseExactExpression {
+        input: ReviseUnitInput,
+    },
     DeclareSources {
         output: DurableOutputIntent,
     },
@@ -90,6 +96,15 @@ pub enum ExperimentalAgentIntentResult {
         promoted: PromoteIdeaResult,
         unit: UnitView,
         occurrence: OccurrenceEvidence,
+    },
+    BindExactExpression {
+        bound: BindOccurrenceResult,
+        unit: UnitView,
+        occurrence: OccurrenceEvidence,
+    },
+    ReviseExactExpression {
+        revised: ReviseUnitResult,
+        unit: UnitView,
     },
     DeclareSources {
         committed: CommitDurableOutputResult,
@@ -489,6 +504,38 @@ pub async fn execute_experimental_agent_intent(
                         resolution,
                     },
                 },
+                ProvenanceCompleteness::Complete,
+            )
+        }
+        ExperimentalAgentIntent::BindExactExpression { input } => {
+            let bound = bind_occurrence(db, principal, actor, input).await?;
+            let unit_id = UnitId::new(&bound.occurrence.unit_revision.subject_id)?;
+            let unit = read_unit(db, principal, &unit_id).await?;
+            let occurrence = list_occurrences(db, principal, &unit_id)
+                .await?
+                .into_iter()
+                .find(|occurrence| occurrence.occurrence_id == bound.occurrence.occurrence_id)
+                .ok_or_else(|| Error::engine("bound Occurrence is unavailable"))?;
+            let resolution =
+                resolve_occurrence(db, principal, &bound.occurrence.occurrence_id).await?;
+            (
+                ExperimentalAgentIntentResult::BindExactExpression {
+                    bound,
+                    unit,
+                    occurrence: OccurrenceEvidence {
+                        occurrence,
+                        resolution,
+                    },
+                },
+                ProvenanceCompleteness::Complete,
+            )
+        }
+        ExperimentalAgentIntent::ReviseExactExpression { input } => {
+            let unit_id = input.unit_id.clone();
+            let revised = revise_unit(db, principal, actor, input).await?;
+            let unit = read_unit(db, principal, &unit_id).await?;
+            (
+                ExperimentalAgentIntentResult::ReviseExactExpression { revised, unit },
                 ProvenanceCompleteness::Complete,
             )
         }

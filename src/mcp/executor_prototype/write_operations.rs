@@ -1382,6 +1382,36 @@ impl ExecutorPrototypeStdioServer {
             .get("arguments")
             .cloned()
             .unwrap_or_else(|| json!({}));
+        // Record-selector aliases normalise to the canonical field before
+        // schema validation and preparation, exactly as on the direct
+        // paths — so `record_id`/`id`/`ids` spellings prepare the same plan.
+        // A malformed selector rejects here with the value-free shape
+        // diagnostic; it must not become a state/authorization failure.
+        let operation_arguments = match crate::mcp::record_ref::normalize_operation_record_selector(
+            &contract.operation,
+            operation_arguments.clone(),
+        ) {
+            Ok(normalized) => normalized,
+            Err(error) => {
+                let diagnostic =
+                    crate::mcp::record_ref::invalid_operation_record_selector_diagnostic(
+                        &contract.operation,
+                        &operation_arguments,
+                    )
+                    .map(|diagnostic| diagnostic.to_string())
+                    .unwrap_or_else(|| error.to_string());
+                return self
+                    .write_plan_error(
+                        id,
+                        modern,
+                        &contract,
+                        &envelope,
+                        telemetry_request.as_ref(),
+                        PlanError::new("preparation_validation_failed", &diagnostic, true),
+                    )
+                    .await;
+            }
+        };
         let schema_valid = jsonschema::validator_for(&contract.input_schema)
             .map(|validator| validator.is_valid(&operation_arguments))
             .unwrap_or(false);
@@ -7307,5 +7337,176 @@ mod tests {
             .unwrap();
             assert_eq!(after_execute, before + 1);
         }
+    }
+
+    /// Record-selector aliases on the plan-backed writes (e674559): every
+    /// spelling prepares the same canonical plan without mutating, while a
+    /// conflicting selector rejects value-free before preparation runs.
+    #[tokio::test]
+    async fn record_selector_aliases_prepare_canonical_write_plans() {
+        let db = create_database(":memory:").await.unwrap();
+        let correction_target = create_record(
+            &db,
+            json!({
+                "id":"ec00b000-0000-4000-8000-000000000031",
+                "type":"Document",
+                "kind":"note",
+                "name":"Alias correction fixture",
+            }),
+        )
+        .await
+        .unwrap();
+        let delete_target = create_record(
+            &db,
+            json!({
+                "id":"ec00b000-0000-4000-8000-000000000032",
+                "type":"Document",
+                "kind":"note",
+                "name":"Alias delete fixture",
+            }),
+        )
+        .await
+        .unwrap();
+        let registry = registry();
+        let server = ExecutorPrototypeStdioServer::new(registry, db.clone(), Caller::local(), None)
+            .await
+            .unwrap();
+
+        // Each alias prepares the same plan as the canonical spelling: same
+        // target, no mutation, and the stored plan carries only the canonical
+        // selector field.
+        for (executor, operation, canonical, target, companions) in [
+            (
+                RECORDS_WRITE_EXECUTOR,
+                CORRECT_RECORD_TYPE_OPERATION,
+                "record_id",
+                correction_target.as_str(),
+                json!({"target_type":"Resolution","target_kind":"decision"}),
+            ),
+            (
+                RECORDS_DELETE_EXECUTOR,
+                DELETE_RECORD_OPERATION,
+                "id",
+                delete_target.as_str(),
+                json!({}),
+            ),
+        ] {
+            let expected_target = if operation == CORRECT_RECORD_TYPE_OPERATION {
+                format!("Alias correction fixture ({target})")
+            } else {
+                format!("Alias delete fixture ({target})")
+            };
+            for (field, reference) in [
+                ("id", target.to_string()),
+                ("record_id", target.to_string()),
+                ("ids", target.to_string()),
+            ] {
+                let mut arguments = companions.clone();
+                arguments["reason"] = json!("Prepare through a selector alias");
+                if field == "ids" {
+                    arguments[field] = json!([reference]);
+                } else {
+                    arguments[field] = json!(reference);
+                }
+                let prepared = server
+                    .handle_message(executor_call_message(
+                        500,
+                        executor,
+                        json!({"operation":operation,"arguments":arguments}),
+                    ))
+                    .await
+                    .unwrap();
+                assert!(
+                    response_succeeded(&prepared),
+                    "{executor}.{operation}.{field}: {prepared}"
+                );
+                let structured = &prepared["result"]["structuredContent"];
+                assert_eq!(structured["preparation_mutated"], false);
+                assert_eq!(structured["target"], expected_target);
+                let plan_id = structured["plan_id"].as_str().unwrap();
+                let stored = server
+                    .write_runtime
+                    .store
+                    .load(plan_id, now_ms())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let plan: WritePlan = serde_json::from_value(stored.payload).unwrap();
+                assert_eq!(plan.operation_arguments[canonical], json!(target));
+                for alias in ["id", "record_id", "ids"] {
+                    if alias != canonical {
+                        assert!(
+                            plan.operation_arguments.get(alias).is_none(),
+                            "{executor}.{operation}.{field}: {plan:?}"
+                        );
+                    }
+                }
+            }
+        }
+        // Nothing above mutated: the correction target keeps its type and the
+        // delete target is still live.
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT type FROM records WHERE id=?")
+                .bind(&correction_target)
+                .fetch_one(db.write_pool())
+                .await
+                .unwrap(),
+            "Document"
+        );
+        assert_eq!(
+            type_correction_event_count(&db, &correction_target).await,
+            0
+        );
+        let deleted_at: Option<String> =
+            sqlx::query_scalar("SELECT deleted_at FROM records WHERE id=?")
+                .bind(&delete_target)
+                .fetch_one(db.write_pool())
+                .await
+                .unwrap();
+        assert!(deleted_at.is_none());
+
+        // A conflicting selector rejects before preparation with the
+        // value-free shape diagnostic and stores no plan.
+        for (executor, operation, target) in [
+            (
+                RECORDS_WRITE_EXECUTOR,
+                CORRECT_RECORD_TYPE_OPERATION,
+                correction_target.as_str(),
+            ),
+            (
+                RECORDS_DELETE_EXECUTOR,
+                DELETE_RECORD_OPERATION,
+                delete_target.as_str(),
+            ),
+        ] {
+            let rejected = server
+                .handle_message(executor_call_message(
+                    501,
+                    executor,
+                    json!({
+                        "operation":operation,
+                        "arguments":{
+                            "id":target,
+                            "record_id":target,
+                            "target_type":"Resolution",
+                            "target_kind":"decision",
+                            "reason":"Conflicting selectors must reject"
+                        }
+                    }),
+                ))
+                .await
+                .unwrap();
+            assert!(!response_succeeded(&rejected), "{rejected}");
+            let serialized = serde_json::to_string(&rejected).unwrap();
+            assert!(serialized.contains("exactly one selector"), "{serialized}");
+            assert!(
+                !serialized.contains(target),
+                "the rejection must not reflect the selector value: {serialized}"
+            );
+        }
+        assert_eq!(
+            type_correction_event_count(&db, &correction_target).await,
+            0
+        );
     }
 }

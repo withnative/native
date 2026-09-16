@@ -13,7 +13,9 @@
 //! runtime mechanism is captured through [`SnapshotSourceRef`].
 
 pub mod apps;
+pub mod artifact_input_cache;
 pub mod artifact_interactions;
+pub mod artifact_revalidate;
 pub mod artifacts;
 pub mod attachments;
 pub mod attribution;

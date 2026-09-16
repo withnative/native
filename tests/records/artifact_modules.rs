@@ -112,10 +112,12 @@ async fn fixture() -> (Db, ToolRegistry, tokio::sync::OwnedMutexGuard<()>) {
 }
 
 async fn call(registry: &ToolRegistry, db: &Db, tool: &str, arguments: Value) -> Value {
-    registry
+    let result = registry
         .call(db.clone(), Caller::local(), tool, arguments)
         .await
-        .unwrap()
+        .unwrap();
+    db.drain_captures_for_tests().await;
+    result
 }
 
 /// Read the current write token the way a caller must: through `get_record`.
@@ -135,10 +137,12 @@ async fn call_as(
     tool: &str,
     arguments: Value,
 ) -> Value {
-    registry
+    let result = registry
         .call(db.clone(), caller, tool, arguments)
         .await
-        .unwrap()
+        .unwrap();
+    db.drain_captures_for_tests().await;
+    result
 }
 
 fn module_source(label: &str) -> String {

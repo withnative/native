@@ -18,7 +18,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use age::secrecy::{ExposeSecret, SecretString};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -292,6 +292,119 @@ impl EndpointUpdate {
 pub struct FileFederationCustody {
     root: Arc<PathBuf>,
     master_key: CustodyMasterKey,
+    inspected: Arc<Mutex<BTreeMap<String, InspectedPrincipal>>>,
+}
+
+// Cache only public projections, never decrypted key material. The file is
+// re-read on every hit; version alone cannot detect same-version corruption.
+#[derive(Clone)]
+struct InspectedPrincipal {
+    document_version: u64,
+    digest: [u8; 32],
+    principal: FederationPrincipal,
+}
+
+const INSPECTED_PRINCIPAL_LIMIT: usize = 256;
+
+/// Bounded production counters for actual custody `flock` acquisitions.
+///
+/// This observes the kernel lock calls in `lock_with_mode`, not provider
+/// entry points: one increment per successful shared (`lock_shared`, the
+/// authenticated-connect inspect path) or exclusive (mutator) acquisition.
+/// The warm `inspect` fast path returns from the in-memory projection without
+/// taking any lock and therefore records zero; a cold inspect records exactly
+/// one shared acquisition. Failed lock attempts record nothing.
+///
+/// Propagation: async custody calls observe the task-local scope installed by
+/// `with_custody_scope`. `spawn_blocking` erases task-locals, so the hosted
+/// `existing_public_principal` path captures the handle before spawning and
+/// re-installs it inside the blocking thread with
+/// `with_custody_blocking_scope`. When no scope is present both lookups are a
+/// cheap miss and no work happens.
+#[derive(Debug, Default)]
+pub struct CustodyWorkCounters {
+    shared_locks: std::sync::atomic::AtomicU64,
+    exclusive_locks: std::sync::atomic::AtomicU64,
+}
+
+impl CustodyWorkCounters {
+    /// One successful `flock` acquisition. Called only after the kernel call
+    /// returns success, never on the provider-call boundary.
+    pub fn record(&self, shared: bool) {
+        if shared {
+            self.shared_locks
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            self.exclusive_locks
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Point-in-time `(shared, exclusive)` totals for this handle.
+    pub fn snapshot(&self) -> (u64, u64) {
+        (
+            self.shared_locks.load(std::sync::atomic::Ordering::Relaxed),
+            self.exclusive_locks
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+}
+
+tokio::task_local! {
+    static CUSTODY_SCOPE: Arc<CustodyWorkCounters>;
+}
+
+std::thread_local! {
+    static CUSTODY_BLOCKING_SCOPE: std::cell::RefCell<Option<Arc<CustodyWorkCounters>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `future` with custody-lock acquisitions attributed to `handle`.
+/// Nested scopes shadow the outer one; the inner count is invisible outside.
+pub async fn with_custody_scope<F>(handle: Arc<CustodyWorkCounters>, future: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    CUSTODY_SCOPE.scope(handle, future).await
+}
+
+/// Run a synchronous blocking closure with custody-lock acquisitions
+/// attributed to `handle`. Sets a thread-local for the duration and restores
+/// the previous value afterwards (including on panic via the guard), so nested
+/// scopes work and reused `spawn_blocking` threads never leak request state.
+pub fn with_custody_blocking_scope<R>(
+    handle: Arc<CustodyWorkCounters>,
+    f: impl FnOnce() -> R,
+) -> R {
+    struct RestoreGuard(Option<Arc<CustodyWorkCounters>>);
+    impl Drop for RestoreGuard {
+        fn drop(&mut self) {
+            CUSTODY_BLOCKING_SCOPE.with(|cell| {
+                *cell.borrow_mut() = self.0.take();
+            });
+        }
+    }
+    let previous = CUSTODY_BLOCKING_SCOPE.with(|cell| cell.borrow_mut().replace(handle));
+    let _guard = RestoreGuard(previous);
+    f()
+}
+
+/// Current custody handle, if any scope is active. The blocking thread-local
+/// (set by `with_custody_blocking_scope` inside `spawn_blocking`) wins when
+/// present; otherwise the async task-local is consulted. Cheap miss when
+/// absent: one thread-local borrow plus one task-local `try_with`.
+pub fn custody_scope_handle() -> Option<Arc<CustodyWorkCounters>> {
+    let blocking = CUSTODY_BLOCKING_SCOPE.with(|cell| cell.borrow().clone());
+    if blocking.is_some() {
+        return blocking;
+    }
+    CUSTODY_SCOPE.try_with(Arc::clone).ok()
+}
+
+fn observe_custody_lock(shared: bool) {
+    if let Some(handle) = custody_scope_handle() {
+        handle.record(shared);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -442,19 +555,60 @@ impl FileFederationCustody {
         Ok(Self {
             root: Arc::new(root),
             master_key,
+            inspected: Arc::new(Mutex::new(BTreeMap::new())),
         })
     }
 
     pub fn inspect(&self, account_id: &str) -> FederationPrincipal {
-        let _guard = match self.lock() {
+        // write_vault publishes by atomic rename. An unchanged complete file
+        // identifies the same verified public view, including lifecycle state,
+        // across handles/processes. This read is the warm observation boundary;
+        // it does not wait for unrelated accounts' writers or decrypt any key.
+        // Retain the lock-file integrity check even when no lock is acquired.
+        if std::fs::symlink_metadata(self.root.join("custody.lock"))
+            .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+        {
+            if let Ok(Some((vault, digest))) = self.read_vault_with_digest(account_id) {
+                if let Ok(cache) = self.inspected.lock() {
+                    if let Some(cached) = cache.get(account_id) {
+                        if cached.document_version == vault.document_version
+                            && cached.digest == digest
+                        {
+                            return cached.principal.clone();
+                        }
+                    }
+                }
+            }
+        }
+
+        // On a miss, re-read under a shared lock before validation. Mutators
+        // still take the exclusive lock; concurrent cold readers can coexist.
+        let _guard = match self.lock_shared() {
             Ok(guard) => guard,
             Err(_) => return corrupt_view(account_id),
         };
-        match self.read_vault(account_id) {
-            Ok(Some(vault)) => self
-                .validate_vault_for_account(vault, account_id)
-                .map(|vault| public_view(&vault))
-                .unwrap_or_else(|_| corrupt_view(account_id)),
+        match self.read_vault_with_digest(account_id) {
+            Ok(Some((vault, digest))) => {
+                let vault = match self.validate_vault_for_account(vault, account_id) {
+                    Ok(vault) => vault,
+                    Err(_) => return corrupt_view(account_id),
+                };
+                let principal = public_view(&vault);
+                if let Ok(mut cache) = self.inspected.lock() {
+                    if cache.len() >= INSPECTED_PRINCIPAL_LIMIT && !cache.contains_key(account_id) {
+                        cache.pop_first();
+                    }
+                    cache.insert(
+                        account_id.to_owned(),
+                        InspectedPrincipal {
+                            document_version: vault.document_version,
+                            digest,
+                            principal: principal.clone(),
+                        },
+                    );
+                }
+                principal
+            }
             Ok(None) => match self.has_marker(account_id) {
                 Ok(true) | Err(_) => corrupt_view(account_id),
                 Ok(false) => FederationPrincipal {
@@ -1034,6 +1188,14 @@ impl FileFederationCustody {
     }
 
     fn lock(&self) -> Result<CustodyLock> {
+        self.lock_with_mode(false)
+    }
+
+    fn lock_shared(&self) -> Result<CustodyLock> {
+        self.lock_with_mode(true)
+    }
+
+    fn lock_with_mode(&self, shared: bool) -> Result<CustodyLock> {
         let path = self.root.join("custody.lock");
         match std::fs::symlink_metadata(&path) {
             Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
@@ -1057,7 +1219,15 @@ impl FileFederationCustody {
             ));
         }
         set_owner_only_file(&file)?;
-        file.lock_exclusive()?;
+        if shared {
+            FileExt::lock_shared(&file)?;
+        } else {
+            file.lock_exclusive()?;
+        }
+        // Actual kernel acquisition only: provider entry, cache hits, and
+        // failed attempts never reach here. Warm `inspect` returns before any
+        // lock call and records zero.
+        observe_custody_lock(shared);
         Ok(CustodyLock(file))
     }
 
@@ -1100,6 +1270,12 @@ impl FileFederationCustody {
     }
 
     fn read_vault(&self, account_id: &str) -> Result<Option<VaultFile>> {
+        Ok(self
+            .read_vault_with_digest(account_id)?
+            .map(|(vault, _)| vault))
+    }
+
+    fn read_vault_with_digest(&self, account_id: &str) -> Result<Option<(VaultFile, [u8; 32])>> {
         let path = self.vault_path(account_id);
         match std::fs::symlink_metadata(&path) {
             Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
@@ -1119,7 +1295,7 @@ impl FileFederationCustody {
         let vault: VaultFile = serde_json::from_slice(&bytes).map_err(|_| {
             Error::engine("federation custody vault is malformed; state is corrupt")
         })?;
-        Ok(Some(vault))
+        Ok(Some((vault, Sha256::digest(&bytes).into())))
     }
 
     fn load_valid(&self, account_id: &str) -> Result<VaultFile> {
@@ -1675,6 +1851,7 @@ impl CustodyArchive {
         let verifier = FileFederationCustody {
             root: Arc::new(PathBuf::new()),
             master_key: master_key.clone(),
+            inspected: Arc::new(Mutex::new(BTreeMap::new())),
         };
         let mut vault_tokens = BTreeSet::new();
         let mut marker_tokens = BTreeSet::new();
@@ -3924,6 +4101,99 @@ mod custody_archive {
             .unwrap();
     }
 
+    #[test]
+    fn inspected_principal_warm_hit_does_not_wait_for_custody_writer() {
+        let directory = TempDir::new().unwrap();
+        let custody = test_custody(&directory, 61);
+        provision_alice(&custody);
+        let before = custody.inspect("account-alice");
+        assert_eq!(before.state, PrincipalState::Active);
+        let guard = custody.lock().unwrap();
+        let (send, receive) = std::sync::mpsc::channel();
+        let reader = custody.clone();
+        let thread = std::thread::spawn(move || {
+            send.send(reader.inspect("account-alice")).unwrap();
+        });
+        let observed = receive.recv_timeout(std::time::Duration::from_secs(5));
+        drop(guard);
+        thread.join().unwrap();
+        let observed = observed.expect("warm inspection waited for the exclusive custody lock");
+        assert_eq!(observed.document_version, before.document_version);
+        assert_eq!(observed.principal_id, before.principal_id);
+    }
+
+    #[test]
+    fn inspected_principal_cold_reader_shares_the_lock() {
+        let directory = TempDir::new().unwrap();
+        let custody = test_custody(&directory, 62);
+        provision_alice(&custody);
+        let guard = custody.lock_shared().unwrap();
+        let (send, receive) = std::sync::mpsc::channel();
+        let reader = custody.clone();
+        let thread = std::thread::spawn(move || {
+            send.send(reader.inspect("account-alice")).unwrap();
+        });
+        let observed = receive.recv_timeout(std::time::Duration::from_secs(5));
+        drop(guard);
+        thread.join().unwrap();
+        assert_eq!(
+            observed
+                .expect("cold inspection took an exclusive lock")
+                .state,
+            PrincipalState::Active
+        );
+    }
+
+    #[test]
+    fn inspected_principal_observes_external_rotation_and_same_version_corruption() {
+        let directory = TempDir::new().unwrap();
+        let custody = test_custody(&directory, 63);
+        provision_alice(&custody);
+        let before = custody.inspect("account-alice");
+        let other =
+            FileFederationCustody::open(directory.path().join("custody"), test_key(63)).unwrap();
+        let rotated = other
+            .begin_rotation(
+                "account-alice",
+                KeyPurpose::Installation,
+                "account-alice",
+                "test rotation",
+                CAPTURED_AT,
+            )
+            .unwrap();
+        assert!(rotated.document_version > before.document_version);
+        let observed = custody.inspect("account-alice");
+        assert_eq!(observed.document_version, rotated.document_version);
+        assert_eq!(observed.state, PrincipalState::RotationPending);
+        assert_eq!(sorted_kids(&observed), sorted_kids(&rotated));
+        let revoked = other
+            .revoke_key(
+                "account-alice",
+                &rotated.keys[0].jwk.kid,
+                "account-alice",
+                "authorization_withdrawn",
+                CAPTURED_AT,
+            )
+            .unwrap();
+        let observed = custody.inspect("account-alice");
+        assert_eq!(observed.state, PrincipalState::Revoked);
+        assert_eq!(observed.document_version, revoked.document_version);
+        // A version-only cache would wrongly return the cached valid state.
+        let path = custody.vault_path("account-alice");
+        let mut changed: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        changed["principal_id"] = json!("tampered-without-version-change");
+        std::fs::write(&path, serde_json::to_vec(&changed).unwrap()).unwrap();
+        assert_eq!(
+            custody.inspect("account-alice").state,
+            PrincipalState::Corrupt
+        );
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(
+            custody.inspect("account-alice").state,
+            PrincipalState::Corrupt
+        );
+    }
+
     fn archive_bytes(custody: &FileFederationCustody) -> Vec<u8> {
         let archive = custody.capture_archive(CAPTURED_AT).unwrap();
         serde_json::to_vec(&archive).unwrap()
@@ -4380,5 +4650,153 @@ mod custody_archive {
             .summary();
         assert_eq!(summary.principal_count, 1);
         assert_eq!(summary.marker_count, 0);
+    }
+}
+
+#[cfg(test)]
+mod custody_work_tests {
+    use super::*;
+
+    fn work_custody(directory: &tempfile::TempDir, byte: u8) -> FileFederationCustody {
+        FileFederationCustody::initialize(
+            directory.path().join("custody"),
+            CustodyMasterKey::from_bytes([byte; 32]),
+        )
+        .unwrap()
+    }
+
+    /// Cold inspect takes exactly one shared `flock`; the warm repeat hits
+    /// the in-memory projection and takes none. This is the hosted warm-
+    /// connect property: a warm authenticated connect performs zero custody
+    /// lock acquisitions.
+    #[test]
+    fn cold_inspect_takes_one_shared_lock_and_warm_takes_none() {
+        let directory = tempfile::tempdir().unwrap();
+        let custody = work_custody(&directory, 71);
+        custody
+            .provision(
+                "account-alice",
+                "native",
+                "00000000-0000-4000-8000-000000000101",
+                "https://node.example",
+                "account-alice",
+                "2026-08-03T12:00:00Z",
+            )
+            .unwrap();
+        // Fresh handle starts cold: no cached projection.
+        let cold_handle = Arc::new(CustodyWorkCounters::default());
+        CUSTODY_BLOCKING_SCOPE.with(|cell| {
+            *cell.borrow_mut() = Some(Arc::clone(&cold_handle));
+        });
+        let first = custody.inspect("account-alice");
+        CUSTODY_BLOCKING_SCOPE.with(|cell| {
+            *cell.borrow_mut() = None;
+        });
+        assert_eq!(first.state, PrincipalState::Active);
+        assert_eq!(
+            cold_handle.snapshot(),
+            (1, 0),
+            "cold inspect must take exactly one shared flock"
+        );
+
+        // Second inspect on the same handle is warm: same version+digest, no lock.
+        let warm_handle = Arc::new(CustodyWorkCounters::default());
+        CUSTODY_BLOCKING_SCOPE.with(|cell| {
+            *cell.borrow_mut() = Some(Arc::clone(&warm_handle));
+        });
+        let second = custody.inspect("account-alice");
+        CUSTODY_BLOCKING_SCOPE.with(|cell| {
+            *cell.borrow_mut() = None;
+        });
+        assert_eq!(second.document_version, first.document_version);
+        assert_eq!(
+            warm_handle.snapshot(),
+            (0, 0),
+            "warm inspect must take no custody lock"
+        );
+    }
+
+    /// The blocking scope clears itself so a reused `spawn_blocking` thread
+    /// never leaks one request's counts into the next. Provider calls without
+    /// any scope record nothing.
+    #[test]
+    fn blocking_scope_does_not_leak_across_uses() {
+        let directory = tempfile::tempdir().unwrap();
+        let custody = work_custody(&directory, 72);
+        custody
+            .provision(
+                "account-alice",
+                "native",
+                "00000000-0000-4000-8000-000000000101",
+                "https://node.example",
+                "account-alice",
+                "2026-08-03T12:00:00Z",
+            )
+            .unwrap();
+        // No scope at all: a cold lock succeeds but records nothing.
+        let cold = custody.inspect("account-alice");
+        assert_eq!(cold.state, PrincipalState::Active);
+        assert!(custody_scope_handle().is_none());
+
+        // A freshly opened handle starts cold, so the scoped read below must
+        // take exactly one shared lock even though `custody` itself is warm.
+        let cold_handle = FileFederationCustody::open(
+            directory.path().join("custody"),
+            CustodyMasterKey::from_bytes([72; 32]),
+        )
+        .unwrap();
+        let first = Arc::new(CustodyWorkCounters::default());
+        let observed = with_custody_blocking_scope(Arc::clone(&first), || {
+            cold_handle.inspect("account-alice")
+        });
+        assert_eq!(observed.state, PrincipalState::Active);
+        assert_eq!(first.snapshot(), (1, 0));
+        // The scope clears itself: no handle is visible after the closure,
+        // so a reused blocking thread never leaks counts into the next use.
+        assert!(custody_scope_handle().is_none());
+        let second = Arc::new(CustodyWorkCounters::default());
+        with_custody_blocking_scope(Arc::clone(&second), || {});
+        assert_eq!(second.snapshot(), (0, 0));
+    }
+
+    #[test]
+    fn nested_blocking_scope_restores_outer_handle() {
+        let outer = Arc::new(CustodyWorkCounters::default());
+        let inner = Arc::new(CustodyWorkCounters::default());
+        with_custody_blocking_scope(Arc::clone(&outer), || {
+            assert!(Arc::ptr_eq(&custody_scope_handle().unwrap(), &outer));
+            with_custody_blocking_scope(Arc::clone(&inner), || {
+                assert!(Arc::ptr_eq(&custody_scope_handle().unwrap(), &inner));
+            });
+            assert!(Arc::ptr_eq(&custody_scope_handle().unwrap(), &outer));
+        });
+        assert!(custody_scope_handle().is_none());
+    }
+
+    /// Exclusive mutator acquisitions are counted separately from shared
+    /// inspection. `provision` on a fresh account takes the exclusive lock.
+    #[tokio::test]
+    async fn exclusive_mutator_is_counted_separately() {
+        let directory = tempfile::tempdir().unwrap();
+        let custody = work_custody(&directory, 73);
+        let handle = Arc::new(CustodyWorkCounters::default());
+        with_custody_scope(Arc::clone(&handle), async {
+            custody
+                .provision(
+                    "account-bob",
+                    "native",
+                    "00000000-0000-4000-8000-000000000202",
+                    "https://node.example",
+                    "account-bob",
+                    "2026-08-03T12:00:00Z",
+                )
+                .unwrap();
+        })
+        .await;
+        assert_eq!(
+            handle.snapshot(),
+            (0, 1),
+            "provision must record one exclusive flock, no shared"
+        );
     }
 }

@@ -1581,13 +1581,19 @@ async fn run_activity_authorizes_derived_touches_through_their_current_bearer() 
         &malformed_annotation,
         &attachment,
     ] {
+        let fixture_pool = crate::common::fixture_write_pool(&db).await;
+        sqlx::query("INSERT OR IGNORE INTO read_log_record_ids (record_id) VALUES (?)")
+            .bind(record_id)
+            .execute(&fixture_pool)
+            .await
+            .unwrap();
         sqlx::query(
-            "INSERT INTO read_log_touches (call_seq, record_id, interaction)
-             VALUES (?, ?, 'surfaced')",
+            "INSERT INTO read_log_touches (call_seq, record_ref, interaction)
+             VALUES (?, (SELECT record_ref FROM read_log_record_ids WHERE record_id = ?), 'surfaced')",
         )
         .bind(call_seq)
         .bind(record_id)
-        .execute(&crate::common::fixture_write_pool(&db).await)
+        .execute(&fixture_pool)
         .await
         .unwrap();
     }
@@ -1774,23 +1780,35 @@ async fn claim_unowned_record_enforces_host_owner_view_and_self_claim_boundaries
         "claim_unowned_record: host-owner authority is required"
     );
     assert_eq!(content_event_count(&db).await, before_prefix_denial);
-    let exact_id_denial = call_as(
-        &registry,
-        &db,
-        Caller::authenticated("acct:alice")
-            .with_hosting_context("host:alice", "db:test")
-            .with_hosting_owner(true),
-        "claim_unowned_record",
-        json!({ "record_id": "abc123", "reason": "Exact ids only" }),
-    )
-    .await
-    .unwrap_err()
-    .to_string();
-    assert_eq!(
-        exact_id_denial,
-        "claim_unowned_record: record_id must be an exact canonical lowercase UUID of version 4 or 7"
-    );
-    assert_eq!(content_event_count(&db).await, before_prefix_denial);
+    // The exact-only restriction holds at runtime on every selector
+    // spelling: each alias normalises to record_id and then meets the same
+    // exactness check, so no spelling resolves a prefix.
+    for (field, selector) in [
+        ("record_id", json!("abc123")),
+        ("id", json!("abc123")),
+        ("ids", json!(["abc123"])),
+    ] {
+        let mut arguments = json!({ "reason": "Exact ids only" });
+        arguments[field] = selector;
+        let exact_id_denial = call_as(
+            &registry,
+            &db,
+            Caller::authenticated("acct:alice")
+                .with_hosting_context("host:alice", "db:test")
+                .with_hosting_owner(true),
+            "claim_unowned_record",
+            arguments,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert_eq!(
+            exact_id_denial,
+            "claim_unowned_record: record_id must be an exact canonical lowercase UUID of version 4 or 7",
+            "alias spelling {field} must stay exact-only"
+        );
+        assert_eq!(content_event_count(&db).await, before_prefix_denial);
+    }
 
     let hidden = create_local(
         &registry,
@@ -2960,7 +2978,7 @@ async fn mutation_and_version_diff_responses_redact_hidden_related_records() {
         &db,
         bea.clone(),
         "update_record",
-        json!({ "id": visible, "summary": "safe response" }),
+        json!({ "id": visible, "summary": "safe response", "response_mode": "verbose" }),
     )
     .await
     .unwrap();

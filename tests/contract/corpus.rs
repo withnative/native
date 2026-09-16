@@ -118,6 +118,19 @@ pub enum Expect {
     /// The invocation succeeds and each JSON pointer resolves to exactly the
     /// given value in the corpus-normalized result.
     Result(Vec<(&'static str, Value)>),
+    /// A default single-record write returns only its portable continuation
+    /// receipt. The concrete display reference differs by backend (the direct
+    /// adapters intentionally do not mint one), and the event sequence is
+    /// fixture-local, so validate their shape rather than a fixed value.
+    SummaryReceipt {
+        id: &'static str,
+        record_type: &'static str,
+        kind: &'static str,
+        name: &'static str,
+        body_digest: String,
+        previous_seq_is_null: bool,
+        body_receipt_operation: Option<&'static str>,
+    },
     /// The invocation fails and its error message contains this stable
     /// fragment on every backend.
     Error {
@@ -184,6 +197,7 @@ pub fn scenarios() -> Vec<Scenario> {
                     "body": "created body",
                     "lifecycle": "open",
                     "facets": { "priority": "high" },
+                    "response_mode": "verbose",
                     "reason": REASON
                 }),
             ),
@@ -213,6 +227,48 @@ pub fn scenarios() -> Vec<Scenario> {
             divergences: vec![],
         },
         Scenario {
+            id: "create_record/default-summary-receipt",
+            operation: "create_record",
+            fixture: vec![],
+            setup: vec![],
+            invocation: local(
+                "create_record",
+                json!({
+                    "id": "c0d90000-0000-4000-8000-000000000061",
+                    "type": "WorkItem",
+                    "kind": "task",
+                    "name": "Compact create",
+                    "body": "compact create body",
+                    "lifecycle": "open",
+                    "reason": REASON
+                }),
+            ),
+            expect: Expect::SummaryReceipt {
+                id: "c0d90000-0000-4000-8000-000000000061",
+                record_type: "WorkItem",
+                kind: "task",
+                name: "Compact create",
+                body_digest: sha256_hex(b"compact create body"),
+                previous_seq_is_null: true,
+                body_receipt_operation: None,
+            },
+            post: PostCondition {
+                records: vec![(
+                    "c0d90000-0000-4000-8000-000000000061",
+                    found_record(json!({
+                        "id": "c0d90000-0000-4000-8000-000000000061",
+                        "type": "WorkItem",
+                        "kind": "task",
+                        "name": "Compact create",
+                        "body": "compact create body",
+                        "lifecycle": "open",
+                    })),
+                )],
+                updated_events: vec![("c0d90000-0000-4000-8000-000000000061", 0)],
+            },
+            divergences: vec![],
+        },
+        Scenario {
             id: "create_record/minimal-without-body",
             operation: "create_record",
             fixture: vec![],
@@ -224,6 +280,7 @@ pub fn scenarios() -> Vec<Scenario> {
                     "type": "Document",
                     "kind": "note",
                     "name": "Minimal",
+                    "response_mode": "verbose",
                     "reason": REASON
                 }),
             ),
@@ -322,6 +379,7 @@ pub fn scenarios() -> Vec<Scenario> {
                     "body": "after body",
                     "if_body_digest": sha256_hex(b"before body"),
                     "facets": { "priority": "high" },
+                    "response_mode": "verbose",
                     "reason": REASON
                 }),
             ),
@@ -351,6 +409,57 @@ pub fn scenarios() -> Vec<Scenario> {
             divergences: vec![],
         },
         Scenario {
+            id: "update_record/default-summary-receipt",
+            operation: "update_record",
+            fixture: vec![local(
+                "create_record",
+                json!({
+                    "id": "c0d90000-0000-4000-8000-000000000062",
+                    "type": "WorkItem",
+                    "kind": "task",
+                    "name": "Compact update before",
+                    "body": "before compact update",
+                    "lifecycle": "open",
+                    "reason": REASON
+                }),
+            )],
+            setup: vec![],
+            invocation: local(
+                "update_record",
+                json!({
+                    "id": "c0d90000-0000-4000-8000-000000000062",
+                    "name": "Compact update after",
+                    "body": "after compact update",
+                    "if_body_digest": sha256_hex(b"before compact update"),
+                    "reason": REASON
+                }),
+            ),
+            expect: Expect::SummaryReceipt {
+                id: "c0d90000-0000-4000-8000-000000000062",
+                record_type: "WorkItem",
+                kind: "task",
+                name: "Compact update after",
+                body_digest: sha256_hex(b"after compact update"),
+                previous_seq_is_null: false,
+                body_receipt_operation: Some("body_set"),
+            },
+            post: PostCondition {
+                records: vec![(
+                    "c0d90000-0000-4000-8000-000000000062",
+                    found_record(json!({
+                        "id": "c0d90000-0000-4000-8000-000000000062",
+                        "type": "WorkItem",
+                        "kind": "task",
+                        "name": "Compact update after",
+                        "body": "after compact update",
+                        "lifecycle": "open",
+                    })),
+                )],
+                updated_events: vec![("c0d90000-0000-4000-8000-000000000062", 1)],
+            },
+            divergences: vec![],
+        },
+        Scenario {
             id: "update_record/facet-overwrite",
             operation: "update_record",
             fixture: vec![local(
@@ -371,6 +480,7 @@ pub fn scenarios() -> Vec<Scenario> {
                     "id": "c0d90000-0000-4000-8000-000000000046",
                     "name": "Facet after",
                     "facets": { "priority": "high" },
+                    "response_mode": "verbose",
                     "reason": REASON
                 }),
             ),
@@ -478,6 +588,49 @@ pub fn scenarios() -> Vec<Scenario> {
                     ("c0d90000-0000-4000-8000-000000000055", 1),
                     ("c0d90000-0000-4000-8000-000000000056", 1),
                 ],
+            },
+            divergences: vec![],
+        },
+        Scenario {
+            id: "update_record/multi-response-mode-rejected",
+            operation: "update_record",
+            fixture: vec![local(
+                "create_record",
+                json!({
+                    "id": "c0d90000-0000-4000-8000-000000000063",
+                    "type": "WorkItem",
+                    "kind": "task",
+                    "name": "Multi receipt boundary",
+                    "facets": { "triage": "untriaged" },
+                    "reason": REASON
+                }),
+            )],
+            setup: vec![],
+            invocation: local(
+                "update_record",
+                json!({
+                    "ids": ["c0d90000-0000-4000-8000-000000000063"],
+                    "facets": { "triage": "completed" },
+                    "response_mode": "verbose",
+                    "reason": REASON
+                }),
+            ),
+            expect: Expect::Error {
+                contains: "response_mode",
+            },
+            post: PostCondition {
+                records: vec![(
+                    "c0d90000-0000-4000-8000-000000000063",
+                    found_record(json!({
+                        "id": "c0d90000-0000-4000-8000-000000000063",
+                        "type": "WorkItem",
+                        "kind": "task",
+                        "name": "Multi receipt boundary",
+                        "lifecycle": "open",
+                        "facets": [{ "key": "triage", "value": "untriaged" }],
+                    })),
+                )],
+                updated_events: vec![("c0d90000-0000-4000-8000-000000000063", 0)],
             },
             divergences: vec![],
         },
@@ -818,6 +971,7 @@ pub fn scenarios() -> Vec<Scenario> {
                     "id": "c0d90000-0000-4000-8000-000000000048",
                     "body": "the first body",
                     "if_body_digest": sha256_hex(b""),
+                    "response_mode": "verbose",
                     "reason": REASON
                 }),
             ),
@@ -1971,6 +2125,60 @@ async fn execute_scenario_in_database<H: ContractHarness>(
                         context(&format!("pointer {pointer} mismatched"))
                     )));
                 }
+            }
+        }
+        Expect::SummaryReceipt {
+            id,
+            record_type,
+            kind,
+            name,
+            body_digest,
+            previous_seq_is_null,
+            body_receipt_operation,
+        } => {
+            let result = outcome
+                .map_err(|error| Error::engine(context(&format!("invocation failed: {error}"))))?;
+            let object = result
+                .as_object()
+                .ok_or_else(|| Error::engine(context("summary receipt was not an object")))?;
+            if object.get("id") != Some(&json!(id))
+                || object.get("type") != Some(&json!(record_type))
+                || object.get("kind") != Some(&json!(kind))
+                || object.get("name") != Some(&json!(name))
+                || object.get("body_digest") != Some(&json!(body_digest))
+            {
+                return Err(Error::engine(context(&format!(
+                    "summary receipt did not preserve id and body digest: {result}"
+                ))));
+            }
+            if !object.contains_key("display_reference")
+                || !object
+                    .get("version")
+                    .and_then(Value::as_str)
+                    .is_some_and(|version| version.starts_with("rec:"))
+                || !object
+                    .get("lifecycle_interpretation")
+                    .is_some_and(Value::is_object)
+                || !object.get("warnings").is_some_and(Value::is_array)
+                || object.contains_key("body")
+            {
+                return Err(Error::engine(context(&format!(
+                    "summary receipt omitted a required continuation field or leaked its body: {result}"
+                ))));
+            }
+            if object.get("previous_seq").is_some_and(Value::is_null) != *previous_seq_is_null
+                || (!*previous_seq_is_null
+                    && !object.get("previous_seq").is_some_and(Value::is_i64))
+                || match body_receipt_operation {
+                    Some(operation) => {
+                        result.pointer("/body_receipt/operation") != Some(&json!(operation))
+                    }
+                    None => object.contains_key("body_receipt"),
+                }
+            {
+                return Err(Error::engine(context(&format!(
+                    "summary receipt did not preserve applicable write receipts: {result}"
+                ))));
             }
         }
         Expect::Error { contains } => {

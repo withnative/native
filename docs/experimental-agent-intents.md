@@ -9,11 +9,17 @@ from the generated stable tool inventory and is advertised only in the
 `complete` MCP tool profile so the focused startup descriptor remains within
 its byte budget. Exact-name dispatch remains available in either profile.
 
-The tool is one tagged dispatcher for four intentions:
+The tool is one tagged dispatcher for six intentions:
 
 - `promote_exact_expression` promotes an exact artefact expression into a Unit
   and returns the Unit, immutable revision, Occurrence, and current anchor
   resolution;
+- `bind_exact_expression` binds an existing Unit revision into another record
+  as a new Occurrence and returns the Unit, bound Occurrence, and current
+  anchor resolution;
+- `revise_exact_expression` records a new revision of a Unit behind its exact
+  expected current revision and returns the previous and new revisions with
+  the Unit;
 - `declare_sources` assembles context and commits a durable output whose exact
   selected sources all support one bounded conclusion;
 - `assess_exact_change` assembles the current context, seals one assessment for
@@ -52,6 +58,27 @@ it through `tools/list`:
 ```console
 NATIVE_CE_MCP_TOOL_PROFILE=complete cargo run --bin mcp-stdio -- <database>
 ```
+
+## Executor-surface opt-in
+
+The executor MCP surface does not advertise this seam by default: its
+catalogue admits only `stable` audit rows. Setting the deployment-level,
+off-by-default allowlist
+
+```console
+NATIVE_CE_EXPERIMENTAL_EXECUTORS=experimental_freshness
+```
+
+admits the audited `experimental_freshness` executor (six operations:
+`experimental_freshness_agent_intent.promote_exact_expression`,
+`.bind_exact_expression`, `.revise_exact_expression`, `.declare_sources`,
+`.assess_exact_change`, and
+`.reconcile_affected_output`) on both the ordinary and lens catalogues, served
+through `describe_operation` and dispatched to the unchanged legacy handler.
+Unset or empty means the stable-only surface, byte-identical to before. Any
+other name fails process startup naming the variable and the offending value.
+This advertises the seam where an operator asks for it; it is not a promotion
+out of experimental, and the seam's limitations below apply unchanged.
 
 For a build that must omit the experiment entirely, disable default features:
 

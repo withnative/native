@@ -1522,6 +1522,19 @@
       }
     },
     {
+      "id": "operator.staging-release.adopt-prepared",
+      "kind": "operator",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:operator.staging-release.adopt-prepared",
+        "postgres-server": "N",
+        "turso-local": "N",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      },
+      "notes": "Successor adoption of a predecessor-prepared production snapshot; production environment gates match snapshot capture."
+    },
+    {
       "id": "operator.staging-disposable.bootstrap-volume",
       "kind": "operator",
       "profiles": {

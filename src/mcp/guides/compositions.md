@@ -4,6 +4,315 @@
 
 This guide contains only non-obvious focused-profile recipes whose limitations matter. It is not an exhaustive history of tool names or a promise that every hidden or retired capability has a faithful composition.
 
+## Author a live artifact from scratch
+
+A board or dashboard is a `Document` record with `kind:"artifact"`, authored
+source in `body`, and a governed `runtime` facet. Create it through
+`records_write.create_record`. `artifacts_write.instantiate_artifact` copies an
+existing artifact; its required source is not evidence that new artifacts
+cannot be authored. If discovery is incomplete, report what you have not
+found rather than asserting that a capability is unsupported.
+
+Use `schema_read.preview_record_shape` with `type:"Document", kind:"artifact"`
+for current shape advice; include candidate `facets` to check runtime values.
+For new record-backed layouts,
+start with `native.mdx.v2`: it provides host-rendered components, named inputs
+and declared host-mediated interactions. Choose `native.html.v1` when the
+presentation needs custom JavaScript or canvas; its self-contained HTML uses
+an isolated runtime with read-only inputs, no ambient network and no mutation
+surface. Existing `native.board.v1` and `native.mdx.v1` artifacts have their own
+contracts; do not assume they accept a v2 manifest. A runtime name alone does
+not adapt a static file into a live view.
+
+For an ongoing Native view, bind canonical inputs and let the host re-resolve
+them under the current viewer's authority; do not paste current records or
+edges into the artifact body. Omit `as_of` for that live path. Use copied data
+or a historical boundary only when the person intentionally asks for a
+snapshot, and label what it captures. Check that the runtime and every input
+support replay before using `as_of`; historical governed-SQL relation execution
+is not supported.
+
+The following minimal MDX v2 example presents names from an existing governed
+Collection. Replace placeholders with returned identities. Call `bootstrap`
+once and carry its `run_key` on each executor envelope. The operation and its
+nested `arguments` are separate fields; `describe_operation` gives the current
+contract when needed.
+
+1. Call `records_write` with `operation:"create_record"` and these arguments,
+   setting `body` to the complete MDX source below:
+
+   ```json
+   {"type":"Document","kind":"artifact","name":"Live items","facets":{"runtime":"native.mdx.v2"},"body":"<MDX source below>","reason":"Present the existing Collection without copying its records into a static view."}
+   ```
+
+   ```mdx
+   export const nativeArtifact = {
+     schema: "native.mdx.artifact.v2",
+     inputs: {
+       items: {
+         envelope: "native.collection-envelope.v1",
+         required: true,
+         expose_to_root: true
+       }
+     },
+     module_inputs: {},
+     capability_requests: [
+       { capability: "input.read", scope: { port: "items" } }
+     ]
+   }
+
+   # Live items
+
+   {native.inputs.items.records.length
+     ? <ul>{native.inputs.items.records.map(item => <li>{item.name}</li>)}</ul>
+     : <p>No visible items.</p>}
+   ```
+
+2. Bind the declared port through `artifacts_write`, operation
+   `manage_artifact_inputs.bind`:
+
+   ```json
+   {"artifact_id":"<artifact ID>","port_name":"items","collection_id":"<Collection ID>"}
+   ```
+
+3. Inspect the exact source through `access_read`, operation
+   `manage_artifact_module_grants.read`, with `{"artifact_id":"<artifact ID>"}`.
+   Use the returned artifact-source subject's event identity and source digest
+   in the next step; do not invent them or copy a module-release subject.
+
+4. Prepare `access_admin`, operation `manage_artifact_module_grants.grant`:
+
+   ```json
+   {"artifact_id":"<artifact ID>","subject_kind":"artifact_source","subject_record_id":"<artifact ID>","subject_event_id":"<source event ID>","source_sha256":"<source digest>","capability":"input.read","scope":{"artifact_port":"items"}}
+   ```
+
+   Preparation does not grant anything. Review the returned target and effect
+   within the person's authorization, then execute with the same operation,
+   `plan_id`, `target` and `effect_summary` returned by preparation, without
+   nested arguments. A manifest declares `scope.port`; this root-source grant
+   uses `scope.artifact_port`. Grants authorize the declared runtime request;
+   they do not confer visibility of otherwise unreadable records. Adding
+   `RecordCard` or `RecordTable` also requires the declared and granted
+   `navigation.record.user_gesture` capability with an empty scope.
+
+5. Call `artifacts_execute.render_artifact` with `{"id":"<artifact ID>"}`.
+   A diagnostic is not a successful render. Inspect the returned plan and
+   provenance. For painted appearance, use `artifacts_read.verify_artifact`
+   when available; report a missing verifier rather than claiming pixels were
+   checked.
+
+The body consumes `native.inputs.items.records`; binding alone does not make
+hard-coded cards live. Later renders re-resolve the bound Collection under the
+opener's authority, and an already-open MDX v2 view follows the host's live
+refresh stream. Verify fresh resolution by changing an authorized source record
+and rendering again without rewriting the artifact body. That smoke check does
+not itself prove how an already-open tab refreshes. Keep query limits and any
+incomplete cohort visible. A relation input instead uses its declared schema
+and `.relation.rows`; it is not interchangeable with `.records`.
+
+A kanban can group these input records by a facet present in that Collection,
+retaining empty stages and handling missing or unexpected values explicitly.
+Inspect the actual envelope and governed facet values before choosing the
+grouping expression. Keep the source records authoritative.
+
+MDX v2 is a constrained authoring language, not an arbitrary React module.
+Start with the manifest export and Markdown/JSX; put filtering and mapping
+inside JSX expressions rather than bare top-level `const` statements. Do not
+add React `key`, inline `style`, `<style>` elements, `className`, event-handler
+props or DOM APIs.
+Use host layout components: `Grid` accepts `columns` and `gap`, each an integer
+from 1 through 4. For example, keep the `items` manifest above and replace its
+heading/list with this body (substitute the Collection's actual stage values):
+
+```mdx
+<Grid columns={3} gap={2}>
+  {["backlog", "active", "done"].map(stage => <section>
+    <h2>{stage}</h2>
+    <ul>{native.inputs.items.records.filter(record => record.facets.stage === stage).map(record => <li>{record.name}</li>)}</ul>
+  </section>)}
+</Grid>
+```
+
+Every declared stage has a heading even when empty. Add an explicit group for
+missing or unrecognized stage values when the Collection permits them. Render
+the smallest source first, then add presentation features and re-render after
+each change, including binding changes. A render from before the final write
+does not verify the final artifact.
+
+### Minimal HTML relationship map
+
+Use HTML when the presentation needs browser JavaScript, while keeping data in
+governed inputs. This complete document expects a `nodes` Collection and an
+`edges` governed-SQL query Collection. The edge query must select only the
+intended cohort from `links`, declare these output columns in this order, and
+use `row_identity:["id"]` with a final `id` order key:
+
+```json
+[
+  {"name":"id","type":"identifier","nullable":false},
+  {"name":"source_id","type":"identifier","nullable":false},
+  {"name":"target_id","type":"identifier","nullable":false},
+  {"name":"relationship","type":"text","nullable":false}
+]
+```
+
+Its `schema_sha256` is
+`83a19095d4d5dea8e6bcd44a29a7abfb3914dfbec8134672079c15d831aeacbf`,
+and its exact semantic dependency is
+`links` → `native.query-sql.links` version 1. Read `engine_info` for the active
+profile and catalog revisions when creating the saved query; do not copy those
+values from an example. Restrict both endpoints in SQL. Filtering again in the
+document prevents cross-scope lines from being painted, but cannot recover a
+relevant edge omitted by an over-broad bounded query.
+
+```html
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Relationship map</title>
+  <script type="application/json" id="native-artifact-manifest">{
+    "schema":"native.html.artifact.v1",
+    "inputs":{
+      "nodes":{"envelope":"native.collection-envelope.v1","required":true,"expose_to_root":true},
+      "edges":{
+        "envelope":"native.relation-envelope.v1","required":true,"expose_to_root":true,
+        "schema_sha256":"83a19095d4d5dea8e6bcd44a29a7abfb3914dfbec8134672079c15d831aeacbf",
+        "relations":{"links":{"identity":"native.query-sql.links","semantic_version":1}}
+      }
+    },
+    "capability_requests":[
+      {"capability":"input.read","scope":{"port":"nodes"}},
+      {"capability":"input.read","scope":{"port":"edges"}}
+    ]
+  }</script>
+  <style>
+    body { margin: 0; font: 15px system-ui, sans-serif; color: #172033; background: #f6f3ec; }
+    main { max-width: 760px; margin: auto; padding: 24px; }
+    svg { width: 100%; min-height: 180px; background: white; border: 1px solid #d7d2c7; }
+    line { stroke: #8a91a0; stroke-width: 2; }
+    circle { fill: #e4ecff; stroke: #4969a8; }
+    text { text-anchor: middle; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Relationship map</h1>
+  <p id="status" role="status">Waiting for governed inputs…</p>
+  <svg aria-label="Relationship map"></svg>
+</main>
+<script>
+  var svg = document.querySelector("svg");
+  var statusNode = document.querySelector("#status");
+  var ns = "http://www.w3.org/2000/svg";
+
+  function paint(delivery) {
+    var inputs = delivery && delivery.input && delivery.input.inputs;
+    var nodes = inputs && inputs.nodes && inputs.nodes.records;
+    var relation = inputs && inputs.edges && inputs.edges.relation;
+    var rows = relation && relation.rows;
+    if (!Array.isArray(nodes) || !Array.isArray(rows)) {
+      statusNode.textContent = "Inputs unavailable.";
+      return;
+    }
+
+    svg.replaceChildren();
+    var partial = relation.extent && relation.extent.complete !== true;
+    var bestEffort = relation.extent &&
+      relation.extent.source_completeness === "best_effort";
+    if (!nodes.length) {
+      statusNode.textContent = "No visible nodes" +
+        (partial ? "; edge result is partial" : "") +
+        (bestEffort ? "; edge source is best effort" : "") + ".";
+      return;
+    }
+
+    var positions = new Map();
+    nodes.forEach(function (node, index) {
+      positions.set(node.id, {x: 90 + (index % 4) * 180, y: 60 + Math.floor(index / 4) * 100});
+    });
+    var height = 120 + Math.floor((nodes.length - 1) / 4) * 100;
+    svg.setAttribute("viewBox", "0 0 720 " + height);
+
+    var visibleEdges = rows.filter(function (edge) {
+      return positions.has(edge.source_id) && positions.has(edge.target_id);
+    });
+    visibleEdges.forEach(function (edge) {
+      var from = positions.get(edge.source_id);
+      var to = positions.get(edge.target_id);
+      var line = document.createElementNS(ns, "line");
+      line.setAttribute("x1", from.x); line.setAttribute("y1", from.y);
+      line.setAttribute("x2", to.x); line.setAttribute("y2", to.y);
+      var title = document.createElementNS(ns, "title");
+      title.textContent = edge.relationship;
+      line.appendChild(title); svg.appendChild(line);
+    });
+    nodes.forEach(function (node) {
+      var point = positions.get(node.id);
+      var circle = document.createElementNS(ns, "circle");
+      circle.setAttribute("cx", point.x); circle.setAttribute("cy", point.y);
+      circle.setAttribute("r", 28); svg.appendChild(circle);
+      var label = document.createElementNS(ns, "text");
+      label.setAttribute("x", point.x); label.setAttribute("y", point.y + 48);
+      label.textContent = node.name; svg.appendChild(label);
+    });
+
+    var outside = rows.length - visibleEdges.length;
+    statusNode.textContent = nodes.length + " nodes; " + visibleEdges.length +
+      " relationships" + (outside ? "; " + outside + " outside node scope" : "") +
+      (partial ? "; partial edge result" : "") +
+      (bestEffort ? "; edge source is best effort" : "") + ".";
+  }
+
+  window.nativeArtifact.onInput(paint);
+  window.nativeArtifact.ready.then(paint).catch(function () {
+    statusNode.textContent = "Inputs unavailable.";
+  });
+</script>
+</body>
+</html>
+```
+
+Create the artifact as in step 1 with `runtime:"native.html.v1"` and this
+document as its complete `body`. Bind both ports with
+`manage_artifact_inputs.bind`:
+
+```json
+{"artifact_id":"<artifact ID>","port_name":"nodes","collection_id":"<node Collection ID>"}
+```
+
+```json
+{"artifact_id":"<artifact ID>","port_name":"edges","collection_id":"<governed edge-query Collection ID>"}
+```
+
+Read the current artifact-source identity as in step 3, then prepare and execute
+one exact-source grant per port as in step 4, changing only
+`scope.artifact_port` between `nodes` and `edges`:
+
+```json
+{"artifact_id":"<artifact ID>","subject_kind":"artifact_source","subject_record_id":"<artifact ID>","subject_event_id":"<source event ID>","source_sha256":"<source digest>","capability":"input.read","scope":{"artifact_port":"nodes"}}
+```
+
+```json
+{"artifact_id":"<artifact ID>","subject_kind":"artifact_source","subject_record_id":"<artifact ID>","subject_event_id":"<source event ID>","source_sha256":"<source digest>","capability":"input.read","scope":{"artifact_port":"edges"}}
+```
+
+The node binding defines scope; its current caller-visible resolution defines
+membership. The edge query has its own cohort scope and row bound, so keep both
+aligned as node membership changes. Refresh re-runs that query; it does not
+discover new relevant entities or rewrite the query's cohort. A valid empty
+array means the current viewer sees no matching nodes or edges. A missing
+binding, grant, required input, or compatible query makes the render unavailable
+before document code runs. `extent.complete:false` means the returned edge
+result is partial; `extent.source_completeness:"best_effort"` separately means
+the source observation was best effort. The document labels both.
+
+The host re-resolves both ports in one snapshot on each live refresh. Registering
+`onInput` lets the same frame repaint when its input digest changes; `ready`
+paints the initial delivery. Without an input subscriber, changed input still
+stays live by relaunching the frame, but frame-local JavaScript state is lost.
+
 ## Attention and dashboard view with bounded queries
 
 Build an attention view with bounded, valid `query_record` calls:

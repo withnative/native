@@ -37,7 +37,7 @@ async fn call(registry: &ToolRegistry, db: &Db, tool: &str, arguments: Value) ->
     .execute(&crate::common::fixture_write_pool(db).await)
     .await
     .unwrap();
-    registry
+    let result = registry
         .call(
             db.clone(),
             Caller::authenticated("acct:test"),
@@ -45,7 +45,14 @@ async fn call(registry: &ToolRegistry, db: &Db, tool: &str, arguments: Value) ->
             crate::common::with_test_reason(tool, arguments),
         )
         .await
-        .unwrap()
+        .unwrap();
+    // Captures run on the handle's background queue; later assertions read
+    // them back, so drain each sequential call. `set_intent` declarations
+    // are additionally synchronous by construction (see the
+    // `set_intent_declaration_is_durable_before_response` unit test), which
+    // this drain does not mask — it only settles ordinary captures.
+    db.drain_captures_for_tests().await;
+    result
 }
 
 #[tokio::test]
@@ -495,6 +502,9 @@ async fn rejected_set_intent_is_only_an_attempt_and_cannot_replace_current_inten
     assert!(rejected.outcome.is_err());
     assert_eq!(rejected.run_context["intent"], "Accepted A");
 
+    // Failed declarations are ordinary queued captures; wait for this attempt
+    // before inspecting its persisted outcome.
+    db.drain_captures_for_tests().await;
     let failed = sqlx::query(
         "SELECT intent, outcome FROM read_log_calls
           WHERE tool = 'set_intent' ORDER BY seq DESC LIMIT 1",
@@ -700,6 +710,128 @@ async fn agent_key_minting_and_displaced_key_nudge_obey_agent_boundaries() {
         .any(|note| note
             .as_str()
             .is_some_and(|note| note.contains("may have displaced"))));
+}
+
+#[tokio::test]
+async fn displaced_nudge_recalls_only_the_newest_1024_calls() {
+    async fn insert_call(db: &Db, id: &str, run_key: &str, actor: &str, ended_offset: &str) {
+        sqlx::query(
+            "INSERT INTO read_log_calls
+              (id, tool, run_key, actor, outcome, started_at, ended_at)
+              VALUES (?, 'get_dashboard', ?, ?, 'ok',
+                      strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+                      strftime('%Y-%m-%dT%H:%M:%fZ','now', ?))",
+        )
+        .bind(id)
+        .bind(run_key)
+        .bind(actor)
+        .bind(ended_offset)
+        .execute(&crate::common::fixture_write_pool(db).await)
+        .await
+        .unwrap();
+    }
+
+    fn notes_of(result: &Value) -> Vec<String> {
+        result["run_context"]["notes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect()
+    }
+
+    let db = create_database(":memory:").await.unwrap();
+    let registry = registry();
+    // Oldest rows: a matching prior and the to-be-queried seen key itself,
+    // both recent enough to advise under the unbounded scan.
+    insert_call(
+        &db,
+        "window-prior",
+        "scout-chair-000001",
+        "acct:test",
+        "-1 minutes",
+    )
+    .await;
+    insert_call(
+        &db,
+        "window-seen",
+        "scout-chair-000007",
+        "acct:test",
+        "-1 minutes",
+    )
+    .await;
+    // Push both below the newest-1024 candidate window with non-matching
+    // filler (another actor, another agent key). Raw log inserts only: no
+    // thousand-record fixture build.
+    for index in 0..1025 {
+        insert_call(
+            &db,
+            &format!("window-filler-{index:04}"),
+            &format!("other-bread-{index:06}"),
+            "acct:nobody",
+            "-2 minutes",
+        )
+        .await;
+    }
+
+    // Beyond-window matching prior: intentional advisory silence.
+    let beyond = call(
+        &registry,
+        &db,
+        "get_dashboard",
+        json!({ "run_key": "scout-chair-999999" }),
+    )
+    .await;
+    assert!(
+        !notes_of(&beyond)
+            .iter()
+            .any(|note| note.contains("may have displaced")),
+        "{}",
+        serde_json::to_string(&beyond["run_context"]["notes"]).unwrap()
+    );
+    // Seen-key suppression still spans the full log: the key below is as old
+    // as the silenced prior, yet no note is emitted because the EXISTS check
+    // is not windowed.
+    let seen = call(
+        &registry,
+        &db,
+        "get_dashboard",
+        json!({ "run_key": "scout-chair-000007" }),
+    )
+    .await;
+    assert!(
+        !notes_of(&seen)
+            .iter()
+            .any(|note| note.contains("may have displaced")),
+        "{}",
+        serde_json::to_string(&seen["run_context"]["notes"]).unwrap()
+    );
+    // Control on the same database: a newest-row prior is inside the window
+    // and still advises.
+    insert_call(
+        &db,
+        "window-fresh",
+        "scout-chair-000002",
+        "acct:test",
+        "+0 minutes",
+    )
+    .await;
+    let within = call(
+        &registry,
+        &db,
+        "get_dashboard",
+        json!({ "run_key": "scout-chair-999998" }),
+    )
+    .await;
+    assert!(
+        notes_of(&within)
+            .iter()
+            .any(|note| note.contains("scout-chair-000002")),
+        "{}",
+        serde_json::to_string(&within["run_context"]["notes"]).unwrap()
+    );
+    db.close().await;
 }
 
 #[tokio::test]
@@ -1238,7 +1370,7 @@ async fn briefing_omits_records_whose_access_was_revoked_after_touch_and_claim()
     sqlx::query(
         "DELETE FROM read_log_touches
           WHERE call_seq IN (SELECT seq FROM read_log_calls WHERE run_key = ?)
-            AND record_id <> ?",
+            AND record_ref <> (SELECT record_ref FROM read_log_record_ids WHERE record_id = ?)",
     )
     .bind(prior)
     .bind(&record)
@@ -1556,4 +1688,198 @@ async fn dropped_read_log_keeps_declaration_and_writes_operational_with_empty_br
             .await
             .unwrap();
     assert_eq!(intent, None);
+}
+
+// ---------------------------------------------------------------------------
+// overlapping_claims
+// ---------------------------------------------------------------------------
+
+async fn other_principal_claim(
+    registry: &ToolRegistry,
+    db: &Db,
+    name: &str,
+    run_key: &str,
+) -> String {
+    // Minting as a second account needs that account's own portable binding;
+    // the shared `call` helper only provisions `acct:test`.
+    sqlx::query(
+        "INSERT OR IGNORE INTO records
+            (id, type, kind, name, home_id, policy_anchor_id, persistence)
+         VALUES ('test:other-person', 'Entity', 'person', 'Other account',
+                 ?, ?, 'enduring')",
+    )
+    .bind(native_ce::schema::UNFILED_RECORD_ID)
+    .bind(native_ce::schema::ROOT_RECORD_ID)
+    .execute(&crate::common::fixture_write_pool(db).await)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT OR IGNORE INTO bindings
+            (record_id, system, identifier, is_canonical)
+         VALUES ('test:other-person', 'account', 'acct:other', 1)",
+    )
+    .execute(&crate::common::fixture_write_pool(db).await)
+    .await
+    .unwrap();
+    let created = registry
+        .call(
+            db.clone(),
+            Caller::authenticated("acct:other"),
+            "create_record",
+            crate::common::with_test_reason(
+                "create_record",
+                json!({
+                    "type": "WorkItem",
+                    "kind": "task",
+                    "name": name,
+                    "lifecycle": "open",
+                    "run_key": run_key,
+                }),
+            ),
+        )
+        .await
+        .unwrap();
+    let id = created["id"].as_str().unwrap().to_string();
+    registry
+        .call(
+            db.clone(),
+            Caller::authenticated("acct:other"),
+            "start_work",
+            json!({ "record_id": id, "run_key": run_key }),
+        )
+        .await
+        .unwrap();
+    id
+}
+
+async fn touch(registry: &ToolRegistry, db: &Db, id: &str, run_key: &str) {
+    registry
+        .call(
+            db.clone(),
+            Caller::authenticated("acct:test"),
+            "get_record",
+            json!({ "ids": [id], "run_key": run_key }),
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn overlapping_claims_names_a_touched_record_claimed_by_another_principal() {
+    let db = create_database(":memory:").await.unwrap();
+    let registry = registry();
+
+    let held = other_principal_claim(&registry, &db, "Held elsewhere", OTHER_RUN).await;
+    touch(&registry, &db, &held, RUN).await;
+
+    let result = call(
+        &registry,
+        &db,
+        "set_intent",
+        json!({ "intent": "Walk into the held record.", "run_key": RUN }),
+    )
+    .await;
+
+    let section = &result["briefing"]["overlapping_claims"];
+    assert_eq!(section["total_count"], 1);
+    assert_eq!(section["truncated"], false);
+    let items = section["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "{items:#?}");
+    assert_eq!(items[0]["record_id"], held);
+
+    let overlap = &items[0]["overlap"];
+    let overlap_items = overlap["items"].as_array().unwrap();
+    assert_eq!(overlap_items.len(), 1, "{overlap_items:#?}");
+    assert_eq!(overlap_items[0]["record_id"], held);
+    assert_eq!(overlap_items[0]["relation"], "same_record");
+    assert_eq!(overlap_items[0]["holder_tier"], "another_principal");
+    let mut keys: Vec<&str> = overlap_items[0]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort();
+    assert_eq!(
+        keys,
+        vec!["holder_tier", "record_id", "relation"],
+        "another_principal must leak nothing beyond existence and relation: {overlap_items:#?}"
+    );
+
+    let rendered = native_ce::mcp::render::render("set_intent", &result).unwrap();
+    assert!(
+        rendered.contains("Overlapping claims: 1 returned of 1."),
+        "{rendered}"
+    );
+    assert!(rendered.contains(&held), "{rendered}");
+}
+
+#[tokio::test]
+async fn overlapping_claims_is_present_but_empty_without_overlap() {
+    let db = create_database(":memory:").await.unwrap();
+    let registry = registry();
+
+    let result = call(
+        &registry,
+        &db,
+        "set_intent",
+        json!({ "intent": "Start clear.", "run_key": RUN }),
+    )
+    .await;
+
+    assert_eq!(
+        result["briefing"]["overlapping_claims"],
+        json!({ "items": [], "total_count": 0, "truncated": false })
+    );
+
+    let rendered = native_ce::mcp::render::render("set_intent", &result).unwrap();
+    assert!(
+        rendered.contains("Overlapping claims: 0 returned of 0."),
+        "{rendered}"
+    );
+}
+
+#[tokio::test]
+async fn overlapping_claims_caps_anchors_at_ten_and_flags_truncation() {
+    let db = create_database(":memory:").await.unwrap();
+    let registry = registry();
+
+    let mut held_ids = Vec::new();
+    for index in 0..12 {
+        let run_key = format!("pilot-river-b{index:04b}2");
+        held_ids
+            .push(other_principal_claim(&registry, &db, &format!("Held {index}"), &run_key).await);
+    }
+    for id in &held_ids {
+        touch(&registry, &db, id, RUN).await;
+    }
+
+    let result = call(
+        &registry,
+        &db,
+        "set_intent",
+        json!({ "intent": "Survey the held records.", "run_key": RUN }),
+    )
+    .await;
+
+    let section = &result["briefing"]["overlapping_claims"];
+    assert_eq!(section["total_count"], 12);
+    assert_eq!(section["truncated"], true);
+    let items = section["items"].as_array().unwrap();
+    assert_eq!(items.len(), 10, "{items:#?}");
+    for item in items {
+        let overlap = &item["overlap"];
+        assert!(
+            overlap["items"]
+                .as_array()
+                .is_some_and(|overlap_items| !overlap_items.is_empty()),
+            "every emitted anchor carries a non-empty window: {item:#?}"
+        );
+    }
+
+    let rendered = native_ce::mcp::render::render("set_intent", &result).unwrap();
+    assert!(
+        rendered.contains("Overlapping claims: 10 returned of 12; producer window truncated"),
+        "{rendered}"
+    );
 }

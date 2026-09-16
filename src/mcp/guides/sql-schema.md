@@ -6,9 +6,9 @@ This is native-ce's exact ordered SQLite DDL contract for a fresh database. It i
 
 ## Contract identity
 
-- Engine schema version: `50`
-- Ordered DDL statements: `292`
-- Frozen DDL SHA-256: `86290c2beea87599feb867309ad2bde3a5154f15217114744ed4c765ca2a0c25`
+- Engine schema version: `55`
+- Ordered DDL statements: `294`
+- Frozen DDL SHA-256: `eb10e6879ffa1bdbac22289bd0d85d68ea75892d98c5bcc77a5594aeeefa9d7f`
 
 The fingerprint is SHA-256 over the canonical statement sequence joined by `\n;\n`. Generation fails before writing if the compiled sequence and frozen pin disagree.
 
@@ -907,22 +907,35 @@ CREATE TABLE read_log_calls (
      result_count INTEGER,
      result_bytes INTEGER,
      started_at   TEXT NOT NULL,
-     ended_at     TEXT NOT NULL
+     ended_at     TEXT NOT NULL,
+     -- Bounded, response-derived evidence for a notice that was actually
+     -- emitted.  It is intentionally nullable: ordinary calls do not acquire
+     -- a synthetic annotation, and this disposable log never reconstructs one
+     -- later from changing claim state.
+     result_annotation TEXT CHECK (result_annotation IS NULL OR json_valid(result_annotation))
    )
 ;
 CREATE INDEX idx_read_log_calls_run     ON read_log_calls(run_key, seq)
 ;
 CREATE INDEX idx_read_log_calls_started ON read_log_calls(started_at)
 ;
-CREATE TABLE read_log_touches (
-     call_seq     INTEGER NOT NULL REFERENCES read_log_calls(seq) ON DELETE CASCADE,
-     record_id    TEXT NOT NULL,
-     interaction  TEXT NOT NULL CHECK (interaction IN ('surfaced','opened','mutated')),
-     result_rank  INTEGER,
-     PRIMARY KEY (call_seq, record_id, interaction)
+CREATE INDEX idx_read_log_calls_overlap_annotation
+       ON read_log_calls(actor, ended_at, seq) WHERE result_annotation IS NOT NULL
+;
+CREATE TABLE read_log_record_ids (
+     record_ref   INTEGER PRIMARY KEY,
+     record_id    TEXT NOT NULL UNIQUE
    )
 ;
-CREATE INDEX idx_read_log_touches_record ON read_log_touches(record_id, call_seq)
+CREATE TABLE read_log_touches (
+     call_seq     INTEGER NOT NULL REFERENCES read_log_calls(seq) ON DELETE CASCADE,
+     record_ref   INTEGER NOT NULL REFERENCES read_log_record_ids(record_ref),
+     interaction  TEXT NOT NULL CHECK (interaction IN ('surfaced','opened','mutated')),
+     result_rank  INTEGER,
+     PRIMARY KEY (call_seq, record_ref, interaction)
+   ) WITHOUT ROWID
+;
+CREATE INDEX idx_read_log_touches_record ON read_log_touches(record_ref, call_seq)
 ;
 CREATE TABLE IF NOT EXISTS authorization_revision (
      id     INTEGER PRIMARY KEY CHECK (id = 1),
@@ -2311,5 +2324,5 @@ CREATE TRIGGER engine_migration_drills_no_update BEFORE UPDATE ON engine_migrati
 CREATE TRIGGER engine_migration_drills_no_delete BEFORE DELETE ON engine_migration_drills
        BEGIN SELECT RAISE(ABORT, 'engine_migration_drills is append-only'); END
 ;
-PRAGMA user_version = 50;
+PRAGMA user_version = 55;
 ```

@@ -193,6 +193,19 @@ fn facet_version(event_seq: Option<i64>) -> Option<String> {
     })
 }
 
+/// Opt-in oldest/newest visible-event attribution for record bylines.
+///
+/// Both ends are metadata-shaped history events (the same shape
+/// `get_history` with `detail: metadata` returns), or null when the record
+/// has no visible event on that end. The key's presence on an enriched
+/// record is the capability signal: absent means the caller did not opt in
+/// (or the reader never serves the projection), never "no history".
+#[derive(Debug, Clone, Serialize)]
+pub struct HistorySummary {
+    pub oldest: Option<Value>,
+    pub latest: Option<Value>,
+}
+
 /// One record with its enrichments: open facets, links both directions,
 /// live children, and the ancestor chain (root first).
 ///
@@ -225,6 +238,16 @@ pub struct EnrichedRecord {
     pub links_in: Vec<LinkRow>,
     /// Total inbound links, whether or not `links_in` is a window onto them.
     pub links_in_count: i64,
+    /// Incoming `supersedes` links, disclosed — never derived from the
+    /// `links_in` window above, which is a page the caller sized. The signal
+    /// is the incoming link alone: `maturity: superseded` is a separate
+    /// authored signal and is not ORed in here. Absent (not empty) when no
+    /// live record names this one as superseded, and absent on backends that
+    /// do not serve this projection. Viewer-relative naming (which successors
+    /// are named vs merely counted) is applied by the visibility-filtering
+    /// layer, not here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<SupersededBy>,
     pub children: Vec<ChildSummary>,
     /// Total live children, whether or not `children` is a window onto them —
     /// the same contract `tree::TreeNode::child_count` already carries.
@@ -249,8 +272,21 @@ pub struct EnrichedRecord {
     /// the reason it is generic: nothing here is comment-shaped.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub contribution: Option<crate::contribution::ContributionProvenance>,
+    /// Opt-in oldest/newest visible-event attribution for bylines. `None`
+    /// (key absent) means the caller did not opt in; `Some` with null ends
+    /// means opted in but no visible event exists on that end. Populated by
+    /// the `get_record` tool layer, never by raw projection readers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub history_summary: Option<HistorySummary>,
     /// Containment chain, root first, excluding the record itself.
     pub ancestors: Vec<tree::AncestorEntry>,
+    /// Advisory freshness projection: present only when at least one
+    /// freshness-kernel Occurrence is bound to this record. Served by the
+    /// SQLite `get_record` live path alone; every other reader (historical
+    /// lens, `query_record`, `render_record`, portable adapters) leaves this
+    /// `None` so the key stays absent from their output.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub freshness: Option<crate::freshness::FreshnessQualification>,
 }
 
 /// One item of a batch get — partial success, in input order.
@@ -259,6 +295,108 @@ pub struct EnrichedRecord {
 pub enum BatchGetItem {
     Found(Box<EnrichedRecord>),
     NotFound { id: String },
+}
+
+/// One named successor in a [`SupersededBy`] disclosure. `display_reference`
+/// is absent, never null, when there is no short reference to give — a
+/// renderer degrades to the full id there.
+#[derive(Debug, Clone, Serialize)]
+pub struct SupersededByItem {
+    pub id: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_reference: Option<String>,
+}
+
+/// The incoming-`supersedes` disclosure on an enriched record: up to
+/// [`MAX_SUPERSEDED_ITEMS`] named successors plus the true total, in the same
+/// window-plus-total shape the link and children sections already use. An
+/// invisible successor is counted in `total_count` but never named in
+/// `items` — that redaction happens in the visibility-filtering layer.
+#[derive(Debug, Clone, Serialize)]
+pub struct SupersededBy {
+    pub items: Vec<SupersededByItem>,
+    pub total_count: i64,
+}
+
+/// Cap on named successors. Succession is normally singular; the cap exists
+/// so convergent corrections stay bounded rather than paged.
+pub const MAX_SUPERSEDED_ITEMS: usize = 3;
+
+/// Incoming `supersedes` successors for a whole set of records in one indexed
+/// statement, grouped by target id. Each group's order is the disclosure
+/// order (`created_at`, then `source_id` — the same stable order the
+/// attribution successor lookup already uses); only targets with at least one
+/// live successor appear, and tombstoned replacements disclose nothing. One
+/// statement rather than one per row: the same batching rule the containment
+/// walk documents in `tree.rs` — the row sets annotated here are already
+/// windowed, so nothing fetched is discarded. Never a filter over a caller's
+/// `links_in` window, so paging links cannot hide a successor.
+pub(crate) async fn load_superseded_by_batch<'e, E>(
+    executor: E,
+    ids: &[String],
+) -> Result<HashMap<String, Vec<(String, String)>>>
+where
+    E: sqlx::Executor<'e, Database = Sqlite>,
+{
+    let mut grouped: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    if ids.is_empty() {
+        return Ok(grouped);
+    }
+    let ids_json = serde_json::to_string(ids)?;
+    let rows = sqlx::query(
+        "SELECT l.target_id, s.id, s.name FROM links l JOIN records s ON s.id = l.source_id
+          WHERE l.relationship = 'supersedes' AND s.deleted_at IS NULL
+            AND l.target_id IN (SELECT value FROM json_each(?))
+          ORDER BY l.target_id, l.created_at, l.source_id",
+    )
+    .bind(ids_json)
+    .fetch_all(executor)
+    .await?;
+    for row in rows {
+        let target: String = row.try_get("target_id")?;
+        let successor: (String, String) = (row.try_get("id")?, row.try_get("name")?);
+        grouped.entry(target).or_default().push(successor);
+    }
+    Ok(grouped)
+}
+
+/// Truncate an ordered successor list to the named disclosure window. This
+/// always runs AFTER visibility filtering at the emission site, so an
+/// invisible head never hides a nameable tail. Totals are the caller's job:
+/// count the full set, never the truncated window.
+pub(crate) fn truncate_superseded_items(
+    successors: Vec<(String, String)>,
+) -> Vec<SupersededByItem> {
+    successors
+        .into_iter()
+        .take(MAX_SUPERSEDED_ITEMS)
+        .map(|(id, name)| SupersededByItem {
+            id,
+            name,
+            display_reference: None,
+        })
+        .collect()
+}
+
+/// Incoming `supersedes` successors of one record, via the batch loader.
+/// Returns `None` — absent, not empty — when nothing live names this record
+/// as superseded. The single-record read paths have no viewer to filter
+/// against, so the window applies here; the visibility-filtering layer
+/// reloads the full set and re-truncates after filtering (see
+/// `truncate_superseded_items`).
+pub(crate) async fn load_superseded_by<'e, E>(executor: E, id: &str) -> Result<Option<SupersededBy>>
+where
+    E: sqlx::Executor<'e, Database = Sqlite>,
+{
+    let mut grouped =
+        load_superseded_by_batch(executor, std::slice::from_ref(&id.to_owned())).await?;
+    let Some(successors) = grouped.remove(id) else {
+        return Ok(None);
+    };
+    let total_count = successors.len() as i64;
+    let items = truncate_superseded_items(successors);
+    Ok(Some(SupersededBy { items, total_count }))
 }
 
 /// Fetch one record with default-windowed enrichments — see
@@ -453,6 +591,10 @@ async fn get_record_with_lens_inner(
     .map(link_from_row)
     .collect::<Result<Vec<_>>>()?;
 
+    // Disclosure, not a window: the full ordered successor list feeds the
+    // capped `superseded_by` projection, so links paging cannot hide one.
+    let superseded_by = load_superseded_by(db, id).await?;
+
     // Counts live visible children, archived included — matching what the `children`
     // window itself returns. `tree::descendants`' `child_count` excludes
     // archived unless asked, because the walk it annotates skips archived
@@ -572,6 +714,7 @@ async fn get_record_with_lens_inner(
         links_out_count,
         links_in,
         links_in_count,
+        superseded_by,
         children,
         child_count,
         suggestions,
@@ -582,7 +725,15 @@ async fn get_record_with_lens_inner(
         comment_count,
         target,
         contribution: None,
+        // Opt-in byline attribution; the `get_record` tool layer attaches it
+        // after visibility filtering when the caller asks. Raw readers leave
+        // it absent so the key stays a capability signal.
+        history_summary: None,
         ancestors,
+        // Historical and non-`get_record` readers never serve this
+        // projection; the SQLite `get_record` live path attaches it after
+        // visibility filtering.
+        freshness: None,
     }))
 }
 
@@ -885,40 +1036,105 @@ async fn hydrate_comment_lifecycles_live_in(
 }
 
 async fn comment_context_owner_with_lens(lens: &ReadLens<'_>, id: &str) -> Result<String> {
-    let db = lens.projection().snapshot_pool();
-    let bearer =
-        sqlx::query("SELECT target_id FROM links WHERE source_id = ? AND relationship = 'part_of'")
-            .bind(id)
-            .fetch_one(db)
-            .await?;
-    let bearer_id: String = bearer.try_get("target_id")?;
-    let row = sqlx::query("SELECT type, kind FROM records WHERE id = ?")
-        .bind(&bearer_id)
-        .fetch_one(db)
-        .await?;
-    let record_type: String = row.try_get("type")?;
-    let kind: Option<String> = row.try_get("kind")?;
-    if resolves_comment(lens, &record_type, kind.as_deref()).await? {
-        Ok(bearer_id)
-    } else {
-        Ok(id.to_string())
+    Ok(
+        comment_context_owners_with_lens(lens, std::slice::from_ref(&id.to_string()))
+            .await?
+            .remove(id)
+            .ok_or(sqlx::Error::RowNotFound)?,
+    )
+}
+
+/// One batched `comment_context_owner` for a comment page.
+///
+/// A page's comments resolve through one bearer, so the bearer record and its
+/// comment-governance decision are read once per distinct bearer instead of
+/// once per comment. Missing links fail with the same `RowNotFound` the
+/// single-read path produced.
+async fn comment_context_owners_with_lens(
+    lens: &ReadLens<'_>,
+    ids: &[String],
+) -> Result<HashMap<String, String>> {
+    let mut owners = HashMap::with_capacity(ids.len());
+    if ids.is_empty() {
+        return Ok(owners);
     }
+    let db = lens.projection().snapshot_pool();
+    let placeholders = std::iter::repeat_n("?", ids.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT source_id, target_id FROM links
+          WHERE source_id IN ({placeholders}) AND relationship = 'part_of'
+          ORDER BY source_id"
+    );
+    let mut query = sqlx::query(&sql);
+    for id in ids {
+        query = query.bind(id);
+    }
+    let mut bearers: HashMap<String, String> = HashMap::new();
+    for row in query.fetch_all(db).await? {
+        let source: String = row.try_get("source_id")?;
+        bearers
+            .entry(source)
+            .or_insert_with(|| row.try_get("target_id").unwrap_or_default());
+    }
+    let mut distinct_bearers = Vec::new();
+    for id in ids {
+        let bearer = bearers.remove(id).ok_or(sqlx::Error::RowNotFound)?;
+        if !distinct_bearers.contains(&bearer) {
+            distinct_bearers.push(bearer.clone());
+        }
+        owners.insert(id.clone(), bearer);
+    }
+    let placeholders = std::iter::repeat_n("?", distinct_bearers.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!("SELECT id, type, kind FROM records WHERE id IN ({placeholders})");
+    let mut query = sqlx::query(&sql);
+    for bearer in &distinct_bearers {
+        query = query.bind(bearer);
+    }
+    let mut bearer_rows: HashMap<String, (String, Option<String>)> = HashMap::new();
+    for row in query.fetch_all(db).await? {
+        let id: String = row.try_get("id")?;
+        bearer_rows.insert(id, (row.try_get("type")?, row.try_get("kind")?));
+    }
+    let mut governed: HashMap<(String, Option<String>), bool> = HashMap::new();
+    for id in ids {
+        let bearer = &owners[id];
+        let (record_type, kind) = bearer_rows
+            .get(bearer)
+            .cloned()
+            .ok_or(sqlx::Error::RowNotFound)?;
+        let is_comment = match governed.entry((record_type.clone(), kind.clone())) {
+            std::collections::hash_map::Entry::Occupied(entry) => *entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                *entry.insert(resolves_comment(lens, &record_type, kind.as_deref()).await?)
+            }
+        };
+        if !is_comment {
+            owners.insert(id.clone(), id.clone());
+        }
+    }
+    Ok(owners)
 }
 
 async fn hydrate_comment_targets_with_lens(
     lens: &ReadLens<'_>,
     comments: &mut [CommentSummary],
 ) -> Result<()> {
-    let mut resolved = HashMap::new();
-    for comment in comments {
-        let owner = comment_context_owner_with_lens(lens, &comment.id).await?;
-        if !resolved.contains_key(&owner) {
-            resolved.insert(
-                owner.clone(),
-                crate::citations::read_target_view_with_lens(lens, &owner).await?,
-            );
+    let ids: Vec<String> = comments.iter().map(|comment| comment.id.clone()).collect();
+    let owners = comment_context_owners_with_lens(lens, &ids).await?;
+    let mut distinct = Vec::new();
+    for id in &ids {
+        let owner = &owners[id];
+        if !distinct.contains(owner) {
+            distinct.push(owner.clone());
         }
-        comment.target = resolved.get(&owner).cloned().flatten();
+    }
+    let resolved = crate::citations::read_target_views_with_lens(lens, &distinct).await?;
+    for comment in comments {
+        comment.target = resolved.get(&owners[&comment.id]).cloned().flatten();
     }
     Ok(())
 }
@@ -927,40 +1143,98 @@ async fn comment_context_owner_live_in(
     tx: &mut Transaction<'_, Sqlite>,
     id: &str,
 ) -> Result<String> {
-    let bearer_id: String = sqlx::query_scalar(
-        "SELECT target_id FROM links WHERE source_id = ? AND relationship = 'part_of'",
+    Ok(
+        comment_context_owners_live_in(tx, std::slice::from_ref(&id.to_string()))
+            .await?
+            .remove(id)
+            .ok_or(sqlx::Error::RowNotFound)?,
     )
-    .bind(id)
-    .fetch_one(&mut **tx)
-    .await?;
-    let row = sqlx::query("SELECT type, kind FROM records WHERE id = ?")
-        .bind(&bearer_id)
-        .fetch_one(&mut **tx)
-        .await?;
-    let record_type: String = row.try_get("type")?;
-    let kind: Option<String> = row.try_get("kind")?;
-    if crate::comments::is_governed_comment_on(tx, &record_type, kind.as_deref()).await? {
-        Ok(bearer_id)
-    } else {
-        Ok(id.to_string())
+}
+
+async fn comment_context_owners_live_in(
+    tx: &mut Transaction<'_, Sqlite>,
+    ids: &[String],
+) -> Result<HashMap<String, String>> {
+    let mut owners = HashMap::with_capacity(ids.len());
+    if ids.is_empty() {
+        return Ok(owners);
     }
+    let placeholders = std::iter::repeat_n("?", ids.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT source_id, target_id FROM links
+          WHERE source_id IN ({placeholders}) AND relationship = 'part_of'
+          ORDER BY source_id"
+    );
+    let mut query = sqlx::query(&sql);
+    for id in ids {
+        query = query.bind(id);
+    }
+    let mut bearers: HashMap<String, String> = HashMap::new();
+    for row in query.fetch_all(&mut **tx).await? {
+        let source: String = row.try_get("source_id")?;
+        bearers
+            .entry(source)
+            .or_insert_with(|| row.try_get("target_id").unwrap_or_default());
+    }
+    let mut distinct_bearers = Vec::new();
+    for id in ids {
+        let bearer = bearers.remove(id).ok_or(sqlx::Error::RowNotFound)?;
+        if !distinct_bearers.contains(&bearer) {
+            distinct_bearers.push(bearer.clone());
+        }
+        owners.insert(id.clone(), bearer);
+    }
+    let placeholders = std::iter::repeat_n("?", distinct_bearers.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!("SELECT id, type, kind FROM records WHERE id IN ({placeholders})");
+    let mut query = sqlx::query(&sql);
+    for bearer in &distinct_bearers {
+        query = query.bind(bearer);
+    }
+    let mut bearer_rows: HashMap<String, (String, Option<String>)> = HashMap::new();
+    for row in query.fetch_all(&mut **tx).await? {
+        let id: String = row.try_get("id")?;
+        bearer_rows.insert(id, (row.try_get("type")?, row.try_get("kind")?));
+    }
+    let mut governed: HashMap<(String, Option<String>), bool> = HashMap::new();
+    for id in ids {
+        let bearer = &owners[id];
+        let (record_type, kind) = bearer_rows
+            .get(bearer)
+            .cloned()
+            .ok_or(sqlx::Error::RowNotFound)?;
+        let is_comment = match governed.entry((record_type.clone(), kind.clone())) {
+            std::collections::hash_map::Entry::Occupied(entry) => *entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => *entry.insert(
+                crate::comments::is_governed_comment_on(tx, &record_type, kind.as_deref()).await?,
+            ),
+        };
+        if !is_comment {
+            owners.insert(id.clone(), id.clone());
+        }
+    }
+    Ok(owners)
 }
 
 async fn hydrate_comment_targets_live_in(
     tx: &mut Transaction<'_, Sqlite>,
-    lens: &ReadLens<'_>,
     comments: &mut [CommentSummary],
 ) -> Result<()> {
-    let mut resolved = HashMap::new();
-    for comment in comments {
-        let owner = comment_context_owner_live_in(tx, &comment.id).await?;
-        if !resolved.contains_key(&owner) {
-            resolved.insert(
-                owner.clone(),
-                crate::citations::read_target_view_live_in(tx, lens, &owner).await?,
-            );
+    let ids: Vec<String> = comments.iter().map(|comment| comment.id.clone()).collect();
+    let owners = comment_context_owners_live_in(tx, &ids).await?;
+    let mut distinct = Vec::new();
+    for id in &ids {
+        let owner = &owners[id];
+        if !distinct.contains(owner) {
+            distinct.push(owner.clone());
         }
-        comment.target = resolved.get(&owner).cloned().flatten();
+    }
+    let resolved = crate::citations::read_target_views_live_in(tx, &distinct).await?;
+    for comment in comments {
+        comment.target = resolved.get(&owners[&comment.id]).cloned().flatten();
     }
     Ok(())
 }
@@ -1152,12 +1426,19 @@ pub(crate) async fn comment_window_for_work(
                 summary.owner_id = None;
             }
         }
-        summary.target = if replies {
-            inherited_target.clone()
-        } else {
-            crate::citations::read_target_view_with_lens(lens, &summary.id).await?
-        };
+        if replies {
+            summary.target = inherited_target.clone();
+        }
         comments.push(summary);
+    }
+    if !replies {
+        // Direct comments each own their anchor; resolve the page in one
+        // batch so comments pinned to the same passage revision share a fold.
+        let ids: Vec<String> = comments.iter().map(|comment| comment.id.clone()).collect();
+        let views = crate::citations::read_target_views_with_lens(lens, &ids).await?;
+        for comment in &mut comments {
+            comment.target = views.get(&comment.id).cloned().flatten();
+        }
     }
     hydrate_comment_lifecycles_with_lens(lens, &mut comments, principal).await?;
     Ok(CommentWindow { comments, total })
@@ -1258,9 +1539,11 @@ pub(crate) async fn comment_summaries(
 /// Canonical live record read. Authorization and every mutable enrichment are
 /// evaluated from the caller-owned transaction, so a response cannot combine
 /// an authorization decision from one SQLite snapshot with data from another.
+/// This takes no lens: every pool a live lens resolves to is the write pool
+/// the caller's transaction already holds, so any pool-backed read here would
+/// nest a second same-pool acquisition inside the handler's snapshot.
 pub(crate) async fn get_records_live_in(
     tx: &mut Transaction<'_, Sqlite>,
-    lens: &ReadLens<'_>,
     ids: &[String],
     opts: EnrichOptions,
     principal: Option<crate::authorization::Principal<'_>>,
@@ -1268,12 +1551,10 @@ pub(crate) async fn get_records_live_in(
     opts.validate()?;
     let mut items = Vec::with_capacity(ids.len());
     for id in ids {
-        items.push(
-            match get_record_live_in(tx, lens, id, opts, principal).await? {
-                Some(record) => BatchGetItem::Found(Box::new(record)),
-                None => BatchGetItem::NotFound { id: id.clone() },
-            },
-        );
+        items.push(match get_record_live_in(tx, id, opts, principal).await? {
+            Some(record) => BatchGetItem::Found(Box::new(record)),
+            None => BatchGetItem::NotFound { id: id.clone() },
+        });
     }
     Ok(items)
 }
@@ -1316,7 +1597,6 @@ pub(crate) async fn ordinary_record_read_eligible(db: &Db, id: &str) -> Result<b
 
 async fn get_record_live_in(
     tx: &mut Transaction<'_, Sqlite>,
-    lens: &ReadLens<'_>,
     id: &str,
     opts: EnrichOptions,
     principal: Option<crate::authorization::Principal<'_>>,
@@ -1446,6 +1726,10 @@ async fn get_record_live_in(
     .map(link_from_row)
     .collect::<Result<Vec<_>>>()?;
 
+    // Same disclosure as the pool-backed path above, over this transaction's
+    // projection rather than the live pool.
+    let superseded_by = load_superseded_by(&mut **tx, id).await?;
+
     let suggestion_candidates = artifact_summaries_live_in(
         tx,
         id,
@@ -1523,7 +1807,7 @@ async fn get_record_live_in(
             .collect::<Vec<_>>()
     });
     if let Some(comments) = comments.as_mut() {
-        hydrate_comment_targets_live_in(tx, lens, comments).await?;
+        hydrate_comment_targets_live_in(tx, comments).await?;
     }
     let target = if record.record_type == "Annotation" {
         let target_owner = if is_comment {
@@ -1531,7 +1815,7 @@ async fn get_record_live_in(
         } else {
             id.to_string()
         };
-        crate::citations::read_target_view_live_in(tx, lens, &target_owner).await?
+        crate::citations::read_target_view_live_in(tx, &target_owner).await?
     } else {
         None
     };
@@ -1549,6 +1833,7 @@ async fn get_record_live_in(
         links_out_count,
         links_in,
         links_in_count,
+        superseded_by,
         children,
         child_count,
         suggestions,
@@ -1559,7 +1844,13 @@ async fn get_record_live_in(
         comment_count,
         target,
         contribution: None,
+        // Same opt-in rule as the pool-backed path above; only the SQLite
+        // `get_record` tool path populates it.
+        history_summary: None,
         ancestors,
+        // Live transactional readers other than the SQLite `get_record` tool
+        // path (e.g. messaging fan-out) never serve this projection.
+        freshness: None,
     }))
 }
 
@@ -1914,10 +2205,8 @@ mod live_snapshot_tests {
         )
         .await
         .unwrap();
-        let lens = ReadLens::live(&db);
         let items = get_records_live_in(
             &mut snapshot,
-            &lens,
             &["9e7ead00-0000-4000-8000-000000000001".into()],
             EnrichOptions::default(),
             Some(principal),

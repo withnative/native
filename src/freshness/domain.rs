@@ -995,6 +995,86 @@ pub struct OccurrenceEvidence {
     pub resolution: OccurrenceResolution,
 }
 
+/// Advisory read-projection contract for `get_record`'s `freshness` block.
+///
+/// This projects state the freshness kernel already computes (occurrence
+/// resolution plus Unit head/supersession bookkeeping). It adds no inference,
+/// thresholds, or server-authored prose: `possibly_stale` is a fixed boolean
+/// function of the listed facts, and `detail` strings from the underlying
+/// resolution are deliberately not forwarded.
+pub const READ_FRESHNESS_CONTRACT: &str = "native.read-freshness.v1-experimental";
+
+/// One Unit revision coordinate inside the `freshness` block: the durable
+/// event plus its sequence. The sequence is repeated from `unit_revisions`
+/// rather than trusted from the Occurrence row so the projection reads what
+/// the revision table says.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FreshnessRevisionRef {
+    pub event_id: String,
+    pub revision_seq: i64,
+}
+
+/// One bound Occurrence as projected onto a record read.
+///
+/// When the caller may see the record but may not see the Unit behind the
+/// Occurrence (no `View` on the Unit record or on its authority bearer),
+/// `unit` is `"withheld"` and every Unit-identifying field (`unit_id`,
+/// `bound_unit_revision`, `current_unit_revision`, `unit_superseded_by`) is
+/// absent — but `unit_moved` is still reported and still counts toward
+/// `possibly_stale`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FreshnessOccurrence {
+    pub occurrence_id: String,
+    pub expression_role: String,
+    /// The kernel's `OccurrenceResolutionState` verbatim
+    /// (`current` | `relocated` | `conflict` | `stale` | `unavailable`).
+    pub anchor: String,
+    /// The kernel's current range, or null when the kernel gives none.
+    pub current_range: Option<ResolvedRange>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unit_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unit: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bound_unit_revision: Option<FreshnessRevisionRef>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_unit_revision: Option<FreshnessRevisionRef>,
+    pub unit_moved: bool,
+    /// Reconciliation projection: an Occurrence whose own bound revision has
+    /// moved off the Unit's current head is reconciled when a later
+    /// Occurrence (greater binding sequence) on the same artefact binds the
+    /// same Unit at its current head behind a live anchor (`current` or
+    /// `relocated`). A reconciled Occurrence is still listed but never
+    /// contributes to `possibly_stale`. Names the reconciling Occurrence.
+    /// Reconciliation is by Unit and head revision only, insensitive to
+    /// selectors and expression role, by design.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reconciled_by: Option<String>,
+    /// Successor Unit ids naming this Unit as predecessor, ordered by
+    /// `ordinal`. Omitted when none. For non-trusted callers only successors
+    /// the caller can `View` (the successor Unit record and its authority
+    /// bearer) are listed; hidden successors are dropped entirely and never
+    /// contribute to `possibly_stale`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unit_superseded_by: Option<Vec<String>>,
+}
+
+/// The advisory `freshness` block on a record read. `possibly_stale` is true
+/// iff some listed, unreconciled occurrence has a live anchor (`current` or
+/// `relocated`) and its Unit moved or (when visible) names successors.
+/// Occurrences with `conflict`/`stale`/`unavailable` anchors are still listed
+/// but never contribute, as are reconciled occurrences (see
+/// `FreshnessOccurrence::reconciled_by`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FreshnessQualification {
+    pub contract: String,
+    pub possibly_stale: bool,
+    pub occurrences: Vec<FreshnessOccurrence>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProvenanceCompleteness {

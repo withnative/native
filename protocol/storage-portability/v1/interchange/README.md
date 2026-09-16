@@ -161,3 +161,9 @@ seeded_instruction_sources
 control_event_applications
 storage_portability_policy
 ```
+
+The `read_log_touches` section carries logical TEXT `record_id` values in
+`(call_seq, record_id, interaction)` primary-key order. SQLite engine 54 and
+later decode these from a local `read_log_record_ids` dictionary on export
+and intern them again on import. The physical dictionary is not a portable
+section, and its integer references are not portable record identities.

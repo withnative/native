@@ -7,8 +7,10 @@
 //!
 //! SQLite `BEGIN IMMEDIATE` serializes the read/predicate/append sequence. A
 //! claim succeeds only while `claimed_by_account IS NULL`; an ordinary release
-//! succeeds only for the exact stored account/run tuple. Trusted local callers
-//! retain a recovery path for a stuck current claim.
+//! succeeds for the exact stored account/run tuple, or for another run of the
+//! SAME account presenting `expected_holder_run_key` as a compare-and-release.
+//! Cross-principal releases stay refused. Trusted local callers retain a
+//! recovery path for a stuck current claim.
 
 use std::collections::HashMap;
 
@@ -25,7 +27,7 @@ use crate::store::{append_in, AppendSpec};
 
 use super::super::registry::{Caller, ToolRegistry};
 use super::super::ToolKind;
-use super::{parse_args, require_record, require_record_in};
+use super::{parse_args, require_record, require_record_in, visible_ids_in_pool};
 
 const ACTION_CLAIM: &str = "claim";
 const ACTION_PREVIEW: &str = "preview";
@@ -48,13 +50,16 @@ struct ProjectedClaimState {
     claimed_at: Option<String>,
     claim_event_id: Option<String>,
     activity_id: Option<String>,
-    run_ended_at: Option<String>,
+    /// Holder liveness resolved with the canonical [`neighbour_run_state`],
+    /// so preview, claim refusal and the overlap notice share one vocabulary.
+    /// Meaningful only for same-account rows; cross-principal rows stay
+    /// `withheld` before it is read.
+    holder_run_state: &'static str,
 }
 
 impl ProjectedClaimState {
-    fn is_owned_by(&self, caller: &Caller) -> bool {
+    fn is_same_account(&self, caller: &Caller) -> bool {
         self.claimed_by_account.as_deref() == Some(caller.credential())
-            && self.claimed_run_key.as_deref() == caller.run_key()
     }
 
     fn work_state(&self, caller: &Caller) -> Value {
@@ -62,20 +67,13 @@ impl ProjectedClaimState {
             return json!({ "state": "unclaimed" });
         };
 
-        if !self.is_owned_by(caller) {
+        if !self.is_same_account(caller) {
             return json!({
                 "state": "claimed",
                 "details": { "visibility": "withheld" },
                 "target": { "visibility": "withheld" },
             });
         }
-
-        let run_state = match self.claimed_run_key.as_deref() {
-            Some(_) if self.activity_id.is_none() => "missing",
-            Some(_) if self.run_ended_at.is_some() => "closed",
-            Some(_) => "open",
-            None => "not_applicable",
-        };
 
         json!({
             "state": "claimed",
@@ -90,18 +88,47 @@ impl ProjectedClaimState {
                 "account": account,
                 "run_key": self.claimed_run_key,
                 "activity_id": self.activity_id,
-                "run_state": run_state,
+                "run_state": self.holder_run_state,
+                "holder_tier": holder_tier(caller, account, self.claimed_run_key.as_deref()),
             },
         })
     }
 }
 
-/// Project current claim occupancy for a bounded record set inside the caller's
-/// existing content transaction. This is the reusable seam for record queries:
-/// one projection query observes every requested record at the same boundary,
-/// while the pure response fold keeps exact-holder disclosure uniform with
+/// Project current claim occupancy for a bounded record set on one
+/// connection. This is the reusable seam for record queries: one projection
+/// query observes every requested record at the same boundary, while the
+/// pure response fold keeps exact-holder disclosure uniform with
 /// `start_work`.
+///
+/// Single-connection by convention: a handler holding a transaction or a
+/// pooled connection must not take a second pool connection from the same
+/// pool (five such handlers deadlock the 5-slot write pool). The cross-pool
+/// form below exists only for the `as_of` arm, where the projection
+/// (scratch) and live-target pools genuinely differ.
 pub(super) async fn project_work_states_in(
+    conn: &mut SqliteConnection,
+    caller: &Caller,
+    record_ids: &[String],
+) -> Result<HashMap<String, Value>> {
+    if record_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let rows = projection_rows(&mut *conn, record_ids).await?;
+    let holder_keys = holder_keys_for(&rows, caller)?;
+    let mut holder_run_states: HashMap<Option<String>, &'static str> = HashMap::new();
+    for key in &holder_keys {
+        let run_state = neighbour_run_state_on(conn, caller.credential(), key.as_deref()).await?;
+        holder_run_states.insert(key.clone(), run_state);
+    }
+    let holder_activities = holder_activities_on(conn, caller, &holder_keys).await?;
+    fold_projected_states(rows, caller, &holder_run_states, &holder_activities)
+}
+
+/// Cross-pool form for the `as_of` query arm only: record rows come from the
+/// replay scratch projection while holder liveness and activity stay live.
+/// Everywhere else the single-connection form above applies.
+pub(super) async fn project_work_states_in_cross_pool(
     projection_conn: &mut SqliteConnection,
     live_target_pool: &SqlitePool,
     caller: &Caller,
@@ -110,89 +137,133 @@ pub(super) async fn project_work_states_in(
     if record_ids.is_empty() {
         return Ok(HashMap::new());
     }
+    let rows = projection_rows(&mut *projection_conn, record_ids).await?;
+    let holder_keys = holder_keys_for(&rows, caller)?;
+    // One live-pool checkout serves every holder-liveness and activity read
+    // through the shared single-connection helpers below; the scratch
+    // projection connection never sits alongside a second live slot.
+    let mut live_conn = live_target_pool.acquire().await?;
+    let mut holder_run_states: HashMap<Option<String>, &'static str> = HashMap::new();
+    for key in &holder_keys {
+        let run_state =
+            neighbour_run_state_on(&mut live_conn, caller.credential(), key.as_deref()).await?;
+        holder_run_states.insert(key.clone(), run_state);
+    }
+    let holder_activities = holder_activities_on(&mut live_conn, caller, &holder_keys).await?;
+    fold_projected_states(rows, caller, &holder_run_states, &holder_activities)
+}
 
+async fn projection_rows(
+    conn: &mut SqliteConnection,
+    record_ids: &[String],
+) -> Result<Vec<sqlx::sqlite::SqliteRow>> {
     let mut query = QueryBuilder::<Sqlite>::new(
         "SELECT r.id, r.claimed_by_account, r.claimed_run_key, r.claimed_at, \
                 (SELECT event.id FROM content_events event \
-                  WHERE event.record_id=r.id AND event.type='record.updated' \
-                    AND event.created_at=r.claimed_at \
-                    AND json_extract(event.payload,'$.claimed_by_account')=r.claimed_by_account \
-                    AND ((r.claimed_run_key IS NULL \
-                          AND json_type(event.payload,'$.claimed_run_key')='null') \
-                         OR json_extract(event.payload,'$.claimed_run_key')=r.claimed_run_key) \
-                  ORDER BY event.seq DESC LIMIT 1) AS claim_event_id \
-           FROM records r \
-          WHERE r.deleted_at IS NULL AND r.id IN (",
+                   WHERE event.record_id=r.id AND event.type='record.updated' \
+                     AND event.created_at=r.claimed_at \
+                     AND json_extract(event.payload,'$.claimed_by_account')=r.claimed_by_account \
+                     AND ((r.claimed_run_key IS NULL \
+                           AND json_type(event.payload,'$.claimed_run_key')='null') \
+                          OR json_extract(event.payload,'$.claimed_run_key')=r.claimed_run_key) \
+                   ORDER BY event.seq DESC LIMIT 1) AS claim_event_id \
+            FROM records r \
+           WHERE r.deleted_at IS NULL AND r.id IN (",
     );
     let mut separated = query.separated(", ");
     for record_id in record_ids {
         separated.push_bind(record_id);
     }
     separated.push_unseparated(") ORDER BY r.id");
+    Ok(query.build().fetch_all(conn).await?)
+}
 
-    let rows = query.build().fetch_all(&mut *projection_conn).await?;
-    // A run key is caller-supplied correlation, not authority. Consult live
-    // target state only for the one account+run tuple the caller is allowed to
-    // see; withheld holder tuples must not become a timing or error oracle.
-    let visible_target = if let Some(caller_run) = caller.run_key() {
-        let owns_presented_tuple = rows.iter().any(|row| {
-            row.try_get::<Option<String>, _>("claimed_by_account")
-                .ok()
-                .flatten()
-                .as_deref()
-                == Some(caller.credential())
-                && row
-                    .try_get::<Option<String>, _>("claimed_run_key")
-                    .ok()
-                    .flatten()
-                    .as_deref()
-                    == Some(caller_run)
-        });
-        if owns_presented_tuple {
-            sqlx::query(
-                "SELECT activity_id,ended_at FROM agent_runs WHERE run_key=? AND account_id=?",
-            )
-            .bind(caller_run)
-            .bind(caller.credential())
-            .fetch_optional(live_target_pool)
-            .await?
-            .map(|row| {
-                Ok::<_, Error>((
-                    row.try_get::<String, _>("activity_id")?,
-                    row.try_get::<Option<String>, _>("ended_at")?,
-                ))
-            })
-            .transpose()?
-        } else {
-            None
+/// Distinct holder run keys needing liveness for the caller's own account.
+///
+/// A run key is caller-supplied correlation, not authority. Holder liveness
+/// resolves with the canonical `neighbour_run_state` for same-account
+/// holders only — account-scoped, so a reused run key from another account
+/// never enriches the holder's target — while `activity_id` still comes
+/// from one batch lookup. Withheld holder tuples must not become a timing
+/// or error oracle either way.
+fn holder_keys_for(
+    rows: &[sqlx::sqlite::SqliteRow],
+    caller: &Caller,
+) -> Result<Vec<Option<String>>> {
+    let mut holder_keys: Vec<Option<String>> = Vec::new();
+    for row in rows {
+        let account: Option<String> = row.try_get("claimed_by_account")?;
+        if account.as_deref() == Some(caller.credential()) {
+            let run_key: Option<String> = row.try_get("claimed_run_key")?;
+            if !holder_keys.contains(&run_key) {
+                holder_keys.push(run_key);
+            }
         }
-    } else {
-        None
-    };
+    }
+    Ok(holder_keys)
+}
+
+async fn holder_activities_on(
+    conn: &mut SqliteConnection,
+    caller: &Caller,
+    holder_keys: &[Option<String>],
+) -> Result<HashMap<String, String>> {
+    let mut holder_activities: HashMap<String, String> = HashMap::new();
+    let holder_some_keys: Vec<&String> =
+        holder_keys.iter().filter_map(|key| key.as_ref()).collect();
+    if !holder_some_keys.is_empty() {
+        let mut activity_query = QueryBuilder::<Sqlite>::new(
+            "SELECT run_key, activity_id FROM agent_runs WHERE account_id=",
+        );
+        activity_query.push_bind(caller.credential());
+        activity_query.push(" AND run_key IN (");
+        let mut separated = activity_query.separated(", ");
+        for run_key in &holder_some_keys {
+            separated.push_bind(*run_key);
+        }
+        separated.push_unseparated(")");
+        for row in activity_query.build().fetch_all(&mut *conn).await? {
+            let run_key: String = row.try_get("run_key")?;
+            let activity_id: String = row.try_get("activity_id")?;
+            holder_activities.insert(run_key, activity_id);
+        }
+    }
+    Ok(holder_activities)
+}
+
+fn fold_projected_states(
+    rows: Vec<sqlx::sqlite::SqliteRow>,
+    caller: &Caller,
+    holder_run_states: &HashMap<Option<String>, &'static str>,
+    holder_activities: &HashMap<String, String>,
+) -> Result<HashMap<String, Value>> {
     let mut projected = HashMap::with_capacity(rows.len());
     for row in rows {
         let claimed_run_key: Option<String> = row.try_get("claimed_run_key")?;
-        let (activity_id, run_ended_at) = if row
-            .try_get::<Option<String>, _>("claimed_by_account")?
-            .as_deref()
-            == Some(caller.credential())
-            && claimed_run_key.as_deref() == caller.run_key()
-        {
-            visible_target
-                .as_ref()
-                .map(|(activity_id, ended_at)| (Some(activity_id.clone()), ended_at.clone()))
-                .unwrap_or((None, None))
-        } else {
-            (None, None)
-        };
+        let claimed_by_account: Option<String> = row.try_get("claimed_by_account")?;
+        let (activity_id, holder_run_state) =
+            if claimed_by_account.as_deref() == Some(caller.credential()) {
+                let activity_id = claimed_run_key
+                    .as_deref()
+                    .and_then(|holder_run| holder_activities.get(holder_run).cloned());
+                // Every same-account holder key was resolved above, including
+                // `None`; the fallback is unreachable defensive padding.
+                let holder_run_state = holder_run_states
+                    .get(&claimed_run_key)
+                    .copied()
+                    .unwrap_or("missing");
+                (activity_id, holder_run_state)
+            } else {
+                (None, "missing")
+            };
         let state = ProjectedClaimState {
             record_id: row.try_get("id")?,
-            claimed_by_account: row.try_get("claimed_by_account")?,
+            claimed_by_account,
             claimed_run_key,
             claimed_at: row.try_get("claimed_at")?,
             claim_event_id: row.try_get("claim_event_id")?,
             activity_id,
-            run_ended_at,
+            holder_run_state,
         };
         projected.insert(state.record_id.clone(), state.work_state(caller));
     }
@@ -201,10 +272,403 @@ pub(super) async fn project_work_states_in(
 
 async fn project_work_state(db: &Db, caller: &Caller, record_id: &str) -> Result<Value> {
     let mut conn = db.write_pool().acquire().await?;
-    project_work_states_in(&mut conn, db.write_pool(), caller, &[record_id.to_string()])
+    project_work_states_in(&mut conn, caller, &[record_id.to_string()])
         .await?
         .remove(record_id)
         .ok_or_else(|| Error::engine(format!("start_work: record {record_id} does not exist")))
+}
+
+// ---------------------------------------------------------------------------
+// Work overlap — a claim-time notice about neighbouring claims
+// ---------------------------------------------------------------------------
+
+/// Bounds the notice to a legible size once the visible claimed overlap in a
+/// relation has been counted. Never applied to the SQL candidate scan itself:
+/// every neighbourhood query below is restricted to CLAIMED, non-deleted
+/// records from the start, so the candidate set is bounded by active work
+/// (rare) rather than by a container's total fan-out (unbounded). Capping the
+/// scan itself, tried first, made `truncated` fire on rows the caller cannot
+/// even see (a one-bit existence oracle) and could drop a visible claimed
+/// record with no truncation signal at all.
+const OVERLAP_RELATION_CAP: usize = 50;
+
+/// The disclosable relations between a focus record and a neighbourhood
+/// candidate. The record itself is never a candidate of the neighbourhood
+/// queries below: every query excludes the focus id directly, so "a caller's
+/// own fresh claim is not an overlap" is a structural property of the queries,
+/// not a tier-dependent exclusion applied afterward.
+///
+/// `SameRecord` is the one exception, and only when a caller opts in (the
+/// `set_intent` briefing, where the anchor itself matters): the focus record's
+/// own claim tuple is read separately and folded in with this relation. The
+/// claim path keeps excluding the anchor, since a first claim must stay
+/// byte-identical.
+///
+/// Declaration order is precedence order for a candidate that matches more
+/// than one relation (e.g. `C part_of T` and `C part_of T`'s parent `P`, with
+/// `T` itself `part_of P`, makes `C` both a `Sibling` of `T` via `P` and a
+/// `Child` of `T` directly): `SameRecord` is resolved first, then `Parent`,
+/// then `Sibling`, then `Child`, and the first relation to claim a candidate
+/// keeps it. The same order is also the sort key used to make the
+/// per-relation cap deterministic below. The opted-in self row can never
+/// collide with a neighbourhood row — the queries exclude the focus id — so
+/// leading with it changes nothing for the other relations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum OverlapRelation {
+    SameRecord,
+    Parent,
+    Sibling,
+    Child,
+}
+
+impl OverlapRelation {
+    fn as_str(self) -> &'static str {
+        match self {
+            OverlapRelation::SameRecord => "same_record",
+            OverlapRelation::Parent => "parent",
+            OverlapRelation::Sibling => "sibling",
+            OverlapRelation::Child => "child",
+        }
+    }
+}
+
+/// One claimed neighbourhood candidate: its resolved relation and the claim
+/// tuple read alongside it, so a second round trip is not needed to fold it
+/// into a response item.
+struct OverlapCandidate {
+    relation: OverlapRelation,
+    account: String,
+    run_key: Option<String>,
+    claimed_at: Option<String>,
+}
+
+fn candidate_from_row(
+    found: &mut HashMap<String, OverlapCandidate>,
+    row: sqlx::sqlite::SqliteRow,
+    relation: OverlapRelation,
+) -> Result<()> {
+    let id: String = row.try_get("id")?;
+    if found.contains_key(&id) {
+        // An earlier relation already claimed this id — precedence order
+        // keeps it, matching the exclusions each query below already applies.
+        return Ok(());
+    }
+    let account: String = row.try_get("claimed_by_account")?;
+    let run_key: Option<String> = row.try_get("claimed_run_key")?;
+    let claimed_at: Option<String> = row.try_get("claimed_at")?;
+    found.insert(
+        id,
+        OverlapCandidate {
+            relation,
+            account,
+            run_key,
+            claimed_at,
+        },
+    );
+    Ok(())
+}
+
+/// Resolve every CLAIMED, visible-relation candidate in the neighbourhood of
+/// `record_id`: its `part_of` link targets and `home_id` parent (`Parent`);
+/// the `part_of` children of those parents, excluding the record itself
+/// (`Sibling`); and the record's own `part_of` children (`Child`). No LIMIT is
+/// applied here — claims are rare, so the candidate set is bounded by active
+/// work, not by fan-out — and `record_id` itself is excluded from every query
+/// so it can never appear as its own overlap.
+async fn overlap_neighbourhood(
+    pool: &SqlitePool,
+    record_id: &str,
+) -> Result<HashMap<String, OverlapCandidate>> {
+    let mut found: HashMap<String, OverlapCandidate> = HashMap::new();
+
+    // The record's parents (home_id and part_of targets) regardless of THEIR
+    // claim state — needed below to resolve siblings even when the parent
+    // itself carries no claim.
+    let all_parent_ids: Vec<String> = sqlx::query(
+        "SELECT id FROM records \
+          WHERE deleted_at IS NULL AND id <> ?1 \
+            AND id IN ( \
+              SELECT home_id FROM records WHERE id = ?1 AND home_id IS NOT NULL \
+              UNION \
+              SELECT target_id FROM links WHERE source_id = ?1 AND relationship = 'part_of' \
+            )",
+    )
+    .bind(record_id)
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .map(|row| row.try_get::<String, _>("id"))
+    .collect::<std::result::Result<_, _>>()?;
+
+    // Parent and Sibling both range over the parent set, so it is bound ONCE
+    // as a single JSON-array parameter (the `visible_ids_in_pool` pattern) —
+    // binding one id per placeholder would spend SQLite's ~999-variable
+    // budget on the parent list before the claim itself ever runs, on a
+    // container with a large claimed family.
+    if !all_parent_ids.is_empty() {
+        let parent_ids_json = serde_json::to_string(&all_parent_ids)?;
+
+        // Parent — claimed parents only.
+        let rows = sqlx::query(
+            "SELECT id, claimed_by_account, claimed_run_key, claimed_at FROM records \
+              WHERE deleted_at IS NULL AND claimed_by_account IS NOT NULL \
+                AND id IN (SELECT value FROM json_each(?1))",
+        )
+        .bind(&parent_ids_json)
+        .fetch_all(pool)
+        .await?;
+        for row in rows {
+            candidate_from_row(&mut found, row, OverlapRelation::Parent)?;
+        }
+
+        // Sibling — claimed part_of children of the (full, claim-state-
+        // agnostic) parent set, excluding the record itself. No `NOT IN` for
+        // ids a Parent match already claimed: `candidate_from_row` already
+        // skips an id already present in `found`, so re-listing them as bind
+        // parameters here would only spend more of that same budget for no
+        // behavioural change.
+        let rows = sqlx::query(
+            "SELECT o.id, o.claimed_by_account, o.claimed_run_key, o.claimed_at \
+               FROM links l JOIN records o ON o.id = l.source_id \
+              WHERE l.relationship = 'part_of' AND o.deleted_at IS NULL \
+                AND o.claimed_by_account IS NOT NULL AND o.id <> ?1 \
+                AND l.target_id IN (SELECT value FROM json_each(?2))",
+        )
+        .bind(record_id)
+        .bind(&parent_ids_json)
+        .fetch_all(pool)
+        .await?;
+        for row in rows {
+            candidate_from_row(&mut found, row, OverlapRelation::Sibling)?;
+        }
+    }
+
+    // Child — the record's own claimed part_of children, excluding the
+    // record itself. Same reasoning as Sibling above: no `NOT IN` against
+    // `found`, since `candidate_from_row` is where that exclusion actually
+    // happens.
+    let rows = sqlx::query(
+        "SELECT o.id, o.claimed_by_account, o.claimed_run_key, o.claimed_at \
+           FROM links l JOIN records o ON o.id = l.source_id \
+          WHERE l.target_id = ?1 AND l.relationship = 'part_of' AND o.deleted_at IS NULL \
+            AND o.claimed_by_account IS NOT NULL AND o.id <> ?1",
+    )
+    .bind(record_id)
+    .fetch_all(pool)
+    .await?;
+    for row in rows {
+        candidate_from_row(&mut found, row, OverlapRelation::Child)?;
+    }
+
+    Ok(found)
+}
+
+/// Same-credential run liveness for a neighbourhood holder, resolved the same
+/// way `project_work_states_in` resolves it for the caller's own exact tuple:
+/// `open` while the run is live, `closed` once it ended, `missing` when no
+/// `agent_runs` row exists for the key, `not_applicable` when the claim
+/// carries no run key at all. Only ever called for a holder sharing the
+/// caller's account — resolving it for another principal would build the
+/// cross-account oracle the projection above deliberately refuses.
+async fn neighbour_run_state(
+    pool: &SqlitePool,
+    account: &str,
+    run_key: Option<&str>,
+) -> Result<&'static str> {
+    // One checkout, then the shared connection-scoped body: callers that
+    // already hold a connection must use `neighbour_run_state_on` directly,
+    // so this pool form exists only where no connection is held.
+    if run_key.is_none() {
+        return Ok("not_applicable");
+    }
+    let mut conn = pool.acquire().await?;
+    neighbour_run_state_on(&mut conn, account, run_key).await
+}
+
+/// Connection-scoped form of [`neighbour_run_state`], and the single place
+/// the `agent_runs` liveness query lives: a handler already holding a
+/// connection reads liveness on it instead of taking a second pool slot.
+async fn neighbour_run_state_on(
+    conn: &mut SqliteConnection,
+    account: &str,
+    run_key: Option<&str>,
+) -> Result<&'static str> {
+    let Some(run_key) = run_key else {
+        return Ok("not_applicable");
+    };
+    let row: Option<(String, Option<String>)> = sqlx::query_as(
+        "SELECT activity_id, ended_at FROM agent_runs WHERE run_key = ? AND account_id = ?",
+    )
+    .bind(run_key)
+    .bind(account)
+    .fetch_optional(&mut *conn)
+    .await?;
+    Ok(match row {
+        None => "missing",
+        Some((_, Some(_))) => "closed",
+        Some((_, None)) => "open",
+    })
+}
+
+/// How a neighbourhood holder relates to the caller's own credential and run.
+///
+/// `this_run` requires an EXACT run-key match — the engine cannot tell two
+/// keyless sessions of the same account apart, so a holder with no run key is
+/// never `this_run` even when the caller also has none; it is reported as
+/// `another_agent_of_yours` (with `run_state: not_applicable`, since there is
+/// no key to resolve liveness from) instead. The record being claimed can
+/// never itself be a neighbour (see [`overlap_neighbourhood`]), so this
+/// stricter rule cannot mislabel a caller's own fresh claim — the engine
+/// refuses a second claim on the same record while the first still holds it,
+/// so that case cannot arise here at all.
+fn holder_tier(caller: &Caller, account: &str, run_key: Option<&str>) -> &'static str {
+    if account != caller.credential() {
+        return "another_principal";
+    }
+    match (caller.run_key(), run_key) {
+        (Some(caller_run), Some(holder_run)) if caller_run == holder_run => "this_run",
+        (Some(caller_run), Some(holder_run))
+            if crate::runkey::agent_key_of(caller_run)
+                == crate::runkey::agent_key_of(holder_run) =>
+        {
+            "another_run_of_this_agent"
+        }
+        _ => "another_agent_of_yours",
+    }
+}
+
+/// The claim-time overlap notice: every OTHER active claim in the bounded
+/// neighbourhood of `record_id`, filtered to what the caller may `View`.
+/// Existence and relation are always disclosed; holder identity, timestamp,
+/// run key and intent only when the holder's account matches the caller's own
+/// credential. Returns `None` when there is nothing to disclose, so the
+/// caller can omit `work_overlap` entirely and keep an overlap-free claim
+/// response byte-identical to one from before this notice existed.
+///
+/// `include_self` folds the focus record's own claim in as a `same_record`
+/// item — for surfaces where the anchor itself matters (the `set_intent`
+/// briefing, `create_record` never needs it: the new record is unclaimed).
+/// A self claim held by the caller's own exact run tuple is still excluded,
+/// so one's own anchor never reports overlap with itself; anything else goes
+/// through the ordinary tier rules below.
+pub(super) async fn work_overlap_for_record(
+    db: &Db,
+    caller: &Caller,
+    record_id: &str,
+    include_self: bool,
+) -> Result<Option<Value>> {
+    let pool = db.write_pool();
+    let mut candidates = overlap_neighbourhood(pool, record_id).await?;
+    if include_self {
+        let own: Option<(String, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT claimed_by_account, claimed_run_key, claimed_at FROM records \
+              WHERE id = ?1 AND deleted_at IS NULL AND claimed_by_account IS NOT NULL",
+        )
+        .bind(record_id)
+        .fetch_optional(pool)
+        .await?;
+        if let Some((account, run_key, claimed_at)) = own {
+            if holder_tier(caller, &account, run_key.as_deref()) != "this_run" {
+                candidates.insert(
+                    record_id.to_string(),
+                    OverlapCandidate {
+                        relation: OverlapRelation::SameRecord,
+                        account,
+                        run_key,
+                        claimed_at,
+                    },
+                );
+            }
+        }
+    }
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+
+    // Batch the View filter over the whole claimed candidate set — the same
+    // seam the links fold uses — rather than a per-row `can_record` call.
+    let ids: Vec<String> = candidates.keys().cloned().collect();
+    let visible = visible_ids_in_pool(pool, caller, ids).await?;
+
+    // Deterministic order across the whole overlap keeps the same items on
+    // every call once the cap trims the tail: relation precedence, then
+    // `claimed_at`, then id.
+    let mut ordered: Vec<(&String, &OverlapCandidate)> = candidates
+        .iter()
+        .filter(|(id, _)| visible.contains(*id))
+        .collect();
+    ordered.sort_by(|(id_a, candidate_a), (id_b, candidate_b)| {
+        candidate_a
+            .relation
+            .cmp(&candidate_b.relation)
+            .then_with(|| candidate_a.claimed_at.cmp(&candidate_b.claimed_at))
+            .then_with(|| id_a.cmp(id_b))
+    });
+
+    // Counted BEFORE the per-relation cap below, over exactly the visible
+    // claimed candidates — an invisible row never moves this number, and
+    // `truncated` is derived from it rather than from the SQL scan.
+    let total_count = ordered.len();
+    if total_count == 0 {
+        return Ok(None);
+    }
+
+    let mut per_relation_count: HashMap<OverlapRelation, usize> = HashMap::new();
+    let mut items = Vec::new();
+    for (id, candidate) in ordered {
+        let count = per_relation_count.entry(candidate.relation).or_insert(0);
+        if *count >= OVERLAP_RELATION_CAP {
+            continue;
+        }
+        *count += 1;
+
+        let tier = holder_tier(caller, &candidate.account, candidate.run_key.as_deref());
+        let mut item = json!({
+            "record_id": id,
+            "relation": candidate.relation.as_str(),
+            "holder_tier": tier,
+        });
+        if tier != "another_principal" {
+            let object = item.as_object_mut().expect("item is an object");
+            let run_state =
+                neighbour_run_state(pool, &candidate.account, candidate.run_key.as_deref()).await?;
+            object.insert("run_state".into(), json!(run_state));
+            if let Some(claimed_at) = &candidate.claimed_at {
+                object.insert("claimed_at".into(), json!(claimed_at));
+            }
+            if let Some(run_key) = candidate.run_key.as_deref() {
+                object.insert("run_key".into(), json!(run_key));
+                // Account-scoped: a run key is a hashtag any account can
+                // reuse, so resolving intent by key alone could hand this
+                // holder another account's declared sentence.
+                if let Some(intent) =
+                    crate::runkey::intent_at_for_actor(db, Some(run_key), &candidate.account).await
+                {
+                    object.insert("intent".into(), json!(intent));
+                }
+            }
+        }
+        items.push(item);
+    }
+    if items.is_empty() {
+        return Ok(None);
+    }
+    let truncated = total_count > items.len();
+    Ok(Some(json!({
+        "items": items,
+        "total_count": total_count,
+        "truncated": truncated,
+    })))
+}
+
+/// The `start_work.claim` notice: the shared window with the anchor itself
+/// always excluded, since a first claim must stay byte-identical.
+async fn work_overlap_for_claim(
+    db: &Db,
+    caller: &Caller,
+    record_id: &str,
+) -> Result<Option<Value>> {
+    work_overlap_for_record(db, caller, record_id, false).await
 }
 
 impl ClaimState {
@@ -215,6 +679,10 @@ impl ClaimState {
     fn is_owned_by(&self, caller: &Caller) -> bool {
         self.claimed_by_account.as_deref() == Some(caller.credential())
             && self.claimed_run_key.as_deref() == caller.run_key()
+    }
+
+    fn is_same_account(&self, caller: &Caller) -> bool {
+        self.claimed_by_account.as_deref() == Some(caller.credential())
     }
 
     fn held_by(&self) -> Option<String> {
@@ -263,14 +731,29 @@ async fn claim_state_in(
 }
 
 fn already_claimed(tool: &str, id: &str, state: &ClaimState, caller: &Caller) -> Error {
-    match state.held_by() {
-        Some(holder) if state.is_owned_by(caller) => Error::engine(format!(
-            "{tool}: record {id} is already claimed by {holder} — release it first"
-        )),
-        _ => Error::engine(format!(
-            "{tool}: record {id} is already claimed — release it first"
-        )),
+    if let Some(holder) = state.held_by() {
+        if state.is_owned_by(caller) {
+            return Error::engine(format!(
+                "{tool}: record {id} is already claimed by {holder} — release it first"
+            ));
+        }
     }
+    if let Some(account) = state.claimed_by_account.as_deref() {
+        if account == caller.credential() {
+            // Same vocabulary as the overlap notice: the tier and run key the
+            // caller would also see in preview and `work_overlap`.
+            let tier = holder_tier(caller, account, state.claimed_run_key.as_deref());
+            let holder_run = state.claimed_run_key.as_deref().unwrap_or("null");
+            return Error::engine(format!(
+                "{tool}: record {id} is already claimed by run {holder_run} \
+                 (holder_tier={tier}) — preview to inspect, then release with \
+                 expected_holder_run_key to take the claim back"
+            ));
+        }
+    }
+    Error::engine(format!(
+        "{tool}: record {id} is already claimed — release it first"
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -525,6 +1008,20 @@ struct StartWorkArgs {
     /// Accepted only for wire compatibility. Identity comes from `Caller`.
     #[serde(rename = "agent_id")]
     _agent_id: Option<String>,
+    /// Compare-and-release guard for same-account recovery. Presence is the
+    /// opt-in: absent means no expectation, explicit null expects an
+    /// account-only holder, a string expects that exact holder run key.
+    #[serde(default, deserialize_with = "deserialize_expected_holder_run_key")]
+    expected_holder_run_key: Option<Option<String>>,
+}
+
+fn deserialize_expected_holder_run_key<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Some(Option::<String>::deserialize(deserializer)?))
 }
 
 #[derive(Debug)]
@@ -623,11 +1120,53 @@ async fn release(db: &Db, caller: &Caller, tool: &str, args: &StartWorkArgs) -> 
             args.record_id,
         )));
     }
-    if !state.is_owned_by(caller) && !super::is_legacy_local(caller) {
+    let is_exact_holder = state.is_owned_by(caller);
+    let is_trusted_local = super::is_legacy_local(caller);
+    let is_same_account = state.is_same_account(caller);
+    if is_exact_holder {
+        if let Some(expected) = args.expected_holder_run_key.as_ref() {
+            if expected.as_deref() != state.claimed_run_key.as_deref() {
+                return Err(Error::engine(format!(
+                    "{tool}: expected_holder_run_key does not match the current holder — \
+                     preview and retry with the current holder"
+                )));
+            }
+        }
+    } else if is_trusted_local {
+        // Recovery path unchanged: permission bypasses ownership.
+    } else if is_same_account {
+        match args.expected_holder_run_key.as_ref() {
+            None => {
+                let holder_run = state.claimed_run_key.as_deref().unwrap_or("null");
+                return Err(Error::engine(format!(
+                    "{tool}: record {} is claimed by run {holder_run} — pass \
+                     expected_holder_run_key to take the claim back",
+                    args.record_id,
+                )));
+            }
+            Some(expected) => {
+                if expected.as_deref() != state.claimed_run_key.as_deref() {
+                    return Err(Error::engine(format!(
+                        "{tool}: claim holder changed — preview and retry with the current holder"
+                    )));
+                }
+            }
+        }
+    } else {
         return Err(Error::engine(format!(
             "{tool}: record {} is claimed by another caller",
             args.record_id
         )));
+    }
+    let mut payload = json!({
+        "claimed_by_account": Value::Null,
+        "claimed_run_key": Value::Null,
+    });
+    if !is_exact_holder {
+        payload["released_from_run_key"] = match state.claimed_run_key.as_deref() {
+            Some(run_key) => Value::String(run_key.to_string()),
+            None => Value::Null,
+        };
     }
     append_in(
         db,
@@ -635,10 +1174,7 @@ async fn release(db: &Db, caller: &Caller, tool: &str, args: &StartWorkArgs) -> 
         AppendSpec {
             record_id: args.record_id.clone(),
             event_type: "record.updated".into(),
-            payload: json!({
-                "claimed_by_account": Value::Null,
-                "claimed_run_key": Value::Null,
-            }),
+            payload,
             actor: Some(caller.actor().to_string()),
         },
     )
@@ -685,9 +1221,7 @@ async fn start_work(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
         _ => claim(&db, &caller, TOOL, &args).await?,
     };
 
-    if outcome.held_by_account.as_deref() != Some(caller.credential())
-        || outcome.held_by_run_key.as_deref() != caller.run_key()
-    {
+    if outcome.held_by_account.as_deref() != Some(caller.credential()) {
         outcome.held_by = None;
         outcome.held_by_account = None;
         outcome.held_by_run_key = None;
@@ -695,8 +1229,13 @@ async fn start_work(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
     }
     let work_state = project_work_state(&db, &caller, &args.record_id).await?;
     let context = working_context(&db, &caller, TOOL, &args.record_id).await?;
+    let work_overlap = if action == ACTION_CLAIM {
+        work_overlap_for_claim(&db, &caller, &args.record_id).await?
+    } else {
+        None
+    };
 
-    Ok(json!({
+    let mut response = json!({
         "record_id": args.record_id,
         "action": action,
         "changed": outcome.changed,
@@ -708,7 +1247,14 @@ async fn start_work(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
         "claimed_at": outcome.claimed_at,
         "work_state": work_state,
         "context": context,
-    }))
+    });
+    if let Some(overlap) = work_overlap {
+        response
+            .as_object_mut()
+            .expect("start_work response is an object")
+            .insert("work_overlap".into(), overlap);
+    }
+    Ok(response)
 }
 
 // ---------------------------------------------------------------------------
@@ -719,14 +1265,12 @@ async fn start_work(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
 pub fn register_work_tools(registry: &mut ToolRegistry) -> Result<()> {
     registry.register(
         ToolKind::StartWork,
-        "Claim a record and get the context to work on it: the record with its \
-         ancestor path, linked resolutions, dependency \
-         readiness, and a bounded newest-first window of direct open comment \
-         roots with bounded oldest-first direct replies. Comments stay pull-shaped: \
-         this context is deliberate discovery, not an inbox or notification. \
+        "Claim a record and get context: the record, ancestors, linked \
+         resolutions, dependency readiness, and a bounded window of direct \
+         open comment roots. Comments are pull-shaped discovery, not an inbox. \
          The claim is one conditional coordination write that leaves lifecycle \
-         unchanged — a second claimant is refused, not queued. Use action 'preview' to inspect \
-         without claiming, or 'release' to hand the claim back.",
+         unchanged — a second claimant is refused, not queued. Actions: claim \
+         (default), preview, release.",
         json!({
             "type": "object",
             "properties": {
@@ -738,7 +1282,11 @@ pub fn register_work_tools(registry: &mut ToolRegistry) -> Result<()> {
                 },
                 "agent_id": {
                     "type": "string",
-                    "description": "Deprecated and ignored. Claim ownership comes from the authenticated account and validated run_key."
+                    "description": "Deprecated; ignored."
+                },
+                "expected_holder_run_key": {
+                    "type": ["string", "null"],
+                    "description": "Same-account compare-and-release: the holding run key (null when account-only). Unneeded for your own run."
                 }
             },
             "required": ["record_id"],
@@ -763,6 +1311,16 @@ mod tests {
             record_id: id.into(),
             action: Some(action.into()),
             _agent_id: None,
+            expected_holder_run_key: None,
+        }
+    }
+
+    fn args_with_expected(id: &str, action: &str, expected: Option<Option<&str>>) -> StartWorkArgs {
+        StartWorkArgs {
+            record_id: id.into(),
+            action: Some(action.into()),
+            _agent_id: None,
+            expected_holder_run_key: expected.map(|inner| inner.map(String::from)),
         }
     }
 
@@ -814,13 +1372,192 @@ mod tests {
         claim(&db, &later, "start_work", &args(&id, ACTION_CLAIM))
             .await
             .unwrap();
+        // A stale same-account run retrying a bare release is refused: the
+        // compare-and-release guard is required, and the later claim survives.
         let error = release(&db, &first, "start_work", &args(&id, ACTION_RELEASE))
             .await
             .unwrap_err()
             .to_string();
-        assert!(error.contains("claimed by another caller"));
+        assert!(error.contains("expected_holder_run_key"));
+        assert!(error.contains("scout-chair-b748b2"));
         let current = claim_state(&db, &id).await.unwrap();
         assert_eq!(current.claimed_run_key, later.run_key().map(String::from));
+    }
+
+    #[tokio::test]
+    async fn same_account_other_run_release_succeeds_with_expected_holder() {
+        let db = create_database(":memory:").await.unwrap();
+        let id = subject(&db).await;
+        let first = Caller::authenticated("account:a")
+            .with_run_context(Some("scout-chair-a748b2".into()), None);
+        let second = Caller::authenticated("account:a")
+            .with_run_context(Some("scout-chair-b748b2".into()), None);
+        claim(&db, &first, "start_work", &args(&id, ACTION_CLAIM))
+            .await
+            .unwrap();
+        let released = release(
+            &db,
+            &second,
+            "start_work",
+            &args_with_expected(&id, ACTION_RELEASE, Some(Some("scout-chair-a748b2"))),
+        )
+        .await
+        .unwrap();
+        assert!(!released.claimed && released.changed);
+        let current = claim_state(&db, &id).await.unwrap();
+        assert!(!current.is_claimed());
+        let payload: serde_json::Value = sqlx::query_scalar(
+            "SELECT payload FROM content_events WHERE record_id=? AND type='record.updated' \
+             ORDER BY seq DESC LIMIT 1",
+        )
+        .bind(&id)
+        .fetch_one(db.write_pool())
+        .await
+        .map(|raw: String| serde_json::from_str(&raw).unwrap())
+        .unwrap();
+        assert_eq!(payload["claimed_by_account"], serde_json::Value::Null);
+        assert_eq!(payload["claimed_run_key"], serde_json::Value::Null);
+        assert_eq!(payload["released_from_run_key"], "scout-chair-a748b2");
+        // The extra release key projects through the claim fold: the record is
+        // unclaimed and a rebuild still reproduces the projections.
+        let diff = crate::conformance::rebuild_and_diff(&db).await.unwrap();
+        assert!(
+            diff.equal,
+            "projections diverge from replay: {:?}",
+            diff.tables
+        );
+    }
+
+    #[tokio::test]
+    async fn same_account_release_without_expected_names_holder_run_key() {
+        let db = create_database(":memory:").await.unwrap();
+        let id = subject(&db).await;
+        let holder = Caller::authenticated("account:a")
+            .with_run_context(Some("scout-chair-a748b2".into()), None);
+        let other = Caller::authenticated("account:a")
+            .with_run_context(Some("scout-chair-b748b2".into()), None);
+        claim(&db, &holder, "start_work", &args(&id, ACTION_CLAIM))
+            .await
+            .unwrap();
+        let error = release(&db, &other, "start_work", &args(&id, ACTION_RELEASE))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("scout-chair-a748b2"));
+        assert!(error.contains("expected_holder_run_key"));
+        let current = claim_state(&db, &id).await.unwrap();
+        assert_eq!(
+            current.claimed_run_key.as_deref(),
+            Some("scout-chair-a748b2")
+        );
+    }
+
+    #[tokio::test]
+    async fn same_account_release_with_wrong_expected_is_refused_without_clearing() {
+        let db = create_database(":memory:").await.unwrap();
+        let id = subject(&db).await;
+        let holder = Caller::authenticated("account:a")
+            .with_run_context(Some("scout-chair-a748b2".into()), None);
+        let other = Caller::authenticated("account:a")
+            .with_run_context(Some("scout-chair-b748b2".into()), None);
+        claim(&db, &holder, "start_work", &args(&id, ACTION_CLAIM))
+            .await
+            .unwrap();
+        let error = release(
+            &db,
+            &other,
+            "start_work",
+            &args_with_expected(&id, ACTION_RELEASE, Some(Some("scout-chair-c748b2"))),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("holder changed"));
+        assert!(error.contains("preview"));
+        assert!(!error.contains("scout-chair-a748b2"));
+        let current = claim_state(&db, &id).await.unwrap();
+        assert_eq!(
+            current.claimed_run_key.as_deref(),
+            Some("scout-chair-a748b2")
+        );
+    }
+
+    #[tokio::test]
+    async fn same_account_account_only_holder_releases_with_null_expectation() {
+        let db = create_database(":memory:").await.unwrap();
+        let id = subject(&db).await;
+        let holder = Caller::authenticated("account:a");
+        let other = Caller::authenticated("account:a")
+            .with_run_context(Some("scout-chair-b748b2".into()), None);
+        claim(&db, &holder, "start_work", &args(&id, ACTION_CLAIM))
+            .await
+            .unwrap();
+        let bare = release(&db, &other, "start_work", &args(&id, ACTION_RELEASE))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(bare.contains("expected_holder_run_key"));
+        release(
+            &db,
+            &other,
+            "start_work",
+            &args_with_expected(&id, ACTION_RELEASE, Some(None)),
+        )
+        .await
+        .unwrap();
+        assert!(!claim_state(&db, &id).await.unwrap().is_claimed());
+    }
+
+    #[tokio::test]
+    async fn other_account_release_stays_refused_without_disclosure() {
+        let db = create_database(":memory:").await.unwrap();
+        let id = subject(&db).await;
+        let holder = Caller::authenticated("account:a")
+            .with_run_context(Some("scout-chair-a748b2".into()), None);
+        let attacker = Caller::authenticated("account:b")
+            .with_run_context(Some("scout-chair-a748b2".into()), None);
+        claim(&db, &holder, "start_work", &args(&id, ACTION_CLAIM))
+            .await
+            .unwrap();
+        for with_expected in [
+            args(&id, ACTION_RELEASE),
+            args_with_expected(&id, ACTION_RELEASE, Some(Some("scout-chair-a748b2"))),
+        ] {
+            let error = release(&db, &attacker, "start_work", &with_expected)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("claimed by another caller"));
+            assert!(!error.contains("scout-chair-a748b2"));
+            assert!(!error.contains("account:a"));
+        }
+        let current = claim_state(&db, &id).await.unwrap();
+        assert_eq!(
+            current.claimed_run_key.as_deref(),
+            Some("scout-chair-a748b2")
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_holder_with_mismatched_expected_is_refused() {
+        let db = create_database(":memory:").await.unwrap();
+        let id = subject(&db).await;
+        let holder = Caller::authenticated("account:a")
+            .with_run_context(Some("scout-chair-a748b2".into()), None);
+        claim(&db, &holder, "start_work", &args(&id, ACTION_CLAIM))
+            .await
+            .unwrap();
+        let error = release(
+            &db,
+            &holder,
+            "start_work",
+            &args_with_expected(&id, ACTION_RELEASE, Some(Some("scout-chair-b748b2"))),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("expected_holder_run_key"));
+        assert!(claim_state(&db, &id).await.unwrap().is_claimed());
     }
 
     #[tokio::test]
@@ -871,25 +1608,32 @@ mod tests {
 
         let ids = vec![open.clone(), closed.clone(), missing.clone()];
         let mut conn = db.write_pool().acquire().await.unwrap();
-        let open_projection =
-            project_work_states_in(&mut conn, db.write_pool(), &open_holder, &ids)
-                .await
-                .unwrap();
+        let open_projection = project_work_states_in(&mut conn, &open_holder, &ids)
+            .await
+            .unwrap();
         assert_eq!(open_projection[&open]["target"]["run_state"], "open");
         assert_eq!(open_projection[&open]["claim_status"], "current");
-        assert_eq!(open_projection[&closed]["target"]["visibility"], "withheld");
+        assert_eq!(open_projection[&open]["target"]["holder_tier"], "this_run");
+        // Same account, different run: still visible, with the HOLDER's
+        // run_state and tier — not the viewer's.
+        assert_eq!(open_projection[&closed]["target"]["visibility"], "visible");
+        assert_eq!(open_projection[&closed]["target"]["run_state"], "closed");
+        assert_eq!(
+            open_projection[&closed]["target"]["holder_tier"],
+            "another_agent_of_yours"
+        );
+        assert_eq!(open_projection[&closed]["claim_status"], "current");
+        assert_eq!(open_projection[&missing]["target"]["run_state"], "missing");
 
-        let closed_projection =
-            project_work_states_in(&mut conn, db.write_pool(), &closed_holder, &ids)
-                .await
-                .unwrap();
+        let closed_projection = project_work_states_in(&mut conn, &closed_holder, &ids)
+            .await
+            .unwrap();
         assert_eq!(closed_projection[&closed]["target"]["run_state"], "closed");
         assert_eq!(closed_projection[&closed]["claim_status"], "current");
 
-        let missing_projection =
-            project_work_states_in(&mut conn, db.write_pool(), &missing_holder, &ids)
-                .await
-                .unwrap();
+        let missing_projection = project_work_states_in(&mut conn, &missing_holder, &ids)
+            .await
+            .unwrap();
         assert_eq!(
             missing_projection[&missing]["target"]["run_state"],
             "missing"
@@ -901,15 +1645,70 @@ mod tests {
         crate::control::ensure_agent_run(&db, missing_run, "account:other")
             .await
             .unwrap();
-        let reused_projection =
-            project_work_states_in(&mut conn, db.write_pool(), &missing_holder, &ids)
-                .await
-                .unwrap();
+        let reused_projection = project_work_states_in(&mut conn, &missing_holder, &ids)
+            .await
+            .unwrap();
         assert_eq!(
             reused_projection[&missing]["target"]["run_state"],
             "missing"
         );
         assert!(reused_projection[&missing]["target"]["activity_id"].is_null());
+
+        // Another principal still gets withheld with no claim_status.
+        let outsider = Caller::authenticated("account:other");
+        let withheld_projection = project_work_states_in(&mut conn, &outsider, &ids)
+            .await
+            .unwrap();
+        for id in &ids {
+            assert_eq!(withheld_projection[id]["target"]["visibility"], "withheld");
+            assert_eq!(withheld_projection[id]["details"]["visibility"], "withheld");
+            assert!(withheld_projection[id].get("claim_status").is_none());
+            assert!(withheld_projection[id].get("holder_tier").is_none());
+            assert!(!serde_json::to_string(&withheld_projection[id])
+                .unwrap()
+                .contains(account));
+        }
+
+        // Same-agent different-run tiering: scout-chair-* shares the agent key.
+        let same_agent_other_run = Caller::authenticated(account)
+            .with_run_context(Some("scout-chair-b748b2".into()), None);
+        let tiered = project_work_states_in(&mut conn, &same_agent_other_run, &ids)
+            .await
+            .unwrap();
+        assert_eq!(
+            tiered[&open]["target"]["holder_tier"],
+            "another_run_of_this_agent"
+        );
+
+        // Canonical keyless semantics, shared with the overlap notice: an
+        // account-only holder is never `this_run`, even for a keyless caller
+        // of the same account — there is no key to resolve liveness from.
+        let keyless_id = subject(&db).await;
+        let keyless_holder = Caller::authenticated(account);
+        claim(
+            &db,
+            &keyless_holder,
+            "start_work",
+            &args(&keyless_id, ACTION_CLAIM),
+        )
+        .await
+        .unwrap();
+        let keyless_projection = project_work_states_in(
+            &mut conn,
+            &keyless_holder,
+            std::slice::from_ref(&keyless_id),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            keyless_projection[&keyless_id]["target"]["holder_tier"],
+            "another_agent_of_yours"
+        );
+        assert_eq!(
+            keyless_projection[&keyless_id]["target"]["run_state"],
+            "not_applicable"
+        );
+        assert_eq!(keyless_projection[&keyless_id]["claim_status"], "current");
     }
 
     #[tokio::test]

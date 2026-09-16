@@ -368,10 +368,24 @@ pub fn decode_native_record(value: &str) -> Result<(String, String)> {
 }
 
 pub async fn database_id(db: &Db) -> Result<String> {
-    sqlx::query_scalar("SELECT origin_db_id FROM database_identity WHERE singleton = 1")
-        .fetch_optional(db.write_pool())
-        .await?
-        .ok_or_else(|| Error::engine("database identity singleton is missing"))
+    // Handle-local memo of an immutable singleton. Successful reads only:
+    // a missing row is never cached, clones share the cell, and a fresh
+    // open starts cold. Offline rekey requires the caller to drain live
+    // handles first; the memo offers no cross-handle invalidation, so it
+    // must stay handle-local and success-only. The read goes to the
+    // read-only pool so warm connect/reconciliation never takes a workspace
+    // writer slot for an immutable fact.
+    db.database_id_cell()
+        .get_or_try_init(|| async {
+            sqlx::query_scalar::<_, String>(
+                "SELECT origin_db_id FROM database_identity WHERE singleton = 1",
+            )
+            .fetch_optional(db.pool())
+            .await?
+            .ok_or_else(|| Error::engine("database identity singleton is missing"))
+        })
+        .await
+        .cloned()
 }
 
 /// Stable workspace-local pseudonym for one portable account. The relation
@@ -3060,5 +3074,93 @@ mod tests {
         let bytes = hex::decode(&identity[4..]).unwrap();
         assert_eq!(bytes.len(), 16);
         assert_eq!(identity, identity.to_ascii_lowercase());
+    }
+
+    #[tokio::test]
+    async fn database_id_miss_is_not_cached_and_later_seed_succeeds() {
+        let db = crate::db::open_database(":memory:").await.unwrap();
+        crate::db::apply_schema(&db).await.unwrap();
+        assert!(db.database_id_cell().get().is_none());
+        let error = database_id(&db).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("database identity singleton is missing"),
+            "{error}"
+        );
+        assert!(
+            db.database_id_cell().get().is_none(),
+            "a missing singleton must never populate the handle memo"
+        );
+        let seeded = seed_database_identity(&db).await.unwrap();
+        assert_eq!(database_id(&db).await.unwrap(), seeded);
+        assert_eq!(db.database_id_cell().get().unwrap(), &seeded);
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn database_id_warm_read_uses_no_pool_slot() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let first = database_id(&db).await.unwrap();
+        assert!(is_database_id(&first));
+        let clone = db.clone();
+        assert_eq!(database_id(&clone).await.unwrap(), first);
+        // Clones share one cell, not one copy (limited pointer evidence;
+        // the pool-exhaustion assertion below is the behavioural proof).
+        assert!(std::ptr::eq(
+            db.database_id_cell(),
+            clone.database_id_cell()
+        ));
+        // Exhaust both pools: every write-pool and read-pool slot is held,
+        // so a warm read that touched either pool would wait and time out.
+        // Both pools are capped at five connections (see open_pool /
+        // open_read_pool in crate::db).
+        let mut held = Vec::new();
+        for _ in 0..5 {
+            held.push(db.write_pool().acquire().await.unwrap());
+        }
+        let mut read_held = Vec::new();
+        for _ in 0..5 {
+            read_held.push(db.pool().acquire().await.unwrap());
+        }
+        let warm = tokio::time::timeout(std::time::Duration::from_secs(2), database_id(&db))
+            .await
+            .expect("warm database_id must not acquire a pool slot");
+        assert_eq!(warm.unwrap(), first);
+        drop(held);
+        drop(read_held);
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn database_id_reopened_after_offline_rekey_reads_the_new_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("identity-memo.db");
+        let url = path.to_string_lossy().into_owned();
+        let db = crate::create_database(&url).await.unwrap();
+        let old_id = database_id(&db).await.unwrap();
+        // Offline rekey requires the caller to drain live handles: checkpoint
+        // the WAL into the file, then close before copying and rekeying.
+        sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+            .execute(db.write_pool())
+            .await
+            .unwrap();
+        db.close().await;
+        let backup = directory.path().join("identity-preimage.db");
+        std::fs::copy(&path, &backup).unwrap();
+        let new_id = rekey_database_offline(
+            &path,
+            &backup,
+            &old_id,
+            "test:rekey",
+            "handle-local memo picks up the offline rekey on fresh open",
+        )
+        .await
+        .unwrap();
+        assert_ne!(new_id, old_id);
+        let reopened = crate::db::open_existing_database(&url).await.unwrap();
+        assert!(reopened.database_id_cell().get().is_none());
+        assert_eq!(database_id(&reopened).await.unwrap(), new_id);
+        reopened.close().await;
     }
 }

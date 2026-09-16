@@ -120,6 +120,8 @@ struct MessageUnitV1 {
     prose: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     name: Option<String>,
+    // Captured as optional for explicit preflight diagnostics and preserved
+    // export; authenticated v1/v2 admission requires a closed-vocabulary value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     expectation: Option<String>,
     /// Immutable authored communication origin. Absence is retained only for
@@ -211,6 +213,9 @@ impl IngestResult {
 #[derive(Debug)]
 struct PreparedUnit {
     wire: MessageUnitV1,
+    // Preflight discharges requiredness for both wire versions. Keep the wire
+    // representation intact for canonicalization and preserved exports.
+    expectation: String,
     canonical_payload: String,
     payload_digest: [u8; 32],
     fingerprint: [u8; 32],
@@ -498,12 +503,14 @@ fn preflight(
         {
             return Err(PreflightFailure::Rejected("name_limit"));
         }
-        if let Some(expectation) = &message.expectation {
-            if !crate::message_expectation::EXPECTATION_VALUES.contains(&expectation.as_str()) {
-                return Err(PreflightFailure::Quarantined(
-                    "unknown_required_expectation",
-                ));
-            }
+        let expectation = message
+            .expectation
+            .as_ref()
+            .ok_or(PreflightFailure::Rejected("missing_required_expectation"))?;
+        if !crate::message_expectation::EXPECTATION_VALUES.contains(&expectation.as_str()) {
+            return Err(PreflightFailure::Quarantined(
+                "unknown_required_expectation",
+            ));
         }
         validate_message_origin(&wire, message, sender)?;
         validate_capabilities(&message.required_capabilities)?;
@@ -560,6 +567,7 @@ fn preflight(
         .into();
         units.push(PreparedUnit {
             wire: message.clone(),
+            expectation: expectation.clone(),
             canonical_payload: String::from_utf8(canonical_payload).expect("JCS JSON is UTF-8"),
             payload_digest,
             fingerprint,
@@ -1056,25 +1064,23 @@ async fn ingest_prepared(
             )
             .await?;
         }
-        if let Some(expectation) = &unit.wire.expectation {
-            append_in(
-                db,
-                &mut tx,
-                AppendSpec {
-                    record_id: unit.wire.message_record_id.clone(),
-                    event_type: "facet.set".into(),
-                    payload: json!({
-                        "key": crate::message_expectation::EXPECTATION_FACET_KEY,
-                        "value": expectation,
-                        "vocab_ref": crate::meta::vocab_ref(
-                            crate::message_expectation::EXPECTATION_VOCABULARY_ID,
-                        ),
-                    }),
-                    actor: Some(sender.actor.clone()),
-                },
-            )
-            .await?;
-        }
+        append_in(
+            db,
+            &mut tx,
+            AppendSpec {
+                record_id: unit.wire.message_record_id.clone(),
+                event_type: "facet.set".into(),
+                payload: json!({
+                    "key": crate::message_expectation::EXPECTATION_FACET_KEY,
+                    "value": unit.expectation,
+                    "vocab_ref": crate::meta::vocab_ref(
+                        crate::message_expectation::EXPECTATION_VOCABULARY_ID,
+                    ),
+                }),
+                actor: Some(sender.actor.clone()),
+            },
+        )
+        .await?;
         if let Some(sender_record_id) = &sender.record_id {
             let addressed_to = unit
                 .wire
@@ -2449,18 +2455,445 @@ mod tests {
         .unwrap();
     }
 
-    async fn ingest_counts(db: &Db) -> (i64, i64, i64, i64, i64, i64) {
-        sqlx::query_as(
-            "SELECT (SELECT COUNT(*) FROM records),
-                    (SELECT COUNT(*) FROM bindings),
-                    (SELECT COUNT(*) FROM content_events),
-                    (SELECT COUNT(*) FROM replicated_message_provenance),
-                    (SELECT COUNT(*) FROM destination_message_ingest),
-                    (SELECT COUNT(*) FROM facet_values)",
+    async fn ingest_counts(db: &Db) -> Vec<i64> {
+        let mut counts = Vec::new();
+        for table in [
+            "records",
+            "bindings",
+            "content_events",
+            "content_event_sources",
+            "content_event_causal_frontier",
+            "replicated_message_provenance",
+            "destination_message_ingest",
+            "replicated_message_references",
+            "facet_values",
+            "links",
+        ] {
+            counts.push(
+                sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+                    .fetch_one(db.write_pool())
+                    .await
+                    .unwrap(),
+            );
+        }
+        counts
+    }
+
+    async fn assert_expectation(db: &Db, message_id: &str, expected: &str) {
+        let facet: (String, String) = sqlx::query_as(
+            "SELECT value,vocab_ref FROM facet_values WHERE record_id=? AND key='expectation'",
+        )
+        .bind(message_id)
+        .fetch_one(db.write_pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            facet,
+            (expected.into(), "rec:voc:message-expectation".into())
+        );
+        let events: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM content_events WHERE record_id=? AND type='facet.set'
+               AND json_extract(payload,'$.key')='expectation'",
+        )
+        .bind(message_id)
+        .fetch_one(db.write_pool())
+        .await
+        .unwrap();
+        assert_eq!(events, 1, "expectation must be projected exactly once");
+    }
+
+    #[tokio::test]
+    async fn required_expectation_is_preflighted_for_every_v1_and_v2_unit() {
+        for encode in [v1_bytes, bytes] {
+            let db = crate::create_database(":memory:").await.unwrap();
+            for (index, expectation) in crate::message_expectation::EXPECTATION_VALUES
+                .iter()
+                .enumerate()
+            {
+                let mut input = message(40 + index as u8, "declared expectation");
+                input.expectation = Some((*expectation).into());
+                let id = input.message_record_id.clone();
+                let result = ingest_verified_native_message(
+                    &db,
+                    context(UNFILED_RECORD_ID),
+                    &encode(vec![input]),
+                )
+                .await;
+                assert_eq!(result.status, IngestStatus::Applied);
+                assert_expectation(&db, &id, expectation).await;
+            }
+            let before = ingest_counts(&db).await;
+            for (value, status, code) in [
+                (None, IngestStatus::Rejected, "missing_required_expectation"),
+                (
+                    Some(Value::Null),
+                    IngestStatus::Rejected,
+                    "missing_required_expectation",
+                ),
+                (
+                    Some(json!(false)),
+                    IngestStatus::Rejected,
+                    "invalid_message_schema",
+                ),
+                (
+                    Some(json!("maybe")),
+                    IngestStatus::Quarantined,
+                    "unknown_required_expectation",
+                ),
+            ] {
+                let mut wire: Value = serde_json::from_slice(&encode(vec![
+                    message(50, "must not append"),
+                    message(51, "bad declaration"),
+                ]))
+                .unwrap();
+                if let Some(value) = value {
+                    wire["messages"][1]["expectation"] = value;
+                } else {
+                    wire["messages"][1]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("expectation");
+                }
+                let result = ingest_verified_native_message(
+                    &db,
+                    context(UNFILED_RECORD_ID),
+                    &serde_jcs::to_vec(&wire).unwrap(),
+                )
+                .await;
+                assert_eq!(result.status, status);
+                assert_eq!(result.code, code);
+                assert_eq!(
+                    ingest_counts(&db).await,
+                    before,
+                    "preflight must reject the whole batch before any write"
+                );
+            }
+            assert!(rebuild_and_diff(&db).await.unwrap().equal);
+        }
+    }
+
+    #[tokio::test]
+    async fn first_delivery_preserves_all_source_and_destination_facts() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        crate::store::create_record(
+            &db,
+            json!({"id":TRUSTED_ALICE_ID,"type":"Entity","kind":"person","name":"Local Alice"}),
+        )
+        .await
+        .unwrap();
+        for (system, identifier) in [
+            ("native-principal", "native/alice"),
+            ("account", "acct_local_alice"),
+        ] {
+            sqlx::query(
+                "INSERT INTO bindings(record_id,system,identifier,is_canonical) VALUES (?,?,?,1)",
+            )
+            .bind(TRUSTED_ALICE_ID)
+            .bind(system)
+            .bind(identifier)
+            .execute(db.write_pool())
+            .await
+            .unwrap();
+        }
+        let mut input = message(52, "preserved prose");
+        input.source_event.source_seq = 100_000;
+        input.name = Some("Source title".into());
+        let payload = bytes(vec![input.clone()]);
+        let prepared = preflight(&context(UNFILED_RECORD_ID), &payload).unwrap();
+        let fingerprint = hex::encode(prepared.units[0].fingerprint);
+        let result =
+            ingest_verified_native_message(&db, context(UNFILED_RECORD_ID), &payload).await;
+        assert_eq!(result.status, IngestStatus::Applied);
+        assert_eq!(result.event_ids, [input.source_event.id.clone()]);
+        assert_eq!(result.message_ids, [input.message_record_id.clone()]);
+        let row = sqlx::query("SELECT e.id,e.record_id,e.type,e.created_at,e.seq,e.actor,r.type AS record_type,r.kind,r.body,r.name,r.persistence,r.home_id,r.owner_id
+            FROM content_events e JOIN records r ON r.id=e.record_id WHERE e.id=?")
+            .bind(&input.source_event.id).fetch_one(db.write_pool()).await.unwrap();
+        for (field, expected) in [
+            ("id", input.source_event.id.as_str()),
+            ("record_id", input.message_record_id.as_str()),
+            ("type", "record.created"),
+            ("record_type", "Message"),
+            ("created_at", AT),
+            ("actor", "acct_local_alice"),
+            ("kind", "text"),
+            ("body", "preserved prose"),
+            ("name", "Source title"),
+            ("persistence", "occurrent"),
+            ("home_id", UNFILED_RECORD_ID),
+            ("owner_id", TRUSTED_ALICE_ID),
+        ] {
+            assert_eq!(
+                row.try_get::<String, _>(field).unwrap(),
+                expected,
+                "{field}"
+            );
+        }
+        assert_ne!(
+            row.try_get::<i64, _>("seq").unwrap(),
+            input.source_event.source_seq
+        );
+        let source: (String,i64,String,String,String) = sqlx::query_as("SELECT origin_database_id,source_seq,source_record_id,source_principal,source_fingerprint FROM content_event_sources WHERE event_id=?")
+            .bind(&input.source_event.id).fetch_one(db.write_pool()).await.unwrap();
+        assert_eq!(
+            source,
+            (
+                ORIGIN.into(),
+                100_000,
+                input.message_record_id.clone(),
+                "native/alice".into(),
+                fingerprint
+            )
+        );
+        assert_expectation(&db, &input.message_record_id, "none").await;
+        assert!(rebuild_and_diff(&db).await.unwrap().equal);
+    }
+
+    #[tokio::test]
+    async fn local_and_intra_batch_identity_collisions_precede_every_write() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let local_event: String = sqlx::query_scalar(
+            "SELECT id FROM content_events WHERE record_id='native:root' LIMIT 1",
         )
         .fetch_one(db.write_pool())
         .await
-        .unwrap()
+        .unwrap();
+        let local_message_id = message(53, "").message_record_id;
+        crate::store::create_record(
+            &db,
+            json!({"id":local_message_id,"type":"Message","kind":"text","body":"local"}),
+        )
+        .await
+        .unwrap();
+        let before = ingest_counts(&db).await;
+        let good = message(54, "must not leak");
+        let mut local_event_collision = message(55, "local event collision");
+        local_event_collision.source_event.id = local_event;
+        let mut local_record_collision = message(56, "local record collision");
+        local_record_collision.message_record_id = local_message_id;
+        let mut repeated_event_collision = good.clone();
+        repeated_event_collision.prose = "different authenticated facts".into();
+        let mut repeated_record_collision = message(57, "same record, different event");
+        repeated_record_collision.message_record_id = good.message_record_id.clone();
+        for bad in [
+            local_event_collision,
+            local_record_collision,
+            repeated_event_collision,
+            repeated_record_collision,
+        ] {
+            let result = ingest_verified_native_message(
+                &db,
+                context(UNFILED_RECORD_ID),
+                &bytes(vec![good.clone(), bad]),
+            )
+            .await;
+            assert_eq!(result.status, IngestStatus::Rejected);
+            assert_eq!(result.code, "source_identity_collision");
+            assert_eq!(ingest_counts(&db).await, before);
+        }
+    }
+
+    #[tokio::test]
+    async fn mixed_batch_coalesces_repeats_in_first_occurrence_order() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let existing = message(58, "existing");
+        let first = message(60, "first despite greater source position");
+        let second = message(59, "second");
+        assert_eq!(
+            ingest_verified_native_message(
+                &db,
+                context(UNFILED_RECORD_ID),
+                &bytes(vec![existing.clone()])
+            )
+            .await
+            .status,
+            IngestStatus::Applied
+        );
+        let payload = bytes(vec![
+            existing.clone(),
+            first.clone(),
+            first.clone(),
+            first.clone(),
+            second.clone(),
+        ]);
+        let result =
+            ingest_verified_native_message(&db, context(UNFILED_RECORD_ID), &payload).await;
+        assert_eq!(result.status, IngestStatus::PartiallyDuplicateBatchApplied);
+        assert_eq!(
+            result.event_ids,
+            [
+                existing.source_event.id.clone(),
+                first.source_event.id.clone(),
+                first.source_event.id.clone(),
+                first.source_event.id.clone(),
+                second.source_event.id.clone()
+            ]
+        );
+        let stored: Vec<String> = sqlx::query_scalar("SELECT e.id FROM content_events e JOIN content_event_sources s ON s.event_id=e.id ORDER BY e.seq")
+            .fetch_all(db.write_pool()).await.unwrap();
+        assert_eq!(
+            stored,
+            [
+                existing.source_event.id,
+                first.source_event.id,
+                second.source_event.id
+            ]
+        );
+        for input in [
+            &existing.message_record_id,
+            &first.message_record_id,
+            &second.message_record_id,
+        ] {
+            assert_expectation(&db, input, "none").await;
+        }
+        let before = ingest_counts(&db).await;
+        assert_eq!(
+            ingest_verified_native_message(&db, context(UNFILED_RECORD_ID), &payload)
+                .await
+                .status,
+            IngestStatus::Duplicate
+        );
+        assert_eq!(ingest_counts(&db).await, before);
+        assert!(rebuild_and_diff(&db).await.unwrap().equal);
+    }
+
+    #[tokio::test]
+    async fn later_projection_failure_rolls_back_creations_facets_and_provenance() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let first = message(61, "first must roll back");
+        let second = message(62, "late failure");
+        // Fire only after the first Message and its expectation have both been
+        // appended. If that earlier work never happened, the expected failure
+        // will not occur. This exercises the real outer ingest transaction.
+        sqlx::query(&format!(
+            "CREATE TRIGGER fail_late_expectation BEFORE INSERT ON facet_values
+            WHEN NEW.record_id='{}' AND NEW.key='expectation'
+             AND EXISTS(SELECT 1 FROM facet_values WHERE record_id='{}' AND key='expectation')
+            BEGIN SELECT RAISE(ABORT,'forced late expectation projection failure'); END",
+            second.message_record_id, first.message_record_id
+        ))
+        .execute(db.write_pool())
+        .await
+        .unwrap();
+        let before = ingest_counts(&db).await;
+        let payload = bytes(vec![first, second]);
+        let result =
+            ingest_verified_native_message(&db, context(UNFILED_RECORD_ID), &payload).await;
+        assert_eq!(result.status, IngestStatus::RetryableFailure);
+        assert_eq!(result.code, "destination_write_failure");
+        assert_eq!(ingest_counts(&db).await, before);
+        sqlx::query("DROP TRIGGER fail_late_expectation")
+            .execute(db.write_pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            ingest_verified_native_message(&db, context(UNFILED_RECORD_ID), &payload)
+                .await
+                .status,
+            IngestStatus::Applied
+        );
+        assert!(rebuild_and_diff(&db).await.unwrap().equal);
+    }
+
+    #[tokio::test]
+    async fn replicated_commit_wakes_realtime_subscribers() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let (db, hub) = crate::realtime::RealtimeHub::install(db).await.unwrap();
+        let mut subscriber = hub.subscribe();
+        let input = message(63, "realtime");
+        assert_eq!(
+            ingest_verified_native_message(
+                &db,
+                context(UNFILED_RECORD_ID),
+                &bytes(vec![input.clone()])
+            )
+            .await
+            .status,
+            IngestStatus::Applied
+        );
+        let invalidation = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let event = subscriber.recv().await.unwrap();
+                if event.id == input.source_event.id {
+                    break event;
+                }
+            }
+        })
+        .await
+        .expect("replicated creation wakes the realtime pump");
+        let seq: i64 = sqlx::query_scalar("SELECT seq FROM content_events WHERE id=?")
+            .bind(&input.source_event.id)
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap();
+        assert_eq!(invalidation.local_seq, seq);
+        assert_eq!(invalidation.record_id, input.message_record_id);
+        assert_eq!(invalidation.event_type, "record.created");
+    }
+
+    #[tokio::test]
+    async fn physical_snapshot_preserves_provenance_and_duplicate_stays_silent() {
+        for encode in [v1_bytes, bytes] {
+            let dir = tempfile::tempdir().unwrap();
+            let source_path = dir.path().join("source.db");
+            let exported_path = dir.path().join("exported.db");
+            let db = crate::create_database(&source_path.to_string_lossy())
+                .await
+                .unwrap();
+            let input = message(64, "snapshot");
+            let payload = encode(vec![input.clone()]);
+            assert_eq!(
+                ingest_verified_native_message(&db, context(UNFILED_RECORD_ID), &payload)
+                    .await
+                    .status,
+                IngestStatus::Applied
+            );
+            let before_source: (String,String,i64,String,String,String) = sqlx::query_as("SELECT event_id,origin_database_id,source_seq,source_record_id,source_principal,source_fingerprint FROM content_event_sources WHERE event_id=?")
+                .bind(&input.source_event.id).fetch_one(db.write_pool()).await.unwrap();
+            let before_export =
+                export_native_messages(&db, std::slice::from_ref(&input.message_record_id))
+                    .await
+                    .unwrap();
+            let before = ingest_counts(&db).await;
+            sqlx::query(&format!(
+                "VACUUM INTO '{}'",
+                exported_path.to_string_lossy().replace('\'', "''")
+            ))
+            .execute(db.write_pool())
+            .await
+            .unwrap();
+            db.close().await;
+            let reopened = crate::open_existing_database_at(&exported_path)
+                .await
+                .unwrap();
+            let (reopened, hub) = crate::realtime::RealtimeHub::install(reopened)
+                .await
+                .unwrap();
+            let mut subscriber = hub.subscribe();
+            let after_source: (String,String,i64,String,String,String) = sqlx::query_as("SELECT event_id,origin_database_id,source_seq,source_record_id,source_principal,source_fingerprint FROM content_event_sources WHERE event_id=?")
+                .bind(&input.source_event.id).fetch_one(reopened.write_pool()).await.unwrap();
+            assert_eq!(after_source, before_source);
+            assert_eq!(
+                export_native_messages(&reopened, std::slice::from_ref(&input.message_record_id))
+                    .await
+                    .unwrap(),
+                before_export
+            );
+            assert_eq!(
+                ingest_verified_native_message(&reopened, context(UNFILED_RECORD_ID), &payload)
+                    .await
+                    .status,
+                IngestStatus::Duplicate
+            );
+            assert_eq!(ingest_counts(&reopened).await, before);
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(150), subscriber.recv())
+                    .await
+                    .is_err()
+            );
+            assert!(rebuild_and_diff(&reopened).await.unwrap().equal);
+            reopened.close().await;
+        }
     }
 
     #[tokio::test]
@@ -2470,9 +2903,11 @@ mod tests {
         let applied =
             ingest_verified_native_message(&db, context(UNFILED_RECORD_ID), &payload).await;
         assert_eq!(applied.status, IngestStatus::Applied);
+        let before_replay = ingest_counts(&db).await;
         let duplicate =
             ingest_verified_native_message(&db, context(UNFILED_RECORD_ID), &payload).await;
         assert_eq!(duplicate.status, IngestStatus::Duplicate);
+        assert_eq!(ingest_counts(&db).await, before_replay);
         let collision = ingest_verified_native_message(
             &db,
             context(UNFILED_RECORD_ID),
@@ -2480,6 +2915,8 @@ mod tests {
         )
         .await;
         assert_eq!(collision.status, IngestStatus::Rejected);
+        assert_eq!(ingest_counts(&db).await, before_replay);
+        assert_expectation(&db, &message(1, "hello").message_record_id, "none").await;
         let body: String = sqlx::query_scalar("SELECT body FROM records WHERE id=?")
             .bind("20000000-0000-4000-8000-000000000001")
             .fetch_one(db.write_pool())
@@ -2673,6 +3110,16 @@ mod tests {
             stored,
             ("readable fallback".into(), "quarantined_kind".into())
         );
+        let kind: (String, String) = sqlx::query_as(
+            "SELECT r.kind,json_extract(e.payload,'$.kind') FROM records r
+             JOIN content_events e ON e.record_id=r.id AND e.type='record.created' WHERE r.id=?",
+        )
+        .bind(message(5, "").message_record_id)
+        .fetch_one(db.write_pool())
+        .await
+        .unwrap();
+        assert_eq!(kind, ("vendor.card".into(), "vendor.card".into()));
+        assert!(rebuild_and_diff(&db).await.unwrap().equal);
     }
 
     #[tokio::test]
@@ -3372,6 +3819,19 @@ mod tests {
             &collection_db,
             AppendSpec {
                 record_id: channel_post_id.into(),
+                event_type: "facet.set".into(),
+                payload: json!({
+                    "key": crate::message_expectation::EXPECTATION_FACET_KEY,
+                    "value": "none",
+                    "vocab_ref": crate::meta::vocab_ref(crate::message_expectation::EXPECTATION_VOCABULARY_ID),
+                }),
+                actor: Some("acct_local_sender".into()),
+            },
+        ).await.unwrap();
+        crate::store::append(
+            &collection_db,
+            AppendSpec {
+                record_id: channel_post_id.into(),
                 event_type: "message.audience.declared".into(),
                 payload: serde_json::to_value(MessageAudienceDeclaredPayload {
                     sender_id: LOCAL_SENDER_ID.into(),
@@ -3546,10 +4006,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unresolved_earlier_reply_stays_visible_without_inventing_expectation() {
+    async fn unresolved_earlier_reply_preserves_its_declared_expectation() {
         let db = crate::create_database(":memory:").await.unwrap();
         let mut reply = message(14, "reply with unavailable causal parent");
-        reply.expectation = None;
+        reply.expectation = Some("ack".into());
+        let reply_id = reply.message_record_id.clone();
         reply.reply_to = Some(ExternalRecordRefV1 {
             origin_database_id: ORIGIN.into(),
             record_id: "20000000-0000-4000-8000-000000000001".into(),
@@ -3575,14 +4036,7 @@ mod tests {
             provenance["references"]["unresolved"][0]["target"]["record_id"],
             "20000000-0000-4000-8000-000000000001"
         );
-        let expectation_count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM facet_values WHERE record_id=? AND key=?")
-                .bind("20000000-0000-4000-8000-000000000014")
-                .bind(crate::message_expectation::EXPECTATION_FACET_KEY)
-                .fetch_one(db.write_pool())
-                .await
-                .unwrap();
-        assert_eq!(expectation_count, 0);
+        assert_expectation(&db, &reply_id, "ack").await;
     }
 
     #[tokio::test]
@@ -3666,6 +4120,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(provenance_count, 1);
+        assert_expectation(&db, &message(17, "").message_record_id, "none").await;
     }
 
     #[tokio::test]

@@ -277,6 +277,10 @@
         },
         {
           "kind": "file",
+          "source": "src/record_body.rs"
+        },
+        {
+          "kind": "file",
           "source": "src/record_images.rs"
         },
         {
@@ -285,11 +289,11 @@
         },
         {
           "kind": "file",
-          "source": "src/replication.rs"
+          "source": "src/replication_v1.rs"
         },
         {
           "kind": "file",
-          "source": "src/replication_v1.rs"
+          "source": "src/request_work.rs"
         },
         {
           "kind": "file",
@@ -560,6 +564,10 @@
         {
           "kind": "file",
           "source": "docs/agent-interventions.md"
+        },
+        {
+          "kind": "file",
+          "source": "docs/artifact-open-view-promise.md"
         },
         {
           "kind": "file",

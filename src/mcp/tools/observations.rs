@@ -313,56 +313,69 @@ async fn manage_facet_observations(db: Db, caller: Caller, arguments: Value) -> 
 }
 
 pub fn register_observation_tools(registry: &mut ToolRegistry) -> Result<()> {
+    let list_schema = crate::mcp::record_ref::with_record_selector_aliases(
+        "manage_facet_observations.list",
+        json!({
+            "type": "object",
+            "properties": {
+                "action": { "const": "list" },
+                "record_id": { "type": "string" },
+                "key": { "type": "string", "minLength": 1, "description": "One projected facet-series key." },
+                "from_as_of": { "type": "string", "description": "Optional inclusive RFC3339 lower bound." },
+                "to_as_of": { "type": "string", "description": "Optional inclusive RFC3339 upper bound." },
+                "after_as_of": { "type": "string", "description": "Optional opaque exclusive keyset cursor returned as next_after_as_of; pass it back unchanged." },
+                "limit": { "type": "integer", "minimum": 1, "maximum": MAX_LIMIT, "default": DEFAULT_LIMIT }
+            },
+            "required": ["action", "record_id", "key"],
+            "additionalProperties": false
+        }),
+    );
+    let set_schema = crate::mcp::record_ref::with_record_selector_aliases(
+        "manage_facet_observations.set",
+        json!({
+                "type": "object",
+                "properties": {
+                    "action": { "const": "set" },
+                    "record_id": { "type": "string" },
+                    "key": { "type": "string", "minLength": 1, "description": "One open facet key; spine and engine-reserved facets are rejected." },
+                    "value": { "type": ["string", "number"], "description": "Preserve JSON numbers for facets declared type:number." },
+                    "vocab_ref": { "type": "string", "description": "Optional vocabulary reference, checked against the governing shape." },
+                    "as_of": { "type": "string", "description": "Required RFC3339 valid-time timestamp." },
+                    "reason": { "type": "string", "minLength": 1, "description": REASON_DESCRIPTION }
+                },
+                "required": ["action", "record_id", "key", "value", "as_of", "reason"],
+                "additionalProperties": false
+        }),
+    );
+    let unset_schema = crate::mcp::record_ref::with_record_selector_aliases(
+        "manage_facet_observations.unset",
+        json!({
+                "type": "object",
+                "properties": {
+                    "action": { "const": "unset" },
+                    "record_id": { "type": "string" },
+                    "key": { "type": "string", "minLength": 1, "description": "One open facet key; spine and engine-reserved facets are rejected." },
+                    "as_of": { "type": "string", "description": "Required RFC3339 valid-time timestamp." },
+                    "reason": { "type": "string", "minLength": 1, "description": REASON_DESCRIPTION }
+                },
+                "required": ["action", "record_id", "key", "as_of", "reason"],
+                "additionalProperties": false
+        }),
+    );
+    let action_schema = json!({
+        "type": "object",
+        "oneOf": [
+            set_schema,
+            unset_schema,
+            list_schema
+        ]
+    });
     registry.register(
         ToolKind::ManageFacetObservations,
         &format!(
             "Set or unset one valid-time open-facet observation without changing the record's current facet value, or list one bounded series oldest-first. Writes require RFC3339 as_of and normalize it to UTC milliseconds. List bounds are inclusive; after_as_of is an exclusive keyset cursor; limit defaults to {DEFAULT_LIMIT} and is capped at {MAX_LIMIT}. Numeric values are returned as stored strings. {PREVIOUS_SEQ_DESCRIPTION}"
         ),
-        json!({
-            "type": "object",
-            "oneOf": [
-                {
-                    "type": "object",
-                    "properties": {
-                        "action": { "const": "set" },
-                        "record_id": { "type": "string" },
-                        "key": { "type": "string", "minLength": 1, "description": "One open facet key; spine and engine-reserved facets are rejected." },
-                        "value": { "type": ["string", "number"], "description": "Preserve JSON numbers for facets declared type:number." },
-                        "vocab_ref": { "type": "string", "description": "Optional vocabulary reference, checked against the governing shape." },
-                        "as_of": { "type": "string", "description": "Required RFC3339 valid-time timestamp." },
-                        "reason": { "type": "string", "minLength": 1, "description": REASON_DESCRIPTION }
-                    },
-                    "required": ["action", "record_id", "key", "value", "as_of", "reason"],
-                    "additionalProperties": false
-                },
-                {
-                    "type": "object",
-                    "properties": {
-                        "action": { "const": "unset" },
-                        "record_id": { "type": "string" },
-                        "key": { "type": "string", "minLength": 1, "description": "One open facet key; spine and engine-reserved facets are rejected." },
-                        "as_of": { "type": "string", "description": "Required RFC3339 valid-time timestamp." },
-                        "reason": { "type": "string", "minLength": 1, "description": REASON_DESCRIPTION }
-                    },
-                    "required": ["action", "record_id", "key", "as_of", "reason"],
-                    "additionalProperties": false
-                },
-                {
-                    "type": "object",
-                    "properties": {
-                        "action": { "const": "list" },
-                        "record_id": { "type": "string" },
-                        "key": { "type": "string", "minLength": 1, "description": "One projected facet-series key." },
-                        "from_as_of": { "type": "string", "description": "Optional inclusive RFC3339 lower bound." },
-                        "to_as_of": { "type": "string", "description": "Optional inclusive RFC3339 upper bound." },
-                        "after_as_of": { "type": "string", "description": "Optional opaque exclusive keyset cursor returned as next_after_as_of; pass it back unchanged." },
-                        "limit": { "type": "integer", "minimum": 1, "maximum": MAX_LIMIT, "default": DEFAULT_LIMIT }
-                    },
-                    "required": ["action", "record_id", "key"],
-                    "additionalProperties": false
-                }
-            ]
-        }),
+        action_schema,
         manage_facet_observations,
     )?;
     Ok(())

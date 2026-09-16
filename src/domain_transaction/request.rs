@@ -670,7 +670,9 @@ where
     trace.record(GovernedRequestOperation::TransientEvidence, transient_stage);
     let ended_at = crate::mcp::interactions::timestamp();
     if capture && interaction_stage == GovernedRequestStageDisposition::Applied {
-        port.capture_interaction(InteractionCapture {
+        let synchronous_declaration =
+            matches!(extractor, Extractor::Shipped(ToolKind::SetIntent)) && outcome.is_ok();
+        let capture = InteractionCapture {
             extractor,
             tool_name: name,
             caller: &capture_caller,
@@ -684,8 +686,16 @@ where
             }),
             started_at: &started_at,
             ended_at: &ended_at,
-        })
-        .await;
+        };
+        if synchronous_declaration {
+            // Successful set_intent capture is a synchronous semantic
+            // declaration, not an enqueue. Keep it out of the enqueue metric.
+            port.capture_interaction(capture).await;
+        } else {
+            // On the production hosted SQLite port this future only submits
+            // to the bounded capture queue; durability happens on its worker.
+            crate::mcp::request_timing::capture_enqueue(port.capture_interaction(capture)).await;
+        }
     }
     trace.record(
         GovernedRequestOperation::InteractionCapture,
@@ -865,6 +875,9 @@ mod tests {
         assert_eq!(result.structured, json!({"ok":true}));
         assert_eq!(result.evidence.len(), 1);
         assert_eq!(result.evidence[0].handle, "proof");
+        // Capture runs on the handle's background queue; drain before
+        // asserting the row landed.
+        db.drain_captures().await;
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
                 "SELECT COUNT(*) FROM read_log_calls WHERE tool = 'wrapper_rich'"

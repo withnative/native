@@ -284,3 +284,58 @@ identifiable, and the extraction removes a production duplication or makes an
 important decision independently testable. Measure warm test execution
 separately from cold compile/link time, and do not delete boundary coverage
 until the replacement proves at least the same contract.
+
+## Query-performance regression bounds
+
+Test parameter growth, statement growth, and execution cost separately. A
+single detector cannot establish all three:
+
+- **Parameters:** run the affected path with a deliberate per-connection SQLite
+  variable limit and a larger input set. Count every parameter in the statement,
+  including credentials and other filters. Several `IN` clauses in one statement
+  still share one limit. For SQLite set membership, `json_each(?)` can carry a
+  text set in one bind without splitting global ordering or aggregation across
+  statements. The serialized set still consumes memory and is subject to
+  `SQLITE_LIMIT_LENGTH`; an oversized value can fail before any statement runs.
+  Restore any lowered variable limit explicitly before reusing a connection:
+  the pool sanitizer restores the value-length limit, not the variable limit.
+- **Statements:** compare small and larger corpora using the test-only
+  `query::test_sqlite::SqliteTrace`. It measures executed statements and the
+  largest parameter index on one physical connection (SQLite's variable-limit
+  metric, including gaps such as `?100`). Install it on every
+  connection used by a pooled test, or run the operation on the observed
+  connection. For a pool-wide measurement, hold all connections simultaneously
+  before installing, resetting, or finishing their traces, and match each trace
+  to its original physical handle. A single-connection measurement should finish
+  before returning that connection to the pool. Use isolated fixtures and one
+  active trace per connection; another trace would replace it.
+  The pool sanitizer does not clear traces. Close the dedicated test pool after
+  an abandoned measurement instead of replacing its trace or reusing the pool.
+  Setup writes belong outside the measured read window. Total executions include
+  SQLite trigger and virtual-table substatements; `internal_statements` also
+  reports the callbacks SQLite marks with `--`. FTS performs internal work per
+  matched row, so a batching regression may compare total minus internal
+  statements while reporting both. This marker is not a SQL parser: do not use
+  leading `--` comments on application SQL in such a measurement.
+  Pool release sanitizers are included. In scan's fixture they contribute a
+  fixed five-statement startup cost and a 20-bind floor, below the tested
+  400-id batch ceiling; releases during scan remain part of its measured work.
+- **Execution cost:** constant statement count still permits scans, large
+  materializations, and expensive in-memory authorization. Use representative
+  data to inspect rows, query plans, CPU and memory. Record measurements with
+  their corpus, build profile and revision; do not infer production latency from
+  statement counts or gate CI on a wall-clock threshold.
+
+Choose a growth bound that matches the algorithm. The preloaded authorization
+fold has five set loads and should retain a constant statement count. A caller
+that intentionally processes batches should allow fixed overhead plus a stated
+number of statements per batch. Exercise batch boundaries as well as a large
+input, and assert result visibility and ordering alongside the resource bound.
+Hidden related records, cross-scope relations, duplicate links and archived
+records are correctness cases, not permission to relax the bound.
+
+The trace callback runs only when a statement executes. It cannot observe a
+statement rejected during preparation for too many variables; the deliberate
+SQLite limit and successful completion assertion provide that proof. A scalar
+baseline that fails under the same limit establishes that the fixture actually
+detects the original bug.

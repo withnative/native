@@ -32,7 +32,7 @@ async fn call(registry: &ToolRegistry, db: &Db, tool: &str, args: Value) -> Valu
                 .unwrap_or("test:local"),
         )
     };
-    registry
+    let result = registry
         .call(
             db.clone(),
             caller,
@@ -40,7 +40,9 @@ async fn call(registry: &ToolRegistry, db: &Db, tool: &str, args: Value) -> Valu
             crate::common::with_test_reason(tool, args),
         )
         .await
-        .unwrap()
+        .unwrap();
+    db.drain_captures_for_tests().await;
+    result
 }
 
 async fn call_err(registry: &ToolRegistry, db: &Db, tool: &str, args: Value) -> String {
@@ -49,7 +51,7 @@ async fn call_err(registry: &ToolRegistry, db: &Db, tool: &str, args: Value) -> 
             .and_then(Value::as_str)
             .unwrap_or("test:local"),
     );
-    registry
+    let error = registry
         .call(
             db.clone(),
             caller,
@@ -58,7 +60,9 @@ async fn call_err(registry: &ToolRegistry, db: &Db, tool: &str, args: Value) -> 
         )
         .await
         .unwrap_err()
-        .to_string()
+        .to_string();
+    db.drain_captures_for_tests().await;
+    error
 }
 
 async fn create(registry: &ToolRegistry, db: &Db, args: Value) -> String {
@@ -94,6 +98,35 @@ async fn link(registry: &ToolRegistry, db: &Db, source: &str, rel: &str, target:
         json!({ "action": "add", "source_id": source, "target_id": target, "relationship": rel }),
     )
     .await;
+}
+
+/// Minting as an authenticated (non-local) caller requires the caller's own
+/// portable account binding; the intent suite keeps the same fixture for its
+/// account. Without this, `create_record` refuses with "caller has no
+/// portable account binding".
+async fn ensure_account_binding(db: &Db, account: &str, person_id: &str) {
+    let pool = crate::common::fixture_write_pool(db).await;
+    sqlx::query(
+        "INSERT OR IGNORE INTO records
+            (id, type, kind, name, home_id, policy_anchor_id, persistence)
+         VALUES (?, 'Entity', 'person', 'Test account', ?, ?, 'enduring')",
+    )
+    .bind(person_id)
+    .bind(native_ce::schema::UNFILED_RECORD_ID)
+    .bind(native_ce::schema::ROOT_RECORD_ID)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT OR IGNORE INTO bindings
+            (record_id, system, identifier, is_canonical)
+         VALUES (?, 'account', ?, 1)",
+    )
+    .bind(person_id)
+    .bind(account)
+    .execute(&pool)
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
@@ -182,8 +215,10 @@ async fn claim_ownership_requires_the_exact_account_and_full_run_pair() {
         .await
         .unwrap_err()
         .to_string();
-    assert!(same_account_other_run.contains("is already claimed — release it first"));
-    assert!(!same_account_other_run.contains("scout"));
+    assert!(same_account_other_run.contains("is already claimed by run"));
+    assert!(same_account_other_run.contains(first_run));
+    assert!(same_account_other_run.contains("holder_tier="));
+    assert!(same_account_other_run.contains("expected_holder_run_key"));
 
     let same_run_other_account = registry
         .call(
@@ -236,7 +271,8 @@ async fn claim_ownership_requires_the_exact_account_and_full_run_pair() {
         .await
         .unwrap_err()
         .to_string();
-    assert!(stale_release.contains("claimed by another caller"));
+    assert!(stale_release.contains("expected_holder_run_key"));
+    assert!(stale_release.contains(second_run));
     let current: Option<String> = sqlx::query_scalar(
         "SELECT claimed_run_key FROM records WHERE id = ? AND claimed_by_account = 'account:a'",
     )
@@ -245,6 +281,36 @@ async fn claim_ownership_requires_the_exact_account_and_full_run_pair() {
     .await
     .unwrap();
     assert_eq!(current.as_deref(), Some(second_run));
+
+    // Same-principal compare-and-release: the stale run takes the claim back
+    // by naming the current holder.
+    let recovered = registry
+        .call(
+            db.clone(),
+            Caller::authenticated("account:a"),
+            "start_work",
+            json!({
+                "record_id": id,
+                "action": "release",
+                "run_key": first_run,
+                "expected_holder_run_key": second_run,
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(recovered["claimed"], false);
+    let payload: Value = sqlx::query_scalar(
+        "SELECT payload FROM content_events WHERE record_id = ? AND type = 'record.updated' \
+         ORDER BY seq DESC LIMIT 1",
+    )
+    .bind(&id)
+    .fetch_one(db.pool())
+    .await
+    .map(|raw: String| serde_json::from_str(&raw).unwrap())
+    .unwrap();
+    assert_eq!(payload["claimed_by_account"], Value::Null);
+    assert_eq!(payload["claimed_run_key"], Value::Null);
+    assert_eq!(payload["released_from_run_key"], second_run);
     db.close().await;
 }
 
@@ -308,6 +374,74 @@ async fn ordinary_reads_and_query_sql_do_not_expose_claim_credentials() {
     let rendered = serde_json::to_string(&history).unwrap();
     assert!(!rendered.contains("account:private"));
     assert!(!rendered.contains(run_key));
+
+    // A same-account compare-and-release from a second run must not leak
+    // either run key to another principal through history surfaces.
+    let second_run = "scout-chair-b748b2";
+    registry
+        .call(
+            db.clone(),
+            Caller::authenticated("account:private"),
+            "start_work",
+            json!({
+                "record_id": id,
+                "action": "release",
+                "run_key": second_run,
+                "expected_holder_run_key": run_key,
+            }),
+        )
+        .await
+        .unwrap();
+    let release_event_id: String = sqlx::query_scalar(
+        "SELECT id FROM content_events WHERE record_id = ? AND type = 'record.updated' \
+         ORDER BY seq DESC LIMIT 1",
+    )
+    .bind(&id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+
+    let released_history = registry
+        .call(
+            db.clone(),
+            Caller::authenticated("account:viewer"),
+            "get_history",
+            json!({ "record_id": id.clone(), "detail": "full" }),
+        )
+        .await
+        .unwrap();
+    let rendered = serde_json::to_string(&released_history).unwrap();
+    assert!(!rendered.contains("account:private"));
+    assert!(!rendered.contains(run_key));
+    assert!(!rendered.contains(second_run));
+
+    let event_context = registry
+        .call(
+            db.clone(),
+            Caller::authenticated("account:viewer"),
+            "get_event_context",
+            json!({ "event_id": release_event_id }),
+        )
+        .await
+        .unwrap();
+    let rendered = serde_json::to_string(&event_context).unwrap();
+    assert!(!rendered.contains("account:private"));
+    assert!(!rendered.contains(run_key));
+    assert!(!rendered.contains(second_run));
+
+    let changes = registry
+        .call(
+            db.clone(),
+            Caller::authenticated("account:viewer"),
+            "whats_changed",
+            json!({}),
+        )
+        .await
+        .unwrap();
+    let rendered = serde_json::to_string(&changes).unwrap();
+    assert!(!rendered.contains("account:private"));
+    assert!(!rendered.contains(run_key));
+    assert!(!rendered.contains(second_run));
 
     let query = registry
         .call(
@@ -751,6 +885,58 @@ async fn preview_inspects_without_claiming() {
 }
 
 #[tokio::test]
+async fn same_account_preview_sees_holder_run_state_tier_and_top_level_fields() {
+    let db = db().await;
+    let registry = registry();
+    let id = task(&registry, &db, "Same account visibility", "in_progress").await;
+    let holder_run = "scout-chair-a748b2";
+    let other_run = "scout-chair-b748b2";
+    registry
+        .call(
+            db.clone(),
+            Caller::authenticated("account:holder"),
+            "set_intent",
+            json!({ "intent": "Hold the claim.", "run_key": holder_run }),
+        )
+        .await
+        .unwrap();
+    registry
+        .call(
+            db.clone(),
+            Caller::authenticated("account:holder"),
+            "start_work",
+            json!({ "record_id": id, "run_key": holder_run }),
+        )
+        .await
+        .unwrap();
+    let preview = registry
+        .call(
+            db.clone(),
+            Caller::authenticated("account:holder"),
+            "start_work",
+            json!({ "record_id": id, "action": "preview", "run_key": other_run }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(preview["claimed"], true);
+    assert_eq!(preview["held_by_account"], "account:holder");
+    assert_eq!(preview["held_by_run_key"], holder_run);
+    assert!(preview["held_by"].is_string());
+    assert!(preview["claimed_at"].is_string());
+    assert_eq!(preview["work_state"]["claim_status"], "current");
+    assert_eq!(preview["work_state"]["details"]["visibility"], "visible");
+    assert_eq!(preview["work_state"]["target"]["visibility"], "visible");
+    assert_eq!(preview["work_state"]["target"]["account"], "account:holder");
+    assert_eq!(preview["work_state"]["target"]["run_key"], holder_run);
+    assert_eq!(
+        preview["work_state"]["target"]["holder_tier"],
+        "another_run_of_this_agent"
+    );
+    assert!(preview["work_state"]["target"]["run_state"].is_string());
+    db.close().await;
+}
+
+#[tokio::test]
 async fn work_state_discloses_claim_and_run_targets_only_to_the_exact_holder() {
     let db = db().await;
     let registry = registry();
@@ -931,6 +1117,1014 @@ async fn withheld_work_state_does_not_disclose_run_lifecycle() {
         .unwrap();
     assert!(open["work_state"].get("claim_status").is_none());
     assert!(open["work_state"].get("stale_reason").is_none());
+}
+
+// ---------------------------------------------------------------------------
+// work_overlap
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn work_overlap_discloses_full_detail_for_the_same_accounts_other_run_on_parent_and_sibling()
+{
+    let db = db().await;
+    let registry = registry();
+
+    let parent = task(&registry, &db, "Parent container", "in_progress").await;
+    let target = task(&registry, &db, "Target", "in_progress").await;
+    link(&registry, &db, &target, "part_of", &parent).await;
+    let sibling = task(&registry, &db, "Sibling", "in_progress").await;
+    link(&registry, &db, &sibling, "part_of", &parent).await;
+
+    let holder_run = "scout-chair-a748b2";
+    let holder = Caller::authenticated("account:a");
+    registry
+        .call(
+            db.clone(),
+            holder.clone(),
+            "set_intent",
+            json!({ "intent": "Coordinate the parent rollout.", "run_key": holder_run }),
+        )
+        .await
+        .unwrap();
+    registry
+        .call(
+            db.clone(),
+            holder.clone(),
+            "start_work",
+            json!({ "record_id": parent, "run_key": holder_run }),
+        )
+        .await
+        .unwrap();
+    registry
+        .call(
+            db.clone(),
+            holder.clone(),
+            "start_work",
+            json!({ "record_id": sibling, "run_key": holder_run }),
+        )
+        .await
+        .unwrap();
+
+    // A different run of the SAME agent key ("scout-chair"), same account.
+    let caller_run = "scout-chair-z748b2";
+    let out = registry
+        .call(
+            db.clone(),
+            Caller::authenticated("account:a"),
+            "start_work",
+            json!({ "record_id": target, "run_key": caller_run }),
+        )
+        .await
+        .unwrap();
+
+    let items = out["work_overlap"]["items"].as_array().unwrap();
+    assert_eq!(out["work_overlap"]["total_count"], items.len());
+    assert_eq!(out["work_overlap"]["truncated"], false);
+    assert_eq!(items.len(), 2, "{items:#?}");
+    assert!(
+        items.iter().all(|item| item["record_id"] != target),
+        "the caller's own fresh claim must never appear as an overlap: {items:#?}"
+    );
+
+    let by_id = |id: &str| {
+        items
+            .iter()
+            .find(|item| item["record_id"] == id)
+            .unwrap_or_else(|| panic!("{id} missing from {items:#?}"))
+    };
+    let parent_item = by_id(&parent);
+    assert_eq!(parent_item["relation"], "parent");
+    assert_eq!(parent_item["holder_tier"], "another_run_of_this_agent");
+    assert_eq!(parent_item["run_state"], "open");
+    assert_eq!(parent_item["run_key"], holder_run);
+    assert_eq!(parent_item["intent"], "Coordinate the parent rollout.");
+    assert!(parent_item["claimed_at"]
+        .as_str()
+        .is_some_and(|at| !at.is_empty()));
+
+    let sibling_item = by_id(&sibling);
+    assert_eq!(sibling_item["relation"], "sibling");
+    assert_eq!(sibling_item["holder_tier"], "another_run_of_this_agent");
+    assert_eq!(sibling_item["run_state"], "open");
+    assert_eq!(sibling_item["run_key"], holder_run);
+    assert_eq!(sibling_item["intent"], "Coordinate the parent rollout.");
+
+    let rendered = native_ce::mcp::render::render("start_work", &out).unwrap();
+    assert!(rendered.contains("Work overlap (2)"), "{rendered}");
+    assert!(rendered.contains(&parent), "{rendered}");
+    assert!(rendered.contains(&sibling), "{rendered}");
+    assert!(
+        rendered.contains("Coordinate the parent rollout."),
+        "{rendered}"
+    );
+
+    // The notice is claim-only: a preview of the same target never carries it.
+    let preview = registry
+        .call(
+            db.clone(),
+            Caller::authenticated("account:a"),
+            "start_work",
+            json!({ "record_id": target, "action": "preview", "run_key": caller_run }),
+        )
+        .await
+        .unwrap();
+    assert!(preview.get("work_overlap").is_none());
+}
+
+#[tokio::test]
+async fn work_overlap_limits_another_principal_to_existence_and_relation() {
+    let db = db().await;
+    let registry = registry();
+
+    let target = task(&registry, &db, "Target", "in_progress").await;
+    let child = task(&registry, &db, "Child", "in_progress").await;
+    link(&registry, &db, &child, "part_of", &target).await;
+
+    registry
+        .call(
+            db.clone(),
+            Caller::authenticated("account:other"),
+            "start_work",
+            json!({ "record_id": child, "run_key": "pilot-river-b748b2" }),
+        )
+        .await
+        .unwrap();
+
+    let out = registry
+        .call(
+            db.clone(),
+            Caller::authenticated("account:a"),
+            "start_work",
+            json!({ "record_id": target, "run_key": "scout-chair-a748b2" }),
+        )
+        .await
+        .unwrap();
+
+    let items = out["work_overlap"]["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    let item = &items[0];
+    assert_eq!(item["record_id"], child);
+    assert_eq!(item["relation"], "child");
+    assert_eq!(item["holder_tier"], "another_principal");
+    let mut keys: Vec<&str> = item
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort();
+    assert_eq!(
+        keys,
+        vec!["holder_tier", "record_id", "relation"],
+        "another_principal must leak nothing beyond existence and relation: {item:#?}"
+    );
+
+    let rendered = native_ce::mcp::render::render("start_work", &out).unwrap();
+    assert!(!rendered.contains("account:other"), "{rendered}");
+    assert!(!rendered.contains("pilot-river-b748b2"), "{rendered}");
+}
+
+#[tokio::test]
+async fn work_overlap_reports_closed_run_state_for_a_stale_same_account_holder() {
+    let db = db().await;
+    let registry = registry();
+
+    let target = task(&registry, &db, "Target", "in_progress").await;
+    let child = task(&registry, &db, "Child", "in_progress").await;
+    link(&registry, &db, &child, "part_of", &target).await;
+
+    let stale_run = "scout-chair-a748b2";
+    registry
+        .call(
+            db.clone(),
+            Caller::authenticated("account:a"),
+            "set_intent",
+            json!({ "intent": "Finish this before it goes stale.", "run_key": stale_run }),
+        )
+        .await
+        .unwrap();
+    registry
+        .call(
+            db.clone(),
+            Caller::authenticated("account:a"),
+            "start_work",
+            json!({ "record_id": child, "run_key": stale_run }),
+        )
+        .await
+        .unwrap();
+    registry
+        .call(
+            db.clone(),
+            Caller::authenticated("account:a"),
+            "close_run",
+            json!({ "run_key": stale_run }),
+        )
+        .await
+        .unwrap();
+
+    let out = registry
+        .call(
+            db.clone(),
+            Caller::authenticated("account:a"),
+            "start_work",
+            json!({ "record_id": target, "run_key": "scout-chair-z748b2" }),
+        )
+        .await
+        .unwrap();
+
+    let items = out["work_overlap"]["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "{items:#?}");
+    assert_eq!(items[0]["record_id"], child);
+    assert_eq!(items[0]["relation"], "child");
+    assert_eq!(items[0]["holder_tier"], "another_run_of_this_agent");
+    assert_eq!(items[0]["run_state"], "closed");
+    assert_eq!(items[0]["run_key"], stale_run);
+}
+
+#[tokio::test]
+async fn work_overlap_caps_sibling_candidates_at_fifty_and_flags_truncation() {
+    let db = db().await;
+    let registry = registry();
+
+    let parent = task(&registry, &db, "Big parent", "in_progress").await;
+    let target = task(&registry, &db, "Target", "in_progress").await;
+    link(&registry, &db, &target, "part_of", &parent).await;
+
+    let holder_run = "scout-chair-a748b2";
+    for n in 0..51 {
+        let sibling = task(&registry, &db, &format!("Sibling {n}"), "in_progress").await;
+        link(&registry, &db, &sibling, "part_of", &parent).await;
+        registry
+            .call(
+                db.clone(),
+                Caller::authenticated("account:a"),
+                "start_work",
+                json!({ "record_id": sibling, "run_key": holder_run }),
+            )
+            .await
+            .unwrap();
+    }
+
+    let out = registry
+        .call(
+            db.clone(),
+            Caller::authenticated("account:a"),
+            "start_work",
+            json!({ "record_id": target, "run_key": "scout-chair-z748b2" }),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(out["work_overlap"]["total_count"], 51);
+    assert_eq!(out["work_overlap"]["truncated"], true);
+    let items = out["work_overlap"]["items"].as_array().unwrap();
+    assert_eq!(
+        items.len(),
+        50,
+        "the cap bounds the DISPLAYED items, not the visible claimed count"
+    );
+    assert!(items
+        .iter()
+        .all(|item| item["relation"] == "sibling"
+            && item["holder_tier"] == "another_run_of_this_agent"));
+}
+
+#[tokio::test]
+async fn work_overlap_ignores_unclaimed_siblings_entirely() {
+    let db = db().await;
+    let registry = registry();
+
+    let parent = task(&registry, &db, "Big parent", "in_progress").await;
+    let target = task(&registry, &db, "Target", "in_progress").await;
+    link(&registry, &db, &target, "part_of", &parent).await;
+
+    // 50 siblings that are never claimed — they must never become candidates
+    // at all, since the neighbourhood SQL itself is restricted to claimed
+    // records from the start.
+    for n in 0..50 {
+        let sibling = task(&registry, &db, &format!("Idle sibling {n}"), "in_progress").await;
+        link(&registry, &db, &sibling, "part_of", &parent).await;
+    }
+    // A 51st sibling that IS claimed and visible.
+    let claimed_sibling = task(&registry, &db, "Claimed sibling", "in_progress").await;
+    link(&registry, &db, &claimed_sibling, "part_of", &parent).await;
+    registry
+        .call(
+            db.clone(),
+            Caller::authenticated("account:a"),
+            "start_work",
+            json!({ "record_id": claimed_sibling, "run_key": "scout-chair-a748b2" }),
+        )
+        .await
+        .unwrap();
+
+    let out = registry
+        .call(
+            db.clone(),
+            Caller::authenticated("account:a"),
+            "start_work",
+            json!({ "record_id": target, "run_key": "scout-chair-z748b2" }),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(out["work_overlap"]["total_count"], 1);
+    assert_eq!(out["work_overlap"]["truncated"], false);
+    let items = out["work_overlap"]["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "{items:#?}");
+    assert_eq!(items[0]["record_id"], claimed_sibling);
+}
+
+#[tokio::test]
+async fn work_overlap_never_lets_an_invisible_sibling_move_truncated_or_total_count() {
+    let db = db().await;
+    let registry = registry();
+
+    let parent = task(&registry, &db, "Parent", "in_progress").await;
+    let target = task(&registry, &db, "Target", "in_progress").await;
+    link(&registry, &db, &target, "part_of", &parent).await;
+
+    let visible_sibling = task(&registry, &db, "Visible sibling", "in_progress").await;
+    link(&registry, &db, &visible_sibling, "part_of", &parent).await;
+    registry
+        .call(
+            db.clone(),
+            Caller::authenticated("account:a"),
+            "start_work",
+            json!({ "record_id": visible_sibling, "run_key": "scout-chair-a748b2" }),
+        )
+        .await
+        .unwrap();
+
+    // A second sibling, claimed by a different account, whose explicit
+    // policy admits only its own claimant — never account:a.
+    let hidden_sibling = task(&registry, &db, "Hidden sibling", "in_progress").await;
+    link(&registry, &db, &hidden_sibling, "part_of", &parent).await;
+    native_ce::authorization::replace_explicit_policy(
+        &db,
+        "test:policy",
+        &hidden_sibling,
+        vec![native_ce::authorization::AllowEntry::account(
+            "account:other",
+            native_ce::authorization::Capability::Edit,
+        )],
+    )
+    .await
+    .unwrap();
+    registry
+        .call(
+            db.clone(),
+            Caller::authenticated("account:other"),
+            "start_work",
+            json!({ "record_id": hidden_sibling, "run_key": "pilot-river-b748b2" }),
+        )
+        .await
+        .unwrap();
+
+    let out = registry
+        .call(
+            db.clone(),
+            Caller::authenticated("account:a"),
+            "start_work",
+            json!({ "record_id": target, "run_key": "scout-chair-z748b2" }),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        out["work_overlap"]["total_count"], 1,
+        "the admission-hidden sibling must not be counted at all"
+    );
+    assert_eq!(out["work_overlap"]["truncated"], false);
+    let items = out["work_overlap"]["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "{items:#?}");
+    assert_eq!(items[0]["record_id"], visible_sibling);
+}
+
+#[tokio::test]
+async fn work_overlap_prefers_sibling_over_child_in_a_diamond() {
+    let db = db().await;
+    let registry = registry();
+
+    // T part_of P; C part_of T AND C part_of P — a diamond where C is both a
+    // Sibling of T (via P) and a Child of T (directly). Sibling must win.
+    let parent = task(&registry, &db, "Diamond parent", "in_progress").await;
+    let target = task(&registry, &db, "Diamond target", "in_progress").await;
+    link(&registry, &db, &target, "part_of", &parent).await;
+    let corner = task(&registry, &db, "Diamond corner", "in_progress").await;
+    link(&registry, &db, &corner, "part_of", &target).await;
+    link(&registry, &db, &corner, "part_of", &parent).await;
+
+    registry
+        .call(
+            db.clone(),
+            Caller::authenticated("account:a"),
+            "start_work",
+            json!({ "record_id": corner, "run_key": "scout-chair-a748b2" }),
+        )
+        .await
+        .unwrap();
+
+    let out = registry
+        .call(
+            db.clone(),
+            Caller::authenticated("account:a"),
+            "start_work",
+            json!({ "record_id": target, "run_key": "scout-chair-z748b2" }),
+        )
+        .await
+        .unwrap();
+
+    let items = out["work_overlap"]["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "{items:#?}");
+    assert_eq!(items[0]["record_id"], corner);
+    assert_eq!(items[0]["relation"], "sibling", "{items:#?}");
+}
+
+#[tokio::test]
+async fn work_overlap_intent_is_scoped_to_the_holders_own_account() {
+    let db = db().await;
+    let registry = registry();
+
+    let target = task(&registry, &db, "Target", "in_progress").await;
+    let sibling = task(&registry, &db, "Sibling", "in_progress").await;
+    let parent = task(&registry, &db, "Parent", "in_progress").await;
+    link(&registry, &db, &target, "part_of", &parent).await;
+    link(&registry, &db, &sibling, "part_of", &parent).await;
+
+    // The run key is a hashtag: a different account can call set_intent under
+    // the exact same key string the real holder claims with. account:a
+    // claims FIRST, under a key with no agent_runs row yet (claim() only
+    // reads that table, it never creates a row) — so nothing here blocks
+    // account:b's later set_intent call under the identical key string from
+    // succeeding too, exactly the collision finding #5 describes.
+    let collided_run = "scout-chair-a748b2";
+    registry
+        .call(
+            db.clone(),
+            Caller::authenticated("account:a"),
+            "start_work",
+            json!({ "record_id": sibling, "run_key": collided_run }),
+        )
+        .await
+        .unwrap();
+    registry
+        .call(
+            db.clone(),
+            Caller::authenticated("account:b"),
+            "set_intent",
+            json!({ "intent": "B's rogue sentence.", "run_key": collided_run }),
+        )
+        .await
+        .unwrap();
+
+    let out = registry
+        .call(
+            db.clone(),
+            Caller::authenticated("account:a"),
+            "start_work",
+            json!({ "record_id": target, "run_key": "scout-chair-z748b2" }),
+        )
+        .await
+        .unwrap();
+
+    let items = out["work_overlap"]["items"].as_array().unwrap();
+    let item = items
+        .iter()
+        .find(|item| item["record_id"] == sibling)
+        .unwrap_or_else(|| panic!("sibling missing from {items:#?}"));
+    assert_ne!(
+        item.get("intent"),
+        Some(&Value::String("B's rogue sentence.".into())),
+        "account:b's declaration must never surface under account:a's holder tuple: {item:#?}"
+    );
+    assert!(item.get("intent").is_none(), "{item:#?}");
+
+    let rendered = native_ce::mcp::render::render("start_work", &out).unwrap();
+    assert!(!rendered.contains("B's rogue sentence."), "{rendered}");
+}
+
+#[tokio::test]
+async fn work_overlap_never_labels_a_keyless_neighbour_this_run() {
+    let db = db().await;
+    let registry = registry();
+
+    let target = task(&registry, &db, "Target", "in_progress").await;
+    let sibling = task(&registry, &db, "Sibling", "in_progress").await;
+    let parent = task(&registry, &db, "Parent", "in_progress").await;
+    link(&registry, &db, &target, "part_of", &parent).await;
+    link(&registry, &db, &sibling, "part_of", &parent).await;
+
+    // Same account, no run key on either side — the engine cannot tell two
+    // keyless sessions apart, so this must never read as this_run.
+    registry
+        .call(
+            db.clone(),
+            Caller::authenticated("account:a"),
+            "start_work",
+            json!({ "record_id": sibling }),
+        )
+        .await
+        .unwrap();
+
+    let out = registry
+        .call(
+            db.clone(),
+            Caller::authenticated("account:a"),
+            "start_work",
+            json!({ "record_id": target }),
+        )
+        .await
+        .unwrap();
+
+    let items = out["work_overlap"]["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "{items:#?}");
+    assert_eq!(items[0]["record_id"], sibling);
+    assert_eq!(items[0]["holder_tier"], "another_agent_of_yours");
+    assert_eq!(items[0]["run_state"], "not_applicable");
+    assert!(items[0].get("run_key").is_none());
+    assert!(items[0]["claimed_at"]
+        .as_str()
+        .is_some_and(|at| !at.is_empty()));
+}
+
+#[tokio::test]
+async fn claim_with_no_neighbours_carries_no_work_overlap_key() {
+    let db = db().await;
+    let registry = registry();
+    let id = task(&registry, &db, "Solo", "in_progress").await;
+
+    let out = call(
+        &registry,
+        &db,
+        "start_work",
+        json!({ "record_id": id, "agent_id": "agent:solo" }),
+    )
+    .await;
+    assert!(
+        out.as_object().unwrap().get("work_overlap").is_none(),
+        "{out:#?}"
+    );
+
+    let rendered = native_ce::mcp::render::render("start_work", &out).unwrap();
+    assert!(!rendered.contains("Work overlap"), "{rendered}");
+}
+
+// ---------------------------------------------------------------------------
+// create_record work_overlap
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn create_record_overlap_names_a_claimed_sibling_at_create_time() {
+    let db = db().await;
+    let registry = registry();
+    ensure_account_binding(&db, "account:a", "test:account-a-person").await;
+
+    let parent = task(&registry, &db, "Parent container", "in_progress").await;
+    let sibling = task(&registry, &db, "Sibling", "in_progress").await;
+    link(&registry, &db, &sibling, "part_of", &parent).await;
+
+    let holder_run = "scout-chair-a748b2";
+    let holder = Caller::authenticated("account:a");
+    registry
+        .call(
+            db.clone(),
+            holder.clone(),
+            "set_intent",
+            json!({ "intent": "Coordinate the parent rollout.", "run_key": holder_run }),
+        )
+        .await
+        .unwrap();
+    registry
+        .call(
+            db.clone(),
+            holder,
+            "start_work",
+            json!({ "record_id": sibling, "run_key": holder_run }),
+        )
+        .await
+        .unwrap();
+
+    // A different run of the SAME agent key ("scout-chair"), same account,
+    // creates the new child with its part_of link inline.
+    let caller_run = "scout-chair-z748b2";
+    let fresh = json!({
+        "type": "WorkItem",
+        "kind": "task",
+        "name": "Fresh child",
+        "lifecycle": "in_progress",
+        "links": [{ "target_id": parent, "relationship": "part_of" }],
+        "run_key": caller_run,
+    });
+    let out = registry
+        .call(
+            db.clone(),
+            Caller::authenticated("account:a"),
+            "create_record",
+            crate::common::with_test_reason("create_record", fresh),
+        )
+        .await
+        .unwrap();
+
+    let new_id = out["id"].as_str().unwrap().to_string();
+    let items = out["work_overlap"]["items"].as_array().unwrap();
+    assert_eq!(out["work_overlap"]["total_count"], items.len());
+    assert_eq!(out["work_overlap"]["truncated"], false);
+    assert_eq!(items.len(), 1, "{items:#?}");
+    assert_eq!(items[0]["record_id"], sibling);
+    assert_eq!(items[0]["relation"], "sibling");
+    assert_eq!(items[0]["holder_tier"], "another_run_of_this_agent");
+    assert_eq!(items[0]["run_state"], "open");
+    assert_eq!(items[0]["run_key"], holder_run);
+    assert_eq!(items[0]["intent"], "Coordinate the parent rollout.");
+    assert!(
+        items[0]["claimed_at"]
+            .as_str()
+            .is_some_and(|at| !at.is_empty()),
+        "{items:#?}"
+    );
+    assert!(
+        items.iter().all(|item| item["record_id"] != new_id),
+        "the unclaimed new record must never appear as its own overlap: {items:#?}"
+    );
+
+    let rendered = native_ce::mcp::render::render("create_record", &out).unwrap();
+    assert!(rendered.contains("Work overlap (1)"), "{rendered}");
+    assert!(rendered.contains(&sibling), "{rendered}");
+    assert!(
+        rendered.contains("Coordinate the parent rollout."),
+        "{rendered}"
+    );
+}
+
+#[tokio::test]
+async fn create_record_overlap_replay_carries_no_key_and_keeps_the_receipt() {
+    let db = db().await;
+    let registry = registry();
+    ensure_account_binding(&db, "account:a", "test:account-a-person").await;
+
+    let parent = task(&registry, &db, "Parent container", "in_progress").await;
+    let sibling = task(&registry, &db, "Sibling", "in_progress").await;
+    link(&registry, &db, &sibling, "part_of", &parent).await;
+
+    let holder_run = "scout-chair-a748b2";
+    registry
+        .call(
+            db.clone(),
+            Caller::authenticated("account:a"),
+            "start_work",
+            json!({ "record_id": sibling, "run_key": holder_run }),
+        )
+        .await
+        .unwrap();
+
+    let keyed = || {
+        crate::common::with_test_reason(
+            "create_record",
+            json!({
+                "type": "WorkItem",
+                "kind": "task",
+                "name": "Keyed child",
+                "lifecycle": "in_progress",
+                "links": [{ "target_id": parent, "relationship": "part_of" }],
+                "idempotency_key": "create-overlap-key-1",
+                "run_key": "scout-chair-z748b2",
+            }),
+        )
+    };
+    let first = registry
+        .call(
+            db.clone(),
+            Caller::authenticated("account:a"),
+            "create_record",
+            keyed(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        first.get("work_overlap").is_some(),
+        "the fresh create names the claimed sibling: {first:#?}"
+    );
+
+    let retry = registry
+        .call(
+            db.clone(),
+            Caller::authenticated("account:a"),
+            "create_record",
+            keyed(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        retry.as_object().unwrap().get("work_overlap").is_none(),
+        "an idempotent replay must not carry the advisory: {retry:#?}"
+    );
+    let mut expected = first.clone();
+    expected.as_object_mut().unwrap().remove("work_overlap");
+    // `run_context` is live per-call wrapper echo, not part of the pinned
+    // receipt: the replay may carry a fresh run-key displacement note.
+    expected.as_object_mut().unwrap().remove("run_context");
+    let mut replay_body = retry.clone();
+    replay_body.as_object_mut().unwrap().remove("run_context");
+    assert_eq!(
+        replay_body, expected,
+        "the replayed receipt is otherwise identical to the fresh one"
+    );
+    assert_eq!(retry["id"], first["id"]);
+    assert_eq!(retry["body_digest"], first["body_digest"]);
+    assert_eq!(
+        retry["action_attestation_ids"],
+        first["action_attestation_ids"]
+    );
+}
+
+#[tokio::test]
+async fn create_record_without_overlap_keeps_every_other_create_byte_identical() {
+    let db = db().await;
+    let registry = registry();
+    ensure_account_binding(&db, "account:a", "test:account-a-person").await;
+
+    let document = registry
+        .call(
+            db.clone(),
+            Caller::authenticated("account:a"),
+            "create_record",
+            crate::common::with_test_reason(
+                "create_record",
+                json!({
+                    "type": "Document",
+                    "kind": "note",
+                    "name": "Plain document",
+                    "run_key": "scout-chair-a748b2",
+                }),
+            ),
+        )
+        .await
+        .unwrap();
+    assert!(
+        document.as_object().unwrap().get("work_overlap").is_none(),
+        "{document:#?}"
+    );
+
+    let lone_task = registry
+        .call(
+            db.clone(),
+            Caller::authenticated("account:a"),
+            "create_record",
+            crate::common::with_test_reason(
+                "create_record",
+                json!({
+                    "type": "WorkItem",
+                    "kind": "task",
+                    "name": "Linkless task",
+                    "lifecycle": "in_progress",
+                    "run_key": "scout-chair-a748b2",
+                }),
+            ),
+        )
+        .await
+        .unwrap();
+    assert!(
+        lone_task.as_object().unwrap().get("work_overlap").is_none(),
+        "{lone_task:#?}"
+    );
+
+    for out in [&document, &lone_task] {
+        let rendered = native_ce::mcp::render::render("create_record", out).unwrap();
+        assert!(!rendered.contains("Work overlap"), "{rendered}");
+        assert!(
+            !rendered.contains("work_overlap"),
+            "the advisory must never leak as a raw receipt key: {rendered}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn overlap_notices_persist_only_their_safe_emission_annotations() {
+    let db = db().await;
+    let registry = registry();
+    ensure_account_binding(&db, "account:a", "test:account-a-emission-person").await;
+
+    let parent = task(&registry, &db, "Emission parent", "in_progress").await;
+    let sibling = task(&registry, &db, "Emission sibling", "in_progress").await;
+    let target = task(&registry, &db, "Emission target", "in_progress").await;
+    link(&registry, &db, &sibling, "part_of", &parent).await;
+    link(&registry, &db, &target, "part_of", &parent).await;
+
+    let holder = Caller::authenticated("account:a");
+    registry
+        .call(
+            db.clone(),
+            holder,
+            "start_work",
+            json!({ "record_id": sibling, "run_key": "scout-chair-a748b2" }),
+        )
+        .await
+        .unwrap();
+
+    let caller = Caller::authenticated("account:a");
+    // Establish the caller's run before it claims work. The initial briefing
+    // is intentionally overlap-free; the later declaration is the surface
+    // that must emit an evidence annotation after the claim exists.
+    let initial_intent = registry
+        .call(
+            db.clone(),
+            caller.clone(),
+            "set_intent",
+            json!({ "intent": "prepare an overlap measurement", "run_key": "pilot-river-b748b2" }),
+        )
+        .await
+        .unwrap();
+    assert!(initial_intent["briefing"]["overlapping_claims"]["items"]
+        .as_array()
+        .is_some_and(Vec::is_empty));
+    let claim = registry
+        .call(
+            db.clone(),
+            caller.clone(),
+            "start_work",
+            json!({ "record_id": target, "action": "claim", "run_key": "pilot-river-b748b2" }),
+        )
+        .await
+        .unwrap();
+    assert!(claim.get("work_overlap").is_some());
+
+    let fresh_create = registry
+        .call(
+            db.clone(),
+            caller.clone(),
+            "create_record",
+            crate::common::with_test_reason(
+                "create_record",
+                json!({
+                    "type": "WorkItem",
+                    "kind": "task",
+                    "name": "Emission fresh create",
+                    "lifecycle": "in_progress",
+                    "links": [{ "target_id": parent, "relationship": "part_of" }],
+                    "run_key": "pilot-river-b748b2",
+                }),
+            ),
+        )
+        .await
+        .unwrap();
+    assert!(fresh_create.get("work_overlap").is_some());
+
+    // `set_intent` notices are based on its bounded briefing anchors. Touch a
+    // record that its existing response is authorized to disclose as claimed,
+    // then declare again to exercise this independent notice surface.
+    registry
+        .call(
+            db.clone(),
+            caller.clone(),
+            "get_record",
+            json!({ "ids": [sibling], "run_key": "pilot-river-b748b2" }),
+        )
+        .await
+        .unwrap();
+
+    let intent = registry
+        .call(
+            db.clone(),
+            caller.clone(),
+            "set_intent",
+            json!({ "intent": "measure a real disclosed overlap", "run_key": "pilot-river-b748b2" }),
+        )
+        .await
+        .unwrap();
+    assert!(intent["briefing"]["overlapping_claims"]["items"]
+        .as_array()
+        .is_some_and(|items| !items.is_empty()));
+
+    let replay_arguments = || {
+        crate::common::with_test_reason(
+            "create_record",
+            json!({
+                "type": "WorkItem",
+                "kind": "task",
+                "name": "Emission replay",
+                "lifecycle": "in_progress",
+                "links": [{ "target_id": parent, "relationship": "part_of" }],
+                "idempotency_key": "emission-overlap-replay",
+                "run_key": "pilot-river-b748b2",
+            }),
+        )
+    };
+    let first = registry
+        .call(
+            db.clone(),
+            caller.clone(),
+            "create_record",
+            replay_arguments(),
+        )
+        .await
+        .unwrap();
+    let replay = registry
+        .call(
+            db.clone(),
+            caller.clone(),
+            "create_record",
+            replay_arguments(),
+        )
+        .await
+        .unwrap();
+    assert!(first.get("work_overlap").is_some());
+    assert!(replay.get("work_overlap").is_none());
+
+    let preview = registry
+        .call(
+            db.clone(),
+            caller.clone(),
+            "start_work",
+            json!({ "record_id": target, "action": "preview", "run_key": "pilot-river-b748b2" }),
+        )
+        .await
+        .unwrap();
+    assert!(preview.get("work_overlap").is_none());
+    let quiet = registry
+        .call(
+            db.clone(),
+            Caller::authenticated("account:quiet"),
+            "set_intent",
+            json!({ "intent": "no overlaps here", "run_key": "scout-chair-z748b2" }),
+        )
+        .await
+        .unwrap();
+    assert!(quiet["briefing"]["overlapping_claims"]["items"]
+        .as_array()
+        .is_some_and(Vec::is_empty));
+
+    let annotation_rows: Vec<String> = sqlx::query_scalar(
+        "SELECT result_annotation FROM read_log_calls
+          WHERE result_annotation IS NOT NULL ORDER BY seq",
+    )
+    .fetch_all(db.pool())
+    .await
+    .unwrap();
+    let annotations = annotation_rows
+        .iter()
+        .map(|row| serde_json::from_str::<Value>(row).unwrap())
+        .collect::<Vec<_>>();
+    let surfaces = annotations
+        .iter()
+        .map(|annotation| annotation["surface"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(surfaces, ["claim", "create", "set_intent", "create"]);
+    for annotation in &annotations {
+        assert_eq!(annotation["kind"], "work_overlap_emission");
+        assert_eq!(annotation["version"], 1);
+        let object = annotation.as_object().unwrap();
+        assert_eq!(object.len(), 4);
+        assert!(object
+            .keys()
+            .all(|key| matches!(key.as_str(), "kind" | "version" | "surface" | "anchors")));
+        for anchor in annotation["anchors"].as_array().unwrap() {
+            let anchor = anchor.as_object().unwrap();
+            assert_eq!(anchor.len(), 5);
+            assert!(anchor.keys().all(|key| matches!(
+                key.as_str(),
+                "record_id"
+                    | "overlap_record_ids"
+                    | "overlap_item_count"
+                    | "overlap_total_count"
+                    | "truncated"
+            )));
+        }
+        let text = serde_json::to_string(annotation).unwrap();
+        for forbidden in [
+            "holder_tier",
+            "holder_identity",
+            "run_key",
+            "claimed_at",
+            "measure a real disclosed overlap",
+        ] {
+            assert!(
+                !text.contains(forbidden),
+                "annotation leaked {forbidden}: {text}"
+            );
+        }
+    }
+
+    let replay_annotations: Vec<Option<String>> = sqlx::query_scalar(
+        "SELECT result_annotation FROM read_log_calls
+          WHERE tool='create_record'
+            AND json_extract(arguments, '$.idempotency_key')='emission-overlap-replay'
+          ORDER BY seq",
+    )
+    .fetch_all(db.pool())
+    .await
+    .unwrap();
+    assert!(replay_annotations[0].is_some());
+    assert_eq!(replay_annotations[1], None);
+    let no_notice_annotations: Vec<Option<String>> = sqlx::query_scalar(
+        "SELECT result_annotation FROM read_log_calls
+          WHERE (tool='start_work' AND json_extract(arguments, '$.action')='preview')
+             OR (tool='set_intent' AND json_extract(arguments, '$.intent')='no overlaps here')",
+    )
+    .fetch_all(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(no_notice_annotations, vec![None, None]);
 }
 
 // ---------------------------------------------------------------------------

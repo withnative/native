@@ -421,9 +421,26 @@ pub fn agent_key_of(key: &str) -> &str {
 /// bounded search returns a key whenever a fresh agent identity exists; it never
 /// falls back to a previously observed agent key or a known full-key collision.
 pub async fn suggest(db: &Db) -> Result<String> {
+    suggest_in_pool(db.write_pool()).await
+}
+
+/// Pool-scoped collision read for callers that must not queue on the writer.
+/// Identical logic to [`suggest`]: two committed-state `DISTINCT` scans
+/// (`content_events`, then the disposable `read_log_calls`) with no
+/// same-transaction dependency — minting writes nothing, so the physically
+/// read-only pool observes the same evidence. Read-only handlers (notably
+/// `bootstrap`) use this to avoid serialising on the write pool.
+///
+/// Best-effort under eventual capture: a read-only run whose capture has not
+/// landed yet is invisible to the second scan, so a freshly used key can be
+/// re-minted in a narrow window. Permanent `content_events` use is still
+/// authoritative; the read-log tier only narrows the window for read-only
+/// runs. Closing it entirely would require a synchronous write on every
+/// ordinary call, which the response-path work explicitly refuses.
+pub async fn suggest_in_pool(pool: &sqlx::SqlitePool) -> Result<String> {
     let mut taken = HashSet::new();
     let rows = sqlx::query("SELECT DISTINCT run_key FROM content_events WHERE run_key IS NOT NULL")
-        .fetch_all(db.write_pool())
+        .fetch_all(pool)
         .await?;
     extend_taken(&mut taken, &rows);
 
@@ -432,7 +449,7 @@ pub async fn suggest(db: &Db) -> Result<String> {
     // checked above.
     if let Ok(rows) =
         sqlx::query("SELECT DISTINCT run_key FROM read_log_calls WHERE run_key IS NOT NULL")
-            .fetch_all(db.write_pool())
+            .fetch_all(pool)
             .await
     {
         extend_taken(&mut taken, &rows);
@@ -557,40 +574,108 @@ pub async fn intent_at(db: &Db, run_key: Option<&str>) -> Option<String> {
           ORDER BY seq DESC LIMIT 1",
     )
     .bind(run_key)
-    .fetch_optional(db.write_pool())
+    .fetch_optional(db.pool())
     .await
     .ok()
     .flatten()
     .and_then(|row| row.try_get::<Option<String>, _>("intent").ok().flatten())
 }
 
+/// Account-scoped variant of [`intent_at`] for callers who did not mint the
+/// key themselves and so cannot trust it to name the account they think it
+/// does. A run key is a hashtag, not a session token (module docs above): any
+/// account can call `set_intent` under any syntactically valid key, so
+/// resolving intent by `run_key` alone can hand one account's declared
+/// sentence to another merely because both used the same tag. Adding the
+/// `actor` predicate — the same column `record_call` stamps from
+/// `caller.actor()`, which is exactly `caller.credential()` — restricts
+/// fill-forward to declarations actually made by `actor`. Existing callers
+/// that already hold the key's own account (the caller resolving their own
+/// run) keep using [`intent_at`] unchanged; this variant is for resolving
+/// someone else's declared intent from a key they did not mint.
+pub async fn intent_at_for_actor(db: &Db, run_key: Option<&str>, actor: &str) -> Option<String> {
+    let run_key = run_key?;
+    sqlx::query(
+        "SELECT intent FROM read_log_calls
+          WHERE run_key = ? AND actor = ? AND tool = 'set_intent' AND outcome = 'ok'
+            AND intent IS NOT NULL
+          ORDER BY seq DESC LIMIT 1",
+    )
+    .bind(run_key)
+    .bind(actor)
+    .fetch_optional(db.pool())
+    .await
+    .ok()
+    .flatten()
+    .and_then(|row| row.try_get::<Option<String>, _>("intent").ok().flatten())
+}
+
+/// Newest `read_log_calls` rows the unseen-key advisory may consider, i.e. the
+/// rows with the highest `seq` values. The candidate scan reads at most this
+/// many rows no matter how large total history grows; anything older is
+/// silently out of recall.
+const DISPLACED_KEY_CANDIDATE_WINDOW: i64 = 1024;
+
 /// Advisory for a complete, never-seen key that may be a mistyped continuation
 /// of a recent run under the same authenticated account and exact agent key.
 /// Read-log absence is deliberately indistinguishable from "no advice".
+///
+/// Recall is bounded: only the newest [`DISPLACED_KEY_CANDIDATE_WINDOW`]
+/// (1024) `read_log_calls` rows by `seq` are candidates, and the actor,
+/// agent-key, excluded-key, 30-minute, grouping, and latest-ended/tie
+/// ordering filters all apply *after* that bound. A matching prior older
+/// than the window is an intentional false negative — advisory silence, never
+/// an authentication decision. The seen-key `EXISTS` check stays indexed
+/// across the full log, so a key observed anywhere (however old) still
+/// suppresses the note.
+///
+/// Best-effort under eventual capture: interaction capture leaves the response
+/// path on a bounded background queue, so a key used seconds ago may not have
+/// landed yet and can read as unseen. That transient lag is accepted — this is
+/// an advisory hint, never an authorization decision — and no synchronous write
+/// is added to ordinary calls to close it.
 pub async fn displaced_key_note(db: &Db, caller: &Caller) -> Option<String> {
+    displaced_key_note_in(db.pool(), caller, DISPLACED_KEY_CANDIDATE_WINDOW).await
+}
+
+/// Window-parameterized form of [`displaced_key_note`]. The production path
+/// always passes [`DISPLACED_KEY_CANDIDATE_WINDOW`]; the parameter exists so
+/// tests can prove the bound with a small window instead of thousands of
+/// fixture rows.
+async fn displaced_key_note_in(
+    pool: &sqlx::SqlitePool,
+    caller: &Caller,
+    candidate_window: i64,
+) -> Option<String> {
     let run_key = caller.run_key()?;
-    let seen: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM read_log_calls WHERE run_key = ?")
-        .bind(run_key)
-        .fetch_one(db.write_pool())
-        .await
-        .ok()?;
+    let seen: i64 =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM read_log_calls WHERE run_key = ?)")
+            .bind(run_key)
+            .fetch_one(pool)
+            .await
+            .ok()?;
     if seen != 0 {
         return None;
     }
     let agent_key = agent_key_of(run_key);
+    // The ORDER BY seq DESC ... LIMIT inner query is a flattening barrier:
+    // SQLite materializes it as a co-routine (at most `candidate_window`
+    // rows via a reverse rowid walk) and applies the outer filters to those
+    // rows only, so the scan stays bounded however large history grows.
     let row = sqlx::query(
         "SELECT run_key, MAX(ended_at) AS last_ended
-           FROM read_log_calls
+           FROM (SELECT run_key, actor, ended_at FROM read_log_calls ORDER BY seq DESC LIMIT ?)
           WHERE actor = ? AND run_key <> ? AND run_key LIKE ?
             AND julianday(ended_at) >= julianday('now', '-30 minutes')
           GROUP BY run_key
           ORDER BY last_ended DESC, run_key
           LIMIT 1",
     )
+    .bind(candidate_window)
     .bind(caller.credential())
     .bind(run_key)
     .bind(format!("{agent_key}-%"))
-    .fetch_optional(db.write_pool())
+    .fetch_optional(pool)
     .await
     .ok()??;
     let prior: String = row.try_get("run_key").ok()?;
@@ -682,6 +767,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn continuation_reads_do_not_wait_for_a_writer_pool_slot() {
+        let db = crate::db::create_database(":memory:").await.unwrap();
+        sqlx::query(
+            "INSERT INTO read_log_calls
+             (id, tool, run_key, actor, intent, outcome, started_at, ended_at)
+             VALUES ('continuation', 'set_intent', 'scout-chair-a748b2', 'actor',
+                     'current intent', 'ok', datetime('now'), datetime('now'))",
+        )
+        .execute(db.write_pool())
+        .await
+        .unwrap();
+        let mut held = Vec::new();
+        for _ in 0..5 {
+            held.push(db.write_pool().acquire().await.unwrap());
+        }
+        let caller = Caller::authenticated("actor")
+            .with_run_context(Some("scout-chair-b748b2".into()), None);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            assert_eq!(
+                intent_at(&db, Some("scout-chair-a748b2")).await.as_deref(),
+                Some("current intent")
+            );
+            assert_eq!(
+                intent_at_for_actor(&db, Some("scout-chair-a748b2"), "actor")
+                    .await
+                    .as_deref(),
+                Some("current intent")
+            );
+            assert_eq!(
+                intent_at_for_actor(&db, Some("scout-chair-a748b2"), "other").await,
+                None
+            );
+            assert!(displaced_key_note(&db, &caller)
+                .await
+                .unwrap()
+                .contains("scout-chair-a748b2"));
+        })
+        .await
+        .expect("continuation reads must not acquire a writer-pool slot");
+        drop(held);
+        db.close().await;
+    }
+
+    #[tokio::test]
     async fn candidate_generation_avoids_durable_and_disposable_usage() {
         let db = crate::db::create_database(":memory:").await.unwrap();
         sqlx::query(
@@ -713,5 +842,161 @@ mod tests {
             .unwrap();
         let without_read_log = suggest(&db).await.unwrap();
         assert_ne!(agent_key_of(&without_read_log), "scout-chair");
+    }
+
+    async fn insert_log_call(
+        db: &crate::db::Db,
+        id: &str,
+        run_key: &str,
+        actor: &str,
+        ended_offset: &str,
+    ) {
+        sqlx::query(
+            "INSERT INTO read_log_calls
+              (id, tool, run_key, actor, outcome, started_at, ended_at)
+              VALUES (?, 'get_dashboard', ?, ?, 'ok',
+                      strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+                      strftime('%Y-%m-%dT%H:%M:%fZ','now', ?))",
+        )
+        .bind(id)
+        .bind(run_key)
+        .bind(actor)
+        .bind(ended_offset)
+        .execute(db.write_pool())
+        .await
+        .unwrap();
+    }
+
+    async fn insert_log_call_at(
+        db: &crate::db::Db,
+        id: &str,
+        run_key: &str,
+        actor: &str,
+        ended_at: &str,
+    ) {
+        sqlx::query(
+            "INSERT INTO read_log_calls
+              (id, tool, run_key, actor, outcome, started_at, ended_at)
+              VALUES (?, 'get_dashboard', ?, ?, 'ok', ?, ?)",
+        )
+        .bind(id)
+        .bind(run_key)
+        .bind(actor)
+        .bind(ended_at)
+        .bind(ended_at)
+        .execute(db.write_pool())
+        .await
+        .unwrap();
+    }
+
+    fn caller_for(actor: &str, run_key: &str) -> Caller {
+        Caller::authenticated(actor).with_run_context(Some(run_key.into()), None)
+    }
+
+    #[tokio::test]
+    async fn displaced_candidate_window_bounds_recall_but_seen_check_spans_history() {
+        let db = crate::db::create_database(":memory:").await.unwrap();
+        // Oldest row: a matching prior, recent enough to advise.
+        insert_log_call(
+            &db,
+            "prior-old",
+            "scout-chair-000001",
+            "acct:test",
+            "-1 minutes",
+        )
+        .await;
+        // Newer rows that never match (other actor, other agent key).
+        for index in 0..6 {
+            insert_log_call(
+                &db,
+                &format!("filler-{index}"),
+                &format!("other-bread-{index:06}"),
+                "acct:nobody",
+                "+0 minutes",
+            )
+            .await;
+        }
+        // In-window matching prior, older-ended than the tie-breaker below.
+        insert_log_call(
+            &db,
+            "prior-older",
+            "scout-chair-000002",
+            "acct:test",
+            "-5 minutes",
+        )
+        .await;
+        // In-window matching prior, latest-ended: the expected advice.
+        insert_log_call(
+            &db,
+            "prior-newest",
+            "scout-chair-000003",
+            "acct:test",
+            "+0 minutes",
+        )
+        .await;
+
+        let unseen = caller_for("acct:test", "scout-chair-999999");
+        // A window of 4 covers only the fillers plus newest priors minus the
+        // ancient one: ancient prior is out of recall, newest still advises
+        // with latest-ended ordering preserved.
+        let note = displaced_key_note_in(db.pool(), &unseen, 4).await.unwrap();
+        assert!(note.contains("scout-chair-000003"), "{note}");
+        // A window of 2 sees only the two newest priors: same winner.
+        let narrow = displaced_key_note_in(db.pool(), &unseen, 2).await.unwrap();
+        assert!(narrow.contains("scout-chair-000003"), "{narrow}");
+        // A window of 1 sees only the newest row: still advises.
+        let single = displaced_key_note_in(db.pool(), &unseen, 1).await.unwrap();
+        assert!(single.contains("scout-chair-000003"), "{single}");
+
+        // Seen-key suppression spans the full log, not the window: the
+        // ancient key below sits far outside any small window, yet querying
+        // it stays silent because the EXISTS check is indexed across the
+        // whole table while only the unseen-key candidate scan is bounded.
+        let ancient_seen = caller_for("acct:test", "scout-chair-000001");
+        assert_eq!(
+            displaced_key_note_in(db.pool(), &ancient_seen, 1).await,
+            None
+        );
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn displaced_window_tie_breaks_on_run_key_and_keeps_actor_and_time_filters() {
+        let db = crate::db::create_database(":memory:").await.unwrap();
+        // One shared "now" literal: the tie breaks toward the smaller run key.
+        // (Per-insert strftime offsets would differ by milliseconds.)
+        let now: String = sqlx::query_scalar("SELECT strftime('%Y-%m-%dT%H:%M:%fZ','now')")
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap();
+        insert_log_call_at(&db, "tie-b", "scout-chair-000002", "acct:test", &now).await;
+        insert_log_call_at(&db, "tie-a", "scout-chair-000001", "acct:test", &now).await;
+        // Same agent key but another actor's run: must not advise.
+        insert_log_call(
+            &db,
+            "other-actor",
+            "scout-chair-000003",
+            "acct:rival",
+            "+0 minutes",
+        )
+        .await;
+        // Same actor and agent key but stale: must not advise.
+        insert_log_call(
+            &db,
+            "stale",
+            "scout-chair-000004",
+            "acct:test",
+            "-31 minutes",
+        )
+        .await;
+
+        // Newest-first window of 2 covers stale + other-actor only: silence.
+        let unseen = caller_for("acct:test", "scout-chair-999999");
+        assert_eq!(displaced_key_note_in(db.pool(), &unseen, 2).await, None);
+        // Window of 4 reaches the tied priors: smaller run key wins.
+        let note = displaced_key_note_in(db.pool(), &unseen, 4).await.unwrap();
+        assert!(note.contains("scout-chair-000001"), "{note}");
+        assert!(!note.contains("scout-chair-000002"), "{note}");
+        db.close().await;
     }
 }

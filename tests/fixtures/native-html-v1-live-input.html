@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="native-artifact-profile" content="document">
+  <title>Bound records live</title>
+  <script type="application/json" id="native-artifact-manifest">{
+  "schema": "native.html.artifact.v1",
+  "inputs": {
+    "records": {
+      "envelope": "native.collection-envelope.v1",
+      "required": true,
+      "expose_to_root": true
+    }
+  },
+  "capability_requests": [
+    { "capability": "input.read", "scope": { "port": "records" } }
+  ]
+}</script>
+  <style>
+    :root { color-scheme: light; }
+    * { box-sizing: border-box; }
+    body { margin: 0; color: #172033; background: #f6f3ec; font: 16px/1.6 system-ui, -apple-system, sans-serif; }
+    main { width: min(48rem, 100%); margin: auto; padding: clamp(1.25rem, 4vw, 3rem); }
+    h1 { margin: 0 0 1rem; }
+    ul { margin: 0; padding-left: 1.25rem; }
+    li { margin: .25rem 0; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Bound records</h1>
+  <p data-frame-marker></p>
+  <ul aria-label="Bound records"></ul>
+</main>
+<script>
+  // Set once per document load: a relaunch re-runs this script and visibly
+  // changes the marker, while an in-place input update leaves it untouched.
+  window.__nativeFrameMarker = window.__nativeFrameMarker || crypto.randomUUID();
+  document.querySelector('[data-frame-marker]').textContent = window.__nativeFrameMarker;
+  function renderBoundRecords(records) {
+    var list = document.querySelector('ul[aria-label="Bound records"]');
+    while (list.firstChild) list.removeChild(list.firstChild);
+    (records || []).forEach(function (record) {
+      var item = document.createElement("li");
+      item.textContent = record.name;
+      list.appendChild(item);
+    });
+  }
+  window.nativeArtifact.ready.then(function (delivery) {
+    var envelope = delivery.input.inputs.records;
+    renderBoundRecords(envelope && envelope.records);
+  });
+  // Subscribing opts this document into in-place input delivery: the host
+  // posts each new input over the existing bridge channel and the same frame
+  // re-renders, keeping all frame-internal state (including the marker above).
+  window.nativeArtifact.onInput(function (delivery) {
+    var envelope = delivery.input.inputs.records;
+    renderBoundRecords(envelope && envelope.records);
+  });
+</script>
+</body>
+</html>

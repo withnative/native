@@ -512,9 +512,10 @@ mod tests {
                 .lines()
                 .filter(|line| line.starts_with("## "))
                 .count(),
-            3
+            4
         );
         for phrase in [
+            "## Author a live artifact from scratch",
             "not one atomic snapshot",
             "pack → user cascade",
             "status:\"active\"",

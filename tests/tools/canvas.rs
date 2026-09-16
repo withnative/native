@@ -2336,7 +2336,12 @@ async fn engine_replay_through_apply_batch_reproduces_the_scene_modulo_remapping
     .await;
     let pool = crate::common::fixture_write_pool(&fresh).await;
     let mut conn = pool.acquire().await.unwrap();
-    sqlx::query("BEGIN").execute(&mut *conn).await.unwrap();
+    // Replay reads before writing. Acquire the writer lock up front so the
+    // fixture's busy timeout can wait for the setup call's background capture.
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
     for (index, batch) in batches.iter().enumerate() {
         let kind: OriginKind = serde_json::from_value(batch["origin"]["kind"].clone()).unwrap();
         let mut ops: Vec<Op> = serde_json::from_value(batch["ops"].clone()).unwrap();

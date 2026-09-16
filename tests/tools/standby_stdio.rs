@@ -897,6 +897,10 @@ async fn standby_process_serves_reads_rejects_writes_and_preserves_accepted_byte
         after_tree, before_tree,
         "standby changed DB/WAL/SHM or directory state"
     );
+    // Standby capture suppression is structural (admission-time
+    // `suppress_persistence`), never queued: no read-log write can be in
+    // flight here, so equality is a genuine zero-state rather than a
+    // delayed-capture artifact.
     assert_eq!(sql_evidence(&installed.snapshot_path), before_sql);
 }
 

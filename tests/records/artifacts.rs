@@ -279,10 +279,12 @@ async fn fixture() -> (Db, ToolRegistry) {
 }
 
 async fn call(registry: &ToolRegistry, db: &Db, tool: &str, arguments: Value) -> Value {
-    registry
+    let result = registry
         .call(db.clone(), Caller::local(), tool, arguments)
         .await
-        .unwrap()
+        .unwrap();
+    db.drain_captures_for_tests().await;
+    result
 }
 
 /// Read the current write token the way a caller must: through `get_record`.
@@ -2476,11 +2478,12 @@ async fn instantiation_interaction_capture_opens_source_and_mutates_copy_only() 
     .await;
     let copy_id = result["id"].as_str().unwrap();
     let touches = sqlx::query(
-        "SELECT t.record_id, t.interaction
+        "SELECT d.record_id, t.interaction
            FROM read_log_touches t
+           JOIN read_log_record_ids d ON d.record_ref = t.record_ref
            JOIN read_log_calls c ON c.seq = t.call_seq
           WHERE c.tool = 'instantiate_artifact'
-          ORDER BY CASE t.interaction WHEN 'opened' THEN 0 ELSE 1 END, t.record_id",
+          ORDER BY CASE t.interaction WHEN 'opened' THEN 0 ELSE 1 END, d.record_id",
     )
     .fetch_all(db.pool())
     .await

@@ -45,11 +45,433 @@ use serde_json::{Map, Value};
 use crate::authorization::Capability;
 use crate::db::Db;
 use crate::mcp::registry::{Caller, EngineHandle};
+use crate::mcp::tools::lifecycle::{MAX_BATCH_GET, MAX_MULTI_UPDATE};
 use crate::portable_sql::{
     BindValue, BorrowedSqliteStatementExecutor, ColumnSpec, DomainStatementExecutor, LogicalType,
     NormalizedRow, NormalizedValue, StatementKind, StatementTemplate,
 };
 use crate::{Error, Result};
+
+#[derive(Clone, Copy)]
+enum RecordSelectorCardinality {
+    Batch,
+    Single,
+    /// A single-record write beside an existing batch branch keyed on `ids`
+    /// (`update_record`). Scalar `id`/`record_id` spellings normalise to the
+    /// canonical single field; `ids` — including a singleton — is left
+    /// untouched so the established batch parser owns it and a batch write
+    /// can never be reinterpreted as a single write.
+    SingleWithBatchIds,
+}
+
+#[derive(Clone, Copy)]
+struct RecordSelectorContract {
+    canonical: &'static str,
+    cardinality: RecordSelectorCardinality,
+}
+
+fn record_selector_contract(operation: &str) -> Option<RecordSelectorContract> {
+    let (canonical, cardinality) = match operation {
+        "get_record" => ("ids", RecordSelectorCardinality::Batch),
+        "render_record" => ("id", RecordSelectorCardinality::Single),
+        "render_record_version_diff"
+        | "render_suggestion_review"
+        | "manage_attachments.list"
+        | "manage_links.list"
+        | "manage_facet_observations.list"
+        | "resolve_rollup" => ("record_id", RecordSelectorCardinality::Single),
+        "update_record" => ("id", RecordSelectorCardinality::SingleWithBatchIds),
+        "archive_record" | "delete_record" => ("id", RecordSelectorCardinality::Single),
+        "attach_text"
+        | "claim_unowned_record"
+        | "correct_record_type"
+        | "manage_facet_observations.set"
+        | "manage_facet_observations.unset" => ("record_id", RecordSelectorCardinality::Single),
+        _ => return None,
+    };
+    Some(RecordSelectorContract {
+        canonical,
+        cardinality,
+    })
+}
+
+/// A full valid UUID example for diagnostics, deliberately distinct from
+/// every fixture and sentinel id so leak assertions cannot false-match it.
+const SHAPE_EXAMPLE_UUID: &str = "7c9e6679-7425-41f6-9b9c-8f7f6a2b3c4d";
+
+fn selector_shape_error(operation: &str, cardinality: RecordSelectorCardinality) -> Error {
+    // Ownership recovery admits exact ids only, so its diagnostic must say
+    // so and show a full UUID: the short references in the generic examples
+    // below can never succeed here.
+    if operation == "claim_unowned_record" {
+        return Error::engine(format!(
+            "{operation} accepts exactly one selector: id: string, record_id: string, \
+             or ids: [one string], each an exact full canonical lowercase UUIDv4 or UUIDv7; \
+             abbreviations are never resolved on this surface. \
+             Example: {{\"record_id\":\"{SHAPE_EXAMPLE_UUID}\"}}."
+        ));
+    }
+    let detail = match cardinality {
+        RecordSelectorCardinality::Batch => format!(
+            "ids: [one or more strings] (maximum {MAX_BATCH_GET}), id: string, or record_id: string. \
+             Example: {{\"ids\":[\"0537ed7\"]}}. Scalar aliases select one record; use ids for batch reads."
+        ),
+        RecordSelectorCardinality::Single => String::from(
+            "id: string, record_id: string, or ids: [one string]. \
+             Example: {\"ids\":[\"0537ed7\"]}. Multiple-record ids is unsupported; issue separate calls.",
+        ),
+        RecordSelectorCardinality::SingleWithBatchIds => String::from(
+            "id: string or record_id: string for a single write. \
+             Example: {\"record_id\":\"0537ed7\"}. ids selects the existing batch branch \
+             (facets/maturity/home_id only, 1-100 unique exact ids) and is never \
+             coerced to a single write, even with one element.",
+        ),
+    };
+    Error::engine(format!(
+        "{operation} accepts exactly one selector: {detail}"
+    ))
+}
+
+fn selector_is_well_shaped(contract: RecordSelectorContract, arguments: &Value) -> bool {
+    let Some(object) = arguments.as_object() else {
+        return false;
+    };
+    let present = ["id", "record_id", "ids"]
+        .into_iter()
+        .filter(|field| object.contains_key(*field))
+        .collect::<Vec<_>>();
+    if present.len() != 1 {
+        return false;
+    }
+    match (contract.cardinality, present[0]) {
+        (RecordSelectorCardinality::Batch, "ids") => object
+            .get("ids")
+            .and_then(Value::as_array)
+            .is_some_and(|ids| {
+                !ids.is_empty()
+                    && ids.len() <= MAX_BATCH_GET
+                    && ids
+                        .iter()
+                        .all(|id| id.as_str().is_some_and(|id| !id.is_empty()))
+            }),
+        (RecordSelectorCardinality::Batch, "id" | "record_id")
+        | (RecordSelectorCardinality::Single, "id" | "record_id") => object
+            .get(present[0])
+            .and_then(Value::as_str)
+            .is_some_and(|id| !id.is_empty()),
+        (RecordSelectorCardinality::Single, "ids") => object
+            .get("ids")
+            .and_then(Value::as_array)
+            .is_some_and(|ids| ids.len() == 1 && ids[0].as_str().is_some_and(|id| !id.is_empty())),
+        (RecordSelectorCardinality::SingleWithBatchIds, "id" | "record_id") => object
+            .get(present[0])
+            .and_then(Value::as_str)
+            .is_some_and(|id| !id.is_empty()),
+        (RecordSelectorCardinality::SingleWithBatchIds, "ids") => {
+            // Batch shape (array type, non-empty, within the batch limit,
+            // non-empty string elements) is validated here so malformed
+            // selectors yield the value-free diagnostic. UUID shape and
+            // uniqueness stay with the established batch parser, whose
+            // diagnostics and semantics are unchanged.
+            object
+                .get("ids")
+                .and_then(Value::as_array)
+                .is_some_and(|ids| {
+                    !ids.is_empty()
+                        && ids.len() <= MAX_MULTI_UPDATE
+                        && ids
+                            .iter()
+                            .all(|id| id.as_str().is_some_and(|id| !id.is_empty()))
+                })
+        }
+        _ => unreachable!("selector fields are exhaustively matched"),
+    }
+}
+
+/// Return an actionable, value-free diagnostic when an allowlisted operation's
+/// selector has the wrong type, cardinality, or conflicts with another
+/// spelling. Repair responses use this both to avoid schema-library messages
+/// that may display the rejected instance and to suppress generic
+/// `failing_value` reflection for this deliberately sensitive boundary.
+pub(crate) fn invalid_operation_record_selector_diagnostic(
+    operation: &str,
+    arguments: &Value,
+) -> Option<Error> {
+    let contract = record_selector_contract(operation)?;
+    let object = arguments.as_object()?;
+    if !["id", "record_id", "ids"]
+        .into_iter()
+        .any(|field| object.contains_key(field))
+    {
+        return None;
+    }
+    if !selector_is_well_shaped(contract, arguments) {
+        return Some(selector_shape_error(operation, contract.cardinality));
+    }
+    // Operation-specific schema constraints whose library messages would
+    // reflect the rejected selector value. This is diagnostic-only:
+    // normalisation still passes these values through untouched, so the
+    // legacy parser, authority order, and established handler wording are
+    // unchanged — only the executor repair surface substitutes the
+    // value-free shape error.
+    selector_violates_operation_specific_constraints(operation, arguments)
+        .then(|| selector_shape_error(operation, contract.cardinality))
+}
+
+/// True when a well-shaped selector violates an operation-specific schema
+/// constraint that would otherwise echo the rejected value in a
+/// schema-library message: `claim_unowned_record`'s exact-UUID pattern on
+/// any spelling, and `update_record`'s batch exact-UUID pattern and
+/// uniqueness on a lone `ids`.
+fn selector_violates_operation_specific_constraints(operation: &str, arguments: &Value) -> bool {
+    let Some(object) = arguments.as_object() else {
+        return false;
+    };
+    match operation {
+        "claim_unowned_record" => {
+            let value = if object.contains_key("ids") {
+                object
+                    .get("ids")
+                    .and_then(Value::as_array)
+                    .filter(|ids| ids.len() == 1)
+                    .and_then(|ids| ids[0].as_str())
+            } else {
+                ["id", "record_id"]
+                    .into_iter()
+                    .find_map(|field| object.get(field).and_then(Value::as_str))
+            };
+            value.is_some_and(|value| !is_canonical_uuid_v4_or_v7(value))
+        }
+        "update_record" => {
+            let Some(ids) = object.get("ids").and_then(Value::as_array) else {
+                return false;
+            };
+            let mut seen = std::collections::HashSet::new();
+            ids.iter().any(|id| match id.as_str() {
+                Some(id) if is_canonical_uuid_v4_or_v7(id) => !seen.insert(id),
+                _ => true,
+            })
+        }
+        _ => false,
+    }
+}
+
+/// Normalize one allowlisted operation's record selector to its existing
+/// canonical field. Reads and single-record writes share the three spellings;
+/// `update_record` additionally preserves its `ids` batch branch untouched.
+/// This is intentionally operation-aware: names that happen to look like
+/// selectors on filters, sibling actions, or entities other than records are
+/// outside this compatibility contract.
+pub(crate) fn normalize_operation_record_selector(
+    operation: &str,
+    mut arguments: Value,
+) -> Result<Value> {
+    let Some(contract) = record_selector_contract(operation) else {
+        return Ok(arguments);
+    };
+    let object = arguments
+        .as_object_mut()
+        .ok_or_else(|| selector_shape_error(operation, contract.cardinality))?;
+    let present = ["id", "record_id", "ids"]
+        .into_iter()
+        .filter(|field| object.contains_key(*field))
+        .collect::<Vec<_>>();
+    if present.len() != 1 {
+        return Err(selector_shape_error(operation, contract.cardinality));
+    }
+
+    let selected = present[0];
+    let canonical_value = match (contract.cardinality, selected) {
+        (RecordSelectorCardinality::Batch, "ids") => {
+            // This is get_record's existing canonical batch contract. Leave
+            // its value untouched so the handler retains its established
+            // parsing and empty-batch diagnostics; only aliases introduce a
+            // new shape at this boundary.
+            object
+                .get("ids")
+                .cloned()
+                .expect("the selected key was collected from this object")
+        }
+        (RecordSelectorCardinality::Batch, "id" | "record_id")
+        | (RecordSelectorCardinality::Single, "id" | "record_id") => {
+            let id = object
+                .get(selected)
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .ok_or_else(|| selector_shape_error(operation, contract.cardinality))?;
+            if matches!(contract.cardinality, RecordSelectorCardinality::Batch) {
+                Value::Array(vec![Value::String(id.to_owned())])
+            } else {
+                Value::String(id.to_owned())
+            }
+        }
+        (RecordSelectorCardinality::Single, "ids") => {
+            let id = object
+                .get("ids")
+                .and_then(Value::as_array)
+                .filter(|ids| ids.len() == 1)
+                .and_then(|ids| ids[0].as_str())
+                .filter(|id| !id.is_empty())
+                .ok_or_else(|| selector_shape_error(operation, contract.cardinality))?;
+            Value::String(id.to_owned())
+        }
+        (RecordSelectorCardinality::SingleWithBatchIds, "ids") => {
+            // Batch branch: leave the value untouched so the handler retains
+            // its established parsing and diagnostics; a singleton list stays
+            // a batch call and is never coerced to a single write. Shape
+            // failures (wrong type, empty, over-limit, conflicting selectors)
+            // reject with the value-free diagnostic above instead.
+            if !selector_is_well_shaped(contract, &arguments) {
+                return Err(selector_shape_error(operation, contract.cardinality));
+            }
+            return Ok(arguments);
+        }
+        (RecordSelectorCardinality::SingleWithBatchIds, "id" | "record_id") => {
+            let id = object
+                .get(selected)
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .ok_or_else(|| selector_shape_error(operation, contract.cardinality))?;
+            Value::String(id.to_owned())
+        }
+        _ => unreachable!("selector fields are exhaustively matched"),
+    };
+
+    for field in ["id", "record_id", "ids"] {
+        object.remove(field);
+    }
+    object.insert(contract.canonical.into(), canonical_value);
+    Ok(arguments)
+}
+
+/// Apply the operation contract to a legacy exact-name tool call. Shared
+/// action tools opt in per action: `list` stays read-only while
+/// `manage_facet_observations` `set`/`unset` join the single-write contract.
+/// Selectors naming other entities (`attachment_id`, citations, link
+/// endpoints, message rows) and id-minting fields (`create_record.id`)
+/// remain outside this contract.
+fn normalize_legacy_record_selector(tool: &str, arguments: Value) -> Result<Value> {
+    let operation = match tool {
+        "get_record"
+        | "render_record"
+        | "render_record_version_diff"
+        | "render_suggestion_review"
+        | "resolve_rollup"
+        | "update_record"
+        | "attach_text"
+        | "claim_unowned_record"
+        | "correct_record_type"
+        | "archive_record"
+        | "delete_record" => Some(tool),
+        "manage_attachments" | "manage_links"
+            if arguments.get("action").and_then(Value::as_str) == Some("list") =>
+        {
+            Some(match tool {
+                "manage_attachments" => "manage_attachments.list",
+                "manage_links" => "manage_links.list",
+                _ => unreachable!(),
+            })
+        }
+        "manage_facet_observations" => match arguments.get("action").and_then(Value::as_str) {
+            Some("list") => Some("manage_facet_observations.list"),
+            Some("set") => Some("manage_facet_observations.set"),
+            Some("unset") => Some("manage_facet_observations.unset"),
+            _ => None,
+        },
+        _ => None,
+    };
+    match operation {
+        // `update_record` carries its batch branch internally: a lone `ids`
+        // value passes through untouched, so the legacy tool name alone is
+        // sufficient to route both branches.
+        Some(operation) => normalize_operation_record_selector(operation, arguments),
+        None => Ok(arguments),
+    }
+}
+
+/// Extend an existing operation schema with the three supported selector
+/// spellings while preserving its existing canonical field and companion
+/// requirements.
+pub(crate) fn with_record_selector_aliases(operation: &str, mut schema: Value) -> Value {
+    let contract = record_selector_contract(operation)
+        .unwrap_or_else(|| panic!("{operation} is not a record-selector alias operation"));
+    if matches!(
+        contract.cardinality,
+        RecordSelectorCardinality::SingleWithBatchIds
+    ) {
+        panic!("{operation} keeps a batch branch: extend its schema by hand so ids stays a batch selector");
+    }
+    let object = schema
+        .as_object_mut()
+        .expect("record-selector operation schema must be an object");
+    let properties = object
+        .get_mut("properties")
+        .and_then(Value::as_object_mut)
+        .expect("record-selector operation schema must declare properties");
+    let canonical_schema = properties
+        .get(contract.canonical)
+        .cloned()
+        .expect("record-selector schema must contain its canonical field");
+    for selected in ["id", "record_id", "ids"] {
+        let selector_schema = if selected == contract.canonical {
+            let mut schema = canonical_schema.clone();
+            if matches!(contract.cardinality, RecordSelectorCardinality::Single) {
+                schema
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("minLength".into(), serde_json::json!(1));
+            }
+            schema
+        } else if matches!(contract.cardinality, RecordSelectorCardinality::Single) {
+            // Every spelling carries the canonical scalar validation
+            // constraints (such as an exact-UUID pattern) so schema and
+            // runtime agree on each alias — but not its prose description,
+            // which stays on the canonical field alone. Read aliases
+            // therefore keep their established bytes exactly.
+            let mut scalar = canonical_schema.clone();
+            {
+                let object = scalar.as_object_mut().unwrap();
+                object.remove("description");
+                object.insert("minLength".into(), serde_json::json!(1));
+            }
+            if selected == "ids" {
+                serde_json::json!({
+                    "type":"array",
+                    "items":scalar,
+                    "minItems":1,
+                    "maxItems":1
+                })
+            } else {
+                scalar
+            }
+        } else if selected == "ids" {
+            serde_json::json!({
+                "type":"array",
+                "items":{"type":"string","minLength":1},
+                "minItems":1,
+                "maxItems":1
+            })
+        } else {
+            serde_json::json!({
+                "type":"string",
+                "minLength":1
+            })
+        };
+        properties.insert(selected.into(), selector_schema);
+    }
+    if let Some(required) = object.get_mut("required").and_then(Value::as_array_mut) {
+        required.retain(|field| !matches!(field.as_str(), Some("id" | "record_id" | "ids")));
+    }
+    object.insert(
+        "oneOf".into(),
+        serde_json::json!([
+            {"required":["id"]},
+            {"required":["record_id"]},
+            {"required":["ids"]}
+        ]),
+    );
+    schema
+}
 
 /// Shortest abbreviation admitted on input.
 ///
@@ -279,6 +701,13 @@ const RECORD_ID_KEYS: &[&str] = &[
 /// - `create_attribution.id` likewise mints the annotation record.
 /// - `manage_vocabularies.id` and `manage_schema_config.id` name rows in other
 ///   tables entirely.
+/// - `claim_unowned_record` is deliberately absent: its handler admits exact
+///   ids only and `resolve_record_ids` returns before the abbreviation scan,
+///   so its `id`/`ids` aliases normalise as field names but never resolve a
+///   prefix.
+/// - Aliases on the remaining write tools need no entry here: they normalise
+///   to `record_id` before resolution, and `record_id` already resolves at
+///   any depth through `RECORD_ID_KEYS`.
 ///
 /// Only the top level is gated this way; a nested `id` (there is none on the
 /// current surface that addresses a record) is never resolved.
@@ -301,8 +730,9 @@ pub(crate) async fn resolve_record_ids(
     engine: &EngineHandle,
     caller: &Caller,
     tool: &str,
-    mut arguments: Value,
+    arguments: Value,
 ) -> Result<Value> {
+    let mut arguments = normalize_legacy_record_selector(tool, arguments)?;
     // Exceptional ownership recovery admits exact ids only. Its handler must
     // check host-owner authority before any target-dependent lookup, while
     // prefix resolution necessarily reads candidate records first.
@@ -325,7 +755,7 @@ pub(crate) async fn resolve_record_ids(
 
     match engine {
         EngineHandle::Sqlite(db) => {
-            let mut snapshot = db.write_pool().begin().await?;
+            let mut snapshot = db.pool().begin().await?;
             let resolved = {
                 let mut executor = BorrowedSqliteStatementExecutor::new(&mut snapshot);
                 resolve_record_ids_with(&mut executor, caller, tool, arguments, abbreviations).await
@@ -866,6 +1296,646 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    const RECORD_ID: &str = "0537ed75-466f-457c-ad04-bcdf48c4fdbe";
+
+    fn companion_arguments(operation: &str) -> Value {
+        match operation {
+            "render_record_version_diff" => json!({"before_seq": 1}),
+            "manage_attachments.list" | "manage_links.list" => json!({"action":"list"}),
+            "manage_facet_observations.list" => json!({"action":"list", "key":"amount"}),
+            "resolve_rollup" => json!({"rollup_name":"all"}),
+            _ => json!({}),
+        }
+    }
+
+    #[test]
+    fn allowlisted_read_selectors_normalize_to_each_operations_canonical_field() {
+        for (operation, canonical) in [
+            ("get_record", "ids"),
+            ("render_record", "id"),
+            ("render_record_version_diff", "record_id"),
+            ("render_suggestion_review", "record_id"),
+            ("manage_attachments.list", "record_id"),
+            ("manage_links.list", "record_id"),
+            ("manage_facet_observations.list", "record_id"),
+            ("resolve_rollup", "record_id"),
+        ] {
+            for selector in [
+                json!({"id":RECORD_ID}),
+                json!({"record_id":RECORD_ID}),
+                json!({"ids":[RECORD_ID]}),
+            ] {
+                let mut arguments = companion_arguments(operation);
+                arguments
+                    .as_object_mut()
+                    .unwrap()
+                    .extend(selector.as_object().unwrap().clone());
+                let normalized = normalize_operation_record_selector(operation, arguments).unwrap();
+                let expected = if operation == "get_record" {
+                    json!([RECORD_ID])
+                } else {
+                    json!(RECORD_ID)
+                };
+                assert_eq!(normalized[canonical], expected, "{operation}: {selector}");
+                for alias in ["id", "record_id", "ids"] {
+                    if alias != canonical {
+                        assert!(normalized.get(alias).is_none(), "{operation}: {normalized}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn singleton_operations_reject_every_missing_conflicting_or_non_single_selector() {
+        let invalid = [
+            json!({}),
+            json!({"id":null}),
+            json!({"id":7}),
+            json!({"id":""}),
+            json!({"record_id":""}),
+            json!({"ids":null}),
+            json!({"ids":[]}),
+            json!({"ids":[""]}),
+            json!({"ids":[RECORD_ID, RECORD_ID]}),
+            json!({"id":RECORD_ID,"record_id":RECORD_ID}),
+            json!({"id":RECORD_ID,"ids":[RECORD_ID]}),
+            json!({"record_id":RECORD_ID,"ids":[RECORD_ID]}),
+            json!({"id":RECORD_ID,"record_id":RECORD_ID,"ids":[RECORD_ID]}),
+        ];
+        for operation in [
+            "render_record",
+            "render_record_version_diff",
+            "render_suggestion_review",
+            "manage_attachments.list",
+            "manage_links.list",
+            "manage_facet_observations.list",
+            "resolve_rollup",
+        ] {
+            for selector in &invalid {
+                let mut arguments = companion_arguments(operation);
+                arguments
+                    .as_object_mut()
+                    .unwrap()
+                    .extend(selector.as_object().unwrap().clone());
+                let error = normalize_operation_record_selector(operation, arguments)
+                    .unwrap_err()
+                    .to_string();
+                for needle in [
+                    operation,
+                    "exactly one selector",
+                    "id: string",
+                    "record_id: string",
+                    "ids: [one string]",
+                    "Example",
+                ] {
+                    assert!(error.contains(needle), "missing {needle:?}: {error}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn get_record_preserves_batch_semantics_but_scalar_aliases_stay_singleton() {
+        let other = "1537ed75-466f-457c-ad04-bcdf48c4fdbe";
+        assert_eq!(
+            normalize_operation_record_selector(
+                "get_record",
+                json!({"ids":[RECORD_ID, other, RECORD_ID], "resolve":false}),
+            )
+            .unwrap(),
+            json!({"ids":[RECORD_ID, other, RECORD_ID], "resolve":false})
+        );
+        for selector in [json!({"id":RECORD_ID}), json!({"record_id":RECORD_ID})] {
+            assert_eq!(
+                normalize_operation_record_selector("get_record", selector).unwrap(),
+                json!({"ids":[RECORD_ID]})
+            );
+        }
+        for canonical in [json!({"ids":[]}), json!({"ids":[RECORD_ID, 7]})] {
+            assert_eq!(
+                normalize_operation_record_selector("get_record", canonical.clone()).unwrap(),
+                canonical,
+                "the established get_record parser owns canonical batch diagnostics"
+            );
+        }
+        for selector in [json!({}), json!({"id":RECORD_ID,"ids":[RECORD_ID]})] {
+            let error = normalize_operation_record_selector("get_record", selector)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("ids: [one or more strings]"), "{error}");
+        }
+    }
+
+    #[test]
+    fn write_single_selectors_normalize_to_each_operations_canonical_field() {
+        for (operation, canonical) in [
+            ("attach_text", "record_id"),
+            ("claim_unowned_record", "record_id"),
+            ("correct_record_type", "record_id"),
+            ("manage_facet_observations.set", "record_id"),
+            ("manage_facet_observations.unset", "record_id"),
+            ("archive_record", "id"),
+            ("delete_record", "id"),
+        ] {
+            for selector in [
+                json!({"id":RECORD_ID}),
+                json!({"record_id":RECORD_ID}),
+                json!({"ids":[RECORD_ID]}),
+            ] {
+                let normalized =
+                    normalize_operation_record_selector(operation, selector.clone()).unwrap();
+                assert_eq!(
+                    normalized[canonical],
+                    json!(RECORD_ID),
+                    "{operation}: {selector}"
+                );
+                for alias in ["id", "record_id", "ids"] {
+                    if alias != canonical {
+                        assert!(normalized.get(alias).is_none(), "{operation}: {normalized}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn write_single_operations_reject_conflicts_and_malformed_selectors_without_values() {
+        let invalid = [
+            json!({}),
+            json!({"id":null}),
+            json!({"id":7}),
+            json!({"id":""}),
+            json!({"record_id":""}),
+            json!({"ids":null}),
+            json!({"ids":[]}),
+            json!({"ids":[""]}),
+            json!({"ids":[RECORD_ID, RECORD_ID]}),
+            json!({"id":RECORD_ID,"record_id":RECORD_ID}),
+            json!({"id":RECORD_ID,"ids":[RECORD_ID]}),
+            json!({"record_id":RECORD_ID,"ids":[RECORD_ID]}),
+            json!({"id":RECORD_ID,"record_id":RECORD_ID,"ids":[RECORD_ID]}),
+        ];
+        for operation in [
+            "attach_text",
+            "claim_unowned_record",
+            "correct_record_type",
+            "manage_facet_observations.set",
+            "manage_facet_observations.unset",
+            "archive_record",
+            "delete_record",
+        ] {
+            for selector in &invalid {
+                // Selector-shaped input rejects through the normaliser ...
+                let error = normalize_operation_record_selector(operation, selector.clone())
+                    .unwrap_err()
+                    .to_string();
+                for needle in [
+                    operation,
+                    "exactly one selector",
+                    "id: string",
+                    "record_id: string",
+                    "ids: [one string]",
+                    "Example",
+                ] {
+                    assert!(error.contains(needle), "missing {needle:?}: {error}");
+                }
+                assert!(
+                    !error.contains(RECORD_ID),
+                    "the diagnostic must not reflect the rejected value: {error}"
+                );
+                // ... and reports the same value-free shape through the
+                // repair diagnostic, which is what suppresses `failing_value`.
+                let with_companions = match operation {
+                    "attach_text" => json!({"text": "x"}),
+                    "correct_record_type" => {
+                        json!({"target_type": "Document", "target_kind": "note"})
+                    }
+                    "manage_facet_observations.set" => json!({
+                        "action": "set",
+                        "key": "k",
+                        "value": "v",
+                        "as_of": "2026-08-01T00:00:00Z",
+                    }),
+                    "manage_facet_observations.unset" => json!({
+                        "action": "unset",
+                        "key": "k",
+                        "as_of": "2026-08-01T00:00:00Z",
+                    }),
+                    _ => json!({}),
+                };
+                let mut arguments = with_companions;
+                arguments
+                    .as_object_mut()
+                    .unwrap()
+                    .extend(selector.as_object().unwrap().clone());
+                // The empty selector carries no spelling, so the diagnostic
+                // stays silent and the missing-field error owns it instead.
+                if selector.as_object().unwrap().is_empty() {
+                    assert!(
+                        invalid_operation_record_selector_diagnostic(operation, &arguments)
+                            .is_none(),
+                        "{operation}: an absent selector must not diagnose"
+                    );
+                    continue;
+                }
+                let diagnostic =
+                    invalid_operation_record_selector_diagnostic(operation, &arguments)
+                        .expect("{operation} must diagnose a malformed selector")
+                        .to_string();
+                assert!(diagnostic.contains("exactly one selector"), "{diagnostic}");
+                assert!(
+                    !diagnostic.contains(RECORD_ID),
+                    "the diagnostic must not reflect the rejected value: {diagnostic}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn operation_specific_constraints_diagnose_without_preempting_normalisation() {
+        const OTHER_ID: &str = "1537ed75-466f-457c-ad04-bcdf48c4fdbe";
+        // A claim alias carrying a non-UUID diagnoses value-free, yet
+        // normalisation still passes it through to the handler's exactness
+        // check — authority order and parser wording are untouched.
+        for (field, selector) in [
+            ("id", json!({"id": "not-a-uuid"})),
+            ("record_id", json!({"record_id": "not-a-uuid"})),
+            ("ids", json!({"ids": ["not-a-uuid"]})),
+        ] {
+            let diagnostic =
+                invalid_operation_record_selector_diagnostic("claim_unowned_record", &selector)
+                    .expect("claim must diagnose a non-UUID selector");
+            let text = diagnostic.to_string();
+            assert!(text.contains("exactly one selector"), "{text}");
+            assert!(!text.contains("not-a-uuid"), "{text}");
+            let normalized =
+                normalize_operation_record_selector("claim_unowned_record", selector).unwrap();
+            assert_eq!(normalized["record_id"], json!("not-a-uuid"), "{field}");
+        }
+        assert!(
+            invalid_operation_record_selector_diagnostic(
+                "claim_unowned_record",
+                &json!({"record_id": RECORD_ID}),
+            )
+            .is_none(),
+            "an exact UUID still reaches the handler silently"
+        );
+        // A batch carrying a non-UUID or a duplicate diagnoses value-free,
+        // while a valid unique batch and scalar spellings stay silent.
+        for selector in [
+            json!({"ids": ["not-a-uuid"], "reason": "r"}),
+            json!({"ids": [RECORD_ID, RECORD_ID], "reason": "r"}),
+        ] {
+            let diagnostic =
+                invalid_operation_record_selector_diagnostic("update_record", &selector)
+                    .expect("batch must diagnose a non-UUID or duplicate selector");
+            let text = diagnostic.to_string();
+            assert!(text.contains("exactly one selector"), "{text}");
+            assert!(!text.contains(RECORD_ID), "{text}");
+            assert!(!text.contains("not-a-uuid"), "{text}");
+            // … and normalisation still leaves the batch for its parser.
+            assert_eq!(
+                normalize_operation_record_selector("update_record", selector.clone()).unwrap(),
+                selector,
+            );
+        }
+        assert!(invalid_operation_record_selector_diagnostic(
+            "update_record",
+            &json!({"ids": [RECORD_ID, OTHER_ID], "reason": "r"}),
+        )
+        .is_none());
+        assert!(
+            invalid_operation_record_selector_diagnostic(
+                "update_record",
+                &json!({"id": "whatever", "reason": "r"}),
+            )
+            .is_none(),
+            "scalar spellings carry no schema constraint"
+        );
+    }
+
+    #[test]
+    fn update_record_scalars_normalize_while_ids_keeps_batch_meaning() {
+        let other = "1537ed75-466f-457c-ad04-bcdf48c4fdbe";
+        // Lone `ids` — including a singleton — passes through untouched so
+        // the established batch parser owns it.
+        for ids in [
+            json!([RECORD_ID]),
+            json!([RECORD_ID, other]),
+            json!([RECORD_ID, "not-a-uuid"]),
+        ] {
+            let arguments = json!({"ids":ids, "reason":"r", "facets":{"a":"b"}});
+            assert_eq!(
+                normalize_operation_record_selector("update_record", arguments.clone()).unwrap(),
+                arguments,
+                "batch ids must never be coerced to a single write"
+            );
+        }
+        // Scalar aliases normalise to the canonical single field.
+        for selector in [json!({"id":RECORD_ID}), json!({"record_id":RECORD_ID})] {
+            let mut arguments = json!({"body_append":"x", "reason":"r"});
+            arguments
+                .as_object_mut()
+                .unwrap()
+                .extend(selector.as_object().unwrap().clone());
+            let normalized =
+                normalize_operation_record_selector("update_record", arguments).unwrap();
+            assert_eq!(normalized["id"], json!(RECORD_ID));
+            assert_eq!(normalized["body_append"], json!("x"));
+            assert!(normalized.get("record_id").is_none());
+            assert!(normalized.get("ids").is_none());
+        }
+    }
+
+    #[test]
+    fn update_record_rejects_malformed_selectors_without_values_or_coercion() {
+        let other = "1537ed75-466f-457c-ad04-bcdf48c4fdbe";
+        let invalid = [
+            json!({}),
+            json!({"id":null}),
+            json!({"id":7}),
+            json!({"id":""}),
+            json!({"record_id":""}),
+            json!({"ids":null}),
+            json!({"ids":"not-an-array"}),
+            json!({"ids":[]}),
+            json!({"ids":[""]}),
+            json!({"ids":[7]}),
+            json!({"id":RECORD_ID,"record_id":RECORD_ID}),
+            json!({"id":RECORD_ID,"ids":[RECORD_ID]}),
+            json!({"record_id":RECORD_ID,"ids":[RECORD_ID]}),
+            json!({"id":RECORD_ID,"record_id":RECORD_ID,"ids":[RECORD_ID]}),
+        ];
+        for selector in &invalid {
+            let error = normalize_operation_record_selector("update_record", selector.clone())
+                .unwrap_err()
+                .to_string();
+            for needle in [
+                "update_record",
+                "exactly one selector",
+                "id: string",
+                "record_id: string",
+                "never",
+                "coerced",
+            ] {
+                assert!(error.contains(needle), "missing {needle:?}: {error}");
+            }
+            assert!(
+                !error.contains(RECORD_ID) && !error.contains(other),
+                "the diagnostic must not reflect rejected values: {error}"
+            );
+        }
+        // An over-limit batch is a shape failure, not a batch write.
+        let oversized: Vec<Value> = (0..=MAX_MULTI_UPDATE)
+            .map(|index| json!(format!("{RECORD_ID}-{index:04}")))
+            .collect();
+        let error = normalize_operation_record_selector("update_record", json!({"ids": oversized}))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("exactly one selector"), "{error}");
+        assert!(!error.contains(RECORD_ID), "{error}");
+    }
+
+    #[test]
+    fn legacy_write_calls_normalize_while_detach_stays_outside() {
+        assert_eq!(
+            normalize_legacy_record_selector(
+                "update_record",
+                json!({"record_id":RECORD_ID, "reason":"r", "body_append":"t"}),
+            )
+            .unwrap(),
+            json!({"id":RECORD_ID, "reason":"r", "body_append":"t"})
+        );
+        // A singleton batch list keeps its batch meaning through the legacy
+        // tool name as well.
+        let batch = json!({"ids":[RECORD_ID], "reason":"r", "facets":{"a":"b"}});
+        assert_eq!(
+            normalize_legacy_record_selector("update_record", batch.clone()).unwrap(),
+            batch
+        );
+        assert_eq!(
+            normalize_legacy_record_selector("attach_text", json!({"id":RECORD_ID, "text":"t"}),)
+                .unwrap(),
+            json!({"record_id":RECORD_ID, "text":"t"})
+        );
+        assert_eq!(
+            normalize_legacy_record_selector(
+                "archive_record",
+                json!({"record_id":RECORD_ID, "reason":"r"}),
+            )
+            .unwrap(),
+            json!({"id":RECORD_ID, "reason":"r"})
+        );
+        assert_eq!(
+            normalize_legacy_record_selector(
+                "manage_facet_observations",
+                json!({"action":"set", "id":RECORD_ID, "key":"k"}),
+            )
+            .unwrap(),
+            json!({"action":"set", "record_id":RECORD_ID, "key":"k"})
+        );
+        assert_eq!(
+            normalize_legacy_record_selector(
+                "manage_facet_observations",
+                json!({"action":"unset", "ids":[RECORD_ID], "key":"k"}),
+            )
+            .unwrap(),
+            json!({"action":"unset", "record_id":RECORD_ID, "key":"k"})
+        );
+        // Selectors naming other entities never enter the contract.
+        for (tool, arguments) in [
+            (
+                "manage_attachments",
+                json!({"action":"detach", "attachment_id":"a"}),
+            ),
+            (
+                "manage_attachments",
+                json!({"action":"inspect", "attachment_id":"a"}),
+            ),
+            ("create_record", json!({"id":"new", "type":"Document"})),
+        ] {
+            assert_eq!(
+                normalize_legacy_record_selector(tool, arguments.clone()).unwrap(),
+                arguments,
+                "{tool} must remain outside the alias contract"
+            );
+        }
+    }
+
+    #[test]
+    fn write_alias_schema_accepts_one_spelling_and_rejects_conflicts() {
+        let base = json!({
+            "type":"object",
+            "properties":{
+                "id":{"type":"string"},
+                "archived":{"type":"boolean"}
+            },
+            "required":["id"],
+            "additionalProperties":false
+        });
+        let schema = with_record_selector_aliases("archive_record", base);
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        for arguments in [
+            json!({"id":RECORD_ID}),
+            json!({"record_id":RECORD_ID}),
+            json!({"ids":[RECORD_ID]}),
+        ] {
+            assert!(validator.is_valid(&arguments), "{arguments}: {schema}");
+        }
+        for arguments in [
+            json!({}),
+            json!({"ids":[]}),
+            json!({"ids":[RECORD_ID,RECORD_ID]}),
+            json!({"id":RECORD_ID,"record_id":RECORD_ID}),
+        ] {
+            assert!(!validator.is_valid(&arguments), "{arguments}: {schema}");
+        }
+    }
+
+    #[test]
+    fn claim_alias_schemas_preserve_the_exact_uuid_pattern_on_every_spelling() {
+        let base = json!({
+            "type":"object",
+            "properties":{
+                "record_id":{
+                    "type":"string",
+                    "pattern":"^[0-9a-f]{8}-[0-9a-f]{4}-[47][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+                },
+                "reason":{"type":"string","minLength":1}
+            },
+            "required":["record_id","reason"],
+            "additionalProperties":false
+        });
+        let schema = with_record_selector_aliases("claim_unowned_record", base);
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        for arguments in [
+            json!({"id":RECORD_ID,"reason":"r"}),
+            json!({"record_id":RECORD_ID,"reason":"r"}),
+            json!({"ids":[RECORD_ID],"reason":"r"}),
+        ] {
+            assert!(validator.is_valid(&arguments), "{arguments}: {schema}");
+        }
+        // An abbreviation is not an exact id on any spelling, so schema and
+        // runtime agree before the handler's exactness check runs.
+        for arguments in [
+            json!({"id":"0537ed7","reason":"r"}),
+            json!({"record_id":"0537ed7","reason":"r"}),
+            json!({"ids":["0537ed7"],"reason":"r"}),
+        ] {
+            assert!(!validator.is_valid(&arguments), "{arguments}: {schema}");
+        }
+    }
+
+    #[test]
+    fn aliases_are_confined_to_record_selectors_not_sibling_entities() {
+        // Selectors identifying other entities stay outside the contract:
+        // `create_record.id` mints a new id, `attachment_id`/`citation`
+        // selectors address attachments, link endpoints address pairs, and
+        // `manage_links.add` carries two record endpoints rather than one
+        // mutation target.
+        for operation in [
+            "create_record",
+            "read_attachment",
+            "manage_attachments.inspect",
+            "manage_attachments.detach",
+            "manage_citations.remove",
+            "manage_links.add",
+            "query_record",
+        ] {
+            let arguments = json!({"ids":[RECORD_ID]});
+            assert_eq!(
+                normalize_operation_record_selector(operation, arguments.clone()).unwrap(),
+                arguments,
+                "{operation} must remain outside the alias contract"
+            );
+        }
+        assert_eq!(
+            normalize_legacy_record_selector(
+                "manage_attachments",
+                json!({"action":"inspect", "ids":[RECORD_ID]}),
+            )
+            .unwrap(),
+            json!({"action":"inspect", "ids":[RECORD_ID]})
+        );
+        assert_eq!(
+            normalize_legacy_record_selector(
+                "manage_attachments",
+                json!({"action":"list", "ids":[RECORD_ID]}),
+            )
+            .unwrap(),
+            json!({"action":"list", "record_id":RECORD_ID})
+        );
+    }
+
+    #[test]
+    fn alias_schema_accepts_one_spelling_and_rejects_conflicts_and_cardinality_errors() {
+        let base = json!({
+            "type":"object",
+            "properties":{
+                "record_id":{"type":"string"},
+                "key":{"type":"string"}
+            },
+            "required":["record_id", "key"],
+            "additionalProperties":false
+        });
+        let schema = with_record_selector_aliases("manage_facet_observations.list", base);
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        for arguments in [
+            json!({"id":RECORD_ID,"key":"amount"}),
+            json!({"record_id":RECORD_ID,"key":"amount"}),
+            json!({"ids":[RECORD_ID],"key":"amount"}),
+        ] {
+            assert!(validator.is_valid(&arguments), "{arguments}: {schema}");
+        }
+        for arguments in [
+            json!({"key":"amount"}),
+            json!({"ids":[],"key":"amount"}),
+            json!({"ids":[RECORD_ID,RECORD_ID],"key":"amount"}),
+            json!({"id":RECORD_ID,"record_id":RECORD_ID,"key":"amount"}),
+        ] {
+            assert!(!validator.is_valid(&arguments), "{arguments}: {schema}");
+        }
+    }
+
+    #[test]
+    fn read_alias_schemas_keep_established_bytes_and_canonical_descriptions() {
+        // The write-side pattern propagation must not drift read
+        // descriptors: aliases carry validation constraints only, while the
+        // canonical field alone keeps its prose description.
+        let base = json!({
+            "type":"object",
+            "properties":{
+                "record_id":{"type":"string","description":"Attachment parent."},
+                "action":{"const":"list"}
+            },
+            "required":["action","record_id"],
+            "additionalProperties":false
+        });
+        let schema = with_record_selector_aliases("manage_attachments.list", base);
+        assert_eq!(
+            schema["properties"]["record_id"],
+            json!({"type":"string","description":"Attachment parent.","minLength":1})
+        );
+        assert_eq!(
+            schema["properties"]["id"],
+            json!({"type":"string","minLength":1})
+        );
+        assert_eq!(
+            schema["properties"]["ids"],
+            json!({
+                "type":"array",
+                "items":{"type":"string","minLength":1},
+                "minItems":1,
+                "maxItems":1
+            })
+        );
+        assert_eq!(
+            schema["oneOf"],
+            json!([{"required":["id"]},{"required":["record_id"]},{"required":["ids"]}])
+        );
+    }
+
     #[test]
     fn abbreviations_are_recognised_only_between_the_floor_and_a_whole_uuid() {
         assert_eq!(canonical_prefix("abc12"), None, "below the six-hex floor");
@@ -1091,6 +2161,32 @@ mod tests {
     /// workbench a record it cannot render. Both spellings must answer alike,
     /// and the tool boundary must be untouched.
     #[tokio::test]
+    async fn abbreviated_argument_resolution_does_not_wait_for_writer_pool() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let id = "0189d4c6-1f2a-4a1b-9c3d-5e6f70819293";
+        seed(&db, &[id]).await;
+        let mut held = Vec::new();
+        for _ in 0..5 {
+            held.push(db.write_pool().acquire().await.unwrap());
+        }
+        let resolved = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            resolve_record_ids(
+                &EngineHandle::Sqlite(db.clone()),
+                &Caller::local(),
+                "get_record",
+                json!({"ids":["0189d4c"]}),
+            ),
+        )
+        .await
+        .expect("reference resolution must not wait for a writer-pool slot")
+        .unwrap();
+        assert_eq!(resolved, json!({"ids":[id]}));
+        drop(held);
+        db.close().await;
+    }
+
+    #[tokio::test]
     async fn a_tombstoned_record_does_not_resolve_at_the_url_boundary() {
         let db = crate::create_database(":memory:").await.unwrap();
         let live = "0189d4c6-1f2a-4a1b-9c3d-5e6f70819293";
@@ -1118,8 +2214,10 @@ mod tests {
             ReferenceResolution::Resolved(id) if id == live
         ));
 
-        // The tool boundary is unchanged: the id is still taken, so it passes
-        // through untouched rather than resolving onto anything.
+        // The tool boundary still does not resolve a complete id. The new
+        // scalar alias is normalized to get_record's canonical batch shape,
+        // but the tombstoned value itself passes through untouched so the
+        // handler retains its existing not-found behavior.
         assert_eq!(
             resolve_record_ids(
                 &EngineHandle::Sqlite(db.clone()),
@@ -1129,7 +2227,7 @@ mod tests {
             )
             .await
             .unwrap(),
-            json!({ "id": tombstoned })
+            json!({ "ids": [tombstoned] })
         );
         db.close().await;
     }
@@ -1207,6 +2305,53 @@ mod tests {
             "the surface can only offer a choice if the message names every \
              candidate as a full dashed id; found {named} in: {message}"
         );
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn selector_aliases_preserve_caller_scoped_prefix_resolution() {
+        use crate::authorization::{replace_explicit_policy, AllowEntry};
+
+        let db = crate::create_database(":memory:").await.unwrap();
+        let visible = "a11ceee1-1111-4000-8000-000000000001";
+        let hidden = "a11ceee2-2222-4000-8000-000000000002";
+        seed(&db, &[visible, hidden]).await;
+        replace_explicit_policy(
+            &db,
+            "test:selector-aliases",
+            visible,
+            vec![AllowEntry::account("acct:bea", Capability::View)],
+        )
+        .await
+        .unwrap();
+        replace_explicit_policy(
+            &db,
+            "test:selector-aliases",
+            hidden,
+            vec![AllowEntry::account("acct:other", Capability::View)],
+        )
+        .await
+        .unwrap();
+
+        let caller = Caller::authenticated("acct:bea");
+        for selector in [
+            json!({"id":"a11ceee"}),
+            json!({"record_id":"a11ceee"}),
+            json!({"ids":["a11ceee"]}),
+        ] {
+            assert_eq!(
+                resolve_record_ids(
+                    &EngineHandle::Sqlite(db.clone()),
+                    &caller,
+                    "render_record",
+                    selector,
+                )
+                .await
+                .unwrap(),
+                json!({"id":visible}),
+                "an invisible collision must not make any alias ambiguous"
+            );
+        }
         db.close().await;
     }
 

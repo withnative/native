@@ -1643,7 +1643,7 @@ async fn describe_schema_classifies_tables_by_authority() {
     // The read log announces its own disposability in the orientation surface —
     // a caller tempted to build on these rows should learn from the schema
     // description that they may simply not be there.
-    for table in ["read_log_calls", "read_log_touches"] {
+    for table in ["read_log_calls", "read_log_touches", "read_log_record_ids"] {
         assert!(
             role_of(table).contains("disposable"),
             "{table} must describe itself as disposable"
@@ -1896,7 +1896,7 @@ async fn kind_schema_and_supported_writes_require_non_empty_values() {
             .unwrap_or_else(|| panic!("{tool} not registered"))
             .input_schema;
         let branch = if tool == "update_record" {
-            &schema["oneOf"][0]
+            &schema["oneOf"][0]["allOf"][0]
         } else {
             schema
         };
@@ -1912,8 +1912,8 @@ async fn kind_schema_and_supported_writes_require_non_empty_values() {
         .iter()
         .any(|field| field == "kind"));
     assert_eq!(
-        registry.get("update_record").unwrap().input_schema["oneOf"][0]["properties"]["kind"]
-            ["type"],
+        registry.get("update_record").unwrap().input_schema["oneOf"][0]["allOf"][0]["properties"]
+            ["kind"]["type"],
         "string"
     );
 
@@ -2679,7 +2679,13 @@ async fn update_record_multi_contract_is_bounded_exact_and_singular_compatible()
     assert!(singular.get("results").is_none());
 
     for (args, needle) in [
-        (json!({"ids":[],"maturity":"active"}), "at least one"),
+        // Malformed selectors reject with the value-free shape diagnostic
+        // before the batch parser runs; the semantic cases below still reach
+        // it unchanged.
+        (
+            json!({"ids":[],"maturity":"active"}),
+            "exactly one selector",
+        ),
         (
             json!({"ids":[id.clone(),id.clone()],"maturity":"active"}),
             "duplicates",
@@ -2694,7 +2700,7 @@ async fn update_record_multi_contract_is_bounded_exact_and_singular_compatible()
         ),
         (
             json!({"id":id.clone(),"ids":[id.clone()],"maturity":"active"}),
-            "unknown field",
+            "exactly one selector",
         ),
     ] {
         let error = call_err(&registry, &db, "update_record", args).await;
@@ -2711,7 +2717,7 @@ async fn update_record_multi_contract_is_bounded_exact_and_singular_compatible()
         json!({"ids":over_limit,"maturity":"active"}),
     )
     .await;
-    assert!(error.contains("at most 100"), "{error}");
+    assert!(error.contains("exactly one selector"), "{error}");
 }
 
 #[tokio::test]
@@ -3293,4 +3299,173 @@ async fn rebuild_and_diff_passes_after_a_full_tool_session() {
         "projections diverge from replay: {:?}",
         diff.tables
     );
+}
+
+// ---------------------------------------------------------------------------
+// Record selector aliases on single-record writes (e674559)
+// ---------------------------------------------------------------------------
+
+/// Each alias spelling reaches the same single record as the canonical field,
+// proven by actual writes rather than normaliser output alone.
+#[tokio::test]
+async fn write_selector_aliases_reach_the_same_single_record() {
+    let db = db().await;
+    let registry = registry();
+    let id = create(
+        &registry,
+        &db,
+        json!({ "type": "Document", "name": "alias target", "body": "start" }),
+    )
+    .await;
+
+    // update_record via record_id writes exactly as id would.
+    let out = call(
+        &registry,
+        &db,
+        "update_record",
+        json!({ "record_id": id, "body_append": " plus alias" }),
+    )
+    .await;
+    assert_eq!(out["id"], id);
+    let fetched = call(&registry, &db, "get_record", json!({ "ids": [id] })).await;
+    assert_eq!(fetched["records"][0]["body"], "start plus alias");
+
+    // attach_text via id attaches under the same record.
+    let out = call(
+        &registry,
+        &db,
+        "attach_text",
+        json!({ "id": id, "text": "aliased bytes", "filename": "alias.txt" }),
+    )
+    .await;
+    assert_eq!(out["record_id"], id);
+
+    // archive_record via record_id archives; a singleton ids list — the
+    // Single-cardinality alias — restores the same record.
+    let out = call(&registry, &db, "archive_record", json!({ "record_id": id })).await;
+    assert_eq!(out["changed"], true);
+    let out = call(
+        &registry,
+        &db,
+        "archive_record",
+        json!({ "ids": [id], "archived": false }),
+    )
+    .await;
+    assert_eq!(out["changed"], true);
+    let fetched = call(&registry, &db, "get_record", json!({ "ids": [id] })).await;
+    assert_eq!(fetched["records"][0]["archived"], false);
+
+    // delete_record via record_id tombstones the same record.
+    let doomed = create(
+        &registry,
+        &db,
+        json!({ "type": "Document", "name": "scrap" }),
+    )
+    .await;
+    let out = call(
+        &registry,
+        &db,
+        "delete_record",
+        json!({ "record_id": doomed }),
+    )
+    .await;
+    assert_eq!(out["deleted"], true);
+}
+
+/// A singleton `ids` on update_record is a batch call, never a coerced
+/// single write: single-only fields reject through the batch parser and a
+/// well-formed singleton batch still executes with batch semantics.
+#[tokio::test]
+async fn update_record_singleton_ids_is_never_coerced_to_a_single_write() {
+    let db = db().await;
+    let registry = registry();
+    let id = create(
+        &registry,
+        &db,
+        json!({ "type": "Document", "name": "batch target", "body": "untouched" }),
+    )
+    .await;
+
+    let before = crate::common::count(&db, "SELECT COUNT(*) AS n FROM content_events").await;
+    // body_append is a single-write field: on the batch branch it is an
+    // unknown field, not a silent single write.
+    let err = call_err(
+        &registry,
+        &db,
+        "update_record",
+        json!({ "ids": [id], "body_append": "must not land" }),
+    )
+    .await;
+    assert!(err.contains("update_record"), "{err}");
+    assert_eq!(
+        crate::common::count(&db, "SELECT COUNT(*) AS n FROM content_events").await,
+        before,
+        "a rejected singleton batch must write nothing"
+    );
+    let fetched = call(&registry, &db, "get_record", json!({ "ids": [id] })).await;
+    assert_eq!(fetched["records"][0]["body"], "untouched");
+
+    // The same singleton with batch fields executes as a batch of one.
+    let out = call(
+        &registry,
+        &db,
+        "update_record",
+        json!({ "ids": [id], "facets": { "priority": "high" } }),
+    )
+    .await;
+    assert_eq!(out["requested"], 1);
+    assert_eq!(out["changed"], 1);
+    assert_eq!(out["results"][0]["id"], id);
+}
+
+/// Conflicting or malformed write selectors reject with the value-free shape
+/// diagnostic and write nothing: no event lands and the rejected id never
+/// appears in the error.
+#[tokio::test]
+async fn conflicting_write_selectors_reject_without_mutation_or_values() {
+    let db = db().await;
+    let registry = registry();
+    let id = create(
+        &registry,
+        &db,
+        json!({ "type": "Document", "name": "alias guard", "body": "pristine" }),
+    )
+    .await;
+
+    for (tool, args) in [
+        (
+            "update_record",
+            json!({ "id": id, "record_id": id, "name": "must not land" }),
+        ),
+        (
+            "update_record",
+            json!({ "record_id": id, "ids": [id], "name": "must not land" }),
+        ),
+        (
+            "attach_text",
+            json!({ "record_id": id, "ids": [id], "text": "t", "filename": "f" }),
+        ),
+        (
+            "archive_record",
+            json!({ "id": id, "record_id": id, "archived": true }),
+        ),
+        ("archive_record", json!({ "ids": [], "archived": true })),
+        ("delete_record", json!({ "id": id, "ids": [id] })),
+    ] {
+        let before = crate::common::count(&db, "SELECT COUNT(*) AS n FROM content_events").await;
+        let err = call_err(&registry, &db, tool, args).await;
+        assert!(err.contains("exactly one selector"), "{tool}: {err}");
+        assert!(
+            !err.contains(&id),
+            "{tool} reflected the rejected value: {err}"
+        );
+        assert_eq!(
+            crate::common::count(&db, "SELECT COUNT(*) AS n FROM content_events").await,
+            before,
+            "{tool} wrote despite rejecting the selector"
+        );
+    }
+    let fetched = call(&registry, &db, "get_record", json!({ "ids": [id] })).await;
+    assert_eq!(fetched["records"][0]["body"], "pristine");
+    assert_eq!(fetched["records"][0]["archived"], false);
 }

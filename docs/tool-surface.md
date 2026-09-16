@@ -59,6 +59,30 @@ generated inventory to locate the operation.
 - Optional or experimental operations retain the maturity stated in the
   capability map and generated inventory.
 
+## Work coordination
+
+`start_work` claims a record (`claim`, the default), inspects without writing
+(`preview`), or hands a claim back (`release`). Arguments: `record_id`
+(required); `action` (`claim` | `preview` | `release`); `agent_id`
+(deprecated and ignored — ownership comes from the authenticated account and
+validated `run_key`); `expected_holder_run_key` (`string | null`, absent by
+default) as the compare-and-release guard for same-account recovery.
+
+Release rules: the exact stored account-and-run holder releases unchanged and
+needs no extra argument (a supplied `expected_holder_run_key` must match).
+Another run of the same account succeeds only when `expected_holder_run_key`
+equals the stored holder run key (explicit null for an account-only holder);
+without it the call is refused naming the holding run key, with a wrong value
+it is refused as a changed holder to preview and retry. Any other principal is
+refused with `claimed by another caller` and learns nothing. Claims never
+expire and are never auto-released.
+
+Visibility: a caller under the same account sees `work_state` as `visible`
+with the holder's `run_state` (`open` | `closed` | `missing` |
+`not_applicable`) and `holder_tier` (`this_run` | `another_run_of_this_agent`
+| `another_agent_of_yours`), plus the top-level `held_by*` fields. Any other
+principal sees `withheld` exactly as before.
+
 ## Regeneration
 
 The inventory generator is selected source and requires the `dev-tools`

@@ -116,10 +116,13 @@ pub const REASON_REQUIRED_TOOLS: [&str; 6] = [
 /// Tests that are ABOUT the requirement pass their own value (or deliberately
 /// omit it); everything else would otherwise have to restate a reason it does not
 /// care about on every write, which buries the assertions under boilerplate. The
-/// helper never overwrites a reason or kind the caller supplied, so tests
-/// asserting either contract still control it. `x-test-fixture` is deliberately
-/// a novel honest token: it exercises open-additive storage without pretending
-/// to be a governed domain classification.
+/// helper never overwrites a reason, kind or response mode the caller supplied,
+/// so tests asserting those contracts still control them. Legacy integration
+/// fixtures generally inspect full enriched write shapes, so singleton writes
+/// opt into verbose here; focused raw-registry tests cover the public summary
+/// default. `x-test-fixture` is deliberately a novel honest token: it exercises
+/// open-additive storage without pretending to be a governed domain
+/// classification.
 pub fn with_test_reason(tool: &str, mut args: serde_json::Value) -> serde_json::Value {
     if tool == "create_record" {
         if let Some(object) = args.as_object_mut() {
@@ -137,6 +140,11 @@ pub fn with_test_reason(tool: &str, mut args: serde_json::Value) -> serde_json::
                 "Test fixture write — this call's subject is not the reason field.".into(),
             )
         });
+        if tool == "create_record" || (tool == "update_record" && !object.contains_key("ids")) {
+            object
+                .entry("response_mode")
+                .or_insert_with(|| serde_json::Value::String("verbose".into()));
+        }
     }
     args
 }

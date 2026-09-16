@@ -33,26 +33,48 @@ pub(crate) async fn require_canonical_account(
     tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
     record_id: &str,
 ) -> Result<String> {
-    let rows = sqlx::query(
+    let rows: Vec<String> = sqlx::query_scalar(
         "SELECT identifier FROM bindings
          WHERE record_id = ? AND system = 'account' AND is_canonical = 1",
     )
     .bind(record_id)
     .fetch_all(&mut **tx)
     .await?;
-    if rows.len() != 1 {
-        return Err(identity_invariant(format!(
+    match canonical_account_from_rows(record_id, &rows)? {
+        Some(token) => Ok(token),
+        None => Err(identity_invariant(format!(
+            "person record '{record_id}' must have exactly one canonical account binding (found 0)"
+        ))),
+    }
+}
+
+/// Validate already-fetched canonical account identifiers for `record_id`
+/// against the single portable-identity authority.
+///
+/// Empty means "no canonical account": repairable, so the caller falls back
+/// to provisioning/repair (`Ok(None)`). Exactly one portable token is the
+/// established case; anything else (a malformed token, multiples) is corrupt
+/// state and fails closed. Shared by the warm read probe and the repair path
+/// so both enforce the same invariant without copying its error strings.
+pub(crate) fn canonical_account_from_rows(
+    record_id: &str,
+    rows: &[String],
+) -> Result<Option<String>> {
+    match rows {
+        [token] => {
+            if !is_account_token(token) {
+                return Err(identity_invariant(format!(
+                    "person record '{record_id}' has malformed canonical account token"
+                )));
+            }
+            Ok(Some(token.clone()))
+        }
+        [] => Ok(None),
+        _ => Err(identity_invariant(format!(
             "person record '{record_id}' must have exactly one canonical account binding (found {})",
             rows.len()
-        )));
+        ))),
     }
-    let token = rows[0].try_get::<String, _>("identifier")?;
-    if !is_account_token(&token) {
-        return Err(identity_invariant(format!(
-            "person record '{record_id}' has malformed canonical account token"
-        )));
-    }
-    Ok(token)
 }
 
 pub(crate) fn is_account_token(token: &str) -> bool {

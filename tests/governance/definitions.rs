@@ -823,6 +823,19 @@ fn resolve_suggestions_description_explains_authoring_recipe() {
 
 #[test]
 fn lifecycle_tool_descriptions_explain_comment_authoring_discovery_and_resolution() {
+    fn property<'a>(schema: &'a serde_json::Value, name: &str) -> Option<&'a serde_json::Value> {
+        schema
+            .get("properties")
+            .and_then(|properties| properties.get(name))
+            .or_else(|| {
+                ["allOf", "anyOf", "oneOf"]
+                    .into_iter()
+                    .filter_map(|keyword| schema.get(keyword).and_then(serde_json::Value::as_array))
+                    .flatten()
+                    .find_map(|branch| property(branch, name))
+            })
+    }
+
     let registry = registry();
     let create = &registry.get("create_record").unwrap().description;
     for phrase in [
@@ -846,7 +859,8 @@ fn lifecycle_tool_descriptions_explain_comment_authoring_discovery_and_resolutio
     ] {
         assert!(get.contains(phrase), "missing {phrase:?}: {get}");
     }
-    let ids = registry.get("get_record").unwrap().input_schema["properties"]["ids"]["description"]
+    let ids = property(&registry.get("get_record").unwrap().input_schema, "ids").unwrap()
+        ["description"]
         .as_str()
         .unwrap();
     for phrase in ["short record references", "search.query", "unknown text"] {

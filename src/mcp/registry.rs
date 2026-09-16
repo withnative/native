@@ -1220,7 +1220,40 @@ impl crate::domain_transaction::request::RequestLifecyclePort for SqliteRequestL
         capture: crate::domain_transaction::request::InteractionCapture<'a>,
     ) -> BoxFuture<'a, ()> {
         Box::pin(async move {
-            if let Some(task) = super::interactions::spawn_record_call(
+            // Semantic-declaration exception: a successful `set_intent` call
+            // IS its declaration row — `runkey::intent_at` and the
+            // event-context episode boundary read it back on the very next
+            // call — so it runs to durability on this task instead of the
+            // lossy queue. A full queue would drop the acknowledged
+            // declaration, and a global drain could stall it behind
+            // continuous traffic; the direct path has neither property.
+            // Ordinary reads enqueue below and return immediately.
+            if matches!(
+                (capture.extractor, capture.outcome),
+                (Extractor::Shipped(ToolKind::SetIntent), Ok(_))
+            ) {
+                super::interactions::record_declaration_call(
+                    self.db,
+                    capture.extractor,
+                    capture.tool_name,
+                    capture.caller,
+                    capture.original_arguments,
+                    capture.run_context,
+                    capture.outcome,
+                    capture.started_at,
+                    capture.ended_at,
+                    Some("native.interaction-log.v1"),
+                    self.persistence_lease.clone(),
+                )
+                .await;
+                return;
+            }
+            // Response-independent by construction: enqueue on the handle's
+            // bounded background queue and return. The caller never waits for
+            // the capture write, so pool pressure on the serialised writer
+            // delays only later captures, never the response. Drops and
+            // failures are counted on the handle and reported to stderr.
+            super::interactions::enqueue_record_call(
                 self.db,
                 capture.extractor,
                 capture.tool_name,
@@ -1232,9 +1265,7 @@ impl crate::domain_transaction::request::RequestLifecyclePort for SqliteRequestL
                 capture.ended_at,
                 Some("native.interaction-log.v1"),
                 self.persistence_lease.clone(),
-            ) {
-                let _ = task.await;
-            }
+            );
         })
     }
 }
@@ -1441,7 +1472,31 @@ async fn dispatch_with_request_port<
             let arguments =
                 crate::mcp::record_ref::resolve_record_ids(&engine, &caller, name, arguments)
                     .await?;
-            handler(engine, caller, arguments).await
+            crate::mcp::request_timing::pre_handler_complete();
+            // Handler-body write-pool acquisition count for the readonly-pool
+            // migration (stage 1: instrument only). Test-only scope around the
+            // handler alone — after reference resolution, before capture — so
+            // the pre-handler resolve snapshot, the admission-policy load, and
+            // the post-handler detached capture write are never attributed to
+            // the handler. Tests observe the count via
+            // `db::with_write_pool_acquisition_sink`; release builds retain
+            // only the cheap request-local hosted timing wrapper, which is a
+            // no-op when no hosted timing scope is installed.
+            #[cfg(test)]
+            {
+                let (outcome, handler_acquisitions) = crate::mcp::request_timing::handler(
+                    crate::db::with_write_pool_acquisition_counter(handler(
+                        engine, caller, arguments,
+                    )),
+                )
+                .await;
+                crate::db::publish_write_pool_acquisitions(handler_acquisitions);
+                outcome
+            }
+            #[cfg(not(test))]
+            {
+                crate::mcp::request_timing::handler(handler(engine, caller, arguments)).await
+            }
         },
     )
     .await
@@ -3484,8 +3539,12 @@ mod hosting_context_tests {
         assert_eq!(caller.hosting_database(), Some("shared-database"));
     }
 
+    /// The response-path contract: a blocked capture write must not hold the
+    /// response. The gate parks the capture inside its write transaction; the
+    /// call still returns, the row is absent until release, and the next call
+    /// proceeds on a healthy pool afterwards.
     #[tokio::test]
-    async fn cancelled_request_leaves_owned_capture_to_finish_before_the_next_call() {
+    async fn response_returns_while_capture_blocked_and_capture_completes_after_release() {
         let db = crate::db::create_database(":memory:").await.unwrap();
         let mut registry = ToolRegistry::new();
         crate::mcp::register_builtin_tools(&mut registry).unwrap();
@@ -3507,20 +3566,41 @@ mod hosting_context_tests {
         tokio::time::timeout(Duration::from_secs(1), gate.wait_until_entered())
             .await
             .expect("capture entered its write transaction");
-
-        request.abort();
-        assert!(request.await.unwrap_err().is_cancelled());
-        gate.release();
-        tokio::time::timeout(Duration::from_secs(1), gate.wait_until_completed())
+        let result = tokio::time::timeout(Duration::from_secs(2), request)
             .await
-            .expect("detached capture completed after request cancellation");
+            .expect("response waited for the blocked capture")
+            .unwrap()
+            .unwrap();
+        assert_eq!(result["ok"], true);
 
+        let missing: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM read_log_calls WHERE tool = 'ping'")
+                .fetch_one(db.write_pool())
+                .await
+                .unwrap();
+        assert_eq!(missing, 0, "blocked capture became visible before release");
+
+        gate.release();
+        db.drain_captures().await;
         let captured: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM read_log_calls WHERE tool = 'ping'")
                 .fetch_one(db.write_pool())
                 .await
                 .unwrap();
         assert_eq!(captured, 1);
+        let stats = db.capture_stats();
+        assert_eq!(
+            stats,
+            crate::mcp::interactions::CaptureStats {
+                enqueued: 1,
+                completed: 1,
+                failed: 0,
+                dropped_full: 0,
+                dropped_shutdown: 0,
+                declarations_completed: 0,
+                declarations_failed: 0,
+            }
+        );
 
         let next = registry
             .call(db.clone(), Caller::local(), "ping", json!({}))
@@ -3529,16 +3609,976 @@ mod hosting_context_tests {
         assert_eq!(next["ok"], true);
         crate::store::create_record(
             &db,
-            json!({ "type": "Document", "kind": "note", "name": "after cancellation" }),
+            json!({ "type": "Document", "kind": "note", "name": "after blocked capture" }),
         )
         .await
         .unwrap();
+        db.drain_captures().await;
         let captured: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM read_log_calls WHERE tool = 'ping'")
                 .fetch_one(db.write_pool())
                 .await
                 .unwrap();
         assert_eq!(captured, 2);
+        db.close().await;
+    }
+
+    /// The semantic-declaration exception: a successful `set_intent` response
+    /// returns only after its declaration row is durable, so the very next
+    /// call observes the intent with no drain in between. Deliberately no
+    /// `drain_captures` anywhere in this test — waiting indiscriminately
+    /// would hide a regression of the exception back into the queue.
+    #[tokio::test]
+    async fn set_intent_declaration_is_durable_before_response() {
+        let db = crate::db::create_database(":memory:").await.unwrap();
+        let mut registry = ToolRegistry::new();
+        crate::mcp::register_builtin_tools(&mut registry).unwrap();
+        crate::mcp::register_surface_tools(&mut registry).unwrap();
+        let run_key = "scout-chair-a748b2";
+
+        let declared = registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "set_intent",
+                json!({"intent": "declare the sprint boundary", "run_key": run_key}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(declared["accepted_intent"], "declare the sprint boundary");
+
+        let durable = crate::runkey::intent_at(&db, Some(run_key)).await;
+        assert_eq!(durable.as_deref(), Some("declare the sprint boundary"));
+
+        let next = registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "get_record",
+                json!({"ids": [crate::schema::ROOT_RECORD_ID], "run_key": run_key}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(next["run_context"]["intent"], "declare the sprint boundary");
+        db.close().await;
+    }
+
+    /// Declarations bypass the lossy queue entirely, so a shut-down (or full)
+    /// queue cannot drop an acknowledged intent: the row lands and the
+    /// ordinary capture afterwards is the one counted as refused.
+    #[tokio::test]
+    async fn set_intent_declares_despite_capture_shutdown() {
+        let db = crate::db::create_database(":memory:").await.unwrap();
+        let mut registry = ToolRegistry::new();
+        crate::mcp::register_builtin_tools(&mut registry).unwrap();
+        crate::mcp::register_surface_tools(&mut registry).unwrap();
+        db.capture_queue_for_test_initiate_shutdown();
+
+        let declared = registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "set_intent",
+                json!({"intent": "shutdown-proof declaration", "run_key": "scout-chair-a748b2"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(declared["accepted_intent"], "shutdown-proof declaration");
+
+        let row: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM read_log_calls WHERE tool = 'set_intent' AND intent = 'shutdown-proof declaration'",
+        )
+        .fetch_one(db.write_pool())
+        .await
+        .unwrap();
+        assert_eq!(row, 1);
+
+        registry
+            .call(db.clone(), Caller::local(), "ping", json!({}))
+            .await
+            .unwrap();
+        let stats = db.capture_stats();
+        assert_eq!(stats.dropped_shutdown, 1);
+        assert_eq!(stats.failed, 0);
+        db.close().await;
+    }
+
+    /// Eviction is not graceful shutdown: a capture still queued when the
+    /// pools close fails on the closed pool and is counted, never silently
+    /// lost. The gate parks capture A inside its transaction; B queues
+    /// behind it; eviction closes the pools; A still commits on its
+    /// checked-out connection while B's begin fails closed.
+    #[tokio::test]
+    async fn evicted_queued_capture_fails_closed_and_is_counted() {
+        let db = crate::db::create_database(":memory:").await.unwrap();
+        let mut registry = ToolRegistry::new();
+        crate::mcp::register_builtin_tools(&mut registry).unwrap();
+        let registry = Arc::new(registry);
+        let gate = Arc::new(super::super::interactions::CaptureTestGate::default());
+
+        let first = tokio::spawn({
+            let db = db.clone();
+            let registry = registry.clone();
+            let gate = gate.clone();
+            async move {
+                super::super::interactions::with_capture_test_gate(
+                    gate,
+                    registry.call(db, Caller::local(), "ping", json!({})),
+                )
+                .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(1), gate.wait_until_entered())
+            .await
+            .expect("first capture entered its write transaction");
+        registry
+            .call(db.clone(), Caller::local(), "ping", json!({}))
+            .await
+            .unwrap();
+        db.close_in_background();
+        gate.release();
+        first.await.unwrap().unwrap();
+        db.drain_captures().await;
+
+        let stats = db.capture_stats();
+        assert_eq!(stats.enqueued, 2);
+        assert_eq!(stats.completed, 2);
+        assert_eq!(
+            stats.failed, 1,
+            "queued capture was not counted on eviction"
+        );
+        let rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM read_log_calls WHERE tool = 'ping'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap_or(-1);
+        assert!(
+            rows == 1 || rows == -1,
+            "unexpected read_log state after eviction: {rows}"
+        );
+    }
+
+    /// Graceful shutdown keeps captures: `close` waits for the parked capture
+    /// instead of failing it on a closed pool.
+    #[tokio::test]
+    async fn graceful_close_drains_pending_capture() {
+        let db = crate::db::create_database(":memory:").await.unwrap();
+        let mut registry = ToolRegistry::new();
+        crate::mcp::register_builtin_tools(&mut registry).unwrap();
+        let gate = Arc::new(super::super::interactions::CaptureTestGate::default());
+
+        let call = tokio::spawn({
+            let db = db.clone();
+            let gate = gate.clone();
+            async move {
+                super::super::interactions::with_capture_test_gate(
+                    gate,
+                    registry.call(db, Caller::local(), "ping", json!({})),
+                )
+                .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(1), gate.wait_until_entered())
+            .await
+            .expect("capture entered its write transaction");
+
+        let closing = tokio::spawn({
+            let db = db.clone();
+            async move { db.close().await }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !closing.is_finished(),
+            "close returned while a capture was still parked"
+        );
+        gate.release();
+        tokio::time::timeout(Duration::from_secs(5), closing)
+            .await
+            .expect("close did not finish after the capture drained")
+            .unwrap();
+        call.await.unwrap().unwrap();
+    }
+
+    /// Fresh enforcement at capture time: the capture path performs no
+    /// request-time policy pre-read, so a strict policy installed after the
+    /// response still rejects the delayed capture at its write boundary.
+    /// `ping` is diagnostic-exempt at request admission (so the response
+    /// stays 200 under strict) while `native.interaction-log.v1` is
+    /// unsupported by the strict target (so the capture must fail). Two
+    /// distinct park points make the interleaving deterministic: A parks
+    /// inside its write transaction; B parks pre-lease (holding no policy
+    /// lease and no write lock), so the strict install lands while B waits
+    /// and B's boundary check then rejects it.
+    #[tokio::test]
+    async fn strict_policy_installed_after_response_still_rejects_delayed_capture() {
+        let db = crate::db::create_database(":memory:").await.unwrap();
+        let mut registry = ToolRegistry::new();
+        crate::mcp::register_builtin_tools(&mut registry).unwrap();
+        let registry = Arc::new(registry);
+        let gate_a = Arc::new(super::super::interactions::CaptureTestGate::default());
+        let gate_b = Arc::new(super::super::interactions::CaptureTestGate::default());
+
+        let first = tokio::spawn({
+            let db = db.clone();
+            let registry = registry.clone();
+            let gate_a = gate_a.clone();
+            async move {
+                super::super::interactions::with_capture_test_gate(
+                    gate_a,
+                    registry.call(db, Caller::local(), "ping", json!({})),
+                )
+                .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(1), gate_a.wait_until_entered())
+            .await
+            .expect("blocker capture entered its write transaction");
+
+        let response = super::super::interactions::with_capture_pre_policy_gate(
+            gate_b.clone(),
+            registry.call(db.clone(), Caller::local(), "ping", json!({})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response["ok"], true);
+
+        gate_a.release();
+        first.await.unwrap().unwrap();
+        // B is next in the FIFO worker and parks before its policy read
+        // lease begins: install strict while it deterministically waits.
+        tokio::time::timeout(Duration::from_secs(1), gate_b.wait_until_entered())
+            .await
+            .expect("delayed capture reached its pre-policy park point");
+        crate::storage_profile::update_portability_policy(
+            &db,
+            crate::storage_profile::PortabilityPolicyUpdate {
+                if_policy_revision: 0,
+                enforcement: crate::storage_profile::PortabilityEnforcement::Strict,
+                target_profiles: vec![crate::storage_profile::StorageTarget {
+                    id: "postgres-server".into(),
+                    revision: 5,
+                    mode: "network".into(),
+                }],
+                allow_conversions: vec![],
+            },
+        )
+        .await
+        .unwrap();
+
+        gate_b.release();
+        db.drain_captures().await;
+
+        let stats = db.capture_stats();
+        assert_eq!(stats.enqueued, 2);
+        assert_eq!(stats.completed, 2);
+        assert_eq!(
+            stats.failed, 1,
+            "delayed capture was not rejected by the fresh strict policy"
+        );
+        let rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM read_log_calls WHERE tool = 'ping'")
+                .fetch_one(db.write_pool())
+                .await
+                .unwrap();
+        assert_eq!(rows, 1, "rejected capture still wrote its row");
+        db.close().await;
+    }
+}
+
+#[cfg(test)]
+mod handler_write_pool_acquisition_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Invoke one tool through the full serving path inside the acquisition
+    /// sink. Returns the tool result and the handler-body write-pool
+    /// acquisition count published by dispatch. The sink starts at a
+    /// sentinel so a broken publish handoff fails loudly instead of
+    /// reading as zero.
+    async fn call_with_acquisition_sink(
+        registry: &ToolRegistry,
+        db: Db,
+        name: &str,
+        arguments: Value,
+    ) -> (Result<Value>, u64) {
+        let sink = Arc::new(AtomicU64::new(u64::MAX));
+        let output = crate::db::with_write_pool_acquisition_sink(
+            Arc::clone(&sink),
+            registry.call(db, Caller::local(), name, arguments),
+        )
+        .await;
+        (output, sink.load(Ordering::Relaxed))
+    }
+
+    fn test_registry() -> ToolRegistry {
+        let mut registry = ToolRegistry::new();
+        crate::mcp::register_surface_tools(&mut registry).unwrap();
+        registry
+    }
+
+    /// Positive control: `create_record` writes through the write pool on its
+    /// handler-body success path, so the instrument must report non-zero.
+    /// Without this, a later "zero" would mean nothing.
+    #[tokio::test]
+    async fn create_record_handler_body_takes_write_pool_connections() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let registry = test_registry();
+        let (result, count) = call_with_acquisition_sink(
+            &registry,
+            db.clone(),
+            "create_record",
+            serde_json::json!({
+                "id": "0e7a0000-0000-4000-8000-000000000011",
+                "type": "Outcome",
+                "kind": "target",
+                "reason": "Positive control for the acquisition counter.",
+            }),
+        )
+        .await;
+        result.unwrap();
+        assert!(
+            count != u64::MAX,
+            "dispatch never published the handler-body count"
+        );
+        assert!(
+            count > 0,
+            "create_record success path reported zero write-pool acquisitions"
+        );
+        db.close().await;
+    }
+
+    /// The handler-body count for `quickstart` — whose handler ignores its
+    /// `Db` and returns static JSON — is zero, even though both bracketing
+    /// acquisitions run: reference resolution beforehand (no-op here, no
+    /// id-shaped args) and interaction capture afterwards. The `read_log_calls`
+    /// assertion proves capture really did write on this request, so the zero
+    /// is exclusion by construction (detached spawn task), not capture being
+    /// skipped.
+    #[tokio::test]
+    async fn quickstart_handler_body_takes_no_write_pool_connections() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let registry = test_registry();
+        let (result, count) =
+            call_with_acquisition_sink(&registry, db.clone(), "quickstart", serde_json::json!({}))
+                .await;
+        result.unwrap();
+        assert!(
+            count != u64::MAX,
+            "dispatch never published the handler-body count"
+        );
+        assert_eq!(
+            count, 0,
+            "quickstart handler body reported {count} write-pool acquisitions"
+        );
+        // Capture runs on the handle's background queue; drain before
+        // asserting the row that proves the zero is exclusion, not absence.
+        db.drain_captures().await;
+        let captured: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM read_log_calls WHERE tool = 'quickstart'")
+                .fetch_one(db.write_pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            captured, 1,
+            "capture did not write for this request, so the zero proves nothing about exclusion"
+        );
+        db.close().await;
+    }
+
+    /// Stage 2 (c331eb8): `bootstrap` performs no writes in-request —
+    /// run-key minting is in-memory collision avoidance, and every other
+    /// resolver read observes committed state — so its handler body must
+    /// take no write-pool connections. Before the migration this reported
+    /// 13 (run-key suggest, canonical-root/children queries, root and
+    /// child `can_record` guards, principal/workspace/world footing reads,
+    /// the lifecycle load, succession annotation, portable instruction
+    /// resolution, and two `user_version` PRAGMAs). Each now reads through
+    /// the physically read-only pool via the existing pool-parameterized
+    /// seams (`*_in_pool`) or a new read-tier variant with identical logic
+    /// (`runkey::suggest_in_pool`, `LifecycleInterpreter::load_in_pool`).
+    /// The `read_log_calls` assertion proves capture really did write for
+    /// this request, so the zero is migration by construction, not a
+    /// skipped pipeline.
+    #[tokio::test]
+    async fn bootstrap_handler_body_takes_no_write_pool_connections() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let registry = test_registry();
+        let (result, count) =
+            call_with_acquisition_sink(&registry, db.clone(), "bootstrap", serde_json::json!({}))
+                .await;
+        result.unwrap();
+        assert!(
+            count != u64::MAX,
+            "dispatch never published the handler-body count"
+        );
+        assert_eq!(
+            count, 0,
+            "bootstrap handler body reported {count} write-pool acquisitions"
+        );
+        db.drain_captures().await;
+        let captured: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM read_log_calls WHERE tool = 'bootstrap'")
+                .fetch_one(db.write_pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            captured, 1,
+            "capture did not write for this request, so the zero proves nothing about exclusion"
+        );
+        db.close().await;
+    }
+
+    /// Stage 2 (c331eb8): `get_structure` performs no writes in-request, so
+    /// its handler body must take no write-pool connections. Before the
+    /// migration this reported 11 (the `require_record` prologue, the root
+    /// existence gate, the containment walk's content and custody reads,
+    /// and succession annotation). The prologue now runs through
+    /// `require_record_in_pool` on the read-only pool — the shared
+    /// `Db`-taking authorization helpers stay on the write pool for write
+    /// handlers that may depend on read-your-writes — and the walk reads
+    /// through the lens shared tier (`descendants_from` /
+    /// `descendants_with_lens_as` now wire `shared_pool` for content and
+    /// authorization; ancestor-chain containment for non-root roots still
+    /// resolves through the passed projection, so a non-root hosted walk
+    /// can take write-pool connections there — the zero asserted here is
+    /// the ROOT live path). Same capture-pipeline guard as `bootstrap` above.
+    #[tokio::test]
+    async fn get_structure_handler_body_takes_no_write_pool_connections() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let registry = test_registry();
+        let (result, count) = call_with_acquisition_sink(
+            &registry,
+            db.clone(),
+            "get_structure",
+            serde_json::json!({ "root_id": crate::schema::ROOT_RECORD_ID }),
+        )
+        .await;
+        result.unwrap();
+        assert!(
+            count != u64::MAX,
+            "dispatch never published the handler-body count"
+        );
+        assert_eq!(
+            count, 0,
+            "get_structure handler body reported {count} write-pool acquisitions"
+        );
+        db.drain_captures().await;
+        let captured: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM read_log_calls WHERE tool = 'get_structure'")
+                .fetch_one(db.write_pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            captured, 1,
+            "capture did not write for this request, so the zero proves nothing about exclusion"
+        );
+        db.close().await;
+    }
+}
+
+/// Nested same-pool acquisition regressions (task 418ef20).
+///
+/// Six read handlers used to hold one write-pool connection for the whole
+/// handler and then take a *second* one from the same 5-slot pool. Five such
+/// calls in flight held every slot while each waited for a sixth, so the only
+/// exit was sqlx's 30 s acquire timeout surfacing as a 503
+/// `DATABASE_POOL_TIMEOUT`.
+///
+/// Three shapes are asserted here, and which one is load-bearing was settled
+/// by reverting each fix and re-running, not by assumption:
+///
+/// - **The constrained-pool cases are the detectors.** They leave exactly one
+///   write-pool connection free and make a single call, so a handler that
+///   ever holds two at once has nothing to take the second from and stalls on
+///   sqlx's 30 s acquire timeout. Verified: with `citations.rs`/`read.rs`
+///   reverted, `annotated_get_record_never_holds_two_write_pool_connections`
+///   fails on its bounded timeout; with `work.rs`/`querying.rs` reverted,
+///   `coordinated_work_reads_never_hold_two_write_pool_connections` fails at
+///   the `start_work` call. They are deterministic in both directions: the
+///   pool is settled to idle first, so nothing but the call under test can
+///   hold a slot.
+/// - **The acquisition-sink count is a change detector, not a proof.** The
+///   sink counts acquisitions, not simultaneous holds, and a handler may
+///   legitimately take several one after another. It does catch this defect —
+///   reverting the fix takes `get_record` from 2 to 3 — but a passing count
+///   alone would not establish that nothing nests.
+/// - **The concurrency cases are the task's acceptance criterion, not
+///   detectors.** They run the five-in-flight shape end to end through the
+///   real 5-connection pool. Measured honestly: both of them still *passed*
+///   against the unfixed code, because five spawned calls do not reliably
+///   align on the slot. They are kept for the end-to-end shape and because
+///   they cannot fail spuriously once the fix is in, but a green run from
+///   them says nothing on its own. Rely on the constrained-pool cases.
+#[cfg(test)]
+mod nested_write_pool_acquisition_tests {
+    use super::*;
+    use serde_json::json;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+
+    const CONCURRENT_CALLS: usize = 5;
+    /// Far below sqlx's 30 s acquire timeout, so a reintroduced nested
+    /// acquire fails the test instead of passing slowly, and far above what
+    /// five uncontended reads cost on any machine this runs on.
+    const BOUNDED: Duration = Duration::from_secs(10);
+    const HOLDER_RUN_KEY: &str = "pilot-river-b748b2";
+    /// `open_pool` in `src/db.rs` builds every write pool with this many
+    /// connections. The whole defect is that six handlers wanted two of them
+    /// at once.
+    const WRITE_POOL_CONNECTIONS: usize = 5;
+
+    /// Wait until nothing holds a write-pool connection.
+    ///
+    /// Interaction capture runs detached after each call, so fixture setup
+    /// can still own a slot when the measured call starts. Taking the pool's
+    /// in-use count to zero first is what makes the constrained-pool tests
+    /// below deterministic instead of racy: once it is idle and no call is in
+    /// flight, nothing else can take a slot.
+    async fn settle_write_pool(db: &Db) {
+        // Drain queued captures first: the pool may look idle while fixture
+        // captures are still queued, and the constrained-pool tests must
+        // exclude that traffic explicitly. Bounded so a wedged worker fails
+        // loudly instead of hanging the test.
+        tokio::time::timeout(BOUNDED, db.drain_captures())
+            .await
+            .expect("fixture capture queue did not drain");
+        let pool = db.write_pool();
+        let deadline = tokio::time::Instant::now() + BOUNDED;
+        while pool.size() as usize > pool.num_idle() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "write pool never went idle, so the constrained-pool assertion below \
+                 would be measuring fixture traffic rather than the handler"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Leave exactly one write-pool connection free for the call under test.
+    ///
+    /// This is the direct assertion the counter cannot make. The acquisition
+    /// sink counts acquisitions, not simultaneous holds, and a handler may
+    /// legitimately take several one after another. Here a handler that ever
+    /// holds two at once has nothing to take the second from, so it blocks on
+    /// sqlx's 30 s acquire timeout and blows this test's bounded timeout —
+    /// which is precisely the production failure, reproduced with one call
+    /// instead of five.
+    async fn hold_all_but_one_write_connection(
+        db: &Db,
+    ) -> Vec<sqlx::pool::PoolConnection<sqlx::Sqlite>> {
+        settle_write_pool(db).await;
+        let pool = db.write_pool();
+        let mut held = Vec::new();
+        for _ in 0..WRITE_POOL_CONNECTIONS - 1 {
+            held.push(
+                tokio::time::timeout(BOUNDED, pool.acquire())
+                    .await
+                    .expect("the idle write pool never handed the test its slots")
+                    .expect("write pool connection"),
+            );
+        }
+        held
+    }
+
+    /// Run one tool call with a single write-pool slot available to it.
+    async fn call_with_one_free_connection(
+        registry: &ToolRegistry,
+        db: &Db,
+        caller: &Caller,
+        tool: &str,
+        arguments: Value,
+    ) -> Value {
+        let held = hold_all_but_one_write_connection(db).await;
+        let output = tokio::time::timeout(
+            BOUNDED,
+            registry.call(db.clone(), caller.clone(), tool, arguments),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "{tool} did not finish with one write-pool connection free, \
+                 so its handler body holds two at once"
+            )
+        })
+        .unwrap_or_else(|error| panic!("{tool} failed: {error}"));
+        drop(held);
+        output
+    }
+
+    fn test_registry() -> Arc<ToolRegistry> {
+        let mut registry = ToolRegistry::new();
+        crate::mcp::register_surface_tools(&mut registry).unwrap();
+        Arc::new(registry)
+    }
+
+    async fn call(
+        registry: &ToolRegistry,
+        db: &Db,
+        caller: &Caller,
+        tool: &str,
+        arguments: Value,
+    ) -> Value {
+        registry
+            .call(db.clone(), caller.clone(), tool, arguments)
+            .await
+            .unwrap_or_else(|error| panic!("{tool} failed: {error}"))
+    }
+
+    /// Count the write-pool acquisitions the handler body performs, through
+    /// the same sink production dispatch publishes to. The sentinel start
+    /// makes a broken handoff fail loudly instead of reading as zero.
+    async fn call_counting_acquisitions(
+        registry: &ToolRegistry,
+        db: &Db,
+        caller: &Caller,
+        tool: &str,
+        arguments: Value,
+    ) -> (Value, u64) {
+        let sink = Arc::new(AtomicU64::new(u64::MAX));
+        let output = crate::db::with_write_pool_acquisition_sink(
+            Arc::clone(&sink),
+            registry.call(db.clone(), caller.clone(), tool, arguments),
+        )
+        .await;
+        let count = sink.load(Ordering::Relaxed);
+        assert!(
+            count != u64::MAX,
+            "dispatch never published the handler-body count for {tool}"
+        );
+        (
+            output.unwrap_or_else(|error| panic!("{tool} failed: {error}")),
+            count,
+        )
+    }
+
+    /// A document with a real body-anchored comment on it: the trigger for
+    /// N1, where the anchored representation used to be folded through a
+    /// second pool connection while `get_record`'s snapshot was held.
+    async fn anchored_document(registry: &ToolRegistry, db: &Db, caller: &Caller) -> String {
+        const BODY: &str = "alpha brave passage for the anchored comment to quote";
+        const EXACT: &str = "brave passage";
+        let target = call(
+            registry,
+            db,
+            caller,
+            "create_record",
+            json!({
+                "type": "Document",
+                "kind": "note",
+                "name": "Anchored source",
+                "body": BODY,
+                "reason": "Nested-acquisition regression fixture.",
+            }),
+        )
+        .await["id"]
+            .as_str()
+            .expect("create_record returns an id")
+            .to_owned();
+        let start = BODY.find(EXACT).expect("fixture body contains the quote");
+        call(
+            registry,
+            db,
+            caller,
+            "create_record",
+            json!({
+                "type": "Annotation",
+                "kind": "comment",
+                "body": "A comment anchored to the body.",
+                "lifecycle": "open",
+                "reason": "Nested-acquisition regression fixture.",
+                "links": [{ "target_id": target, "relationship": "part_of" }],
+                "target": {
+                    "target_record_id": target,
+                    "source_slot": "body",
+                    "purpose": "comment_context",
+                    "selectors": [
+                        { "type": "text_quote", "exact": EXACT,
+                          "prefix": &BODY[..start], "suffix": &BODY[start + EXACT.len()..] },
+                        { "type": "data_position", "start": start, "end": start + EXACT.len() }
+                    ]
+                }
+            }),
+        )
+        .await;
+        target
+    }
+
+    /// The comment really came back anchored. Without this the acquisition
+    /// counts below could be one because the enrichment silently did nothing.
+    fn assert_anchored_comment_present(record: &Value) {
+        let comments = record["comments"]
+            .as_array()
+            .expect("include_comments returns a comments array");
+        assert_eq!(comments.len(), 1, "fixture comment missing: {record:#}");
+        assert!(
+            !comments[0]["target"].is_null(),
+            "comment came back without its anchored target: {record:#}"
+        );
+    }
+
+    /// N1: `get_record` with `include_comments` on a body-anchored comment,
+    /// with one write-pool connection free. Before the fix the anchored fold
+    /// took a second connection from the same pool while the handler's
+    /// snapshot was still held, so this call could not complete.
+    #[tokio::test]
+    async fn annotated_get_record_never_holds_two_write_pool_connections() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let registry = test_registry();
+        let caller = Caller::local();
+        let target = anchored_document(&registry, &db, &caller).await;
+        let output = call_with_one_free_connection(
+            &registry,
+            &db,
+            &caller,
+            "get_record",
+            json!({ "ids": [target], "include_comments": true }),
+        )
+        .await;
+        assert_anchored_comment_present(&output["records"][0]);
+        db.close().await;
+    }
+
+    /// The same read through the acquisition sink, which counts acquisitions
+    /// rather than simultaneous holds.
+    ///
+    /// Two is the whole handler body: the read snapshot
+    /// (`lifecycle.rs` `get_record_from_lens`), and the display-reference
+    /// annotation that deliberately runs *after* `finish_read_snapshot` has
+    /// released it. The anchored comment fold is no longer a third. The exact
+    /// number is asserted on purpose — it is brittle against an unrelated
+    /// sequential read being added, and that is the point: a new pool read in
+    /// this handler should be looked at rather than absorbed, since whether
+    /// it nests is not visible from the count alone.
+    #[tokio::test]
+    async fn annotated_get_record_acquisition_count_is_the_snapshot_and_the_annotation() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let registry = test_registry();
+        let caller = Caller::local();
+        let target = anchored_document(&registry, &db, &caller).await;
+        let (output, count) = call_counting_acquisitions(
+            &registry,
+            &db,
+            &caller,
+            "get_record",
+            json!({ "ids": [target], "include_comments": true }),
+        )
+        .await;
+        assert_anchored_comment_present(&output["records"][0]);
+        assert_eq!(
+            count, 2,
+            "get_record with anchored comments took {count} write-pool connections, \
+             not the snapshot and the post-snapshot display-reference annotation"
+        );
+        db.close().await;
+    }
+
+    /// N2 and N4 with one write-pool connection free: `query_record` with
+    /// `include_coordination` over a record the caller holds, and the
+    /// `start_work` claim that put it there. Both projected claim state by
+    /// taking a connection and then reading holder liveness and holder
+    /// activity from the same pool.
+    #[tokio::test]
+    async fn coordinated_work_reads_never_hold_two_write_pool_connections() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let registry = test_registry();
+        // The run key travels in the arguments envelope: dispatch lifts and
+        // validates it there and rebuilds the caller's run context from it,
+        // so setting it on the `Caller` alone would leave `claimed_run_key`
+        // null and skip the holder-liveness read this test exists for.
+        let holder = Caller::local();
+        // An `agent_runs` row for the holder, so liveness resolves to `open`
+        // rather than `missing`. Both answers run the same query — this is
+        // the one that proves it found the row it looked for.
+        crate::control::ensure_agent_run(&db, HOLDER_RUN_KEY, holder.credential())
+            .await
+            .unwrap();
+        let subject = call(
+            &registry,
+            &db,
+            &holder,
+            "create_record",
+            json!({
+                "type": "WorkItem",
+                "kind": "task",
+                "name": "Coordinated subject",
+                "lifecycle": "in_progress",
+                "reason": "Nested-acquisition regression fixture.",
+                "run_key": HOLDER_RUN_KEY,
+            }),
+        )
+        .await["id"]
+            .as_str()
+            .expect("create_record returns an id")
+            .to_owned();
+        let claim = call_with_one_free_connection(
+            &registry,
+            &db,
+            &holder,
+            "start_work",
+            json!({ "record_id": subject, "action": "claim", "run_key": HOLDER_RUN_KEY }),
+        )
+        .await;
+        assert_eq!(
+            claim["work_state"]["claim_status"], "current",
+            "start_work did not project its own claim: {claim:#}"
+        );
+        // Without a recorded holder run key the projection skips holder
+        // liveness entirely, and this test would pass against the nesting it
+        // exists to catch.
+        assert_eq!(
+            claim["held_by_run_key"], HOLDER_RUN_KEY,
+            "the claim carries no holder run key, so no liveness read happened: {claim:#}"
+        );
+        assert_eq!(
+            claim["work_state"]["target"]["run_state"], "open",
+            "holder liveness was not resolved from `agent_runs`: {claim:#}"
+        );
+
+        let output = call_with_one_free_connection(
+            &registry,
+            &db,
+            &holder,
+            "query_record",
+            json!({
+                "steps": [{ "step": "filter" }],
+                "include_coordination": true,
+                "run_key": HOLDER_RUN_KEY,
+            }),
+        )
+        .await;
+        let claimed = output["records"]
+            .as_array()
+            .expect("query_record returns records")
+            .iter()
+            .find(|record| record["id"] == json!(subject))
+            .expect("the claimed record is in the page");
+        assert_eq!(
+            claimed["work_state"]["claim_status"], "current",
+            "coordination annotation did not observe the caller's own claim: {claimed:#}"
+        );
+        assert_eq!(
+            claimed["work_state"]["target"]["run_state"], "open",
+            "coordinated query did not resolve holder liveness: {claimed:#}"
+        );
+        db.close().await;
+    }
+
+    /// The task's acceptance case: five concurrent `get_record
+    /// include_comments:true` calls against a record with body-anchored
+    /// comments, on the ordinary 5-connection write pool. Before the fix all
+    /// five held a slot while each waited for a sixth.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn five_concurrent_annotated_get_records_do_not_exhaust_the_write_pool() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let registry = test_registry();
+        let caller = Caller::local();
+        let target = anchored_document(&registry, &db, &caller).await;
+
+        let calls = (0..CONCURRENT_CALLS).map(|_| {
+            let registry = Arc::clone(&registry);
+            let db = db.clone();
+            let caller = caller.clone();
+            let target = target.clone();
+            tokio::spawn(async move {
+                registry
+                    .call(
+                        db,
+                        caller,
+                        "get_record",
+                        json!({ "ids": [target], "include_comments": true }),
+                    )
+                    .await
+            })
+        });
+        let outputs = tokio::time::timeout(BOUNDED, futures::future::join_all(calls))
+            .await
+            .expect("concurrent annotated get_record calls exhausted the write pool");
+        for output in outputs {
+            let output = output.expect("get_record task panicked").unwrap();
+            assert_anchored_comment_present(&output["records"][0]);
+        }
+        db.close().await;
+    }
+
+    /// N2/N4 under the same constrained pool: `start_work` and coordinated
+    /// `query_record` interleaved, five in flight. Both used to project claim
+    /// state by acquiring a connection and then reading holder liveness and
+    /// activity from the same pool.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_claim_and_coordinated_query_do_not_exhaust_the_write_pool() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let registry = test_registry();
+        let holder = Caller::local();
+        crate::control::ensure_agent_run(&db, HOLDER_RUN_KEY, holder.credential())
+            .await
+            .unwrap();
+        let mut subjects = Vec::new();
+        for index in 0..CONCURRENT_CALLS {
+            subjects.push(
+                call(
+                    &registry,
+                    &db,
+                    &holder,
+                    "create_record",
+                    json!({
+                        "type": "WorkItem",
+                        "kind": "task",
+                        "name": format!("Concurrent subject {index}"),
+                        "lifecycle": "in_progress",
+                        "reason": "Nested-acquisition regression fixture.",
+                        "run_key": HOLDER_RUN_KEY,
+                    }),
+                )
+                .await["id"]
+                    .as_str()
+                    .expect("create_record returns an id")
+                    .to_owned(),
+            );
+        }
+
+        let calls = subjects.iter().enumerate().map(|(index, subject)| {
+            let registry = Arc::clone(&registry);
+            let db = db.clone();
+            let holder = holder.clone();
+            let subject = subject.clone();
+            tokio::spawn(async move {
+                if index % 2 == 0 {
+                    registry
+                        .call(
+                            db,
+                            holder,
+                            "start_work",
+                            json!({
+                                "record_id": subject,
+                                "action": "claim",
+                                "run_key": HOLDER_RUN_KEY,
+                            }),
+                        )
+                        .await
+                } else {
+                    registry
+                        .call(
+                            db,
+                            holder,
+                            "query_record",
+                            json!({
+                                "steps": [{ "step": "filter" }],
+                                "include_coordination": true,
+                                "run_key": HOLDER_RUN_KEY,
+                            }),
+                        )
+                        .await
+                }
+            })
+        });
+        let outputs = tokio::time::timeout(BOUNDED, futures::future::join_all(calls))
+            .await
+            .expect("concurrent claim and coordinated query exhausted the write pool");
+        for output in outputs {
+            output
+                .expect("coordination task panicked")
+                .expect("coordination call failed");
+        }
         db.close().await;
     }
 }

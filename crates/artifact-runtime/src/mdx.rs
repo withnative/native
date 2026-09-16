@@ -21,6 +21,25 @@ use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use url::Url;
 
+/// Content-free per-port input-resolution split. Closed fields only: kind,
+/// cache state, and microsecond counters. Port identifiers are stored beside
+/// this value, bounded separately.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct PortTiming {
+    pub kind: &'static str,
+    pub cache: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub membership_micros: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authorization_micros: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub redaction_micros: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assembly_micros: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub governed_sql_micros: Option<u64>,
+}
+
 pub const RUNTIME_ID: &str = "native.mdx.v1";
 pub const SAFE_TREE_VERSION: &str = "native.safe-tree.v1";
 /// Prefix prepended to every author class name, in the author stylesheet and
@@ -204,6 +223,10 @@ struct TelemetryEvent {
     diagnostic_code: Option<String>,
     diagnostic_phase: Option<String>,
     diagnostic_limit: Option<String>,
+    /// Per-port input-resolution split. Host-owned; never closes a phase.
+    /// Empty on v1 and on v2 renders that never resolved a named port.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    ports: BTreeMap<String, PortTiming>,
 }
 
 impl TelemetryEvent {
@@ -244,6 +267,7 @@ impl TelemetryEvent {
             diagnostic_code: None,
             diagnostic_phase: None,
             diagnostic_limit: None,
+            ports: BTreeMap::new(),
         }
     }
 
@@ -432,6 +456,14 @@ impl RenderTelemetry {
         self.event.cache_state = Some(state);
     }
 
+    /// Record a content-free per-port split. Does not close a phase.
+    ///
+    /// Port names are artifact-author-declared and bounded here. The timing
+    /// value is a closed struct: kind, cache state, and microsecond counters.
+    pub fn port(&mut self, name: &str, timing: PortTiming) {
+        self.event.ports.insert(bounded(name, 64), timing);
+    }
+
     pub fn input(&mut self, records: usize, json_bytes: usize) {
         self.event.input_records = Some(records);
         self.event.input_json_bytes = Some(json_bytes);
@@ -524,6 +556,7 @@ impl RenderTelemetry {
             "input_json_bytes": self.event.input_json_bytes,
             "output_nodes": self.event.output_nodes,
             "output_json_bytes": self.event.output_json_bytes,
+            "ports": self.event.ports,
         })
     }
 
@@ -5110,6 +5143,25 @@ const Child=()=>globalThis.__nativeBridge.jsx("DropTarget",{entry:"place"},globa
         assert!(!encoded.contains("telemetry-secret-source"));
         assert!(!encoded.contains("private-record"));
         assert!(!encoded.contains("telemetry-principal"));
+        let mut with_port = RenderTelemetry::begin("render", RUNTIME_ID, 1, "telemetry-artifact");
+        with_port.port(
+            "items",
+            PortTiming {
+                kind: "collection",
+                cache: "miss",
+                membership_micros: Some(1),
+                authorization_micros: Some(2),
+                redaction_micros: Some(3),
+                assembly_micros: Some(4),
+                governed_sql_micros: None,
+            },
+        );
+        let timing = with_port.timing();
+        assert_eq!(timing["ports"]["items"]["kind"], "collection");
+        assert_eq!(timing["ports"]["items"]["cache"], "miss");
+        let encoded_ports = timing.to_string();
+        assert!(!encoded_ports.contains("telemetry-secret-source"));
+        assert!(!encoded_ports.contains("private-record"));
 
         let template = TelemetryEvent::new("validate", "bounded", "# body");
         for _ in 0..MAX_TELEMETRY_EVENTS + 5 {

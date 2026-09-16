@@ -438,50 +438,57 @@ pub(super) async fn relationship_owned_in(
 
 /// Register tool 13.
 pub fn register_link_tools(registry: &mut ToolRegistry) -> Result<()> {
-    registry.register(
-        ToolKind::ManageLinks,
-        &format!("Add, remove, or page typed links. Relationship strings are \
-         open-additive. Writes echo previous_seq; list returns a bounded, \
-         viewer-relative live page. {PREVIOUS_SEQ_DESCRIPTION}"),
+    let list_schema = crate::mcp::record_ref::with_record_selector_aliases(
+        "manage_links.list",
         json!({
             "type": "object",
-            "oneOf": [
-                {
-                    "type": "object",
-                    "properties": {
-                        "action": { "const": "add" },
-                        "source_id": { "type": "string" },
-                        "target_id": { "type": "string" },
-                        "relationship": { "type": "string" },
-                        "note": { "type": "string", "description": "Optional link note." }
-                    },
-                    "required": ["action", "source_id", "target_id", "relationship"],
-                    "additionalProperties": false
-                },
-                {
-                    "type": "object",
-                    "properties": {
-                        "action": { "const": "remove" },
-                        "source_id": { "type": "string" },
-                        "target_id": { "type": "string" },
-                        "relationship": { "type": "string" }
-                    },
-                    "required": ["action", "source_id", "target_id", "relationship"],
-                    "additionalProperties": false
-                },
-                {
-                    "type": "object",
-                    "properties": {
-                        "action": { "const": "list" },
-                        "record_id": { "type": "string", "description": "Record to page." },
-                        "limit": { "type": "integer", "minimum": 1, "maximum": 200, "default": 50, "description": "Bounded live-page work." },
-                        "cursor": { "type": "string", "description": "Opaque prior-page continuation." }
-                    },
-                    "required": ["action", "record_id"],
-                    "additionalProperties": false
-                }
-            ]
+            "properties": {
+                "action": { "const": "list" },
+                "record_id": { "type": "string", "description": "Record to page." },
+                "limit": { "type": "integer", "minimum": 1, "maximum": 200, "default": 50, "description": "Bounded live-page work." },
+                "cursor": { "type": "string", "description": "Opaque prior-page continuation." }
+            },
+            "required": ["action", "record_id"],
+            "additionalProperties": false
         }),
+    );
+    let action_schema = json!({
+        "type": "object",
+        "oneOf": [
+            {
+                "type": "object",
+                "properties": {
+                    "action": { "const": "add" },
+                    "source_id": { "type": "string" },
+                    "target_id": { "type": "string" },
+                    "relationship": { "type": "string" },
+                    "note": { "type": "string", "description": "Optional link note." }
+                },
+                "required": ["action", "source_id", "target_id", "relationship"],
+                "additionalProperties": false
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "action": { "const": "remove" },
+                    "source_id": { "type": "string" },
+                    "target_id": { "type": "string" },
+                    "relationship": { "type": "string" }
+                },
+                "required": ["action", "source_id", "target_id", "relationship"],
+                "additionalProperties": false
+            },
+            list_schema
+        ]
+    });
+    registry.register(
+        ToolKind::ManageLinks,
+        &format!(
+            "Add, remove, or page typed links. Relationship strings are \
+         open-additive. Writes echo previous_seq; list returns a bounded, \
+         viewer-relative live page. {PREVIOUS_SEQ_DESCRIPTION}"
+        ),
+        action_schema,
         manage_links,
     )?;
     Ok(())

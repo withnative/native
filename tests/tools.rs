@@ -36,6 +36,8 @@ mod export_snapshot;
 mod facet_observations_tool;
 #[path = "tools/fetch_guard.rs"]
 mod fetch_guard;
+#[path = "tools/history_summary.rs"]
+mod history_summary;
 #[path = "tools/instruction_controls.rs"]
 mod instruction_controls;
 #[path = "tools/intent.rs"]
@@ -44,12 +46,16 @@ mod intent;
 mod mcp;
 #[path = "tools/mcp_apps.rs"]
 mod mcp_apps;
+#[path = "tools/overlap_measurement.rs"]
+mod overlap_measurement;
 #[path = "tools/programs.rs"]
 mod programs;
 #[path = "tools/record_policy_tool.rs"]
 mod record_policy_tool;
 #[path = "tools/record_shape_preflight.rs"]
 mod record_shape_preflight;
+#[path = "tools/records_read_format.rs"]
+mod records_read_format;
 #[path = "tools/relationships.rs"]
 mod relationships;
 #[path = "tools/resolve_many.rs"]

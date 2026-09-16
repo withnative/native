@@ -4562,6 +4562,30 @@
         "claim": "manage_canvas.promote rejects a caller below the threshold and writes no record."
       },
       "rationale": "Promotion mints governed records from a sketch, so it carries Edit on the canvas and, through the shared minting kernel, Edit on every destination home."
+    },
+    {
+      "tool": "manage_messages",
+      "action": "get_attention",
+      "disposition": "specialized",
+      "risk_tier": "specialized",
+      "fixture": "messaging-audience",
+      "expected_threshold": "caller-filtered-pinned-audience",
+      "access": "read",
+      "non_disclosure": true,
+      "no_write_on_deny": false,
+      "positive_evidence": {
+        "status": "test",
+        "file": "tests/records/message_first_conversations.rs",
+        "test": "attention_true_for_unsurfaced_inbound_false_once_presented",
+        "claim": "Authorized manage_messages.get_attention succeeds at threshold caller-filtered-pinned-audience."
+      },
+      "negative_evidence": {
+        "status": "test",
+        "file": "tests/records/message_first_conversations.rs",
+        "test": "attention_revocation_removes_signal",
+        "claim": "manage_messages.get_attention rejects a caller below caller-filtered-pinned-audience with no signal and no writes."
+      },
+      "rationale": "Messaging combines sealed audiences, exact human/agent authority, snapshot paging, and per-action mutations."
     }
   ]
 }

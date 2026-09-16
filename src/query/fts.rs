@@ -130,6 +130,20 @@ pub(crate) fn effective_limit(limit: Option<i64>) -> Result<i64> {
     Ok(limit.min(MAX_LIMIT))
 }
 
+/// Bind an id/type set as ONE json array parameter instead of one host
+/// variable per element. A scoped query resolves the whole subtree, which can
+/// exceed SQLite's per-connection variable limit (a runtime value, not a fixed
+/// 999), so the placeholder form fails on exactly the large corpora scoping
+/// exists to serve. `json_each` keeps the parameter count of the statement
+/// fixed however large the set is.
+fn set_filter(column: &str, values: &[String]) -> Result<(String, String)> {
+    let json = serde_json::to_string(values).map_err(|e| contract_violation(e.to_string()))?;
+    Ok((
+        format!("AND {column} IN (SELECT value FROM json_each(?))"),
+        json,
+    ))
+}
+
 #[derive(Clone, Copy)]
 struct SearchPrincipal<'a> {
     credential: &'a str,
@@ -157,21 +171,21 @@ async fn run_match(
     } else {
         format!("AND {NOT_ARCHIVED}")
     };
-    let scope_filter = match &scope_ids {
+    let (scope_filter, scope_bind) = match &scope_ids {
         Some(ids) => {
             if ids.is_empty() {
                 return Ok(Vec::new());
             }
-            let placeholders = vec!["?"; ids.len()].join(", ");
-            format!("AND r.id IN ({placeholders})")
+            let (filter, bind) = set_filter("r.id", ids)?;
+            (filter, Some(bind))
         }
-        None => String::new(),
+        None => (String::new(), None),
     };
-    let type_filter = if opts.types.is_empty() {
-        String::new()
+    let (type_filter, type_bind) = if opts.types.is_empty() {
+        (String::new(), None)
     } else {
-        let placeholders = vec!["?"; opts.types.len()].join(", ");
-        format!("AND r.type IN ({placeholders})")
+        let (filter, bind) = set_filter("r.type", &opts.types)?;
+        (filter, Some(bind))
     };
     let not_hidden = super::not_hidden_predicate("r");
     let view_filter = view_predicate("r");
@@ -191,13 +205,11 @@ async fn run_match(
         .bind(principal.trusted_local_bypass)
         .bind(principal.credential)
         .bind(principal.credential);
-    if let Some(ids) = &scope_ids {
-        for id in ids {
-            query = query.bind(id);
-        }
+    if let Some(bind) = &scope_bind {
+        query = query.bind(bind);
     }
-    for t in &opts.types {
-        query = query.bind(t);
+    if let Some(bind) = &type_bind {
+        query = query.bind(bind);
     }
     let mut stream = query.bind(TRUSTED_CANDIDATE_CAP).fetch(db.write_pool());
     let mut hits = Vec::new();
@@ -484,21 +496,21 @@ pub(crate) async fn search_pool_count_with_policy_bypass(
     } else {
         format!("AND {NOT_ARCHIVED}")
     };
-    let scope_filter = match &scope_ids {
+    let (scope_filter, scope_bind) = match &scope_ids {
         Some(ids) => {
             if ids.is_empty() {
                 return Ok(0);
             }
-            let placeholders = vec!["?"; ids.len()].join(", ");
-            format!("AND r.id IN ({placeholders})")
+            let (filter, bind) = set_filter("r.id", ids)?;
+            (filter, Some(bind))
         }
-        None => String::new(),
+        None => (String::new(), None),
     };
-    let type_filter = if opts.types.is_empty() {
-        String::new()
+    let (type_filter, type_bind) = if opts.types.is_empty() {
+        (String::new(), None)
     } else {
-        let placeholders = vec!["?"; opts.types.len()].join(", ");
-        format!("AND r.type IN ({placeholders})")
+        let (filter, bind) = set_filter("r.type", &opts.types)?;
+        (filter, Some(bind))
     };
     let not_hidden = super::not_hidden_predicate("r");
     let view_filter = view_predicate("r");
@@ -519,13 +531,11 @@ pub(crate) async fn search_pool_count_with_policy_bypass(
         .bind(trusted_local_bypass)
         .bind(credential)
         .bind(credential);
-    if let Some(ids) = &scope_ids {
-        for id in ids {
-            query = query.bind(id);
-        }
+    if let Some(bind) = &scope_bind {
+        query = query.bind(bind);
     }
-    for t in &opts.types {
-        query = query.bind(t);
+    if let Some(bind) = &type_bind {
+        query = query.bind(bind);
     }
     Ok(query.fetch_one(db.write_pool()).await?.try_get("n")?)
 }

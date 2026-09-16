@@ -263,6 +263,9 @@ pub fn take_format(tool: &str, arguments: &mut Value) -> std::result::Result<For
             "invalid arguments for {tool}: 'format' cannot be \"text\" because this operation has no registered text renderer; use \"json\" or omit the field"
         )),
         Some("json") => Ok(Format::Json),
+        _ if !has_renderer(tool) => Err(format!(
+            "invalid arguments for {tool}: 'format' must be \"json\" for this operation; omit the field to use its default"
+        )),
         _ => Err(format!(
             "invalid arguments for {tool}: 'format' must be \"text\" or \"json\""
         )),
@@ -2360,6 +2363,7 @@ enum IntentWindowKind {
     Record,
     Lineage,
     Claim,
+    Overlap,
 }
 
 fn intent_item_projection(kind: IntentWindowKind, item: &Value) -> Value {
@@ -2470,6 +2474,41 @@ fn intent_item_projection(kind: IntentWindowKind, item: &Value) -> Value {
         }
         IntentWindowKind::Lineage => pick(&["run_key", "intent"]),
         IntentWindowKind::Claim => pick(&["id", "name", "type", "claimed_at", "run_key"]),
+        IntentWindowKind::Overlap => {
+            let mut projected = pick(&["record_id"]);
+            if let Some(overlap) = item.get("overlap").filter(|value| value.is_object()) {
+                let unknown = unknown_object_keys(overlap, |key| {
+                    matches!(key, "items" | "total_count" | "truncated")
+                });
+                let returned = array(overlap, "items").len();
+                projected
+                    .as_object_mut()
+                    .expect("projection is an object")
+                    .insert(
+                        "overlap".into(),
+                        json!({
+                            "returned": returned,
+                            "total_count": overlap.get("total_count"),
+                            "truncated": overlap.get("truncated"),
+                        }),
+                    );
+                if !unknown.is_empty() {
+                    projected
+                        .as_object_mut()
+                        .expect("projection is an object")
+                        .insert("additional_overlap_fields".into(), json!(unknown));
+                }
+            } else if item.get("overlap").is_some() {
+                projected
+                    .as_object_mut()
+                    .expect("projection is an object")
+                    .insert(
+                        "overlap_text".into(),
+                        json!("malformed and not interpreted; exact current value remains in structuredContent; a new set_intent call is not an exact replay"),
+                    );
+            }
+            projected
+        }
     }
 }
 
@@ -2485,6 +2524,9 @@ fn intent_item_known(kind: IntentWindowKind, key: &str) -> bool {
         IntentWindowKind::Lineage => matches!(key, "run_key" | "intent"),
         IntentWindowKind::Claim => {
             matches!(key, "id" | "name" | "type" | "claimed_at" | "run_key")
+        }
+        IntentWindowKind::Overlap => {
+            matches!(key, "record_id" | "overlap")
         }
     }
 }
@@ -2593,6 +2635,139 @@ fn render_intent_window(
     }
 }
 
+/// The `overlapping_claims` briefing section: one line per anchor record via
+/// the shared [`IntentWindowKind::Overlap`] projection, then one
+/// [`render_overlap_item_line`] per overlap item in that anchor's window.
+/// Anchor-level conventions (malformed items, budget exhaustion, unknown
+/// keys) mirror [`render_intent_window`] exactly; the per-item lines keep
+/// `render_start_work` parity and carry no unknown-key notes, just as there.
+fn render_overlapping_claims(out: &mut String, briefing: &Value, remaining: &mut usize) {
+    const LABEL: &str = "Overlapping claims";
+    let Some(window) = briefing
+        .get("overlapping_claims")
+        .filter(|value| value.is_object())
+    else {
+        let _ = writeln!(out, "{LABEL}: unavailable in this briefing.");
+        return;
+    };
+    let Some(items) = window.get("items").and_then(Value::as_array) else {
+        let _ = writeln!(out, "{LABEL}: item window unavailable or malformed.");
+        return;
+    };
+    let total = window.get("total_count").and_then(Value::as_u64);
+    let truncated = boolean(window, "truncated");
+    match (total, truncated) {
+        (Some(total), Some(truncated)) => {
+            let _ = write!(out, "{LABEL}: {} returned of {total}", items.len());
+            if truncated {
+                out.push_str("; producer window truncated and additional authorized items exist or may exist");
+            }
+            out.push_str(".\n");
+        }
+        _ => {
+            let _ = writeln!(
+                out,
+                "{LABEL}: window metadata unavailable; {} item(s) returned.",
+                items.len()
+            );
+        }
+    }
+
+    let mut rendered = 0usize;
+    let mut malformed = 0usize;
+    for (index, item) in items.iter().enumerate() {
+        if !item.is_object() {
+            let _ = writeln!(
+                out,
+                "- {LABEL} item {} is malformed and was not interpreted; its exact current value remains in structuredContent and a new set_intent call is not an exact replay.",
+                index + 1
+            );
+            malformed += 1;
+            continue;
+        }
+        let projected = intent_item_projection(IntentWindowKind::Overlap, item);
+        if !render_bounded_query_json_line(
+            out,
+            "- ",
+            &projected,
+            remaining,
+            " (shortened; exact current value remains in structuredContent; a new set_intent call is not an exact replay)",
+        ) {
+            break;
+        }
+        let unknown = unknown_object_keys(item, |key| {
+            intent_item_known(IntentWindowKind::Overlap, key)
+        });
+        if !unknown.is_empty() {
+            let _ = writeln!(
+                out,
+                "  Additional {LABEL} item fields omitted from text: {}; {SET_INTENT_WRITE_RECOVERY}",
+                inline_json(&json!(unknown)),
+            );
+        }
+        // The nested overlap lines share the anchor projection's budget: each
+        // data line is charged in characters, the same unit
+        // `render_bounded_query_json_line` uses, and a line that does not fit
+        // ends the whole section. The anchor counts as rendered only once its
+        // nested lines all fit, so the exhaustion sentence below fires for a
+        // cut anywhere inside the section — exhaustion stays declared, never
+        // silent. Malformed-item notes stay uncharged, exactly as the
+        // surrounding windows treat theirs.
+        let mut cut = false;
+        if let Some(overlap) = item.get("overlap") {
+            if !overlap.is_object() {
+                // The projection already carried the malformed-overlap note;
+                // the anchor itself is still fully rendered.
+            } else if overlap.get("items").and_then(Value::as_array).is_none() {
+                let _ = writeln!(
+                    out,
+                    "  {LABEL} overlap item window unavailable or malformed; its exact current value remains in structuredContent and a new set_intent call is not an exact replay."
+                );
+            } else {
+                for sub in array(overlap, "items") {
+                    if !sub.is_object() {
+                        let _ = writeln!(
+                            out,
+                            "  {LABEL} overlap item is malformed and was not interpreted; its exact current value remains in structuredContent and a new set_intent call is not an exact replay."
+                        );
+                        continue;
+                    }
+                    let line = render_overlap_item_line(sub);
+                    let cost = line.chars().count() + 1;
+                    if cost > *remaining {
+                        cut = true;
+                        break;
+                    }
+                    *remaining -= cost;
+                    out.push_str(&line);
+                    out.push('\n');
+                }
+            }
+        }
+        if cut {
+            break;
+        }
+        rendered += 1;
+    }
+    if rendered + malformed < items.len() {
+        let _ = writeln!(
+            out,
+            "  {LABEL} detail budget exhausted: {rendered} of {} interpretable returned item(s) rendered; exact current values remain in structuredContent and a new set_intent call is not an exact replay.",
+            items.len()
+        );
+    }
+    let unknown = unknown_object_keys(window, |key| {
+        matches!(key, "items" | "total_count" | "truncated")
+    });
+    if !unknown.is_empty() {
+        let _ = writeln!(
+            out,
+            "  Additional {LABEL} fields omitted from text: {}; {SET_INTENT_WRITE_RECOVERY}",
+            inline_json(&json!(unknown)),
+        );
+    }
+}
+
 fn render_set_intent(value: &Value) -> String {
     let mut out = String::new();
     match string(value, "accepted_intent") {
@@ -2643,7 +2818,12 @@ fn render_set_intent(value: &Value) -> String {
     let unknown = unknown_object_keys(briefing, |key| {
         matches!(
             key,
-            "availability" | "this_run" | "resume" | "working_under" | "open_claims"
+            "availability"
+                | "this_run"
+                | "resume"
+                | "working_under"
+                | "open_claims"
+                | "overlapping_claims"
         )
     });
     if !unknown.is_empty() {
@@ -2697,9 +2877,11 @@ fn render_set_intent(value: &Value) -> String {
 
     let mut lineage_remaining = SET_INTENT_ACTIVE_SECTION_BUDGET;
     let mut claims_remaining = SET_INTENT_ACTIVE_SECTION_BUDGET;
+    let mut overlap_remaining = SET_INTENT_ACTIVE_SECTION_BUDGET;
     let mut remaining = SET_INTENT_DETAIL_BUDGET
         .saturating_sub(lineage_remaining)
-        .saturating_sub(claims_remaining);
+        .saturating_sub(claims_remaining)
+        .saturating_sub(overlap_remaining);
     // Active coordination facts come first: they prevent collisions and
     // explain the current run even when later historical detail exhausts the
     // shared rendering budget.
@@ -2735,6 +2917,7 @@ fn render_set_intent(value: &Value) -> String {
         IntentWindowKind::Claim,
         None,
     );
+    render_overlapping_claims(&mut out, briefing, &mut overlap_remaining);
     render_intent_window(
         &mut out,
         "This run declarations",
@@ -3722,7 +3905,7 @@ fn string(value: &Value, key: &str) -> Option<String> {
     value.get(key).and_then(Value::as_str).map(str::to_string)
 }
 
-fn display_inline(text: &str) -> String {
+pub(crate) fn display_inline(text: &str) -> String {
     let mut displayed = String::with_capacity(text.len());
     for character in text.chars() {
         if character.is_control() {
@@ -4139,7 +4322,7 @@ fn render_internal_continuation(
         }
         let _ = writeln!(out, "  record_value_delivered:\n    tool: manage_onboarding\n    arguments:\n      action: record_progress\n      programme_id: {}\n      generation: {generation}\n      phase: value_delivered\n      evidence.basis: user_confirmed\n      idempotency_key: <stable key>\n      reason: <confirmed value without copying learned context>\n      run_key: *run_key\n  complete_or_decline:\n    tool: manage_onboarding\n    arguments:\n      action: resolve_obligation\n      programme_id: {}\n      generation: {generation}\n      resolution: <completed | declined>\n      evidence: <non-null evidence>\n      idempotency_key: <stable key>\n      reason: <why the terminal state is established>\n      run_key: *run_key", yaml_scalar(programme), yaml_scalar(programme));
     }
-    out.push_str("```\n\nReuse the exact anchored run key on every subsequent Native call, reads included. It groups activity for continuity, inspection, and recovery; it is not a rollback command.\n");
+    out.push_str("```\n\nReuse the exact anchored run key on every subsequent Native call, reads included. It groups activity for continuity, inspection, and recovery; it is not a rollback command. If this bootstrap response is lost to a transient transport/pool failure or HTTP 502/503/504, retry bootstrap itself at most twice: a retry that carries the anchored key gets that same key echoed back, and bootstrap does not allocate a durable run.\n");
 }
 
 fn render_bootstrap_world_items(
@@ -4194,6 +4377,11 @@ fn render_bootstrap_world_items(
         }
         if let Some(activity) = string(item, "last_activity_at") {
             let _ = write!(out, " · activity {activity}");
+        }
+        // A superseded recent item stays listed — Bootstrap annotates, never
+        // excludes — with its successor reference inline.
+        if let Some(summary) = format_superseded_by(item) {
+            let _ = write!(out, " · {summary}");
         }
         out.push('\n');
     }
@@ -4486,13 +4674,20 @@ fn render_structure(value: &Value) -> String {
             out.push_str("  [archived]");
         }
         out.push('\n');
-        let details = json!({
+        let mut details = json!({
             "home_id": node.get("home_id"),
             "persistence": node.get("persistence"),
             "last_activity_at": node.get("last_activity_at"),
             "custody_boundary": node.get("custody_boundary"),
             "containment_path_visible": node.get("containment_path_visible"),
         });
+        // Succession rides the details blob rather than the node line: the
+        // line stays a stable column layout, and the blob is where this
+        // surface already puts per-node truth. Inserted only when present so
+        // unsuperseded nodes render byte-identical text to before.
+        if let Some(superseded) = node.get("superseded_by") {
+            details["superseded_by"] = superseded.clone();
+        }
         let _ = writeln!(
             out,
             "{}details: {}",
@@ -4551,7 +4746,221 @@ fn record_line(record: &Value, id_width: usize, type_width: usize) -> String {
     if !state.is_empty() {
         let _ = write!(line, "  [{}]", state.join(", "));
     }
+    // Succession is disclosure, not state: it names other records rather than
+    // describing this one, so it rides outside the state bracket — and only
+    // when there is a successor to name, keeping unsuperseded rows
+    // byte-identical to before.
+    if let Some(summary) = format_superseded_by(record) {
+        let _ = write!(line, "  [{summary}]");
+    }
     line
+}
+
+/// One-line disclosure of the incoming-`supersedes` projection, shared by
+/// every text renderer that names a record. `None` when there is nothing to
+/// disclose — absent, zero-total, or item-less-with-zero-total — so records
+/// without a successor render byte-identical text to before this field
+/// existed. A short reference degrades to the full id where display
+/// references are absent, and a nameless item renders as its bare reference.
+pub(crate) fn format_superseded_by(record: &Value) -> Option<String> {
+    let superseded = record.get("superseded_by")?;
+    // The count is required by the shape, never defaulted: a missing count
+    // is not 0, and without it there is nothing total-safe to say — not even
+    // about named items, whose "and N more" suffix needs the total.
+    let total = superseded.get("total_count").and_then(Value::as_i64)?;
+    let items = superseded
+        .get("items")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    if items.is_empty() {
+        if total <= 0 {
+            return None;
+        }
+        let noun = if total == 1 { "record" } else { "records" };
+        return Some(format!("superseded by {total} {noun}"));
+    }
+    let mut parts = Vec::with_capacity(items.len());
+    for item in items {
+        let name = string(item, "name").unwrap_or_default();
+        let reference = string(item, "display_reference")
+            .or_else(|| string(item, "id"))
+            .unwrap_or_default();
+        parts.push((display_inline(&name), display_inline(&reference)));
+    }
+    summarize_superseded_items(&parts, total)
+}
+
+/// Shared succession-summary core: pre-escaped `(name, reference)` pairs plus
+/// the true total. A nameless item renders as its bare reference (the world
+/// preview carries no titles); an empty item list with a positive total is
+/// the counted-but-unnamed case and renders count-only.
+pub(crate) fn summarize_superseded_items(items: &[(String, String)], total: i64) -> Option<String> {
+    if items.is_empty() {
+        if total <= 0 {
+            return None;
+        }
+        let noun = if total == 1 { "record" } else { "records" };
+        return Some(format!("superseded by {total} {noun}"));
+    }
+    let mut parts = Vec::with_capacity(items.len());
+    for (name, reference) in items {
+        if name.is_empty() {
+            parts.push(reference.clone());
+        } else {
+            parts.push(format!("{name} ({reference})"));
+        }
+    }
+    let mut summary = format!("superseded by {}", parts.join(", "));
+    let more = total - items.len() as i64;
+    if more > 0 {
+        summary.push_str(&format!(" and {more} more"));
+    }
+    Some(summary)
+}
+
+/// Advisory freshness line for one `get_record` item: facts only, no advice.
+///
+/// The headline states whether any bound occurrence currently flags the
+/// record (`possibly_stale`) with the contributing count; each occurrence
+/// then gets one compact line naming its anchor, expression role, Unit
+/// visibility, movement, and current range. Withheld Units name no
+/// identifiers — the line says `unit withheld` and still reports movement.
+fn render_freshness(out: &mut String, item: &Value) {
+    let Some(freshness) = item.get("freshness") else {
+        return;
+    };
+    let occurrences = freshness
+        .get("occurrences")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let total = occurrences.len();
+    let is_live_anchor = |occurrence: &Value| {
+        matches!(
+            occurrence.get("anchor").and_then(Value::as_str),
+            Some("current") | Some("relocated")
+        )
+    };
+    // Reconciled occurrences are still listed but never flag: a later
+    // binding on the same record already re-affirmed the Unit at its head.
+    let unreconciled = |occurrence: &Value| {
+        occurrence
+            .get("reconciled_by")
+            .and_then(Value::as_str)
+            .is_none()
+    };
+    let contributes = |occurrence: &Value| {
+        unreconciled(occurrence)
+            && is_live_anchor(occurrence)
+            && (occurrence
+                .get("unit_moved")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+                || occurrence
+                    .get("unit_superseded_by")
+                    .and_then(Value::as_array)
+                    .is_some())
+    };
+    let contributing = occurrences
+        .iter()
+        .filter(|occurrence| contributes(occurrence))
+        .count();
+    let possibly_stale = freshness
+        .get("possibly_stale")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if possibly_stale {
+        let mut reasons = Vec::new();
+        if occurrences
+            .iter()
+            .filter(|occurrence| unreconciled(occurrence) && is_live_anchor(occurrence))
+            .any(|occurrence| {
+                occurrence
+                    .get("unit_moved")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+            })
+        {
+            reasons.push("unit moved");
+        }
+        if occurrences.iter().any(|occurrence| {
+            contributes(occurrence)
+                && occurrence
+                    .get("unit_superseded_by")
+                    .and_then(Value::as_array)
+                    .is_some()
+        }) {
+            reasons.push("unit superseded");
+        }
+        if reasons.is_empty() {
+            let _ = writeln!(
+                out,
+                "  Freshness: possibly stale ({contributing} of {total} bound occurrences)"
+            );
+        } else {
+            let _ = writeln!(
+                out,
+                "  Freshness: possibly stale ({contributing} of {total} bound occurrences: {})",
+                reasons.join(", ")
+            );
+        }
+    } else {
+        let _ = writeln!(
+            out,
+            "  Freshness: not possibly stale ({total} bound occurrences)"
+        );
+    }
+    for occurrence in occurrences {
+        let id = display_inline(&string(occurrence, "occurrence_id").unwrap_or_default());
+        let anchor = claimed_string(occurrence.get("anchor"), "anchor");
+        let role = claimed_string(occurrence.get("expression_role"), "expression role");
+        let unit = match (
+            occurrence.get("unit_id").and_then(Value::as_str),
+            occurrence.get("unit").and_then(Value::as_str),
+        ) {
+            (Some(unit_id), _) => format!("unit {}", display_inline(unit_id)),
+            (None, Some("withheld")) => "unit withheld".to_string(),
+            _ => "(unit not reported)".to_string(),
+        };
+        let moved = match occurrence.get("unit_moved").and_then(Value::as_bool) {
+            Some(moved) => moved.to_string(),
+            None => "(unit movement not reported)".to_string(),
+        };
+        let range = match occurrence.get("current_range") {
+            Some(Value::Object(range)) => match (
+                range.get("start").and_then(Value::as_u64),
+                range.get("end").and_then(Value::as_u64),
+            ) {
+                (Some(start), Some(end)) => format!("range {start}-{end}"),
+                _ => "(current range not reported)".to_string(),
+            },
+            _ => "(no current range)".to_string(),
+        };
+        let mut line =
+            format!("  Occurrence {id}: anchor {anchor}, expression {role}, {unit}, unit moved {moved}, {range}");
+        if let Some(bound) = occurrence.get("bound_unit_revision") {
+            let bound_seq = claimed_integer(bound.get("revision_seq"), "bound revision");
+            let current_seq = match occurrence.get("current_unit_revision") {
+                None | Some(Value::Null) => "(current revision not reported)".to_string(),
+                Some(current) => claimed_integer(current.get("revision_seq"), "current revision"),
+            };
+            line.push_str(&format!(", revisions {bound_seq}->{current_seq}"));
+        }
+        if let Some(successors) = occurrence
+            .get("unit_superseded_by")
+            .and_then(Value::as_array)
+        {
+            line.push_str(&format!(
+                ", superseded by {}",
+                inline_json(&Value::Array(successors.clone()))
+            ));
+        }
+        if let Some(reconciler) = occurrence.get("reconciled_by").and_then(Value::as_str) {
+            line.push_str(&format!(", reconciled by {}", display_inline(reconciler)));
+        }
+        let _ = writeln!(out, "{line}");
+    }
 }
 
 fn render_dashboard(value: &Value) -> String {
@@ -4730,12 +5139,6 @@ fn render_describe_schema(value: &Value) -> String {
                 out.push('\n');
             }
         }
-    }
-    if let Some(resolved) = value.get("resolved_schema_config") {
-        let _ = writeln!(out, "\nResolved schema config: {}", inline_json(resolved));
-    }
-    if let Some(registry) = value.get("kind_registry") {
-        let _ = writeln!(out, "\nKind registry: {}", inline_json(registry));
     }
     out
 }
@@ -5461,7 +5864,14 @@ fn unknown_object_keys(value: &Value, known: impl Fn(&str) -> bool) -> Vec<Strin
         .collect()
 }
 
-fn render_get_record(value: &Value, include_response_scope: bool) -> String {
+// These enrichments remain available in JSON, but their full provenance and
+// governance envelopes overwhelm the authored content on ordinary text reads.
+// Keep the general record-field classification intact for write receipts.
+fn is_get_record_text_field(key: &str) -> bool {
+    is_record_render_field(key) && !matches!(key, "kind_governance" | "contribution")
+}
+
+fn render_get_record(value: &Value, include_response_disclosures: bool) -> String {
     let mut out = temporal_header(value);
     let records = array(value, "records");
     let multiple = records.len() > 1;
@@ -5475,20 +5885,7 @@ fn render_get_record(value: &Value, include_response_scope: bool) -> String {
     let citations_offset = integer(value, "citations_offset").unwrap_or_default();
     let comments_limit = integer(value, "comments_limit").unwrap_or_default();
     let comments_offset = integer(value, "comments_offset").unwrap_or_default();
-    if include_response_scope {
-        if let Some(scope) = exact_known_object_remainder(
-            value,
-            &[
-                "records",
-                "run_context",
-                "resolved_content_seq",
-                "content_head_seq",
-                "as_of",
-            ],
-            is_get_record_response_field,
-        ) {
-            let _ = writeln!(out, "Read scope: {}", inline_json(&scope));
-        }
+    if include_response_disclosures {
         let unknown = unknown_object_keys(value, is_get_record_response_field);
         if !unknown.is_empty() {
             let _ = writeln!(
@@ -5542,6 +5939,17 @@ fn render_get_record(value: &Value, include_response_scope: bool) -> String {
         }
         out.push('\n');
 
+        // Succession heads the record: a reader who never inspects links
+        // still learns the successor's title and reference here.
+        if let Some(summary) = format_superseded_by(item) {
+            let _ = writeln!(out, "  {summary}");
+        }
+
+        // Advisory freshness: one factual line for the record plus one
+        // compact line per bound occurrence. No advice, no thresholds — the
+        // `freshness` JSON block carries the exact coordinates.
+        render_freshness(&mut out, item);
+
         // State line: the spine facets that are set, plus activity. Absent
         // facets are omitted rather than printed as null — an unset lifecycle
         // is not a value worth a token.
@@ -5582,6 +5990,8 @@ fn render_get_record(value: &Value, include_response_scope: bool) -> String {
                 "facets",
                 "links_out",
                 "links_in",
+                "superseded_by",
+                "freshness",
                 "children",
                 "suggestions",
                 "citations",
@@ -5591,7 +6001,7 @@ fn render_get_record(value: &Value, include_response_scope: bool) -> String {
                 "interpretation",
                 "query_resolution",
             ],
-            is_record_render_field,
+            is_get_record_text_field,
         ) {
             let label = if value.get("as_of").is_some() {
                 "Record details (historical projection with live-at-read-time enrichments)"
@@ -5600,12 +6010,12 @@ fn render_get_record(value: &Value, include_response_scope: bool) -> String {
             };
             let _ = writeln!(out, "  {label}: {}", inline_json(&details));
         }
-        let unknown = unknown_object_keys(item, is_record_render_field);
-        if !unknown.is_empty() {
+        let omitted = unknown_object_keys(item, is_get_record_text_field);
+        if !omitted.is_empty() {
             let _ = writeln!(
                 out,
                 "  Additional record fields omitted from text: {}; re-call this read with the same arguments and format:\"json\" for exact values.",
-                inline_json(&json!(unknown))
+                inline_json(&json!(omitted))
             );
         }
         let facets = array(item, "facets");
@@ -5964,6 +6374,9 @@ fn compact_query_record_omitted_fields(record: &Value) -> Vec<String> {
             !matches!(
                 key.as_str(),
                 "id" | "type" | "kind" | "name" | "maturity" | "last_activity_at" | "work_state"
+                    // Rendered inline by `record_line` as `[superseded by …]`,
+                    // so the footnote must not also claim it was omitted.
+                    | "superseded_by"
             )
         })
         .map(|(key, _)| key.clone())
@@ -6660,6 +7073,11 @@ fn render_search(value: &Value) -> String {
                 .unwrap_or_else(|| "?".into()),
         );
         out.push('\n');
+        // The successor is why-adjacent: a hit worth opening is worth knowing
+        // the replacement of, without a second read.
+        if let Some(summary) = format_superseded_by(hit) {
+            let _ = writeln!(out, "      {summary}");
+        }
         // The snippet is why this hit matched — the one thing the id and name
         // cannot tell the agent.
         if let Some(snippet) = string(hit, "snippet") {
@@ -6770,6 +7188,13 @@ fn render_enriched_write(verb: &str, value: &Value) -> String {
     }
     render_previous_seq(&mut out, value);
     render_write_receipt(&mut out, value);
+    render_body_receipt(&mut out, value);
+    // The create-time overlap advisory is prose, never a raw receipt key: only
+    // `create_record` ever carries it, and the other verbs sharing this
+    // renderer never do, so presence here implies a fresh WorkItem create.
+    if let Some(overlap) = value.get("work_overlap") {
+        render_overlap_window(&mut out, "Work overlap", overlap);
+    }
     out.push_str("Call get_record for post-write state.\n");
     out
 }
@@ -6811,7 +7236,12 @@ fn render_write_receipt(out: &mut String, value: &Value) {
     let receipt = object
         .iter()
         .filter(|(key, _)| key.as_str() == "body_digest" || !is_record_render_field(key))
-        .filter(|(key, _)| !matches!(key.as_str(), "previous_seq" | "run_context"))
+        .filter(|(key, _)| {
+            !matches!(
+                key.as_str(),
+                "previous_seq" | "run_context" | "work_overlap"
+            )
+        })
         .collect::<Vec<_>>();
     if receipt.is_empty() {
         return;
@@ -6819,6 +7249,51 @@ fn render_write_receipt(out: &mut String, value: &Value) {
     out.push_str("Write receipt:\n");
     for (key, field) in receipt {
         let _ = writeln!(out, "  {key}: {}", inline_json(field));
+    }
+}
+
+/// Human-readable body-operation receipt. The structured `body_receipt`
+/// already travels in the write receipt above; this line names the requested
+/// verb explicitly so an equal-length replacement still reads as a
+/// replacement and a deprecated-alias call reads as one. Counts are Unicode
+/// scalar values with an explicit unit — never bytes, UTF-16 units, or bare
+/// numbers.
+fn render_body_receipt(out: &mut String, value: &Value) {
+    let Some(receipt) = value.get("body_receipt") else {
+        return;
+    };
+    let operation = claimed_string(receipt.get("operation"), "operation");
+    let requested = receipt
+        .get("requested_as")
+        .and_then(Value::as_str)
+        .filter(|name| Some(*name) != receipt.get("operation").and_then(Value::as_str))
+        .map(display_inline);
+    let unit = claimed_string(receipt.get("unit"), "unit");
+    let before = receipt.get("before_chars").and_then(Value::as_u64);
+    let after = receipt.get("after_chars").and_then(Value::as_u64);
+    let delta = receipt.get("delta_chars").and_then(Value::as_i64);
+    match (before, after, delta) {
+        (Some(before), Some(after), Some(delta)) => {
+            let signed = if delta >= 0 {
+                format!("+{delta}")
+            } else {
+                format!("{delta}")
+            };
+            if let Some(requested) = requested {
+                let _ = writeln!(
+                    out,
+                    "Body {operation} (requested as {requested}): {before} → {after} {unit} (delta {signed})"
+                );
+            } else {
+                let _ = writeln!(
+                    out,
+                    "Body {operation}: {before} → {after} {unit} (delta {signed})"
+                );
+            }
+        }
+        _ => {
+            let _ = writeln!(out, "Body {operation}: {}", inline_json(receipt));
+        }
     }
 }
 
@@ -6853,6 +7328,7 @@ fn is_enriched_record_field(key: &str) -> bool {
             | "links_out_count"
             | "links_in"
             | "links_in_count"
+            | "superseded_by"
             | "children"
             | "child_count"
             | "suggestions"
@@ -6863,6 +7339,7 @@ fn is_enriched_record_field(key: &str) -> bool {
             | "comment_count"
             | "target"
             | "contribution"
+            | "freshness"
             | "ancestors"
     )
 }
@@ -6905,6 +7382,7 @@ fn is_get_record_response_field(key: &str) -> bool {
             | "comments_limit"
             | "comments_offset"
             | "include_interpretation"
+            | "include_history_summary"
             | "run_context"
             | "resolved_content_seq"
             | "content_head_seq"
@@ -7825,6 +8303,9 @@ fn render_run_activity(value: &Value) -> String {
             "Run activity is malformed and was not interpreted; {READ_JSON_RECOVERY}\n"
         );
     };
+    if value.get("view").and_then(Value::as_str) == Some("work_overlap_evaluation") {
+        return render_work_overlap_evaluation(value);
+    }
     if value.get("mode").and_then(Value::as_str) == Some("discovery") {
         return render_run_discovery(value, DETAIL_BUDGET);
     }
@@ -8012,6 +8493,63 @@ fn render_run_activity(value: &Value) -> String {
         },
         &mut remaining,
     );
+    out
+}
+
+fn render_work_overlap_evaluation(value: &Value) -> String {
+    let scope = claimed_string(value.get("scope"), "scope");
+    let as_of = claimed_string(value.get("as_of"), "as_of");
+    let window = claimed_integer(
+        value.get("observation_window_seconds"),
+        "observation window seconds",
+    );
+    let status_value = value.pointer("/availability/status");
+    let status = claimed_string(status_value, "availability status");
+    let reason = claimed_string(value.pointer("/availability/reason"), "availability reason");
+    let mut out = format!(
+        "Work-overlap evaluation: scope `{scope}` · as of {as_of} · observation window {window}s.\nAvailability: `{status}` ({reason}).\n"
+    );
+    if status_value.and_then(Value::as_str) == Some("unavailable") {
+        out.push_str("Measurement evidence is unavailable; this is not evidence that no notices were emitted. Re-call with format:\"json\" for the exact availability envelope.\n");
+        return out;
+    }
+    let emissions = value.get("emissions");
+    let claims = value.get("claim_outcomes");
+    let _ = writeln!(
+        out,
+        "Retained notice-bearing calls: {} (claim {}, create {}, set_intent {}); anchors {}; overlap items {} ({} disclosed).",
+        claimed_integer(emissions.and_then(|item| item.get("notice_bearing_call_count")), "notice-bearing call count"),
+        claimed_integer(emissions.and_then(|item| item.pointer("/by_surface/claim")), "claim count"),
+        claimed_integer(emissions.and_then(|item| item.pointer("/by_surface/create")), "create count"),
+        claimed_integer(emissions.and_then(|item| item.pointer("/by_surface/set_intent")), "set_intent count"),
+        claimed_integer(emissions.and_then(|item| item.get("anchor_count")), "anchor count"),
+        claimed_integer(emissions.and_then(|item| item.get("overlap_item_count")), "overlap item count"),
+        claimed_integer(emissions.and_then(|item| item.get("disclosed_overlap_item_count")), "disclosed overlap item count"),
+    );
+    if claims.is_none_or(Value::is_null) {
+        out.push_str("Claim outcomes are unavailable; missing follow-on evidence was not counted as a behavioral zero.\n");
+    } else {
+        let _ = writeln!(
+            out,
+            "Mature claim denominator: {}; pending {}; released {}; coordinated {}; proceeded {}; no observed outcome {}.",
+            claimed_integer(claims.and_then(|item| item.get("mature_denominator")), "mature denominator"),
+            claimed_integer(claims.and_then(|item| item.get("pending_count")), "pending count"),
+            claimed_integer(claims.and_then(|item| item.get("released")), "released count"),
+            claimed_integer(claims.and_then(|item| item.get("coordinated")), "coordinated count"),
+            claimed_integer(claims.and_then(|item| item.get("proceeded")), "proceeded count"),
+            claimed_integer(claims.and_then(|item| item.get("no_observed_outcome")), "no observed outcome count"),
+        );
+    }
+    if let Some(observations) = value.get("observations").and_then(Value::as_array) {
+        let _ = writeln!(
+            out,
+            "Own-account observations: {}. Re-call with format:\"json\" for notice-level detail.",
+            observations.len()
+        );
+    } else {
+        out.push_str("Workspace scope is aggregate-only; notice timelines and identifiers are not returned.\n");
+    }
+    out.push_str("Counts cover disposable retained post-instrumentation evidence only; an empty result is not a historical zero.\n");
     out
 }
 
@@ -9225,6 +9763,44 @@ fn render_resolve_suggestions(value: &Value) -> String {
     out
 }
 
+/// One `work_overlap` item as a prose line, shared by every surface that
+/// carries the window (`start_work`, `create_record`, the `set_intent`
+/// briefing). Absent identity fields render as absence, never as a plausible
+/// stand-in — see [`claimed_string`].
+fn render_overlap_item_line(item: &Value) -> String {
+    let record_id = claimed_string(item.get("record_id"), "record_id");
+    let relation = claimed_string(item.get("relation"), "relation");
+    let holder_tier = claimed_string(item.get("holder_tier"), "holder_tier");
+    let mut line = format!("  {record_id}  {relation}  {holder_tier}");
+    if let Some(run_state) = string(item, "run_state") {
+        let _ = write!(line, " · run {run_state}");
+    }
+    if let Some(claimed_at) = string(item, "claimed_at") {
+        let _ = write!(line, " · claimed at {claimed_at}");
+    }
+    if let Some(run_key) = string(item, "run_key") {
+        let _ = write!(line, " · run key {run_key}");
+    }
+    if let Some(intent) = string(item, "intent") {
+        let _ = write!(line, " · intent: {}", display_inline(&intent));
+    }
+    line
+}
+
+fn render_overlap_window(out: &mut String, label: &str, overlap: &Value) {
+    let truncated = matches!(overlap.get("truncated"), Some(Value::Bool(true)));
+    let _ = writeln!(
+        out,
+        "{label} ({}{})",
+        claimed_integer(overlap.get("total_count"), "total_count"),
+        if truncated { ", truncated" } else { "" }
+    );
+    for item in array(overlap, "items") {
+        out.push_str(&render_overlap_item_line(item));
+        out.push('\n');
+    }
+}
+
 fn render_start_work(value: &Value) -> String {
     let mut out = format!(
         "Work {} on {} · {}",
@@ -9260,6 +9836,10 @@ fn render_start_work(value: &Value) -> String {
         let _ = write!(out, " · claimed at {claimed_at}");
     }
     out.push('\n');
+
+    if let Some(overlap) = value.get("work_overlap") {
+        render_overlap_window(&mut out, "Work overlap", overlap);
+    }
 
     let context = value.get("context").cloned().unwrap_or(Value::Null);
     if let Some(record) = context.get("record") {
@@ -9699,5 +10279,98 @@ mod record_url_render_tests {
         );
         assert!(updated.contains("[0] 0189d4c6"), "{updated}");
         assert!(updated.contains("[1] 0189d4c6"), "{updated}");
+    }
+}
+
+#[cfg(test)]
+mod body_receipt_render_tests {
+    use super::*;
+
+    #[test]
+    fn incomplete_receipt_does_not_invent_operation_or_units() {
+        let mut rendered = String::new();
+        render_body_receipt(
+            &mut rendered,
+            &json!({"body_receipt": {
+                "before_chars": 5, "after_chars": 5, "delta_chars": 0,
+            }}),
+        );
+        assert_eq!(
+            rendered,
+            "Body (operation not reported): 5 → 5 (unit not reported) (delta +0)\n"
+        );
+        rendered.clear();
+        render_body_receipt(
+            &mut rendered,
+            &json!({"body_receipt": {
+                "operation": 42, "unit": false,
+                "before_chars": 5, "after_chars": 5, "delta_chars": 0,
+            }}),
+        );
+        assert!(
+            rendered.contains("(operation unreadable: 42)"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("(unit unreadable: false)"), "{rendered}");
+    }
+
+    #[test]
+    fn set_receipt_names_operation_counts_and_signed_delta() {
+        let rendered = render(
+            "update_record",
+            &json!({
+                "id": "0189d4c6-1f2a-7b3c-9d4e-5f60718293a4",
+                "type": "Document",
+                "name": "Probe",
+                "previous_seq": 7,
+                "body_digest": "a".repeat(64),
+                "body_receipt": {
+                    "operation": "body_set",
+                    "requested_as": "body_set",
+                    "before_chars": 5,
+                    "after_chars": 14,
+                    "delta_chars": 9,
+                    "unit": "unicode_scalars",
+                },
+            }),
+        )
+        .unwrap();
+        assert!(
+            rendered.contains("Body body_set: 5 → 14 unicode_scalars (delta +9)"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn legacy_alias_and_negative_delta_read_explicitly() {
+        let rendered = render(
+            "update_record",
+            &json!({
+                "id": "0189d4c6-1f2a-7b3c-9d4e-5f60718293a4",
+                "type": "Document",
+                "name": "Probe",
+                "previous_seq": 7,
+                "body_digest": "a".repeat(64),
+                "body_receipt": {
+                    "operation": "body_set",
+                    "requested_as": "body",
+                    "before_chars": 10,
+                    "after_chars": 4,
+                    "delta_chars": -6,
+                    "unit": "unicode_scalars",
+                },
+                "warnings": [{
+                    "code": "deprecated_body_alias",
+                    "message": "update_record 'body' is a deprecated alias for full replacement; use 'body_set' for new calls.",
+                }],
+            }),
+        )
+        .unwrap();
+        assert!(
+            rendered
+                .contains("Body body_set (requested as body): 10 → 4 unicode_scalars (delta -6)"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("deprecated_body_alias"), "{rendered}");
     }
 }

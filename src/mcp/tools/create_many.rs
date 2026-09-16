@@ -437,7 +437,12 @@ async fn execute(
             continue;
         }
 
-        match lifecycle::create_record(db.clone(), caller.clone(), record.arguments.clone()).await {
+        // create_many owns its own response_mode contract. It needs the full
+        // singular shape to preserve its existing verbose item results, even
+        // though public create_record now defaults to a compact receipt.
+        match lifecycle::create_record_verbose(db.clone(), caller.clone(), record.arguments.clone())
+            .await
+        {
             Ok(created) => {
                 states[index] = ItemState::Succeeded;
                 let id = created

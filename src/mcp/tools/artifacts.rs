@@ -6,6 +6,7 @@
 //! returning React plans; HTML returns only an isolated-origin launch plan.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -55,17 +56,12 @@ fn named_input_bundle_receipt(
     snapshot_event_id: &str,
     snapshot_event_seq: i64,
     authorization_revision: i64,
+    meta_sha256: &str,
 ) -> Value {
     let mut ports = Map::new();
     if let Some(inputs) = input.get("inputs").and_then(Value::as_object) {
         for (port, envelope) in inputs {
-            ports.insert(
-                port.clone(),
-                json!({
-                    "envelope": envelope.get("version").and_then(Value::as_str),
-                    "sha256": mdx::sha256_hex(&mdx_v2::canonical_json_bytes(envelope)),
-                }),
-            );
+            ports.insert(port.clone(), named_input_port_receipt(envelope));
         }
     }
     let material = json!({
@@ -75,6 +71,7 @@ fn named_input_bundle_receipt(
             "content_event_id": snapshot_event_id,
             "content_event_seq": snapshot_event_seq,
             "authorization_revision": authorization_revision,
+            "meta_sha256": meta_sha256,
         },
         "input_abi": mdx_v2::NAMED_INPUT_ABI,
         "input": input,
@@ -86,11 +83,423 @@ fn named_input_bundle_receipt(
             "content_event_id": snapshot_event_id,
             "content_event_seq": snapshot_event_seq,
             "authorization_revision": authorization_revision,
+            "meta_sha256": meta_sha256,
         },
         "input_abi": mdx_v2::NAMED_INPUT_ABI,
         "ports": ports,
         "sha256": mdx::sha256_hex(&mdx_v2::canonical_json_bytes(&material)),
     })
+}
+
+fn named_input_port_receipt(envelope: &Value) -> Value {
+    let mut receipt = json!({
+        "envelope": envelope.get("version").and_then(Value::as_str),
+        "sha256": mdx::sha256_hex(&mdx_v2::canonical_json_bytes(envelope)),
+    });
+    let object = receipt
+        .as_object_mut()
+        .expect("named input port receipt is an object");
+    if let Some(rows_sha256) = envelope.pointer("/relation/rows_sha256") {
+        object.insert("rows_sha256".into(), rows_sha256.clone());
+    }
+    if let Some(schema_sha256) = envelope.pointer("/relation/schema_sha256") {
+        object.insert("schema_sha256".into(), schema_sha256.clone());
+    }
+    if let Some(records_sha256) = envelope.get("records_sha256") {
+        object.insert("records_sha256".into(), records_sha256.clone());
+    }
+    receipt
+}
+
+fn render_caller_sha256(origin_db_id: &str, caller: &Caller) -> String {
+    let principal = super::principal(caller);
+    let mut material = origin_db_id.as_bytes().to_vec();
+    material.push(0);
+    material.push(u8::from(principal.is_trusted_local()));
+    material.push(u8::from(principal.is_member));
+    material.push(0);
+    if let Some(account) = principal.account_id {
+        material.extend_from_slice(account.as_bytes());
+    }
+    mdx::sha256_hex(&material)
+}
+
+fn v2_compiled_cache_key(parsed: &mdx_v2::ParsedSource, closure_sha256: &str) -> String {
+    mdx_v2::compiled_cache_key(
+        &parsed.source_sha256,
+        &parsed.manifest_sha256,
+        closure_sha256,
+        &mdx::sha256_hex(include_bytes!("../../../Cargo.lock")),
+        parsed.styles_sha256(),
+    )
+}
+
+async fn live_origin_db_id(
+    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    historical_lens: Option<&lens::ReadLens<'_>>,
+) -> Result<String> {
+    match historical_lens {
+        Some(lens) => {
+            sqlx::query_scalar("SELECT origin_db_id FROM database_identity WHERE singleton=1")
+                .fetch_one(lens.meta().snapshot_pool())
+                .await
+                .map_err(Into::into)
+        }
+        None => crate::interventions::database_id_in(tx).await,
+    }
+}
+
+async fn live_meta_sha256(
+    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    historical_lens: Option<&lens::ReadLens<'_>>,
+) -> Result<String> {
+    match historical_lens {
+        Some(lens) => meta_sha256_on_pool(lens.meta().snapshot_pool()).await,
+        None => meta_sha256_in(tx).await,
+    }
+}
+
+async fn meta_sha256_in(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>) -> Result<String> {
+    let schema_config = ordered_table_rows_in(
+        tx,
+        "SELECT CAST(id AS TEXT), CAST(layer AS TEXT), CAST(COALESCE(name,'') AS TEXT), CAST(data AS TEXT), CAST(COALESCE(applies_to_collection_id,'') AS TEXT), CAST(COALESCE(version_lineage,'') AS TEXT), CAST(created_at AS TEXT) FROM main.schema_config ORDER BY id",
+        7,
+    )
+    .await?;
+    let vocabularies = ordered_table_rows_in(
+        tx,
+        "SELECT CAST(id AS TEXT), CAST(name AS TEXT), CAST(created_at AS TEXT) FROM main.vocabularies ORDER BY id",
+        3,
+    )
+    .await?;
+    let vocabulary_values = ordered_table_rows_in(
+        tx,
+        "SELECT CAST(id AS TEXT), CAST(vocabulary_id AS TEXT), CAST(value AS TEXT), CAST(COALESCE(gloss,'') AS TEXT), CAST(status AS TEXT), CAST(ordinal AS TEXT), CAST(terminality AS TEXT), CAST(metadata AS TEXT), CAST(COALESCE(alias_of,'') AS TEXT) FROM main.vocabulary_values ORDER BY id",
+        9,
+    )
+    .await?;
+    Ok(mdx::sha256_hex(&mdx_v2::canonical_json_bytes(&json!({
+        "schema_config": schema_config,
+        "vocabularies": vocabularies,
+        "vocabulary_values": vocabulary_values,
+    }))))
+}
+
+async fn meta_sha256_on_pool(pool: &sqlx::SqlitePool) -> Result<String> {
+    let mut snapshot = pool.begin().await?;
+    let digest = meta_sha256_in(&mut snapshot).await?;
+    snapshot.rollback().await?;
+    Ok(digest)
+}
+
+async fn ordered_table_rows_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    sql: &str,
+    columns: usize,
+) -> Result<Vec<Vec<String>>> {
+    let rows = sqlx::query(sql).fetch_all(&mut **tx).await?;
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let mut record = Vec::with_capacity(columns);
+        for index in 0..columns {
+            record.push(row.try_get::<String, _>(index).unwrap_or_default());
+        }
+        out.push(record);
+    }
+    Ok(out)
+}
+
+struct V2ProvenanceArgs<'a> {
+    artifact_id: &'a str,
+    source_event_id: &'a str,
+    source_event_seq: i64,
+    snapshot_event_id: &'a str,
+    snapshot_event_seq: i64,
+    authorization_revision: i64,
+    meta_sha256: &'a str,
+    body_sha256: &'a str,
+    closure_sha256: &'a str,
+    module_releases: Vec<Value>,
+    caller_sha256: &'a str,
+    cache_key: &'a str,
+    input_bundle: Option<Value>,
+    render_sha256: Option<&'a str>,
+}
+
+fn v2_plan_provenance(args: V2ProvenanceArgs<'_>) -> Value {
+    let revalidation = json!({
+        "artifact_id": args.artifact_id,
+        "snapshot_event_id": args.snapshot_event_id,
+        "snapshot_event_seq": args.snapshot_event_seq,
+        "authorization_revision": args.authorization_revision,
+        "cache_key": args.cache_key,
+        "caller_sha256": args.caller_sha256,
+        "meta_sha256": args.meta_sha256,
+    });
+    let revision = json!({
+        "content_event_id": args.snapshot_event_id,
+        "content_event_seq": args.snapshot_event_seq,
+        "authorization_revision": args.authorization_revision,
+        "meta_sha256": args.meta_sha256,
+    });
+    let input_bundle = args
+        .input_bundle
+        .unwrap_or_else(|| json!({ "revision": revision }));
+    let mut provenance = json!({
+        "record_id": args.artifact_id,
+        "source_event_id": args.source_event_id,
+        "event_seq": args.source_event_seq,
+        "snapshot_event_id": args.snapshot_event_id,
+        "snapshot_event_seq": args.snapshot_event_seq,
+        "revalidation": revalidation,
+        "body_sha256": args.body_sha256,
+        "dependency_closure_sha256": args.closure_sha256,
+        "module_releases": args.module_releases,
+        "input_bundle": input_bundle,
+        "caller_sha256": args.caller_sha256,
+    });
+    if let Some(render_sha256) = args.render_sha256 {
+        provenance
+            .as_object_mut()
+            .expect("provenance is an object")
+            .insert("render_sha256".into(), json!(render_sha256));
+    }
+    provenance
+}
+
+fn unchanged_v2_render(args: V2ProvenanceArgs<'_>, port_names: Vec<&String>) -> Value {
+    let artifact_id = args.artifact_id;
+    let cache_key = args.cache_key;
+    let provenance = v2_plan_provenance(args);
+    json!({
+        "status": "rendered",
+        "unchanged": true,
+        "artifact_id": artifact_id,
+        "runtime": with_verification(mdx_v2::descriptor(), mdx_v2::RUNTIME_ID),
+        "input": {
+            "version": mdx_v2::NAMED_INPUT_ABI,
+            "mode": "named",
+            "ports": port_names,
+        },
+        "plan": {
+            "kind": "safe_tree",
+            "version": "1",
+            "provenance": provenance,
+            "cache": { "state": "unchanged", "key": cache_key },
+        },
+    })
+}
+
+fn elapsed_micros(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
+}
+
+fn collection_port_timing(
+    cache: &'static str,
+    membership_micros: u64,
+    authorization_micros: u64,
+    redaction_micros: u64,
+    assembly_micros: u64,
+) -> mdx::PortTiming {
+    mdx::PortTiming {
+        kind: "collection",
+        cache,
+        membership_micros: Some(membership_micros),
+        authorization_micros: Some(authorization_micros),
+        redaction_micros: Some(redaction_micros),
+        assembly_micros: Some(assembly_micros),
+        governed_sql_micros: None,
+    }
+}
+
+fn relation_port_timing(
+    cache: &'static str,
+    governed_sql_micros: u64,
+    authorization_micros: u64,
+    assembly_micros: u64,
+) -> mdx::PortTiming {
+    mdx::PortTiming {
+        kind: "relation",
+        cache,
+        membership_micros: None,
+        authorization_micros: Some(authorization_micros),
+        redaction_micros: None,
+        assembly_micros: Some(assembly_micros),
+        governed_sql_micros: Some(governed_sql_micros),
+    }
+}
+
+fn record_relation_port_timing(
+    cache: &'static str,
+    membership_micros: u64,
+    authorization_micros: u64,
+    redaction_micros: u64,
+    assembly_micros: u64,
+) -> mdx::PortTiming {
+    mdx::PortTiming {
+        kind: "relation",
+        cache,
+        membership_micros: Some(membership_micros),
+        authorization_micros: Some(authorization_micros),
+        redaction_micros: Some(redaction_micros),
+        assembly_micros: Some(assembly_micros),
+        governed_sql_micros: None,
+    }
+}
+
+fn restore_cached_collection_port(
+    port: &str,
+    envelope: &Value,
+    named_inputs: &mut BTreeMap<String, Value>,
+    records_by_port: &mut BTreeMap<String, BTreeSet<String>>,
+    aggregate_records: &mut BTreeMap<String, Value>,
+) {
+    if let Some(records) = envelope.get("records").and_then(Value::as_array) {
+        let mut ids = BTreeSet::new();
+        for value in records {
+            if let Some(id) = value.get("id").and_then(Value::as_str) {
+                ids.insert(id.to_owned());
+                aggregate_records.insert(id.to_owned(), value.clone());
+            }
+        }
+        records_by_port.insert(port.to_owned(), ids);
+    }
+    named_inputs.insert(port.to_owned(), envelope.clone());
+}
+
+async fn revalidate_governed_sql_ports(
+    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    caller: &Caller,
+    artifact_id: &str,
+    bound: &BTreeMap<String, (String, i64)>,
+    inputs: &BTreeMap<String, mdx_v2::InputDecl>,
+    request: &super::artifact_revalidate::RevalidateRequest,
+    telemetry: &mut mdx::RenderTelemetry,
+) -> std::result::Result<
+    (
+        BTreeMap<String, Value>,
+        Option<super::artifact_revalidate::RevalidateMiss>,
+    ),
+    Value,
+> {
+    let mut envelopes = BTreeMap::new();
+    let mut miss = None;
+    for (port, declaration) in inputs {
+        if declaration.envelope != mdx_v2::RELATION_ENVELOPE {
+            continue;
+        }
+        let Some((collection_id, binding_seq)) = bound.get(port) else {
+            continue;
+        };
+        let visible = super::can_record_in(tx, caller, collection_id, Capability::View).await;
+        if !matches!(visible, Ok(true)) {
+            return Err(diagnostic(
+                "binding_unavailable",
+                "artifact input binding is unavailable",
+                json!({ "artifact_id": artifact_id, "port": port }),
+            ));
+        }
+        let kind = match collection_kind_in(tx, collection_id).await {
+            Ok(Some(kind)) => kind,
+            _ => {
+                return Err(v2_host_diagnostic(
+                    artifact_id,
+                    "named_input_incompatible",
+                    format!("input '{port}' does not target a live governed Collection"),
+                    json!({ "artifact_id": artifact_id, "port": port, "collection_id": collection_id }),
+                ))
+            }
+        };
+        if kind != "query" {
+            continue;
+        }
+        let query_relation = match governed_sql_query_in(tx, collection_id).await {
+            Ok(query_kind) => query_kind,
+            Err(error) => {
+                return Err(v2_host_diagnostic(
+                    artifact_id,
+                    "named_input_incompatible",
+                    error.to_string(),
+                    json!({ "artifact_id": artifact_id, "port": port, "collection_id": collection_id }),
+                ))
+            }
+        };
+        let QueryRelationKind::GovernedSql { schema_sha256, .. } = &query_relation else {
+            continue;
+        };
+        if !query_relation_matches_port(&query_relation, declaration)
+            || declaration.schema_sha256.as_deref() != Some(schema_sha256.as_str())
+        {
+            return Err(v2_host_diagnostic(
+                artifact_id,
+                "named_input_incompatible",
+                format!("input '{port}' relation schema does not match its bound query"),
+                json!({ "artifact_id": artifact_id, "port": port, "collection_id": collection_id }),
+            ));
+        }
+        let sql_started = Instant::now();
+        let relation = match resolve_governed_sql_relation_in(tx, caller, collection_id).await {
+            Ok(relation) => relation,
+            Err(error) => {
+                return Err(v2_host_diagnostic(
+                    artifact_id,
+                    "named_input_incompatible",
+                    error.to_string(),
+                    json!({ "artifact_id": artifact_id, "port": port, "collection_id": collection_id }),
+                ))
+            }
+        };
+        let governed_sql_micros = elapsed_micros(sql_started);
+        if declaration.schema_sha256.as_deref() != Some(relation.output.schema_sha256.as_str()) {
+            return Err(v2_host_diagnostic(
+                artifact_id,
+                "named_input_incompatible",
+                format!("input '{port}' governed SQL output schema changed during resolution"),
+                json!({ "artifact_id": artifact_id, "port": port, "collection_id": collection_id }),
+            ));
+        }
+        let assembly_started = Instant::now();
+        let envelope = match governed_sql_relation_envelope(collection_id, *binding_seq, &relation)
+        {
+            Ok(envelope) => envelope,
+            Err(error) => {
+                return Err(v2_host_diagnostic(
+                    artifact_id,
+                    "named_input_incompatible",
+                    error.to_string(),
+                    json!({ "artifact_id": artifact_id, "port": port }),
+                ))
+            }
+        };
+        let assembly_micros = elapsed_micros(assembly_started);
+        telemetry.port(
+            port,
+            relation_port_timing("miss", governed_sql_micros, 0, assembly_micros),
+        );
+        if miss.is_none() {
+            match request.ports.get(port) {
+                Some(client_port) => {
+                    if let Err(found) =
+                        super::artifact_revalidate::relation_hashes_match(&envelope, client_port)
+                    {
+                        miss = Some(found);
+                    }
+                }
+                None => miss = Some(super::artifact_revalidate::RevalidateMiss::Malformed),
+            }
+        }
+        envelopes.insert(port.clone(), envelope);
+    }
+    Ok((envelopes, miss))
+}
+
+fn sort_input_records(records: &mut [InputRecord]) {
+    records.sort_by(|left, right| {
+        left.name
+            .to_lowercase()
+            .cmp(&right.name.to_lowercase())
+            .then_with(|| left.id.cmp(&right.id))
+    });
 }
 
 fn root_authored_input(root_context_inputs: &Map<String, Value>) -> Value {
@@ -2061,11 +2470,20 @@ struct RenderArtifactArgs {
     as_of: Option<Value>,
     /// Opt-in per-render timing. When true, a content-free `timing` member
     /// (phase names, microseconds, record/byte counts for this render only,
-    /// plus `cache.state`) is returned under `plan.timing` for rendered plans
-    /// or as a top-level `timing` member for diagnostics. Absent/false leaves
-    /// the response byte-identical to before.
+    /// plus `cache.state` and a per-port kind/cache/micros split) is returned
+    /// under `plan.timing` for rendered plans or as a top-level `timing`
+    /// member for diagnostics. Additive provenance fields (`revalidation`,
+    /// `caller_sha256`, `input_bundle.revision.meta_sha256`) are always
+    /// present on live v2 renders; absent/false only omits `timing`.
     #[serde(default)]
     include_timing: bool,
+    /// Optional conditional revalidation token: the previous live
+    /// `native.mdx.v2` `plan.provenance.revalidation` object plus `ports`
+    /// copied from `input_bundle.ports`. Unknown extra keys are ignored.
+    /// Malformed values never fail the call; they fall through to a full
+    /// render.
+    #[serde(default)]
+    revalidate: Option<Value>,
 }
 
 pub(crate) fn diagnostic(code: &str, message: impl Into<String>, details: Value) -> Value {
@@ -2547,21 +2965,20 @@ async fn paged_query_in(
     Ok(records)
 }
 
-pub(crate) async fn resolve_collection(
+async fn collection_member_values(
     lens: &lens::ReadLens<'_>,
     caller: &Caller,
     id: &str,
     kind: &str,
-) -> Result<Vec<InputRecord>> {
-    let projection = lens.projection().snapshot_pool();
-    let values = match kind {
+) -> Result<Vec<Value>> {
+    match kind {
         "folder" => {
             paged_query(
                 lens,
                 caller,
                 &json!({ "steps": [{ "step": "filter", "home_id": id }], "order": "name_asc" }),
             )
-            .await?
+            .await
         }
         "selection" => {
             paged_query(
@@ -2575,14 +2992,14 @@ pub(crate) async fn resolve_collection(
                     "order": "name_asc"
                 }),
             )
-            .await?
+            .await
         }
         "query" => {
             let raw: Option<String> = sqlx::query_scalar(
                 "SELECT value FROM facet_values WHERE record_id = ? AND key = 'query'",
             )
             .bind(id)
-            .fetch_optional(projection)
+            .fetch_optional(lens.projection().snapshot_pool())
             .await?
             .flatten();
             match super::querying::inspect_saved_record_query(raw.as_deref()) {
@@ -2598,45 +3015,37 @@ pub(crate) async fn resolve_collection(
                         .get("records")
                         .and_then(Value::as_array)
                         .cloned()
-                        .ok_or_else(|| Error::engine("Collection kind:query must resolve to records, not a count or aggregate"))?
+                        .ok_or_else(|| Error::engine("Collection kind:query must resolve to records, not a count or aggregate"))
                 }
                 super::querying::SavedQueryInspection::GovernedSql { .. } => {
-                    return Err(Error::engine(
+                    Err(Error::engine(
                         "saved governed SQL artifact inputs require a native.relation-envelope.v1 port",
                     ))
                 }
                 super::querying::SavedQueryInspection::Invalid { diagnostic }
                 | super::querying::SavedQueryInspection::UnsupportedVersion { diagnostic, .. } => {
-                    return Err(Error::engine(diagnostic))
+                    Err(Error::engine(diagnostic))
                 }
             }
         }
-        _ => return Err(Error::engine(format!("unsupported Collection kind '{kind}'"))),
-    };
-    let mut records = input_records_from_values_in_pool(projection, values).await?;
-    records.sort_by(|left, right| {
-        left.name
-            .to_lowercase()
-            .cmp(&right.name.to_lowercase())
-            .then_with(|| left.id.cmp(&right.id))
-    });
-    Ok(records)
+        _ => Err(Error::engine(format!("unsupported Collection kind '{kind}'"))),
+    }
 }
 
-pub(crate) async fn resolve_collection_in(
+async fn collection_member_values_in(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     caller: &Caller,
     id: &str,
     kind: &str,
-) -> Result<Vec<InputRecord>> {
-    let values = match kind {
+) -> Result<Vec<Value>> {
+    match kind {
         "folder" => {
             paged_query_in(
                 tx,
                 caller,
                 &json!({ "steps": [{ "step": "filter", "home_id": id }], "order": "name_asc" }),
             )
-            .await?
+            .await
         }
         "selection" => {
             paged_query_in(
@@ -2650,7 +3059,7 @@ pub(crate) async fn resolve_collection_in(
                     "order": "name_asc"
                 }),
             )
-            .await?
+            .await
         }
         "query" => {
             let raw: Option<String> = sqlx::query_scalar(
@@ -2673,28 +3082,45 @@ pub(crate) async fn resolve_collection_in(
                         .get("records")
                         .and_then(Value::as_array)
                         .cloned()
-                        .ok_or_else(|| Error::engine("Collection kind:query must resolve to records, not a count or aggregate"))?
+                        .ok_or_else(|| Error::engine("Collection kind:query must resolve to records, not a count or aggregate"))
                 }
                 super::querying::SavedQueryInspection::GovernedSql { .. } => {
-                    return Err(Error::engine(
+                    Err(Error::engine(
                         "saved governed SQL artifact inputs require a native.relation-envelope.v1 port",
                     ))
                 }
                 super::querying::SavedQueryInspection::Invalid { diagnostic }
                 | super::querying::SavedQueryInspection::UnsupportedVersion { diagnostic, .. } => {
-                    return Err(Error::engine(diagnostic))
+                    Err(Error::engine(diagnostic))
                 }
             }
         }
-        _ => return Err(Error::engine(format!("unsupported Collection kind '{kind}'"))),
-    };
+        _ => Err(Error::engine(format!("unsupported Collection kind '{kind}'"))),
+    }
+}
+
+pub(crate) async fn resolve_collection(
+    lens: &lens::ReadLens<'_>,
+    caller: &Caller,
+    id: &str,
+    kind: &str,
+) -> Result<Vec<InputRecord>> {
+    let values = collection_member_values(lens, caller, id, kind).await?;
+    let mut records =
+        input_records_from_values_in_pool(lens.projection().snapshot_pool(), values).await?;
+    sort_input_records(&mut records);
+    Ok(records)
+}
+
+pub(crate) async fn resolve_collection_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    caller: &Caller,
+    id: &str,
+    kind: &str,
+) -> Result<Vec<InputRecord>> {
+    let values = collection_member_values_in(tx, caller, id, kind).await?;
     let mut records = input_records_from_values_in(tx, values).await?;
-    records.sort_by(|left, right| {
-        left.name
-            .to_lowercase()
-            .cmp(&right.name.to_lowercase())
-            .then_with(|| left.id.cmp(&right.id))
-    });
+    sort_input_records(&mut records);
     Ok(records)
 }
 
@@ -2977,6 +3403,21 @@ pub(crate) use grants::{
 };
 use inputs::*;
 use modules::*;
+
+fn module_releases_json(closure: &BTreeMap<String, ReleaseMaterial>) -> Vec<Value> {
+    closure
+        .values()
+        .map(|release| {
+            json!({
+                "module_record_id": release.address.module_record_id,
+                "publication_event_id": release.address.publication_event_id,
+                "source_event_id": release.source_event_id,
+                "source_sha256": release.address.source_sha256,
+                "release_sha256": release.release_sha256,
+            })
+        })
+        .collect()
+}
 
 struct V2BuildOutput {
     modules: HashMap<String, String>,
@@ -3544,6 +3985,7 @@ async fn render_mdx_v2_in_reported(
         snapshot_event_seq,
         &mut telemetry,
         false,
+        None,
     )
     .await;
     let _ = tx.rollback().await;
@@ -3636,6 +4078,7 @@ async fn render_mdx_v2_measured(
         snapshot_event_seq,
         telemetry,
         false,
+        None,
     )
     .await;
     let _ = tx.rollback().await;
@@ -3678,6 +4121,7 @@ async fn render_mdx_v2_in(
     snapshot_event_seq: i64,
     telemetry: &mut mdx::RenderTelemetry,
     include_verification_context: bool,
+    revalidate: Option<Value>,
 ) -> Value {
     let cache_partition = caller.hosting_principal().unwrap_or("local");
     let parse_body = body.to_owned();
@@ -3869,7 +4313,129 @@ async fn render_mdx_v2_in(
     let mut records_by_port = BTreeMap::<String, BTreeSet<String>>::new();
     let mut aggregate_records = BTreeMap::<String, Value>::new();
     let mut resolved_port_count = 0usize;
+    let origin_db_id = match live_origin_db_id(tx, historical_lens).await {
+        Ok(id) => id,
+        Err(_) => {
+            return v2_host_diagnostic(
+                artifact_id,
+                "origin_db_id_unavailable",
+                "the origin database id for this render is unavailable",
+                json!({ "artifact_id": artifact_id }),
+            )
+        }
+    };
+    let caller_digest = render_caller_sha256(&origin_db_id, caller);
+    let meta_sha256 = match live_meta_sha256(tx, historical_lens).await {
+        Ok(digest) => digest,
+        Err(_) => {
+            return v2_host_diagnostic(
+                artifact_id,
+                "meta_sha256_unavailable",
+                "the meta-tier digest for named input resolution is unavailable",
+                json!({ "artifact_id": artifact_id }),
+            )
+        }
+    };
+    let closure_sha256 = closure_sha256(&parsed, &closure);
+    let cache_key = v2_compiled_cache_key(&parsed, &closure_sha256);
+    let declared_port_names = manifest.inputs.keys().collect::<Vec<_>>();
+    let expected_ports = manifest
+        .inputs
+        .keys()
+        .filter(|port| bound.contains_key(*port))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut revalidate_miss = None;
+    if historical_lens.is_none() {
+        if let Some(raw) = revalidate.as_ref() {
+            match super::artifact_revalidate::parse_revalidate(raw) {
+                Err(miss) => revalidate_miss = Some(miss),
+                Ok(request) => {
+                    match super::artifact_revalidate::evaluate(
+                        &request,
+                        &super::artifact_revalidate::LiveRevalidateIdentity {
+                            artifact_id,
+                            snapshot_event_id,
+                            snapshot_event_seq,
+                            authorization_revision,
+                            cache_key: &cache_key,
+                            caller_sha256: &caller_digest,
+                            meta_sha256: &meta_sha256,
+                        },
+                        &expected_ports,
+                    ) {
+                        Ok(()) => {
+                            match revalidate_governed_sql_ports(
+                                tx,
+                                caller,
+                                artifact_id,
+                                &bound,
+                                &manifest.inputs,
+                                &request,
+                                telemetry,
+                            )
+                            .await
+                            {
+                                Ok((_envelopes, None)) => {
+                                    let authorization_revision_after =
+                                        match v2_authorization_revision(tx, historical_lens).await {
+                                            Ok(revision) => revision,
+                                            Err(_) => {
+                                                return v2_host_diagnostic(
+                                                    artifact_id,
+                                                    "authorization_revision_unavailable",
+                                                    "the authorization revision for named input resolution is unavailable",
+                                                    json!({ "artifact_id": artifact_id }),
+                                                )
+                                            }
+                                        };
+                                    if authorization_revision_after != authorization_revision {
+                                        return v2_host_diagnostic(
+                                            artifact_id,
+                                            "authorization_revision_changed",
+                                            "authorization changed while named inputs were resolving; retry the render",
+                                            json!({ "artifact_id": artifact_id }),
+                                        );
+                                    }
+                                    telemetry.phase("resolve_inputs");
+                                    telemetry.phase("plan_assembly");
+                                    return unchanged_v2_render(
+                                        V2ProvenanceArgs {
+                                            artifact_id,
+                                            source_event_id,
+                                            source_event_seq,
+                                            snapshot_event_id,
+                                            snapshot_event_seq,
+                                            authorization_revision,
+                                            meta_sha256: &meta_sha256,
+                                            body_sha256: &parsed.source_sha256,
+                                            closure_sha256: &closure_sha256,
+                                            module_releases: module_releases_json(&closure),
+                                            caller_sha256: &caller_digest,
+                                            cache_key: &cache_key,
+                                            input_bundle: None,
+                                            render_sha256: None,
+                                        },
+                                        declared_port_names,
+                                    );
+                                }
+                                Ok((envelopes, Some(miss))) => {
+                                    revalidate_miss = Some(miss);
+                                    named_inputs = envelopes;
+                                }
+                                Err(diagnostic) => return diagnostic,
+                            }
+                        }
+                        Err(miss) => revalidate_miss = Some(miss),
+                    }
+                }
+            }
+        }
+    }
     for (port, declaration) in &manifest.inputs {
+        if named_inputs.contains_key(port) {
+            continue;
+        }
         let Some((collection_id, binding_seq)) = bound.get(port) else {
             if declaration.required {
                 return v2_host_diagnostic(
@@ -3881,6 +4447,7 @@ async fn render_mdx_v2_in(
             }
             continue;
         };
+        let visibility_started = Instant::now();
         let visible = match historical_lens {
             Some(lens) => {
                 super::can_record_in_pool(
@@ -3893,6 +4460,7 @@ async fn render_mdx_v2_in(
             }
             None => super::can_record_in(tx, caller, collection_id, Capability::View).await,
         };
+        let visibility_micros = elapsed_micros(visibility_started);
         match visible {
             Ok(true) => {}
             _ => {
@@ -3966,12 +4534,14 @@ async fn render_mdx_v2_in(
             (None, None) => {}
         }
         if governed_schema.is_some() {
+            let sql_started = Instant::now();
             let relation = match historical_lens {
                 Some(_) => Err(Error::engine(
                     "saved governed SQL artifact relations are live-only; historical execution has no portable snapshot contract",
                 )),
                 None => resolve_governed_sql_relation_in(tx, caller, collection_id).await,
             };
+            let governed_sql_micros = elapsed_micros(sql_started);
             let relation = match relation {
                 Ok(relation) => relation,
                 Err(error) => {
@@ -3992,6 +4562,7 @@ async fn render_mdx_v2_in(
                     json!({ "artifact_id": artifact_id, "port": port, "collection_id": collection_id }),
                 );
             }
+            let assembly_started = Instant::now();
             let envelope =
                 match governed_sql_relation_envelope(collection_id, *binding_seq, &relation) {
                     Ok(envelope) => envelope,
@@ -4004,15 +4575,106 @@ async fn render_mdx_v2_in(
                         )
                     }
                 };
+            let assembly_micros = elapsed_micros(assembly_started);
+            telemetry.port(
+                port,
+                relation_port_timing(
+                    "miss",
+                    governed_sql_micros,
+                    visibility_micros,
+                    assembly_micros,
+                ),
+            );
             named_inputs.insert(port.clone(), envelope);
             continue;
         }
-        let resolved_records = match historical_lens {
-            Some(lens) => resolve_collection(lens, caller, collection_id, &kind).await,
-            None => resolve_collection_in(tx, caller, collection_id, &kind).await,
+        let collection_cache_key = if historical_lens.is_none()
+            && declaration.envelope == mdx_v2::COLLECTION_ENVELOPE
+        {
+            Some(super::artifact_input_cache::CollectionPortKey {
+                origin_db_id: origin_db_id.clone(),
+                collection_id: collection_id.clone(),
+                declaration_sha256: super::artifact_input_cache::declaration_identity(declaration),
+                caller_identity: caller_digest.clone(),
+                snapshot_event_id: snapshot_event_id.to_owned(),
+                snapshot_event_seq,
+                authorization_revision,
+                meta_sha256: meta_sha256.clone(),
+                binding_event_seq: *binding_seq,
+                build: super::artifact_input_cache::server_build(),
+            })
+        } else {
+            None
         };
-        let records = match resolved_records {
-            Ok(records) => records,
+        if let Some(key) = collection_cache_key.as_ref() {
+            if let Some(cached) = super::artifact_input_cache::lookup(key) {
+                restore_cached_collection_port(
+                    port,
+                    cached.envelope.as_ref(),
+                    &mut named_inputs,
+                    &mut records_by_port,
+                    &mut aggregate_records,
+                );
+                telemetry.port(
+                    port,
+                    collection_port_timing("hit", 0, visibility_micros, 0, 0),
+                );
+                resolved_port_count = resolved_port_count.saturating_add(1);
+                if resolved_port_count == 1 && manifest.inputs.len() > 1 {
+                    pause_after_first_v2_input_port().await;
+                }
+                continue;
+            }
+        }
+        let fetch_started = Instant::now();
+        let (values_result, stages) = if let Some(lens) = historical_lens {
+            crate::query::stage_timing::collect(collection_member_values(
+                lens,
+                caller,
+                collection_id,
+                &kind,
+            ))
+            .await
+        } else {
+            crate::query::stage_timing::collect(collection_member_values_in(
+                tx,
+                caller,
+                collection_id,
+                &kind,
+            ))
+            .await
+        };
+        let fetch_total = elapsed_micros(fetch_started);
+        let values = match values_result {
+            Ok(values) => values,
+            Err(error) => {
+                if error.to_string() == NON_CANONICAL_TYPED_FACET_ERROR {
+                    return v2_host_diagnostic(
+                        artifact_id,
+                        "named_input_incompatible",
+                        NON_CANONICAL_TYPED_FACET_ERROR,
+                        json!({ "port": port }),
+                    );
+                }
+                return v2_host_diagnostic(
+                    artifact_id,
+                    "named_input_incompatible",
+                    error.to_string(),
+                    json!({ "artifact_id": artifact_id, "port": port, "collection_id": collection_id }),
+                );
+            }
+        };
+        let assembly_started = Instant::now();
+        let records_result = if let Some(lens) = historical_lens {
+            input_records_from_values_in_pool(lens.projection().snapshot_pool(), values).await
+        } else {
+            input_records_from_values_in(tx, values).await
+        };
+        let records = match records_result {
+            Ok(mut records) => {
+                sort_input_records(&mut records);
+                records
+            }
             Err(error) => {
                 if error.to_string() == NON_CANONICAL_TYPED_FACET_ERROR {
                     return v2_host_diagnostic(
@@ -4042,22 +4704,30 @@ async fn render_mdx_v2_in(
                         aggregate_records.insert(id.to_owned(), value.clone());
                     }
                 }
-                let records_sha256 = mdx::sha256_hex(&mdx_v2::canonical_json_bytes(&records_value));
+                let records_canonical = mdx_v2::canonical_json_bytes(&records_value);
+                let records_sha256 = mdx::sha256_hex(&records_canonical);
                 if declaration.envelope == mdx_v2::COLLECTION_ENVELOPE {
                     records_by_port.insert(
                         port.clone(),
                         records.iter().map(|record| record.id.clone()).collect(),
                     );
-                    named_inputs.insert(
-                        port.clone(),
-                        json!({
-                            "version": mdx_v2::COLLECTION_ENVELOPE,
-                            "collection": { "id": collection_id, "kind": kind },
-                            "projection": { "binding_event_seq": binding_seq },
-                            "records": records_value,
-                            "records_sha256": records_sha256,
-                        }),
-                    );
+                    let envelope = json!({
+                        "version": mdx_v2::COLLECTION_ENVELOPE,
+                        "collection": { "id": collection_id, "kind": kind },
+                        "projection": { "binding_event_seq": binding_seq },
+                        "records": records_value,
+                        "records_sha256": records_sha256,
+                    });
+                    if let Some(key) = collection_cache_key {
+                        super::artifact_input_cache::insert(
+                            key,
+                            super::artifact_input_cache::CachedCollectionPort {
+                                envelope: std::sync::Arc::new(envelope.clone()),
+                            },
+                            records_canonical.len(),
+                        );
+                    }
+                    named_inputs.insert(port.clone(), envelope);
                 } else {
                     let envelope = match record_relation_envelope(
                         collection_id,
@@ -4113,6 +4783,31 @@ async fn render_mdx_v2_in(
             }
             _ => unreachable!("manifest admission closes named input envelopes"),
         }
+        let assembly_micros = elapsed_micros(assembly_started);
+        let membership_micros = fetch_total
+            .saturating_sub(stages.authorization_micros)
+            .saturating_sub(stages.redaction_micros);
+        let authorization_micros = stages
+            .authorization_micros
+            .saturating_add(visibility_micros);
+        let port_timing = if declaration.envelope == mdx_v2::RELATION_ENVELOPE {
+            record_relation_port_timing(
+                "miss",
+                membership_micros,
+                authorization_micros,
+                stages.redaction_micros,
+                assembly_micros,
+            )
+        } else {
+            collection_port_timing(
+                "miss",
+                membership_micros,
+                authorization_micros,
+                stages.redaction_micros,
+                assembly_micros,
+            )
+        };
+        telemetry.port(port, port_timing);
         resolved_port_count = resolved_port_count.saturating_add(1);
         if resolved_port_count == 1 && manifest.inputs.len() > 1 {
             pause_after_first_v2_input_port().await;
@@ -4288,14 +4983,6 @@ async fn render_mdx_v2_in(
         }
     }
     telemetry.phase("capability_preflight");
-    let closure_sha256 = closure_sha256(&parsed, &closure);
-    let cache_key = mdx_v2::compiled_cache_key(
-        &parsed.source_sha256,
-        &parsed.manifest_sha256,
-        &closure_sha256,
-        &mdx::sha256_hex(include_bytes!("../../../Cargo.lock")),
-        parsed.styles_sha256(),
-    );
     let graph_parsed = parsed.clone();
     let graph_closure = closure.clone();
     let graph_named_inputs = named_inputs.clone();
@@ -4450,6 +5137,7 @@ async fn render_mdx_v2_in(
         snapshot_event_id,
         snapshot_event_seq,
         authorization_revision,
+        &meta_sha256,
     );
     let verification_context = include_verification_context.then(|| receipt_input.clone());
     // Its own phase, not part of `blocking_dispatch`. `json!` here deep-rebuilds
@@ -4514,23 +5202,33 @@ async fn render_mdx_v2_in(
             "kind": "safe_tree", "version": "1", "tree": tree,
             "interactions": &manifest.interactions,
             "observed": observed,
-            "provenance": { "record_id": artifact_id, "source_event_id": source_event_id,
-                "event_seq": source_event_seq,
-                "snapshot_event_id": snapshot_event_id,
-                "snapshot_event_seq": snapshot_event_seq,
-                "input_bundle": input_bundle,
-                "body_sha256": parsed.source_sha256, "dependency_closure_sha256": closure_sha256,
-                "render_sha256": render_sha256,
-                "module_releases": closure.values().map(|release| json!({
-                    "module_record_id": release.address.module_record_id,
-                    "publication_event_id": release.address.publication_event_id,
-                    "source_event_id": release.source_event_id,
-                    "source_sha256": release.address.source_sha256,
-                    "release_sha256": release.release_sha256,
-                })).collect::<Vec<_>>() },
+            "provenance": v2_plan_provenance(V2ProvenanceArgs {
+                artifact_id,
+                source_event_id,
+                source_event_seq,
+                snapshot_event_id,
+                snapshot_event_seq,
+                authorization_revision,
+                meta_sha256: &meta_sha256,
+                body_sha256: &parsed.source_sha256,
+                closure_sha256: &closure_sha256,
+                module_releases: module_releases_json(&closure),
+                caller_sha256: &caller_digest,
+                cache_key: &cache_key,
+                input_bundle: Some(input_bundle),
+                render_sha256: Some(&render_sha256),
+            }),
             "cache": { "state": graph_cache_state, "parsed_state": parsed_cache_state,
                 "key": cache_key },
     });
+    if let Some(miss) = revalidate_miss {
+        let cache = plan
+            .get_mut("cache")
+            .and_then(Value::as_object_mut)
+            .expect("cache is an object");
+        cache.insert("state".into(), json!("revalidated_full"));
+        cache.insert("revalidation".into(), json!({ "miss": miss.as_str() }));
+    }
     if let Some(availability) = interaction_availability {
         plan.as_object_mut()
             .expect("safe-tree plan is a JSON object")
@@ -5610,6 +6308,7 @@ async fn materialize_live_mdx_v2(
     tool: &'static str,
     collect_verification_context: bool,
     include_timing: bool,
+    revalidate: Option<Value>,
 ) -> Result<Option<LiveMdxV2Materialization>> {
     let mut telemetry = mdx::RenderTelemetry::begin(
         "render",
@@ -5724,6 +6423,7 @@ async fn materialize_live_mdx_v2(
         snapshot_event_seq,
         &mut telemetry,
         collect_verification_context,
+        revalidate,
     )
     .await;
     let author_style = if collect_verification_context
@@ -5767,6 +6467,7 @@ pub(crate) async fn try_render_live_mdx_v2(
     caller: &Caller,
     artifact_id: &str,
     include_timing: bool,
+    revalidate: Option<Value>,
 ) -> Result<Option<Value>> {
     Ok(materialize_live_mdx_v2(
         db,
@@ -5775,6 +6476,7 @@ pub(crate) async fn try_render_live_mdx_v2(
         "render_artifact",
         false,
         include_timing,
+        revalidate,
     )
     .await?
     .map(|materialization| materialization.rendered))
@@ -6027,7 +6729,8 @@ async fn render_artifact(db: Db, caller: Caller, arguments: Value) -> Result<Val
         .flatten();
         if runtime.as_deref() == Some(mdx_v2::RUNTIME_ID) {
             if let Some(rendered) =
-                try_render_live_mdx_v2(&db, &caller, &args.id, args.include_timing).await?
+                try_render_live_mdx_v2(&db, &caller, &args.id, args.include_timing, args.revalidate)
+                    .await?
             {
                 return Ok(rendered);
             }
@@ -6704,6 +7407,7 @@ fn empty_render_timing() -> Value {
         "input_json_bytes": Value::Null,
         "output_nodes": Value::Null,
         "output_json_bytes": Value::Null,
+        "ports": {},
     })
 }
 
@@ -7123,12 +7827,17 @@ async fn resolve_html_named_inputs_in(
             json!({ "artifact_id": artifact_id, "runtime": HTML_RUNTIME, "limit": "input_json_bytes", "maximum": crate::artifact_html::INPUT_JSON_LIMIT, "actual": input_json.len() }),
         )));
     }
+    let meta_sha256 = match historical_lens {
+        Some(lens) => meta_sha256_on_pool(lens.meta().snapshot_pool()).await?,
+        None => meta_sha256_in(tx).await?,
+    };
     let input_digest = hex::encode(sha2::Sha256::digest(&input_json));
     let input_bundle = named_input_bundle_receipt(
         &input,
         snapshot_event_id,
         snapshot_event_seq,
         authorization_revision,
+        &meta_sha256,
     );
     Ok(Ok(PreparedHtml {
         input,
@@ -7855,7 +8564,7 @@ async fn verify_artifact(db: Db, caller: Caller, arguments: Value) -> Result<Too
     };
     if resolved.runtime_id == mdx_v2::RUNTIME_ID {
         let Some(materialization) =
-            materialize_live_mdx_v2(&db, &caller, &args.id, TOOL, true, false).await?
+            materialize_live_mdx_v2(&db, &caller, &args.id, TOOL, true, false, None).await?
         else {
             return Ok(diagnostic(
                 "mdx_verifier_unavailable",
@@ -8126,7 +8835,7 @@ async fn verify_artifact(db: Db, caller: Caller, arguments: Value) -> Result<Too
 pub fn register_artifact_tools(registry: &mut ToolRegistry) -> Result<()> {
     registry.register(
         ToolKind::InstantiateArtifact,
-        "Create a standalone governed Document kind:artifact by copying one live artifact's body, name (unless title overrides it), and governed runtime facet, with exactly one immediate-source instantiated_from edge. The copy is placed in Unfiled and the complete create, facet, and provenance batch commits atomically; no renders binding or other source state is inherited.",
+        "Copy one live artifact into a standalone governed Document kind:artifact, preserving its body, name (unless title overrides it), and governed runtime facet, with exactly one immediate-source instantiated_from edge. To author from scratch, use records_write.create_record with type Document, kind artifact and facets.runtime; guidance_read.read_guide topic compositions covers runtime choice and create/bind/grant/render. The copy is placed in Unfiled and the complete create, facet, and provenance batch commits atomically; no renders binding or other source state is inherited.",
         json!({
             "type": "object",
             "properties": {
@@ -8219,7 +8928,23 @@ pub fn register_artifact_tools(registry: &mut ToolRegistry) -> Result<()> {
                         { "type": "object", "properties": { "event_id": { "type": "string", "description": "Portable event boundary; remains meaningful if local content sequence numbers are remapped during import." } }, "required": ["event_id"], "additionalProperties": false }
                     ]
                 },
-                "include_timing": { "type": "boolean", "description": "Opt-in per-render timing. When true, a content-free timing member (phase names, microseconds, record/byte counts for this render only, plus cache.state) is returned under plan.timing for rendered plans or as a top-level timing member for diagnostics. Absent/false leaves the response unchanged." }
+                "include_timing": { "type": "boolean", "description": "Opt-in per-render timing. When true, a content-free timing member (phase names, microseconds, record/byte counts for this render only, plus cache.state and a per-port kind/cache/micros split) is returned under plan.timing for rendered plans or as a top-level timing member for diagnostics. Additive provenance fields are always present on live v2 renders; absent/false only omits timing." },
+                "revalidate": {
+                    "type": "object",
+                    "description": "Optional conditional revalidation: copy plan.provenance.revalidation wholesale from a previous live native.mdx.v2 result and add ports from input_bundle.ports. Unknown extra keys are ignored. Any doubt falls through to a full render rather than an error.",
+                    "properties": {
+                        "artifact_id": { "type": "string" },
+                        "snapshot_event_id": { "type": "string" },
+                        "snapshot_event_seq": { "type": "integer" },
+                        "authorization_revision": { "type": "integer" },
+                        "cache_key": { "type": "string" },
+                        "caller_sha256": { "type": "string" },
+                        "meta_sha256": { "type": "string" },
+                        "ports": { "type": "object", "additionalProperties": { "type": "object" } }
+                    },
+                    "required": ["artifact_id", "snapshot_event_id", "snapshot_event_seq", "authorization_revision", "cache_key", "caller_sha256", "meta_sha256", "ports"],
+                    "additionalProperties": true
+                }
             },
             "required": ["id"],
             "additionalProperties": false
@@ -8261,6 +8986,88 @@ mod admission_tests {
     const LIVE_SNAPSHOT_SECOND_ITEM: &str = "aaaa0000-0000-4000-8000-000000000004";
     const LIVE_SNAPSHOT_THIRD_ITEM: &str = "aaaa0000-0000-4000-8000-000000000005";
     const LIVE_SNAPSHOT_FOURTH_ITEM: &str = "aaaa0000-0000-4000-8000-000000000006";
+    const LIVE_SQL_QUERY: &str = "aaaa0000-0000-4000-8000-000000000007";
+
+    async fn grant_account_view(db: &Db, account: &str, record_ids: &[&str]) {
+        for record_id in record_ids {
+            crate::authorization::replace_explicit_policy(
+                db,
+                "test:collection-port-cache",
+                record_id,
+                vec![crate::authorization::AllowEntry::account(
+                    account,
+                    Capability::View,
+                )],
+            )
+            .await
+            .expect("grant view");
+        }
+    }
+
+    fn collection_port_cache_state(rendered: &Value, port: &str) -> String {
+        rendered
+            .pointer(&format!("/plan/timing/ports/{port}/cache"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned()
+    }
+
+    fn revalidate_from(rendered: &Value) -> Value {
+        let mut token = rendered["plan"]["provenance"]["revalidation"].clone();
+        token
+            .as_object_mut()
+            .expect("revalidation is an object")
+            .insert(
+                "ports".into(),
+                rendered["plan"]["provenance"]["input_bundle"]["ports"].clone(),
+            );
+        token
+    }
+
+    fn assert_unchanged_content_free(rendered: &Value) {
+        assert_eq!(rendered["status"], "rendered", "{rendered:#}");
+        assert_eq!(rendered["unchanged"], true, "{rendered:#}");
+        assert!(rendered.get("tree").is_none(), "{rendered:#}");
+        assert!(
+            rendered["plan"].get("tree").is_none(),
+            "unchanged must omit plan.tree: {rendered:#}"
+        );
+        assert!(
+            rendered["plan"].get("interactions").is_none(),
+            "{rendered:#}"
+        );
+        assert!(rendered["plan"].get("observed").is_none(), "{rendered:#}");
+        assert!(
+            rendered["plan"].get("interaction_availability").is_none(),
+            "{rendered:#}"
+        );
+        assert!(rendered["plan"].get("styles").is_none(), "{rendered:#}");
+        assert!(
+            rendered["plan"]["provenance"]
+                .get("render_sha256")
+                .is_none(),
+            "{rendered:#}"
+        );
+        assert!(
+            rendered["plan"]["provenance"]["input_bundle"]
+                .get("ports")
+                .is_none(),
+            "{rendered:#}"
+        );
+        let serialized = rendered.to_string();
+        for forbidden in [
+            LIVE_SNAPSHOT_ITEM,
+            LIVE_SNAPSHOT_COLLECTION,
+            LIVE_SNAPSHOT_SECOND_ITEM,
+            "Snapshot item",
+            "First todo item",
+        ] {
+            assert!(
+                !serialized.contains(forbidden),
+                "unchanged leaked {forbidden}: {rendered:#}"
+            );
+        }
+    }
 
     #[test]
     fn safe_tree_render_identity_tracks_control_availability_not_cas_token_churn() {
@@ -8875,6 +9682,341 @@ mod admission_tests {
             )
             .await
             .expect("grant input.read");
+    }
+
+    const SECOND_SNAPSHOT_ARTIFACT: &str = "aaaa0000-0000-4000-8000-000000000008";
+
+    fn dual_identical_collection_source() -> &'static str {
+        r#"export const nativeArtifact = {
+  schema: "native.mdx.artifact.v2",
+  inputs: {
+    left: { envelope: "native.collection-envelope.v1", required: true, expose_to_root: true },
+    right: { envelope: "native.collection-envelope.v1", required: true, expose_to_root: true }
+  },
+  module_inputs: {},
+  capability_requests: [
+    { capability: "input.read", scope: { port: "left" } },
+    { capability: "input.read", scope: { port: "right" } }
+  ]
+}
+
+<Metric label="Left" value={native.inputs.left.records.length} />
+<Metric label="Right" value={native.inputs.right.records.length} />"#
+    }
+
+    async fn grant_artifact_source_ports(
+        registry: &crate::mcp::ToolRegistry,
+        db: &Db,
+        artifact_id: &str,
+        ports: &[&str],
+    ) {
+        let subjects = registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "manage_artifact_module_grants",
+                json!({ "action": "read", "artifact_id": artifact_id }),
+            )
+            .await
+            .expect("read grant subjects");
+        let subject = subjects["subjects"]
+            .as_array()
+            .and_then(|subjects| subjects.first())
+            .expect("input.read subject");
+        for port in ports {
+            registry
+                .call(
+                    db.clone(),
+                    Caller::local(),
+                    "manage_artifact_module_grants",
+                    json!({
+                        "action": "grant", "artifact_id": artifact_id,
+                        "subject_kind": "artifact_source", "subject_record_id": artifact_id,
+                        "subject_event_id": subject["subject_event_id"],
+                        "source_sha256": subject["source_sha256"], "capability": "input.read",
+                        "scope": { "artifact_port": port }
+                    }),
+                )
+                .await
+                .expect("grant input.read");
+        }
+    }
+
+    async fn create_dual_identical_collection_artifact(
+        registry: &crate::mcp::ToolRegistry,
+        db: &Db,
+    ) {
+        for arguments in [
+            json!({
+                "id": LIVE_SNAPSHOT_ARTIFACT, "type": "Document", "kind": "artifact",
+                "name": "Dual identical collection ports", "body": dual_identical_collection_source(),
+                "facets": { "runtime": mdx_v2::RUNTIME_ID },
+                "reason": "Exercise binding-seq cache identity."
+            }),
+            json!({
+                "id": LIVE_SNAPSHOT_COLLECTION, "type": "Collection", "kind": "selection",
+                "name": "Snapshot items", "reason": "Bind one collection twice."
+            }),
+            json!({
+                "id": LIVE_SNAPSHOT_ITEM, "type": "WorkItem", "kind": "task",
+                "name": "Snapshot item", "reason": "Populate the collection."
+            }),
+        ] {
+            registry
+                .call(db.clone(), Caller::local(), "create_record", arguments)
+                .await
+                .expect("create dual-port fixture record");
+        }
+        registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "manage_links",
+                json!({
+                    "action": "add", "source_id": LIVE_SNAPSHOT_ITEM,
+                    "target_id": LIVE_SNAPSHOT_COLLECTION, "relationship": "member_of"
+                }),
+            )
+            .await
+            .expect("add selection member");
+        registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "manage_artifact_inputs",
+                json!({
+                    "action": "bind", "artifact_id": LIVE_SNAPSHOT_ARTIFACT,
+                    "port_name": "left", "collection_id": LIVE_SNAPSHOT_COLLECTION
+                }),
+            )
+            .await
+            .expect("bind left");
+        registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "create_record",
+                json!({
+                    "id": LIVE_SNAPSHOT_SECOND_ITEM, "type": "WorkItem", "kind": "task",
+                    "name": "Seq bump", "reason": "Advance content seq between binds."
+                }),
+            )
+            .await
+            .expect("advance seq");
+        registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "manage_artifact_inputs",
+                json!({
+                    "action": "bind", "artifact_id": LIVE_SNAPSHOT_ARTIFACT,
+                    "port_name": "right", "collection_id": LIVE_SNAPSHOT_COLLECTION
+                }),
+            )
+            .await
+            .expect("bind right");
+        grant_artifact_source_ports(registry, db, LIVE_SNAPSHOT_ARTIFACT, &["left", "right"]).await;
+    }
+
+    async fn create_identical_items_artifact_on_existing_collection(
+        registry: &crate::mcp::ToolRegistry,
+        db: &Db,
+        artifact_id: &str,
+    ) {
+        registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "create_record",
+                json!({
+                    "id": artifact_id, "type": "Document", "kind": "artifact",
+                    "name": "Second identical collection-port artifact",
+                    "body": bound_snapshot_source(),
+                    "facets": { "runtime": mdx_v2::RUNTIME_ID },
+                    "reason": "Exercise binding-seq cache identity across artifacts."
+                }),
+            )
+            .await
+            .expect("create second items artifact");
+        registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "manage_artifact_inputs",
+                json!({
+                    "action": "bind", "artifact_id": artifact_id,
+                    "port_name": "items", "collection_id": LIVE_SNAPSHOT_COLLECTION
+                }),
+            )
+            .await
+            .expect("bind second items port");
+        grant_artifact_source_ports(registry, db, artifact_id, &["items"]).await;
+    }
+
+    fn clock_sql_definition() -> crate::mcp::tools::querying::SavedSqlDefinition {
+        use crate::mcp::tools::querying::{
+            SavedSqlBounds, SavedSqlColumn, SavedSqlColumnType, SavedSqlDefinition,
+            SavedSqlDirection, SavedSqlOrder, SavedSqlOutput, SavedSqlProfile,
+            SavedSqlRelationDependency,
+        };
+
+        let columns = vec![
+            SavedSqlColumn {
+                name: "id".into(),
+                column_type: SavedSqlColumnType::Identifier,
+                nullable: false,
+            },
+            SavedSqlColumn {
+                name: "tick".into(),
+                column_type: SavedSqlColumnType::Text,
+                nullable: false,
+            },
+        ];
+        let schema_sha256 = mdx::sha256_hex(&mdx_v2::canonical_json_bytes(&json!(columns)));
+        SavedSqlDefinition {
+            v: "1.1".into(),
+            kind: "governed_sql".into(),
+            profile: SavedSqlProfile {
+                id: "sqlite-local".into(),
+                revision: 1,
+            },
+            catalog_revision: crate::query::sql_contract::LOGICAL_CATALOG_REVISION,
+            relations: BTreeMap::from([(
+                "records".into(),
+                SavedSqlRelationDependency {
+                    identity: "native.query-sql.records".into(),
+                    semantic_version: 1,
+                },
+            )]),
+            sql: "SELECT id, strftime('%Y-%m-%dT%H:%M:%fZ','now') AS tick FROM records LIMIT 1"
+                .into(),
+            parameters: vec![],
+            output: SavedSqlOutput {
+                columns,
+                schema_sha256,
+                row_identity: vec!["id".into()],
+                order: vec![SavedSqlOrder {
+                    column: "id".into(),
+                    direction: SavedSqlDirection::Asc,
+                }],
+            },
+            bounds: SavedSqlBounds { rows: 1 },
+        }
+    }
+
+    fn clock_sql_two_port_source(schema_sha256: &str) -> String {
+        format!(
+            r#"export const nativeArtifact = {{
+  schema: "native.mdx.artifact.v2",
+  inputs: {{
+    board: {{ envelope: "native.collection-envelope.v1", required: true, expose_to_root: true }},
+    meta: {{
+      envelope: "native.relation-envelope.v1", required: true, expose_to_root: true,
+      schema_sha256: "{schema_sha256}",
+      relations: {{ records: {{ identity: "native.query-sql.records", semantic_version: 1 }} }}
+    }}
+  }},
+  module_inputs: {{}},
+  capability_requests: [
+    {{ capability: "input.read", scope: {{ port: "board" }} }},
+    {{ capability: "input.read", scope: {{ port: "meta" }} }}
+  ]
+}}
+
+<Metric label="Count" value={{native.inputs.board.records.length}} />
+<Metric label="Tick" value={{native.inputs.meta.relation.rows[0].tick}} />"#
+        )
+    }
+
+    async fn create_clock_sql_two_port_artifact(registry: &crate::mcp::ToolRegistry, db: &Db) {
+        let definition = clock_sql_definition();
+        let source = clock_sql_two_port_source(&definition.output.schema_sha256);
+        for arguments in [
+            json!({
+                "id": LIVE_SNAPSHOT_ARTIFACT, "type": "Document", "kind": "artifact",
+                "name": "Clock SQL two-port artifact", "body": source,
+                "facets": { "runtime": mdx_v2::RUNTIME_ID },
+                "reason": "Exercise governed-SQL revalidation."
+            }),
+            json!({
+                "id": LIVE_SNAPSHOT_COLLECTION, "type": "Collection", "kind": "selection",
+                "name": "Board items", "reason": "Bind the collection port."
+            }),
+            json!({
+                "id": LIVE_SQL_QUERY, "type": "Collection", "kind": "query",
+                "name": "Clock relation",
+                "facets": { "query": serde_json::to_string(&definition).unwrap() },
+                "reason": "Bind the governed SQL relation port."
+            }),
+            json!({
+                "id": LIVE_SNAPSHOT_ITEM, "type": "WorkItem", "kind": "task",
+                "name": "Board item", "reason": "Populate the board collection."
+            }),
+        ] {
+            registry
+                .call(db.clone(), Caller::local(), "create_record", arguments)
+                .await
+                .expect("create clock SQL fixture record");
+        }
+        registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "manage_links",
+                json!({
+                    "action": "add", "source_id": LIVE_SNAPSHOT_ITEM,
+                    "target_id": LIVE_SNAPSHOT_COLLECTION, "relationship": "member_of"
+                }),
+            )
+            .await
+            .expect("add board member");
+        for (port_name, collection_id) in [
+            ("board", LIVE_SNAPSHOT_COLLECTION),
+            ("meta", LIVE_SQL_QUERY),
+        ] {
+            registry
+                .call(
+                    db.clone(),
+                    Caller::local(),
+                    "manage_artifact_inputs",
+                    json!({
+                        "action": "bind", "artifact_id": LIVE_SNAPSHOT_ARTIFACT,
+                        "port_name": port_name, "collection_id": collection_id
+                    }),
+                )
+                .await
+                .expect("bind clock SQL input");
+        }
+        let subjects = registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "manage_artifact_module_grants",
+                json!({ "action": "read", "artifact_id": LIVE_SNAPSHOT_ARTIFACT }),
+            )
+            .await
+            .expect("read clock SQL grant subjects");
+        let subject = subjects["subjects"]
+            .as_array()
+            .and_then(|subjects| subjects.first())
+            .expect("clock SQL input.read subject");
+        for artifact_port in ["board", "meta"] {
+            registry
+                .call(
+                    db.clone(),
+                    Caller::local(),
+                    "manage_artifact_module_grants",
+                    json!({
+                        "action": "grant", "artifact_id": LIVE_SNAPSHOT_ARTIFACT,
+                        "subject_kind": "artifact_source", "subject_record_id": LIVE_SNAPSHOT_ARTIFACT,
+                        "subject_event_id": subject["subject_event_id"],
+                        "source_sha256": subject["source_sha256"], "capability": "input.read",
+                        "scope": { "artifact_port": artifact_port }
+                    }),
+                )
+                .await
+                .expect("grant clock SQL input.read");
+        }
     }
 
     fn two_port_snapshot_source() -> &'static str {
@@ -11202,7 +12344,7 @@ export const nativeArtifact = {{
             ),
             "legacy authored input ABI changed"
         );
-        let first = named_input_bundle_receipt(&input, "event:21", 21, 7);
+        let first = named_input_bundle_receipt(&input, "event:21", 21, 7, "meta-digest");
 
         assert_eq!(
             mdx_v2::canonical_json_bytes(&input),
@@ -11214,6 +12356,7 @@ export const nativeArtifact = {{
         assert_eq!(first["revision"]["content_event_id"], "event:21");
         assert_eq!(first["revision"]["content_event_seq"], 21);
         assert_eq!(first["revision"]["authorization_revision"], 7);
+        assert_eq!(first["revision"]["meta_sha256"], "meta-digest");
         assert_eq!(first["input_abi"], mdx_v2::NAMED_INPUT_ABI);
         assert_eq!(
             first["ports"]["items"]["envelope"],
@@ -11224,24 +12367,29 @@ export const nativeArtifact = {{
             mdx::sha256_hex(&mdx_v2::canonical_json_bytes(&input["inputs"]["items"]))
         );
 
-        let later_boundary = named_input_bundle_receipt(&input, "event:22", 22, 7);
+        let later_boundary = named_input_bundle_receipt(&input, "event:22", 22, 7, "meta-digest");
         assert_ne!(first["sha256"], later_boundary["sha256"]);
         assert_eq!(
             first["ports"]["items"]["sha256"], later_boundary["ports"]["items"]["sha256"],
             "a new shared boundary must not pretend unchanged port bytes changed"
         );
 
-        let later_authority = named_input_bundle_receipt(&input, "event:21", 21, 8);
+        let later_authority = named_input_bundle_receipt(&input, "event:21", 21, 8, "meta-digest");
         assert_ne!(first["sha256"], later_authority["sha256"]);
         assert_eq!(
             first["ports"]["items"]["sha256"], later_authority["ports"]["items"]["sha256"],
             "an authority fence change must not pretend the port bytes changed"
         );
+        let later_meta = named_input_bundle_receipt(&input, "event:21", 21, 7, "other-meta");
+        assert_ne!(
+            first["sha256"], later_meta["sha256"],
+            "a meta-tier digest change must change the receipt"
+        );
 
         let mut changed = input.clone();
         changed["inputs"]["items"]["records"][0]["facets"]["effort"] = json!("large");
         changed["records"][0]["facets"]["effort"] = json!("large");
-        let second = named_input_bundle_receipt(&changed, "event:22", 22, 7);
+        let second = named_input_bundle_receipt(&changed, "event:22", 22, 7, "meta-digest");
         assert_ne!(first["sha256"], second["sha256"]);
         assert_ne!(
             first["ports"]["items"]["sha256"],
@@ -11684,6 +12832,7 @@ export const nativeArtifact = {{
             "render_artifact",
             true,
             false,
+            None,
         )
         .await
         .expect("materialize authorized cohort")
@@ -12429,7 +13578,7 @@ export const nativeArtifact = {{
             },
             "records": [child_record],
         });
-        let receipt = named_input_bundle_receipt(&full_input, "event:9", 9, 4);
+        let receipt = named_input_bundle_receipt(&full_input, "event:9", 9, 4, "meta-digest");
         assert_eq!(receipt["ports"].as_object().map(Map::len), Some(2));
 
         let authored = root_authored_input(&Map::new());
@@ -13406,6 +14555,7 @@ export function Grouped() { return <Metric label="Grouped" value={1} /> }"#,
                 "output_json_bytes",
                 "output_nodes",
                 "phases",
+                "ports",
                 "validate_micros",
             ]
             .into_iter()
@@ -13535,6 +14685,571 @@ export function Grouped() { return <Metric label="Grouped" value={1} /> }"#,
 
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
+    async fn include_timing_true_reports_per_port_kind_and_micros_split() {
+        let _guard = mdx::test_guard();
+        let db = crate::create_database(":memory:")
+            .await
+            .expect("test database");
+        let mut registry = crate::mcp::ToolRegistry::new();
+        crate::mcp::register_surface_tools(&mut registry).expect("artifact tools register");
+        create_two_port_snapshot_artifact(&registry, &db).await;
+
+        let rendered = render_artifact(
+            db.clone(),
+            Caller::local(),
+            json!({ "id": LIVE_SNAPSHOT_ARTIFACT, "include_timing": true }),
+        )
+        .await
+        .expect("render two-port artifact with timing");
+        assert_eq!(rendered["status"], "rendered", "{rendered:#}");
+        let timing = rendered
+            .pointer("/plan/timing")
+            .expect("live v2 carries plan.timing");
+        assert_content_free_timing(timing, LIVE_SNAPSHOT_ARTIFACT);
+        let ports = timing
+            .get("ports")
+            .and_then(Value::as_object)
+            .expect("timing carries per-port split");
+        assert_eq!(
+            ports.keys().cloned().collect::<Vec<_>>(),
+            vec![
+                "details".to_owned(),
+                "metrics_basis".to_owned(),
+                "records".to_owned()
+            ],
+            "port names are author-declared and sorted: {ports:#?}"
+        );
+        let details = &ports["details"];
+        assert_eq!(details["kind"], "collection", "{details:#}");
+        assert_eq!(details["cache"], "miss", "{details:#}");
+        for key in [
+            "membership_micros",
+            "authorization_micros",
+            "redaction_micros",
+            "assembly_micros",
+        ] {
+            assert!(
+                details.get(key).and_then(Value::as_u64).is_some(),
+                "collection port reports {key}: {details:#}"
+            );
+        }
+        assert!(
+            details.get("governed_sql_micros").is_none(),
+            "collection ports omit governed SQL: {details:#}"
+        );
+        let records = &ports["records"];
+        assert_eq!(records["kind"], "relation", "{records:#}");
+        assert_eq!(records["cache"], "miss", "{records:#}");
+        for key in [
+            "membership_micros",
+            "authorization_micros",
+            "redaction_micros",
+            "assembly_micros",
+        ] {
+            assert!(
+                records.get(key).and_then(Value::as_u64).is_some(),
+                "record-relation port reports {key}: {records:#}"
+            );
+        }
+        let metrics = &ports["metrics_basis"];
+        assert_eq!(metrics["kind"], "collection", "{metrics:#}");
+        assert_eq!(metrics["cache"], "miss", "{metrics:#}");
+        let serialized = serde_json::to_string(timing).expect("timing serializes");
+        for leaked in [LIVE_SNAPSHOT_COLLECTION, LIVE_SNAPSHOT_ITEM, "todo"] {
+            assert!(
+                !serialized.contains(leaked),
+                "per-port timing must not leak {leaked:?}: {serialized}"
+            );
+        }
+
+        db.close().await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn collection_port_cache_hits_on_identical_authenticated_state() {
+        let _mdx = mdx::test_guard();
+        let _cache = super::super::artifact_input_cache::test_guard();
+        super::super::artifact_input_cache::reset_for_test();
+        let db = crate::create_database(":memory:")
+            .await
+            .expect("test database");
+        let mut registry = crate::mcp::ToolRegistry::new();
+        crate::mcp::register_surface_tools(&mut registry).expect("artifact tools register");
+        create_bound_snapshot_artifact(&registry, &db).await;
+        grant_account_view(
+            &db,
+            "acct:bea",
+            &[
+                LIVE_SNAPSHOT_ARTIFACT,
+                LIVE_SNAPSHOT_COLLECTION,
+                LIVE_SNAPSHOT_ITEM,
+            ],
+        )
+        .await;
+        let caller = Caller::authenticated("acct:bea");
+        let first = render_artifact(
+            db.clone(),
+            caller.clone(),
+            json!({ "id": LIVE_SNAPSHOT_ARTIFACT, "include_timing": true }),
+        )
+        .await
+        .expect("first authenticated render");
+        assert_eq!(first["status"], "rendered", "{first:#}");
+        assert_eq!(collection_port_cache_state(&first, "items"), "miss");
+        let first_sha = first["plan"]["provenance"]["input_bundle"]["ports"]["items"]["sha256"]
+            .as_str()
+            .expect("first envelope digest")
+            .to_owned();
+        let first_envelope = first["plan"]["provenance"]["input_bundle"]["sha256"].clone();
+
+        let second = render_artifact(
+            db.clone(),
+            caller,
+            json!({ "id": LIVE_SNAPSHOT_ARTIFACT, "include_timing": true }),
+        )
+        .await
+        .expect("second authenticated render");
+        assert_eq!(second["status"], "rendered", "{second:#}");
+        assert_eq!(collection_port_cache_state(&second, "items"), "hit");
+        assert_eq!(
+            second["plan"]["provenance"]["input_bundle"]["ports"]["items"]["sha256"], first_sha,
+            "cached envelope is byte-identical"
+        );
+        assert_eq!(
+            second["plan"]["provenance"]["input_bundle"]["sha256"], first_envelope,
+            "input bundle digest is unchanged on a collection cache hit"
+        );
+
+        db.close().await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn collection_port_cache_does_not_share_entries_across_restored_heads() {
+        let _mdx = mdx::test_guard();
+        let _cache = super::super::artifact_input_cache::test_guard();
+        super::super::artifact_input_cache::reset_for_test();
+        let mut registry = crate::mcp::ToolRegistry::new();
+        crate::mcp::register_surface_tools(&mut registry).expect("artifact tools register");
+
+        async fn bound_db(registry: &crate::mcp::ToolRegistry) -> crate::Db {
+            let db = crate::create_database(":memory:")
+                .await
+                .expect("test database");
+            create_bound_snapshot_artifact(registry, &db).await;
+            grant_account_view(
+                &db,
+                "acct:bea",
+                &[
+                    LIVE_SNAPSHOT_ARTIFACT,
+                    LIVE_SNAPSHOT_COLLECTION,
+                    LIVE_SNAPSHOT_ITEM,
+                ],
+            )
+            .await;
+            db
+        }
+
+        let db_a = bound_db(&registry).await;
+        let db_b = bound_db(&registry).await;
+        let origin_a: String =
+            sqlx::query_scalar("SELECT origin_db_id FROM database_identity WHERE singleton=1")
+                .fetch_one(db_a.write_pool())
+                .await
+                .expect("origin a");
+        sqlx::query("UPDATE database_identity SET origin_db_id = ?1 WHERE singleton = 1")
+            .bind(&origin_a)
+            .execute(db_b.write_pool())
+            .await
+            .expect("re-adopt db_b under db_a's origin");
+
+        let seq_a: i64 =
+            sqlx::query_scalar("SELECT seq FROM content_events ORDER BY seq DESC LIMIT 1")
+                .fetch_one(db_a.write_pool())
+                .await
+                .expect("seq a");
+        let seq_b: i64 =
+            sqlx::query_scalar("SELECT seq FROM content_events ORDER BY seq DESC LIMIT 1")
+                .fetch_one(db_b.write_pool())
+                .await
+                .expect("seq b");
+        let event_a: String =
+            sqlx::query_scalar("SELECT id FROM content_events ORDER BY seq DESC LIMIT 1")
+                .fetch_one(db_a.write_pool())
+                .await
+                .expect("event a");
+        let event_b: String =
+            sqlx::query_scalar("SELECT id FROM content_events ORDER BY seq DESC LIMIT 1")
+                .fetch_one(db_b.write_pool())
+                .await
+                .expect("event b");
+        let epoch_a = crate::authorization::authorization_revision(&db_a)
+            .await
+            .expect("epoch a");
+        let epoch_b = crate::authorization::authorization_revision(&db_b)
+            .await
+            .expect("epoch b");
+        assert_eq!(seq_a, seq_b, "restore coincidence requires equal head seq");
+        assert_eq!(epoch_a, epoch_b, "restore coincidence requires equal epoch");
+        assert_ne!(event_a, event_b, "the two heads must be distinct events");
+
+        let caller = Caller::authenticated("acct:bea");
+        let first = render_artifact(
+            db_a.clone(),
+            caller.clone(),
+            json!({ "id": LIVE_SNAPSHOT_ARTIFACT, "include_timing": true }),
+        )
+        .await
+        .expect("render db_a");
+        assert_eq!(collection_port_cache_state(&first, "items"), "miss");
+
+        let second = render_artifact(
+            db_b.clone(),
+            caller,
+            json!({ "id": LIVE_SNAPSHOT_ARTIFACT, "include_timing": true }),
+        )
+        .await
+        .expect("render db_b");
+        assert_eq!(
+            collection_port_cache_state(&second, "items"),
+            "miss",
+            "equal seq/epoch under the same origin_db_id must not share a Collection-port entry when head event ids differ"
+        );
+
+        db_a.close().await;
+        db_b.close().await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn collection_port_cache_misses_after_a_content_commit() {
+        let _mdx = mdx::test_guard();
+        let _cache = super::super::artifact_input_cache::test_guard();
+        super::super::artifact_input_cache::reset_for_test();
+        let db = crate::create_database(":memory:")
+            .await
+            .expect("test database");
+        let mut registry = crate::mcp::ToolRegistry::new();
+        crate::mcp::register_surface_tools(&mut registry).expect("artifact tools register");
+        create_bound_snapshot_artifact(&registry, &db).await;
+        grant_account_view(
+            &db,
+            "acct:bea",
+            &[
+                LIVE_SNAPSHOT_ARTIFACT,
+                LIVE_SNAPSHOT_COLLECTION,
+                LIVE_SNAPSHOT_ITEM,
+            ],
+        )
+        .await;
+        let caller = Caller::authenticated("acct:bea");
+        let first = render_artifact(
+            db.clone(),
+            caller.clone(),
+            json!({ "id": LIVE_SNAPSHOT_ARTIFACT, "include_timing": true }),
+        )
+        .await
+        .expect("first render");
+        assert_eq!(collection_port_cache_state(&first, "items"), "miss");
+
+        registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "update_record",
+                json!({
+                    "id": LIVE_SNAPSHOT_ITEM, "facets": { "effort": "large" },
+                    "reason": "Move the content head between cached renders."
+                }),
+            )
+            .await
+            .expect("content commit");
+        // Trusted-local still has filesystem authority; re-assert the
+        // authenticated view so the second render is still caller-relative.
+        grant_account_view(
+            &db,
+            "acct:bea",
+            &[
+                LIVE_SNAPSHOT_ARTIFACT,
+                LIVE_SNAPSHOT_COLLECTION,
+                LIVE_SNAPSHOT_ITEM,
+            ],
+        )
+        .await;
+
+        let second = render_artifact(
+            db.clone(),
+            caller,
+            json!({ "id": LIVE_SNAPSHOT_ARTIFACT, "include_timing": true }),
+        )
+        .await
+        .expect("render after commit");
+        assert_eq!(second["status"], "rendered", "{second:#}");
+        assert_eq!(collection_port_cache_state(&second, "items"), "miss");
+        assert_ne!(
+            first["plan"]["provenance"]["input_bundle"]["ports"]["items"]["sha256"],
+            second["plan"]["provenance"]["input_bundle"]["ports"]["items"]["sha256"]
+        );
+
+        db.close().await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn collection_port_cache_misses_when_authorization_epoch_moves() {
+        let _mdx = mdx::test_guard();
+        let _cache = super::super::artifact_input_cache::test_guard();
+        super::super::artifact_input_cache::reset_for_test();
+        let db = crate::create_database(":memory:")
+            .await
+            .expect("test database");
+        let mut registry = crate::mcp::ToolRegistry::new();
+        crate::mcp::register_surface_tools(&mut registry).expect("artifact tools register");
+        create_bound_snapshot_artifact(&registry, &db).await;
+        grant_account_view(
+            &db,
+            "acct:bea",
+            &[
+                LIVE_SNAPSHOT_ARTIFACT,
+                LIVE_SNAPSHOT_COLLECTION,
+                LIVE_SNAPSHOT_ITEM,
+            ],
+        )
+        .await;
+        let caller = Caller::authenticated("acct:bea");
+        let first = render_artifact(
+            db.clone(),
+            caller.clone(),
+            json!({ "id": LIVE_SNAPSHOT_ARTIFACT, "include_timing": true }),
+        )
+        .await
+        .expect("first render");
+        assert_eq!(collection_port_cache_state(&first, "items"), "miss");
+        let first_epoch = first["plan"]["provenance"]["input_bundle"]["revision"]
+            ["authorization_revision"]
+            .as_i64()
+            .expect("authorization revision");
+
+        crate::authorization::replace_explicit_policy(
+            &db,
+            "test:collection-port-cache-narrow",
+            LIVE_SNAPSHOT_ITEM,
+            vec![crate::authorization::AllowEntry::account(
+                "acct:bea",
+                Capability::View,
+            )],
+        )
+        .await
+        .expect("rewrite item policy to bump the epoch");
+
+        let second = render_artifact(
+            db.clone(),
+            caller,
+            json!({ "id": LIVE_SNAPSHOT_ARTIFACT, "include_timing": true }),
+        )
+        .await
+        .expect("render after epoch bump");
+        assert_eq!(second["status"], "rendered", "{second:#}");
+        assert_eq!(collection_port_cache_state(&second, "items"), "miss");
+        let second_epoch = second["plan"]["provenance"]["input_bundle"]["revision"]
+            ["authorization_revision"]
+            .as_i64()
+            .expect("authorization revision");
+        assert!(
+            second_epoch > first_epoch,
+            "grant rewrite must move the epoch: {first_epoch} -> {second_epoch}"
+        );
+
+        db.close().await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn collection_port_cache_misses_for_a_different_authenticated_caller() {
+        let _mdx = mdx::test_guard();
+        let _cache = super::super::artifact_input_cache::test_guard();
+        super::super::artifact_input_cache::reset_for_test();
+        let db = crate::create_database(":memory:")
+            .await
+            .expect("test database");
+        let mut registry = crate::mcp::ToolRegistry::new();
+        crate::mcp::register_surface_tools(&mut registry).expect("artifact tools register");
+        create_bound_snapshot_artifact(&registry, &db).await;
+        for account in ["acct:bea", "acct:cam"] {
+            grant_account_view(
+                &db,
+                account,
+                &[
+                    LIVE_SNAPSHOT_ARTIFACT,
+                    LIVE_SNAPSHOT_COLLECTION,
+                    LIVE_SNAPSHOT_ITEM,
+                ],
+            )
+            .await;
+        }
+        // The last grant_account_view replaced policy with only acct:cam.
+        // Reinstall both principals on every record.
+        for record_id in [
+            LIVE_SNAPSHOT_ARTIFACT,
+            LIVE_SNAPSHOT_COLLECTION,
+            LIVE_SNAPSHOT_ITEM,
+        ] {
+            crate::authorization::replace_explicit_policy(
+                &db,
+                "test:collection-port-cache-two-callers",
+                record_id,
+                vec![
+                    crate::authorization::AllowEntry::account("acct:bea", Capability::View),
+                    crate::authorization::AllowEntry::account("acct:cam", Capability::View),
+                ],
+            )
+            .await
+            .expect("grant both callers");
+        }
+
+        let bea = render_artifact(
+            db.clone(),
+            Caller::authenticated("acct:bea"),
+            json!({ "id": LIVE_SNAPSHOT_ARTIFACT, "include_timing": true }),
+        )
+        .await
+        .expect("bea render");
+        assert_eq!(bea["status"], "rendered", "{bea:#}");
+        assert_eq!(collection_port_cache_state(&bea, "items"), "miss");
+
+        let cam = render_artifact(
+            db.clone(),
+            Caller::authenticated("acct:cam"),
+            json!({ "id": LIVE_SNAPSHOT_ARTIFACT, "include_timing": true }),
+        )
+        .await
+        .expect("cam render");
+        assert_eq!(cam["status"], "rendered", "{cam:#}");
+        assert_eq!(collection_port_cache_state(&cam, "items"), "miss");
+
+        let bea_again = render_artifact(
+            db.clone(),
+            Caller::authenticated("acct:bea"),
+            json!({ "id": LIVE_SNAPSHOT_ARTIFACT, "include_timing": true }),
+        )
+        .await
+        .expect("bea cache hit");
+        assert_eq!(collection_port_cache_state(&bea_again, "items"), "hit");
+
+        db.close().await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn collection_port_cache_does_not_serve_a_different_declaration() {
+        let _mdx = mdx::test_guard();
+        let _cache = super::super::artifact_input_cache::test_guard();
+        super::super::artifact_input_cache::reset_for_test();
+        let db = crate::create_database(":memory:")
+            .await
+            .expect("test database");
+        let mut registry = crate::mcp::ToolRegistry::new();
+        crate::mcp::register_surface_tools(&mut registry).expect("artifact tools register");
+        create_two_port_snapshot_artifact(&registry, &db).await;
+        grant_account_view(
+            &db,
+            "acct:bea",
+            &[
+                LIVE_SNAPSHOT_ARTIFACT,
+                LIVE_SNAPSHOT_COLLECTION,
+                LIVE_SNAPSHOT_ITEM,
+                LIVE_SNAPSHOT_SECOND_ITEM,
+                LIVE_SNAPSHOT_THIRD_ITEM,
+                LIVE_SNAPSHOT_FOURTH_ITEM,
+            ],
+        )
+        .await;
+        let caller = Caller::authenticated("acct:bea");
+        let first = render_artifact(
+            db.clone(),
+            caller.clone(),
+            json!({ "id": LIVE_SNAPSHOT_ARTIFACT, "include_timing": true }),
+        )
+        .await
+        .expect("two-port render");
+        assert_eq!(first["status"], "rendered", "{first:#}");
+        assert_eq!(collection_port_cache_state(&first, "details"), "miss");
+        assert_eq!(
+            collection_port_cache_state(&first, "metrics_basis"),
+            "miss",
+            "grouped-count is a different declaration and is never cached"
+        );
+        assert_eq!(
+            collection_port_cache_state(&first, "records"),
+            "miss",
+            "relation ports are never cached"
+        );
+
+        let second = render_artifact(
+            db.clone(),
+            caller,
+            json!({ "id": LIVE_SNAPSHOT_ARTIFACT, "include_timing": true }),
+        )
+        .await
+        .expect("second two-port render");
+        assert_eq!(collection_port_cache_state(&second, "details"), "hit");
+        assert_eq!(
+            collection_port_cache_state(&second, "metrics_basis"),
+            "miss"
+        );
+        assert_eq!(collection_port_cache_state(&second, "records"), "miss");
+
+        db.close().await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn collection_port_cache_bypasses_historical_renders() {
+        let _mdx = mdx::test_guard();
+        let _cache = super::super::artifact_input_cache::test_guard();
+        super::super::artifact_input_cache::reset_for_test();
+        let db = crate::create_database(":memory:")
+            .await
+            .expect("test database");
+        let mut registry = crate::mcp::ToolRegistry::new();
+        crate::mcp::register_surface_tools(&mut registry).expect("artifact tools register");
+        create_bound_snapshot_artifact(&registry, &db).await;
+        let head_event_id: String =
+            sqlx::query_scalar("SELECT id FROM content_events ORDER BY seq DESC LIMIT 1")
+                .fetch_one(db.write_pool())
+                .await
+                .expect("head event id");
+        let live = render_artifact(
+            db.clone(),
+            Caller::local(),
+            json!({ "id": LIVE_SNAPSHOT_ARTIFACT, "include_timing": true }),
+        )
+        .await
+        .expect("live render");
+        assert_eq!(collection_port_cache_state(&live, "items"), "miss");
+        let historical = render_artifact(
+            db.clone(),
+            Caller::local(),
+            json!({
+                "id": LIVE_SNAPSHOT_ARTIFACT,
+                "include_timing": true,
+                "as_of": { "event_id": head_event_id }
+            }),
+        )
+        .await
+        .expect("historical render");
+        assert_eq!(
+            collection_port_cache_state(&historical, "items"),
+            "miss",
+            "as_of must not reuse the live collection-port cache"
+        );
+
+        db.close().await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn include_timing_true_missing_body_diagnostic_carries_empty_timing() {
         let _guard = mdx::test_guard();
         let db = crate::create_database(":memory:")
@@ -13650,6 +15365,7 @@ export function Grouped() { return <Metric label="Grouped" value={1} /> }"#,
                 "{key} stays null"
             );
         }
+        assert_eq!(empty["ports"], json!({}));
         // Rendered plans gain `plan.timing`; diagnostics gain top-level `timing`.
         let plan = attach_empty_timing_if_requested(
             json!({ "status": "rendered", "plan": { "kind": "x" } }),
@@ -13719,6 +15435,787 @@ export function Grouped() { return <Metric label="Grouped" value={1} /> }"#,
             "historical render reports cache state: {historical_timing:#}"
         );
 
+        db.close().await;
+    }
+
+    async fn authenticated_bound_render(db: &Db) -> (Caller, Value) {
+        grant_account_view(
+            db,
+            "acct:bea",
+            &[
+                LIVE_SNAPSHOT_ARTIFACT,
+                LIVE_SNAPSHOT_COLLECTION,
+                LIVE_SNAPSHOT_ITEM,
+            ],
+        )
+        .await;
+        let caller = Caller::authenticated("acct:bea");
+        let rendered = render_artifact(
+            db.clone(),
+            caller.clone(),
+            json!({ "id": LIVE_SNAPSHOT_ARTIFACT }),
+        )
+        .await
+        .expect("authenticated bound render");
+        (caller, rendered)
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn revalidate_identical_authenticated_state_is_unchanged() {
+        let _guard = mdx::test_guard();
+        let db = crate::create_database(":memory:")
+            .await
+            .expect("test database");
+        let mut registry = crate::mcp::ToolRegistry::new();
+        crate::mcp::register_surface_tools(&mut registry).expect("artifact tools register");
+        create_bound_snapshot_artifact(&registry, &db).await;
+        let (caller, first) = authenticated_bound_render(&db).await;
+        assert_eq!(first["status"], "rendered", "{first:#}");
+        assert!(first.get("unchanged").is_none(), "{first:#}");
+        assert!(first["plan"].get("tree").is_some(), "{first:#}");
+        assert!(first["plan"]["provenance"]["caller_sha256"]
+            .as_str()
+            .is_some());
+
+        let second = render_artifact(
+            db.clone(),
+            caller,
+            json!({
+                "id": LIVE_SNAPSHOT_ARTIFACT,
+                "revalidate": revalidate_from(&first),
+            }),
+        )
+        .await
+        .expect("revalidate identical state");
+        assert_unchanged_content_free(&second);
+        assert_eq!(second["plan"]["cache"]["state"], "unchanged");
+        assert_eq!(second["input"]["ports"], first["input"]["ports"]);
+        assert_eq!(
+            second["plan"]["cache"]["key"],
+            first["plan"]["cache"]["key"]
+        );
+        assert_eq!(
+            second["plan"]["provenance"]["snapshot_event_seq"],
+            first["plan"]["provenance"]["snapshot_event_seq"]
+        );
+        db.close().await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn revalidate_after_a_content_commit_is_a_full_render() {
+        let _guard = mdx::test_guard();
+        let db = crate::create_database(":memory:")
+            .await
+            .expect("test database");
+        let mut registry = crate::mcp::ToolRegistry::new();
+        crate::mcp::register_surface_tools(&mut registry).expect("artifact tools register");
+        create_bound_snapshot_artifact(&registry, &db).await;
+        let (caller, first) = authenticated_bound_render(&db).await;
+        let token = revalidate_from(&first);
+
+        registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "update_record",
+                json!({
+                    "id": LIVE_SNAPSHOT_ITEM, "facets": { "effort": "large" },
+                    "reason": "Move the content head before revalidation."
+                }),
+            )
+            .await
+            .expect("content commit");
+        grant_account_view(
+            &db,
+            "acct:bea",
+            &[
+                LIVE_SNAPSHOT_ARTIFACT,
+                LIVE_SNAPSHOT_COLLECTION,
+                LIVE_SNAPSHOT_ITEM,
+            ],
+        )
+        .await;
+
+        let second = render_artifact(
+            db.clone(),
+            caller,
+            json!({ "id": LIVE_SNAPSHOT_ARTIFACT, "revalidate": token }),
+        )
+        .await
+        .expect("revalidate after commit");
+        assert_eq!(second["status"], "rendered", "{second:#}");
+        assert!(second.get("unchanged").is_none(), "{second:#}");
+        assert!(second["plan"].get("tree").is_some(), "{second:#}");
+        assert_eq!(second["plan"]["cache"]["state"], "revalidated_full");
+        assert_eq!(second["plan"]["cache"]["revalidation"]["miss"], "head");
+        db.close().await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn revalidate_after_grant_narrowing_never_returns_unchanged() {
+        let _guard = mdx::test_guard();
+        let db = crate::create_database(":memory:")
+            .await
+            .expect("test database");
+        let mut registry = crate::mcp::ToolRegistry::new();
+        crate::mcp::register_surface_tools(&mut registry).expect("artifact tools register");
+        create_bound_snapshot_artifact(&registry, &db).await;
+        registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "create_record",
+                json!({
+                    "id": LIVE_SNAPSHOT_SECOND_ITEM, "type": "WorkItem", "kind": "task",
+                    "name": "Still-visible item", "facets": { "effort": "small" },
+                    "reason": "Keep one authorized record after narrowing."
+                }),
+            )
+            .await
+            .expect("create second item");
+        registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "manage_links",
+                json!({
+                    "action": "add", "source_id": LIVE_SNAPSHOT_SECOND_ITEM,
+                    "target_id": LIVE_SNAPSHOT_COLLECTION, "relationship": "member_of"
+                }),
+            )
+            .await
+            .expect("add second member");
+        grant_account_view(
+            &db,
+            "acct:bea",
+            &[
+                LIVE_SNAPSHOT_ARTIFACT,
+                LIVE_SNAPSHOT_COLLECTION,
+                LIVE_SNAPSHOT_ITEM,
+                LIVE_SNAPSHOT_SECOND_ITEM,
+            ],
+        )
+        .await;
+        let caller = Caller::authenticated("acct:bea");
+        let first = render_artifact(
+            db.clone(),
+            caller.clone(),
+            json!({ "id": LIVE_SNAPSHOT_ARTIFACT }),
+        )
+        .await
+        .expect("first render before grant narrowing");
+        assert_eq!(first["status"], "rendered", "{first:#}");
+        let token = revalidate_from(&first);
+
+        crate::authorization::replace_explicit_policy(
+            &db,
+            "test:revalidate-narrow",
+            LIVE_SNAPSHOT_ITEM,
+            vec![crate::authorization::AllowEntry::account(
+                "acct:cam",
+                Capability::View,
+            )],
+        )
+        .await
+        .expect("narrow the item grant");
+
+        let second = render_artifact(
+            db.clone(),
+            caller,
+            json!({ "id": LIVE_SNAPSHOT_ARTIFACT, "revalidate": token }),
+        )
+        .await
+        .expect("revalidate after grant narrowing");
+        assert_eq!(second["status"], "rendered", "{second:#}");
+        assert!(second.get("unchanged").is_none(), "{second:#}");
+        assert_eq!(second["plan"]["cache"]["state"], "revalidated_full");
+        assert_eq!(
+            second["plan"]["cache"]["revalidation"]["miss"],
+            "authorization"
+        );
+        assert!(second["plan"].get("tree").is_some(), "{second:#}");
+        db.close().await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn revalidate_relation_port_row_change_is_revalidated_full() {
+        let _guard = mdx::test_guard();
+        let db = crate::create_database(":memory:")
+            .await
+            .expect("test database");
+        let mut registry = crate::mcp::ToolRegistry::new();
+        crate::mcp::register_surface_tools(&mut registry).expect("artifact tools register");
+        create_clock_sql_two_port_artifact(&registry, &db).await;
+        grant_account_view(
+            &db,
+            "acct:bea",
+            &[
+                LIVE_SNAPSHOT_ARTIFACT,
+                LIVE_SNAPSHOT_COLLECTION,
+                LIVE_SQL_QUERY,
+                LIVE_SNAPSHOT_ITEM,
+            ],
+        )
+        .await;
+        let caller = Caller::authenticated("acct:bea");
+        let first = render_artifact(
+            db.clone(),
+            caller.clone(),
+            json!({ "id": LIVE_SNAPSHOT_ARTIFACT }),
+        )
+        .await
+        .expect("first clock SQL render");
+        assert_eq!(first["status"], "rendered", "{first:#}");
+        let first_rows = first["plan"]["provenance"]["input_bundle"]["ports"]["meta"]
+            ["rows_sha256"]
+            .as_str()
+            .expect("first relation rows digest")
+            .to_owned();
+        let token = revalidate_from(&first);
+        let started = std::time::Instant::now();
+        let second = loop {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            let candidate = render_artifact(
+                db.clone(),
+                caller.clone(),
+                json!({ "id": LIVE_SNAPSHOT_ARTIFACT, "revalidate": token.clone() }),
+            )
+            .await
+            .expect("revalidate after clock SQL row change");
+            if candidate["plan"]["cache"]["revalidation"]["miss"] == "relation_port" {
+                break candidate;
+            }
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(1),
+                "clock SQL rows_sha256 did not change under the same head: {candidate:#}"
+            );
+        };
+
+        assert_eq!(second["status"], "rendered", "{second:#}");
+        assert!(second.get("unchanged").is_none(), "{second:#}");
+        assert_eq!(second["plan"]["cache"]["state"], "revalidated_full");
+        assert_eq!(
+            second["plan"]["cache"]["revalidation"]["miss"],
+            "relation_port"
+        );
+        assert_ne!(
+            second["plan"]["provenance"]["input_bundle"]["ports"]["meta"]["rows_sha256"],
+            first_rows,
+            "governed SQL rows changed under the same head"
+        );
+        let tree = second["plan"]["tree"].to_string();
+        assert!(tree.contains("Count"), "{second:#}");
+        assert!(tree.contains("Tick"), "{second:#}");
+        db.close().await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn revalidate_with_as_of_is_a_full_render() {
+        let _guard = mdx::test_guard();
+        let db = crate::create_database(":memory:")
+            .await
+            .expect("test database");
+        let mut registry = crate::mcp::ToolRegistry::new();
+        crate::mcp::register_surface_tools(&mut registry).expect("artifact tools register");
+        create_bound_snapshot_artifact(&registry, &db).await;
+        let (caller, first) = authenticated_bound_render(&db).await;
+        let event_id = first["plan"]["provenance"]["snapshot_event_id"]
+            .as_str()
+            .expect("snapshot event id")
+            .to_owned();
+
+        let second = render_artifact(
+            db.clone(),
+            caller,
+            json!({
+                "id": LIVE_SNAPSHOT_ARTIFACT,
+                "as_of": { "event_id": event_id },
+                "revalidate": revalidate_from(&first),
+            }),
+        )
+        .await
+        .expect("as_of plus revalidate");
+        assert_eq!(second["status"], "rendered", "{second:#}");
+        assert!(second.get("unchanged").is_none(), "{second:#}");
+        assert!(second["plan"].get("tree").is_some(), "{second:#}");
+        assert_ne!(second["plan"]["cache"]["state"], "unchanged");
+        db.close().await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn revalidate_wrong_caller_sha256_is_a_full_render() {
+        let _guard = mdx::test_guard();
+        let db = crate::create_database(":memory:")
+            .await
+            .expect("test database");
+        let mut registry = crate::mcp::ToolRegistry::new();
+        crate::mcp::register_surface_tools(&mut registry).expect("artifact tools register");
+        create_bound_snapshot_artifact(&registry, &db).await;
+        for record_id in [
+            LIVE_SNAPSHOT_ARTIFACT,
+            LIVE_SNAPSHOT_COLLECTION,
+            LIVE_SNAPSHOT_ITEM,
+        ] {
+            crate::authorization::replace_explicit_policy(
+                &db,
+                "test:revalidate-two-callers",
+                record_id,
+                vec![
+                    crate::authorization::AllowEntry::account("acct:bea", Capability::View),
+                    crate::authorization::AllowEntry::account("acct:cam", Capability::View),
+                ],
+            )
+            .await
+            .expect("grant both callers");
+        }
+        let bea = Caller::authenticated("acct:bea");
+        let first = render_artifact(db.clone(), bea, json!({ "id": LIVE_SNAPSHOT_ARTIFACT }))
+            .await
+            .expect("bea render");
+        let cam = Caller::authenticated("acct:cam");
+        let second = render_artifact(
+            db.clone(),
+            cam,
+            json!({
+                "id": LIVE_SNAPSHOT_ARTIFACT,
+                "revalidate": revalidate_from(&first),
+            }),
+        )
+        .await
+        .expect("cam revalidate with bea token");
+        assert_eq!(second["status"], "rendered", "{second:#}");
+        assert!(second.get("unchanged").is_none(), "{second:#}");
+        assert_eq!(second["plan"]["cache"]["state"], "revalidated_full");
+        assert_eq!(second["plan"]["cache"]["revalidation"]["miss"], "caller");
+        assert!(second["plan"].get("tree").is_some(), "{second:#}");
+        db.close().await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn revalidate_malformed_token_is_a_full_render_not_an_error() {
+        let _guard = mdx::test_guard();
+        let db = crate::create_database(":memory:")
+            .await
+            .expect("test database");
+        let mut registry = crate::mcp::ToolRegistry::new();
+        crate::mcp::register_surface_tools(&mut registry).expect("artifact tools register");
+        create_bound_snapshot_artifact(&registry, &db).await;
+        let (caller, _) = authenticated_bound_render(&db).await;
+
+        let second = render_artifact(
+            db.clone(),
+            caller,
+            json!({
+                "id": LIVE_SNAPSHOT_ARTIFACT,
+                "revalidate": { "not": "a token" },
+            }),
+        )
+        .await
+        .expect("malformed revalidate");
+        assert_eq!(second["status"], "rendered", "{second:#}");
+        assert!(second.get("unchanged").is_none(), "{second:#}");
+        assert_eq!(second["plan"]["cache"]["state"], "revalidated_full");
+        assert_eq!(second["plan"]["cache"]["revalidation"]["miss"], "malformed");
+        assert!(second["plan"].get("tree").is_some(), "{second:#}");
+        db.close().await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn legacy_render_without_revalidate_keeps_todays_shape() {
+        let _guard = mdx::test_guard();
+        let db = crate::create_database(":memory:")
+            .await
+            .expect("test database");
+        let mut registry = crate::mcp::ToolRegistry::new();
+        crate::mcp::register_surface_tools(&mut registry).expect("artifact tools register");
+        create_bound_snapshot_artifact(&registry, &db).await;
+        let (_caller, rendered) = authenticated_bound_render(&db).await;
+        assert_eq!(rendered["status"], "rendered", "{rendered:#}");
+        assert!(rendered.get("unchanged").is_none(), "{rendered:#}");
+        assert!(rendered["plan"].get("tree").is_some(), "{rendered:#}");
+        assert!(
+            rendered["plan"].get("interactions").is_some(),
+            "{rendered:#}"
+        );
+        assert!(rendered["plan"]["provenance"]
+            .get("render_sha256")
+            .is_some());
+        assert!(rendered["plan"]["provenance"]["input_bundle"]
+            .get("ports")
+            .is_some());
+        assert!(rendered["plan"]["provenance"]["caller_sha256"]
+            .as_str()
+            .is_some());
+        assert_ne!(rendered["plan"]["cache"]["state"], "unchanged");
+        db.close().await;
+    }
+
+    #[test]
+    fn caller_fingerprint_follows_authorization_principal() {
+        let origin = "origin-db";
+        let bypass = render_caller_sha256(origin, &Caller::local());
+        let authenticated = render_caller_sha256(origin, &Caller::authenticated("local"));
+        let hosted = render_caller_sha256(
+            origin,
+            &Caller::local().with_hosting_context("acct:host", "db-1"),
+        );
+        assert_ne!(
+            bypass, authenticated,
+            "trusted-local bypass and an authenticated caller with the same credential string are distinct principals"
+        );
+        assert_ne!(
+            bypass, hosted,
+            "hosting-bound trusted-local is not the bypass principal"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn revalidate_after_schema_config_write_misses_meta() {
+        let _guard = mdx::test_guard();
+        let db = crate::create_database(":memory:")
+            .await
+            .expect("test database");
+        let mut registry = crate::mcp::ToolRegistry::new();
+        crate::mcp::register_surface_tools(&mut registry).expect("artifact tools register");
+        create_bound_snapshot_artifact(&registry, &db).await;
+        let (caller, first) = authenticated_bound_render(&db).await;
+        let token = revalidate_from(&first);
+        registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "manage_schema_config",
+                json!({
+                    "action": "write",
+                    "id": "user:numeric-target",
+                    "data": { "shapes": { "Outcome": { "facets": {
+                        "target": { "type": "number" }
+                    } } } }
+                }),
+            )
+            .await
+            .expect("write schema_config");
+        let second = render_artifact(
+            db.clone(),
+            caller,
+            json!({ "id": LIVE_SNAPSHOT_ARTIFACT, "revalidate": token }),
+        )
+        .await
+        .expect("revalidate after schema_config write");
+        assert_eq!(second["status"], "rendered", "{second:#}");
+        assert!(second.get("unchanged").is_none(), "{second:#}");
+        assert_eq!(second["plan"]["cache"]["state"], "revalidated_full");
+        assert_eq!(second["plan"]["cache"]["revalidation"]["miss"], "meta");
+        db.close().await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn revalidate_after_vocabulary_deprecation_misses_meta() {
+        let _guard = mdx::test_guard();
+        let db = crate::create_database(":memory:")
+            .await
+            .expect("test database");
+        let mut registry = crate::mcp::ToolRegistry::new();
+        crate::mcp::register_surface_tools(&mut registry).expect("artifact tools register");
+        create_bound_snapshot_artifact(&registry, &db).await;
+        registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "manage_vocabularies",
+                json!({ "action": "create_vocabulary", "name": "revalidate-meta" }),
+            )
+            .await
+            .expect("create vocabulary");
+        let proposed = registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "manage_vocabularies",
+                json!({
+                    "action": "propose_value",
+                    "vocabulary": "revalidate-meta",
+                    "value": "active-value"
+                }),
+            )
+            .await
+            .expect("propose value");
+        let value_id = proposed["value_id"].as_str().expect("value_id").to_owned();
+        registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "manage_vocabularies",
+                json!({ "action": "promote_value", "value_id": value_id }),
+            )
+            .await
+            .expect("promote value");
+        let (caller, first) = authenticated_bound_render(&db).await;
+        let token = revalidate_from(&first);
+        registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "manage_vocabularies",
+                json!({ "action": "deprecate_value", "value_id": value_id }),
+            )
+            .await
+            .expect("deprecate value");
+        let second = render_artifact(
+            db.clone(),
+            caller,
+            json!({ "id": LIVE_SNAPSHOT_ARTIFACT, "revalidate": token }),
+        )
+        .await
+        .expect("revalidate after vocabulary deprecation");
+        assert_eq!(second["status"], "rendered", "{second:#}");
+        assert!(second.get("unchanged").is_none(), "{second:#}");
+        assert_eq!(second["plan"]["cache"]["state"], "revalidated_full");
+        assert_eq!(second["plan"]["cache"]["revalidation"]["miss"], "meta");
+        db.close().await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn revalidate_token_for_another_artifact_misses_artifact() {
+        let _guard = mdx::test_guard();
+        let db = crate::create_database(":memory:")
+            .await
+            .expect("test database");
+        let mut registry = crate::mcp::ToolRegistry::new();
+        crate::mcp::register_surface_tools(&mut registry).expect("artifact tools register");
+        create_bound_snapshot_artifact(&registry, &db).await;
+        create_identical_items_artifact_on_existing_collection(
+            &registry,
+            &db,
+            SECOND_SNAPSHOT_ARTIFACT,
+        )
+        .await;
+        let (caller, first) = authenticated_bound_render(&db).await;
+        grant_account_view(&db, "acct:bea", &[SECOND_SNAPSHOT_ARTIFACT]).await;
+        let token = revalidate_from(&first);
+        let second = render_artifact(
+            db.clone(),
+            caller,
+            json!({ "id": SECOND_SNAPSHOT_ARTIFACT, "revalidate": token }),
+        )
+        .await
+        .expect("revalidate token against another artifact");
+        assert_eq!(second["status"], "rendered", "{second:#}");
+        assert!(second.get("unchanged").is_none(), "{second:#}");
+        assert_eq!(second["plan"]["cache"]["state"], "revalidated_full");
+        assert_eq!(second["plan"]["cache"]["revalidation"]["miss"], "artifact");
+        db.close().await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn revalidate_ignores_unknown_extra_keys() {
+        let _guard = mdx::test_guard();
+        let db = crate::create_database(":memory:")
+            .await
+            .expect("test database");
+        let mut registry = crate::mcp::ToolRegistry::new();
+        crate::mcp::register_surface_tools(&mut registry).expect("artifact tools register");
+        create_bound_snapshot_artifact(&registry, &db).await;
+        let (caller, first) = authenticated_bound_render(&db).await;
+        let mut token = revalidate_from(&first);
+        token
+            .as_object_mut()
+            .expect("token is an object")
+            .insert("future_field".into(), json!("ignored"));
+        let second = render_artifact(
+            db.clone(),
+            caller,
+            json!({ "id": LIVE_SNAPSHOT_ARTIFACT, "revalidate": token }),
+        )
+        .await
+        .expect("revalidate with extra keys");
+        assert_unchanged_content_free(&second);
+        db.close().await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn collection_port_cache_does_not_restore_the_other_ports_binding_seq() {
+        let _mdx = mdx::test_guard();
+        let _cache = super::super::artifact_input_cache::test_guard();
+        super::super::artifact_input_cache::reset_for_test();
+        let db = crate::create_database(":memory:")
+            .await
+            .expect("test database");
+        let mut registry = crate::mcp::ToolRegistry::new();
+        crate::mcp::register_surface_tools(&mut registry).expect("artifact tools register");
+        create_dual_identical_collection_artifact(&registry, &db).await;
+        grant_account_view(
+            &db,
+            "acct:bea",
+            &[
+                LIVE_SNAPSHOT_ARTIFACT,
+                LIVE_SNAPSHOT_COLLECTION,
+                LIVE_SNAPSHOT_ITEM,
+                LIVE_SNAPSHOT_SECOND_ITEM,
+            ],
+        )
+        .await;
+        let caller = Caller::authenticated("acct:bea");
+        let first = render_artifact(
+            db.clone(),
+            caller.clone(),
+            json!({ "id": LIVE_SNAPSHOT_ARTIFACT, "include_timing": true }),
+        )
+        .await
+        .expect("first dual-port render");
+        assert_eq!(first["status"], "rendered", "{first:#}");
+        let left = first["plan"]["provenance"]["input_bundle"]["ports"]["left"]["sha256"].clone();
+        let right = first["plan"]["provenance"]["input_bundle"]["ports"]["right"]["sha256"].clone();
+        assert_ne!(
+            left, right,
+            "identical declarations on two binds must still differ by binding seq: {first:#}"
+        );
+        let second = render_artifact(
+            db.clone(),
+            caller,
+            json!({ "id": LIVE_SNAPSHOT_ARTIFACT, "include_timing": true }),
+        )
+        .await
+        .expect("second dual-port render");
+        assert_eq!(collection_port_cache_state(&second, "left"), "hit");
+        assert_eq!(collection_port_cache_state(&second, "right"), "hit");
+        assert_eq!(
+            second["plan"]["provenance"]["input_bundle"]["ports"]["left"]["sha256"],
+            left
+        );
+        assert_eq!(
+            second["plan"]["provenance"]["input_bundle"]["ports"]["right"]["sha256"],
+            right
+        );
+        db.close().await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn second_artifact_does_not_restore_the_other_bindings_seq() {
+        let _mdx = mdx::test_guard();
+        let _cache = super::super::artifact_input_cache::test_guard();
+        super::super::artifact_input_cache::reset_for_test();
+        let db = crate::create_database(":memory:")
+            .await
+            .expect("test database");
+        let mut registry = crate::mcp::ToolRegistry::new();
+        crate::mcp::register_surface_tools(&mut registry).expect("artifact tools register");
+        create_bound_snapshot_artifact(&registry, &db).await;
+        registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "create_record",
+                json!({
+                    "id": LIVE_SNAPSHOT_SECOND_ITEM, "type": "WorkItem", "kind": "task",
+                    "name": "Seq bump", "reason": "Advance content seq before the second bind."
+                }),
+            )
+            .await
+            .expect("advance seq");
+        create_identical_items_artifact_on_existing_collection(
+            &registry,
+            &db,
+            SECOND_SNAPSHOT_ARTIFACT,
+        )
+        .await;
+        grant_account_view(
+            &db,
+            "acct:bea",
+            &[
+                LIVE_SNAPSHOT_ARTIFACT,
+                SECOND_SNAPSHOT_ARTIFACT,
+                LIVE_SNAPSHOT_COLLECTION,
+                LIVE_SNAPSHOT_ITEM,
+            ],
+        )
+        .await;
+        let caller = Caller::authenticated("acct:bea");
+        let first = render_artifact(
+            db.clone(),
+            caller.clone(),
+            json!({ "id": LIVE_SNAPSHOT_ARTIFACT, "include_timing": true }),
+        )
+        .await
+        .expect("first artifact render");
+        let first_sha =
+            first["plan"]["provenance"]["input_bundle"]["ports"]["items"]["sha256"].clone();
+        let second = render_artifact(
+            db.clone(),
+            caller,
+            json!({ "id": SECOND_SNAPSHOT_ARTIFACT, "include_timing": true }),
+        )
+        .await
+        .expect("second artifact render");
+        assert_eq!(second["status"], "rendered", "{second:#}");
+        assert_eq!(
+            collection_port_cache_state(&second, "items"),
+            "miss",
+            "identical declarations at a later bind seq must not hit the earlier binding: {second:#}"
+        );
+        assert_ne!(
+            second["plan"]["provenance"]["input_bundle"]["ports"]["items"]["sha256"], first_sha,
+            "the later binding's envelope must keep its own binding_event_seq"
+        );
+        db.close().await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn collection_port_reports_nonzero_authorization_and_redaction_micros() {
+        let _guard = mdx::test_guard();
+        let db = crate::create_database(":memory:")
+            .await
+            .expect("test database");
+        let mut registry = crate::mcp::ToolRegistry::new();
+        crate::mcp::register_surface_tools(&mut registry).expect("artifact tools register");
+        create_two_port_snapshot_artifact(&registry, &db).await;
+        grant_account_view(
+            &db,
+            "acct:bea",
+            &[
+                LIVE_SNAPSHOT_ARTIFACT,
+                LIVE_SNAPSHOT_COLLECTION,
+                LIVE_SNAPSHOT_ITEM,
+                LIVE_SNAPSHOT_SECOND_ITEM,
+                LIVE_SNAPSHOT_THIRD_ITEM,
+                LIVE_SNAPSHOT_FOURTH_ITEM,
+            ],
+        )
+        .await;
+        let caller = Caller::authenticated("acct:bea");
+        let rendered = render_artifact(
+            db.clone(),
+            caller,
+            json!({ "id": LIVE_SNAPSHOT_ARTIFACT, "include_timing": true }),
+        )
+        .await
+        .expect("timed collection render");
+        let details = rendered
+            .pointer("/plan/timing/ports/details")
+            .expect("collection port timing");
+        assert!(
+            details["authorization_micros"].as_u64().unwrap_or(0) > 0,
+            "authorization micros must be measured: {details:#}"
+        );
+        assert!(
+            details["redaction_micros"].as_u64().unwrap_or(0) > 0,
+            "redaction micros must be measured: {details:#}"
+        );
         db.close().await;
     }
 }

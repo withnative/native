@@ -110,7 +110,12 @@ pub(crate) fn redact_history_payload_for_member(payload: &mut Value, credential:
                         }
                     } else if matches!(
                         key.as_str(),
-                        "actor" | "account_id" | "email" | "claimed_by_account" | "claimed_run_key"
+                        "actor"
+                            | "account_id"
+                            | "email"
+                            | "claimed_by_account"
+                            | "claimed_run_key"
+                            | "released_from_run_key"
                     ) || key == "id"
                         || key.ends_with("_id")
                         || matches!(key.as_str(), "owner" | "home")
@@ -2171,13 +2176,19 @@ mod tests {
         let mut payload = json!({
             "owner_id":"person:sender",
             "nested":{"account_id":"acct:sender","body":"visible"},
-            "accounts":["acct:reader","acct:other"]
+            "accounts":["acct:reader","acct:other"],
+            "claimed_by_account":"acct:holder",
+            "claimed_run_key":"scout-chair-a748b2",
+            "released_from_run_key":"scout-chair-a748b2"
         });
         redact_history_payload_for_member(&mut payload, "acct:reader");
         assert_eq!(payload["owner_id"], Value::Null);
         assert_eq!(payload["nested"]["account_id"], Value::Null);
         assert_eq!(payload["nested"]["body"], "visible");
         assert_eq!(payload["accounts"], json!(["acct:reader"]));
+        assert_eq!(payload["claimed_by_account"], Value::Null);
+        assert_eq!(payload["claimed_run_key"], Value::Null);
+        assert_eq!(payload["released_from_run_key"], Value::Null);
     }
 }
 

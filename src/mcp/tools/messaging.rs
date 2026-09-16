@@ -20,7 +20,8 @@ use crate::store::{append_in, AppendSpec};
 use super::super::registry::{Caller, ToolRegistry};
 use super::super::ToolKind;
 use super::{
-    can_record, parse_args, require_nonblank_reason, require_record_in, REASON_DESCRIPTION,
+    can_record, can_record_in, parse_args, require_nonblank_reason, require_record_in,
+    REASON_DESCRIPTION,
 };
 
 #[derive(Deserialize)]
@@ -173,6 +174,7 @@ enum ManageMessagesArgs {
         #[serde(default = "default_inbox_limit")]
         limit: usize,
     },
+    GetAttention,
 }
 
 fn default_inbox_view() -> String {
@@ -602,6 +604,38 @@ async fn caller_record_id_in(
         "SELECT record_id FROM bindings
           WHERE system='account' AND identifier=? AND is_canonical=1
           ORDER BY record_id LIMIT 1",
+    )
+    .bind(caller.credential())
+    .fetch_optional(&mut **tx)
+    .await?)
+}
+
+/// Attention-local viewer resolution. The author-exclusion compares against
+/// `records.owner_id`, which names a Person record — the same domain the
+/// membership roster carries as `person_id` for the viewer's own row — so the
+/// account binding must resolve to a live Person, not just any bound record.
+/// A deleted, non-Person, or missing binding is "Person unknown" (no signal)
+/// rather than someone else's dot. Kept separate from
+/// [`caller_record_id_in`] so the reaction sender path keeps its exact
+/// long-standing semantics.
+///
+/// The `kind = 'person'` literal is the governed canonical token
+/// ([`crate::generated::kinds::CoreKind::EntityPerson`]): admission persists
+/// the canonical kind for writes, so it cannot miss a governed Person, and it
+/// is the same literal the send and list_context paths already require of
+/// direct participants. Like the roster fallback it replaces, this resolves
+/// the id with no record-View gate — the id only ever meets `owner_id`, so it
+/// discloses nothing, and gating it would turn a hidden-but-bound Person into
+/// someone else's signal instead of its own exclusion.
+async fn attention_person_id_in(
+    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    caller: &Caller,
+) -> Result<Option<String>> {
+    Ok(sqlx::query_scalar(
+        "SELECT b.record_id FROM bindings b JOIN records r ON r.id=b.record_id
+          WHERE b.system='account' AND b.identifier=? AND b.is_canonical=1
+            AND r.type='Entity' AND r.kind='person' AND r.deleted_at IS NULL
+          ORDER BY b.record_id LIMIT 1",
     )
     .bind(caller.credential())
     .fetch_optional(&mut **tx)
@@ -1545,11 +1579,9 @@ async fn list_context(
         }
     }
     let mut messages = Vec::with_capacity(candidates.len());
-    let read_lens = crate::query::lens::ReadLens::live(db);
     for (id, _) in &candidates {
         let mut items = crate::query::read::get_records_live_in(
             &mut snapshot,
-            &read_lens,
             std::slice::from_ref(id),
             crate::query::read::EnrichOptions {
                 children_limit: 0,
@@ -1850,8 +1882,14 @@ async fn inbox_item(db: &Db, caller: &Caller, message_id: &str) -> Result<Option
     })))
 }
 
-async fn validate_strong_agent_evidence(
-    db: &Db,
+/// Transaction-scoped evidence admission for the `set_agent_disposition`
+/// handler, which holds its `BEGIN IMMEDIATE` write transaction across
+/// admission. Deriving and re-reading on the caller's transaction keeps one
+/// pool slot and one snapshot instead of two: a pool-backed read here would
+/// take a second write-pool connection while that transaction (and the
+/// SQLite write lock) is held.
+async fn validate_strong_agent_evidence_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     account: &str,
     message_id: &str,
     state: &str,
@@ -1861,7 +1899,7 @@ async fn validate_strong_agent_evidence(
         return Ok(());
     }
     let derived =
-        crate::message_expectation::derive_message_expectation_state(db, message_id, account)
+        crate::message_expectation::derive_message_expectation_state_in(tx, message_id, account)
             .await?;
     if let Some(governed) = derived.evidence {
         let role = match governed.kind {
@@ -1895,7 +1933,7 @@ async fn validate_strong_agent_evidence(
         .bind(message_id)
         .bind(relationship)
         .bind(&item.record_id)
-        .fetch_one(db.write_pool())
+        .fetch_one(&mut **tx)
         .await?;
         if valid {
             return Ok(());
@@ -1925,6 +1963,151 @@ fn item_in_view(item: &Value, view: &str) -> bool {
         "browse" => true,
         _ => false,
     }
+}
+
+/// Typed response for `get_attention`. It is deliberately not an inbox
+/// response: [`crate::awareness::validate_messaging_surface_response`] only
+/// accepts `native.message-inbox.v2` shapes, and this endpoint never builds
+/// one.
+const ATTENTION_SCHEMA: &str = "native.message-attention.v1";
+
+/// Bound on the newest-first filtered-candidate scan. The filter (unsurfaced,
+/// not-self, unsuppressed) applies before the bound, so this caps attention
+/// work rather than total Messages; exceeding it errors rather than answering
+/// `false`.
+const ATTENTION_CANDIDATE_LIMIT: i64 = 10_001;
+
+/// Viewer-correct header-dot boolean without inbox hydration.
+///
+/// This is the server side of the workbench attention snapshot: one joined,
+/// bounded newest-first candidate query plus, per surviving candidate, one
+/// live visibility check through [`can_record_in`] in the same read
+/// transaction, and a principal lookup only for a direct candidate that
+/// survived everything else. The scan always fetches up to the bound; a match
+/// ends per-candidate work early but never skips that bounded fetch. There is
+/// no `inbox_item` projection, no expectation derivation, no reaction groups,
+/// no Message bodies, and no inbox snapshot token stored.
+///
+/// The predicate mirrors the workbench `adapter.newMessages` dot exactly:
+/// unsurfaced human stage, author exclusion against the caller's own live
+/// Person (`owner_id IS NOT` keeps the NULL-owner behaviour identical to the
+/// `!==` comparison), unarchived/unmuted attention in SQL with the
+/// not-future-snoozed check per surviving row in Rust, and a valid
+/// destination (declared collection; declared direct with the stored
+/// digest/count invariant and at least two principals; explicit
+/// `legacy_unknown` filed under its home, with a homeless legacy Message
+/// contributing no destination). A missing origin projection is a fail-closed
+/// error like hydration — nothing is silently skipped into a `false`.
+async fn get_attention(db: &Db, caller: &Caller) -> Result<Value> {
+    let mut tx = db.write_pool().begin().await?;
+    // The caller is the viewer. No request field names a Person: a
+    // user-supplied id here would let one account ask after another's dot.
+    let person_id = attention_person_id_in(&mut tx, caller).await?;
+    let Some(person_id) = person_id else {
+        tx.rollback().await?;
+        return Ok(
+            json!({"schema":ATTENTION_SCHEMA,"has_new_messages":false,"viewer_relative":true}),
+        );
+    };
+    let rows = sqlx::query(
+        "SELECT r.id AS message_id, r.home_id AS home_id,
+                p.snoozed_until AS snoozed_until,
+                s.status AS origin_status, s.origin_type AS origin_type,
+                s.collection_id AS collection_id,
+                s.direct_set_digest AS direct_set_digest,
+                s.participant_count AS participant_count
+           FROM records r
+           LEFT JOIN human_message_awareness h
+             ON h.message_id=r.id AND h.subject_account_id=?
+           LEFT JOIN message_preferences p
+             ON p.message_id=r.id AND p.subject_account_id=?
+           LEFT JOIN message_origin_state s ON s.message_id=r.id
+          WHERE r.type='Message' AND r.deleted_at IS NULL
+            AND COALESCE(h.stage,'unsurfaced')='unsurfaced'
+            AND r.owner_id IS NOT ?
+            AND COALESCE(p.archived,0)=0 AND COALESCE(p.muted,0)=0
+          ORDER BY r.created_at DESC, r.id DESC LIMIT ?",
+    )
+    .bind(caller.credential())
+    .bind(caller.credential())
+    .bind(&person_id)
+    .bind(ATTENTION_CANDIDATE_LIMIT)
+    .fetch_all(&mut *tx)
+    .await?;
+    if rows.len() as i64 >= ATTENTION_CANDIDATE_LIMIT {
+        return Err(Error::engine(
+            "get_attention exceeds the bounded 10000 Message selection",
+        ));
+    }
+    for row in &rows {
+        let message_id: String = row.try_get("message_id")?;
+        if !can_record_in(&mut tx, caller, &message_id, Capability::View).await? {
+            continue;
+        }
+        let snoozed = row
+            .try_get::<Option<String>, _>("snoozed_until")?
+            .as_deref()
+            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+            .is_some_and(|value| value > chrono::Utc::now());
+        if snoozed {
+            continue;
+        }
+        let status: Option<String> = row.try_get("origin_status")?;
+        let has_destination = match status.as_deref() {
+            None => {
+                return Err(Error::engine(format!(
+                    "Message {message_id} has no communication-origin projection state"
+                )));
+            }
+            Some("legacy_unknown") => row.try_get::<Option<String>, _>("home_id")?.is_some(),
+            Some("declared") => match row.try_get::<Option<String>, _>("origin_type")?.as_deref() {
+                Some("collection") => row.try_get::<Option<String>, _>("collection_id")?.is_some(),
+                Some("direct") => {
+                    let stored = sqlx::query_scalar::<_, String>(
+                        "SELECT principal_id FROM message_origin_principals
+                          WHERE message_id=? ORDER BY principal_id",
+                    )
+                    .bind(&message_id)
+                    .fetch_all(&mut *tx)
+                    .await?;
+                    // Same normalization the send and list_context paths
+                    // canonicalize with: sorted distinct principals. The
+                    // stored projection is already canonical, so this is a
+                    // no-op on healthy rows and fail-closed on corrupt ones.
+                    let principals = crate::events::normalize_direct_origin_principals(stored);
+                    let stored_digest: Option<String> = row.try_get("direct_set_digest")?;
+                    let stored_count: Option<i64> = row.try_get("participant_count")?;
+                    if stored_count != Some(principals.len() as i64)
+                        || stored_digest.as_deref()
+                            != Some(crate::events::direct_origin_set_digest(&principals).as_str())
+                    {
+                        return Err(Error::engine(format!(
+                            "Message {message_id} has inconsistent direct communication-origin projection"
+                        )));
+                    }
+                    principals.len() >= 2
+                }
+                _ => {
+                    return Err(Error::engine(format!(
+                        "Message {message_id} has invalid declared communication-origin state"
+                    )));
+                }
+            },
+            _ => {
+                return Err(Error::engine(format!(
+                    "Message {message_id} has invalid declared communication-origin state"
+                )));
+            }
+        };
+        if has_destination {
+            tx.rollback().await?;
+            return Ok(
+                json!({"schema":ATTENTION_SCHEMA,"has_new_messages":true,"viewer_relative":true}),
+            );
+        }
+    }
+    tx.rollback().await?;
+    Ok(json!({"schema":ATTENTION_SCHEMA,"has_new_messages":false,"viewer_relative":true}))
 }
 
 async fn manage_messages(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
@@ -2389,8 +2572,8 @@ async fn manage_messages(db: Db, caller: Caller, arguments: Value) -> Result<Val
                 )
                 .await?;
             }
-            validate_strong_agent_evidence(
-                &db,
+            validate_strong_agent_evidence_in(
+                &mut tx,
                 caller.credential(),
                 &message_id,
                 &state,
@@ -2666,6 +2849,7 @@ async fn manage_messages(db: Db, caller: Caller, arguments: Value) -> Result<Val
                 json!({"candidates":candidates,"delivery_facts_are_not_awareness":true,"retention_floor":crate::awareness::CANDIDATE_RETENTION_FLOOR}),
             )
         }
+        ManageMessagesArgs::GetAttention => get_attention(&db, &caller).await,
     }
 }
 
@@ -2673,7 +2857,7 @@ fn manage_messages_schema() -> Value {
     json!({
             "type":"object",
             "properties":{
-                "action":{"type":"string","enum":["send","list_context","classify","unclassify","move","share_history","add_reaction","remove_reaction","satisfy_acknowledgement_expectation_with_reaction","list_message_state","list_conversation","list_unclassified","list_my_conversations","mutate_human_awareness","set_agent_disposition","set_preference","set_routing","set_destination","list_destinations","list_inbox","list_notification_candidates"]},
+                "action":{"type":"string","enum":["send","list_context","classify","unclassify","move","share_history","add_reaction","remove_reaction","satisfy_acknowledgement_expectation_with_reaction","list_message_state","list_conversation","list_unclassified","list_my_conversations","mutate_human_awareness","set_agent_disposition","set_preference","set_routing","set_destination","list_destinations","list_inbox","list_notification_candidates","get_attention"]},
                 "id":{"type":"string"},
                 "body":{"type":"string","minLength":1},
                 "preview":{"type":"string","minLength":1,"maxLength":500},

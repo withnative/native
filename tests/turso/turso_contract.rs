@@ -103,8 +103,6 @@ async fn turso_local_describe_schema_is_normalized_allowlisted_and_owner_gated()
         .unwrap();
     assert_eq!(value_num["type"], "REAL");
     assert_eq!(value_num["physical_type"], "REAL");
-    assert!(owner["resolved_schema_config"]["shapes"].is_object());
-    assert!(owner["kind_registry"]["Document"].is_array());
     let encoded = serde_json::to_string(&owner).unwrap();
     assert!(!encoded.contains("sqlite_schema"));
     assert!(!encoded.contains("_native_turso_runtime"));
@@ -113,7 +111,6 @@ async fn turso_local_describe_schema_is_normalized_allowlisted_and_owner_gated()
         .await
         .unwrap();
     assert_eq!(repeated["tables"], owner["tables"]);
-    assert_eq!(repeated["kind_registry"], owner["kind_registry"]);
     assert_eq!(
         repeated["engine"]["ddl_fingerprint"],
         owner["engine"]["ddl_fingerprint"]
@@ -129,6 +126,28 @@ async fn turso_local_describe_schema_is_normalized_allowlisted_and_owner_gated()
         .await
         .unwrap();
     scenarios::assert_describe_schema_shared_contract(&owner, &member);
+    // The governed record-shape half of the same fixture now lives in
+    // preview_record_shape, the tool that owns effective write shape.
+    let shape_arguments = json!({"type":"Document","kind":scenarios::DESCRIBE_SCHEMA_KIND_TOKEN});
+    let owner_shape = harness
+        .call(
+            &database,
+            TestCaller::Local,
+            "preview_record_shape",
+            shape_arguments.clone(),
+        )
+        .await
+        .unwrap();
+    let member_shape = harness
+        .call(
+            &database,
+            TestCaller::member("acct:schema-reader"),
+            "preview_record_shape",
+            shape_arguments,
+        )
+        .await
+        .unwrap();
+    scenarios::assert_record_shape_shared_contract(&owner_shape, &member_shape);
     assert!(member["tables"]
         .as_array()
         .unwrap()

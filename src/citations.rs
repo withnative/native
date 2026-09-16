@@ -5,12 +5,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use sqlx::{Row, Sqlite, SqliteConnection, Transaction};
+use std::collections::HashMap;
 
 use crate::blob::BLOB_REF_FACET_KEY;
-use crate::db::{apply_schema, open_database, Db};
+use crate::db::Db;
 use crate::error::{Error, Result};
 use crate::events::AnnotationTargetSetPayload;
-use crate::query::events;
 use crate::query::lens::{LiveBlobRead, ReadLens};
 
 #[derive(Debug, Clone, Deserialize)]
@@ -129,58 +129,24 @@ async fn body_at(
     record_id: &str,
     seq: i64,
 ) -> Result<Option<Representation>> {
-    let prefix = events::log_prefix_in_pool(content_log, seq).await?;
-    let scratch = open_database(":memory:").await?;
-    apply_schema(&scratch).await?;
-    let outcome = async {
-        // One transaction for the same reason `lens::replay_projection` takes
-        // one: a bare connection autocommits every projector statement, and a
-        // scratch database is a real WAL file at `synchronous=FULL`, so the
-        // fold pays a flush several times per event. Reconstructing one body
-        // anchor should not cost a commit per event in the workspace.
-        let mut tx = scratch.write_pool().begin().await?;
-        // Blob citation events earlier in the prefix need FK identities only;
-        // never hydrate their potentially large bytes while reconstructing an
-        // unrelated body anchor.
-        crate::projector::replay_with_blob_placeholders(&mut tx, &prefix).await?;
-        let body: Option<Option<String>> =
-            sqlx::query_scalar("SELECT body FROM records WHERE id = ?")
-                .bind(record_id)
-                .fetch_optional(&mut *tx)
-                .await?;
-        // The anchor has been read from inside the fold, and the scratch is
-        // closed below, so there is nothing to publish to another connection.
-        // Rolling back explicitly says that, and skips the commit's flush.
-        tx.rollback().await?;
-        Ok::<_, crate::Error>(body.map(|body| {
-            let bytes = body.unwrap_or_default().into_bytes();
-            Representation {
+    // One indexed per-record fold, not a whole-log replay: the projector
+    // writes `records.body` verbatim from the event payload, so the body at
+    // seq N is the last body-bearing write for this record at or before N.
+    // See `crate::record_body` for the exact event-type contract.
+    Ok(
+        crate::record_body::body_at_seq_in_pool(content_log, record_id, seq)
+            .await?
+            .map(|bytes| Representation {
                 sha256: digest(&bytes),
                 bytes,
-            }
-        }))
-    }
-    .await;
-    scratch.close().await;
-    outcome
+            }),
+    )
 }
 
 async fn blob_bytes(blobs: LiveBlobRead<'_>, blob_id: &str) -> Result<Option<Representation>> {
-    let row = sqlx::query("SELECT bytes, storage_tier FROM blobs WHERE id = ?")
-        .bind(blob_id)
-        .fetch_optional(blobs.shared_pool())
-        .await?;
-    let Some(row) = row else { return Ok(None) };
-    if row.try_get::<String, _>("storage_tier")? != "inline" {
-        return Ok(None);
-    }
-    let Some(bytes) = row.try_get::<Option<Vec<u8>>, _>("bytes")? else {
-        return Ok(None);
-    };
-    Ok(Some(Representation {
-        sha256: digest(&bytes),
-        bytes,
-    }))
+    // One checkout, then the shared connection-scoped body below.
+    let mut conn = blobs.shared_pool().acquire().await?;
+    blob_bytes_on(&mut conn, blob_id).await
 }
 
 async fn current_representation(
@@ -257,24 +223,10 @@ async fn current_representation_on(
             .bind(BLOB_REF_FACET_KEY)
             .fetch_optional(&mut *conn)
             .await?;
-            let Some(blob_id) = current_blob else {
-                return Ok(None);
-            };
-            let row = sqlx::query("SELECT bytes, storage_tier FROM blobs WHERE id = ?")
-                .bind(blob_id)
-                .fetch_optional(conn)
-                .await?;
-            let Some(row) = row else { return Ok(None) };
-            if row.try_get::<String, _>("storage_tier")? != "inline" {
-                return Ok(None);
+            match current_blob {
+                Some(blob_id) => blob_bytes_on(conn, &blob_id).await,
+                None => Ok(None),
             }
-            let Some(bytes) = row.try_get::<Option<Vec<u8>>, _>("bytes")? else {
-                return Ok(None);
-            };
-            Ok(Some(Representation {
-                sha256: digest(&bytes),
-                bytes,
-            }))
         }
         _ => Ok(None),
     }
@@ -299,6 +251,62 @@ async fn anchored_representation(
         },
         _ => Ok(None),
     }
+}
+
+/// Transaction-scoped mirror of [`anchored_representation`].
+///
+/// A live read handler holds its snapshot transaction for the whole handler,
+/// and on a live lens every pool above resolves to the same write pool — so
+/// reusing the pool-backed form here would take a second pool connection
+/// while the first is held. The anchored fold reads immutable event/blob
+/// state, so running it on the caller's connection keeps one snapshot and
+/// one pool slot. Historical reads keep the pool-backed form above, where
+/// the projection (scratch) and content-log (live) pools genuinely differ.
+async fn anchored_representation_on(
+    conn: &mut SqliteConnection,
+    target: &TargetRow,
+) -> Result<Option<Representation>> {
+    match target.source_slot.as_str() {
+        "body" => Ok(crate::record_body::body_at_seq_on(
+            conn,
+            &target.target_record_id,
+            target.source_event_seq.unwrap_or_default(),
+        )
+        .await?
+        .map(|bytes| Representation {
+            sha256: digest(&bytes),
+            bytes,
+        })),
+        "blob" => match target.blob_id.as_deref() {
+            Some(id) => blob_bytes_on(conn, id).await,
+            None => Ok(None),
+        },
+        _ => Ok(None),
+    }
+}
+
+/// The one inline-blob representation read, connection-scoped so a caller
+/// holding a transaction never takes a second pool slot for it. The pool
+/// form above checks a connection out and calls straight into this.
+async fn blob_bytes_on(
+    conn: &mut SqliteConnection,
+    blob_id: &str,
+) -> Result<Option<Representation>> {
+    let row = sqlx::query("SELECT bytes, storage_tier FROM blobs WHERE id = ?")
+        .bind(blob_id)
+        .fetch_optional(&mut *conn)
+        .await?;
+    let Some(row) = row else { return Ok(None) };
+    if row.try_get::<String, _>("storage_tier")? != "inline" {
+        return Ok(None);
+    }
+    let Some(bytes) = row.try_get::<Option<Vec<u8>>, _>("bytes")? else {
+        return Ok(None);
+    };
+    Ok(Some(Representation {
+        sha256: digest(&bytes),
+        bytes,
+    }))
 }
 
 fn quote_matches(
@@ -735,14 +743,6 @@ fn evidence(bytes: &[u8], range: (usize, usize)) -> Value {
     }
 }
 
-async fn target_row_in_pool(
-    pool: &sqlx::SqlitePool,
-    annotation_id: &str,
-) -> Result<Option<TargetRow>> {
-    let mut conn = pool.acquire().await?;
-    target_row_on(&mut conn, annotation_id).await
-}
-
 async fn target_row(db: &Db, annotation_id: &str) -> Result<Option<TargetRow>> {
     let mut conn = db.write_pool().acquire().await?;
     target_row_on(&mut conn, annotation_id).await
@@ -760,25 +760,89 @@ async fn target_row_on(
     .bind(annotation_id)
     .fetch_optional(conn)
     .await?;
-    row.map(|row| {
-        Ok(TargetRow {
-            annotation_id: row.try_get("annotation_id")?,
-            target_record_id: row.try_get("target_record_id")?,
-            source_slot: row.try_get("source_slot")?,
-            source_event_seq: row.try_get("source_event_seq")?,
-            blob_id: row.try_get("blob_id")?,
-            source_sha256: row.try_get("source_sha256")?,
-            selectors: serde_json::from_str(&row.try_get::<String, _>("selectors")?)?,
-            purpose: row.try_get("purpose")?,
-            created_at: row.try_get("created_at")?,
-            updated_at: row.try_get("updated_at")?,
-        })
-    })
-    .transpose()
+    row.map(|row| target_row_from_row(&row)).transpose()
 }
 
 fn parsed_selectors(target: &TargetRow) -> Result<Vec<SelectorInput>> {
     serde_json::from_value(target.selectors.clone()).map_err(Into::into)
+}
+
+/// Cache identity for one annotation's *anchored* representation in a batch.
+///
+/// The anchored bytes depend only on the source revision (slot, target
+/// record, source seq or blob id), never on which annotation captured them,
+/// so comments quoting different passages of one revision share one fold.
+/// Unknown slots are keyed per annotation and therefore never shared.
+fn anchored_key(target: &TargetRow) -> String {
+    match target.source_slot.as_str() {
+        "body" => format!(
+            "body:{}:{}",
+            target.target_record_id,
+            target.source_event_seq.unwrap_or_default()
+        ),
+        "blob" => format!("blob:{}", target.blob_id.as_deref().unwrap_or_default()),
+        slot => format!("other:{}:{slot}", target.annotation_id),
+    }
+}
+
+/// Cache identity for one annotation's *current* representation in a batch.
+///
+/// The current bytes depend only on the live record (and slot), so every
+/// comment anchored to one bearer shares one read.
+fn current_key(target: &TargetRow) -> String {
+    format!("{}:{}", target.source_slot, target.target_record_id)
+}
+
+fn target_row_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<TargetRow> {
+    Ok(TargetRow {
+        annotation_id: row.try_get("annotation_id")?,
+        target_record_id: row.try_get("target_record_id")?,
+        source_slot: row.try_get("source_slot")?,
+        source_event_seq: row.try_get("source_event_seq")?,
+        blob_id: row.try_get("blob_id")?,
+        source_sha256: row.try_get("source_sha256")?,
+        selectors: serde_json::from_str(&row.try_get::<String, _>("selectors")?)?,
+        purpose: row.try_get("purpose")?,
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+    })
+}
+
+const TARGET_ROW_COLUMNS: &str =
+    "annotation_id, target_record_id, source_slot, source_event_seq, blob_id,
+                source_sha256, selectors, purpose, created_at, updated_at";
+
+async fn target_rows_in_pool(
+    pool: &sqlx::SqlitePool,
+    ids: &[String],
+) -> Result<HashMap<String, TargetRow>> {
+    let mut conn = pool.acquire().await?;
+    target_rows_on(&mut conn, ids).await
+}
+
+async fn target_rows_on(
+    conn: &mut SqliteConnection,
+    ids: &[String],
+) -> Result<HashMap<String, TargetRow>> {
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let placeholders = std::iter::repeat_n("?", ids.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT {TARGET_ROW_COLUMNS} FROM annotation_targets WHERE annotation_id IN ({placeholders})"
+    );
+    let mut query = sqlx::query(&sql);
+    for id in ids {
+        query = query.bind(id);
+    }
+    let mut rows = HashMap::with_capacity(ids.len());
+    for row in query.fetch_all(conn).await? {
+        let target = target_row_from_row(&row)?;
+        rows.insert(target.annotation_id.clone(), target);
+    }
+    Ok(rows)
 }
 
 fn validation_from(
@@ -844,14 +908,20 @@ fn validation_from(
     }
 }
 
-async fn resolved_values(
-    lens: &ReadLens<'_>,
-    target: &TargetRow,
-) -> Result<(ValidationSummary, Value, Value)> {
-    let selectors = parsed_selectors(target)?;
-    let anchored = anchored_representation(lens, target).await?;
-    let current = current_representation(lens, target).await?;
-    let (anchored_value, anchored_evidence) = match anchored.as_ref() {
+/// Build one annotation's view from its own target row and the batch's shared
+/// representations.
+///
+/// Only the anchored and current byte representations are shared across a
+/// batch. Selectors, validation, excerpt, and every identity field come from
+/// this annotation's own `TargetRow`, so two comments quoting different
+/// passages of one revision never share a view.
+fn build_view(
+    target: TargetRow,
+    anchored: Option<&Representation>,
+    current: Option<&Representation>,
+) -> Result<AnnotationTargetView> {
+    let selectors = parsed_selectors(&target)?;
+    let (anchored_value, anchored_evidence) = match anchored {
         Some(rep) if rep.sha256 == target.source_sha256 => {
             match selector_ranges(&selectors, &rep.bytes, None) {
                 Ok(ranges) => (
@@ -866,8 +936,8 @@ async fn resolved_values(
         }
         _ => (json!({ "available": false }), None),
     };
-    let validation = validation_from(target, &selectors, anchored.as_ref(), current.as_ref());
-    let current_value = match current.as_ref() {
+    let validation = validation_from(&target, &selectors, anchored, current);
+    let current_value = match current {
         Some(rep) => {
             let relocation_evidence = (rep.sha256 != target.source_sha256)
                 .then_some(anchored_evidence.as_deref())
@@ -881,7 +951,12 @@ async fn resolved_values(
         }
         None => Value::Null,
     };
-    Ok((validation, anchored_value, current_value))
+    Ok(target_view(
+        target,
+        validation,
+        anchored_value,
+        current_value,
+    ))
 }
 
 pub async fn read_target_view(
@@ -895,12 +970,51 @@ pub async fn read_target_view_with_lens(
     lens: &ReadLens<'_>,
     annotation_id: &str,
 ) -> Result<Option<AnnotationTargetView>> {
-    let Some(target) = target_row_in_pool(lens.projection().snapshot_pool(), annotation_id).await?
-    else {
-        return Ok(None);
-    };
-    let (validation, anchored, current) = resolved_values(lens, &target).await?;
-    Ok(Some(target_view(target, validation, anchored, current)))
+    Ok(
+        read_target_views_with_lens(lens, std::slice::from_ref(&annotation_id.to_string()))
+            .await?
+            .remove(annotation_id)
+            .flatten(),
+    )
+}
+
+/// Resolve one page of target views, sharing only representations.
+///
+/// Comments pinned to the same passage revision share one anchored fold, and
+/// comments on one bearer share one current read; every annotation still
+/// gets its own view built from its own target row (see `build_view`).
+/// Owners without a target row resolve to `None`, exactly as the single-read
+/// path does.
+pub async fn read_target_views_with_lens(
+    lens: &ReadLens<'_>,
+    annotation_ids: &[String],
+) -> Result<HashMap<String, Option<AnnotationTargetView>>> {
+    let rows = target_rows_in_pool(lens.projection().snapshot_pool(), annotation_ids).await?;
+    let mut anchored: HashMap<String, Option<Representation>> = HashMap::new();
+    let mut current: HashMap<String, Option<Representation>> = HashMap::new();
+    let mut out = HashMap::with_capacity(annotation_ids.len());
+    for id in annotation_ids {
+        let view = match rows.get(id) {
+            Some(target) => {
+                let akey = anchored_key(target);
+                if !anchored.contains_key(&akey) {
+                    anchored.insert(akey.clone(), anchored_representation(lens, target).await?);
+                }
+                let ckey = current_key(target);
+                if !current.contains_key(&ckey) {
+                    current.insert(ckey.clone(), current_representation(lens, target).await?);
+                }
+                Some(build_view(
+                    target.clone(),
+                    anchored.get(&akey).and_then(Option::as_ref),
+                    current.get(&ckey).and_then(Option::as_ref),
+                )?)
+            }
+            None => None,
+        };
+        out.insert(id.clone(), view);
+    }
+    Ok(out)
 }
 
 fn target_view(
@@ -939,54 +1053,55 @@ fn target_view(
 
 pub(crate) async fn read_target_view_live_in(
     tx: &mut Transaction<'_, Sqlite>,
-    lens: &ReadLens<'_>,
     annotation_id: &str,
 ) -> Result<Option<AnnotationTargetView>> {
-    let Some(target) = target_row_on(tx, annotation_id).await? else {
-        return Ok(None);
-    };
-    // The target row controlling identity and disclosure is pinned to the
-    // caller's snapshot. Anchored event/blob representations are immutable;
-    // current record content is read below from that same snapshot.
-    let selectors = parsed_selectors(&target)?;
-    let anchored = anchored_representation(lens, &target).await?;
-    let current = current_representation_on(tx, &target).await?;
-    let validation = validation_from(&target, &selectors, anchored.as_ref(), current.as_ref());
-    let (anchored_value, anchored_evidence) = match anchored.as_ref() {
-        Some(rep) if rep.sha256 == target.source_sha256 => {
-            match selector_ranges(&selectors, &rep.bytes, None) {
-                Ok(ranges) => (
-                    json!({ "available": true, "source_sha256": rep.sha256, "excerpt": evidence(&rep.bytes, ranges[0]) }),
-                    Some(rep.bytes[ranges[0].0..ranges[0].1].to_vec()),
-                ),
-                Err(error) => (
-                    json!({ "available": true, "source_sha256": rep.sha256, "conflict": error.to_string() }),
-                    None,
-                ),
-            }
-        }
-        _ => (json!({ "available": false }), None),
-    };
-    let current_value = match current.as_ref() {
-        Some(rep) => {
-            let relocation_evidence = (rep.sha256 != target.source_sha256)
-                .then_some(anchored_evidence.as_deref())
-                .flatten();
-            match selector_ranges(&selectors, &rep.bytes, relocation_evidence) {
-                Ok(ranges) => {
-                    json!({ "source_sha256": rep.sha256, "excerpt": evidence(&rep.bytes, ranges[0]) })
+    Ok(
+        read_target_views_live_in(tx, std::slice::from_ref(&annotation_id.to_string()))
+            .await?
+            .remove(annotation_id)
+            .flatten(),
+    )
+}
+
+/// Live-transaction batch mirror of `read_target_views_with_lens`.
+///
+/// The target rows controlling identity and disclosure are pinned to the
+/// caller's snapshot. Anchored event/blob representations are immutable;
+/// current record content is read from that same snapshot and shared across
+/// the batch. This takes no lens: on a live lens every pool resolves to the
+/// write pool the caller's transaction already holds, so any pool-backed
+/// read here would nest a second same-pool acquisition inside the handler's
+/// snapshot.
+pub(crate) async fn read_target_views_live_in(
+    tx: &mut Transaction<'_, Sqlite>,
+    annotation_ids: &[String],
+) -> Result<HashMap<String, Option<AnnotationTargetView>>> {
+    let rows = target_rows_on(tx, annotation_ids).await?;
+    let mut anchored: HashMap<String, Option<Representation>> = HashMap::new();
+    let mut current: HashMap<String, Option<Representation>> = HashMap::new();
+    let mut out = HashMap::with_capacity(annotation_ids.len());
+    for id in annotation_ids {
+        let view = match rows.get(id) {
+            Some(target) => {
+                let akey = anchored_key(target);
+                if !anchored.contains_key(&akey) {
+                    anchored.insert(akey.clone(), anchored_representation_on(tx, target).await?);
                 }
-                Err(error) => json!({ "source_sha256": rep.sha256, "detail": error.to_string() }),
+                let ckey = current_key(target);
+                if !current.contains_key(&ckey) {
+                    current.insert(ckey.clone(), current_representation_on(tx, target).await?);
+                }
+                Some(build_view(
+                    target.clone(),
+                    anchored.get(&akey).and_then(Option::as_ref),
+                    current.get(&ckey).and_then(Option::as_ref),
+                )?)
             }
-        }
-        None => Value::Null,
-    };
-    Ok(Some(target_view(
-        target,
-        validation,
-        anchored_value,
-        current_value,
-    )))
+            None => None,
+        };
+        out.insert(id.clone(), view);
+    }
+    Ok(out)
 }
 
 pub async fn resolve(db: &Db, annotation_id: &str) -> Result<Value> {

@@ -224,13 +224,24 @@ impl<'a> ReadLens<'a> {
 
 /// Resolve an explicit selector against one observed content-log head.
 pub async fn resolve_as_of(db: &Db, selector: AsOfSelector) -> Result<ResolvedAsOf> {
+    resolve_as_of_in_pool(db.write_pool(), selector).await
+}
+
+/// Pool-scoped selector resolution for callers that must not queue on the
+/// writer. Identical logic to [`resolve_as_of`]: the content-log head (and,
+/// for timestamps, the resolved prefix) in one statement over committed
+/// event state, with no same-transaction dependency.
+pub async fn resolve_as_of_in_pool(
+    pool: &sqlx::SqlitePool,
+    selector: AsOfSelector,
+) -> Result<ResolvedAsOf> {
     let (resolved_content_seq, content_head_seq) = match &selector {
         AsOfSelector::ContentSeq(value) => {
             if value.content_seq < 0 {
                 return Err(contract_violation("as_of content_seq must be >= 0"));
             }
             let head: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(seq), 0) FROM content_events")
-                .fetch_one(db.write_pool())
+                .fetch_one(pool)
                 .await?;
             if value.content_seq > head {
                 return Err(contract_violation(format!(
@@ -256,7 +267,7 @@ pub async fn resolve_as_of(db: &Db, selector: AsOfSelector) -> Result<ResolvedAs
                    FROM content_events",
             )
             .bind(normalized)
-            .fetch_one(db.write_pool())
+            .fetch_one(pool)
             .await?;
             (row.try_get("resolved")?, row.try_get("head")?)
         }

@@ -611,6 +611,20 @@ fn print_timing_split(rendered: &Value, elapsed: Duration) {
         timing.get("input_json_bytes").unwrap_or(&Value::Null),
         timing.get("output_json_bytes").unwrap_or(&Value::Null),
     );
+    if let Some(ports) = timing.get("ports").and_then(Value::as_object) {
+        for (name, port) in ports {
+            println!(
+                "    port {name}  kind={} cache={} membership={}us authorization={}us redaction={}us assembly={}us governed_sql={}us",
+                port.get("kind").and_then(Value::as_str).unwrap_or("-"),
+                port.get("cache").and_then(Value::as_str).unwrap_or("-"),
+                port.get("membership_micros").and_then(Value::as_u64).unwrap_or(0),
+                port.get("authorization_micros").and_then(Value::as_u64).unwrap_or(0),
+                port.get("redaction_micros").and_then(Value::as_u64).unwrap_or(0),
+                port.get("assembly_micros").and_then(Value::as_u64).unwrap_or(0),
+                port.get("governed_sql_micros").and_then(Value::as_u64).unwrap_or(0),
+            );
+        }
+    }
 }
 
 async fn run_two_port() {
@@ -769,6 +783,40 @@ async fn run_two_port() {
             plan.len(),
         );
         print_timing_split(&rendered, elapsed);
+        if attempt == 3 {
+            let started = Instant::now();
+            let revalidated = call_as(
+                &registry,
+                &db,
+                caller.clone(),
+                "render_artifact",
+                json!({
+                    "id": TWO_PORT_ARTIFACT,
+                    "include_timing": true,
+                    "revalidate": {
+                        "artifact_id": rendered["plan"]["provenance"]["revalidation"]["artifact_id"],
+                        "snapshot_event_id": rendered["plan"]["provenance"]["revalidation"]["snapshot_event_id"],
+                        "snapshot_event_seq": rendered["plan"]["provenance"]["revalidation"]["snapshot_event_seq"],
+                        "authorization_revision": rendered["plan"]["provenance"]["revalidation"]["authorization_revision"],
+                        "cache_key": rendered["plan"]["provenance"]["revalidation"]["cache_key"],
+                        "caller_sha256": rendered["plan"]["provenance"]["revalidation"]["caller_sha256"],
+                        "meta_sha256": rendered["plan"]["provenance"]["revalidation"]["meta_sha256"],
+                        "ports": rendered["plan"]["provenance"]["input_bundle"]["ports"],
+                    }
+                }),
+            )
+            .await;
+            let elapsed = started.elapsed();
+            assert_eq!(revalidated["status"], "rendered", "{revalidated:#}");
+            let plan = serde_json::to_string(&revalidated["plan"]).unwrap();
+            println!(
+                "render revalidate  {elapsed:?}  unchanged={}  cache={}  plan {} bytes",
+                revalidated.get("unchanged").unwrap_or(&Value::Null),
+                revalidated["plan"]["cache"]["state"],
+                plan.len(),
+            );
+            print_timing_split(&revalidated, elapsed);
+        }
     }
 }
 
