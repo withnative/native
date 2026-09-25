@@ -49,6 +49,10 @@
         },
         {
           "kind": "file",
+          "source": "SELF_HOSTING.md"
+        },
+        {
+          "kind": "file",
           "source": "rust-toolchain.toml"
         },
         {

@@ -11530,8 +11530,10 @@ mod admission_tests {
                     semantic_version: 1,
                 },
             )]),
-            sql: "SELECT id, strftime('%Y-%m-%dT%H:%M:%fZ','now') AS tick FROM records LIMIT 1"
-                .into(),
+            // Native e25665c: already-stored governed SQL keeps the legacy
+            // allowance, so the wall-clock tick survives here. `ORDER BY id`
+            // keeps the fixture clean under the coming I3 rule.
+            sql: "SELECT id, strftime('%Y-%m-%dT%H:%M:%fZ','now') AS tick FROM records ORDER BY id LIMIT 1".into(),
             parameters: vec![],
             output: SavedSqlOutput {
                 columns,
@@ -11587,7 +11589,6 @@ mod admission_tests {
             json!({
                 "id": LIVE_SQL_QUERY, "type": "Collection", "kind": "query",
                 "name": "Clock relation",
-                "facets": { "query": serde_json::to_string(&definition).unwrap() },
                 "reason": "Bind the governed SQL relation port."
             }),
             json!({
@@ -11600,6 +11601,23 @@ mod admission_tests {
                 .await
                 .expect("create clock SQL fixture record");
         }
+        // Native e25665c: the stored definition keeps legacy-only `strftime`,
+        // which the write-time portable gate would refuse on a new save. Seed
+        // it as already-stored by writing the facet directly, bypassing the
+        // gate exactly as import/replay of pre-I2 definitions does.
+        crate::store::set_facet(
+            db,
+            LIVE_SQL_QUERY,
+            crate::events::FacetSetPayload {
+                key: "query".into(),
+                value: Some(serde_json::to_string(&definition).unwrap()),
+                vocab_ref: None,
+                as_of: None,
+                observation_only: false,
+            },
+        )
+        .await
+        .expect("seed stored clock SQL definition");
         registry
             .call(
                 db.clone(),

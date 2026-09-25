@@ -4,46 +4,17 @@ use std::collections::BTreeSet;
 
 use turso_parser::ast::{
     Cmd, Expr, FrameBound, FrameClause, FromClause, FunctionTail, GroupBy, JoinConstraint, Limit,
-    Name, OneSelect, Over, ResultColumn, Select, SelectTable, SortedColumn, Stmt, Type, TypeSize,
-    Window, With,
+    Name, OneSelect, Operator, Over, ResultColumn, Select, SelectTable, SortedColumn, Stmt, Type,
+    TypeSize, Window, With,
 };
 use turso_parser::parser::Parser;
 
 use super::sql_contract::{self, QuerySqlErrorCategory};
 use crate::Result;
 
-const SAFE_FUNCTIONS: [&str; 29] = [
-    "abs",
-    "avg",
-    "count",
-    "cume_dist",
-    "date",
-    "datetime",
-    "dense_rank",
-    "glob",
-    "instr",
-    "json_array_length",
-    "json_type",
-    "json_valid",
-    "julianday",
-    "length",
-    "like",
-    "max",
-    "min",
-    "ntile",
-    "percent_rank",
-    "rank",
-    "round",
-    "row_number",
-    "strftime",
-    "sum",
-    "time",
-    "total",
-    "typeof",
-    "unicode",
-    "unixepoch",
-];
-
+/// I2: function admission is the shared portable subset
+/// (`sql_contract::is_portable_function`, plus function-form `like`);
+/// the local AST walk below is defence in depth behind the classifier.
 const SAFE_CAST_TYPES: [&str; 8] = [
     "", "blob", "integer", "numeric", "real", "text", "none", "boolean",
 ];
@@ -256,7 +227,23 @@ fn validate_expr(expr: &Expr, scopes: &[BTreeSet<String>]) -> Result<()> {
             validate_expr(start, scopes)?;
             validate_expr(end, scopes)?;
         }
-        Expr::Binary(lhs, _, rhs) => {
+        Expr::Binary(lhs, operator, rhs) => {
+            // I2 review: `->` / `->>` are JSON access, which the portable
+            // profile drops like `json_*` (SQLite and Postgres both deny
+            // them). The operator was previously ignored, admitting JSON
+            // extraction on Turso alone.
+            if matches!(operator, Operator::ArrowRight | Operator::ArrowRightShift) {
+                let spelling = match operator {
+                    Operator::ArrowRight => "->",
+                    _ => "->>",
+                };
+                let repair = sql_contract::portable_function_repair("json_extract")
+                    .unwrap_or("unavailable on the portable profile");
+                return Err(reject(
+                    QuerySqlErrorCategory::UnsafeStatement,
+                    format!("operator '{spelling}' is unavailable — {repair}"),
+                ));
+            }
             validate_expr(lhs, scopes)?;
             validate_expr(rhs, scopes)?;
         }
@@ -371,17 +358,20 @@ fn validate_expr(expr: &Expr, scopes: &[BTreeSet<String>]) -> Result<()> {
 
 fn validate_function(name: &Name) -> Result<()> {
     let name = checked_name(name)?;
-    if SAFE_FUNCTIONS
-        .iter()
-        .any(|safe| name.eq_ignore_ascii_case(safe))
-    {
-        Ok(())
-    } else {
-        Err(reject(
-            QuerySqlErrorCategory::UnsafeStatement,
-            format!("function '{name}' is unavailable"),
-        ))
+    // I2: the portable subset lives in the shared contract table; the
+    // classifier already rejected dropped names with their repair, so the
+    // repair branch below is defence in depth with the identical message.
+    // `like` keeps its function-form admission; Postgres spells it `~~`.
+    if sql_contract::is_portable_function(name) || name.eq_ignore_ascii_case("like") {
+        return Ok(());
     }
+    if let Some(detail) = sql_contract::unavailable_function_detail(name) {
+        return Err(reject(QuerySqlErrorCategory::UnsafeStatement, detail));
+    }
+    Err(reject(
+        QuerySqlErrorCategory::UnsafeStatement,
+        format!("function '{name}' is unavailable"),
+    ))
 }
 
 fn validate_type(typ: Option<&Type>) -> Result<()> {
@@ -537,6 +527,92 @@ mod tests {
             "SELECT * FROM records; SELECT * FROM links",
         ] {
             assert!(validate(sql).is_err(), "accepted {sql}");
+        }
+    }
+
+    #[test]
+    fn widened_functions_validate_and_dropped_ones_name_the_repair() {
+        // I2: the classifier rejects dropped names first with the shared
+        // repair; the AST walk below is defence in depth.
+        for sql in [
+            "SELECT lower(name), upper(name) FROM records",
+            "SELECT trim(name), replace(name, 'a', 'b') FROM records",
+            // I2 review: two-argument `trim(x, chars)` matches Postgres
+            // `btrim(x, chars)` exactly, so it validates on every engine.
+            "SELECT trim(name, 'x') FROM records",
+            "SELECT substr(name, 1, 2) FROM records",
+            "SELECT coalesce(name, 'z'), nullif(name, 'z') FROM records",
+            "SELECT abs(id), length(name), round(1.5) FROM records",
+            "SELECT avg(id), count(*), sum(id), min(id), max(id) FROM records",
+            "SELECT rank() OVER (ORDER BY id) FROM records",
+            "SELECT CASE WHEN id = 1 THEN 'one' ELSE 'other' END FROM records",
+            "SELECT CAST(id AS TEXT) FROM records",
+            "SELECT id FROM records WHERE name LIKE 'conf:%'",
+        ] {
+            validate(sql).unwrap_or_else(|error| panic!("{sql}: {error}"));
+        }
+        for (sql, repair) in [
+            (
+                "SELECT instr(body, 'x') FROM records",
+                "use substr() or LIKE",
+            ),
+            ("SELECT glob('*', name) FROM records", "use LIKE"),
+            (
+                "SELECT date(created_at) FROM records",
+                "M1 timestamp columns",
+            ),
+            (
+                "SELECT json_type(body) FROM records",
+                "facet_values, facet_observations",
+            ),
+            ("SELECT typeof(name) FROM records", "catalog column types"),
+            (
+                "SELECT group_concat(name) FROM records",
+                "aggregate client-side",
+            ),
+            ("SELECT total(id) FROM records", "use sum"),
+            ("SELECT floor(value) FROM records", "CAST(x AS INTEGER)"),
+            ("SELECT char_length(name) FROM records", "use length"),
+            ("SELECT greatest(a, b) FROM records", "CASE"),
+            (
+                "SELECT round(avg(id), 2) FROM records",
+                "catalog numeric type",
+            ),
+            // I2 review: quoting the name bypasses nothing — the shared
+            // classifier runs the same dropped-name and arity checks on
+            // quoted calls before the AST walk.
+            (
+                "SELECT \"round\"(1.5, 2) FROM records",
+                "catalog numeric type",
+            ),
+            (
+                "SELECT \"instr\"(body, 'x') FROM records",
+                "use substr() or LIKE",
+            ),
+        ] {
+            let error = validate(sql).unwrap_err().to_string();
+            assert!(error.contains(repair), "{sql}: missing repair: {error}");
+        }
+    }
+
+    #[test]
+    fn json_access_operators_are_rejected_with_the_json_repair() {
+        // I2 review: `->` / `->>` are JSON access, dropped like `json_*`
+        // (SQLite and Postgres deny them). They previously slipped past
+        // the AST walk, which ignored the binary operator.
+        for (sql, spelling) in [
+            ("SELECT body->>'$.a' FROM records", "->>"),
+            ("SELECT body->'$.a' FROM records", "->"),
+        ] {
+            let error = validate(sql).unwrap_err().to_string();
+            assert!(
+                error.contains(&format!("operator '{spelling}' is unavailable")),
+                "{sql}: missing operator refusal: {error}"
+            );
+            assert!(
+                error.contains("facet_values, facet_observations"),
+                "{sql}: missing JSON repair: {error}"
+            );
         }
     }
 

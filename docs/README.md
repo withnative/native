@@ -34,6 +34,8 @@ with selected evidence, **Partial** is a real bounded implementation,
   capability map for behavioral evidence.
 - [Source boundary](source-boundary.md) — **Current** (governance): how the
   machine-readable selection is validated and why held files are absent.
+- [Local setup](../SELF_HOSTING.md) — **Current, local only:** build the selected
+  `mcp-stdio` node, connect an MCP client, and verify persistent SQLite state.
 
 For agents already operating inside Native, the runtime guide corpus begins at
 [`src/mcp/guides/README.md`](../src/mcp/guides/README.md). Those guides explain

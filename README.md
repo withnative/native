@@ -172,6 +172,11 @@ you finish Native setup. This hosted-first route is the practical way to begin;
 the source snapshot below supports inspection and exploration, not turnkey
 meaningful self-hosting today.
 
+If you want to run the selected node on your own computer, give your agent
+the [local setup guide](SELF_HOSTING.md). It takes you through a persistent
+SQLite database and an MCP client connection, with a restart check and the
+current limits of this public snapshot.
+
 ### Try continuity with one piece of work
 
 Choose a real task and ask the connected agent to record its current state,
@@ -293,6 +298,8 @@ and the evidence routes in [`docs/capability-map.md`](docs/capability-map.md).
   its contract.
 - **Exploring builds or checks:** [`BUILDING.md`](BUILDING.md) gives the
   source-snapshot edit loop and optional-feature boundaries.
+- **Running the local node:** [`SELF_HOSTING.md`](SELF_HOSTING.md) gives an
+  agent-readable setup and verification path for the selected stdio server.
 
 ## Further context
 

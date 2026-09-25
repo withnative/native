@@ -7010,9 +7010,9 @@ mod tests {
         assert_eq!(content_event_count(&db).await, events_before);
     }
 
-    /// A grown selection between prepare and execute is drift: the
-    /// one-operation bound trips on revalidation, so the execute-shaped call
-    /// reports `plan_stale` with no claim and no dispatch.
+    /// A grown selection between prepare and execute is drift: the signed
+    /// target set changed, so the execute-shaped call reports `plan_stale`
+    /// with no claim and no dispatch.
     #[tokio::test]
     async fn sql_write_grown_selection_reports_plan_stale() {
         use crate::authorization::{replace_explicit_policy, AllowEntry, Capability};
@@ -7037,6 +7037,74 @@ mod tests {
         replace_explicit_policy(
             &db,
             "test:sql-write-facade-grown",
+            &grown,
+            vec![AllowEntry::account("plan-author", Capability::Manage)],
+        )
+        .await
+        .unwrap();
+        let events_before = content_event_count(&db).await;
+        let stale = sql_write_execute(&server, &plan_id, &target_text, &effect_summary).await;
+        assert_eq!(plan_error_code(&stale), "plan_stale", "{stale}");
+        assert_sql_write_plan_prepared(&db, &plan_id).await;
+        assert_eq!(content_event_count(&db).await, events_before);
+        // Still stale on repeat: nothing was claimed or dispatched.
+        let repeated = sql_write_execute(&server, &plan_id, &target_text, &effect_summary).await;
+        assert_eq!(plan_error_code(&repeated), "plan_stale");
+        assert_sql_write_plan_prepared(&db, &plan_id).await;
+        assert_eq!(content_event_count(&db).await, events_before);
+    }
+
+    /// A changed multi-target set between prepare and execute is drift on the
+    /// signed target-set route: a matching third record changes the sorted
+    /// ID/version digest, so the execute-shaped call reports `plan_stale` with
+    /// the plan still Prepared and no event, claim, or dispatch.
+    #[tokio::test]
+    async fn sql_write_multirow_grown_set_reports_plan_stale() {
+        use crate::authorization::{replace_explicit_policy, AllowEntry, Capability};
+        let db = create_database(":memory:").await.unwrap();
+        let caller = Caller::authenticated("plan-author");
+        for (index, (id, name)) in [
+            ("ec00b000-0000-4000-8000-00000000b301", "Multi one"),
+            ("ec00b000-0000-4000-8000-00000000b302", "Multi two"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            crate::store::create_record(
+                &db,
+                json!({"id": id, "type":"Document","kind":"note","name": name}),
+            )
+            .await
+            .unwrap();
+            replace_explicit_policy(
+                &db,
+                &format!("test:sql-write-multirow-grown-{index}"),
+                id,
+                vec![AllowEntry::account("plan-author", Capability::Manage)],
+            )
+            .await
+            .unwrap();
+        }
+        let server = sql_write_opted_in_server(&db, caller).await;
+        let statement = "SELECT id AS record_id, 'set_field' AS op, 'name' AS key, 'Confirmed' AS value FROM records WHERE name LIKE 'Multi%'";
+        let prepared = sql_write_prepare(&server, statement).await;
+        assert_eq!(prepared["result"]["isError"], false, "{prepared}");
+        let plan = structured_result(&prepared);
+        assert_eq!(plan["effect"]["target_count"], json!(2));
+        let (plan_id, target_text, effect_summary) = (
+            plan["plan_id"].as_str().unwrap().to_string(),
+            plan["target"].as_str().unwrap().to_string(),
+            plan["effect_summary"].as_str().unwrap().to_string(),
+        );
+        let grown = crate::store::create_record(
+            &db,
+            json!({"id":"ec00b000-0000-4000-8000-00000000b303","type":"Document","kind":"note","name":"Multi three"}),
+        )
+        .await
+        .unwrap();
+        replace_explicit_policy(
+            &db,
+            "test:sql-write-multirow-grown-3",
             &grown,
             vec![AllowEntry::account("plan-author", Capability::Manage)],
         )

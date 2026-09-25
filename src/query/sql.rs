@@ -205,48 +205,16 @@ pub(crate) async fn workspace_visible_set(
     result
 }
 
-/// Deliberately conservative: every callable function is denied unless its
-/// output is intrinsically small or a familiar numeric/min/max aggregate. The
-/// SQLite runtime value ceiling is still mandatory for min/max over text.
-/// Operators and CAST remain available. `substr` and `substring` are admitted
-/// because their output is bounded by their input, and the cell ceiling still
-/// applies. Blob constructors, other value-returning string/JSON/window
-/// functions, concatenating aggregates, extension loaders, and introspection
-/// helpers never prepare.
-const SAFE_FUNCTIONS: [&str; 31] = [
-    "abs",
-    "avg",
-    "count",
-    "cume_dist",
-    "date",
-    "datetime",
-    "dense_rank",
-    "glob",
-    "instr",
-    "json_array_length",
-    "json_type",
-    "json_valid",
-    "julianday",
-    "length",
-    "like",
-    "max",
-    "min",
-    "ntile",
-    "percent_rank",
-    "rank",
-    "round",
-    "row_number",
-    "strftime",
-    "substr",
-    "substring",
-    "sum",
-    "time",
-    "total",
-    "typeof",
-    "unicode",
-    "unixepoch",
-];
-
+/// Deliberately conservative: every callable function is denied unless it is
+/// in the shared portable subset (`sql_contract::is_portable_function`,
+/// plus function-form `like`), whose output is intrinsically small or a
+/// familiar numeric/min/max aggregate. The SQLite runtime value ceiling is
+/// still mandatory for min/max over text. Operators and CAST remain
+/// available. Dropped names never reach the authorizer: the classifier
+/// rejects them first with the portable replacement, so a deny here means
+/// an unknown function. Blob constructors, other value-returning
+/// string/JSON/window functions, concatenating aggregates, extension
+/// loaders, and introspection helpers never prepare.
 /// The connection-local contract. `_query_sql_visible_records` is an internal
 /// helper, absent from the strict public schema, so caller SQL cannot name it.
 /// A routed credential resolves with its folded catalog footing for this
@@ -998,6 +966,71 @@ async fn populate_activity_members(
     Ok(())
 }
 
+/// Richard 25 Sep (Native e25665c): already-stored governed SQL
+/// keeps working under the pinned engine's pre-I2 function rules, nothing
+/// added: the legacy allowance is exactly the portable subset plus every
+/// other name the pre-I2 SQLite authorizer admitted (`SAFE_FUNCTIONS` as of
+/// the I2 base, minus the portable overlap). Before I2 `group_concat` was
+/// already refused ("not authorized to use function"), so it stays refused
+/// for stored definitions too. Ad-hoc `query_sql` and SQL being saved stay
+/// on the portable subset.
+const LEGACY_SAVED_SQL_EXTRA_FUNCTIONS: [&str; 15] = [
+    "date",
+    "datetime",
+    "glob",
+    "instr",
+    "json_array_length",
+    "json_type",
+    "json_valid",
+    "julianday",
+    "strftime",
+    "substring",
+    "time",
+    "total",
+    "typeof",
+    "unicode",
+    "unixepoch",
+];
+
+fn is_legacy_saved_sql_function(function_name: &str) -> bool {
+    sql_contract::is_portable_function(function_name)
+        || function_name.eq_ignore_ascii_case("like")
+        || LEGACY_SAVED_SQL_EXTRA_FUNCTIONS
+            .iter()
+            .any(|safe| function_name.eq_ignore_ascii_case(safe))
+}
+
+fn authorize_view_expansion_legacy_saved_sql(context: AuthContext<'_>) -> Authorization {
+    match context.action {
+        AuthAction::Select | AuthAction::Recursive => Authorization::Allow,
+        AuthAction::Read { table_name, .. } => {
+            let public_temp = context.database_name == Some("temp")
+                && sql_contract::is_logical_relation(table_name);
+            let through_controlled = context
+                .accessor
+                .is_some_and(|view| CONTROLLED_ACCESSORS.contains(&view));
+            if public_temp || through_controlled {
+                Authorization::Allow
+            } else {
+                Authorization::Deny
+            }
+        }
+        AuthAction::Function { function_name }
+            if context
+                .accessor
+                .is_some_and(|view| CONTROLLED_ACCESSORS.contains(&view))
+                && !function_name.eq_ignore_ascii_case("load_extension") =>
+        {
+            Authorization::Allow
+        }
+        AuthAction::Function { function_name } if is_legacy_saved_sql_function(function_name) => {
+            Authorization::Allow
+        }
+        AuthAction::Function { .. } => Authorization::Deny,
+        _ => Authorization::Deny,
+    }
+}
+
 fn authorize_view_expansion(context: AuthContext<'_>) -> Authorization {
     match context.action {
         AuthAction::Select | AuthAction::Recursive => Authorization::Allow,
@@ -1022,9 +1055,8 @@ fn authorize_view_expansion(context: AuthContext<'_>) -> Authorization {
             Authorization::Allow
         }
         AuthAction::Function { function_name }
-            if SAFE_FUNCTIONS
-                .iter()
-                .any(|safe| function_name.eq_ignore_ascii_case(safe)) =>
+            if sql_contract::is_portable_function(function_name)
+                || function_name.eq_ignore_ascii_case("like") =>
         {
             Authorization::Allow
         }
@@ -1044,10 +1076,26 @@ fn authorize_strict(context: AuthContext<'_>) -> Authorization {
         }
         AuthAction::Read { .. } if context.database_name.is_none() => Authorization::Allow,
         AuthAction::Function { function_name }
-            if SAFE_FUNCTIONS
-                .iter()
-                .any(|safe| function_name.eq_ignore_ascii_case(safe)) =>
+            if sql_contract::is_portable_function(function_name)
+                || function_name.eq_ignore_ascii_case("like") =>
         {
+            Authorization::Allow
+        }
+        _ => Authorization::Deny,
+    }
+}
+
+fn authorize_strict_legacy_saved_sql(context: AuthContext<'_>) -> Authorization {
+    match context.action {
+        AuthAction::Select | AuthAction::Recursive => Authorization::Allow,
+        AuthAction::Read { table_name, .. }
+            if context.database_name == Some("temp")
+                && sql_contract::is_logical_relation(table_name) =>
+        {
+            Authorization::Allow
+        }
+        AuthAction::Read { .. } if context.database_name.is_none() => Authorization::Allow,
+        AuthAction::Function { function_name } if is_legacy_saved_sql_function(function_name) => {
             Authorization::Allow
         }
         _ => Authorization::Deny,
@@ -1264,8 +1312,20 @@ fn validate_view_expansion(statement: &str) -> Result<()> {
     })
 }
 
+fn validate_view_expansion_legacy_saved_sql(statement: &str) -> Result<()> {
+    with_frozen_validator(|conn| {
+        prepare_under_authorizer(conn, statement, authorize_view_expansion_legacy_saved_sql)
+    })
+}
+
 fn validate_strict(statement: &str) -> Result<()> {
     with_strict_validator(|conn| prepare_under_authorizer(conn, statement, authorize_strict))
+}
+
+fn validate_strict_legacy_saved_sql(statement: &str) -> Result<()> {
+    with_strict_validator(|conn| {
+        prepare_under_authorizer(conn, statement, authorize_strict_legacy_saved_sql)
+    })
 }
 
 /// Validate caller SQL against both the real view expansion and a strict
@@ -1279,6 +1339,16 @@ pub fn validate(sql: &str) -> Result<()> {
     validate_strict(&statement)
 }
 
+/// Stored governed SQL only (Native e25665c): identical gates except
+/// the I2 portable-function rules are replaced by the legacy allowance, in
+/// both the shared classifier and the engine authorizers.
+pub(crate) fn validate_legacy_saved_sql(sql: &str) -> Result<()> {
+    let statement =
+        sql_contract::classify_stored_saved_sql(sql_contract::QuerySqlProfile::SqliteLocal, sql)?;
+    validate_view_expansion_legacy_saved_sql(&statement)?;
+    validate_strict_legacy_saved_sql(&statement)
+}
+
 /// Return the labels SQLite assigns to a validated statement without running
 /// it. Saved SQL uses this at admission so an empty result cannot defer output
 /// schema drift until a later execution happens to produce rows.
@@ -1290,6 +1360,27 @@ pub(crate) fn validated_output_columns(sql: &str) -> Result<Vec<String>> {
     validate_view_expansion(&statement)?;
     with_strict_validator(|conn| {
         conn.authorizer(Some(authorize_strict));
+        let prepared = conn.prepare(&statement);
+        conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
+        let prepared = prepared.map_err(|error| {
+            sql_contract::categorized_error(QuerySqlErrorCategory::SyntaxOrType, error.to_string())
+        })?;
+        Ok(prepared
+            .column_names()
+            .into_iter()
+            .map(str::to_owned)
+            .collect())
+    })
+}
+
+/// Stored governed SQL only (Native e25665c): same labels under the
+/// legacy function allowance.
+pub(crate) fn validated_output_columns_legacy_saved_sql(sql: &str) -> Result<Vec<String>> {
+    let statement =
+        sql_contract::classify_stored_saved_sql(sql_contract::QuerySqlProfile::SqliteLocal, sql)?;
+    validate_view_expansion_legacy_saved_sql(&statement)?;
+    with_strict_validator(|conn| {
+        conn.authorizer(Some(authorize_strict_legacy_saved_sql));
         let prepared = conn.prepare(&statement);
         conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
         let prepared = prepared.map_err(|error| {
@@ -1332,6 +1423,52 @@ pub(crate) fn validated_relation_dependencies(
                 }
             }
             authorize_strict(context)
+        }));
+        let prepared = conn.prepare(&statement);
+        conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
+        let prepared = prepared.map_err(|error| {
+            sql_contract::categorized_error(QuerySqlErrorCategory::SyntaxOrType, error.to_string())
+        })?;
+        if !prepared.readonly() {
+            return Err(sql_contract::categorized_error(
+                QuerySqlErrorCategory::UnsafeStatement,
+                "read-only statement writes",
+            ));
+        }
+        drop(prepared);
+        Ok(())
+    })?;
+    Ok(std::sync::Arc::try_unwrap(dependencies)
+        .expect("validator releases dependency observer")
+        .into_inner()
+        .expect("dependency lock"))
+}
+
+/// Stored governed SQL only (Native e25665c): same relation
+/// observation under the legacy function allowance.
+pub(crate) fn validated_relation_dependencies_legacy_saved_sql(
+    sql: &str,
+) -> Result<std::collections::BTreeSet<String>> {
+    let statement =
+        sql_contract::classify_stored_saved_sql(sql_contract::QuerySqlProfile::SqliteLocal, sql)?;
+    validate_view_expansion_legacy_saved_sql(&statement)?;
+    let dependencies = std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::<
+        String,
+    >::new()));
+    let observed = dependencies.clone();
+    with_strict_validator(|conn| {
+        conn.authorizer(Some(move |context: AuthContext<'_>| {
+            if let AuthAction::Read { table_name, .. } = context.action {
+                if context.database_name == Some("temp")
+                    && sql_contract::is_logical_relation(table_name)
+                {
+                    observed
+                        .lock()
+                        .expect("dependency lock")
+                        .insert(table_name.to_owned());
+                }
+            }
+            authorize_strict_legacy_saved_sql(context)
         }));
         let prepared = conn.prepare(&statement);
         conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
@@ -1796,19 +1933,34 @@ pub(crate) async fn query_sql_request_in(
     principal: QueryPrincipal,
     request: QuerySqlRequest,
 ) -> Result<SqlResult> {
-    query_sql_request_in_with_row_limit(transaction, principal, request, MAX_ROWS)
-        .await
-        .map(|(result, _)| result)
+    query_sql_request_in_with_row_limit(
+        transaction,
+        principal,
+        request,
+        MAX_ROWS,
+        sql_contract::FunctionAllowance::Portable,
+    )
+    .await
+    .map(|(result, _)| result)
 }
 
 /// Internal saved-query execution retains one extra row so the governed
 /// envelope can validate the identity/order boundary before truncating it.
+/// Stored definitions run under the legacy saved-SQL function allowance
+/// (Native e25665c): the only caller executing stored governed SQL.
 pub(crate) async fn query_sql_request_in_for_saved(
     transaction: &mut sqlx::Transaction<'_, Sqlite>,
     principal: QueryPrincipal,
     request: QuerySqlRequest,
 ) -> Result<(SqlResult, GovernedSqlObservation)> {
-    query_sql_request_in_with_row_limit(transaction, principal, request, MAX_ROWS + 1).await
+    query_sql_request_in_with_row_limit(
+        transaction,
+        principal,
+        request,
+        MAX_ROWS + 1,
+        sql_contract::FunctionAllowance::LegacySavedSql,
+    )
+    .await
 }
 
 /// Bounded governed read inside the caller's transaction. The probe row
@@ -1820,14 +1972,25 @@ pub(crate) async fn query_sql_request_in_with_row_limit(
     principal: QueryPrincipal,
     request: QuerySqlRequest,
     row_limit: i64,
+    allowance: sql_contract::FunctionAllowance,
 ) -> Result<(SqlResult, GovernedSqlObservation)> {
+    use sql_contract::FunctionAllowance;
     sql_contract::require_available(sql_contract::QuerySqlProfile::SqliteLocal)?;
     request.validate()?;
-    validate(&request.sql)?;
-    let statement = sql_contract::classify_single_read_statement(
-        sql_contract::QuerySqlProfile::SqliteLocal,
-        &request.sql,
-    )?;
+    match allowance {
+        FunctionAllowance::Portable => validate(&request.sql)?,
+        FunctionAllowance::LegacySavedSql => validate_legacy_saved_sql(&request.sql)?,
+    }
+    let statement = match allowance {
+        FunctionAllowance::Portable => sql_contract::classify_single_read_statement(
+            sql_contract::QuerySqlProfile::SqliteLocal,
+            &request.sql,
+        )?,
+        FunctionAllowance::LegacySavedSql => sql_contract::classify_stored_saved_sql(
+            sql_contract::QuerySqlProfile::SqliteLocal,
+            &request.sql,
+        )?,
+    };
     // I1 review: `?2` with one parameter must fail, not bind a silent
     // NULL. The `?N` set has to be exactly `1..=parameters.len()`.
     sql_contract::check_positional_arguments(
@@ -1835,7 +1998,12 @@ pub(crate) async fn query_sql_request_in_with_row_limit(
         &statement,
         request.parameters.len(),
     )?;
-    let relation_dependencies = validated_relation_dependencies(&statement)?;
+    let relation_dependencies = match allowance {
+        FunctionAllowance::Portable => validated_relation_dependencies(&statement)?,
+        FunctionAllowance::LegacySavedSql => {
+            validated_relation_dependencies_legacy_saved_sql(&statement)?
+        }
+    };
     let needs_awaiting_reply = relation_dependencies.contains("messages_awaiting_reply");
     let activity_dependent = relation_dependencies
         .iter()
@@ -2959,6 +3127,82 @@ mod frozen_schema_cache_tests {
                     .contains("use positional `?N` placeholders"),
                 "{sql}: missing repair: {error}"
             );
+        }
+    }
+
+    #[test]
+    fn widened_functions_validate_and_dropped_ones_name_the_repair() {
+        // I2: preparing proves SQLite itself executes the widened set.
+        validate("SELECT lower('AbC'), upper('AbC') FROM records").unwrap();
+        validate("SELECT trim(' x '), replace('aab', 'a', 'c') FROM records").unwrap();
+        // I2 review: the two-argument `trim(x, chars)` matches Postgres
+        // `btrim(x, chars)` exactly, so it validates on every engine.
+        validate("SELECT trim('xxhelloxx', 'x') FROM records").unwrap();
+        validate("SELECT substr('hello', 2, 3) FROM records").unwrap();
+        validate("SELECT coalesce(NULL, 'z'), nullif('a', 'a') FROM records").unwrap();
+        validate("SELECT abs(-3), length('hey'), round(1.5) FROM records").unwrap();
+        validate("SELECT avg(id), count(*), sum(id), min(id), max(id) FROM records").unwrap();
+        validate("SELECT rank() OVER (ORDER BY id) FROM records").unwrap();
+        validate("SELECT CASE WHEN id = 1 THEN 'one' ELSE 'other' END FROM records").unwrap();
+        validate("SELECT CAST(id AS TEXT) FROM records").unwrap();
+        // LIKE (either spelling) still validates.
+        validate("SELECT id FROM records WHERE name LIKE 'conf:%'").unwrap();
+        validate("SELECT id FROM records WHERE lower(name) LIKE 'conf:%'").unwrap();
+        for (sql, repair) in [
+            (
+                "SELECT instr(body, 'x') FROM records",
+                "use substr() or LIKE",
+            ),
+            ("SELECT glob('*', name) FROM records", "use LIKE"),
+            (
+                "SELECT date(created_at) FROM records",
+                "M1 timestamp columns",
+            ),
+            (
+                "SELECT json_type(body) FROM records",
+                "facet_values, facet_observations",
+            ),
+            ("SELECT typeof(name) FROM records", "catalog column types"),
+            // Richard 25 Sep: I2 dropped functions stay rejected ad-hoc even
+            // though already-stored governed SQL keeps the legacy allowance.
+            (
+                "SELECT strftime('%w', 'now') FROM records",
+                "M1 timestamp columns",
+            ),
+            (
+                "SELECT julianday('now') FROM records",
+                "M1 timestamp columns",
+            ),
+            (
+                "SELECT group_concat(name) FROM records",
+                "aggregate client-side",
+            ),
+            (
+                "SELECT group_concat(name) FROM records",
+                "aggregate client-side",
+            ),
+            ("SELECT total(id) FROM records", "use sum"),
+            ("SELECT floor(value) FROM records", "CAST(x AS INTEGER)"),
+            ("SELECT char_length(name) FROM records", "use length"),
+            ("SELECT greatest(a, b) FROM records", "CASE"),
+            (
+                "SELECT round(avg(id), 2) FROM records",
+                "catalog numeric type",
+            ),
+            // I2 review: quoting the name bypasses nothing — the shared
+            // classifier runs the same dropped-name and arity checks on
+            // `"name"(`, `` `name` `` and `[name](` calls.
+            (
+                "SELECT \"round\"(1.5, 2) FROM records",
+                "catalog numeric type",
+            ),
+            (
+                "SELECT \"instr\"(body, 'x') FROM records",
+                "use substr() or LIKE",
+            ),
+        ] {
+            let error = validate(sql).unwrap_err().to_string();
+            assert!(error.contains(repair), "{sql}: missing repair: {error}");
         }
     }
 
@@ -4889,14 +5133,14 @@ JOIN temp._qs_legacy_visible_records AS target_visible
             "SELECT id FROM vocabularies",
             "SELECT id FROM schema_config",
             "SELECT substr(name, 1, 5) AS preview FROM records",
-            "SELECT substring(body, 1, 10) AS preview FROM records",
+            "SELECT substr(body, 1, 10) AS preview FROM records",
         ] {
             validate(statement).unwrap_or_else(|error| panic!("{statement}: {error}"));
         }
     }
 
     #[tokio::test]
-    async fn substr_and_substring_truncate_text_in_sql() {
+    async fn substr_truncates_text_in_sql() {
         let (db, alice, _bea) = protected_fixture().await;
         // "Common" / "sharedterm common" are the COMMON_ID fixture values.
         let preview = query_sql(
@@ -4915,7 +5159,9 @@ JOIN temp._qs_legacy_visible_records AS target_visible
         .await
         .unwrap();
         assert_eq!(first_strings(&tail), ["mon"]);
-        let body_preview = query_sql(
+        // I2: `substring` is dropped everywhere (Turso never had it);
+        // the repair names `substr`.
+        let dropped = query_sql(
             &db,
             &alice,
             &format!(
@@ -4923,8 +5169,12 @@ JOIN temp._qs_legacy_visible_records AS target_visible
             ),
         )
         .await
-        .unwrap();
-        assert_eq!(first_strings(&body_preview), ["sharedterm"]);
+        .unwrap_err()
+        .to_string();
+        assert!(
+            dropped.contains("function 'substring' is unavailable — use substr"),
+            "missing repair: {dropped}"
+        );
         assert!(principal_context_is_empty(&db).await.unwrap());
     }
 

@@ -6,7 +6,7 @@
 //! deliberately separate from `portable_sql`, which accepts only Native-owned
 //! reviewed statements.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use base64::Engine as _;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -1434,13 +1434,36 @@ pub fn require_available(profile: QuerySqlProfile) -> Result<()> {
 /// lets an author see a visibility-relation scan without widening the data
 /// surface. Bare `EXPLAIN` and any other explained statement stay rejected.
 pub fn classify_single_read_statement(profile: QuerySqlProfile, sql: &str) -> Result<String> {
-    classify_single_read_statement_impl(profile, sql, true)
+    classify_single_read_statement_impl(profile, sql, true, FunctionAllowance::Portable)
+}
+
+/// Richard 25 Sep (Native e25665c): the I2 portable-function rules
+/// (dropped functions + two-argument `round`) apply to NEW SQL only — ad-hoc
+/// `query_sql` and SQL being saved. Inspection and execution of already-stored
+/// governed SQL use this entry point instead: every other check is identical
+/// (safety, single statement, relations, I1 placeholders, catalog pin), only
+/// the portable-call scan is skipped and the legacy allowance (pre-I2
+/// allowlist ∪ the portable subset) applies at the engine allowlist.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FunctionAllowance {
+    /// Ad-hoc `query_sql` and SQL being saved: the I2 portable subset.
+    Portable,
+    /// Native e25665c: already-stored governed SQL keeps working
+    /// under the legacy allowance (pre-I2 allowlist ∪ portable subset).
+    LegacySavedSql,
+}
+
+/// Inspection/execution of already-stored governed SQL. See
+/// [`FunctionAllowance::LegacySavedSql`].
+pub fn classify_stored_saved_sql(profile: QuerySqlProfile, sql: &str) -> Result<String> {
+    classify_single_read_statement_impl(profile, sql, true, FunctionAllowance::LegacySavedSql)
 }
 
 fn classify_single_read_statement_impl(
     profile: QuerySqlProfile,
     sql: &str,
     allow_explain: bool,
+    allowance: FunctionAllowance,
 ) -> Result<String> {
     if sql.len() > MAX_SQL_BYTES {
         return Err(categorized_error(
@@ -1465,7 +1488,7 @@ fn classify_single_read_statement_impl(
         ));
     };
     if allow_explain && first == "explain" {
-        return classify_explain_query_plan(profile, sql, &words, &semicolons);
+        return classify_explain_query_plan(profile, sql, &words, &semicolons, allowance);
     }
     if !matches!(first.as_str(), "select" | "with") {
         return Err(categorized_error(
@@ -1473,7 +1496,11 @@ fn classify_single_read_statement_impl(
             format!("read-only statement must start with SELECT or WITH, got '{first}'"),
         ));
     }
-    const FORBIDDEN: [&str; 24] = [
+    // `replace` is absent on purpose: it is both the `REPLACE INTO` write
+    // and the portable `replace()` string function. The write is rejected
+    // by `reject_bare_replace` below; the call form is admitted by the
+    // portable function check.
+    const FORBIDDEN: [&str; 23] = [
         "insert",
         "update",
         "delete",
@@ -1497,7 +1524,6 @@ fn classify_single_read_statement_impl(
         "rollback",
         "savepoint",
         "release",
-        "replace",
     ];
     if let Some((word, _)) = words
         .iter()
@@ -1508,6 +1534,7 @@ fn classify_single_read_statement_impl(
             format!("read-only statement contains prohibited token '{word}'"),
         ));
     }
+    reject_bare_replace(profile, sql, &words)?;
     if semicolons.len() > 1
         || semicolons
             .first()
@@ -1519,7 +1546,11 @@ fn classify_single_read_statement_impl(
         ));
     }
     let statement = semicolons.first().map_or(sql, |offset| &sql[..*offset]);
-    Ok(statement.trim().to_owned())
+    let statement = statement.trim();
+    if allowance == FunctionAllowance::Portable {
+        validate_portable_calls(profile, statement)?;
+    }
+    Ok(statement.to_owned())
 }
 
 /// Admit `EXPLAIN QUERY PLAN <statement>` only. The explained statement is
@@ -1531,6 +1562,7 @@ fn classify_explain_query_plan(
     sql: &str,
     words: &[(String, usize)],
     semicolons: &[usize],
+    allowance: FunctionAllowance,
 ) -> Result<String> {
     let is_query_plan = words.get(1).is_some_and(|(word, _)| word == "query")
         && words.get(2).is_some_and(|(word, _)| word == "plan");
@@ -1547,7 +1579,7 @@ fn classify_explain_query_plan(
             "a single statement only",
         ));
     }
-    let inner = classify_single_read_statement_impl(profile, &sql[plan_end..], false)?;
+    let inner = classify_single_read_statement_impl(profile, &sql[plan_end..], false, allowance)?;
     Ok(format!("EXPLAIN QUERY PLAN {inner}"))
 }
 
@@ -1823,6 +1855,471 @@ fn placeholder_end(bytes: &[u8], start: usize) -> Result<usize> {
         }
         _ => Ok(start + 1),
     }
+}
+
+/// I2 (E1 M2 portability validator): the portable function subset. One
+/// table feeds every engine, so a rejection names the same replacement on
+/// SQLite, Turso and Postgres. `like` is intentionally absent: it is an
+/// operator on Postgres (`~~`) and a function-form entry at the engines'
+/// own call sites. `round` is admitted with one argument only; two or more
+/// arguments are rejected by the arity check in `validate_portable_calls`.
+pub const PORTABLE_FUNCTIONS: &[&str] = &[
+    "abs",
+    "avg",
+    "coalesce",
+    "count",
+    "cume_dist",
+    "dense_rank",
+    "length",
+    "lower",
+    "max",
+    "min",
+    "ntile",
+    "nullif",
+    "percent_rank",
+    "rank",
+    "replace",
+    "round",
+    "row_number",
+    "substr",
+    "sum",
+    "trim",
+    "upper",
+];
+
+/// True for the intersection every engine executes. The SQLite and Turso
+/// call sites additionally admit `like`, whose Postgres spelling is the
+/// `~~` operator family rather than a function call.
+pub fn is_portable_function(name: &str) -> bool {
+    PORTABLE_FUNCTIONS
+        .iter()
+        .any(|safe| name.eq_ignore_ascii_case(safe))
+}
+
+const M1_TIMESTAMP_REPAIR: &str =
+    "use the M1 timestamp columns (e.g. created_at and created_at_ms)";
+const JSON_REPAIR: &str = "use the owned relations (e.g. facet_values, facet_observations)";
+const FLOOR_CEIL_REPAIR: &str = "unavailable on the portable profile — use CAST(x AS INTEGER) for truncation toward zero (it truncates rather than floors negatives) or compute client-side";
+
+/// I2: dropped functions and their portable replacements. `json_*` is
+/// covered by the prefix rule in `portable_function_repair`, so only the
+/// named forms that deserve a distinct mention are listed.
+const DROPPED_FUNCTION_REPAIRS: &[(&str, &str)] = &[
+    // I4 will add the case-insensitivity claim when it is true on
+    // Postgres; until then the repair names no semantics.
+    ("instr", "use substr() or LIKE"),
+    ("glob", "use LIKE"),
+    ("date", M1_TIMESTAMP_REPAIR),
+    ("datetime", M1_TIMESTAMP_REPAIR),
+    ("julianday", M1_TIMESTAMP_REPAIR),
+    ("strftime", M1_TIMESTAMP_REPAIR),
+    ("time", M1_TIMESTAMP_REPAIR),
+    ("unixepoch", M1_TIMESTAMP_REPAIR),
+    ("json_array_length", JSON_REPAIR),
+    ("json_type", JSON_REPAIR),
+    ("json_valid", JSON_REPAIR),
+    ("json_group_array", JSON_REPAIR),
+    // N2 residual (re-review): bare `json()` is SQLite's JSON parse, not
+    // covered by the `json_` prefix rule, so it names the repair directly.
+    ("json", JSON_REPAIR),
+    ("typeof", "use the catalog column types"),
+    (
+        "group_concat",
+        "aggregate client-side instead of GROUP_CONCAT",
+    ),
+    ("total", "use sum (note: sum returns NULL on empty input where total returns 0.0 — use coalesce(sum(x), 0))"),
+    // substr(x, 1, 1) returns a character, not a code point, so it
+    // would be a misleading replacement.
+    ("unicode", "no portable equivalent — compute client-side"),
+    ("substring", "use substr"),
+    ("floor", FLOOR_CEIL_REPAIR),
+    ("ceil", FLOOR_CEIL_REPAIR),
+    ("ceiling", FLOOR_CEIL_REPAIR),
+    ("char_length", "use length"),
+    ("character_length", "use length"),
+    (
+        "octet_length",
+        "use length() for character length; byte length has no portable equivalent",
+    ),
+    ("greatest", "use a CASE expression"),
+    ("least", "use a CASE expression"),
+];
+
+/// The portable repair for a lowercased function name, if the function is
+/// dropped from the portable profile. Any other `json_*` spelling falls
+/// under the same repair via the prefix rule.
+pub fn portable_function_repair(lower_name: &str) -> Option<&'static str> {
+    DROPPED_FUNCTION_REPAIRS
+        .iter()
+        .find(|(dropped, _)| *dropped == lower_name)
+        .map(|(_, repair)| *repair)
+        .or_else(|| lower_name.starts_with("json_").then_some(JSON_REPAIR))
+}
+
+/// The identical rejection detail every engine reports for a dropped
+/// function: `function '<name>' is unavailable — <repair>`, with the name
+/// lowercased so caller casing cannot fork the message. Engines wrap it
+/// with `QuerySqlErrorCategory::UnsafeStatement`, matching the classifier.
+pub fn unavailable_function_detail(found_name: &str) -> Option<String> {
+    let lower = found_name.to_ascii_lowercase();
+    portable_function_repair(&lower)
+        .map(|repair| format!("function '{lower}' is unavailable — {repair}"))
+}
+
+/// I2: enforce the portable function subset on a classified statement.
+/// Every `word(` outside strings, comments and quoted identifiers is a
+/// call: dropped names are rejected with their portable replacement, and
+/// `round` with two or more arguments is rejected with the numeric repair.
+/// Anything else (admitted names, unknown names, keywords like `CAST (`)
+/// is left for the engines, which keep their own allowlists as defence in
+/// depth. `::` casts and `[1:2]`-style colons never reach here as calls.
+fn validate_portable_calls(profile: QuerySqlProfile, statement: &str) -> Result<()> {
+    let bytes = statement.as_bytes();
+    let nested = profile == QuerySqlProfile::PostgresServer;
+    // N1 (re-review): one linear paren pre-pass. Per-call rescans here were
+    // quadratic on nested input; every exemption/arity check below is now an
+    // O(1) index lookup, keeping the whole classifier linear.
+    let index = build_paren_index(statement, bytes, nested)?;
+    let mut i = 0;
+    // N2 (re-review): whether the previous significant token is the word
+    // `AS`, so `AS name(` (a table-alias column list) is exempt like a CTE
+    // definition. Comments and whitespace leave it; every other token sets
+    // it. A genuine call is never directly preceded by `AS`.
+    let mut prev_is_as = false;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'-' if bytes.get(i + 1) == Some(&b'-') => {
+                i += 2;
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                i = block_comment_end(bytes, i, nested)?;
+            }
+            b'e' | b'E' if nested && bytes.get(i + 1) == Some(&b'\'') => {
+                prev_is_as = false;
+                i = quoted_end(bytes, i + 1, b'\'', true)?;
+            }
+            b'\'' => {
+                prev_is_as = false;
+                i = quoted_end(bytes, i, b'\'', false)?;
+            }
+            // I2 review: a quoted/bracketed identifier immediately followed
+            // by `(` is a call too (`SELECT "round"(1.5, 2)`), so the
+            // dropped-name and round-arity checks run on it. A bare CTE
+            // definition (`WITH instr(a) AS (...)`, quoted or not) is not
+            // a call and stays admitted.
+            b'"' => {
+                let end = quoted_end(bytes, i, b'"', false)?;
+                let j = skip_ws_and_comments(bytes, end, nested)?;
+                if bytes.get(j) == Some(&b'(')
+                    && !prev_is_as
+                    && !is_cte_column_list(bytes, j, nested, &index)?
+                {
+                    check_call(&unquote_doubled(&statement[i + 1..end - 1], '"'), j, &index)?;
+                }
+                prev_is_as = false;
+                i = end;
+            }
+            b'`' if !nested => {
+                let end = quoted_end(bytes, i, b'`', false)?;
+                let j = skip_ws_and_comments(bytes, end, nested)?;
+                if bytes.get(j) == Some(&b'(')
+                    && !prev_is_as
+                    && !is_cte_column_list(bytes, j, nested, &index)?
+                {
+                    check_call(&unquote_doubled(&statement[i + 1..end - 1], '`'), j, &index)?;
+                }
+                prev_is_as = false;
+                i = end;
+            }
+            b'[' if !nested => {
+                let end = bracket_identifier_end(bytes, i)?;
+                let j = skip_ws_and_comments(bytes, end, nested)?;
+                if bytes.get(j) == Some(&b'(')
+                    && !prev_is_as
+                    && !is_cte_column_list(bytes, j, nested, &index)?
+                {
+                    check_call(&statement[i + 1..end - 1], j, &index)?;
+                }
+                prev_is_as = false;
+                i = end;
+            }
+            b'$' if nested => {
+                prev_is_as = false;
+                if let Some((delimiter, after)) = dollar_delimiter(statement, i) {
+                    let rest = &statement[after..];
+                    let Some(end) = rest.find(&delimiter) else {
+                        return syntax_error("unterminated dollar-quoted string");
+                    };
+                    i = after + end + delimiter.len();
+                } else {
+                    i += 1;
+                }
+            }
+            byte if byte.is_ascii_alphabetic() || byte == b'_' => {
+                let start = i;
+                i += 1;
+                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                    i += 1;
+                }
+                let name = &statement[start..i];
+                let j = skip_ws_and_comments(bytes, i, nested)?;
+                if bytes.get(j) == Some(&b'(')
+                    && !prev_is_as
+                    && !is_cte_column_list(bytes, j, nested, &index)?
+                {
+                    check_call(name, j, &index)?;
+                }
+                prev_is_as = name.eq_ignore_ascii_case("as");
+            }
+            _ => {
+                // Whitespace leaves `prev_is_as` (`AS "instr"(` is still
+                // an alias); any other single byte ends the adjacency.
+                if !bytes[i].is_ascii_whitespace() {
+                    prev_is_as = false;
+                }
+                i += 1;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn skip_ws_and_comments(bytes: &[u8], mut j: usize, nested: bool) -> Result<usize> {
+    loop {
+        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if bytes.get(j) == Some(&b'-') && bytes.get(j + 1) == Some(&b'-') {
+            j += 2;
+            while j < bytes.len() && bytes[j] != b'\n' {
+                j += 1;
+            }
+        } else if bytes.get(j) == Some(&b'/') && bytes.get(j + 1) == Some(&b'*') {
+            j = block_comment_end(bytes, j, nested)?;
+        } else {
+            return Ok(j);
+        }
+    }
+}
+
+/// Check one `name(` call found in code. Dropped names report their
+/// portable replacement; `round` with a top-level comma takes the numeric
+/// repair; everything else belongs to the engines.
+fn check_call(name: &str, paren: usize, index: &ParenIndex) -> Result<()> {
+    let lower = name.to_ascii_lowercase();
+    if lower == "round" {
+        return check_round_arity(paren, index);
+    }
+    if let Some(detail) = unavailable_function_detail(name) {
+        return Err(categorized_error(
+            QuerySqlErrorCategory::UnsafeStatement,
+            detail,
+        ));
+    }
+    Ok(())
+}
+
+/// `name(` is a CTE column list rather than a call when the parenthesised
+/// group is followed by `AS (` (optionally via `MATERIALIZED` / `NOT
+/// MATERIALIZED`): `WITH instr(a) AS (SELECT ...)`. A genuine call alias
+/// (`SELECT instr(x) AS y`) never has a parenthesised target, so skipping
+/// exactly this shape cannot hide a call.
+fn is_cte_column_list(
+    bytes: &[u8],
+    paren: usize,
+    nested: bool,
+    index: &ParenIndex,
+) -> Result<bool> {
+    let Some(close) = index.close.get(&paren) else {
+        // Unbalanced tail: left for the engines to syntax-error.
+        return Ok(false);
+    };
+    let mut j = skip_ws_and_comments(bytes, close + 1, nested)?;
+    let (word, end) = read_word(bytes, j);
+    if word != "as" {
+        return Ok(false);
+    }
+    j = skip_ws_and_comments(bytes, end, nested)?;
+    let (word, end) = read_word(bytes, j);
+    j = if word == "materialized" {
+        skip_ws_and_comments(bytes, end, nested)?
+    } else if word == "not" {
+        let k = skip_ws_and_comments(bytes, end, nested)?;
+        let (next, next_end) = read_word(bytes, k);
+        if next != "materialized" {
+            return Ok(false);
+        }
+        skip_ws_and_comments(bytes, next_end, nested)?
+    } else {
+        j
+    };
+    Ok(bytes.get(j) == Some(&b'('))
+}
+
+/// Paren-match index from one linear pre-pass over a statement: every
+/// `(` in code maps to its matching `)`, and every `(` whose level
+/// directly contains a top-level comma is flagged. Exemption and arity
+/// checks consult it in O(1), keeping `validate_portable_calls` linear.
+/// Unbalanced parens map to nothing; the engines syntax-error those.
+struct ParenIndex {
+    close: HashMap<usize, usize>,
+    top_comma: HashSet<usize>,
+}
+
+/// One linear scan with the same literal/comment skipping as the
+/// classifiers (Postgres nesting, dollar quotes and `E''` when `nested`).
+fn build_paren_index(statement: &str, bytes: &[u8], nested: bool) -> Result<ParenIndex> {
+    let mut index = ParenIndex {
+        close: HashMap::new(),
+        top_comma: HashSet::new(),
+    };
+    let mut open: Vec<usize> = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'-' if bytes.get(i + 1) == Some(&b'-') => {
+                i += 2;
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                i = block_comment_end(bytes, i, nested)?;
+            }
+            b'e' | b'E' if nested && bytes.get(i + 1) == Some(&b'\'') => {
+                i = quoted_end(bytes, i + 1, b'\'', true)?;
+            }
+            b'\'' | b'"' => {
+                i = quoted_end(bytes, i, bytes[i], false)?;
+            }
+            b'`' if !nested => {
+                i = quoted_end(bytes, i, b'`', false)?;
+            }
+            b'[' if !nested => {
+                i = bracket_identifier_end(bytes, i)?;
+            }
+            b'$' if nested => {
+                if let Some((delimiter, after)) = dollar_delimiter(statement, i) {
+                    let rest = &statement[after..];
+                    let Some(end) = rest.find(&delimiter) else {
+                        return syntax_error("unterminated dollar-quoted string");
+                    };
+                    i = after + end + delimiter.len();
+                } else {
+                    i += 1;
+                }
+            }
+            b'(' => {
+                open.push(i);
+                i += 1;
+            }
+            b')' => {
+                if let Some(start) = open.pop() {
+                    index.close.insert(start, i);
+                }
+                i += 1;
+            }
+            b',' => {
+                if let Some(top) = open.last() {
+                    index.top_comma.insert(*top);
+                }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    Ok(index)
+}
+
+/// Lowercased word (`[A-Za-z_][A-Za-z0-9_]*`) at `j`, or empty when `j` is
+/// not at a word. The second element is the byte offset past the word.
+fn read_word(bytes: &[u8], j: usize) -> (String, usize) {
+    if !bytes
+        .get(j)
+        .is_some_and(|byte| byte.is_ascii_alphabetic() || *byte == b'_')
+    {
+        return (String::new(), j);
+    }
+    let mut end = j + 1;
+    while bytes
+        .get(end)
+        .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+    {
+        end += 1;
+    }
+    (
+        String::from_utf8_lossy(&bytes[j..end]).to_ascii_lowercase(),
+        end,
+    )
+}
+
+/// Undo `""`-style doubling inside a quoted identifier (`"a""b"` names
+/// `a"b`). Only exact names reach the checks, so anything exotic stays
+/// admitted here and fails closed at the engines.
+fn unquote_doubled(inner: &str, quote: char) -> String {
+    let doubled: String = [quote, quote].iter().collect();
+    inner.replace(&doubled, &quote.to_string())
+}
+
+/// `round` admits one argument; two or more name the numeric repair. The
+/// answer comes from the linear pre-pass index: a top-level comma flag on
+/// the call's own level. An unbalanced tail (no index entry) is left for
+/// the engines to syntax-error.
+fn check_round_arity(paren: usize, index: &ParenIndex) -> Result<()> {
+    const REPAIR: &str =
+        "two-argument round is not portable — CAST the value to the catalog numeric type first";
+    if !index.close.contains_key(&paren) {
+        return Ok(());
+    }
+    if index.top_comma.contains(&paren) {
+        return Err(categorized_error(
+            QuerySqlErrorCategory::UnsafeStatement,
+            REPAIR,
+        ));
+    }
+    Ok(())
+}
+
+/// I2: `REPLACE` is both the `REPLACE INTO` / `INSERT OR REPLACE` write
+/// and the portable `replace()` string function. Only the write positions
+/// are rejected: a leading `REPLACE` (never reached — the statement must
+/// start with SELECT or WITH), `REPLACE INTO`, and `INSERT OR REPLACE`.
+/// Anywhere else (`SELECT 1 AS replace`, a column named `replace`) the
+/// word is data, and the call form `replace(` is admitted by the portable
+/// function check.
+fn reject_bare_replace(
+    profile: QuerySqlProfile,
+    sql: &str,
+    words: &[(String, usize)],
+) -> Result<()> {
+    let bytes = sql.as_bytes();
+    let nested = profile == QuerySqlProfile::PostgresServer;
+    for (index, (word, end)) in words.iter().enumerate() {
+        if word != "replace" {
+            continue;
+        }
+        let after = skip_ws_and_comments(bytes, *end, nested)?;
+        if bytes.get(after) == Some(&b'(') {
+            continue;
+        }
+        let prev = index.checked_sub(1).and_then(|i| words.get(i));
+        let prev_prev = index.checked_sub(2).and_then(|i| words.get(i));
+        let next = words.get(index + 1);
+        let is_write = index == 0
+            || next.is_some_and(|(next, _)| next == "into")
+            || (prev.is_some_and(|(prev, _)| prev == "or")
+                && prev_prev.is_some_and(|(prev_prev, _)| prev_prev == "insert"));
+        if is_write {
+            return Err(categorized_error(
+                QuerySqlErrorCategory::UnsafeStatement,
+                "read-only statement contains prohibited token 'replace'",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn quoted_end(bytes: &[u8], start: usize, quote: u8, backslash_escapes: bool) -> Result<usize> {
@@ -2340,6 +2837,308 @@ mod tests {
         // `$N` form is the execution rewrite, never caller syntax.
         for profile in PROFILES {
             assert_eq!(profile.contract().placeholder, "?1", "{profile:?}");
+        }
+    }
+
+    #[test]
+    fn dropped_functions_name_their_portable_replacement() {
+        // I2: every profile rejects the same way with the same message.
+        for (sql, repair) in [
+            (
+                "SELECT instr(body, 'x') FROM records",
+                "use substr() or LIKE",
+            ),
+            ("SELECT glob('*', name) FROM records", "use LIKE"),
+            (
+                "SELECT date(created_at) FROM records",
+                "M1 timestamp columns",
+            ),
+            (
+                "SELECT datetime(created_at) FROM records",
+                "M1 timestamp columns",
+            ),
+            (
+                "SELECT julianday(created_at) FROM records",
+                "M1 timestamp columns",
+            ),
+            (
+                "SELECT strftime('%Y', created_at) FROM records",
+                "M1 timestamp columns",
+            ),
+            (
+                "SELECT time(created_at) FROM records",
+                "M1 timestamp columns",
+            ),
+            (
+                "SELECT unixepoch(created_at) FROM records",
+                "M1 timestamp columns",
+            ),
+            (
+                "SELECT json_type(body) FROM records",
+                "facet_values, facet_observations",
+            ),
+            (
+                "SELECT json_extract(body, '$.a') FROM records",
+                "facet_values, facet_observations",
+            ),
+            (
+                "SELECT json_group_array(name) FROM records",
+                "facet_values, facet_observations",
+            ),
+            (
+                "SELECT json(body) FROM records",
+                "facet_values, facet_observations",
+            ),
+            ("SELECT typeof(name) FROM records", "catalog column types"),
+            (
+                "SELECT group_concat(name) FROM records",
+                "aggregate client-side",
+            ),
+            ("SELECT total(id) FROM records", "use sum"),
+            (
+                "SELECT unicode(name) FROM records",
+                "no portable equivalent",
+            ),
+            ("SELECT substring(name, 1, 2) FROM records", "use substr"),
+            ("SELECT floor(value) FROM records", "CAST(x AS INTEGER)"),
+            ("SELECT ceil(value) FROM records", "CAST(x AS INTEGER)"),
+            ("SELECT ceiling(value) FROM records", "CAST(x AS INTEGER)"),
+            ("SELECT char_length(name) FROM records", "use length"),
+            ("SELECT character_length(name) FROM records", "use length"),
+            ("SELECT octet_length(name) FROM records", "character length"),
+            ("SELECT greatest(a, b) FROM records", "CASE"),
+            ("SELECT least(a, b) FROM records", "CASE"),
+            (
+                "SELECT round(avg(value), 2) FROM records",
+                "catalog numeric type",
+            ),
+        ] {
+            for profile in PROFILES {
+                let error = classify_single_read_statement(*profile, sql).unwrap_err();
+                let rendered = error.to_string();
+                assert!(
+                    rendered.contains(repair),
+                    "{profile:?}: {sql}: missing repair: {rendered}"
+                );
+            }
+        }
+        // Case-insensitive names report the lowercased repair, and calls
+        // hidden in literals, comments and quoted identifiers stay admitted.
+        for profile in PROFILES {
+            let error =
+                classify_single_read_statement(*profile, "SELECT INSTR(body, 'x') FROM records")
+                    .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("function 'instr' is unavailable"),
+                "{profile:?}: {error}"
+            );
+            for sql in [
+                "SELECT 'instr(' AS value FROM records",
+                "SELECT /* glob(*) */ id FROM records",
+                "-- typeof(name)\nSELECT id FROM records",
+                "SELECT \"instr\" FROM records",
+            ] {
+                assert!(
+                    classify_single_read_statement(*profile, sql).is_ok(),
+                    "{profile:?}: {sql}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn widened_functions_are_admitted_on_every_profile() {
+        // I2 intersection: scalar/string, aggregates, window, plus 1-arg
+        // round. CASE/CAST coverage lives with the engine suites.
+        for sql in [
+            "SELECT lower(name), upper(name) FROM records",
+            "SELECT trim(name), replace(name, 'a', 'b') FROM records",
+            "SELECT substr(name, 1, 2) FROM records",
+            "SELECT coalesce(name, 'z'), nullif(name, 'z') FROM records",
+            "SELECT abs(id), length(name), round(1.5) FROM records",
+            "SELECT avg(id), count(*), sum(id), min(id), max(id) FROM records",
+            "SELECT rank() OVER (ORDER BY id) FROM records",
+            "SELECT row_number() OVER (ORDER BY id) FROM records",
+            "SELECT dense_rank() OVER (ORDER BY id) FROM records",
+            "SELECT id FROM records WHERE name LIKE 'conf:%'",
+            "SELECT CASE WHEN id = 1 THEN 'one' ELSE 'other' END FROM records",
+            "SELECT CAST(id AS TEXT) FROM records",
+        ] {
+            for profile in PROFILES {
+                assert!(
+                    classify_single_read_statement(*profile, sql).is_ok(),
+                    "{profile:?}: {sql}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn quoted_calls_face_the_same_dropped_name_and_arity_checks() {
+        // I2 review: quoting the name (`"round"`, `` `round` ``,
+        // `[round]`) must not bypass the dropped-name or round-arity
+        // checks. Whitespace and comments between the name and `(` still
+        // form a call.
+        for sql in [
+            "SELECT \"round\"(1.5, 2) FROM records",
+            "SELECT \"round\" /* c */ (1.5, 2) FROM records",
+            "SELECT round(\"round\"(a, 2)) FROM records",
+            "SELECT \"instr\"(x, y) FROM records",
+            "SELECT \"ROUND\"(1.5, 2) FROM records",
+        ] {
+            for profile in PROFILES {
+                assert!(
+                    classify_single_read_statement(*profile, sql).is_err(),
+                    "{profile:?}: unexpectedly admitted {sql}"
+                );
+            }
+        }
+        let error = classify_single_read_statement(
+            QuerySqlProfile::SqliteLocal,
+            "SELECT \"instr\"(x, y) FROM records",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("use substr() or LIKE"), "{error}");
+        let error = classify_single_read_statement(
+            QuerySqlProfile::SqliteLocal,
+            "SELECT \"round\"(1.5, 2) FROM records",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("catalog numeric type"), "{error}");
+        // Backtick and bracket spellings are not identifiers on Postgres
+        // (they fail closed at the pg parser instead), so they are only
+        // checked on the SQLite-family profiles.
+        for sql in [
+            "SELECT `round`(1.5, 2) FROM records",
+            "SELECT [round](1.5, 2) FROM records",
+            "SELECT `instr`(x, y) FROM records",
+            "SELECT [instr](x, y) FROM records",
+        ] {
+            for profile in [QuerySqlProfile::SqliteLocal, QuerySqlProfile::TursoLocal] {
+                assert!(
+                    classify_single_read_statement(profile, sql).is_err(),
+                    "{profile:?}: unexpectedly admitted {sql}"
+                );
+            }
+        }
+        // Quoted names without a call stay admitted, as do one-argument
+        // quoted `round` and the widened quoted spellings.
+        for sql in [
+            "SELECT \"round\"(1.5) FROM records",
+            "SELECT \"lower\"(name) FROM records",
+            "SELECT \"instr\" FROM records",
+        ] {
+            for profile in PROFILES {
+                assert!(
+                    classify_single_read_statement(*profile, sql).is_ok(),
+                    "{profile:?}: {sql}: unexpectedly rejected"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn deeply_nested_calls_classify_in_linear_time() {
+        // N1 (re-review): per-call paren rescans were quadratic (2.2–2.6 s
+        // at the 64 KiB cap; the linear pre-pass measures 51–65 ms there).
+        // The 1 s bound catches the regression without flaking on a loaded
+        // CI runner.
+        use std::time::Instant;
+        let depth = 20_000;
+        let mut sql = String::from("SELECT ");
+        for _ in 0..depth {
+            sql.push_str("a(");
+        }
+        sql.push('1');
+        for _ in 0..depth {
+            sql.push(')');
+        }
+        sql.push_str(" FROM records");
+        assert!(sql.len() < MAX_SQL_BYTES, "{}", sql.len());
+        for profile in PROFILES {
+            let start = Instant::now();
+            let outcome = classify_single_read_statement(*profile, &sql);
+            let elapsed = start.elapsed();
+            assert!(outcome.is_ok(), "{profile:?}: {outcome:?}");
+            assert!(
+                elapsed.as_secs() < 1,
+                "{profile:?}: took {elapsed:?} for {} bytes",
+                sql.len()
+            );
+        }
+    }
+
+    #[test]
+    fn cte_column_lists_are_not_calls() {
+        // I2 review nit: a CTE name with an explicit column list is a
+        // definition, not a call — even when the name matches a dropped
+        // function. The `AS (` shape (optionally via MATERIALIZED)
+        // distinguishes it from a call alias (`SELECT f(x) AS y`).
+        for sql in [
+            "WITH instr(a) AS (SELECT 1) SELECT a FROM instr",
+            "WITH \"instr\"(a) AS (SELECT 1) SELECT a FROM \"instr\"",
+            "WITH t(a, b) AS (SELECT 1, 2) SELECT * FROM t",
+            "WITH round(a) AS MATERIALIZED (SELECT 1) SELECT a FROM round",
+            // N2 (re-review): a derived-table alias with a column list is
+            // not a call either (`AS name(`/`, quoted or not). Engines
+            // without alias column lists still fail closed at parse.
+            "SELECT * FROM (SELECT 1 AS q) AS \"instr\"(y)",
+            "SELECT * FROM (SELECT 1 AS q) AS instr(y)",
+            "SELECT * FROM (VALUES (1)) AS \"instr\"(x)",
+        ] {
+            for profile in PROFILES {
+                assert!(
+                    classify_single_read_statement(*profile, sql).is_ok(),
+                    "{profile:?}: {sql}: unexpectedly rejected"
+                );
+            }
+        }
+        // A genuine dropped call with an alias is still a call.
+        for profile in PROFILES {
+            let error = classify_single_read_statement(
+                *profile,
+                "SELECT instr(x, y) AS found FROM records",
+            )
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("use substr() or LIKE"),
+                "{profile:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn replace_as_an_alias_is_not_the_write() {
+        // I2 review nit: only the write positions (`REPLACE INTO`,
+        // `INSERT OR REPLACE`) are rejected; `replace` elsewhere is data
+        // and the `replace()` call form stays admitted.
+        for sql in [
+            "SELECT 1 AS replace FROM records",
+            "SELECT 'a' AS replace, replace(name, 'b', 'c') FROM records",
+            "SELECT replace FROM records",
+        ] {
+            for profile in PROFILES {
+                assert!(
+                    classify_single_read_statement(*profile, sql).is_ok(),
+                    "{profile:?}: {sql}: unexpectedly rejected"
+                );
+            }
+        }
+        for sql in [
+            "WITH x AS (SELECT 1) REPLACE INTO records VALUES(1,'z')",
+            "WITH changed AS (INSERT OR REPLACE INTO records VALUES(1,'z')) SELECT * FROM changed",
+            "REPLACE INTO records VALUES(1,'z')",
+        ] {
+            for profile in PROFILES {
+                assert!(
+                    classify_single_read_statement(*profile, sql).is_err(),
+                    "{profile:?}: unexpectedly admitted {sql}"
+                );
+            }
         }
     }
 

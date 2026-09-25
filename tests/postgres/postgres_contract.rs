@@ -1869,6 +1869,66 @@ async fn postgres_query_sql_positional_placeholders_run_end_to_end() {
 }
 
 #[tokio::test]
+async fn postgres_query_sql_widened_functions_run_end_to_end() {
+    // I2: the widened intersection executes on Postgres with no fixture
+    // (no FROM clause). `round(1.5)` pins the float spelling the encoder
+    // produces; LIKE/ILIKE translation stays I4.
+    let Some(harness) = configured_harness().await else {
+        return;
+    };
+    let database = harness.fresh_logical_database().await.unwrap();
+    let rows = qualification_query_sql(
+        database.clone(),
+        Caller::local(),
+        QuerySqlRequest {
+            sql: "SELECT lower('AbC') AS lo, upper('AbC') AS hi, trim(' x ') AS t, replace('aab', 'a', 'c') AS r, substr('hello', 2, 3) AS s, coalesce(NULL, 'z') AS c, nullif('a', 'a') AS n, abs(-3) AS a, length('hey') AS l, round(1.5) AS r2".into(),
+            parameters: Vec::new(),
+        },
+    )
+    .await
+    .unwrap()
+    .rows;
+    assert_eq!(
+        rows,
+        [
+            json!({"lo": "abc", "hi": "ABC", "t": "x", "r": "ccb", "s": "ell", "c": "z", "n": null, "a": 3, "l": 3, "r2": 2})
+        ]
+    );
+    // A `?1` inside a string literal is data; the placeholder still binds.
+    let rows = qualification_query_sql(
+        database.clone(),
+        Caller::local(),
+        QuerySqlRequest {
+            sql: "SELECT trim(?1) AS t, '?2' AS lit".into(),
+            parameters: vec![QuerySqlParameter::Text {
+                value: Some(" x ".into()),
+            }],
+        },
+    )
+    .await
+    .unwrap()
+    .rows;
+    assert_eq!(rows, [json!({"t": "x", "lit": "?2"})]);
+    // I2 review: two-argument `trim(x, chars)` executes as
+    // `btrim(x, chars)` with SQLite-identical results.
+    let rows = qualification_query_sql(
+        database.clone(),
+        Caller::local(),
+        QuerySqlRequest {
+            sql: "SELECT trim('xxhelloxx', 'x') AS t".into(),
+            parameters: Vec::new(),
+        },
+    )
+    .await
+    .unwrap()
+    .rows;
+    assert_eq!(rows, [json!({"t": "hello"})]);
+
+    harness.close(&database).await;
+    harness.shutdown().await;
+}
+
+#[tokio::test]
 async fn postgres_query_sql_computed_booleans_encode_as_zero_one() {
     let Some(harness) = configured_harness().await else {
         return;

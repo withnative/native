@@ -258,6 +258,29 @@ pub(crate) fn corpus() -> Vec<ConformanceCase> {
             ],
         },
         ConformanceCase {
+            name: "widened_scalar_functions_agree",
+            sql: "SELECT lower('AbC') AS lo, upper('AbC') AS hi, trim(' x ') AS t, replace('aab', 'a', 'c') AS r, substr('hello', 2, 3) AS s, coalesce(NULL, 'z') AS c, nullif('a', 'a') AS n, abs(-3) AS a, length('hey') AS l",
+            parameters: Vec::new(),
+            expected_columns: vec!["lo", "hi", "t", "r", "s", "c", "n", "a", "l"],
+            // I2: the widened intersection executes identically on
+            // SQLite and Turso (the Postgres runner reuses `check_case`).
+            // Single row, so no ORDER BY is required.
+            expected_rows: vec![
+                serde_json::json!({"lo": "abc", "hi": "ABC", "t": "x", "r": "ccb", "s": "ell", "c": "z", "n": null, "a": 3, "l": 3}),
+            ],
+        },
+        ConformanceCase {
+            name: "trim_with_chars_agrees",
+            sql: "SELECT trim('xxhelloxx', 'x') AS t",
+            parameters: Vec::new(),
+            expected_columns: vec!["t"],
+            // I2 review: two-argument `trim(x, chars)` is `btrim(x,
+            // chars)` on Postgres with identical semantics, so every
+            // engine returns the same result. Single row, so no ORDER BY
+            // is required.
+            expected_rows: vec![serde_json::json!({"t": "hello"})],
+        },
+        ConformanceCase {
             name: "catalog_columns_lists_links_columns_in_position",
             sql: "SELECT relation_name, column_name, column_position FROM catalog_columns WHERE relation_name = 'links' ORDER BY column_position",
             parameters: Vec::new(),

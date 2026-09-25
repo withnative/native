@@ -636,6 +636,12 @@ pub(super) async fn advance_artifact_port_pin(
                 "{TOOL}: bound Collection saved query is not a governed SQL definition"
             ))
         })?;
+    // Native e25665c: the pin advance is exempt from the save-time portable
+    // rules because it never changes the SQL text — only relation version
+    // pins. The comparison below is a defensive assertion of that
+    // invariant, not a live branch: changed text would be authored SQL and
+    // must validate under the full rules.
+    let stored_sql = definition.sql.clone();
     let query_pin = definition.relations.get(&relation_name).ok_or_else(|| {
         Error::engine(format!(
             "{TOOL}: saved query does not pin relation '{relation_name}'; this is not a pin-only advance"
@@ -794,6 +800,13 @@ pub(super) async fn advance_artifact_port_pin(
     let previous_seq = previous_record_seq_in(&mut tx, &args.artifact_id).await?;
 
     let query_updated = if query_needs_advance {
+        if definition.sql != stored_sql {
+            crate::mcp::tools::querying::validate_saved_sql(&definition).map_err(|error| {
+                Error::engine(format!(
+                    "{TOOL}: re-saving changed governed SQL requires the portable subset: {error}"
+                ))
+            })?;
+        }
         append_in(
             &db,
             &mut tx,

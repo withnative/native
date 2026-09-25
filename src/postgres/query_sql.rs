@@ -27,33 +27,10 @@ use crate::query::sql_contract::{
 use crate::query::QueryPrincipal;
 use crate::{Error, Result};
 
-const SAFE_FUNCTIONS: &[&str] = &[
-    "abs",
-    "avg",
-    "ceil",
-    "ceiling",
-    "char_length",
-    "count",
-    "cume_dist",
-    "dense_rank",
-    "floor",
-    "greatest",
-    "least",
-    "length",
-    "lower",
-    "max",
-    "min",
-    "ntile",
-    "nullif",
-    "octet_length",
-    "percent_rank",
-    "rank",
-    "round",
-    "row_number",
-    "sum",
-    "upper",
-];
-
+/// I2: function admission is the shared portable subset
+/// (`sql_contract::is_portable_function`); the closed AST walk below is
+/// defence in depth behind the classifier, which already rejected dropped
+/// names with their portable repair.
 const SAFE_TYPES: &[&str] = &[
     "bool",
     "boolean",
@@ -590,11 +567,34 @@ fn validate_variant(name: &str, data: &Value, parameters: &mut HashSet<usize>) -
     match name {
         "FuncCall" => {
             let names = node_strings(fields.get("funcname").unwrap_or(&Value::Null))?;
-            if names.len() != 1
-                || !SAFE_FUNCTIONS
-                    .iter()
-                    .any(|safe| names[0].eq_ignore_ascii_case(safe))
+            // I2: plain `trim(x)` desugars to qualified `pg_catalog.btrim`
+            // with one argument, and `trim(x, chars)` — the SQLite
+            // two-argument form — to `btrim` with two. Both shapes are the
+            // portable call; modifier forms (`trim(leading …)`) and bare
+            // `btrim` stay rejected. Admission never skips the field
+            // recursion below, which still collects `$n` ParamRefs.
+            let portable_trim = names.len() == 2
+                && names[0].eq_ignore_ascii_case("pg_catalog")
+                && names[1].eq_ignore_ascii_case("btrim")
+                && fields
+                    .get("args")
+                    .and_then(Value::as_array)
+                    .is_some_and(|args| args.len() == 1 || args.len() == 2);
+            if !portable_trim
+                && (names.len() != 1 || !sql_contract::is_portable_function(&names[0]))
             {
+                if names.len() == 1 {
+                    if let Some(detail) = sql_contract::unavailable_function_detail(&names[0]) {
+                        return Err(reject(QuerySqlErrorCategory::UnsafeStatement, detail));
+                    }
+                    return Err(reject(
+                        QuerySqlErrorCategory::UnsafeStatement,
+                        format!(
+                            "function '{}' is unavailable",
+                            names[0].to_ascii_lowercase()
+                        ),
+                    ));
+                }
                 return Err(reject(
                     QuerySqlErrorCategory::UnsafeStatement,
                     "function is outside the pure function allowlist",
@@ -1850,6 +1850,72 @@ mod tests {
             "SELECT * FROM records TABLESAMPLE SYSTEM (1)",
         ] {
             assert!(validate(&request(sql)).is_err(), "admitted {sql}");
+        }
+    }
+
+    #[test]
+    fn widened_functions_validate_and_dropped_ones_name_the_repair() {
+        // I2: the classifier rejects dropped names first with the shared
+        // repair; the closed AST walk below is defence in depth. `~~`
+        // (LIKE/ILIKE) is untouched — the ILIKE translation is I4.
+        for sql in [
+            "SELECT lower(name), upper(name) FROM records",
+            "SELECT trim(name), replace(name, 'a', 'b') FROM records",
+            // I2 review: two-argument `trim(x, chars)` desugars to
+            // two-argument `pg_catalog.btrim`, matching SQLite exactly.
+            "SELECT trim(name, 'x') FROM records",
+            "SELECT substr(name, 1, 2) FROM records",
+            "SELECT coalesce(name, 'z'), nullif(name, 'z') FROM records",
+            "SELECT abs(id), length(name), round(1.5) FROM records",
+            "SELECT avg(id), count(*), sum(id), min(id), max(id) FROM records",
+            "SELECT rank() OVER (ORDER BY id) FROM records",
+            "SELECT CASE WHEN id = 1 THEN 'one' ELSE 'other' END FROM records",
+            "SELECT CAST(id AS TEXT) FROM records",
+            "SELECT id FROM records WHERE name LIKE 'conf:%'",
+        ] {
+            validate(&request(sql)).unwrap_or_else(|error| panic!("{sql}: {error}"));
+        }
+        for (sql, repair) in [
+            (
+                "SELECT instr(body, 'x') FROM records",
+                "use substr() or LIKE",
+            ),
+            ("SELECT glob('*', name) FROM records", "use LIKE"),
+            (
+                "SELECT date(created_at) FROM records",
+                "M1 timestamp columns",
+            ),
+            (
+                "SELECT json_type(body) FROM records",
+                "facet_values, facet_observations",
+            ),
+            ("SELECT typeof(name) FROM records", "catalog column types"),
+            (
+                "SELECT group_concat(name) FROM records",
+                "aggregate client-side",
+            ),
+            ("SELECT total(id) FROM records", "use sum"),
+            ("SELECT floor(value) FROM records", "CAST(x AS INTEGER)"),
+            ("SELECT char_length(name) FROM records", "use length"),
+            ("SELECT greatest(a, b) FROM records", "CASE"),
+            (
+                "SELECT round(avg(id), 2) FROM records",
+                "catalog numeric type",
+            ),
+            // I2 review: quoting the name bypasses nothing — the shared
+            // classifier runs the same dropped-name and arity checks on
+            // `"name"(` calls before the AST walk.
+            (
+                "SELECT \"round\"(1.5::float8, 2) FROM records",
+                "catalog numeric type",
+            ),
+            (
+                "SELECT \"instr\"(body, 'x') FROM records",
+                "use substr() or LIKE",
+            ),
+        ] {
+            let error = validate(&request(sql)).unwrap_err().to_string();
+            assert!(error.contains(repair), "{sql}: missing repair: {error}");
         }
     }
 

@@ -972,9 +972,9 @@ async fn sql_validator_rejects_everything_it_must() {
         // token scanner, which is why the authorizer replaced it).
         (
             "SELECT * FROM records AS \"where\", json_each('[1]')",
-            "prohibited",
+            "unavailable",
         ),
-        ("SELECT * FROM json_each('[1]')", "prohibited"),
+        ("SELECT * FROM json_each('[1]')", "unavailable"),
         ("SELECT load_extension('evil')", "prohibited"),
         // Parenthesized join-lists and post-subquery commas (round 2).
         // generate_series may or may not be compiled in — denied or unknown,
@@ -983,7 +983,7 @@ async fn sql_validator_rejects_everything_it_must() {
             "SELECT * FROM (records, generate_series(1,3))",
             "generate_series",
         ),
-        ("SELECT * FROM (SELECT 1), json_each('[1]')", "prohibited"),
+        ("SELECT * FROM (SELECT 1), json_each('[1]')", "unavailable"),
         // Unknown tables fail prepare outright.
         (
             "SELECT * FROM records JOIN nonexistent ON 1=1",

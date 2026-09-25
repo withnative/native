@@ -5,9 +5,10 @@
 //! the direct handler unconditionally refuses, so every direct call fails
 //! closed without touching the database. Preview is plan-required. The schema
 //! mirrors `SqlWritePreviewArgs` (`executor_prototype/write_operations.rs`):
-//! one portable read SELECT yielding one typed operation row, tagged positional
-//! parameters, a caller-visible reason, and an optional expected content
-//! sequence.
+//! one portable read SELECT yielding typed `set_field` operation rows over at
+//! most 25 caller-visible records (at most one `name` and one `summary` per
+//! record), tagged positional parameters, a caller-visible reason, and an
+//! optional expected content sequence.
 
 use serde_json::{json, Value};
 
@@ -50,7 +51,7 @@ fn input_schema() -> Value {
                 "type": "string",
                 "minLength": 1,
                 "maxLength": 65536,
-                "description": "One portable read SELECT yielding exactly one visible set_field row (record_id, op, key, value) for name or summary. Never authority for physical writes."
+                "description": "One portable read SELECT yielding visible set_field rows (record_id, op, key, value), one per (record, name|summary). At most 25 distinct records and at most one row per (record_id, key); duplicates, overflow, and unknown ops/keys/columns refuse. Never authority for physical writes."
             },
             "parameters": {
                 "type": "array",
@@ -69,7 +70,7 @@ fn input_schema() -> Value {
                 }
             },
             "reason": { "type": "string", "minLength": 1, "maxLength": 1024, "description": REASON_DESCRIPTION },
-            "expected_version": { "type": ["integer", "null"], "minimum": 1, "description": "Optional expected content sequence pin for the selected record." }
+            "expected_version": { "type": ["integer", "null"], "minimum": 1, "description": "Optional expected content sequence pin, valid only when the selection targets exactly one record. A multi-record selection refuses it; multi-record version integrity comes from the signed per-target versions instead." }
         },
         "required": ["statement", "reason"],
         "additionalProperties": false
@@ -92,7 +93,7 @@ pub fn register_sql_write_tool(registry: &mut ToolRegistry) -> Result<()> {
         // probe: out of the near-full Focused descriptor, visible under
         // Complete only once a deployment allowlists the executor.
         ToolExposure::extension(false),
-        "EXPERIMENTAL, preview-only SQL-selected record edit. Direct calls always refuse without mutation; preview is plan-required and the sql_write executor is admitted only under the experimental allowlist. Schema mirrors the preview envelope: one portable read SELECT yielding one visible set_field row for name or summary, tagged positional parameters, reason, and optional expected version.",
+        "EXPERIMENTAL, preview-only SQL-selected record edit. Direct calls always refuse without mutation; preview is plan-required and the sql_write executor is admitted only under the experimental allowlist. Schema mirrors the preview envelope: one portable read SELECT yielding set_field rows for name or summary over at most 25 visible records, tagged positional parameters, reason, and an optional single-target expected version.",
         input_schema(),
         execute,
     )

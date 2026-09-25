@@ -1831,6 +1831,27 @@ pub(crate) async fn assess_facet_write<E: DomainStatementExecutor>(
     kind: Option<&str>,
     facet: &FacetWrite,
 ) -> Result<FacetPredicateAssessment> {
+    // Richard 25 Sep (Native e25665c): SQL being saved stays on the full I2
+    // portable rules. A `query` facet carrying a current-version
+    // governed-SQL envelope is validated here — the single chokepoint every
+    // user-authored facet write (create, update, batch) funnels through —
+    // and refused with the portable repair. Import/replay/migration seams
+    // bypass live admission by design so already-stored definitions keep
+    // working.
+    if facet.key == "query" {
+        if let Some(message) =
+            crate::mcp::tools::querying::saved_governed_sql_write_issue(tool, &facet.value)
+        {
+            return Ok(FacetPredicateAssessment {
+                declared: false,
+                accepted: false,
+                declared_type: None,
+                governing_vocabulary: None,
+                value_resolution: None,
+                issues: vec![predicate_issue("saved_sql_not_portable", message)],
+            });
+        }
+    }
     let Some(shape) = shape else {
         let mut issues = Vec::new();
         if facet.key == "lifecycle" {

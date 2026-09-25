@@ -891,10 +891,16 @@ fn artifact_grant_effect_summary(
 
 /// Request shape for the preview-only `sql_write` preparer (E4 M1).
 ///
-/// One portable read SELECT yielding typed operation rows over the
-/// caller-visible logical catalog, plus the caller-visible `reason` and
-/// an optional expected content sequence. Unknown fields are rejected;
-/// submitted SQL is never authority for physical writes.
+/// One portable read SELECT yielding typed `set_field` operation rows over the
+/// caller-visible logical catalog, plus the caller-visible `reason` and an
+/// optional expected content sequence. Unknown fields are rejected; submitted
+/// SQL is never authority for physical writes.
+///
+/// `expected_version` pins exactly one record. A multi-target selection has no
+/// single revision, so supplying it alongside more than one distinct target is
+/// refused rather than interpreted: multi-target version integrity comes from
+/// the signed per-target `previous_seq` set instead, and any concurrent edit
+/// changes that set and revalidates as `plan_stale`.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SqlWritePreviewArgs {
@@ -918,6 +924,26 @@ struct SqlWritePreparation {
     operation_evidence: Value,
 }
 
+/// One resolved governed operation. `before`/`after` are the exact signed
+/// values; neither is ever clipped, and the target's `previous_seq` pins the
+/// revision it was read at.
+#[derive(Debug)]
+struct SqlWriteResolvedOp {
+    key: &'static str,
+    value: String,
+    before: Value,
+    after: Value,
+    changed: bool,
+}
+
+#[derive(Debug)]
+struct SqlWriteTarget {
+    record_id: String,
+    previous_seq: i64,
+    name: String,
+    ops: Vec<SqlWriteResolvedOp>,
+}
+
 /// Caller-controlled proposal bounds, refused rather than clipped: the
 /// signed effect must stay predictably small, and silent clipping would
 /// corrupt the proposal a future commit path must execute exactly. No
@@ -930,6 +956,23 @@ const SQL_WRITE_MAX_REASON_CHARS: usize = 1024;
 /// text (unbounded physical TEXT). Clipping is explicit (`...`) and
 /// char-boundary safe; semantic `effect` values are never clipped.
 const SQL_WRITE_MAX_DISPLAY_CHARS: usize = 120;
+/// Distinct record cap. `set_field` admits only `name` and `summary`, and a
+/// duplicate `(record_id, key)` is refused, so each target carries at most two
+/// operations; 25 targets bound the total operation set at 50.
+const SQL_WRITE_MAX_TARGETS: usize = 25;
+const SQL_WRITE_MAX_OPS: usize = SQL_WRITE_MAX_TARGETS * 2;
+/// Overflow probe: request one row beyond the complete-operation bound so a
+/// truncated selection is refused, never digested. A complete 50-row result
+/// fixes the distinct ID set, so counting its distinct IDs is exact and needs
+/// no second, volatile run of the caller's SELECT.
+const SQL_WRITE_OP_ROW_LIMIT: i64 = SQL_WRITE_MAX_OPS as i64 + 1;
+/// Domain separator mixed into the sorted target-set digest so an equivalent
+/// digest computed for another payload cannot be confused with this one.
+const SQL_WRITE_TARGET_DOMAIN: &str = "native.sql-write.target-set.v1";
+/// Effect-summary sample bound: the signed effect carries every operation, but
+/// the human-readable summary samples at most this many and then says how many
+/// it omitted, explicitly.
+const SQL_WRITE_SUMMARY_SAMPLE_OPS: usize = 3;
 
 fn sql_write_display(text: &str) -> String {
     if text.chars().count() > SQL_WRITE_MAX_DISPLAY_CHARS {
@@ -944,14 +987,59 @@ fn sql_write_display(text: &str) -> String {
     }
 }
 
-/// Truthful non-mutating preparation for one `set_field` op row.
+/// Bounded, order-independent human-readable effect summary. Samples at most
+/// [`SQL_WRITE_SUMMARY_SAMPLE_OPS`] operations and then states the omitted
+/// count explicitly; display text is clipped, semantic `effect` values are not.
+fn sql_write_effect_summary(targets: &[SqlWriteTarget], op_count: usize) -> String {
+    let plural = |count: usize| if count == 1 { "" } else { "s" };
+    let mut summary = format!(
+        "set {op_count} operation{} on {} record{}",
+        plural(op_count),
+        targets.len(),
+        plural(targets.len())
+    );
+    let mut sampled = 0usize;
+    let mut omitted = 0usize;
+    let mut parts = Vec::new();
+    for target in targets {
+        for op in &target.ops {
+            if sampled < SQL_WRITE_SUMMARY_SAMPLE_OPS {
+                sampled += 1;
+                parts.push(format!(
+                    "{} of {} ({}) -> {}",
+                    op.key,
+                    sql_write_display(&target.name),
+                    target.record_id,
+                    sql_write_display(&op.value),
+                ));
+            } else {
+                omitted += 1;
+            }
+        }
+    }
+    if !parts.is_empty() {
+        summary.push_str(": ");
+        summary.push_str(&parts.join("; "));
+    }
+    if omitted > 0 {
+        summary.push_str(&format!("; (+{omitted} more operation{})", plural(omitted)));
+    }
+    summary
+}
+
+/// Truthful non-mutating preparation for a bounded `set_field` operation set.
 ///
 /// Runs the caller's SELECT through the governed in-transaction read path
-/// (portable validator plus caller-relative catalog relations), then
-/// checks target version and Edit authorization in that same transaction
-/// before rolling it back. Appends no event and calls no mutation
-/// handler; the first compiler admits only `set_field` on `name` or
-/// `summary`, exactly one visible row, and no extra columns.
+/// (portable validator plus caller-relative catalog relations), then checks
+/// every target's version and Edit authorization in that same transaction
+/// before rolling it back. Appends no event and calls no mutation handler.
+///
+/// The first compiler admits only `set_field` on `name` or `summary`, at most
+/// 25 distinct visible records, at most one operation per `(record_id, key)`,
+/// and no extra columns. A complete result is proved by requesting one row
+/// beyond the 50-operation cap: either that row arrives or the engine reports
+/// truncation. Rows are canonically sorted so caller row order cannot change
+/// the signed target, effect, or digest.
 async fn prepare_sql_write_preview(
     db: &crate::Db,
     caller: &Caller,
@@ -976,171 +1064,283 @@ async fn prepare_sql_write_preview(
         parameters: args.parameters.clone(),
     };
     let principal: crate::query::QueryPrincipal = caller.into();
-    let (result, _) =
-        crate::query::sql::query_sql_request_in_with_row_limit(&mut tx, principal, request, 1)
-            .await
-            .map_err(|error| Error::engine(format!("{TOOL}: selection rejected: {error}")))?;
-    if result.truncated || result.rows.len() > 1 {
-        return Err(Error::conflict(format!(
-            "{TOOL}: selection exceeds the one-operation preview bound; narrow the statement"
-        )));
-    }
-    let row = result.rows.first().ok_or_else(|| {
-        Error::conflict(format!(
-            "{TOOL}: selection returned no visible operation row"
-        ))
-    })?;
-    let object = row
-        .as_object()
-        .ok_or_else(|| Error::conflict(format!("{TOOL}: operation row must be an object")))?;
-    for key in object.keys() {
-        if !matches!(key.as_str(), "record_id" | "op" | "key" | "value") {
-            return Err(Error::conflict(format!(
-                "{TOOL}: unknown operation field '{key}'"
-            )));
-        }
-    }
-    let missing =
-        |field: &str| Error::conflict(format!("{TOOL}: operation row is missing '{field}'"));
-    let record_id = object
-        .get("record_id")
-        .and_then(Value::as_str)
-        .ok_or_else(|| missing("record_id"))?;
-    let op = object
-        .get("op")
-        .and_then(Value::as_str)
-        .ok_or_else(|| missing("op"))?;
-    let key = object
-        .get("key")
-        .and_then(Value::as_str)
-        .ok_or_else(|| missing("key"))?;
-    let value = object
-        .get("value")
-        .and_then(Value::as_str)
-        .ok_or_else(|| missing("value"))?;
-    if op != "set_field" {
-        return Err(Error::conflict(format!(
-            "{TOOL}: unsupported operation '{op}'; the first compiler admits only set_field"
-        )));
-    }
-    if !matches!(key, "name" | "summary") {
-        return Err(Error::conflict(format!(
-            "{TOOL}: unsupported set_field key '{key}'; the first compiler admits only name and summary"
-        )));
-    }
-    if key == "name" && value.trim().is_empty() {
-        return Err(Error::conflict(format!(
-            "{TOOL}: set_field name must be non-blank"
-        )));
-    }
-    if value.chars().count() > SQL_WRITE_MAX_VALUE_CHARS {
-        return Err(Error::conflict(format!(
-            "{TOOL}: set_field value exceeds {SQL_WRITE_MAX_VALUE_CHARS} characters"
-        )));
-    }
-    super::super::tools::require_record_in(
+    let (result, _) = crate::query::sql::query_sql_request_in_with_row_limit(
         &mut tx,
-        caller,
-        TOOL,
-        record_id,
-        crate::authorization::Capability::Edit,
+        principal,
+        request,
+        SQL_WRITE_OP_ROW_LIMIT,
+        crate::query::sql_contract::FunctionAllowance::Portable,
     )
     .await
-    .map_err(|error| match error {
-        // Infrastructure failures stay non-stale; lost visibility or Edit is
-        // selection drift. The message is preserved verbatim, so hidden and
-        // missing targets keep refusing identically.
-        Error::Sqlx(_) => error,
-        other => Error::conflict(other.to_string()),
-    })?;
-    let archived: i64 = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM facet_values WHERE record_id = ? AND key = ?)",
-    )
-    .bind(record_id)
-    .bind(crate::schema::ARCHIVED_FACET_KEY)
-    .fetch_one(&mut *tx)
-    .await?;
-    if archived != 0 {
+    .map_err(|error| Error::engine(format!("{TOOL}: selection rejected: {error}")))?;
+    // The probe row beyond the operation cap is how completeness is proved:
+    // 50 valid operations are the most two keys can produce on 25 distinct
+    // records, so anything past the cap refuses instead of digesting a
+    // truncation. The distinct-ID cap below is then exact over a complete set.
+    if result.truncated || result.rows.len() > SQL_WRITE_MAX_OPS {
         return Err(Error::conflict(format!(
-            "{TOOL}: selected record is archived; restore it before preparing an edit"
+            "{TOOL}: selection exceeds the {SQL_WRITE_MAX_OPS}-operation preview bound; narrow the statement"
         )));
     }
-    let previous_seq = super::super::tools::previous_record_seq_in(&mut tx, record_id)
+    if result.rows.is_empty() {
+        return Err(Error::conflict(format!(
+            "{TOOL}: selection returned no visible operation row"
+        )));
+    }
+    // Parse and canonicalize the typed rows before any per-record check, so a
+    // malformed or duplicate row refuses even when another target is fine.
+    let mut seen = std::collections::HashSet::new();
+    let mut parsed: Vec<(String, &'static str, String)> = Vec::with_capacity(result.rows.len());
+    for row in &result.rows {
+        let object = row
+            .as_object()
+            .ok_or_else(|| Error::conflict(format!("{TOOL}: operation row must be an object")))?;
+        for key in object.keys() {
+            if !matches!(key.as_str(), "record_id" | "op" | "key" | "value") {
+                return Err(Error::conflict(format!(
+                    "{TOOL}: unknown operation field '{key}'"
+                )));
+            }
+        }
+        let missing =
+            |field: &str| Error::conflict(format!("{TOOL}: operation row is missing '{field}'"));
+        let record_id = object
+            .get("record_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| missing("record_id"))?;
+        let op = object
+            .get("op")
+            .and_then(Value::as_str)
+            .ok_or_else(|| missing("op"))?;
+        let key = object
+            .get("key")
+            .and_then(Value::as_str)
+            .ok_or_else(|| missing("key"))?;
+        let value = object
+            .get("value")
+            .and_then(Value::as_str)
+            .ok_or_else(|| missing("value"))?;
+        if op != "set_field" {
+            return Err(Error::conflict(format!(
+                "{TOOL}: unsupported operation '{op}'; the first compiler admits only set_field"
+            )));
+        }
+        let key = match key {
+            "name" => "name",
+            "summary" => "summary",
+            other => {
+                return Err(Error::conflict(format!(
+                    "{TOOL}: unsupported set_field key '{other}'; the first compiler admits only name and summary"
+                )))
+            }
+        };
+        if key == "name" && value.trim().is_empty() {
+            return Err(Error::conflict(format!(
+                "{TOOL}: set_field name must be non-blank"
+            )));
+        }
+        if value.chars().count() > SQL_WRITE_MAX_VALUE_CHARS {
+            return Err(Error::conflict(format!(
+                "{TOOL}: set_field value exceeds {SQL_WRITE_MAX_VALUE_CHARS} characters"
+            )));
+        }
+        if !seen.insert((record_id.to_string(), key)) {
+            return Err(Error::conflict(format!(
+                "{TOOL}: duplicate set_field '{key}' for record {record_id}; each record admits at most one operation per field"
+            )));
+        }
+        parsed.push((record_id.to_string(), key, value.to_string()));
+    }
+    // Canonical sort makes caller row order irrelevant to every signed field.
+    parsed.sort();
+    let mut distinct_targets: Vec<String> = parsed
+        .iter()
+        .map(|(record_id, _, _)| record_id.clone())
+        .collect();
+    distinct_targets.dedup();
+    if distinct_targets.len() > SQL_WRITE_MAX_TARGETS {
+        return Err(Error::conflict(format!(
+            "{TOOL}: selection targets {} distinct records; the preview admits at most {SQL_WRITE_MAX_TARGETS}",
+            distinct_targets.len()
+        )));
+    }
+    if args.expected_version.is_some() && distinct_targets.len() > 1 {
+        return Err(Error::conflict(format!(
+            "{TOOL}: 'expected_version' pins one record but the selection targets {} distinct records; omit it and rely on the signed per-target versions",
+            distinct_targets.len()
+        )));
+    }
+    let mut targets: Vec<SqlWriteTarget> = Vec::with_capacity(distinct_targets.len());
+    for record_id in &distinct_targets {
+        super::super::tools::require_record_in(
+            &mut tx,
+            caller,
+            TOOL,
+            record_id,
+            crate::authorization::Capability::Edit,
+        )
+        .await
+        .map_err(|error| match error {
+            // Infrastructure failures stay non-stale; lost visibility or Edit is
+            // selection drift. The message is preserved verbatim, so hidden and
+            // missing targets keep refusing identically.
+            Error::Sqlx(_) => error,
+            other => Error::conflict(other.to_string()),
+        })?;
+        let archived: i64 = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM facet_values WHERE record_id = ? AND key = ?)",
+        )
+        .bind(record_id)
+        .bind(crate::schema::ARCHIVED_FACET_KEY)
+        .fetch_one(&mut *tx)
+        .await?;
+        if archived != 0 {
+            return Err(Error::conflict(format!(
+                "{TOOL}: selected record {record_id} is archived; restore it before preparing an edit"
+            )));
+        }
+        let previous_seq = super::super::tools::previous_record_seq_in(&mut tx, record_id)
+            .await?
+            .ok_or_else(|| Error::conflict(format!("{TOOL}: record {record_id} does not exist")))?;
+        if args
+            .expected_version
+            .is_some_and(|expected| expected != previous_seq)
+        {
+            return Err(Error::conflict(format!(
+                "{TOOL}: content revision conflict; get the record and prepare again"
+            )));
+        }
+        let current: (String, Option<String>) = sqlx::query_as::<_, (String, Option<String>)>(
+            "SELECT name, summary FROM records WHERE id = ? AND deleted_at IS NULL",
+        )
+        .bind(record_id)
+        .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(|| Error::conflict(format!("{TOOL}: record {record_id} does not exist")))?;
-    if args
-        .expected_version
-        .is_some_and(|expected| expected != previous_seq)
-    {
-        return Err(Error::conflict(format!(
-            "{TOOL}: content revision conflict; get the record and prepare again"
-        )));
+        let (current_name, current_summary) = current;
+        let mut ops = Vec::new();
+        for (_, key, value) in parsed.iter().filter(|(id, _, _)| id == record_id) {
+            let before = if *key == "name" {
+                json!(current_name.clone())
+            } else {
+                json!(current_summary.clone())
+            };
+            let existing = if *key == "name" {
+                current_name.as_str()
+            } else {
+                current_summary.as_deref().unwrap_or("")
+            };
+            // The signed `before` carries the exact stored value, so an
+            // oversized stored field is refused like an oversized proposal: no
+            // clipping of semantic fields, ever.
+            if existing.chars().count() > SQL_WRITE_MAX_VALUE_CHARS {
+                return Err(Error::conflict(format!(
+                    "{TOOL}: existing {key} exceeds {SQL_WRITE_MAX_VALUE_CHARS} characters; the preview bound covers the replaced value too"
+                )));
+            }
+            let after = json!(value);
+            ops.push(SqlWriteResolvedOp {
+                key,
+                value: value.clone(),
+                before: before.clone(),
+                after: after.clone(),
+                changed: before != after,
+            });
+        }
+        targets.push(SqlWriteTarget {
+            record_id: record_id.clone(),
+            previous_seq,
+            name: current_name,
+            ops,
+        });
     }
-    let current: (String, Option<String>) = sqlx::query_as::<_, (String, Option<String>)>(
-        "SELECT name, summary FROM records WHERE id = ? AND deleted_at IS NULL",
-    )
-    .bind(record_id)
-    .fetch_optional(&mut *tx)
-    .await?
-    .ok_or_else(|| Error::conflict(format!("{TOOL}: record {record_id} does not exist")))?;
-    let (current_name, current_summary) = current;
-    // The signed `before` carries the exact stored value, so an oversized
-    // stored field is refused like an oversized proposal: no clipping of
-    // semantic fields, ever.
-    let existing_len = if key == "name" {
-        current_name.chars().count()
-    } else {
-        current_summary.as_deref().unwrap_or("").chars().count()
-    };
-    if existing_len > SQL_WRITE_MAX_VALUE_CHARS {
-        return Err(Error::conflict(format!(
-            "{TOOL}: existing {key} exceeds {SQL_WRITE_MAX_VALUE_CHARS} characters; the preview bound covers the replaced value too"
-        )));
-    }
-    let target = if current_name.trim().is_empty() {
-        format!("record {record_id}")
-    } else {
-        format!("{} ({record_id})", sql_write_display(&current_name))
-    };
-    let (before, after) = if key == "name" {
-        (json!(current_name), json!(value))
-    } else {
-        (json!(current_summary), json!(value))
-    };
+    let target_evidence: Vec<Value> = targets
+        .iter()
+        .map(|target| {
+            json!({
+                "record_id": &target.record_id,
+                "previous_seq": target.previous_seq,
+            })
+        })
+        .collect();
+    // Domain-separated digest of the sorted IDs plus their pinned versions:
+    // stable under row order and sensitive to any set or version change.
+    let target_state_digest = digest(&json!({
+        "domain": SQL_WRITE_TARGET_DOMAIN,
+        "targets": target_evidence,
+    }))?;
+    let target_count = targets.len();
+    let op_count: usize = targets.iter().map(|target| target.ops.len()).sum();
+    let changed = targets
+        .iter()
+        .any(|target| target.ops.iter().any(|op| op.changed));
     let operation_evidence = json!({
         "kind": "sql_write_preview",
-        "record_id": record_id,
-        "op": op,
-        "key": key,
-        "previous_seq": previous_seq,
+        "target_count": target_count,
+        "op_count": op_count,
+        "targets": target_evidence,
     });
-    let target_state_digest = digest(&operation_evidence)?;
-    let mut before_map = serde_json::Map::new();
-    before_map.insert(key.to_string(), before);
-    let mut after_map = serde_json::Map::new();
-    after_map.insert(key.to_string(), after.clone());
-    let changed = before_map != after_map;
+    let mut effect_targets = Vec::with_capacity(target_count);
+    for target in &targets {
+        let ops: Vec<Value> = target
+            .ops
+            .iter()
+            .map(|op| {
+                json!({
+                    "op": "set_field",
+                    "key": op.key,
+                    "value": &op.value,
+                    "before": &op.before,
+                    "after": &op.after,
+                    "changed": op.changed,
+                })
+            })
+            .collect();
+        effect_targets.push(json!({
+            "record_id": &target.record_id,
+            "previous_seq": target.previous_seq,
+            "ops": ops,
+        }));
+    }
     let effect = json!({
-        "target": { "record_id": record_id },
-        "op": { "op": op, "key": key, "value": value },
-        "before": Value::Object(before_map),
-        "after": Value::Object(after_map),
+        "kind": "sql_write_preview",
+        "targets": effect_targets,
+        "target_count": target_count,
+        "op_count": op_count,
         "changed": changed,
-        "reason": args.reason,
+        "reason": &args.reason,
     });
+    // A single target keeps the stricter resolved-version pin; a multi-target
+    // selection carries no scalar pin and relies on the signed version set.
+    let canonical_expected_version = if target_count == 1 {
+        Some(targets[0].previous_seq)
+    } else {
+        None
+    };
     let preparation = SqlWritePreparation {
         canonical_source_arguments: json!({
-            "statement": args.statement,
-            "parameters": args.parameters,
-            "reason": args.reason,
-            "expected_version": previous_seq,
+            "statement": &args.statement,
+            "parameters": &args.parameters,
+            "reason": &args.reason,
+            "expected_version": canonical_expected_version,
         }),
-        target_id: record_id.to_string(),
-        target: target.clone(),
-        state_revision: format!("content-seq:{previous_seq}"),
+        // A single target keeps its real record ID (unchanged from the
+        // one-row contract). A multi-target plan has no single record ID, so
+        // it uses a deterministic namespaced digest of the sorted set rather
+        // than silently choosing the first record.
+        target_id: if target_count == 1 {
+            targets[0].record_id.clone()
+        } else {
+            format!("sql-write-target-set:{target_state_digest}")
+        },
+        target: format!(
+            "{target_count} record{} [{target_state_digest}]",
+            if target_count == 1 { "" } else { "s" }
+        ),
+        state_revision: format!("content-seq-set:{target_state_digest}"),
         target_state_digest,
+        effect_summary: sql_write_effect_summary(&targets, op_count),
         effect,
-        effect_summary: format!("set {key} of {target} to {value:?}"),
         operation_evidence,
     };
     tx.rollback().await?;
@@ -4419,13 +4619,16 @@ mod tests {
         }
     }
 
-    /// E4 M1 first preparer slice: one portable SELECT producing one
-    /// `set_field` op for a caller-visible record, with target version and
-    /// Edit authorization checked in the same governed snapshot. Hidden and
-    /// missing targets refuse identically, overflow and unknown ops refuse,
-    /// and no content event is appended by any preparation.
+    /// E4 M1 multirow preparer: one portable SELECT producing at most one
+    /// `set_field` per `(record, name|summary)` across a bounded visible target
+    /// set, with every target's version and Edit authorization checked in the
+    /// same governed snapshot. The E0 W4 rename task proves both field
+    /// operations on one record survive in the signed effect. Hidden and
+    /// missing targets refuse identically; archived, view-only, duplicate,
+    /// oversized, and unknown operations refuse; and no preparation appends a
+    /// content event.
     #[tokio::test]
-    async fn sql_write_preview_prepares_one_visible_set_field_without_mutation() {
+    async fn sql_write_preview_prepares_bounded_multirow_set_field_without_mutation() {
         let db = create_database(":memory:").await.unwrap();
         let target = create_record(
             &db,
@@ -4513,14 +4716,43 @@ mod tests {
                 "reason": "Preview a rename through the sql_write preparer",
             })
         };
-        let prepared = prepare_sql_write_preview(&db, &caller, like_args())
+        // E0 W4: rename `name` and rewrite `summary` on the same single record
+        // in one edit. Both operations must survive in the signed effect.
+        let w4_args = || {
+            json!({
+                "statement": format!(
+                    "SELECT id AS record_id, 'set_field' AS op, 'name' AS key, 'Renamed' AS value FROM records WHERE id = '{target}' \
+                     UNION ALL \
+                     SELECT id AS record_id, 'set_field' AS op, 'summary' AS key, 'Rewritten summary' AS value FROM records WHERE id = '{target}'"
+                ),
+                "reason": "Preview the W4 rename and summary rewrite",
+            })
+        };
+        let prepared = prepare_sql_write_preview(&db, &caller, w4_args())
             .await
             .unwrap();
-        assert_eq!(prepared.target_id, target);
-        assert_eq!(prepared.effect["after"]["name"], json!("Renamed"));
-        assert_eq!(prepared.effect["before"]["name"], json!("Perturb me"));
-        assert!(prepared.state_revision.starts_with("content-seq:"));
+        assert_eq!(prepared.target_id, target, "one target keeps its record id");
+        assert_eq!(prepared.effect["target_count"], json!(1));
+        assert_eq!(prepared.effect["op_count"], json!(2));
+        assert_eq!(prepared.effect["changed"], json!(true));
+        assert_eq!(prepared.effect["targets"][0]["record_id"], json!(target));
+        let ops = prepared.effect["targets"][0]["ops"]
+            .as_array()
+            .expect("target ops array");
+        assert_eq!(ops.len(), 2, "both W4 field operations must survive");
+        // Ops are canonically sorted by field key, independent of row order.
+        assert_eq!(ops[0]["key"], json!("name"));
+        assert_eq!(ops[1]["key"], json!("summary"));
+        assert_eq!(ops[0]["after"], json!("Renamed"));
+        assert_eq!(ops[0]["before"], json!("Perturb me"));
+        assert_eq!(ops[0]["changed"], json!(true));
+        assert_eq!(ops[1]["after"], json!("Rewritten summary"));
+        assert_eq!(ops[1]["before"], json!(null));
+        assert!(prepared.target.starts_with("1 record ["));
+        assert!(prepared.state_revision.starts_with("content-seq-set:"));
+        assert_eq!(prepared.target_state_digest.len(), 64);
         assert!(prepared.effect_summary.contains("Renamed"));
+        assert!(prepared.effect_summary.contains("Rewritten summary"));
         assert!(prepared.canonical_source_arguments["expected_version"]
             .as_i64()
             .is_some());
@@ -4559,6 +4791,23 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(stale_error.contains("revision conflict"), "{stale_error}");
+        // `expected_version` pins one record; a two-target selection refuses it
+        // explicitly instead of guessing which record it means.
+        let two_targets = json!({
+            "statement": format!(
+                "SELECT id AS record_id, 'set_field' AS op, 'name' AS key, 'Renamed' AS value FROM records WHERE id IN ('{target}','{big_record}')"
+            ),
+            "reason": "Preview a two-record rename",
+            "expected_version": 1,
+        });
+        let multi_version_error = prepare_sql_write_preview(&db, &caller, two_targets)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            multi_version_error.contains("'expected_version' pins one record"),
+            "{multi_version_error}"
+        );
         // An oversized stored value is refused like an oversized proposal:
         // the signed `before` stays exact, never clipped.
         let big_existing_error = prepare_sql_write_preview(
@@ -4582,14 +4831,15 @@ mod tests {
             .await
             .unwrap_err()
             .to_string();
-        assert!(
-            archived_error.contains("selected record is archived"),
-            "{archived_error}"
-        );
+        assert!(archived_error.contains("is archived"), "{archived_error}");
         // Hidden rows do not perturb a successful preview: insert a record
         // the predicate would also match, hide it, and re-prepare. The
         // governed layer filters it, so the visible result is identical.
-        // Every preparation and refusal above appended nothing.
+        let predicate_before = prepare_sql_write_preview(&db, &caller, like_args())
+            .await
+            .unwrap();
+        // Every preparation above appended nothing; assert it immediately
+        // before the one deliberate perturbative fixture write.
         let events_pre_insert: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM content_events")
             .fetch_one(db.write_pool())
             .await
@@ -4613,33 +4863,22 @@ mod tests {
             .fetch_one(db.write_pool())
             .await
             .unwrap();
-        assert!(
-            events_mid > events_before,
-            "the mid-test fixture write must append, so the baselines bracket it"
-        );
-        let reprepared = prepare_sql_write_preview(&db, &caller, like_args())
+        let predicate_after = prepare_sql_write_preview(&db, &caller, like_args())
             .await
             .unwrap();
-        assert_eq!(reprepared.effect, prepared.effect);
-        assert_eq!(reprepared.effect_summary, prepared.effect_summary);
-        assert_eq!(reprepared.target, prepared.target);
-        assert_eq!(reprepared.state_revision, prepared.state_revision);
-        assert_eq!(reprepared.target_state_digest, prepared.target_state_digest);
-        // Overflow: an unfiltered selection exceeds the one-operation bound.
-        let overflow_error = prepare_sql_write_preview(
-            &db,
-            &Caller::local(),
-            json!({
-                "statement": "SELECT id AS record_id, 'set_field' AS op, 'name' AS key, 'X' AS value FROM records",
-                "reason": "Overflow probe",
-            }),
-        )
-        .await
-        .unwrap_err()
-        .to_string();
-        assert!(
-            overflow_error.contains("one-operation preview bound"),
-            "{overflow_error}"
+        assert_eq!(predicate_after.effect, predicate_before.effect);
+        assert_eq!(
+            predicate_after.effect_summary,
+            predicate_before.effect_summary
+        );
+        assert_eq!(predicate_after.target, predicate_before.target);
+        assert_eq!(
+            predicate_after.state_revision,
+            predicate_before.state_revision
+        );
+        assert_eq!(
+            predicate_after.target_state_digest,
+            predicate_before.target_state_digest
         );
         // Unknown op rows are refused, never interpreted.
         let op_error = prepare_sql_write_preview(
@@ -4654,6 +4893,22 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(op_error.contains("only set_field"), "{op_error}");
+        // Unknown field keys refuse the same way.
+        let field_error = prepare_sql_write_preview(
+            &db,
+            &caller,
+            json!({
+                "statement": format!("SELECT id AS record_id, 'set_field' AS op, 'body' AS key, 'x' AS value FROM records WHERE id = '{target}'"),
+                "reason": "Unknown-field probe",
+            }),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            field_error.contains("only name and summary"),
+            "{field_error}"
+        );
         // Oversized caller text is refused with a precise bound, never
         // signed into a plan.
         let big_value: String = std::iter::repeat_n('v', 1025).collect();
@@ -4686,7 +4941,153 @@ mod tests {
             .fetch_one(db.write_pool())
             .await
             .unwrap();
+        assert!(
+            events_mid > events_pre_insert,
+            "the hidden perturbative fixture write must append, so the baselines bracket it"
+        );
         assert_eq!(events_mid, events_after);
+    }
+
+    /// The signed result is canonically sorted, so the same complete operation
+    /// set selected in a different row order yields an identical target,
+    /// effect, summary, and version-sensitive digests. Only the statement text
+    /// (hence canonical source arguments) differs.
+    #[tokio::test]
+    async fn sql_write_preview_row_order_is_canonically_irrelevant() {
+        let db = create_database(":memory:").await.unwrap();
+        let alpha = create_record(
+            &db,
+            json!({"id":"ec00b000-0000-4000-8000-000000000041","type":"Document","kind":"note","name":"Alpha"}),
+        )
+        .await
+        .unwrap();
+        let beta = create_record(
+            &db,
+            json!({"id":"ec00b000-0000-4000-8000-000000000042","type":"Document","kind":"note","name":"Beta"}),
+        )
+        .await
+        .unwrap();
+        let caller = Caller::local();
+        let forward = json!({
+            "statement": "SELECT id AS record_id, 'set_field' AS op, 'name' AS key, 'X' AS value FROM records WHERE name IN ('Alpha','Beta') \
+                 UNION ALL \
+                 SELECT id AS record_id, 'set_field' AS op, 'summary' AS key, 'S' AS value FROM records WHERE name = 'Alpha'",
+            "reason": "Row-order probe",
+        });
+        let reverse = json!({
+            "statement": "SELECT id AS record_id, 'set_field' AS op, 'summary' AS key, 'S' AS value FROM records WHERE name = 'Alpha' \
+                 UNION ALL \
+                 SELECT id AS record_id, 'set_field' AS op, 'name' AS key, 'X' AS value FROM records WHERE name IN ('Beta','Alpha')",
+            "reason": "Row-order probe",
+        });
+        let first = prepare_sql_write_preview(&db, &caller, forward)
+            .await
+            .unwrap();
+        let second = prepare_sql_write_preview(&db, &caller, reverse)
+            .await
+            .unwrap();
+        assert_eq!(first.effect, second.effect);
+        assert_eq!(first.effect_summary, second.effect_summary);
+        assert_eq!(first.target, second.target);
+        assert_eq!(first.target_id, second.target_id);
+        assert_eq!(first.state_revision, second.state_revision);
+        assert_eq!(first.target_state_digest, second.target_state_digest);
+        assert_eq!(first.operation_evidence, second.operation_evidence);
+        // The two-target set is canonically ordered regardless of row order.
+        assert_eq!(first.effect["targets"][0]["record_id"], json!(alpha));
+        assert_eq!(first.effect["targets"][1]["record_id"], json!(beta));
+        assert_eq!(
+            first.target_id,
+            format!("sql-write-target-set:{}", first.target_state_digest)
+        );
+        assert!(first.target.starts_with("2 records ["));
+    }
+
+    /// The compiler proves completeness with a one-row overflow probe: more
+    /// than 50 operation rows refuse, more than 25 distinct targets refuse, and
+    /// a duplicate `(record_id, key)` refuses rather than collapsing silently.
+    #[tokio::test]
+    async fn sql_write_preview_enforces_target_operation_and_uniqueness_bounds() {
+        let db = create_database(":memory:").await.unwrap();
+        let mut ids = Vec::new();
+        for index in 0..26u32 {
+            let id = format!("ec00b000-0000-4000-8000-{:012}", 0x100 + index);
+            create_record(
+                &db,
+                json!({"id": id, "type":"Document","kind":"note","name": format!("Bound {index}")}),
+            )
+            .await
+            .unwrap();
+            ids.push(id);
+        }
+        let caller = Caller::local();
+        // 26 distinct targets, one operation each: the distinct-target cap
+        // refuses. Rows (26) are within the 50-operation bound.
+        let many_targets = json!({
+            "statement": "SELECT id AS record_id, 'set_field' AS op, 'name' AS key, 'X' AS value FROM records WHERE name LIKE 'Bound %'",
+            "reason": "Target overflow probe",
+        });
+        let target_error = prepare_sql_write_preview(&db, &caller, many_targets)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            target_error.contains("26 distinct records") && target_error.contains("at most 25"),
+            "{target_error}"
+        );
+        // 26 targets x two keys = 52 operation rows: the 51-row probe refuses
+        // overflow instead of digesting a truncated selection.
+        let many_ops = json!({
+            "statement": "SELECT id AS record_id, 'set_field' AS op, 'name' AS key, 'X' AS value FROM records WHERE name LIKE 'Bound %' \
+                          UNION ALL \
+                          SELECT id AS record_id, 'set_field' AS op, 'summary' AS key, 'Y' AS value FROM records WHERE name LIKE 'Bound %'",
+            "reason": "Operation overflow probe",
+        });
+        let op_error = prepare_sql_write_preview(&db, &caller, many_ops)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            op_error.contains("50-operation preview bound"),
+            "{op_error}"
+        );
+        // The caps are inclusive: exactly 25 targets and exactly 50 operations
+        // (25 records x two keys) prepare, and the bounded summary truncates
+        // its sample explicitly.
+        let boundary = json!({
+            "statement": "SELECT id AS record_id, 'set_field' AS op, 'name' AS key, 'X' AS value FROM records WHERE name LIKE 'Bound %' AND name != 'Bound 25' \
+                          UNION ALL \
+                          SELECT id AS record_id, 'set_field' AS op, 'summary' AS key, 'Y' AS value FROM records WHERE name LIKE 'Bound %' AND name != 'Bound 25'",
+            "reason": "Boundary probe",
+        });
+        let accepted = prepare_sql_write_preview(&db, &caller, boundary)
+            .await
+            .unwrap();
+        assert_eq!(accepted.effect["target_count"], json!(25));
+        assert_eq!(accepted.effect["op_count"], json!(50));
+        assert!(
+            accepted.effect_summary.contains("(+47 more operations)"),
+            "bounded summary must state its omitted count: {}",
+            accepted.effect_summary
+        );
+        assert_eq!(
+            accepted.target_id,
+            format!("sql-write-target-set:{}", accepted.target_state_digest)
+        );
+        let first = ids[0].clone();
+        let duplicate = json!({
+            "statement": format!(
+                "SELECT id AS record_id, 'set_field' AS op, 'name' AS key, 'A' AS value FROM records WHERE id = '{first}' \
+                 UNION ALL \
+                 SELECT id AS record_id, 'set_field' AS op, 'name' AS key, 'B' AS value FROM records WHERE id = '{first}'"
+            ),
+            "reason": "Duplicate probe",
+        });
+        let duplicate_error = prepare_sql_write_preview(&db, &caller, duplicate)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(duplicate_error.contains("duplicate"), "{duplicate_error}");
     }
 
     #[test]

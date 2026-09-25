@@ -2627,8 +2627,70 @@ fn logical_cte_shadow(sql: &str) -> Option<String> {
     }
 }
 
-fn validate_saved_sql(definition: &SavedSqlDefinition) -> Result<()> {
+/// Validate SQL being saved or created: the full I2 portable function rules
+/// apply. New definitions using dropped functions or two-argument `round`
+/// are rejected here with the portable repair. Also enforced at write time
+/// (`saved_governed_sql_write_issue`) and for changed text in `advance_pin`.
+pub(crate) fn validate_saved_sql(definition: &SavedSqlDefinition) -> Result<()> {
+    use crate::query::sql_contract::FunctionAllowance;
+    validate_saved_sql_in(definition, FunctionAllowance::Portable)
+}
+
+/// Validate an already-stored definition at inspection or execution time
+/// (Native e25665c): identical checks except the I2
+/// dropped-function and round-arity rules are replaced by the legacy
+/// saved-SQL function allowance, so definitions stored before I2 keep
+/// working under their pinned engine's previous rules.
+fn validate_stored_saved_sql(definition: &SavedSqlDefinition) -> Result<()> {
+    use crate::query::sql_contract::FunctionAllowance;
+    validate_saved_sql_in(definition, FunctionAllowance::LegacySavedSql)
+}
+
+/// Richard 25 Sep (Native e25665c): SQL-semantic check for `query`-facet
+/// writes. When the written value decodes as a current-version governed-SQL
+/// envelope, the new statement is classified with the full portable rules
+/// and the write is refused with its repair on failure. Anything else —
+/// non-governed-SQL values, older envelope versions, undecodable strings —
+/// is untouched; version handling stays with inspection.
+///
+/// Deliberately narrower than `validate_saved_sql`: version/catalog/output
+/// pins are NOT write-gated, so saving a drifted definition still works and
+/// fails legibly at resolution with the stale-pin remedy
+/// (`advance_artifact_port_pin`). The portable function rules plus the
+/// `?N`/parameter-count match gate new SQL text.
+pub(crate) fn saved_governed_sql_write_issue(tool: &str, value: &Value) -> Option<String> {
     use crate::query::sql_contract as contract;
+    let raw = value.as_str()?;
+    let decoded: Value = serde_json::from_str(raw).ok()?;
+    if decoded.get("kind").and_then(Value::as_str) != Some("governed_sql") {
+        return None;
+    }
+    if decoded.get("v").and_then(Value::as_str) != Some(SAVED_SQL_VERSION) {
+        return None;
+    }
+    let definition: SavedSqlDefinition = serde_json::from_value(decoded).ok()?;
+    if let Err(error) = contract::classify_single_read_statement(
+        contract::QuerySqlProfile::SqliteLocal,
+        &definition.sql,
+    ) {
+        return Some(format!("{tool}: refusing to save governed SQL: {error}"));
+    }
+    if let Err(error) = contract::check_positional_arguments(
+        contract::QuerySqlProfile::SqliteLocal,
+        &definition.sql,
+        definition.parameters.len(),
+    ) {
+        return Some(format!("{tool}: refusing to save governed SQL: {error}"));
+    }
+    None
+}
+
+fn validate_saved_sql_in(
+    definition: &SavedSqlDefinition,
+    allowance: crate::query::sql_contract::FunctionAllowance,
+) -> Result<()> {
+    use crate::query::sql_contract as contract;
+    use contract::FunctionAllowance as Allow;
     if definition.v != SAVED_SQL_VERSION || definition.kind != "governed_sql" {
         return Err(Error::engine(
             "saved governed SQL envelope/version mismatch",
@@ -2654,13 +2716,21 @@ fn validate_saved_sql(definition: &SavedSqlDefinition) -> Result<()> {
         parameters: definition.parameters.clone(),
     };
     request.validate().map_err(Error::from)?;
-    sql::validate(&definition.sql)?;
+    match allowance {
+        Allow::Portable => sql::validate(&definition.sql)?,
+        Allow::LegacySavedSql => sql::validate_legacy_saved_sql(&definition.sql)?,
+    }
     if let Some(name) = logical_cte_shadow(&definition.sql) {
         return Err(Error::engine(format!(
             "saved governed SQL cannot shadow logical relation '{name}' with a CTE"
         )));
     }
-    let used_relations = sql::validated_relation_dependencies(&definition.sql)?;
+    let used_relations = match allowance {
+        Allow::Portable => sql::validated_relation_dependencies(&definition.sql)?,
+        Allow::LegacySavedSql => {
+            sql::validated_relation_dependencies_legacy_saved_sql(&definition.sql)?
+        }
+    };
     if definition.relations.is_empty() {
         return Err(Error::engine(
             "saved governed SQL must declare relation dependencies",
@@ -2736,7 +2806,10 @@ fn validate_saved_sql(definition: &SavedSqlDefinition) -> Result<()> {
         .iter()
         .map(|column| column.name.clone())
         .collect::<Vec<_>>();
-    let prepared_labels = sql::validated_output_columns(&definition.sql)?;
+    let prepared_labels = match allowance {
+        Allow::Portable => sql::validated_output_columns(&definition.sql)?,
+        Allow::LegacySavedSql => sql::validated_output_columns_legacy_saved_sql(&definition.sql)?,
+    };
     if prepared_labels != declared_labels {
         return Err(Error::engine(format!(
             "saved governed SQL output columns do not match the statement (declared {}, statement {})",
@@ -2852,7 +2925,7 @@ fn inspect_saved_query_with(raw: Option<&str>, records_only: bool) -> SavedQuery
                 diagnostic: "saved governed SQL Collection output must use 'id' as its first stable row identity".into(),
             };
         }
-        return match validate_saved_sql(&definition) {
+        return match validate_stored_saved_sql(&definition) {
             Ok(()) => SavedQueryInspection::GovernedSql { definition },
             Err(error) => SavedQueryInspection::Invalid {
                 diagnostic: error.to_string(),
@@ -3650,7 +3723,7 @@ pub(crate) async fn execute_saved_sql(
 ) -> Result<Value> {
     use sqlx::Acquire as _;
 
-    validate_saved_sql(definition)?;
+    validate_stored_saved_sql(definition)?;
     let parameters = parameter_override.unwrap_or_else(|| definition.parameters.clone());
     if parameters.len() != definition.parameters.len()
         || parameters
@@ -3864,7 +3937,7 @@ pub(crate) async fn execute_saved_sql_in(
     caller: &Caller,
     definition: &SavedSqlDefinition,
 ) -> Result<Value> {
-    validate_saved_sql(definition)?;
+    validate_stored_saved_sql(definition)?;
     let parameters = definition.parameters.clone();
     let order = definition
         .output
@@ -5320,6 +5393,533 @@ mod governed_sql_tests {
                 "quote style {quoted} must not bypass logical-relation shadowing"
             );
         }
+    }
+
+    /// Richard 25 Sep (Native e25665c): verbatim statements from
+    /// live HQ definitions stored before I2. Slate clock (9405b6b6) and its
+    /// probe (df618e66) use `date`/`strftime`; backlog meta (f5b77a8a) uses
+    /// `julianday`. All pin sqlite-local@1.
+    const HQ_SLATE_CLOCK_SQL: &str = "SELECT 'slate-clock:' || r.id AS id, substr('SunMonTueWedThuFriSat',1+3*CAST(strftime('%w','now') AS INTEGER),3) || ' ' || CAST(CAST(strftime('%d','now') AS INTEGER) AS TEXT) || ' ' || substr('JanFebMarAprMayJunJulAugSepOctNovDec',1+3*(CAST(strftime('%m','now') AS INTEGER)-1),3) AS date_label, r.id AS task_id, CASE WHEN r.lifecycle = 'completed' AND date(r.updated_at) = date('now') THEN 1 ELSE 0 END AS done_today FROM records r WHERE r.home_id = ?1 AND r.type = 'WorkItem' AND r.deleted_at IS NULL UNION ALL SELECT 'slate-clock' AS id, substr('SunMonTueWedThuFriSat',1+3*CAST(strftime('%w','now') AS INTEGER),3) || ' ' || CAST(CAST(strftime('%d','now') AS INTEGER) AS TEXT) || ' ' || substr('JanFebMarAprMayJunJulAugSepOctNovDec',1+3*(CAST(strftime('%m','now') AS INTEGER)-1),3) AS date_label, '' AS task_id, 0 AS done_today ORDER BY id";
+    const HQ_SLATE_PROBE_SQL: &str = "SELECT r.id AS id, date('now') AS today, date('now','weekday 0') AS end_week, substr('SunMonTueWedThuFriSat',1+3*CAST(strftime('%w','now') AS INTEGER),3) || ' ' || CAST(CAST(strftime('%d','now') AS INTEGER) AS TEXT) || ' ' || substr('JanFebMarAprMayJunJulAugSepOctNovDec',1+3*(CAST(strftime('%m','now') AS INTEGER)-1),3) AS date_label, CASE WHEN r.lifecycle = 'completed' AND date(r.updated_at) = date('now') THEN 1 ELSE 0 END AS done_today FROM records r JOIN links l ON l.source_id = r.id AND l.relationship = 'member_of' AND l.target_id = ?1 WHERE r.deleted_at IS NULL UNION ALL SELECT ?1 AS id, date('now') AS today, date('now','weekday 0') AS end_week, substr('SunMonTueWedThuFriSat',1+3*CAST(strftime('%w','now') AS INTEGER),3) || ' ' || CAST(CAST(strftime('%d','now') AS INTEGER) AS TEXT) || ' ' || substr('JanFebMarAprMayJunJulAugSepOctNovDec',1+3*(CAST(strftime('%m','now') AS INTEGER)-1),3) AS date_label, 0 AS done_today ORDER BY id";
+    const HQ_BACKLOG_META_SQL: &str = "SELECT ('meta:' || r.id) AS id, r.id AS task_id, r.name, r.created_at, r.updated_at, CAST(julianday('now') - julianday(r.created_at) AS INTEGER) AS created_days_ago, CAST(julianday('now') - julianday(r.updated_at) AS INTEGER) AS updated_days_ago, (SELECT e.name FROM links l JOIN records e ON e.id = l.target_id WHERE l.source_id = r.id AND l.relationship = ?2 AND e.type = ?3 AND e.kind = ?4 LIMIT 1) AS epic_name, (SELECT f.value FROM facet_values f WHERE f.record_id = r.id AND f.key = ?5 LIMIT 1) AS priority FROM records r WHERE r.home_id = ?1 AND r.type = ?3 AND r.kind = ?6 AND r.lifecycle = ?7 ORDER BY r.updated_at DESC, r.id ASC";
+    /// Compact stored case exercising every legacy-only function at once.
+    /// `group_concat` is deliberately absent: refused before I2, refused
+    /// still (covered by `stored_group_concat_stays_rejected`). `max(name)`
+    /// forces a real column read so the declared `records` dependency is
+    /// used; constant-only projections (and `count(*)`) prune it.
+    const LEGACY_COMPACT_SQL: &str = "SELECT 'legacy' AS id, date('now') AS d, strftime('%w','now') AS w, julianday('now') AS j, max(name) AS m FROM records";
+
+    fn legacy_definition(
+        sql: &str,
+        parameters: Vec<crate::query::sql_contract::QuerySqlParameter>,
+        relations: &[&str],
+        columns: Vec<(&str, SavedSqlColumnType, bool)>,
+        order: Vec<(&str, SavedSqlDirection)>,
+        identity: &str,
+        rows: usize,
+    ) -> SavedSqlDefinition {
+        fn identity_of(name: &str) -> &'static str {
+            match name {
+                "records" => "native.query-sql.records",
+                "links" => "native.query-sql.links",
+                "facet_values" => "native.query-sql.facet-values",
+                _ => unreachable!("audited test relation {name}"),
+            }
+        }
+        let columns: Vec<SavedSqlColumn> = columns
+            .into_iter()
+            .map(|(name, column_type, nullable)| SavedSqlColumn {
+                name: name.into(),
+                column_type,
+                nullable,
+            })
+            .collect();
+        SavedSqlDefinition {
+            v: SAVED_SQL_VERSION.into(),
+            kind: "governed_sql".into(),
+            profile: SavedSqlProfile {
+                id: "sqlite-local".into(),
+                revision: 1,
+            },
+            catalog_revision: crate::query::sql_contract::LOGICAL_CATALOG_REVISION,
+            relations: relations
+                .iter()
+                .map(|name| {
+                    (
+                        (*name).to_owned(),
+                        SavedSqlRelationDependency {
+                            identity: identity_of(name).into(),
+                            semantic_version: 1,
+                        },
+                    )
+                })
+                .collect(),
+            sql: sql.into(),
+            parameters,
+            output: SavedSqlOutput {
+                schema_sha256: saved_sql_schema_sha256(&columns).unwrap(),
+                columns,
+                row_identity: vec![identity.into()],
+                order: order
+                    .into_iter()
+                    .map(|(column, direction)| SavedSqlOrder {
+                        column: column.into(),
+                        direction,
+                    })
+                    .collect(),
+            },
+            bounds: SavedSqlBounds { rows },
+        }
+    }
+
+    fn legacy_text(value: &str) -> crate::query::sql_contract::QuerySqlParameter {
+        crate::query::sql_contract::QuerySqlParameter::Text {
+            value: Some(value.into()),
+        }
+    }
+
+    fn hq_slate_definition() -> SavedSqlDefinition {
+        legacy_definition(
+            HQ_SLATE_CLOCK_SQL,
+            vec![legacy_text("4d03f76b-0dde-4948-b304-bc7029e3bb1d")],
+            &["records"],
+            vec![
+                ("id", SavedSqlColumnType::Identifier, false),
+                ("date_label", SavedSqlColumnType::Text, false),
+                ("task_id", SavedSqlColumnType::Text, false),
+                ("done_today", SavedSqlColumnType::Integer, false),
+            ],
+            vec![("id", SavedSqlDirection::Asc)],
+            "id",
+            1000,
+        )
+    }
+
+    fn hq_probe_definition() -> SavedSqlDefinition {
+        legacy_definition(
+            HQ_SLATE_PROBE_SQL,
+            vec![legacy_text("401fe0ef-a181-4395-96d3-d4adf34f295b")],
+            &["records", "links"],
+            vec![
+                ("id", SavedSqlColumnType::Identifier, false),
+                ("today", SavedSqlColumnType::Text, false),
+                ("end_week", SavedSqlColumnType::Text, false),
+                ("date_label", SavedSqlColumnType::Text, false),
+                ("done_today", SavedSqlColumnType::Integer, false),
+            ],
+            vec![("id", SavedSqlDirection::Asc)],
+            "id",
+            1000,
+        )
+    }
+
+    fn hq_backlog_definition() -> SavedSqlDefinition {
+        legacy_definition(
+            HQ_BACKLOG_META_SQL,
+            vec![
+                legacy_text("ed64466d-2552-4abd-b7ab-e7d9503f6ec8"),
+                legacy_text("part_of"),
+                legacy_text("WorkItem"),
+                legacy_text("epic"),
+                legacy_text("priority"),
+                legacy_text("task"),
+                legacy_text("open"),
+            ],
+            &["records", "links", "facet_values"],
+            vec![
+                ("id", SavedSqlColumnType::Identifier, false),
+                ("task_id", SavedSqlColumnType::Text, false),
+                ("name", SavedSqlColumnType::Text, false),
+                ("created_at", SavedSqlColumnType::Timestamp, false),
+                ("updated_at", SavedSqlColumnType::Timestamp, false),
+                ("created_days_ago", SavedSqlColumnType::Integer, true),
+                ("updated_days_ago", SavedSqlColumnType::Integer, true),
+                ("epic_name", SavedSqlColumnType::Text, true),
+                ("priority", SavedSqlColumnType::Text, true),
+            ],
+            vec![
+                ("updated_at", SavedSqlDirection::Desc),
+                ("id", SavedSqlDirection::Asc),
+            ],
+            "id",
+            300,
+        )
+    }
+
+    fn legacy_compact_definition() -> SavedSqlDefinition {
+        legacy_definition(
+            LEGACY_COMPACT_SQL,
+            vec![],
+            &["records"],
+            vec![
+                ("id", SavedSqlColumnType::Identifier, false),
+                ("d", SavedSqlColumnType::Text, false),
+                ("w", SavedSqlColumnType::Text, false),
+                ("j", SavedSqlColumnType::Real, false),
+                ("m", SavedSqlColumnType::Text, true),
+            ],
+            vec![("id", SavedSqlDirection::Asc)],
+            "id",
+            10,
+        )
+    }
+
+    #[test]
+    fn stored_legacy_functions_inspect_as_valid() {
+        // Richard 25 Sep: already-stored governed SQL keeps working under
+        // the legacy allowance, including the three live HQ definitions.
+        let slate = hq_slate_definition();
+        let probe = hq_probe_definition();
+        let backlog = hq_backlog_definition();
+        for definition in [slate, probe, backlog, legacy_compact_definition()] {
+            validate_stored_saved_sql(&definition)
+                .unwrap_or_else(|error| panic!("stored {}: {error}", definition.sql));
+            let raw = serde_json::to_string(&definition).unwrap();
+            assert!(
+                matches!(
+                    inspect_saved_query(Some(&raw)),
+                    SavedQueryInspection::GovernedSql { .. }
+                ),
+                "stored {}",
+                definition.sql
+            );
+        }
+    }
+
+    #[test]
+    fn saving_legacy_functions_is_rejected_with_the_portable_repair() {
+        // Richard 25 Sep: SQL being saved stays on the full I2 rules, even
+        // the HQ statements verbatim.
+        let slate = hq_slate_definition();
+        for (definition, repair) in [
+            (legacy_compact_definition(), "M1 timestamp columns"),
+            (slate, "M1 timestamp columns"),
+        ] {
+            let error = validate_saved_sql(&definition).unwrap_err().to_string();
+            assert!(error.contains(repair), "{}: {error}", definition.sql);
+        }
+        let group_concat = legacy_definition(
+            "SELECT group_concat(name) AS g FROM records",
+            vec![],
+            &["records"],
+            vec![("g", SavedSqlColumnType::Text, true)],
+            vec![("g", SavedSqlDirection::Asc)],
+            "g",
+            10,
+        );
+        let error = validate_saved_sql(&group_concat).unwrap_err().to_string();
+        assert!(error.contains("aggregate client-side"), "{error}");
+        // Round arity is a save-time rule too.
+        let round = legacy_definition(
+            "SELECT round(avg(id), 2) AS r FROM records",
+            vec![],
+            &["records"],
+            vec![("r", SavedSqlColumnType::Real, true)],
+            vec![("r", SavedSqlDirection::Asc)],
+            "r",
+            10,
+        );
+        let error = validate_saved_sql(&round).unwrap_err().to_string();
+        assert!(error.contains("catalog numeric type"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn stored_legacy_functions_execute_on_sqlite_local() {
+        let db = create_database(":memory:").await.unwrap();
+        let output = execute_saved_sql(db, &Caller::local(), &legacy_compact_definition(), None)
+            .await
+            .unwrap();
+        let rows = output["rows"].as_array().expect("rows");
+        assert_eq!(rows.len(), 1, "{output:#}");
+        let row = &rows[0];
+        assert_eq!(
+            row.get("id").and_then(Value::as_str),
+            Some("legacy"),
+            "{row:#}"
+        );
+        assert!(row.get("d").and_then(Value::as_str).is_some(), "{row:#}");
+        assert!(row.get("w").and_then(Value::as_str).is_some(), "{row:#}");
+        assert!(row.get("j").and_then(Value::as_f64).is_some(), "{row:#}");
+        assert!(row.get("m").is_some(), "{row:#}");
+    }
+
+    #[test]
+    fn legacy_definition_can_advance_its_pin() {
+        // Pin advance re-pins an existing definition without changing its
+        // SQL text, so it stays on the stored/legacy allowance: a stale pin
+        // fails, and bumping it to current (what advance_artifact_port_pin
+        // does) inspects as governed SQL even with legacy-only functions.
+        let mut definition = legacy_compact_definition();
+        definition
+            .relations
+            .get_mut("records")
+            .expect("records dependency")
+            .semantic_version = 0;
+        let stale = serde_json::to_string(&definition).unwrap();
+        assert!(
+            matches!(
+                inspect_saved_query(Some(&stale)),
+                SavedQueryInspection::Invalid { .. }
+            ),
+            "{stale}"
+        );
+        definition
+            .relations
+            .get_mut("records")
+            .expect("records dependency")
+            .semantic_version = crate::query::sql_contract::LOGICAL_RELATION_VERSION;
+        let advanced = serde_json::to_string(&definition).unwrap();
+        assert!(
+            matches!(
+                inspect_saved_query(Some(&advanced)),
+                SavedQueryInspection::GovernedSql { .. }
+            ),
+            "{advanced}"
+        );
+    }
+
+    #[test]
+    fn stored_group_concat_stays_rejected() {
+        // `group_concat` was already refused before I2 ("not authorized to
+        // use function"), so the legacy allowance — the pre-I2 allowlist ∪
+        // the portable subset — refuses it for stored definitions too.
+        let definition = legacy_definition(
+            "SELECT group_concat(name) AS g FROM records",
+            vec![],
+            &["records"],
+            vec![("g", SavedSqlColumnType::Text, true)],
+            vec![("g", SavedSqlDirection::Asc)],
+            "g",
+            10,
+        );
+        let error = validate_stored_saved_sql(&definition)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not authorized"), "{error}");
+        let raw = serde_json::to_string(&definition).unwrap();
+        assert!(
+            matches!(
+                inspect_saved_query(Some(&raw)),
+                SavedQueryInspection::Invalid { diagnostic }
+                if diagnostic.contains("not authorized")
+            ),
+            "{raw}"
+        );
+    }
+
+    #[tokio::test]
+    async fn hq_fixture_statements_execute_verbatim_on_sqlite_local() {
+        // Finding 5: the three live HQ statements execute verbatim as
+        // already-stored definitions. Only data is seeded (definitions never
+        // pass the new write gate in this test); rows are disclosed to the
+        // test caller through explicit view grants.
+        let db = create_database(":memory:").await.unwrap();
+        let reader = Caller::authenticated("hq-fixture-reader");
+        async fn grant_view(db: &Db, id: &str) {
+            replace_explicit_policy(
+                db,
+                "hq-fixture",
+                id,
+                vec![AllowEntry::account("hq-fixture-reader", Capability::View)],
+            )
+            .await
+            .unwrap();
+        }
+        let home = crate::schema::contract::ROOT_RECORD_ID;
+        for (id, kind, lifecycle) in [
+            ("42345678-1234-4234-8234-1234567890ab", "task", "open"),
+            ("52345678-1234-4234-8234-1234567890ab", "task", "open"),
+        ] {
+            create_record(
+                &db,
+                json!({ "id": id, "type": "WorkItem", "kind": kind,
+                        "lifecycle": lifecycle, "home_id": home, "name": id }),
+            )
+            .await
+            .unwrap();
+            grant_view(&db, id).await;
+        }
+        let mut slate_definition = hq_slate_definition();
+        slate_definition.parameters = vec![legacy_text(home)];
+        let slate = execute_saved_sql(db.clone(), &reader, &slate_definition, None)
+            .await
+            .unwrap();
+        let rows = slate["rows"].as_array().expect("slate rows");
+        // Two tasks plus the date-only row.
+        assert_eq!(rows.len(), 3, "{slate:#}");
+        assert!(
+            rows.iter().all(|row| row
+                .get("date_label")
+                .and_then(Value::as_str)
+                .is_some_and(|label| !label.is_empty())),
+            "{slate:#}"
+        );
+
+        let folder = "62345678-1234-4234-8234-1234567890ab";
+        create_record(
+            &db,
+            json!({ "id": folder, "type": "Collection", "kind": "folder", "name": "Slate" }),
+        )
+        .await
+        .unwrap();
+        grant_view(&db, folder).await;
+        sqlx::query(
+            "INSERT INTO links(id,source_id,target_id,relationship,created_at)
+             VALUES (?,?,?,'member_of','2026-09-25T00:00:00.000Z')",
+        )
+        .bind("72345678-1234-4234-8234-1234567890ab")
+        .bind("42345678-1234-4234-8234-1234567890ab")
+        .bind(folder)
+        .execute(db.write_pool())
+        .await
+        .unwrap();
+        let mut probe_definition = hq_probe_definition();
+        probe_definition.parameters = vec![legacy_text(folder)];
+        let probe = execute_saved_sql(db.clone(), &reader, &probe_definition, None)
+            .await
+            .unwrap();
+        let rows = probe["rows"].as_array().expect("probe rows");
+        // The member task plus the folder's own row.
+        assert_eq!(rows.len(), 2, "{probe:#}");
+        assert!(
+            rows.iter()
+                .all(|row| row.get("today").and_then(Value::as_str).is_some()),
+            "{probe:#}"
+        );
+
+        let backlog_home = "82345678-1234-4234-8234-1234567890ab";
+        let epic = "92345678-1234-4234-8234-1234567890ab";
+        let task = "a2345678-1234-4234-8234-1234567890ab";
+        create_record(
+            &db,
+            json!({ "id": backlog_home, "type": "Collection", "kind": "folder", "name": "Backlog home" }),
+        )
+        .await
+        .unwrap();
+        grant_view(&db, backlog_home).await;
+        create_record(
+            &db,
+            json!({ "id": epic, "type": "WorkItem", "kind": "epic", "name": "Epic" }),
+        )
+        .await
+        .unwrap();
+        grant_view(&db, epic).await;
+        create_record(
+            &db,
+            json!({ "id": task, "type": "WorkItem", "kind": "task",
+                    "lifecycle": "open", "home_id": backlog_home, "name": "Backlog task" }),
+        )
+        .await
+        .unwrap();
+        grant_view(&db, task).await;
+        sqlx::query(
+            "INSERT INTO links(id,source_id,target_id,relationship,created_at)
+             VALUES (?,?,?,'part_of','2026-09-25T00:00:00.000Z')",
+        )
+        .bind("b2345678-1234-4234-8234-1234567890ab")
+        .bind(task)
+        .bind(epic)
+        .execute(db.write_pool())
+        .await
+        .unwrap();
+        crate::store::set_facet(
+            &db,
+            task,
+            crate::events::FacetSetPayload {
+                key: "priority".into(),
+                value: Some("high".into()),
+                vocab_ref: None,
+                as_of: None,
+                observation_only: false,
+            },
+        )
+        .await
+        .unwrap();
+        let mut backlog_definition = hq_backlog_definition();
+        backlog_definition.parameters = vec![
+            legacy_text(backlog_home),
+            legacy_text("part_of"),
+            legacy_text("WorkItem"),
+            legacy_text("epic"),
+            legacy_text("priority"),
+            legacy_text("task"),
+            legacy_text("open"),
+        ];
+        let backlog = execute_saved_sql(db.clone(), &reader, &backlog_definition, None)
+            .await
+            .unwrap();
+        let rows = backlog["rows"].as_array().expect("backlog rows");
+        assert_eq!(rows.len(), 1, "{backlog:#}");
+        let row = &rows[0];
+        assert_eq!(
+            row.get("task_id").and_then(Value::as_str),
+            Some(task),
+            "{row:#}"
+        );
+        assert_eq!(
+            row.get("epic_name").and_then(Value::as_str),
+            Some("Epic"),
+            "{row:#}"
+        );
+        assert_eq!(
+            row.get("priority").and_then(Value::as_str),
+            Some("high"),
+            "{row:#}"
+        );
+        assert!(
+            row.get("created_days_ago")
+                .and_then(Value::as_i64)
+                .is_some(),
+            "{row:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn saving_governed_sql_via_create_record_is_refused() {
+        // Finding 2: the write-time gate fires on the real MCP path, not
+        // just the unit-tested validator. A brand-new definition using
+        // dropped functions is refused with the portable repair.
+        let db = create_database(":memory:").await.unwrap();
+        let mut registry = ToolRegistry::new();
+        crate::mcp::register_surface_tools(&mut registry).unwrap();
+        let raw = serde_json::to_string(&legacy_compact_definition()).unwrap();
+        let error = registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "create_record",
+                json!({
+                    "id": "c2345678-1234-4234-8234-1234567890ab",
+                    "type": "Collection", "kind": "query", "name": "Legacy clock",
+                    "facets": {"query": raw},
+                    "reason": "Prove new legacy saves are refused."
+                }),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("M1 timestamp columns"), "{error}");
+        // The gate also sees the typed definition: gapped placeholders are
+        // refused at write, not deferred to execution.
+        let mut gapped = legacy_compact_definition();
+        gapped.sql = "SELECT id FROM records WHERE id = ?1 AND name = ?3".into();
+        let raw = serde_json::to_string(&gapped).unwrap();
+        let error = registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "create_record",
+                json!({
+                    "id": "d2345678-1234-4234-8234-1234567890ab",
+                    "type": "Collection", "kind": "query", "name": "Gapped placeholders",
+                    "facets": {"query": raw},
+                    "reason": "Prove placeholder gaps are refused at write."
+                }),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("must match exactly"), "{error}");
     }
 
     #[test]
