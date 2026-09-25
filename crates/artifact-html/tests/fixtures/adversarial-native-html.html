@@ -1,0 +1,198 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Adversarial bridge fixture</title>
+  <style>
+    body { margin: 0; padding: 2rem; font: 16px system-ui; color: #182018; background: #f4f6ef; }
+    button { padding: .75rem 1rem; }
+  </style>
+  <script>
+    (() => {
+      const nativeAddEventListener = EventTarget.prototype.addEventListener;
+      const nativePortPostMessage = MessagePort.prototype.postMessage;
+      const nativePortStart = MessagePort.prototype.start;
+      const nativeFreeze = Object.freeze;
+      const nativeIsFrozen = Object.isFrozen;
+      const nativeKeys = Object.keys;
+      const nativeStringify = JSON.stringify;
+      const nativeConsoleInfo = console.info;
+      const currentTargetGetter = Object.getOwnPropertyDescriptor(Event.prototype, "currentTarget").get;
+      const messageEventGetters = Object.fromEntries(
+        ["data", "origin", "ports", "source"].map(name => [name, Object.getOwnPropertyDescriptor(MessageEvent.prototype, name).get]),
+      );
+      let resolveProof;
+      let rejectProof;
+      const proofJsonReady = new Promise((resolve, reject) => {
+        resolveProof = resolve;
+        rejectProof = reject;
+      });
+      const captures = {
+        addEventListenerThis: [],
+        currentTargets: [],
+        messageEvents: [],
+        portMethodThis: [],
+        returnedPorts: [],
+      };
+      const state = {
+        authoredMessageEvents: 0,
+        addEventListenerIntercepts: 0,
+        capturedPorts: 0,
+        messagePortPostIntercepts: 0,
+        messagePortStartIntercepts: 0,
+        messagePortOnMessageSets: 0,
+        patchedGetterReads: 0,
+        objectFreezeIntercepts: 0,
+        objectIsFrozenIntercepts: 0,
+        objectKeysIntercepts: 0,
+        inputFrozen: false,
+        recordsFrozen: false,
+        nestedRecordFrozen: false,
+        syntheticClicks: 0,
+        proof: null,
+        proofJsonReady,
+      };
+      Object.defineProperty(window, "__nativeAdversary", { value: state, configurable: false, writable: false });
+
+      const tryStolenPort = port => {
+        captures.returnedPorts.push(port);
+        state.capturedPorts = captures.returnedPorts.length;
+        try {
+          Reflect.apply(nativePortPostMessage, port, [{
+            type: "navigation",
+            version: "native.html.bridge.v1",
+            recordId: "not-delivered",
+          }]);
+        } catch {}
+      };
+      Reflect.apply(nativeAddEventListener, window, ["message", event => {
+        state.authoredMessageEvents += 1;
+        captures.messageEvents.push(event);
+        captures.currentTargets.push(Reflect.apply(currentTargetGetter, event, []));
+        const ports = Reflect.apply(messageEventGetters.ports, event, []);
+        for (const port of ports) tryStolenPort(port);
+      }, true]);
+
+      try {
+        MessagePort.prototype.postMessage = function (...args) {
+          captures.portMethodThis.push(this);
+          state.messagePortPostIntercepts += 1;
+          return Reflect.apply(nativePortPostMessage, this, args);
+        };
+      } catch {}
+      try {
+        MessagePort.prototype.start = function (...args) {
+          captures.portMethodThis.push(this);
+          state.messagePortStartIntercepts += 1;
+          return Reflect.apply(nativePortStart, this, args);
+        };
+      } catch {}
+      try {
+        Object.defineProperty(MessagePort.prototype, "onmessage", {
+          configurable: true,
+          get: () => null,
+          set: function () {
+            captures.portMethodThis.push(this);
+            state.messagePortOnMessageSets += 1;
+          },
+        });
+      } catch {}
+      try {
+        EventTarget.prototype.addEventListener = function (...args) {
+          captures.addEventListenerThis.push(this);
+          state.addEventListenerIntercepts += 1;
+          return Reflect.apply(nativeAddEventListener, this, args);
+        };
+      } catch {}
+
+      const forged = {
+        data: { type: "navigation", version: "native.html.bridge.v1", recordId: "not-delivered" },
+        origin: "http://localhost:4175",
+        ports: [],
+        source: parent,
+      };
+      for (const name of ["data", "origin", "ports", "source"]) {
+        try {
+          Object.defineProperty(MessageEvent.prototype, name, {
+            configurable: true,
+            get: function () {
+              captures.messageEvents.push(this);
+              state.patchedGetterReads += 1;
+              if (name === "ports") {
+                const ports = Reflect.apply(messageEventGetters.ports, this, []);
+                for (const port of ports) tryStolenPort(port);
+              }
+              return forged[name];
+            },
+          });
+        } catch {}
+      }
+      try {
+        Object.freeze = function (...args) {
+          state.objectFreezeIntercepts += 1;
+          return Reflect.apply(nativeFreeze, Object, args);
+        };
+        Object.isFrozen = function (...args) {
+          state.objectIsFrozenIntercepts += 1;
+          return Reflect.apply(nativeIsFrozen, Object, args);
+        };
+        Object.keys = function (...args) {
+          state.objectKeysIntercepts += 1;
+          return Reflect.apply(nativeKeys, Object, args);
+        };
+      } catch {}
+
+      parent.postMessage({
+        type: "navigation",
+        version: "native.html.bridge.v1",
+        recordId: "not-delivered",
+      }, "*");
+
+      Reflect.apply(nativeAddEventListener, window, ["DOMContentLoaded", () => {
+        nativeArtifact.ready.then(({ input }) => {
+          state.inputFrozen = Reflect.apply(nativeIsFrozen, Object, [input]);
+          state.recordsFrozen = Reflect.apply(nativeIsFrozen, Object, [input?.records]);
+          state.nestedRecordFrozen = Boolean(input?.records?.length)
+            && Reflect.apply(nativeIsFrozen, Object, [input.records[0]])
+            && Reflect.apply(nativeIsFrozen, Object, [input.records[0].facets]);
+          document.getElementById("trusted-record").click();
+          state.syntheticClicks += 1;
+          state.proof = Reflect.apply(nativeFreeze, Object, [{
+            authoredMessageEvents: state.authoredMessageEvents,
+            addEventListenerIntercepts: state.addEventListenerIntercepts,
+            capturedPorts: state.capturedPorts,
+            messagePortPostIntercepts: state.messagePortPostIntercepts,
+            messagePortStartIntercepts: state.messagePortStartIntercepts,
+            messagePortOnMessageSets: state.messagePortOnMessageSets,
+            patchedGetterReads: state.patchedGetterReads,
+            objectFreezeIntercepts: state.objectFreezeIntercepts,
+            objectIsFrozenIntercepts: state.objectIsFrozenIntercepts,
+            objectKeysIntercepts: state.objectKeysIntercepts,
+            inputFrozen: state.inputFrozen,
+            recordsFrozen: state.recordsFrozen,
+            nestedRecordFrozen: state.nestedRecordFrozen,
+            syntheticClicks: state.syntheticClicks,
+          }]);
+          // Publish a scalar while every measured counter is still sealed.
+          // The console marker crosses the browser boundary without installing
+          // a Playwright evaluation in this adversarial realm. Newer Chromium
+          // enumerates evaluation results before this promise resolves, which
+          // would exercise the deliberately patched Object.keys and contaminate
+          // the bridge proof with observer behavior.
+          const proofJson = Reflect.apply(nativeStringify, JSON, [state.proof]);
+          Reflect.apply(nativeConsoleInfo, console, [`native-adversary-proof:${proofJson}`]);
+          resolveProof(proofJson);
+        }, rejectProof);
+      }]);
+    })();
+  </script>
+</head>
+<body>
+  <main>
+    <h1>Private bridge adversary</h1>
+    <p>Authored code cannot capture or forge the host bridge.</p>
+    <button id="trusted-record" type="button" data-native-record-id="__DELIVERED_RECORD_ID__">Open delivered record</button>
+  </main>
+</body>
+</html>

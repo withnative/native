@@ -211,6 +211,17 @@ fn columns_for(table: &str) -> &'static [&'static str] {
             "source_event_seq",
             "effective",
         ],
+        "record_mentions" => &[
+            "source_id",
+            "occurrence_ix",
+            "source_event_seq",
+            "span_start",
+            "span_end",
+            "authored_reference",
+            "lookup_key",
+            "form",
+            "parser_version",
+        ],
         "module_releases" => &[
             "publication_event_id",
             "module_record_id",
@@ -498,6 +509,9 @@ fn columns_for(table: &str) -> &'static [&'static str] {
             "start_event_seq",
             "close_event_id",
             "close_event_seq",
+            "reported_mcp_client_name",
+            "reported_mcp_client_version",
+            "reported_model",
         ],
         "member_contexts" => &[
             "account_id",
@@ -564,6 +578,21 @@ fn columns_for(table: &str) -> &'static [&'static str] {
             "template_version",
             "last_applied_digest",
             "last_applied_at",
+        ],
+        "alpha_tab_installs" => &[
+            "account_id",
+            "package",
+            "version",
+            "digest",
+            "artifact_id",
+            "consented_source_revision",
+            "declaration_digest",
+            "consented_declaration",
+            "adoption",
+            "status",
+            "event_id",
+            "event_seq",
+            "updated_at",
         ],
         "control_event_applications" => &["event_id", "event_seq", "applied_at"],
         "derivation_series" => &[
@@ -896,7 +925,7 @@ pub struct RebuildDiffResult {
 async fn read_all_events(conn: &mut SqliteConnection) -> Result<Vec<EventRow>> {
     let rows = sqlx::query(
         "SELECT seq, id, record_id, type, payload, actor,
-                run_key, parent_key, intent, created_at,
+                run_key, parent_key, intent, created_at, act,
                 causal_envelope_version, causal_status
            FROM content_events ORDER BY seq",
     )
@@ -943,6 +972,7 @@ async fn read_all_events(conn: &mut SqliteConnection) -> Result<Vec<EventRow>> {
             intent: r.try_get("intent")?,
             created_at: r.try_get("created_at")?,
             causal_envelope,
+            act: r.try_get("act")?,
         });
     }
     Ok(events)
@@ -992,6 +1022,7 @@ async fn dump_table_where(
         "message_origin_principals" => "message_id, principal_id",
         "message_conversations" => "message_id, conversation_id",
         "message_mentions" => "message_id, mention_id",
+        "record_mentions" => "source_id, occurrence_ix",
         "record_policies" => "record_id",
         "policy_entries" => "policy_anchor_id, subject_kind, subject_id, effect, capability",
         "agent_runs" => "activity_id",
@@ -1000,6 +1031,7 @@ async fn dump_table_where(
         "member_obligations" => "account_id, programme_id, generation",
         "member_obligation_progress" => "account_id, programme_id, generation",
         "seeded_instruction_sources" => "source_record_id",
+        "alpha_tab_installs" => "account_id, package",
         "control_event_applications" => "event_seq",
         "derivation_revision_inputs" => "revision_id, ordinal",
         "derivation_target_bindings" => "target_kind, target_record_id, target_slot, generation",
@@ -1073,6 +1105,15 @@ async fn dump_table_where(
                             && matches!(
                                 *column,
                                 "span_start" | "span_end" | "source_event_seq" | "effective"
+                            ))
+                        || (table == "record_mentions"
+                            && matches!(
+                                *column,
+                                "occurrence_ix"
+                                    | "source_event_seq"
+                                    | "span_start"
+                                    | "span_end"
+                                    | "parser_version"
                             ))
                         || (table == "module_releases"
                             && matches!(*column, "local_event_seq" | "status_event_seq"))
@@ -1183,6 +1224,7 @@ async fn dump_table_where(
                             | ("member_obligations", "generation")
                             | ("member_obligation_progress", "generation")
                             | ("seeded_instruction_sources", "template_version")
+                            | ("alpha_tab_installs", "event_seq")
                             | ("control_event_applications", "event_seq")
                             | ("derivation_series", "created_event_seq")
                             | ("derivation_revisions", "completed_event_seq")
@@ -1696,6 +1738,7 @@ mod tests {
     async fn derivation_rebuild_is_equal_and_detects_projection_drift() {
         let db = crate::db::create_database(":memory:").await.unwrap();
         let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+        let mut act_alloc = crate::act::ActAllocation::new();
         append_derivation_event_in(
             &mut tx,
             NewDerivationEvent::authored(
@@ -1710,6 +1753,7 @@ mod tests {
                 }),
             )
             .unwrap(),
+            &mut act_alloc,
         )
         .await
         .unwrap();

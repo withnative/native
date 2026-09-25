@@ -1,6 +1,9 @@
+use std::collections::BTreeSet;
+
 use serde_json::json;
 use sqlx::{Row, Sqlite, SqliteConnection, Transaction};
 
+use crate::interchange::{Cell, Section, REVISION, SECTION_FORMAT};
 use crate::{Error, Result};
 
 use super::reducer::{AssertionHead, ReductionFacts, RelationshipProposition};
@@ -913,12 +916,30 @@ pub(crate) struct ReceiverAdmissionDecision {
     pub verified: bool,
 }
 
+/// One authoritative relationship-log row prepared for replay. `act` is not
+/// part of the relationship event's origin fingerprint, but it is canonical
+/// workspace commit grouping and must survive a local rebuild exactly,
+/// including legacy rows whose grouping is unknown (`NULL`).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct RelationshipReplayEvent {
+    pub(crate) event: RelationshipEventSpec,
+    pub(crate) act: Option<i64>,
+}
+
+impl std::ops::Deref for RelationshipReplayEvent {
+    type Target = RelationshipEventSpec;
+
+    fn deref(&self) -> &Self::Target {
+        &self.event
+    }
+}
+
 pub(crate) async fn read_all_relationship_events(
     conn: &mut SqliteConnection,
-) -> Result<Vec<RelationshipEventSpec>> {
+) -> Result<Vec<RelationshipReplayEvent>> {
     let rows = sqlx::query(
         "SELECT id,stream_id,stream_version,relationship_origin_db_id,relationship_id,
-                type,payload,actor,issuer_origin_db_id,occurred_at,ingested_at
+                type,payload,actor,issuer_origin_db_id,occurred_at,ingested_at,act
            FROM relationship_events ORDER BY seq",
     )
     .fetch_all(conn)
@@ -935,10 +956,10 @@ pub(crate) async fn read_all_relationship_events(
 pub(crate) async fn read_relationship_event_prefix(
     conn: &mut SqliteConnection,
     max_seq: i64,
-) -> Result<Vec<RelationshipEventSpec>> {
+) -> Result<Vec<RelationshipReplayEvent>> {
     let rows = sqlx::query(
         "SELECT id,stream_id,stream_version,relationship_origin_db_id,relationship_id,
-                type,payload,actor,issuer_origin_db_id,occurred_at,ingested_at
+                type,payload,actor,issuer_origin_db_id,occurred_at,ingested_at,act
            FROM relationship_events WHERE seq <= ? ORDER BY seq",
     )
     .bind(max_seq)
@@ -947,12 +968,35 @@ pub(crate) async fn read_relationship_event_prefix(
     rows.iter().map(relationship_event_spec_from_row).collect()
 }
 
+/// The relationship-only act-range reader: exactly the rows whose `act` falls
+/// in the half-open interval `(from_exclusive_act, to_inclusive_act]`, in `seq`
+/// order, decoded by the same [`relationship_event_spec_from_row`] the full
+/// reader uses. Legacy rows whose act is `NULL` never satisfy the strict
+/// `act > ?` predicate and are excluded.
+#[allow(dead_code)] // R3 wires the bounded fold; the reader lands ahead of its caller.
+pub(crate) async fn relationship_events_in_act_range(
+    conn: &mut SqliteConnection,
+    from_exclusive_act: i64,
+    to_inclusive_act: i64,
+) -> Result<Vec<RelationshipReplayEvent>> {
+    let rows = sqlx::query(
+        "SELECT id,stream_id,stream_version,relationship_origin_db_id,relationship_id,
+                type,payload,actor,issuer_origin_db_id,occurred_at,ingested_at,act
+           FROM relationship_events WHERE act > ? AND act <= ? ORDER BY seq",
+    )
+    .bind(from_exclusive_act)
+    .bind(to_inclusive_act)
+    .fetch_all(conn)
+    .await?;
+    rows.iter().map(relationship_event_spec_from_row).collect()
+}
+
 fn relationship_event_spec_from_row(
     row: &sqlx::sqlite::SqliteRow,
-) -> Result<RelationshipEventSpec> {
+) -> Result<RelationshipReplayEvent> {
     let event_type: String = row.try_get("type")?;
     let stream_version: i64 = row.try_get("stream_version")?;
-    Ok(RelationshipEventSpec {
+    let event = RelationshipEventSpec {
         event_id: row.try_get("id")?,
         stream_id: row.try_get("stream_id")?,
         expected_stream_version: stream_version - 1,
@@ -969,20 +1013,309 @@ fn relationship_event_spec_from_row(
         issuer_origin_db_id: row.try_get("issuer_origin_db_id")?,
         occurred_at: row.try_get("occurred_at")?,
         ingested_at: row.try_get("ingested_at")?,
+    };
+    Ok(RelationshipReplayEvent {
+        event,
+        act: row.try_get("act")?,
     })
 }
 
+/// The canonical interchange table name of the co-located relationship /
+/// assertion authority log.
+const RELATIONSHIP_EVENTS_SECTION: &str = "relationship_events";
+
+/// The exact canonical interchange columns of the carried `relationship_events`
+/// act section, in the live-schema order the authority act-range reader emits.
+///
+/// Names *and* declared types are pinned together, so no cell is ever read by
+/// position before the column list has been proven: a tampered section cannot
+/// relabel one column as another, and a schema drift cannot silently reorder a
+/// value into the wrong envelope field.
+const RELATIONSHIP_EVENTS_SECTION_COLUMNS: [(&str, &str); 14] = [
+    ("seq", "INTEGER"),
+    ("id", "TEXT"),
+    ("stream_kind", "TEXT"),
+    ("stream_id", "TEXT"),
+    ("stream_version", "INTEGER"),
+    ("relationship_origin_db_id", "TEXT"),
+    ("relationship_id", "TEXT"),
+    ("type", "TEXT"),
+    ("payload", "TEXT"),
+    ("actor", "TEXT"),
+    ("issuer_origin_db_id", "TEXT"),
+    ("occurred_at", "TEXT"),
+    ("ingested_at", "TEXT"),
+    ("act", "INTEGER"),
+];
+
+const RELATIONSHIP_EVENTS_SECTION_PRIMARY_KEY: [&str; 1] = ["seq"];
+
+/// The canonical table name of the receiver-local federation-evidence
+/// companion carried alongside the relationship act section.
+const RELATIONSHIP_FEDERATION_EVENTS_SECTION: &str = "relationship_federation_events";
+
+const RELATIONSHIP_FEDERATION_EVENTS_SECTION_COLUMNS: [(&str, &str); 9] = [
+    ("issuer_origin_db_id", "TEXT"),
+    ("event_id", "TEXT"),
+    ("fingerprint", "TEXT"),
+    ("source_batch_origin_db_id", "TEXT"),
+    ("envelope_id", "TEXT"),
+    ("authenticated_peer_principal", "TEXT"),
+    ("origin_trust_state", "TEXT"),
+    ("origin_evidence_state", "TEXT"),
+    ("received_at", "TEXT"),
+];
+
+const RELATIONSHIP_FEDERATION_EVENTS_SECTION_PRIMARY_KEY: [&str; 2] =
+    ["issuer_origin_db_id", "event_id"];
+
+/// Fail-closed pin of one carried section's identity and shape before any
+/// positional cell is read: exact table name, current canonical format and
+/// revision, the exact ordered column list (name and declared type), and the
+/// exact ordered declared primary key.
+///
+/// Row width, cell storage-class validity, primary-key reachability and
+/// strictly increasing primary-key order (which also rejects duplicate primary
+/// keys) are delegated to the shared canonical
+/// [`crate::interchange::validate_section_shape`] helper, so this decode path
+/// reuses the one canonical cell validator rather than a second permissive
+/// codec.
+fn pin_relationship_section(
+    section: &Section,
+    table: &str,
+    columns: &[(&str, &str)],
+    primary_key: &[&str],
+) -> Result<()> {
+    if section.name != table {
+        return Err(Error::engine(format!(
+            "carried relationship section is '{}', not '{table}'",
+            section.name
+        )));
+    }
+    if section.format != SECTION_FORMAT || section.revision != REVISION {
+        return Err(Error::engine(format!(
+            "carried '{table}' section is not current canonical interchange"
+        )));
+    }
+    if section.columns.len() != columns.len()
+        || section
+            .columns
+            .iter()
+            .zip(columns.iter())
+            .any(|(column, (name, declared_type))| {
+                column.name != *name || column.declared_type != *declared_type
+            })
+    {
+        return Err(Error::engine(format!(
+            "carried '{table}' section columns do not match the canonical shape"
+        )));
+    }
+    if section.primary_key.len() != primary_key.len()
+        || section
+            .primary_key
+            .iter()
+            .zip(primary_key.iter())
+            .any(|(actual, expected)| actual != expected)
+    {
+        return Err(Error::engine(format!(
+            "carried '{table}' section primary key does not match the canonical shape"
+        )));
+    }
+    crate::interchange::validate_section_shape(section)
+        .map_err(|error| Error::engine(format!("carried '{table}' section is malformed: {error}")))
+}
+
+fn column_index(section: &Section, column: &str) -> Result<usize> {
+    section
+        .columns
+        .iter()
+        .position(|candidate| candidate.name == column)
+        .ok_or_else(|| {
+            Error::engine(format!(
+                "carried '{}' section has no {column} column",
+                section.name
+            ))
+        })
+}
+
+fn text_cell(section: &Section, row: &[Cell], column: &str) -> Result<String> {
+    match row.get(column_index(section, column)?) {
+        Some(Cell::Text(value)) => Ok(value.clone()),
+        _ => Err(Error::engine(format!(
+            "carried '{}' cell '{column}' is not text",
+            section.name
+        ))),
+    }
+}
+
+fn integer_cell(section: &Section, row: &[Cell], column: &str) -> Result<i64> {
+    match row.get(column_index(section, column)?) {
+        Some(Cell::Integer(value)) => Ok(*value),
+        _ => Err(Error::engine(format!(
+            "carried '{}' cell '{column}' is not an integer",
+            section.name
+        ))),
+    }
+}
+
+fn optional_integer_cell(section: &Section, row: &[Cell], column: &str) -> Result<Option<i64>> {
+    match row.get(column_index(section, column)?) {
+        Some(Cell::Integer(value)) => Ok(Some(*value)),
+        Some(Cell::Null) => Ok(None),
+        _ => Err(Error::engine(format!(
+            "carried '{}' cell '{column}' is not an integer or null",
+            section.name
+        ))),
+    }
+}
+
+/// Decode the carried `relationship_events` act section into the exact typed
+/// replay inputs the preserved-act replay seam consumes, in section primary-key
+/// (`seq`) order.
+///
+/// This is the wire-boundary twin of [`relationship_event_spec_from_row`]: it
+/// produces the same [`RelationshipEventSpec`] fields and the same
+/// [`RelationshipReplayEvent::act`] (`Option<i64>`) as the live bounded reader,
+/// but from a validated carried section rather than a SQLite row. The section
+/// is pinned by name, format, revision, ordered columns and primary key before
+/// any cell is read, and every cell is decoded by its pinned column name. A
+/// `NULL` `act` is preserved exactly as `None`: a live `(F1, F2]` authority cut
+/// cannot carry one (its act predicate is strict and its rows are act-stamped),
+/// but a directly constructed current-revision section may, and replay's
+/// legacy grouping-unknown semantics require it round-trips.
+pub(crate) fn relationship_replay_events_from_section(
+    section: &Section,
+) -> Result<Vec<RelationshipReplayEvent>> {
+    pin_relationship_section(
+        section,
+        RELATIONSHIP_EVENTS_SECTION,
+        &RELATIONSHIP_EVENTS_SECTION_COLUMNS,
+        &RELATIONSHIP_EVENTS_SECTION_PRIMARY_KEY,
+    )?;
+    section
+        .rows
+        .iter()
+        .map(|row| relationship_replay_event_from_cells(section, row))
+        .collect()
+}
+
+fn relationship_replay_event_from_cells(
+    section: &Section,
+    row: &[Cell],
+) -> Result<RelationshipReplayEvent> {
+    let event_type = text_cell(section, row, "type")?;
+    let expected_stream_version = integer_cell(section, row, "stream_version")?
+        .checked_sub(1)
+        .ok_or_else(|| Error::engine("carried 'relationship_events' stream_version underflows"))?;
+    let event = RelationshipEventSpec {
+        event_id: text_cell(section, row, "id")?,
+        stream_id: text_cell(section, row, "stream_id")?,
+        expected_stream_version,
+        relationship: super::RelationshipCoordinate {
+            relationship_origin_db_id: text_cell(section, row, "relationship_origin_db_id")?,
+            relationship_id: text_cell(section, row, "relationship_id")?,
+            relationship_revision: 1,
+        },
+        payload: super::parse_event_payload(
+            &event_type,
+            serde_json::from_str(&text_cell(section, row, "payload")?)?,
+        )?,
+        actor: text_cell(section, row, "actor")?,
+        issuer_origin_db_id: text_cell(section, row, "issuer_origin_db_id")?,
+        occurred_at: text_cell(section, row, "occurred_at")?,
+        ingested_at: text_cell(section, row, "ingested_at")?,
+    };
+    Ok(RelationshipReplayEvent {
+        event,
+        act: optional_integer_cell(section, row, "act")?,
+    })
+}
+
+/// Decode the carried `relationship_federation_events` companion section into
+/// the exact `(issuer_origin_db_id, event_id)` identity set
+/// [`replay_relationship_events`] routes through the receiver-resolved
+/// federated path.
+///
+/// The section is pinned by name, format, revision, ordered columns and
+/// primary key before any cell is read. Both identity cells must be `TEXT`, and
+/// every identity must be unique and must name a carried relationship event:
+/// the companion closure is only reachable through the act section, so a
+/// federation row that names no carried event is a fabricated row, not a
+/// legitimate federated identity, and is refused.
+pub(crate) fn relationship_federation_identities_from_section(
+    section: &Section,
+    carried_events: &[RelationshipReplayEvent],
+) -> Result<BTreeSet<(String, String)>> {
+    pin_relationship_section(
+        section,
+        RELATIONSHIP_FEDERATION_EVENTS_SECTION,
+        &RELATIONSHIP_FEDERATION_EVENTS_SECTION_COLUMNS,
+        &RELATIONSHIP_FEDERATION_EVENTS_SECTION_PRIMARY_KEY,
+    )?;
+    let carried = carried_events
+        .iter()
+        .map(|event| (event.issuer_origin_db_id.as_str(), event.event_id.as_str()))
+        .collect::<BTreeSet<_>>();
+    let mut identities = BTreeSet::new();
+    for row in &section.rows {
+        let issuer_origin_db_id = text_cell(section, row, "issuer_origin_db_id")?;
+        let event_id = text_cell(section, row, "event_id")?;
+        if !carried.contains(&(issuer_origin_db_id.as_str(), event_id.as_str())) {
+            return Err(Error::engine(
+                "carried relationship_federation_events row does not name a carried relationship event",
+            ));
+        }
+        if !identities.insert((issuer_origin_db_id, event_id)) {
+            return Err(Error::engine(
+                "carried relationship_federation_events repeats a federation identity",
+            ));
+        }
+    }
+    Ok(identities)
+}
+
+/// Fold authoritative rows into an empty relationship projection while
+/// preserving their workspace acts verbatim. This path deliberately does
+/// not advance `act_state`; durable restore callers own that singleton,
+/// while conformance and receipt reconstruction use disposable scratch DBs.
 pub(crate) async fn replay_relationship_events(
     tx: &mut Transaction<'_, Sqlite>,
-    events: &[RelationshipEventSpec],
+    events: &[RelationshipReplayEvent],
     federated_events: &std::collections::BTreeSet<(String, String)>,
 ) -> Result<()> {
     for event in events {
         if federated_events.contains(&(event.issuer_origin_db_id.clone(), event.event_id.clone())) {
-            super::persistence::append_federated_relationship_event_in(tx, event).await?;
+            super::persistence::replay_federated_relationship_event_in(tx, &event.event, event.act)
+                .await?;
         } else {
-            super::persistence::replay_relationship_event_in(tx, event).await?;
+            super::persistence::replay_relationship_event_in(tx, &event.event, event.act).await?;
         }
+    }
+    Ok(())
+}
+
+/// Re-derive receiver-local admission state for exactly the freshly replayed
+/// relationship events, in the order they were replayed.
+///
+/// This is the bounded counterpart of
+/// [`initialize_receiver_local_state_after_import_in`]: it never scans the
+/// whole relationship log and never recomputes an unrelated relationship. It
+/// reuses the same per-event admission seam the live validity and output paths
+/// call, so a newly replayed assertion's `relationship_local_admissions` row is
+/// upgraded from the placeholder `unresolved` state that `apply_event_in`
+/// inserted exactly as the live writer leaves it before the admission refresh.
+/// A non-assertion event is a no-op inside the per-event seam.
+pub(crate) async fn initialize_receiver_local_state_for_replayed_events_in(
+    tx: &mut Transaction<'_, Sqlite>,
+    events: &[RelationshipReplayEvent],
+) -> Result<()> {
+    for event in events {
+        refresh_receiver_local_admission_for_event_in(
+            tx,
+            &event.issuer_origin_db_id,
+            &event.event_id,
+        )
+        .await?;
     }
     Ok(())
 }

@@ -8,18 +8,19 @@ remain connected, inspectable and available to later contributors. People can
 bring different agents to the same work, inspect its history and attribution,
 and correct what the workspace holds.
 
-That shared state is the basis for work that continues across agents and
-sessions, views shaped around different questions, and feedback that helps
-agents repair some proposed contributions. The sections below distinguish
-current foundations from further possibilities.
+A later contributor can search or query for the records relevant to a question
+instead of replaying the conversation that produced them. Their connections,
+history and attribution help the contributor judge what still applies: a newer
+decision can supersede an older one while the original rationale remains
+available. This can make working context more focused, provided someone records
+important changes and the next contributor retrieves and assesses them.
 
 You work with Native through a connected agent and the browser app. An agent
 can retrieve project context, record a decision, update a task or leave a
-handoff; people can inspect and correct those contributions. For example, a
-changed decision can live beside the work it affects, so a later contributor
-can discover what superseded the old answer and why. Someone or something
-still has to record the correction, and the next contributor still has to
-retrieve and assess it.
+handoff; people can inspect and correct those contributions. That shared state
+supports work across agents and sessions, views shaped around different
+questions, and feedback that helps agents repair some proposed contributions.
+The sections below distinguish current foundations from further possibilities.
 
 ## What Native makes possible
 
@@ -49,10 +50,19 @@ presentation preserves the underlying records and their history; a compatible
 Collection can supply another dataset to the same view. Separate renders can
 observe different revisions or caller-authorized subsets.
 
-MDX provides bounded components and mediated interactions; HTML consumes
-read-only inputs. The host owns authorization, writes, provenance and audit.
-These mechanisms support adaptable tools. They do not demonstrate the imagined
-launch tools or effortless replacement of the whole Workbench shell.
+MDX provides bounded components and mediated interactions. HTML can consume
+named inputs, and its v2 runtime can request typed interactions that the host
+reviews and settles. The host owns authorization, writes, provenance and
+audit. These mechanisms support adaptable tools; they do not demonstrate the
+imagined launch tools or replacement of the whole Workbench shell.
+
+An [experimental agent-authored tab proof](docs/capability-map.md#agent-authored-tabs)
+takes a narrower step toward that possibility. An agent can author an HTML
+view over declared inputs; the selected source includes two read-only package
+examples and backend rules for pinned installation, sample preview, personal
+adoption and governed reads. The alpha browser shell that hosts tabs is held
+outside this snapshot. The examples do not establish a general plugin
+marketplace, workspace-wide installs or an interactive tab product.
 
 **Further possibility.** Ask an agent to adapt a tool around your working
 habits, then carry the useful presentation into another project. A timeline
@@ -188,7 +198,7 @@ setup details, use the [plugin installation guide](https://github.com/withnative
 | Maturity | Included surface |
 |---|---|
 | **Current — included here** | A portable SQLite reference node, the `mcp-stdio` local MCP server, the public MCP tool implementation, event-authoritative history and rebuildable projections, lexical search and structured retrieval, complete-database `export_snapshot`, the conformance runner, and public documentation and boundary enforcement. |
-| **Experimental — included here** | Federation wire schemas and fixtures, a replaceable encrypted relay reference implementation, bounded record-diff and suggestion-review MCP Apps, and the default-on agent-intent experiment. These are not operated directory, trust, or custody services. |
+| **Experimental — included here** | Federation wire schemas and fixtures, a replaceable encrypted relay reference implementation, bounded record-diff and suggestion-review MCP Apps, selected backend rules and proof packages for agent-authored alpha tabs, and the default-on agent-intent experiment. The alpha tab host is held; the federation work is not an operated directory, trust, or custody service. |
 | **Partial / spike — included here** | Bounded Postgres and exact-local Turso adapters. Unsupported operations fail closed; these are not interchangeable backends. |
 | **Hosted elsewhere / held** | Native-operated hosting, accounts and authentication, hosted backup and runtime composition, and the full commercial Workbench exist outside this snapshot. |
 

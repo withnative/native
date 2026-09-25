@@ -48,7 +48,7 @@ test = false
 name = "mcp-stdio"
 path = "src/bin/mcp_stdio.rs"
 
-# The four binaries below are codegen checkers, not product surfaces. Each
+# The development binaries below are codegen/evaluation tools, not product surfaces. Each
 # [[bin]] is a separate link of the full library — the memory-heavy phase
 # sccache can never cache — so they are gated behind the empty `dev-tools`
 # feature (task 7fe5091): a plain `cargo build`/`cargo test` skips every one of
@@ -77,6 +77,12 @@ required-features = ["dev-tools"]
 name = "guide-corpus"
 path = "src/bin/guide_corpus.rs"
 required-features = ["dev-tools"]
+
+[[bin]]
+name = "relationship-lint"
+path = "src/bin/relationship_lint.rs"
+required-features = ["dev-tools"]
+test = false
 
 # Cold-open cost of one large `native.mdx.v2` board: a measurement tool, not a
 # product surface and not a test. Gated behind `dev-tools` for the same reason

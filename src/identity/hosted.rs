@@ -32,6 +32,7 @@ pub use cleanup::{
 pub enum HostedMembershipRole {
     Owner,
     Member,
+    Guest,
 }
 
 /// Immutable source of a hosted membership arrival.
@@ -62,6 +63,9 @@ impl HostedMembershipArrival {
                 }
                 HostedMembershipRole::Member => {
                     crate::instruction_templates::TrustedMembershipRole::Member
+                }
+                HostedMembershipRole::Guest => {
+                    crate::instruction_templates::TrustedMembershipRole::Guest
                 }
             },
             source: match source {
@@ -304,6 +308,7 @@ async fn resolve_account_identity_inner_with_principal(
     // Never upgrade the read snapshot: repair re-reads all state under the
     // existing serialized transaction, preserving atomic invariant checks.
     let mut tx = crate::db::begin_write(db.write_pool()).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
 
     let email_binding =
         sqlx::query("SELECT record_id FROM bindings WHERE system = 'email' AND identifier = ?")
@@ -316,13 +321,15 @@ async fn resolve_account_identity_inner_with_principal(
             let record_id = binding.try_get::<String, _>("record_id")?;
             require_live_person(&mut tx, &format!("email '{email}'"), &record_id).await?;
             let (account_token, account_repaired) =
-                ensure_canonical_account(&mut tx, catalog_user_id, &record_id).await?;
+                ensure_canonical_account(&mut tx, catalog_user_id, &record_id, &mut act_alloc)
+                    .await?;
             // A hit proves this resolver has already provisioned or adopted the
             // identity. Never rescan the append-only history here: validate an
             // alias when one exists, but keep normal connects O(bindings lookup).
             validate_existing_legacy_alias(&mut tx, catalog_user_id, &record_id).await?;
             let alias_inserted = if account_repaired {
-                migrate_legacy_actor_alias(&mut tx, catalog_user_id, &record_id).await?
+                migrate_legacy_actor_alias(&mut tx, catalog_user_id, &record_id, &mut act_alloc)
+                    .await?
             } else {
                 false
             };
@@ -357,6 +364,7 @@ async fn resolve_account_identity_inner_with_principal(
                     }),
                     actor: Some(account_token.clone()),
                 },
+                &mut act_alloc,
             )
             .await?;
             crate::identity::add_binding_internal_in(
@@ -367,6 +375,7 @@ async fn resolve_account_identity_inner_with_principal(
                 "email",
                 email,
                 true,
+                &mut act_alloc,
             )
             .await?;
             crate::identity::add_binding_internal_in(
@@ -377,20 +386,28 @@ async fn resolve_account_identity_inner_with_principal(
                 "account",
                 &account_token,
                 true,
+                &mut act_alloc,
             )
             .await?;
             // Provisioning is the one migration boundary. The resolver-created
             // email binding is the durable proof that this unindexed legacy scan
             // has already happened and must not run again on future connects.
             let alias_inserted =
-                migrate_legacy_actor_alias(&mut tx, catalog_user_id, &record_id).await?;
+                migrate_legacy_actor_alias(&mut tx, catalog_user_id, &record_id, &mut act_alloc)
+                    .await?;
             (account_token, record_id, true, alias_inserted, false)
         };
 
     let principal_changed = match public_principal {
         Some(principal) => {
-            ensure_canonical_principal(&mut tx, &account_token, &person_record_id, principal)
-                .await?
+            ensure_canonical_principal(
+                &mut tx,
+                &account_token,
+                &person_record_id,
+                principal,
+                &mut act_alloc,
+            )
+            .await?
         }
         None => false,
     };
@@ -402,6 +419,7 @@ async fn resolve_account_identity_inner_with_principal(
             &account_token,
             &person_record_id,
             crate::instruction_templates::MemberProvisioningAuthority::Hosted(&arrival.0),
+            &mut act_alloc,
         )
         .await?
     } else {
@@ -434,6 +452,7 @@ async fn reconciled_identity_in_read_snapshot(
     public_principal: Option<&str>,
 ) -> Result<Option<String>> {
     let mut tx = db.pool().begin().await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
     let person: Option<String> =
         sqlx::query_scalar("SELECT record_id FROM bindings WHERE system='email' AND identifier=?")
             .bind(email)
@@ -497,6 +516,7 @@ async fn reconciled_identity_in_read_snapshot(
             &account,
             &person,
             crate::instruction_templates::MemberProvisioningAuthority::Hosted(&arrival.0),
+            &mut act_alloc,
         )
         .await?;
     }
@@ -508,6 +528,7 @@ async fn ensure_canonical_account(
     tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
     catalog_user_id: &str,
     record_id: &str,
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<(String, bool)> {
     let rows = sqlx::query(
         "SELECT identifier FROM bindings
@@ -559,6 +580,7 @@ async fn ensure_canonical_account(
                 "account",
                 &token,
                 true,
+            act_alloc,
             )
             .await?;
             Ok((token, true))
@@ -575,6 +597,7 @@ async fn ensure_canonical_principal(
     actor: &str,
     record_id: &str,
     public_principal: &str,
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<bool> {
     // Validate the provider output even on a no-op, rather than trusting an
     // injected or future remote provider to obey the binding grammar.
@@ -597,6 +620,7 @@ async fn ensure_canonical_principal(
                 "native-principal",
                 &normalized,
                 true,
+                act_alloc,
             )
             .await
         }
@@ -671,6 +695,7 @@ async fn migrate_legacy_actor_alias(
     tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
     catalog_user_id: &str,
     record_id: &str,
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<bool> {
     #[cfg(test)]
     LEGACY_SCAN_COUNT
@@ -707,6 +732,7 @@ async fn migrate_legacy_actor_alias(
         "account",
         catalog_user_id,
         false,
+        act_alloc,
     )
     .await?;
     Ok(true)
@@ -1676,6 +1702,217 @@ mod tests {
                 );
             })
             .await;
+        db.close().await;
+    }
+}
+
+#[cfg(test)]
+mod guest_provisioning_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn guest_arrival_provisions_no_private_context_and_gets_guest_programme() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let arrival = HostedMembershipArrival::new(
+            HostedMembershipRole::Guest,
+            HostedMembershipSource::Invitation,
+            crate::store::now_iso(),
+        )
+        .unwrap();
+        let account =
+            reconcile_hosted_identity(&db, "guest@example.com", "catalog-guest", &arrival, None)
+                .await
+                .unwrap();
+
+        // No personal workspace: no member context, no private root.
+        let contexts: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM member_contexts WHERE account_id = ?")
+                .bind(&account)
+                .fetch_one(db.write_pool())
+                .await
+                .unwrap();
+        assert_eq!(contexts, 0);
+        let private_roots: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM records WHERE type = 'Collection' AND name = 'My agent context'",
+        )
+        .fetch_one(db.write_pool())
+        .await
+        .unwrap();
+        assert_eq!(private_roots, 0);
+
+        // The arrival obligation lands on the guest programme, not member's.
+        let programme: String =
+            sqlx::query_scalar("SELECT programme_id FROM member_obligations WHERE account_id = ?")
+                .bind(&account)
+                .fetch_one(db.write_pool())
+                .await
+                .unwrap();
+        assert_eq!(programme, crate::instruction_templates::GUEST_PROGRAMME_ID);
+
+        // The guest guidance template seeded with the programme.
+        let guidance: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM records WHERE id = 'native:onboarding-guest-guidance'",
+        )
+        .fetch_one(db.write_pool())
+        .await
+        .unwrap();
+        assert_eq!(guidance, 1);
+
+        // Second reconcile is read-only: the guest readiness path requires
+        // the obligation only, never a member context.
+        let before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM content_events")
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap();
+        let again =
+            reconcile_hosted_identity(&db, "guest@example.com", "catalog-guest", &arrival, None)
+                .await
+                .unwrap();
+        assert_eq!(again, account);
+        let after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM content_events")
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap();
+        assert_eq!(after, before);
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn older_database_grows_the_guest_programme_on_next_provisioning() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let owner_arrival = HostedMembershipArrival::new(
+            HostedMembershipRole::Owner,
+            HostedMembershipSource::Personal,
+            crate::store::now_iso(),
+        )
+        .unwrap();
+        reconcile_hosted_identity(&db, "ada@example.com", "catalog-ada", &owner_arrival, None)
+            .await
+            .unwrap();
+
+        // Simulate a database seeded before the guest programme existed:
+        // remove the guest programme, its sources, and their seed events
+        // (on a real older database those events were never appended, so
+        // removing them here is what makes the simulation faithful — the
+        // re-seed below must be a fresh append, not an idempotency replay).
+        // control_events is append-only by trigger, so the triggers are
+        // saved, dropped, and restored verbatim around the simulation.
+        let triggers: Vec<String> = sqlx::query_scalar(
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger'
+              AND name IN ('control_events_no_update', 'control_events_no_delete')
+              ORDER BY name",
+        )
+        .fetch_all(db.write_pool())
+        .await
+        .unwrap();
+        assert_eq!(triggers.len(), 2);
+        sqlx::query("DROP TRIGGER control_events_no_update")
+            .execute(db.write_pool())
+            .await
+            .unwrap();
+        sqlx::query("DROP TRIGGER control_events_no_delete")
+            .execute(db.write_pool())
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM onboarding_programme_sources WHERE programme_id = ?")
+            .bind(crate::instruction_templates::GUEST_PROGRAMME_ID)
+            .execute(db.write_pool())
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM onboarding_programmes WHERE id = ?")
+            .bind(crate::instruction_templates::GUEST_PROGRAMME_ID)
+            .execute(db.write_pool())
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM control_events WHERE idempotency_key LIKE 'seed:v1:programme%guest-welcome%'")
+            .execute(db.write_pool())
+            .await
+            .unwrap();
+        for trigger in triggers {
+            sqlx::query(&trigger)
+                .execute(db.write_pool())
+                .await
+                .unwrap();
+        }
+
+        // The next provisioning reseeds exactly the missing guest pieces
+        // instead of failing the connect as a partial seed.
+        let guest_arrival = HostedMembershipArrival::new(
+            HostedMembershipRole::Guest,
+            HostedMembershipSource::Invitation,
+            crate::store::now_iso(),
+        )
+        .unwrap();
+        reconcile_hosted_identity(
+            &db,
+            "guest@example.com",
+            "catalog-guest",
+            &guest_arrival,
+            None,
+        )
+        .await
+        .unwrap();
+        let programmes: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM onboarding_programmes WHERE id IN (?,?,?)")
+                .bind(crate::instruction_templates::OWNER_PROGRAMME_ID)
+                .bind(crate::instruction_templates::MEMBER_PROGRAMME_ID)
+                .bind(crate::instruction_templates::GUEST_PROGRAMME_ID)
+                .fetch_one(db.write_pool())
+                .await
+                .unwrap();
+        assert_eq!(programmes, 3);
+        let sources: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM onboarding_programme_sources WHERE programme_id = ?",
+        )
+        .bind(crate::instruction_templates::GUEST_PROGRAMME_ID)
+        .fetch_one(db.write_pool())
+        .await
+        .unwrap();
+        assert_eq!(sources, 1);
+        db.close().await;
+    }
+}
+
+#[cfg(test)]
+mod guest_onboarding_resolution_tests {
+    use super::*;
+
+    /// C2: the guest's own onboarding resolves to a ready stack. Without the
+    /// per-guest guidance grant the guest programme source is unreadable and
+    /// resolve discards the whole stack (invalid); without the layer-0
+    /// exclusion the members-only workspace sources abort it the same way.
+    #[tokio::test]
+    async fn guest_stack_resolves_ready_with_its_own_guidance() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let arrival = HostedMembershipArrival::new(
+            HostedMembershipRole::Guest,
+            HostedMembershipSource::Invitation,
+            crate::store::now_iso(),
+        )
+        .unwrap();
+        let account =
+            reconcile_hosted_identity(&db, "guest@example.com", "catalog-guest", &arrival, None)
+                .await
+                .unwrap();
+        let resolution = crate::instructions::resolve_for_account(db.pool(), &account, false, None)
+            .await
+            .unwrap();
+        assert_eq!(resolution.instructions.status, "ready");
+        assert!(
+            resolution.instructions.entries.iter().any(|entry| {
+                entry.programme_id.as_deref()
+                    == Some(crate::instruction_templates::GUEST_PROGRAMME_ID)
+            }),
+            "guest stack must contain its programme guidance"
+        );
+        assert!(
+            !resolution
+                .instructions
+                .entries
+                .iter()
+                .any(|entry| entry.scope == "workspace"),
+            "guests resolve no workspace agent instructions"
+        );
         db.close().await;
     }
 }

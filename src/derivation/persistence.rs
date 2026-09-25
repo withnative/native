@@ -141,6 +141,7 @@ pub(crate) async fn read_by_key(
 async fn append_derivation_event_on(
     conn: &mut SqliteConnection,
     input: NewDerivationEvent,
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<DerivationEventRow> {
     let event_type = input.payload.event_type().to_string();
     let aggregate_kind = input.payload.aggregate_kind().to_string();
@@ -194,8 +195,8 @@ async fn append_derivation_event_on(
     validate_event(&event)?;
     event.seq = sqlx::query_scalar(
         "INSERT INTO derivation_events
-         (id,idempotency_key,type,schema_version,aggregate_kind,aggregate_id,actor,run_key,reason,payload,created_at)
-         VALUES(?,?,?,?,?,?,?,?,?,?,?) RETURNING seq",
+         (id,idempotency_key,type,schema_version,aggregate_kind,aggregate_id,actor,run_key,reason,payload,created_at,act)
+         VALUES(?,?,?,?,?,?,?,?,?,?,?,?) RETURNING seq",
     )
     .bind(&event.id)
     .bind(&event.idempotency_key)
@@ -208,6 +209,7 @@ async fn append_derivation_event_on(
     .bind(&event.reason)
     .bind(&event.payload)
     .bind(&event.created_at)
+    .bind(act_alloc.get_or_allocate(conn).await?)
     .fetch_one(&mut *conn)
     .await?;
     project_event(conn, &event).await?;
@@ -217,8 +219,9 @@ async fn append_derivation_event_on(
 pub(crate) async fn append_derivation_event_in(
     tx: &mut Transaction<'_, Sqlite>,
     input: NewDerivationEvent,
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<DerivationEventRow> {
-    append_derivation_event_on(tx, input).await
+    append_derivation_event_on(tx, input, act_alloc).await
 }
 
 pub async fn read_all_derivation_events(
@@ -236,14 +239,50 @@ pub async fn read_all_derivation_events(
     .collect()
 }
 
+/// The derivation-only act-range reader: exactly the rows whose `act` falls in
+/// the half-open interval `(from_exclusive, to_inclusive]`, in `seq` order,
+/// decoded by the same [`row_from_sql`] the full reader uses. Legacy rows whose
+/// act is `NULL` never satisfy the strict `act > ?` predicate and are excluded.
+#[allow(dead_code)] // R3 wires the bounded fold; the reader lands ahead of its caller.
+pub(crate) async fn derivation_events_in_act_range(
+    conn: &mut SqliteConnection,
+    from_exclusive_act: i64,
+    to_inclusive_act: i64,
+) -> Result<Vec<DerivationEventRow>> {
+    sqlx::query(
+        "SELECT seq,id,idempotency_key,type,schema_version,aggregate_kind,aggregate_id,
+                actor,run_key,reason,payload,created_at
+           FROM derivation_events WHERE act > ? AND act <= ? ORDER BY seq",
+    )
+    .bind(from_exclusive_act)
+    .bind(to_inclusive_act)
+    .fetch_all(&mut *conn)
+    .await?
+    .into_iter()
+    .map(row_from_sql)
+    .collect()
+}
+
 pub async fn replay_derivations(
     conn: &mut SqliteConnection,
     events: &[DerivationEventRow],
 ) -> Result<()> {
     let mut tx = conn.begin().await?;
-    for event in events {
-        project_event(&mut tx, event).await?;
-    }
+    replay_derivations_in(&mut tx, events).await?;
     tx.commit().await?;
+    Ok(())
+}
+
+/// Replay derivation projections inside a caller-owned transaction.
+///
+/// Canonical interchange import uses this after inserting the authoritative
+/// log so the log and every derived table become visible atomically.
+pub(crate) async fn replay_derivations_in(
+    tx: &mut Transaction<'_, Sqlite>,
+    events: &[DerivationEventRow],
+) -> Result<()> {
+    for event in events {
+        project_event(tx, event).await?;
+    }
     Ok(())
 }

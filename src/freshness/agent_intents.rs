@@ -304,6 +304,16 @@ async fn replay_committed_output(
         .iter()
         .map(|dependency| dependency.dependency_id.clone())
         .collect();
+    // The original commit's act, read from its receipt event so a replay
+    // returns the same act as the call that did the work.
+    let act: Option<i64> = sqlx::query_scalar(
+        "SELECT e.act FROM receipts r JOIN content_events e ON e.id=r.receipt_event_id
+          WHERE r.receipt_id=?",
+    )
+    .bind(payload.receipt_id.as_str())
+    .fetch_optional(&mut *tx)
+    .await?
+    .flatten();
     let committed = CommitDurableOutputResult {
         receipt_id: payload.receipt_id.clone(),
         output_revision: serde_json::from_str(
@@ -318,6 +328,7 @@ async fn replay_committed_output(
         execution: payload.execution,
         disclosure: payload.disclosure,
         high_water: payload.history_high_water,
+        act,
     };
     tx.rollback().await?;
     let explanation = explain_freshness(db, principal, committed.receipt_id.clone()).await?;

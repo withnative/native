@@ -53,18 +53,18 @@ pub use substrate::{
     PostgresMetaEvent, PostgresPolicyEvent,
 };
 
-const SCHEMA_VERSION: i32 = 6;
+const SCHEMA_VERSION: i32 = 7;
 const DATABASE_PROVISION_LOCK: &str = "native-ce:postgres-database-provision:v1";
 const SEEDED_RECORD_TIMESTAMP: &str = "1970-01-01T00:00:00Z";
-const POSTGRES_DESCRIBE_SCHEMA_DDL_COUNT: usize = 54;
+const POSTGRES_DESCRIBE_SCHEMA_DDL_COUNT: usize = 56;
 const POSTGRES_DESCRIBE_SCHEMA_DDL_FINGERPRINT: &str =
-    "3ee20c39d45c4c8d7cf2738685f6b311164264d5ba3ae23d4955e0cfe3e74b6a";
+    "52025443a3641300ddc2e984a05c2b3ed4e3c67178da77cceb32048ba199d56d";
 const POSTGRES_V4_DDL_COUNT: usize = 49;
 const POSTGRES_V4_DDL_FINGERPRINT: &str =
     "9a65675dd0d396a6437fe25d98051303b9a6128fc6686fbb28bdfaff0a5eb553";
 const MAX_MULTI_UPDATE: usize = 100;
 const MAX_MULTI_UPDATE_FAILURE_DETAILS: usize = 20;
-const REQUIRED_RELATIONS: [&str; 35] = [
+const REQUIRED_RELATIONS: [&str; 37] = [
     "schema_migrations",
     "event_cursor",
     "content_events",
@@ -100,6 +100,8 @@ const REQUIRED_RELATIONS: [&str; 35] = [
     "onboarding_programme_sources",
     "notification_candidate_events",
     "notification_candidates",
+    "act_state",
+    "act_cutover",
 ];
 pub const POSTGRES_RUNTIME_CONFIG_FORMAT: &str = "native.postgres-runtime.v1";
 
@@ -121,6 +123,7 @@ struct PostgresCandidateReplayEvent {
     source_event_id: String,
     payload: Value,
     created_at: String,
+    act: Option<i64>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -845,6 +848,13 @@ impl PostgresRuntimeConfig {
             if observed == Some(5) {
                 db.migrate_v5_to_v6().await?;
             }
+            let observed: Option<i32> =
+                sqlx::query_scalar(&format!("SELECT MAX(version) FROM {migrations}"))
+                    .fetch_one(&db.pool)
+                    .await?;
+            if observed == Some(6) {
+                db.migrate_v6_to_v7().await?;
+            }
             let health = db.health().await?;
             if !health.ready || !health.write_ready {
                 db.close().await;
@@ -1333,6 +1343,7 @@ struct PostgresBindingAuditEvent {
     parent_key: Option<String>,
     intent: Option<String>,
     created_at: DateTime<Utc>,
+    act: Option<i64>,
 }
 
 pub type PostgresImportReport = PostgresVerificationReport;
@@ -1343,11 +1354,22 @@ fn postgres_delete_parity_schema(schema: &str) -> Vec<String> {
         format!("CREATE INDEX instruction_bindings_source ON {schema}.instruction_bindings(source_record_id)"),
         format!("CREATE TABLE {schema}.onboarding_programmes (id TEXT PRIMARY KEY,trigger_key TEXT NOT NULL,generation BIGINT NOT NULL DEFAULT 1 CHECK(generation > 0),position BIGINT NOT NULL,enabled BOOLEAN NOT NULL DEFAULT TRUE,created_by TEXT NOT NULL,legacy_baseline_before TIMESTAMPTZ,created_at TIMESTAMPTZ NOT NULL,updated_at TIMESTAMPTZ NOT NULL)"),
         format!("CREATE TABLE {schema}.onboarding_programme_sources (programme_id TEXT NOT NULL REFERENCES {schema}.onboarding_programmes(id) ON DELETE CASCADE,source_record_id TEXT NOT NULL REFERENCES {schema}.records(id),source_role TEXT NOT NULL CHECK(source_role IN ('guidance','completion_criteria')),position BIGINT NOT NULL,PRIMARY KEY(programme_id,source_record_id),UNIQUE(programme_id,position))"),
-        format!("CREATE TABLE {schema}.notification_candidate_events (seq BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,id TEXT NOT NULL UNIQUE,candidate_key TEXT NOT NULL,action TEXT NOT NULL CHECK(action IN ('proposed','suppressed','withdrawn')),recipient_account_id TEXT NOT NULL,message_id TEXT NOT NULL,reason TEXT NOT NULL CHECK(reason IN ('principal_mention','human_obligation','human_intervention','snooze_due','routine_arrival')),priority TEXT NOT NULL CHECK(priority IN ('routine','urgent')),not_before TIMESTAMPTZ,redaction_class TEXT NOT NULL CHECK(redaction_class IN ('metadata_only','minimal_context')),evaluator_kind TEXT NOT NULL CHECK(evaluator_kind IN ('portable_default','recipient_policy','intervention_policy')),policy_version TEXT NOT NULL,source_event_type TEXT NOT NULL,source_event_id TEXT NOT NULL,payload JSONB NOT NULL CHECK(jsonb_typeof(payload)='object'),created_at TIMESTAMPTZ NOT NULL)"),
+        format!("CREATE TABLE {schema}.notification_candidate_events (seq BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,id TEXT NOT NULL UNIQUE,candidate_key TEXT NOT NULL,action TEXT NOT NULL CHECK(action IN ('proposed','suppressed','withdrawn')),recipient_account_id TEXT NOT NULL,message_id TEXT NOT NULL,reason TEXT NOT NULL CHECK(reason IN ('principal_mention','human_obligation','human_intervention','snooze_due','routine_arrival')),priority TEXT NOT NULL CHECK(priority IN ('routine','urgent')),not_before TIMESTAMPTZ,redaction_class TEXT NOT NULL CHECK(redaction_class IN ('metadata_only','minimal_context')),evaluator_kind TEXT NOT NULL CHECK(evaluator_kind IN ('portable_default','recipient_policy','intervention_policy')),policy_version TEXT NOT NULL,source_event_type TEXT NOT NULL,source_event_id TEXT NOT NULL,payload JSONB NOT NULL CHECK(jsonb_typeof(payload)='object'),created_at TIMESTAMPTZ NOT NULL,act BIGINT)"),
         format!("CREATE INDEX notification_candidate_events_recipient ON {schema}.notification_candidate_events(recipient_account_id,seq)"),
         format!("CREATE TRIGGER notification_candidate_events_append_only BEFORE UPDATE OR DELETE ON {schema}.notification_candidate_events FOR EACH ROW EXECUTE FUNCTION {schema}.reject_authoritative_event_mutation()"),
         format!("CREATE TABLE {schema}.notification_candidates (candidate_id TEXT PRIMARY KEY REFERENCES {schema}.notification_candidate_events(id) ON DELETE RESTRICT,candidate_key TEXT NOT NULL UNIQUE,recipient_account_id TEXT NOT NULL,message_id TEXT NOT NULL,reason TEXT NOT NULL,priority TEXT NOT NULL,not_before TIMESTAMPTZ,redaction_class TEXT NOT NULL,evaluator_kind TEXT NOT NULL,policy_version TEXT NOT NULL,source_event_type TEXT NOT NULL,source_event_id TEXT NOT NULL,candidate_event_seq BIGINT NOT NULL UNIQUE,status TEXT NOT NULL CHECK(status IN ('effective','suppressed','withdrawn')),created_at TIMESTAMPTZ NOT NULL)"),
         format!("CREATE INDEX notification_candidates_recipient ON {schema}.notification_candidates(recipient_account_id,candidate_event_seq)"),
+        format!(
+            "CREATE TABLE {schema}.act_state (\
+             singleton SMALLINT PRIMARY KEY CHECK(singleton=1),\
+             next_act BIGINT NOT NULL CHECK(next_act>=0))"
+        ),
+        format!(
+            "CREATE TABLE {schema}.act_cutover (\
+             domain TEXT PRIMARY KEY CHECK(domain IN ('content_events','meta_events','policy_events','control_events','binding_audit','database_identity_audit','notification_candidate_events')),\
+             last_legacy_seq BIGINT NOT NULL CHECK(last_legacy_seq>=0),\
+             cutover_at TIMESTAMPTZ NOT NULL,from_engine_schema INTEGER)"
+        ),
     ]
 }
 
@@ -1406,6 +1428,52 @@ fn postgres_v6_schema(schema: &str) -> Vec<String> {
     ]
 }
 
+/// Act-number stamping (decision 4e152d5) for existing v6 logical databases:
+/// nullable `act` on the seven sequenced event tables this adapter
+/// implements, plus the `act_state` counter and the recorded `act_cutover`.
+/// Existing rows keep NULL acts and stay grouping-unknown.
+fn postgres_v7_schema(schema: &str) -> Vec<String> {
+    let mut statements = Vec::new();
+    for table in [
+        "content_events",
+        "meta_events",
+        "policy_events",
+        "control_events",
+        "binding_audit",
+        "database_identity_audit",
+        "notification_candidate_events",
+    ] {
+        statements.push(format!(
+            "ALTER TABLE {schema}.{table} ADD COLUMN act BIGINT"
+        ));
+    }
+    statements.push(format!(
+        "CREATE TABLE {schema}.act_state (\
+         singleton SMALLINT PRIMARY KEY CHECK(singleton=1),\
+         next_act BIGINT NOT NULL CHECK(next_act>=0))"
+    ));
+    statements.push(format!(
+        "INSERT INTO {schema}.act_state(singleton,next_act) VALUES(1,0)"
+    ));
+    statements.push(format!(
+        "CREATE TABLE {schema}.act_cutover (\
+         domain TEXT PRIMARY KEY CHECK(domain IN ('content_events','meta_events','policy_events','control_events','binding_audit','database_identity_audit','notification_candidate_events')),\
+         last_legacy_seq BIGINT NOT NULL CHECK(last_legacy_seq>=0),\
+         cutover_at TIMESTAMPTZ NOT NULL,from_engine_schema INTEGER)"
+    ));
+    statements.push(format!(
+        "INSERT INTO {schema}.act_cutover(domain,last_legacy_seq,cutover_at,from_engine_schema) \
+         VALUES('binding_audit',(SELECT COALESCE(MAX(seq),0) FROM {schema}.binding_audit),transaction_timestamp(),6),\
+               ('content_events',(SELECT COALESCE(MAX(seq),0) FROM {schema}.content_events),transaction_timestamp(),6),\
+               ('control_events',(SELECT COALESCE(MAX(seq),0) FROM {schema}.control_events),transaction_timestamp(),6),\
+               ('database_identity_audit',(SELECT COALESCE(MAX(seq),0) FROM {schema}.database_identity_audit),transaction_timestamp(),6),\
+               ('meta_events',(SELECT COALESCE(MAX(seq),0) FROM {schema}.meta_events),transaction_timestamp(),6),\
+               ('notification_candidate_events',(SELECT COALESCE(MAX(seq),0) FROM {schema}.notification_candidate_events),transaction_timestamp(),6),\
+               ('policy_events',(SELECT COALESCE(MAX(seq),0) FROM {schema}.policy_events),transaction_timestamp(),6)"
+    ));
+    statements
+}
+
 impl PostgresDb {
     #[cfg(feature = "postgres-tests")]
     #[doc(hidden)]
@@ -1444,6 +1512,46 @@ impl PostgresDb {
             .as_str(),
         )
         .await?;
+        // Rewind the act-number edge alongside the causal edge: drop the
+        // counter and cutover state, then the act columns on the seven
+        // sequenced event tables this adapter implements.
+        tx.execute(
+            format!(
+                "DROP TABLE {}.{}",
+                quote_identifier(&self.schema)?,
+                quote_identifier("act_cutover")?
+            )
+            .as_str(),
+        )
+        .await?;
+        tx.execute(
+            format!(
+                "DROP TABLE {}.{}",
+                quote_identifier(&self.schema)?,
+                quote_identifier("act_state")?
+            )
+            .as_str(),
+        )
+        .await?;
+        for table in [
+            "content_events",
+            "meta_events",
+            "policy_events",
+            "control_events",
+            "binding_audit",
+            "database_identity_audit",
+            "notification_candidate_events",
+        ] {
+            tx.execute(
+                format!(
+                    "ALTER TABLE {}.{} DROP COLUMN act",
+                    quote_identifier(&self.schema)?,
+                    quote_identifier(table)?
+                )
+                .as_str(),
+            )
+            .await?;
+        }
         tx.execute(
             format!(
                 "ALTER TABLE {}.{} DROP COLUMN causal_envelope_version,DROP COLUMN causal_status",
@@ -1454,9 +1562,11 @@ impl PostgresDb {
         )
         .await?;
         tx.execute(format!("DROP INDEX {index}").as_str()).await?;
-        sqlx::query(&format!("DELETE FROM {migrations} WHERE version IN (5,6)"))
-            .execute(&mut *tx)
-            .await?;
+        sqlx::query(&format!(
+            "DELETE FROM {migrations} WHERE version IN (5,6,7)"
+        ))
+        .execute(&mut *tx)
+        .await?;
         sqlx::query(&format!(
             "INSERT INTO {migrations}(version) VALUES(4) ON CONFLICT DO NOTHING"
         ))
@@ -1488,6 +1598,7 @@ impl PostgresDb {
             "home_id":UNFILED_RECORD_ID,
             "persistence":"enduring"
         });
+        let act = allocate_act_in(self, &mut tx).await?;
         let (_, created_at) = append_event(
             self,
             &mut tx,
@@ -1495,6 +1606,7 @@ impl PostgresDb {
             "record.created",
             &created,
             "engine:migration",
+            act,
         )
         .await?;
         apply_projection(
@@ -1521,6 +1633,7 @@ impl PostgresDb {
             "persistence":"enduring",
             "reason":"Exercise portable attribution deletion refusal."
         });
+        let act = allocate_act_in(self, &mut tx).await?;
         let (_, created_at) = append_event(
             self,
             &mut tx,
@@ -1528,6 +1641,7 @@ impl PostgresDb {
             "record.created",
             &created,
             "contract",
+            act,
         )
         .await?;
         apply_projection(
@@ -1545,8 +1659,16 @@ impl PostgresDb {
             "relationship":"part_of",
             "reason":"Bind attribution authorization to its bearer."
         });
-        let (_, linked_at) =
-            append_event(self, &mut tx, record_id, "link.added", &linked, "contract").await?;
+        let (_, linked_at) = append_event(
+            self,
+            &mut tx,
+            record_id,
+            "link.added",
+            &linked,
+            "contract",
+            act,
+        )
+        .await?;
         apply_projection(self, &mut tx, record_id, "link.added", &linked, &linked_at).await?;
         tx.commit().await?;
         self.complete_realtime_commit();
@@ -1882,6 +2004,8 @@ impl PostgresDb {
                 | "onboarding_programme_sources"
                 | "notification_candidate_events"
                 | "notification_candidates"
+                | "act_state"
+                | "act_cutover"
                 | "annotation_targets"
         ) {
             return Err(Error::engine("unknown Postgres substrate table"));
@@ -1914,7 +2038,8 @@ impl PostgresDb {
                  type TEXT NOT NULL, payload JSONB NOT NULL, actor TEXT,run_key TEXT,parent_key TEXT,intent TEXT,\
                  created_at TIMESTAMPTZ NOT NULL DEFAULT transaction_timestamp(),\
                  causal_envelope_version BIGINT NOT NULL CHECK(causal_envelope_version=1),\
-                 causal_status TEXT NOT NULL CHECK(causal_status IN ('complete','import_incomplete','legacy_unknown')))"
+                 causal_status TEXT NOT NULL CHECK(causal_status IN ('complete','import_incomplete','legacy_unknown')),\
+                 act BIGINT)"
             ),
             format!(
                 "CREATE INDEX content_events_record_seq ON {schema}.content_events(record_id, seq)"
@@ -1977,15 +2102,15 @@ impl PostgresDb {
                 "CREATE TABLE {schema}.log_cursors (log_name TEXT PRIMARY KEY CHECK(log_name IN ('content','meta','policy','control')), last_seq BIGINT NOT NULL CHECK(last_seq >= 0))"
             ),
             format!(
-                "CREATE TABLE {schema}.meta_events (seq BIGINT PRIMARY KEY,id TEXT NOT NULL UNIQUE,subject_id TEXT NOT NULL,type TEXT NOT NULL,payload JSONB,actor TEXT,created_at TIMESTAMPTZ NOT NULL)"
+                "CREATE TABLE {schema}.meta_events (seq BIGINT PRIMARY KEY,id TEXT NOT NULL UNIQUE,subject_id TEXT NOT NULL,type TEXT NOT NULL,payload JSONB,actor TEXT,created_at TIMESTAMPTZ NOT NULL,act BIGINT)"
             ),
             format!("CREATE INDEX meta_events_subject_seq ON {schema}.meta_events(subject_id,seq)"),
             format!(
-                "CREATE TABLE {schema}.policy_events (seq BIGINT PRIMARY KEY,id TEXT NOT NULL UNIQUE,record_id TEXT NOT NULL,type TEXT NOT NULL CHECK(type IN ('policy.replaced','policy.inheritance_restored')),payload JSONB,actor TEXT NOT NULL CHECK(btrim(actor) <> ''),reason TEXT NOT NULL CHECK(btrim(reason) <> ''),created_at TIMESTAMPTZ NOT NULL)"
+                "CREATE TABLE {schema}.policy_events (seq BIGINT PRIMARY KEY,id TEXT NOT NULL UNIQUE,record_id TEXT NOT NULL,type TEXT NOT NULL CHECK(type IN ('policy.replaced','policy.inheritance_restored')),payload JSONB,actor TEXT NOT NULL CHECK(btrim(actor) <> ''),reason TEXT NOT NULL CHECK(btrim(reason) <> ''),created_at TIMESTAMPTZ NOT NULL,act BIGINT)"
             ),
             format!("CREATE INDEX policy_events_record_seq ON {schema}.policy_events(record_id,seq)"),
             format!(
-                "CREATE TABLE {schema}.control_events (seq BIGINT PRIMARY KEY,id TEXT NOT NULL UNIQUE,idempotency_key TEXT NOT NULL UNIQUE CHECK(btrim(idempotency_key) <> ''),type TEXT NOT NULL CHECK(btrim(type) <> ''),schema_version BIGINT NOT NULL CHECK(schema_version > 0),aggregate_kind TEXT NOT NULL CHECK(btrim(aggregate_kind) <> ''),aggregate_id TEXT NOT NULL CHECK(btrim(aggregate_id) <> ''),actor TEXT NOT NULL CHECK(btrim(actor) <> ''),run_key TEXT,reason TEXT NOT NULL CHECK(btrim(reason) <> ''),payload JSONB NOT NULL CHECK(jsonb_typeof(payload)='object'),created_at TIMESTAMPTZ NOT NULL)"
+                "CREATE TABLE {schema}.control_events (seq BIGINT PRIMARY KEY,id TEXT NOT NULL UNIQUE,idempotency_key TEXT NOT NULL UNIQUE CHECK(btrim(idempotency_key) <> ''),type TEXT NOT NULL CHECK(btrim(type) <> ''),schema_version BIGINT NOT NULL CHECK(schema_version > 0),aggregate_kind TEXT NOT NULL CHECK(btrim(aggregate_kind) <> ''),aggregate_id TEXT NOT NULL CHECK(btrim(aggregate_id) <> ''),actor TEXT NOT NULL CHECK(btrim(actor) <> ''),run_key TEXT,reason TEXT NOT NULL CHECK(btrim(reason) <> ''),payload JSONB NOT NULL CHECK(jsonb_typeof(payload)='object'),created_at TIMESTAMPTZ NOT NULL,act BIGINT)"
             ),
             format!("CREATE INDEX control_events_aggregate_seq ON {schema}.control_events(aggregate_kind,aggregate_id,seq)"),
             format!(
@@ -2006,14 +2131,14 @@ impl PostgresDb {
                 "CREATE TABLE {schema}.binding_systems (system TEXT PRIMARY KEY,normalizer TEXT NOT NULL,compatible_type TEXT,compatible_kind TEXT,visibility TEXT NOT NULL CHECK(visibility IN ('public','internal','reserved')),add_policy TEXT NOT NULL CHECK(add_policy IN ('record_manage','internal','forbidden')),remove_policy TEXT NOT NULL CHECK(remove_policy IN ('record_manage','internal','forbidden')),canonicalize_policy TEXT NOT NULL CHECK(canonicalize_policy IN ('record_manage','internal','forbidden')),transfer_policy TEXT NOT NULL CHECK(transfer_policy IN ('record_manage','internal','forbidden')),reconciliation_rule TEXT NOT NULL CHECK(reconciliation_rule IN ('binding_only','none')),stub_allowed BOOLEAN NOT NULL,authoritative_provenance BOOLEAN NOT NULL,required_durable BOOLEAN NOT NULL)"
             ),
             format!(
-                "CREATE TABLE {schema}.binding_audit (seq BIGINT PRIMARY KEY,id TEXT NOT NULL UNIQUE,action TEXT NOT NULL CHECK(action IN ('add','remove','canonicalize','transfer')),system TEXT NOT NULL REFERENCES {schema}.binding_systems(system),identifier TEXT NOT NULL CHECK(btrim(identifier) <> ''),old_record_id TEXT,new_record_id TEXT,old_canonical BOOLEAN,new_canonical BOOLEAN,actor TEXT NOT NULL CHECK(btrim(actor) <> ''),reason TEXT NOT NULL CHECK(btrim(reason) <> ''),run_key TEXT,parent_key TEXT,intent TEXT,created_at TIMESTAMPTZ NOT NULL,CHECK((action='add' AND old_record_id IS NULL AND new_record_id IS NOT NULL AND old_canonical IS NULL AND new_canonical IS NOT NULL) OR (action='remove' AND old_record_id IS NOT NULL AND new_record_id IS NULL AND old_canonical IS NOT NULL AND new_canonical IS NULL) OR (action='transfer' AND old_record_id IS NOT NULL AND new_record_id IS NOT NULL AND old_record_id<>new_record_id AND old_canonical=new_canonical) OR (action='canonicalize' AND old_record_id=new_record_id AND old_canonical<>new_canonical)))"
+                "CREATE TABLE {schema}.binding_audit (seq BIGINT PRIMARY KEY,id TEXT NOT NULL UNIQUE,action TEXT NOT NULL CHECK(action IN ('add','remove','canonicalize','transfer')),system TEXT NOT NULL REFERENCES {schema}.binding_systems(system),identifier TEXT NOT NULL CHECK(btrim(identifier) <> ''),old_record_id TEXT,new_record_id TEXT,old_canonical BOOLEAN,new_canonical BOOLEAN,actor TEXT NOT NULL CHECK(btrim(actor) <> ''),reason TEXT NOT NULL CHECK(btrim(reason) <> ''),run_key TEXT,parent_key TEXT,intent TEXT,created_at TIMESTAMPTZ NOT NULL,act BIGINT,CHECK((action='add' AND old_record_id IS NULL AND new_record_id IS NOT NULL AND old_canonical IS NULL AND new_canonical IS NOT NULL) OR (action='remove' AND old_record_id IS NOT NULL AND new_record_id IS NULL AND old_canonical IS NOT NULL AND new_canonical IS NULL) OR (action='transfer' AND old_record_id IS NOT NULL AND new_record_id IS NOT NULL AND old_record_id<>new_record_id AND old_canonical=new_canonical) OR (action='canonicalize' AND old_record_id=new_record_id AND old_canonical<>new_canonical)))"
             ),
             format!("CREATE TRIGGER binding_audit_append_only BEFORE UPDATE OR DELETE ON {schema}.binding_audit FOR EACH ROW EXECUTE FUNCTION {schema}.reject_authoritative_event_mutation()"),
             format!(
                 "CREATE TABLE {schema}.database_identity (singleton SMALLINT PRIMARY KEY CHECK(singleton=1),origin_db_id TEXT NOT NULL UNIQUE CHECK(origin_db_id ~ '^ndb_[0-9a-f]{{32}}$'),created_at TIMESTAMPTZ NOT NULL)"
             ),
             format!(
-                "CREATE TABLE {schema}.database_identity_audit (seq BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,id TEXT NOT NULL UNIQUE,action TEXT NOT NULL CHECK(action IN ('mint','rekey')),old_origin_db_id TEXT,new_origin_db_id TEXT NOT NULL CHECK(new_origin_db_id ~ '^ndb_[0-9a-f]{{32}}$'),actor TEXT NOT NULL CHECK(btrim(actor) <> ''),reason TEXT NOT NULL CHECK(btrim(reason) <> ''),run_key TEXT,parent_key TEXT,intent TEXT,created_at TIMESTAMPTZ NOT NULL,CHECK((action='mint' AND old_origin_db_id IS NULL) OR (action='rekey' AND old_origin_db_id IS NOT NULL AND old_origin_db_id<>new_origin_db_id)))"
+                "CREATE TABLE {schema}.database_identity_audit (seq BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,id TEXT NOT NULL UNIQUE,action TEXT NOT NULL CHECK(action IN ('mint','rekey')),old_origin_db_id TEXT,new_origin_db_id TEXT NOT NULL CHECK(new_origin_db_id ~ '^ndb_[0-9a-f]{{32}}$'),actor TEXT NOT NULL CHECK(btrim(actor) <> ''),reason TEXT NOT NULL CHECK(btrim(reason) <> ''),run_key TEXT,parent_key TEXT,intent TEXT,created_at TIMESTAMPTZ NOT NULL,act BIGINT,CHECK((action='mint' AND old_origin_db_id IS NULL) OR (action='rekey' AND old_origin_db_id IS NOT NULL AND old_origin_db_id<>new_origin_db_id)))"
             ),
             format!(
                 "CREATE TABLE {schema}.record_policies (record_id TEXT PRIMARY KEY REFERENCES {schema}.records(id) ON DELETE CASCADE,created_at TIMESTAMPTZ NOT NULL DEFAULT transaction_timestamp())"
@@ -2066,6 +2191,23 @@ impl PostgresDb {
         sqlx::query(&format!(
             "INSERT INTO {schema}.content_event_causal_cutover(singleton,last_legacy_local_seq,cutover_at,from_engine_schema) \
              VALUES(1,0,transaction_timestamp(),NULL)"
+        ))
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(&format!(
+            "INSERT INTO {schema}.act_state(singleton,next_act) VALUES(1,0)"
+        ))
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(&format!(
+            "INSERT INTO {schema}.act_cutover(domain,last_legacy_seq,cutover_at,from_engine_schema) \
+             VALUES('binding_audit',0,transaction_timestamp(),NULL),\
+                   ('content_events',0,transaction_timestamp(),NULL),\
+                   ('control_events',0,transaction_timestamp(),NULL),\
+                   ('database_identity_audit',0,transaction_timestamp(),NULL),\
+                   ('meta_events',0,transaction_timestamp(),NULL),\
+                   ('notification_candidate_events',0,transaction_timestamp(),NULL),\
+                   ('policy_events',0,transaction_timestamp(),NULL)"
         ))
         .execute(&mut *tx)
         .await?;
@@ -2162,6 +2304,31 @@ impl PostgresDb {
             tx.execute(statement.as_str()).await?;
         }
         sqlx::query(&format!("INSERT INTO {migrations}(version) VALUES(6)"))
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        self.complete_realtime_commit();
+        Ok(())
+    }
+
+    async fn migrate_v6_to_v7(&self) -> Result<()> {
+        let schema = quote_identifier(&self.schema)?;
+        let migrations = self.qualified_table("schema_migrations")?;
+        let mut tx = self.pool.begin().await?;
+        let observed: Option<i32> = sqlx::query_scalar(&format!(
+            "SELECT version FROM {migrations} ORDER BY version DESC LIMIT 1 FOR UPDATE"
+        ))
+        .fetch_optional(&mut *tx)
+        .await?;
+        if observed != Some(6) {
+            return Err(Error::engine(
+                "Postgres schema v6-to-v7 migration requires exact source version 6",
+            ));
+        }
+        for statement in postgres_v7_schema(&schema) {
+            tx.execute(statement.as_str()).await?;
+        }
+        sqlx::query(&format!("INSERT INTO {migrations}(version) VALUES(7)"))
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
@@ -2276,15 +2443,17 @@ impl PostgresDb {
         )
         .execute(&mut *tx)
         .await?;
+        let act = allocate_act_in(self, &mut tx).await?;
         for (system, identifier) in [("account", account_id), ("native-principal", principal_id)] {
             sqlx::query(&format!(
-                "INSERT INTO {audit}(seq,id,action,system,identifier,new_record_id,new_canonical,actor,reason,created_at) \
-                 VALUES((SELECT COALESCE(MAX(seq),0)+1 FROM {audit}),$1,'add',$2,$3,$4,TRUE,'native:provisioner','Provision member identity bindings.',transaction_timestamp())"
+                "INSERT INTO {audit}(seq,id,action,system,identifier,new_record_id,new_canonical,actor,reason,created_at,act) \
+                 VALUES((SELECT COALESCE(MAX(seq),0)+1 FROM {audit}),$1,'add',$2,$3,$4,TRUE,'native:provisioner','Provision member identity bindings.',transaction_timestamp(),$5)"
             ))
             .bind(Uuid::new_v4().to_string())
             .bind(system)
             .bind(identifier)
             .bind(person_id)
+            .bind(act)
             .execute(&mut *tx)
             .await?;
         }
@@ -2410,9 +2579,10 @@ impl PostgresDb {
                     "unsupported Postgres canonical event type {event_type}"
                 )));
             }
+            let act = optional_integer_cell(events_section, row, "act")?;
             sqlx::query(&format!(
-                "INSERT INTO {events}(seq,id,record_id,type,payload,actor,run_key,parent_key,intent,created_at,causal_envelope_version,causal_status) \
-                 VALUES($1,$2,$3,$4,$5::jsonb,$6,$7,$8,$9,$10::timestamptz,$11,$12)"
+                "INSERT INTO {events}(seq,id,record_id,type,payload,actor,run_key,parent_key,intent,created_at,causal_envelope_version,causal_status,act) \
+                 VALUES($1,$2,$3,$4,$5::jsonb,$6,$7,$8,$9,$10::timestamptz,$11,$12,$13)"
             ))
             .bind(seq)
             .bind(id)
@@ -2426,6 +2596,7 @@ impl PostgresDb {
             .bind(created_at)
             .bind(causal_envelope_version)
             .bind(causal_status)
+            .bind(act)
             .execute(&mut *tx)
             .await?;
             apply_projection(self, &mut tx, record_id, event_type, &payload, created_at).await?;
@@ -2487,6 +2658,7 @@ impl PostgresDb {
         .bind(last_seq)
         .execute(&mut *tx)
         .await?;
+        self.import_act_state(&mut tx, interchange).await?;
 
         // The policy lands after the events it must govern, mirroring the
         // SQLite importer's ordering: a strict policy becomes real only once
@@ -2499,6 +2671,72 @@ impl PostgresDb {
         self.complete_realtime_commit();
         self.assert_replay_equivalent().await?;
         Ok(report)
+    }
+
+    /// Materialize the act counter and cutover from a validated (revision 5)
+    /// bundle. The counter resumes above every imported act so later local
+    /// writes never collide with imported grouping; the cutover rows cover
+    /// the seven sequenced domains this adapter implements.
+    async fn import_act_state(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        interchange: &ValidatedInterchange,
+    ) -> Result<()> {
+        let state_section = required_section(interchange, "act_state")?;
+        if state_section.rows.len() != 1 {
+            return Err(Error::engine(
+                "Postgres canonical import requires exactly one act counter row",
+            ));
+        }
+        let next_act = integer(state_section, &state_section.rows[0], "next_act")?;
+        let state = self.qualified_table("act_state")?;
+        sqlx::query(&format!("DELETE FROM {state}"))
+            .execute(&mut **tx)
+            .await?;
+        sqlx::query(&format!(
+            "INSERT INTO {state}(singleton,next_act) VALUES(1,$1)"
+        ))
+        .bind(next_act)
+        .execute(&mut **tx)
+        .await?;
+        let cutover_section = required_section(interchange, "act_cutover")?;
+        let cutover = self.qualified_table("act_cutover")?;
+        sqlx::query(&format!("DELETE FROM {cutover}"))
+            .execute(&mut **tx)
+            .await?;
+        for domain in [
+            "content_events",
+            "meta_events",
+            "policy_events",
+            "control_events",
+            "binding_audit",
+            "database_identity_audit",
+            "notification_candidate_events",
+        ] {
+            let Some(row) = cutover_section
+                .rows
+                .iter()
+                .find(|row| text(cutover_section, row, "domain").is_ok_and(|d| d == domain))
+            else {
+                return Err(Error::engine(format!(
+                    "Postgres canonical import is missing the act cutover row for {domain}"
+                )));
+            };
+            sqlx::query(&format!(
+                "INSERT INTO {cutover}(domain,last_legacy_seq,cutover_at,from_engine_schema)                  VALUES($1,$2,$3::timestamptz,$4)"
+            ))
+            .bind(domain)
+            .bind(integer(cutover_section, row, "last_legacy_seq")?)
+            .bind(text(cutover_section, row, "cutover_at")?)
+            .bind(optional_integer_cell(
+                cutover_section,
+                row,
+                "from_engine_schema",
+            )?)
+            .execute(&mut **tx)
+            .await?;
+        }
+        Ok(())
     }
 
     async fn import_portability_policy(
@@ -2573,6 +2811,8 @@ impl PostgresDb {
                     "content_events"
                         | "content_event_causal_frontier"
                         | "content_event_causal_cutover"
+                        | "act_state"
+                        | "act_cutover"
                         | "records"
                         | "facet_values"
                         | "storage_portability_policy"
@@ -2598,6 +2838,7 @@ impl PostgresDb {
                         "actor",
                         "causal_envelope_version",
                         "causal_status",
+                        "act",
                         "created_at",
                     ]
                     .into_iter()
@@ -2697,7 +2938,7 @@ impl PostgresDb {
         let records = self.qualified_table("records")?;
         let facets = self.qualified_table("facet_values")?;
         let event_rows = sqlx::query(&format!(
-            "SELECT seq,id,record_id,type,payload::text AS payload,actor,run_key,parent_key,intent,causal_envelope_version,causal_status,\
+            "SELECT seq,id,record_id,type,payload::text AS payload,actor,run_key,parent_key,intent,causal_envelope_version,causal_status,act,\
                     (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_at_micros \
              FROM {events} ORDER BY seq"
         ))
@@ -2717,6 +2958,7 @@ impl PostgresDb {
                 "intent": row.try_get::<Option<String>, _>("intent")?,
                 "causal_envelope_version": row.try_get::<i64, _>("causal_envelope_version")?,
                 "causal_status": row.try_get::<String, _>("causal_status")?,
+                "act": row.try_get::<Option<i64>, _>("act")?,
                 "created_at_micros": row.try_get::<i64, _>("created_at_micros")?,
             }));
         }
@@ -2919,7 +3161,7 @@ impl PostgresDb {
                     .get(&event.id)
                     .ok_or_else(|| Error::engine("Postgres replay lost content causality"))?;
                 sqlx::query(&format!(
-                    "INSERT INTO {rebuilt_events}(seq,id,record_id,type,payload,actor,run_key,parent_key,intent,created_at,causal_envelope_version,causal_status) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::timestamptz,$11,$12)"
+                    "INSERT INTO {rebuilt_events}(seq,id,record_id,type,payload,actor,run_key,parent_key,intent,created_at,causal_envelope_version,causal_status,act) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::timestamptz,$11,$12,$13)"
                 ))
                 .bind(event.seq)
                 .bind(event.id)
@@ -2933,6 +3175,7 @@ impl PostgresDb {
                 .bind(&event.created_at)
                 .bind(causal_version)
                 .bind(causal_status)
+                .bind(event.act)
                 .execute(&mut *tx)
                 .await?;
                 apply_projection(
@@ -2986,6 +3229,7 @@ impl PostgresDb {
                         payload: event.payload.unwrap_or(Value::Null),
                         actor: event.actor,
                         created_at: event.created_at,
+                        act: event.act,
                     })
                     .await?;
             }
@@ -2999,6 +3243,7 @@ impl PostgresDb {
                         actor: event.actor.unwrap_or_default(),
                         reason: event.reason.unwrap_or_default(),
                         created_at: event.created_at,
+                        act: event.act,
                     })
                     .await?;
             }
@@ -3016,6 +3261,7 @@ impl PostgresDb {
                         reason: event.reason.unwrap_or_default(),
                         payload: event.payload.unwrap_or(Value::Null),
                         created_at: event.created_at,
+                        act: event.act,
                     })
                     .await?;
             }
@@ -3092,7 +3338,7 @@ impl PostgresDb {
                     }
                 }
                 sqlx::query(&format!(
-                    "INSERT INTO {rebuilt_binding_audit}(seq,id,action,system,identifier,old_record_id,new_record_id,old_canonical,new_canonical,actor,reason,run_key,parent_key,intent,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)"
+                    "INSERT INTO {rebuilt_binding_audit}(seq,id,action,system,identifier,old_record_id,new_record_id,old_canonical,new_canonical,actor,reason,run_key,parent_key,intent,created_at,act) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)"
                 ))
                 .bind(event.seq)
                 .bind(event.id)
@@ -3109,6 +3355,7 @@ impl PostgresDb {
                 .bind(event.parent_key)
                 .bind(event.intent)
                 .bind(event.created_at)
+                .bind(event.act)
                 .execute(&mut *tx)
                 .await?;
             }
@@ -3135,13 +3382,213 @@ impl PostgresDb {
         }
     }
 
+    /// The content-domain rebuild-and-diff: replay the live `content_events`
+    /// log from seq 0 through the same projector every live mutation uses
+    /// ([`apply_projection`]) into a FRESH scratch schema, then compare every
+    /// column of every content projection against the live snapshot taken from
+    /// the same transaction as the log. Drift between the stored log and the
+    /// stored projections becomes a failing check instead of a silent
+    /// corruption.
+    ///
+    /// This is the Postgres analogue of `src/conformance/rebuild.rs`, ported
+    /// column-list first. It is deliberately narrower than
+    /// [`PostgresDb::assert_replay_equivalent`], which folds every tier and
+    /// compares a whole logical snapshot: this check states, per column and
+    /// per table, exactly which content projection the log must reproduce, and
+    /// it names what it does not compare.
+    ///
+    /// Named exclusions, each a decision rather than an omission:
+    ///
+    /// - `records.policy_anchor_id`: a derived authorization index. The
+    ///   independent policy log (`policy.replaced` /
+    ///   `policy.inheritance_restored`, plus recursive propagation) rewrites it
+    ///   outside the content log, so a content-only replay neither can nor
+    ///   should reproduce it. The SQLite check makes the same exclusion.
+    /// - `record_policies`, `policy_entries`: the policy tier's own
+    ///   projections, with their own log and fold. Content replay only ever
+    ///   touches the root policy seed, and that is reproduced by the same
+    ///   `migrate` genesis the live database ran (see the genesis note below),
+    ///   not by a content event.
+    /// - `bindings`, `blobs`: direct-write tables with no content-event fold on
+    ///   this adapter, matching the SQLite rationale.
+    /// - `record_mentions`: the current-state body-mention projection
+    ///   (engine 59). Not implemented on this adapter: its SQLite fold,
+    ///   migration backfill and rebuild equality are slice-2 scope, and the
+    ///   read surface is slice 3. The read fields stay absent here until a
+    ///   later slice deliberately ports the projection.
+    /// - `event_cursor`, `log_cursors`, `content_event_causal_frontier`,
+    ///   `content_event_causal_cutover`, `content_event_sources`: log
+    ///   bookkeeping and causal metadata, not projection state.
+    /// - `authorization_revision`, `run_contexts`, `request_interactions`,
+    ///   `act_state`, `act_cutover`, `database_identity*`, `binding_systems`,
+    ///   `binding_audit`, `schema_migrations`, and every meta/policy/control
+    ///   table: not outputs of the content fold.
+    /// - `records.archived` IS compared here even though SQLite keeps it in a
+    ///   facet: on Postgres it is a physical column the projector writes, so
+    ///   omitting it would create a real blind spot. The same reasoning makes
+    ///   `records.record_type` (not `type`) the compared column.
+    /// - Genesis is a named difference from SQLite. SQLite's content tier
+    ///   appends `record.created` events for `native:root`/`native:unfiled`;
+    ///   Postgres seeds those two rows directly in `migrate`. The replay
+    ///   therefore calls `migrate(seed_roots)` exactly as genesis did (`false`
+    ///   only when the log itself carries an imported root creation), so the
+    ///   genesis rows exist on both sides and the comparison is over
+    ///   log-derived state rather than over a missing seed.
+    pub async fn rebuild_and_diff_content(&self) -> Result<PostgresContentRebuildDiff> {
+        // One read transaction for both the log and the live projections, so a
+        // concurrent write landing between the two reads cannot look like drift.
+        let mut source_tx = self.repeatable_read_snapshot().await?;
+        let events = self.content_rebuild_events_on(&mut source_tx).await?;
+        let mut live_dumps: Vec<(&str, Vec<String>)> = Vec::new();
+        for table in POSTGRES_CONTENT_REBUILD_TABLES {
+            let qualified = self.qualified_table(table)?;
+            live_dumps.push((
+                table,
+                dump_postgres_content_rows(
+                    &mut source_tx,
+                    &qualified,
+                    postgres_content_rebuild_columns(table),
+                    postgres_content_rebuild_order(table),
+                )
+                .await?,
+            ));
+        }
+        source_tx.commit().await?;
+
+        let scratch = match self.schema_tag.as_deref() {
+            Some(tag) => format!("native_rebuild_{tag}_{}", Uuid::new_v4().simple()),
+            None => format!("native_rebuild_{}", Uuid::new_v4().simple()),
+        };
+        let quoted = quote_identifier(&scratch)?;
+        self.pool
+            .execute(format!("CREATE SCHEMA {quoted}").as_str())
+            .await?;
+        let query_role = query_role_for_schema(&scratch)?;
+        let query_pool = PgPoolOptions::new()
+            .min_connections(0)
+            .max_connections(4)
+            .after_release(|connection, _metadata| {
+                Box::pin(async move {
+                    sqlx::query("DISCARD ALL").execute(connection).await?;
+                    Ok(false)
+                })
+            })
+            .connect_with(self.pool.connect_options().as_ref().clone())
+            .await?;
+        let rebuilt = PostgresDb {
+            pool: self.pool.clone(),
+            query_pool,
+            query_role,
+            schema: scratch,
+            schema_tag: self.schema_tag.clone(),
+            runtime: None,
+            portability_policy_gate: Arc::new(tokio::sync::RwLock::new(())),
+            realtime_hub: Arc::new(PostgresRealtimeHub::new()),
+            #[cfg(feature = "postgres-tests")]
+            intent_persist_checkpoint: Arc::new(PostgresIntentPersistCheckpoint::default()),
+            #[cfg(test)]
+            request_lifecycle_test_bypass: false,
+        };
+        let result = async {
+            let has_imported_roots = events
+                .iter()
+                .any(|event| event.1 == ROOT_RECORD_ID && event.2 == "record.created");
+            rebuilt.migrate(!has_imported_roots).await?;
+            {
+                let mut tx = rebuilt.pool.begin().await?;
+                for (_, record_id, event_type, payload, created_at) in &events {
+                    apply_projection(
+                        &rebuilt,
+                        &mut tx,
+                        record_id,
+                        event_type,
+                        payload.as_ref().unwrap_or(&Value::Null),
+                        created_at,
+                    )
+                    .await?;
+                }
+                tx.commit().await?;
+            }
+            let mut tables: Vec<PostgresContentTableDiff> = Vec::new();
+            for (table, live_rows) in &live_dumps {
+                let qualified = rebuilt.qualified_table(table)?;
+                let mut conn = rebuilt.pool.acquire().await?;
+                let rebuilt_rows = dump_postgres_content_rows(
+                    &mut conn,
+                    &qualified,
+                    postgres_content_rebuild_columns(table),
+                    postgres_content_rebuild_order(table),
+                )
+                .await?;
+                let max = live_rows.len().max(rebuilt_rows.len());
+                let mut mismatches = Vec::new();
+                for index in 0..max {
+                    if live_rows.get(index) != rebuilt_rows.get(index) {
+                        mismatches.push(format!(
+                            "row {index}: live={} rebuilt={}",
+                            live_rows.get(index).map_or("<none>", String::as_str),
+                            rebuilt_rows.get(index).map_or("<none>", String::as_str),
+                        ));
+                    }
+                }
+                tables.push(PostgresContentTableDiff {
+                    table: (*table).to_string(),
+                    live: live_rows.len(),
+                    rebuilt: rebuilt_rows.len(),
+                    mismatches,
+                });
+            }
+            Ok(PostgresContentRebuildDiff {
+                equal: tables
+                    .iter()
+                    .all(|table| table.live == table.rebuilt && table.mismatches.is_empty()),
+                tables,
+                event_count: events.len(),
+            })
+        }
+        .await;
+        let cleanup = rebuilt.drop_schema().await;
+        match (result, cleanup) {
+            (Ok(diff), Ok(())) => Ok(diff),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(_), Err(cleanup)) => Err(cleanup),
+            (Err(error), Err(cleanup)) => Err(Error::engine(format!(
+                "{error}; additionally failed to clean up Postgres rebuild schema {}: {cleanup}",
+                rebuilt.schema()
+            ))),
+        }
+    }
+
+    async fn content_rebuild_events_on(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+    ) -> Result<Vec<(i64, String, String, Option<Value>, String)>> {
+        let events = self.qualified_table("content_events")?;
+        let rows = sqlx::query(&format!(
+            "SELECT seq,record_id,type,payload,created_at FROM {events} ORDER BY seq"
+        ))
+        .fetch_all(&mut **tx)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok((
+                    row.try_get("seq")?,
+                    row.try_get("record_id")?,
+                    row.try_get("type")?,
+                    row.try_get("payload")?,
+                    row.try_get::<DateTime<Utc>, _>("created_at")?.to_rfc3339(),
+                ))
+            })
+            .collect()
+    }
+
     async fn replay_candidate_events(&self, events: &[PostgresCandidateReplayEvent]) -> Result<()> {
         let event_table = self.qualified_table("notification_candidate_events")?;
         let candidate_table = self.qualified_table("notification_candidates")?;
         let mut tx = self.pool.begin().await?;
         for event in events {
             sqlx::query(&format!(
-                "INSERT INTO {event_table}(seq,id,candidate_key,action,recipient_account_id,message_id,reason,priority,not_before,redaction_class,evaluator_kind,policy_version,source_event_type,source_event_id,payload,created_at) OVERRIDING SYSTEM VALUE VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::timestamptz,$10,$11,$12,$13,$14,$15,$16::timestamptz)"
+                "INSERT INTO {event_table}(seq,id,candidate_key,action,recipient_account_id,message_id,reason,priority,not_before,redaction_class,evaluator_kind,policy_version,source_event_type,source_event_id,payload,created_at,act) OVERRIDING SYSTEM VALUE VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::timestamptz,$10,$11,$12,$13,$14,$15,$16::timestamptz,$17)"
             ))
             .bind(event.seq)
             .bind(&event.id)
@@ -3159,6 +3606,7 @@ impl PostgresDb {
             .bind(&event.source_event_id)
             .bind(&event.payload)
             .bind(&event.created_at)
+            .bind(event.act)
             .execute(&mut *tx)
             .await?;
             if event.action == "proposed" {
@@ -3282,6 +3730,109 @@ impl PostgresDb {
             "message_audience": logical_audience,
         }))
     }
+}
+
+/// Tables the Postgres content projector writes and
+/// [`PostgresDb::rebuild_and_diff_content`] therefore compares. This is the
+/// Postgres subset of `PROJECTION_TABLES` in `src/conformance/rebuild.rs`; see
+/// that method for the named exclusions.
+const POSTGRES_CONTENT_REBUILD_TABLES: [&str; 4] =
+    ["records", "facet_values", "links", "message_audience"];
+
+/// Explicit comparison columns per table, ported from `columns_for` in
+/// `src/conformance/rebuild.rs` and adapted to the Postgres physical names
+/// (`record_type`, not `type`; `archived` is a column here, not a facet).
+/// Explicit columns keep the fingerprint stable regardless of engine column
+/// ordering and keep derived/index columns out of the comparison.
+fn postgres_content_rebuild_columns(table: &str) -> &'static [&'static str] {
+    match table {
+        "records" => &[
+            "id",
+            "record_type",
+            "kind",
+            "name",
+            "body",
+            "home_id",
+            "summary",
+            "lifecycle",
+            "owner_id",
+            // policy_anchor_id is deliberately absent: a policy-tier mutation
+            // rewrites it outside the content log. See rebuild_and_diff_content.
+            "persistence",
+            "maturity",
+            "archived",
+            "deleted_at",
+            "created_at",
+            "updated_at",
+        ],
+        "facet_values" => &["record_id", "key", "value"],
+        "links" => &[
+            "id",
+            "source_id",
+            "target_id",
+            "relationship",
+            "note",
+            "created_at",
+        ],
+        "message_audience" => &["message_id", "account_id"],
+        other => unreachable!("not a Postgres content projection table: {other}"),
+    }
+}
+
+/// Deterministic row order for each compared table. Every ordering expression
+/// names a primary key or unique key, so the projection dump is total.
+fn postgres_content_rebuild_order(table: &str) -> &'static str {
+    match table {
+        "records" => "id",
+        "facet_values" => "record_id, key",
+        "links" => "id",
+        "message_audience" => "message_id, account_id",
+        other => unreachable!("not a Postgres content projection table: {other}"),
+    }
+}
+
+/// One table's result inside [`PostgresContentRebuildDiff`].
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PostgresContentTableDiff {
+    pub table: String,
+    pub live: usize,
+    pub rebuilt: usize,
+    pub mismatches: Vec<String>,
+}
+
+/// The outcome of [`PostgresDb::rebuild_and_diff_content`].
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PostgresContentRebuildDiff {
+    pub equal: bool,
+    pub tables: Vec<PostgresContentTableDiff>,
+    pub event_count: usize,
+}
+
+/// Render every compared column of every row as one canonical JSON object
+/// string, ordered by the supplied key. Both live and rebuilt sides go through
+/// this exact function, so the fingerprint is type-faithful and dialect-stable.
+async fn dump_postgres_content_rows(
+    conn: &mut sqlx::PgConnection,
+    qualified: &str,
+    columns: &[&str],
+    order: &str,
+) -> Result<Vec<String>> {
+    // `columns` and `order` are source-static; no runtime identifier reaches
+    // this SQL. `jsonb` canonicalizes key order, so string equality is a
+    // value-level fingerprint of the row.
+    let object = columns
+        .iter()
+        .map(|column| format!("'{column}', {column}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let rows = sqlx::query(&format!(
+        "SELECT jsonb_build_object({object})::text FROM {qualified} ORDER BY {order}"
+    ))
+    .fetch_all(&mut *conn)
+    .await?;
+    rows.into_iter()
+        .map(|row| Ok(row.try_get::<String, _>(0)?))
+        .collect()
 }
 
 fn validate_postgres_admission(interchange: &ValidatedInterchange) -> Result<()> {
@@ -3563,6 +4114,7 @@ fn expected_postgres_state(interchange: &ValidatedInterchange) -> Result<Value> 
             "intent": optional_text_cell(events, row, "intent")?,
             "causal_envelope_version": integer(events, row, "causal_envelope_version")?,
             "causal_status": text(events, row, "causal_status")?,
+            "act": optional_integer_cell(events, row, "act")?,
             "created_at_micros": timestamp_micros(events, row, "created_at")?,
         }));
     }
@@ -3884,6 +4436,8 @@ async fn assert_postgres_v4_search_migration_source(db: &PostgresDb) -> Result<(
                 "content_event_causal_frontier"
                     | "content_event_causal_cutover"
                     | "content_event_sources"
+                    | "act_state"
+                    | "act_cutover"
             )
         })
         .collect::<Vec<_>>();
@@ -4202,12 +4756,17 @@ async fn postgres_resolve_external(
             } else {
                 port.rollback().await?;
             }
-            Ok(json!({
+            let mut response = json!({
                 "status":if result.created{"created"}else{"resolved"},
                 "record_id":result.record_id,
                 "created":result.created,
                 "bindings_added":result.bindings_added,
-            }))
+            });
+            // Omission-safe: a true no-op that appended nothing carries no act.
+            if let Some(act) = result.act {
+                response["act"] = json!(act);
+            }
+            Ok(response)
         }
         Err(error) => {
             let _ = port.rollback().await;
@@ -4329,6 +4888,8 @@ async fn postgres_query_sql(db: &PostgresDb, caller: &Caller, arguments: Value) 
         "rows": result.rows,
         "row_count": result.row_count,
         "truncated": result.truncated,
+        "truncation_hint": result.truncation_hint,
+        "as_of_seq": result.as_of_seq,
     }))
 }
 
@@ -4391,6 +4952,7 @@ struct CompactWriteReceipt {
     version_seq: i64,
     previous_seq: Option<i64>,
     body_receipt: Option<Value>,
+    act: Option<i64>,
 }
 
 fn summarize_write_receipt(result: Value, write: CompactWriteReceipt) -> Result<Value> {
@@ -4402,8 +4964,9 @@ fn summarize_write_receipt(result: Value, write: CompactWriteReceipt) -> Result<
         "body_digest",
         "lifecycle_interpretation",
     ];
-    const OPTIONAL_RECEIPTS: [&str; 7] = [
+    const OPTIONAL_RECEIPTS: [&str; 8] = [
         "previous_seq",
+        "act",
         "body_receipt",
         "html_body_write",
         "delivery",
@@ -4515,9 +5078,15 @@ async fn compact_write_projection_in(
 
 fn render_write_response(
     response_mode: ResponseMode,
-    result: Value,
+    mut result: Value,
     write: CompactWriteReceipt,
 ) -> Result<Value> {
+    // The verbose shape carries the full record read; stamp the produced act
+    // on it directly so both modes return the write's coordinate. The summary
+    // projection below picks it up through OPTIONAL_RECEIPTS.
+    if let Some(act) = write.act {
+        result["act"] = json!(act);
+    }
     if response_mode == ResponseMode::Verbose {
         return Ok(result);
     }
@@ -4684,17 +5253,34 @@ async fn create_record(db: &PostgresDb, caller: &Caller, arguments: Value) -> Re
         "reason": args.reason,
     });
     {
+        let act = transaction.allocate_act().await?;
         let tx = transaction.admitted("append create_record")?;
         let (_, created_at) =
-            append_event(db, tx, &id, "record.created", &payload, caller.actor()).await?;
+            append_event(db, tx, &id, "record.created", &payload, caller.actor(), act).await?;
         apply_projection(db, tx, &id, "record.created", &payload, &created_at).await?;
     }
 
+    // Alias shadows warn on success with the admitted kind; exact governed
+    // names never reach here, refused by facet parsing above.
+    let alias_warnings = crate::domain_transaction::governed_alias_warnings_for_sets(
+        &facets,
+        &args.record_type,
+        Some(&kind),
+    );
     for facet in facets {
         let spec = crate::domain_transaction::facet_set_spec(&id, &facet, caller.actor());
+        let act = transaction.allocate_act().await?;
         let tx = transaction.admitted("append governed create_record facet")?;
-        let (_, created_at) =
-            append_event(db, tx, &id, &spec.event_type, &spec.payload, caller.actor()).await?;
+        let (_, created_at) = append_event(
+            db,
+            tx,
+            &id,
+            &spec.event_type,
+            &spec.payload,
+            caller.actor(),
+            act,
+        )
+        .await?;
         apply_projection(db, tx, &id, &spec.event_type, &spec.payload, &created_at).await?;
     }
     let required_after = crate::domain_transaction::required_violations(
@@ -4731,9 +5317,10 @@ async fn create_record(db: &PostgresDb, caller: &Caller, arguments: Value) -> Re
             )));
         }
         let payload = link_added_payload(&id, &link.target_id, &link.relationship, link.note);
+        let act = transaction.allocate_act().await?;
         let tx = transaction.admitted("append create_record link")?;
         let (_, created_at) =
-            append_event(db, tx, &id, "link.added", &payload, caller.actor()).await?;
+            append_event(db, tx, &id, "link.added", &payload, caller.actor(), act).await?;
         apply_projection(db, tx, &id, "link.added", &payload, &created_at).await?;
     }
 
@@ -4759,6 +5346,7 @@ async fn create_record(db: &PostgresDb, caller: &Caller, arguments: Value) -> Re
         accounts.sort();
         accounts.dedup();
         let payload = json!({ "sender_id": owner, "accounts": accounts });
+        let act = transaction.allocate_act().await?;
         let tx = transaction.admitted("append create_record audience")?;
         let (_, created_at) = append_event(
             db,
@@ -4767,6 +5355,7 @@ async fn create_record(db: &PostgresDb, caller: &Caller, arguments: Value) -> Re
             "message.audience.declared",
             &payload,
             caller.actor(),
+            act,
         )
         .await?;
         apply_projection(
@@ -4782,7 +5371,7 @@ async fn create_record(db: &PostgresDb, caller: &Caller, arguments: Value) -> Re
     // Capture the record-local head while this writer still owns the
     // transaction. A later writer cannot change the compact receipt's version.
     let version_seq = record_version_in(db, &mut transaction, &id).await?;
-    let result = if response_mode == ResponseMode::Summary {
+    let mut result = if response_mode == ResponseMode::Summary {
         compact_write_projection_in(db, &mut transaction, caller, &id).await?
     } else {
         let lifecycle_interpreter =
@@ -4805,7 +5394,12 @@ async fn create_record(db: &PostgresDb, caller: &Caller, arguments: Value) -> Re
             ))
         })?
     };
+    let transaction_act = transaction.act;
     transaction.commit().await?;
+    // Alias warnings ride the receipt in both modes: verbose returns the
+    // result as is, and the summary projection preserves its warnings array.
+    // Absent when nothing warned, so other receipts stay byte-identical.
+    crate::domain_transaction::push_receipt_warnings(&mut result, alias_warnings)?;
     render_write_response(
         response_mode,
         result,
@@ -4813,6 +5407,7 @@ async fn create_record(db: &PostgresDb, caller: &Caller, arguments: Value) -> Re
             version_seq,
             previous_seq: None,
             body_receipt: None,
+            act: transaction_act,
         },
     )
 }
@@ -4936,6 +5531,19 @@ async fn attachment_authorization_bearer_in(
     Ok(None)
 }
 
+/// SQL fragment gating the `native:members` baseline on the caller's folded
+/// catalog footing. Interpolated as a boolean literal rather than a bind so
+/// the four inline Postgres visibility predicates keep their existing
+/// positional parameter order. A guest resolves as `FALSE` and therefore
+/// matches only direct account and owner grants.
+fn member_baseline_sql(caller: &Caller) -> &'static str {
+    if caller.is_host_member() {
+        "TRUE"
+    } else {
+        "FALSE"
+    }
+}
+
 /// Apply the ordinary-record visibility rules to the terminal bearer without
 /// calling `read_record_in`; that avoids an async recursion cycle when a
 /// derived attachment is itself being read.
@@ -4991,8 +5599,9 @@ async fn ordinary_bearer_visible_in(
     .await?;
     if !owns {
         let entries = db.qualified_table("policy_entries")?;
+        let member_clause = member_baseline_sql(caller);
         let allowed: bool = sqlx::query_scalar(&format!(
-            "SELECT EXISTS(SELECT 1 FROM {entries} WHERE policy_anchor_id=$1 AND effect='allow' AND capability IN ('view','edit','manage') AND ((subject_kind='account' AND subject_id=$2) OR (subject_kind='members' AND subject_id='native:members')))"
+            "SELECT EXISTS(SELECT 1 FROM {entries} WHERE policy_anchor_id=$1 AND effect='allow' AND capability IN ('view','edit','manage') AND ((subject_kind='account' AND subject_id=$2) OR (subject_kind='members' AND subject_id='native:members' AND {member_clause})))"
         ))
         .bind(&policy_anchor_id)
         .bind(caller.credential())
@@ -5095,8 +5704,9 @@ async fn read_record_in(
             .await?;
             if !owns {
                 let entries = db.qualified_table("policy_entries")?;
+                let member_clause = member_baseline_sql(caller);
                 let allowed: bool = sqlx::query_scalar(&format!(
-                        "SELECT EXISTS(SELECT 1 FROM {entries} WHERE policy_anchor_id=$1 AND effect='allow' AND capability IN ('view','edit','manage') AND ((subject_kind='account' AND subject_id=$2) OR (subject_kind='members' AND subject_id='native:members')))"
+                        "SELECT EXISTS(SELECT 1 FROM {entries} WHERE policy_anchor_id=$1 AND effect='allow' AND capability IN ('view','edit','manage') AND ((subject_kind='account' AND subject_id=$2) OR (subject_kind='members' AND subject_id='native:members' AND {member_clause})))"
                 ))
                 .bind(&policy_anchor_id)
                 .bind(caller.credential())
@@ -5675,6 +6285,7 @@ async fn correct_record_type(db: &PostgresDb, caller: &Caller, arguments: Value)
         "schema_state_revision":plan.schema_state_revision(),
         "confirmation_required":confirmation_required,
     });
+    let act = transaction.allocate_act().await?;
     let tx = transaction.admitted("append record type correction")?;
     let (event_seq, event_id, created_at) = append_event_with_id(
         db,
@@ -5683,6 +6294,7 @@ async fn correct_record_type(db: &PostgresDb, caller: &Caller, arguments: Value)
         "record.type_corrected.v1",
         &payload,
         caller.actor(),
+        act,
     )
     .await?;
     apply_projection(
@@ -5696,7 +6308,7 @@ async fn correct_record_type(db: &PostgresDb, caller: &Caller, arguments: Value)
     .await?;
     transaction.commit().await?;
     Ok(
-        json!({"record_id":args.record_id,"type":plan.classification().target.record_type,"kind":plan.classification().target.kind,"mode":mode,"event_id":event_id,"event_seq":event_seq,"previous_seq":plan.previous_seq(),"body_digest":plan.body_digest()}),
+        json!({"record_id":args.record_id,"type":plan.classification().target.record_type,"kind":plan.classification().target.kind,"mode":mode,"event_id":event_id,"event_seq":event_seq,"previous_seq":plan.previous_seq(),"body_digest":plan.body_digest(),"act":act}),
     )
 }
 
@@ -5716,6 +6328,7 @@ struct UpdateArgs {
     if_body_digest: Option<String>,
     if_unmodified_since: Option<String>,
     facets: Option<Map<String, Value>>,
+    links: Option<Vec<CreateLink>>,
     #[serde(default)]
     response_mode: ResponseMode,
 }
@@ -6085,6 +6698,9 @@ async fn update_record_multi(db: &PostgresDb, caller: &Caller, arguments: Value)
         facet_inputs.contains_key(crate::message_expectation::EXPECTATION_FACET_KEY);
     let mut prepared = Vec::with_capacity(args.ids.len());
     let mut unchanged = 0usize;
+    // Per-target alias warnings, correlated by request index like
+    // `create_many`. Absent from the receipt when nothing warned.
+    let mut batch_warnings = Vec::new();
     for (index, id) in args.ids.iter().enumerate() {
         if !authorized[index] {
             continue;
@@ -6158,6 +6774,17 @@ async fn update_record_multi(db: &PostgresDb, caller: &Caller, arguments: Value)
                 message: error.to_string(),
             });
             continue;
+        }
+        // Warn on the requested sets with this target's effective kind.
+        // Unsets never warn and ineligible kinds stay quiet.
+        for warning in crate::domain_transaction::governed_alias_warnings_for_sets(
+            &governed_sets,
+            &record_type,
+            Some(effective_kind),
+        ) {
+            batch_warnings.push(crate::domain_transaction::index_warning_for_batch(
+                index, id, warning,
+            ));
         }
 
         let mut conflict = None;
@@ -6330,6 +6957,7 @@ async fn update_record_multi(db: &PostgresDb, caller: &Caller, arguments: Value)
                 .fields
                 .insert("reason".into(), json!(args.reason.clone()));
             let payload = Value::Object(target.fields);
+            let act = transaction.allocate_act().await?;
             let tx = transaction.admitted("append multi-update fields")?;
             let (_, created_at) = append_event(
                 db,
@@ -6338,6 +6966,7 @@ async fn update_record_multi(db: &PostgresDb, caller: &Caller, arguments: Value)
                 "record.updated",
                 &payload,
                 caller.actor(),
+                act,
             )
             .await?;
             apply_projection(db, tx, &target.id, "record.updated", &payload, &created_at).await?;
@@ -6350,6 +6979,7 @@ async fn update_record_multi(db: &PostgresDb, caller: &Caller, arguments: Value)
                 spec.payload["reason"] = json!(args.reason.clone());
             }
             first_facet = false;
+            let act = transaction.allocate_act().await?;
             let tx = transaction.admitted("append multi-update facet set")?;
             let (_, created_at) = append_event(
                 db,
@@ -6358,6 +6988,7 @@ async fn update_record_multi(db: &PostgresDb, caller: &Caller, arguments: Value)
                 &spec.event_type,
                 &spec.payload,
                 caller.actor(),
+                act,
             )
             .await?;
             apply_projection(
@@ -6376,9 +7007,18 @@ async fn update_record_multi(db: &PostgresDb, caller: &Caller, arguments: Value)
                 payload["reason"] = json!(args.reason.clone());
             }
             first_facet = false;
+            let act = transaction.allocate_act().await?;
             let tx = transaction.admitted("append multi-update facet unset")?;
-            let (_, created_at) =
-                append_event(db, tx, &target.id, "facet.unset", &payload, caller.actor()).await?;
+            let (_, created_at) = append_event(
+                db,
+                tx,
+                &target.id,
+                "facet.unset",
+                &payload,
+                caller.actor(),
+                act,
+            )
+            .await?;
             apply_projection(db, tx, &target.id, "facet.unset", &payload, &created_at).await?;
         }
     }
@@ -6396,6 +7036,7 @@ async fn update_record_multi(db: &PostgresDb, caller: &Caller, arguments: Value)
         &required_before,
         &required_after,
     )?;
+    let transaction_act = transaction.act;
     transaction.commit().await?;
 
     let results = prepared
@@ -6408,12 +7049,19 @@ async fn update_record_multi(db: &PostgresDb, caller: &Caller, arguments: Value)
             })
         })
         .collect::<Vec<_>>();
-    Ok(json!({
+    let mut batch_response = json!({
         "requested": args.ids.len(),
         "changed": changed,
         "unchanged": args.ids.len() - changed,
         "results": results,
-    }))
+    });
+    if !batch_warnings.is_empty() {
+        batch_response["warnings"] = Value::Array(batch_warnings);
+    }
+    if let Some(act) = transaction_act {
+        batch_response["act"] = json!(act);
+    }
+    Ok(batch_response)
 }
 
 async fn update_record(db: &PostgresDb, caller: &Caller, arguments: Value) -> Result<Value> {
@@ -6449,6 +7097,27 @@ async fn update_record_singular(
                 .map(|facet| (key, facet))
         })
         .collect::<Result<Vec<_>>>()?;
+    // Add-only links in the create_record-compatible shape. Links ride along
+    // with a record edit (manage_links.add remains the links-only path), and
+    // every link is validated and appended inside the same transaction below,
+    // so the edit and the links commit together or not at all.
+    let links = args.links.unwrap_or_default();
+    for link in &links {
+        if link.relationship.trim().is_empty() {
+            return Err(Error::engine(
+                "update_record: link relationship must contain non-whitespace text",
+            ));
+        }
+        if link.relationship == "addressed_to" {
+            return Err(Error::engine(
+                "update_record: addressed_to must use the Message addressed_to field",
+            ));
+        }
+        crate::surface_binding::refuse_reserved_surface_binding(
+            "update_record",
+            &link.relationship,
+        )?;
+    }
     let records = db.qualified_table("records")?;
     let mut transaction = PostgresDomainTransaction::begin(db).await?;
     let row = sqlx::query(&format!(
@@ -6466,6 +7135,16 @@ async fn update_record_singular(
         row.try_get("owner_id")?,
     )
     .await?;
+    // Target View check per link, before any append: a link target the
+    // caller cannot view fails the whole call with nothing written.
+    for link in &links {
+        if read_record(db, caller, &link.target_id).await?.is_none() {
+            return Err(Error::engine(format!(
+                "update_record: link target {} does not exist",
+                link.target_id
+            )));
+        }
+    }
     let previous_seq = record_version_in(db, &mut transaction, &args.id).await?;
     let current_body: Option<String> = row.try_get("body")?;
     // The whole-body guard is evaluated under the same `FOR UPDATE` row lock
@@ -6532,6 +7211,18 @@ async fn update_record_singular(
     });
     let (set_summary, summary) = optional_text("update_record", "summary", &args.summary)?;
     let (set_lifecycle, lifecycle) = optional_text("update_record", "lifecycle", &args.lifecycle)?;
+    // Links ride along with an edit; use manage_links.add for links alone.
+    if !set_name
+        && !set_body
+        && !set_summary
+        && !set_lifecycle
+        && facets.is_empty()
+        && !links.is_empty()
+    {
+        return Err(Error::engine(
+            "update_record: no changes — pass at least one field or facet alongside links",
+        ));
+    }
     let record_type: String = row.try_get("record_type")?;
     let kind: String = row.try_get("kind")?;
     let resolution = crate::meta::kind::resolve_with(&mut transaction, &record_type, &kind).await?;
@@ -6583,6 +7274,7 @@ async fn update_record_singular(
             payload.insert(key.into(), json!(value));
         }
     }
+    let act = transaction.allocate_act().await?;
     let tx = transaction.admitted("append update_record")?;
     let (_, created_at) = append_event(
         db,
@@ -6591,6 +7283,7 @@ async fn update_record_singular(
         "record.updated",
         &Value::Object(payload.clone()),
         caller.actor(),
+        act,
     )
     .await?;
     apply_projection(
@@ -6602,6 +7295,16 @@ async fn update_record_singular(
         &created_at,
     )
     .await?;
+    // Alias shadows warn on success with the effective kind; unsets never
+    // warn (only the sets are judged) and ineligible kinds stay quiet.
+    let alias_warnings = crate::domain_transaction::governed_alias_warnings_for_sets(
+        &facets
+            .iter()
+            .filter_map(|(_, facet)| facet.clone())
+            .collect::<Vec<_>>(),
+        &record_type,
+        Some(effective_kind),
+    );
     for (key, facet) in facets {
         let spec = match facet {
             Some(facet) => {
@@ -6614,6 +7317,7 @@ async fn update_record_singular(
                 actor: Some(caller.actor().into()),
             },
         };
+        let act = transaction.allocate_act().await?;
         let tx = transaction.admitted("append governed update_record facet")?;
         let (_, created_at) = append_event(
             db,
@@ -6622,6 +7326,7 @@ async fn update_record_singular(
             &spec.event_type,
             &spec.payload,
             caller.actor(),
+            act,
         )
         .await?;
         apply_projection(
@@ -6633,6 +7338,29 @@ async fn update_record_singular(
             &created_at,
         )
         .await?;
+    }
+    // Link emission in the same transaction: reason stays on record.updated
+    // above, never on these events. Any failure here rolls everything back.
+    for link in &links {
+        let payload = link_added_payload(
+            &args.id,
+            &link.target_id,
+            &link.relationship,
+            link.note.clone(),
+        );
+        let act = transaction.allocate_act().await?;
+        let tx = transaction.admitted("append update_record link")?;
+        let (_, created_at) = append_event(
+            db,
+            tx,
+            &args.id,
+            "link.added",
+            &payload,
+            caller.actor(),
+            act,
+        )
+        .await?;
+        apply_projection(db, tx, &args.id, "link.added", &payload, &created_at).await?;
     }
     let required_after = crate::domain_transaction::required_violations(
         &mut transaction,
@@ -6646,7 +7374,7 @@ async fn update_record_singular(
         &required_after,
     )?;
     let version_seq = record_version_in(db, &mut transaction, &args.id).await?;
-    let result = if response_mode == ResponseMode::Summary {
+    let mut result = if response_mode == ResponseMode::Summary {
         compact_write_projection_in(db, &mut transaction, caller, &args.id).await?
     } else {
         let lifecycle_interpreter =
@@ -6670,7 +7398,9 @@ async fn update_record_singular(
             ))
         })?
     };
+    let transaction_act = transaction.act;
     transaction.commit().await?;
+    crate::domain_transaction::push_receipt_warnings(&mut result, alias_warnings)?;
     render_write_response(
         response_mode,
         result,
@@ -6678,6 +7408,7 @@ async fn update_record_singular(
             version_seq,
             previous_seq: Some(previous_seq),
             body_receipt,
+            act: transaction_act,
         },
     )
 }
@@ -6723,8 +7454,9 @@ async fn require_edit(
         Err(Error::engine("record does not exist"))
     } else {
         let entries = db.qualified_table("policy_entries")?;
+        let member_clause = member_baseline_sql(caller);
         let allowed: bool = sqlx::query_scalar(&format!(
-            "SELECT EXISTS(SELECT 1 FROM {records} record JOIN {entries} entry ON entry.policy_anchor_id=record.policy_anchor_id WHERE record.id=$1 AND entry.effect='allow' AND entry.capability IN ('edit','manage') AND ((entry.subject_kind='account' AND entry.subject_id=$2) OR (entry.subject_kind='members' AND entry.subject_id='native:members')))"
+            "SELECT EXISTS(SELECT 1 FROM {records} record JOIN {entries} entry ON entry.policy_anchor_id=record.policy_anchor_id WHERE record.id=$1 AND entry.effect='allow' AND entry.capability IN ('edit','manage') AND ((entry.subject_kind='account' AND entry.subject_id=$2) OR (entry.subject_kind='members' AND entry.subject_id='native:members' AND {member_clause})))"
         ))
         .bind(record_id)
         .bind(caller.credential())
@@ -6849,13 +7581,22 @@ async fn archive_record(db: &PostgresDb, caller: &Caller, arguments: Value) -> R
     }
     let event_type = if want { "facet.set" } else { "facet.unset" };
     let payload = json!({ "key": "archived", "value": if want { Value::String("true".into()) } else { Value::Null } });
-    let (_, created_at) =
-        append_event(db, &mut tx, &args.id, event_type, &payload, caller.actor()).await?;
+    let act = allocate_act_in(db, &mut tx).await?;
+    let (_, created_at) = append_event(
+        db,
+        &mut tx,
+        &args.id,
+        event_type,
+        &payload,
+        caller.actor(),
+        act,
+    )
+    .await?;
     apply_projection(db, &mut tx, &args.id, event_type, &payload, &created_at).await?;
     tx.commit().await?;
     db.complete_realtime_commit();
     Ok(json!({
-        "id": args.id, "archived": want, "changed": true, "previous_seq": previous_seq
+        "id": args.id, "archived": want, "changed": true, "previous_seq": previous_seq, "act": act
     }))
 }
 
@@ -7118,8 +7859,9 @@ async fn history_record_visible_in(
             .await?;
             if !owns {
                 let entries = db.qualified_table("policy_entries")?;
+                let member_clause = member_baseline_sql(caller);
                 let allowed: bool = sqlx::query_scalar(&format!(
-                    "SELECT EXISTS(SELECT 1 FROM {entries} WHERE policy_anchor_id=$1 AND effect='allow' AND capability IN ('view','edit','manage') AND ((subject_kind='account' AND subject_id=$2) OR (subject_kind='members' AND subject_id='native:members')))"
+                    "SELECT EXISTS(SELECT 1 FROM {entries} WHERE policy_anchor_id=$1 AND effect='allow' AND capability IN ('view','edit','manage') AND ((subject_kind='account' AND subject_id=$2) OR (subject_kind='members' AND subject_id='native:members' AND {member_clause})))"
                 ))
                 .bind(&policy_anchor_id)
                 .bind(caller.credential())
@@ -7211,6 +7953,7 @@ async fn manage_links(db: &PostgresDb, caller: &Caller, arguments: Value) -> Res
             })?;
             require_edit(&mut tx, db, caller, &source_id, row.try_get("owner_id")?).await?;
             let payload = link_added_payload(&source_id, &target_id, &relationship, note);
+            let act = allocate_act_in(db, &mut tx).await?;
             let (_, created_at) = append_event(
                 db,
                 &mut tx,
@@ -7218,6 +7961,7 @@ async fn manage_links(db: &PostgresDb, caller: &Caller, arguments: Value) -> Res
                 "link.added",
                 &payload,
                 caller.actor(),
+                act,
             )
             .await?;
             apply_projection(db, &mut tx, &source_id, "link.added", &payload, &created_at).await?;
@@ -7228,6 +7972,7 @@ async fn manage_links(db: &PostgresDb, caller: &Caller, arguments: Value) -> Res
                 "source_id": source_id,
                 "target_id": target_id,
                 "relationship": relationship,
+                "act": act,
             }))
         }
         ManageLinksArgs::Remove { .. } => Err(Error::engine(
@@ -7502,6 +8247,7 @@ struct PostgresDomainTransaction<'db> {
     db: &'db PostgresDb,
     executor: PortableStatementTransaction<'static>,
     control: ExecutionControl,
+    act: Option<i64>,
 }
 
 impl<'db> PostgresDomainTransaction<'db> {
@@ -7519,6 +8265,7 @@ impl<'db> PostgresDomainTransaction<'db> {
             db,
             executor,
             control: ExecutionControl::default(),
+            act: None,
         })
     }
 
@@ -7545,6 +8292,7 @@ impl<'db> PostgresDomainTransaction<'db> {
             db,
             executor,
             control: ExecutionControl::default(),
+            act: None,
         })
     }
 
@@ -7576,6 +8324,29 @@ impl<'db> PostgresDomainTransaction<'db> {
         self.executor
             .admitted_mut()
             .map_err(|error| crate::domain_transaction::stable_storage_error(operation, &error))
+    }
+
+    /// Return this transaction's act, bumping the workspace counter on the
+    /// first call. The bump is an in-transaction singleton UPDATE, so a
+    /// rollback takes the allocation with it and the counter stays gapless.
+    /// Writers already serialize on the per-log cursor row locks, so the
+    /// counter adds no new serialization.
+    async fn allocate_act(&mut self) -> Result<i64> {
+        if let Some(act) = self.act {
+            return Ok(act);
+        }
+        let state = self.db.qualified_table("act_state")?;
+        let tx = self.admitted("allocate act number")?;
+        let act: i64 = sqlx::query_scalar(&format!(
+            "UPDATE {state} SET next_act=next_act+1 WHERE singleton=1 RETURNING next_act"
+        ))
+        .fetch_one(&mut **tx)
+        .await?;
+        if act <= 0 {
+            return Err(Error::engine("allocated act number is not positive"));
+        }
+        self.act = Some(act);
+        Ok(act)
     }
 }
 
@@ -7822,6 +8593,10 @@ impl crate::domain_transaction::search::SearchPhysicalPort for PostgresDomainTra
 }
 
 impl FacetObservationPort for PostgresDomainTransaction<'_> {
+    fn allocated_act(&self) -> Option<i64> {
+        self.act
+    }
+
     fn lock_facet_revision<'a>(&'a mut self) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             let cursors = self.db.qualified_table("log_cursors")?;
@@ -7850,9 +8625,18 @@ impl FacetObservationPort for PostgresDomainTransaction<'_> {
                 Error::engine("postgres facet observation requires an attributed actor")
             })?;
             let db = self.db;
+            let act = self.allocate_act().await?;
             let tx = self.admitted("append facet observation")?;
-            let (seq, created_at) =
-                append_event(db, tx, &spec.record_id, &spec.event_type, &payload, actor).await?;
+            let (seq, created_at) = append_event(
+                db,
+                tx,
+                &spec.record_id,
+                &spec.event_type,
+                &payload,
+                actor,
+                act,
+            )
+            .await?;
             apply_projection(
                 db,
                 tx,
@@ -7868,6 +8652,10 @@ impl FacetObservationPort for PostgresDomainTransaction<'_> {
 }
 
 impl AttachmentPhysicalPort for PostgresDomainTransaction<'_> {
+    fn allocated_act(&self) -> Option<i64> {
+        self.act
+    }
+
     fn lock_content_log<'a>(&'a mut self) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             let cursors = self.db.qualified_table("log_cursors")?;
@@ -7984,11 +8772,20 @@ impl AttachmentPhysicalPort for PostgresDomainTransaction<'_> {
                 Error::engine("postgres append_content requires an attributed actor")
             })?;
             let db = self.db;
+            let act = self.allocate_act().await?;
             let tx = self.executor.admitted_mut().map_err(|error| {
                 crate::domain_transaction::stable_storage_error("append content event", &error)
             })?;
-            let (_, created_at) =
-                append_event(db, tx, &spec.record_id, &spec.event_type, &payload, actor).await?;
+            let (_, created_at) = append_event(
+                db,
+                tx,
+                &spec.record_id,
+                &spec.event_type,
+                &payload,
+                actor,
+                act,
+            )
+            .await?;
             apply_projection(
                 db,
                 tx,
@@ -8004,6 +8801,10 @@ impl AttachmentPhysicalPort for PostgresDomainTransaction<'_> {
 }
 
 impl crate::domain_transaction::RecordLifecyclePhysicalPort for PostgresDomainTransaction<'_> {
+    fn allocated_act(&self) -> Option<i64> {
+        self.act
+    }
+
     fn lock_live_record<'a>(&'a mut self, record_id: &'a str) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             let records = self.db.qualified_table("records")?;
@@ -8040,12 +8841,20 @@ impl crate::domain_transaction::RecordLifecyclePhysicalPort for PostgresDomainTr
                 Error::engine("postgres append_content requires an attributed actor")
             })?;
             let db = self.db;
+            let act = self.allocate_act().await?;
             let tx = self.executor.admitted_mut().map_err(|error| {
                 crate::domain_transaction::stable_storage_error("append content event", &error)
             })?;
-            let (_, event_id, created_at) =
-                append_event_with_id(db, tx, &spec.record_id, &spec.event_type, &payload, actor)
-                    .await?;
+            let (_, event_id, created_at) = append_event_with_id(
+                db,
+                tx,
+                &spec.record_id,
+                &spec.event_type,
+                &payload,
+                actor,
+                act,
+            )
+            .await?;
             apply_projection(
                 db,
                 tx,
@@ -8072,9 +8881,10 @@ impl crate::awareness::CandidateWithdrawalPhysicalPort for PostgresDomainTransac
     ) -> BoxFuture<'a, Result<i64>> {
         Box::pin(async move {
             let events = self.db.qualified_table("notification_candidate_events")?;
+            let act = self.allocate_act().await?;
             let tx = self.admitted("append notification candidate withdrawal")?;
             Ok(sqlx::query_scalar(&format!(
-                "INSERT INTO {events}(id,candidate_key,action,recipient_account_id,message_id,reason,priority,not_before,redaction_class,evaluator_kind,policy_version,source_event_type,source_event_id,payload,created_at) VALUES($1,$2,'withdrawn',$3,$4,$5,$6,$7::timestamptz,$8,$9,$10,$11,$12,$13::jsonb,$14::timestamptz) RETURNING seq"
+                "INSERT INTO {events}(id,candidate_key,action,recipient_account_id,message_id,reason,priority,not_before,redaction_class,evaluator_kind,policy_version,source_event_type,source_event_id,payload,created_at,act) VALUES($1,$2,'withdrawn',$3,$4,$5,$6,$7::timestamptz,$8,$9,$10,$11,$12,$13::jsonb,$14::timestamptz,$15) RETURNING seq"
             ))
             .bind(withdrawal_event_id)
             .bind(&candidate.candidate_key)
@@ -8090,6 +8900,7 @@ impl crate::awareness::CandidateWithdrawalPhysicalPort for PostgresDomainTransac
             .bind(source_event_id)
             .bind("{\"schema\":\"native.notification-candidate.v1\"}")
             .bind(created_at)
+            .bind(act)
             .fetch_one(&mut **tx)
             .await?)
         })
@@ -8336,16 +9147,18 @@ impl BindingPhysicalPort for PostgresDomainTransaction<'_> {
     ) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             let table = self.db.qualified_table("binding_audit")?;
+            let act = self.allocate_act().await?;
             let tx = self.admitted("append binding audit")?;
             sqlx::query(
                 "SELECT pg_advisory_xact_lock(hashtextextended('native-ce:binding-audit-sequence', 0))",
             )
             .execute(&mut **tx)
             .await?;
-            sqlx::query(&format!("INSERT INTO {table}(seq,id,action,system,identifier,old_record_id,new_record_id,old_canonical,new_canonical,actor,reason,run_key,parent_key,intent,created_at) VALUES((SELECT COALESCE(MAX(seq),0)+1 FROM {table}),$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,transaction_timestamp())"))
+            sqlx::query(&format!("INSERT INTO {table}(seq,id,action,system,identifier,old_record_id,new_record_id,old_canonical,new_canonical,actor,reason,run_key,parent_key,intent,created_at,act) VALUES((SELECT COALESCE(MAX(seq),0)+1 FROM {table}),$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,transaction_timestamp(),$14)"))
                 .bind(Uuid::new_v4().to_string()).bind(audit.action).bind(&audit.claim.system).bind(&audit.claim.identifier)
                 .bind(audit.old_record_id).bind(audit.new_record_id).bind(audit.old_canonical).bind(audit.new_canonical)
                 .bind(audit.actor).bind(audit.reason).bind(audit.run_key).bind(audit.parent_key).bind(audit.intent)
+                .bind(act)
                 .execute(&mut **tx).await?;
             Ok(())
         })
@@ -8368,12 +9181,12 @@ fn postgres_binding_row(row: sqlx::postgres::PgRow) -> Result<BindingRow> {
 
 /// Map one MCP caller onto the shared authorization principal exactly as the
 /// Turso-local boundary does: only the unhosted trusted-local caller bypasses
-/// policy; routed hosted callers are member-bound accounts.
+/// policy; routed hosted callers resolve to the folded membership footing.
 fn attachment_principal(caller: &Caller) -> crate::authorization::Principal<'_> {
     if caller.is_trusted_local() && caller.hosting_database().is_none() {
         crate::authorization::Principal::trusted_local()
     } else {
-        crate::authorization::Principal::bound(caller.credential(), true)
+        crate::authorization::Principal::bound(caller.credential(), caller.is_host_member())
     }
 }
 
@@ -8759,10 +9572,28 @@ async fn append_event(
     event_type: &str,
     payload: &Value,
     actor: &str,
+    act: i64,
 ) -> Result<(i64, String)> {
     let (seq, _, created_at) =
-        append_event_with_id(db, tx, record_id, event_type, payload, actor).await?;
+        append_event_with_id(db, tx, record_id, event_type, payload, actor, act).await?;
     Ok((seq, created_at))
+}
+
+/// Allocate one act on a backend-owned raw transaction (handlers that do
+/// not run through [`PostgresDomainTransaction`]). Single-append sites call
+/// this inline; the UPDATE rolls back with the transaction, so a rollback
+/// consumes no act.
+async fn allocate_act_in(db: &PostgresDb, tx: &mut Transaction<'_, Postgres>) -> Result<i64> {
+    let state = db.qualified_table("act_state")?;
+    let act: i64 = sqlx::query_scalar(&format!(
+        "UPDATE {state} SET next_act=next_act+1 WHERE singleton=1 RETURNING next_act"
+    ))
+    .fetch_one(&mut **tx)
+    .await?;
+    if act <= 0 {
+        return Err(Error::engine("allocated act number is not positive"));
+    }
+    Ok(act)
 }
 
 async fn append_event_with_id(
@@ -8772,6 +9603,7 @@ async fn append_event_with_id(
     event_type: &str,
     payload: &Value,
     actor: &str,
+    act: i64,
 ) -> Result<(i64, String, String)> {
     let cursor = db.qualified_table("event_cursor")?;
     let log_cursors = db.qualified_table("log_cursors")?;
@@ -8812,8 +9644,8 @@ async fn append_event_with_id(
     let event_id = Uuid::new_v4().to_string();
     let created_at: DateTime<Utc> = sqlx::query_scalar(&format!(
         "INSERT INTO {events}(seq,id,record_id,type,payload,actor,run_key,parent_key,intent,\
-                              causal_envelope_version,causal_status) \
-         VALUES($1,$2,$3,$4,$5::jsonb,$6,$7,$8,$9,1,'complete') RETURNING created_at"
+                              causal_envelope_version,causal_status,act) \
+         VALUES($1,$2,$3,$4,$5::jsonb,$6,$7,$8,$9,1,'complete',$10) RETURNING created_at"
     ))
     .bind(seq)
     .bind(&event_id)
@@ -8824,6 +9656,7 @@ async fn append_event_with_id(
     .bind(annotations.run_key)
     .bind(annotations.parent_key)
     .bind(annotations.intent)
+    .bind(act)
     .fetch_one(&mut **tx)
     .await?;
     for parent_event_id in heads {
@@ -9054,6 +9887,7 @@ async fn apply_projection(
                 intent: None,
                 created_at: event_created_at.into(),
                 causal_envelope: CausalEnvelopeV1::default(),
+                act: None,
             };
             let intent = ProjectorIntent::from_event(&event)?;
             let plan = {

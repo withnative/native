@@ -9,11 +9,11 @@ without a top-level action discriminator.
 
 ## Current operation census
 
-- **76 registered tools / 193 operations**.
-- **13 ordinary, 77 high-risk, and 103 specialized operations**.
-- **81 read-only and 112 mutating operations**.
-- **188 operations carry a non-disclosure obligation**.
-- All **112 mutating operations** carry an explicit no-write-on-deny obligation
+- **86 registered tools / 220 operations**.
+- **13 ordinary, 86 high-risk, and 121 specialized operations**.
+- **95 read-only and 125 mutating operations**.
+- **215 operations carry a non-disclosure obligation**.
+- All **125 mutating operations** carry an explicit no-write-on-deny obligation
   and named negative evidence.
 - **5 read operations** have justified `negative_evidence: not_applicable`:
   `ping.$tool`, `engine_info.$tool`, `quickstart.$tool`, `read_guide.$tool`, and
@@ -27,9 +27,11 @@ Each operation independently declares its production disposition, risk tier,
 fixture owner, expected threshold, read/mutation nature, non-disclosure and
 no-write obligations, and separate positive and negative evidence claims. A
 single named test can own several operations only when every operation row
-cites that test and states the side-specific claim it owns. CI verifies that a
-Rust citation is an exact `fn`/`async fn` declaration and a Playwright citation
-is an exact named `test(...)`, rather than accepting an arbitrary substring.
+cites that test and states the side-specific claim it owns. A side of one
+operation may cite several tests when its conjunction threshold is proven by
+separate focused tests. CI verifies that a Rust citation is an exact
+`fn`/`async fn` declaration and a Playwright citation is an exact named
+`test(...)`, rather than accepting an arbitrary substring.
 
 CI fails when:
 

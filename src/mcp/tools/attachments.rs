@@ -36,7 +36,7 @@ use crate::portable_sql::{
 };
 
 use super::lifecycle::{assert_facet_value_predicates, parse_facet_entry, FacetWrite};
-use super::{parse_args, require_record, require_record_in};
+use super::{echo_act, parse_args, require_record, require_record_in};
 
 /// Cap on `attach_text` payloads — matches the guarded-fetch hard ceiling, so
 /// neither ingestion path can out-size the other.
@@ -156,6 +156,7 @@ enum ManageAttachmentsArgs {
 struct SqliteAttachmentTransaction<'a> {
     db: &'a Db,
     tx: &'a mut Transaction<'static, Sqlite>,
+    act_alloc: &'a mut crate::act::ActAllocation,
 }
 
 struct SqliteAttachmentLifecycle<'a> {
@@ -245,10 +246,14 @@ impl AttachmentPhysicalPort for SqliteAttachmentTransaction<'_> {
         spec: crate::store::AppendSpec,
     ) -> futures::future::BoxFuture<'a, Result<()>> {
         Box::pin(async move {
-            crate::store::append_in(self.db, self.tx, spec)
+            crate::store::append_in(self.db, self.tx, spec, self.act_alloc)
                 .await
                 .map(|_| ())
         })
+    }
+
+    fn allocated_act(&self) -> Option<i64> {
+        self.act_alloc.get()
     }
 }
 
@@ -310,9 +315,11 @@ async fn create_attachment(db: &Db, create: AttachmentCreate<'_>) -> Result<Valu
                     .1
                     .take()
                     .expect("attachment transaction handler runs once");
+                let mut act_alloc = crate::act::ActAllocation::new();
                 let mut port = SqliteAttachmentTransaction {
                     db: context.0,
                     tx: transaction,
+                    act_alloc: &mut act_alloc,
                 };
                 crate::domain_transaction::create_attachment(&mut port, create).await
             })
@@ -556,9 +563,14 @@ async fn attach_text_keyed(
     // exist. The reserved action identity is taken before the tentative
     // write so the miss path commits under one accepted action.
     let mut tx = crate::db::begin_write(db.write_pool()).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
     let draft = crate::provenance::reserve_action_attestation()?;
     let tentative = {
-        let mut port = SqliteAttachmentTransaction { db, tx: &mut tx };
+        let mut port = SqliteAttachmentTransaction {
+            db,
+            tx: &mut tx,
+            act_alloc: &mut act_alloc,
+        };
         crate::domain_transaction::create_attachment(
             &mut port,
             AttachmentCreate {
@@ -639,6 +651,9 @@ struct AttestedAttachment {
     attachment_id: String,
     bearer_id: String,
     blob_id: String,
+    /// The act the original call allocated; a replay returns it so the two
+    /// receipts are indistinguishable.
+    act: Option<i64>,
 }
 
 async fn attested_attachment_in(
@@ -715,6 +730,7 @@ async fn attested_attachment_in(
         attachment_id,
         bearer_id,
         blob_id,
+        act: super::attested_act_in(tx, attestation_id).await?,
     })
 }
 
@@ -779,12 +795,16 @@ async fn read_attested_attachment_receipt(
                 attested.blob_id, attested.attachment_id
             ))
         })?;
-    Ok(json!({
-        "attachment_id": attested.attachment_id,
-        "record_id": attested.bearer_id,
-        "name": name,
-        "blob": meta,
-    }))
+    echo_act(
+        json!({
+            "attachment_id": attested.attachment_id,
+            "record_id": attested.bearer_id,
+            "name": name,
+            "blob": meta,
+        }),
+        // A keyed replay returns the original write's act.
+        attested.act,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -880,9 +900,11 @@ async fn read_attachment(db: Db, caller: Caller, arguments: Value) -> Result<Val
         &mut context,
         |transaction, context| {
             Box::pin(async {
+                let mut act_alloc = crate::act::ActAllocation::new();
                 let mut port = SqliteAttachmentTransaction {
                     db: context.0,
                     tx: transaction,
+                    act_alloc: &mut act_alloc,
                 };
                 crate::domain_transaction::read_attachment(
                     &mut port,
@@ -929,9 +951,11 @@ pub(crate) async fn prepare_manage_attachments_detach(
         &mut context,
         |transaction, context| {
             Box::pin(async {
+                let mut act_alloc = crate::act::ActAllocation::new();
                 let mut port = SqliteAttachmentTransaction {
                     db: context.0,
                     tx: transaction,
+                    act_alloc: &mut act_alloc,
                 };
                 crate::domain_transaction::prepare_attachment_detach(
                     &mut port,
@@ -963,9 +987,11 @@ async fn manage_attachments(db: Db, caller: Caller, arguments: Value) -> Result<
                 &mut context,
                 |transaction, context| {
                     Box::pin(async {
+                        let mut act_alloc = crate::act::ActAllocation::new();
                         let mut port = SqliteAttachmentTransaction {
                             db: context.0,
                             tx: transaction,
+                            act_alloc: &mut act_alloc,
                         };
                         crate::domain_transaction::list_attachments(
                             &mut port,
@@ -993,9 +1019,11 @@ async fn manage_attachments(db: Db, caller: Caller, arguments: Value) -> Result<
                 &mut context,
                 |transaction, context| {
                     Box::pin(async {
+                        let mut act_alloc = crate::act::ActAllocation::new();
                         let mut port = SqliteAttachmentTransaction {
                             db: context.0,
                             tx: transaction,
+                            act_alloc: &mut act_alloc,
                         };
                         crate::domain_transaction::inspect_attachment(
                             &mut port,
@@ -1026,9 +1054,11 @@ async fn manage_attachments(db: Db, caller: Caller, arguments: Value) -> Result<
                 &mut context,
                 |transaction, context| {
                     Box::pin(async {
+                        let mut act_alloc = crate::act::ActAllocation::new();
                         let mut port = SqliteAttachmentTransaction {
                             db: context.0,
                             tx: transaction,
+                            act_alloc: &mut act_alloc,
                         };
                         crate::domain_transaction::detach_attachment(
                             &mut port,
@@ -1287,6 +1317,7 @@ mod transaction_tests {
         let db = fixture().await;
         parent(&db, ARCHIVED_PARENT_ID).await;
         let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+        let mut act_alloc = crate::act::ActAllocation::new();
         append_in(
             &db,
             &mut tx,
@@ -1296,6 +1327,7 @@ mod transaction_tests {
                 payload: json!({ "key": "archived", "value": "true" }),
                 actor: Some("agent:test".into()),
             },
+            &mut act_alloc,
         )
         .await
         .unwrap();
@@ -1335,6 +1367,7 @@ mod transaction_tests {
         let db = fixture().await;
         parent(&db, DEAD_PARENT_ID).await;
         let mut blocker = crate::db::begin_write(db.write_pool()).await.unwrap();
+        let mut act_alloc = crate::act::ActAllocation::new();
         let worker_db = db.clone();
         let dead_worker = tokio::spawn(async move {
             attach_text(
@@ -1356,6 +1389,7 @@ mod transaction_tests {
                 payload: json!({}),
                 actor: Some("agent:test".into()),
             },
+            &mut act_alloc,
         )
         .await
         .unwrap();
@@ -1401,9 +1435,15 @@ mod transaction_tests {
             .to_string()
         });
         tokio::task::yield_now().await;
-        replace_explicit_policy_on(&mut blocker, "agent:test", REVOKED_PARENT_ID, vec![])
-            .await
-            .unwrap();
+        replace_explicit_policy_on(
+            &mut blocker,
+            "agent:test",
+            REVOKED_PARENT_ID,
+            vec![],
+            &mut act_alloc,
+        )
+        .await
+        .unwrap();
         blocker.commit().await.unwrap();
         assert_eq!(
             revoked_worker.await.unwrap(),
@@ -1754,6 +1794,7 @@ mod idempotency_tests {
             attachment_id: first["attachment_id"].as_str().unwrap().to_string(),
             bearer_id: PARENT_ID.to_string(),
             blob_id: first["blob"]["id"].as_str().unwrap().to_string(),
+            act: first["act"].as_i64(),
         };
         call(
             &registry,

@@ -1122,13 +1122,30 @@ async fn blocked_draft_is_private_and_exact_authority_resumes_delivery_atomicall
     assert_eq!(satisfied["state"]["execution"]["state"], "resumed");
     assert_eq!(satisfied["state"]["obligation"]["state"], "satisfied");
     assert!(rebuild_and_diff(&db).await.unwrap().equal);
+    // content_events is append-only by trigger; this corruption sequence
+    // drops only the update guard once and restores the exact sqlite_master
+    // SQL on the same connection after the last mutation. The intervening
+    // rebuild checks only read events and projections, so they observe the
+    // intended tampered rows either way.
+    let intervention_fixture_pool = crate::common::fixture_write_pool(&db).await;
+    let mut intervention_fixture = intervention_fixture_pool.acquire().await.unwrap();
+    let intervention_update_guard: String = sqlx::query_scalar(
+        "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='content_events_no_update'",
+    )
+    .fetch_one(&mut *intervention_fixture)
+    .await
+    .unwrap();
+    sqlx::query("DROP TRIGGER content_events_no_update")
+        .execute(&mut *intervention_fixture)
+        .await
+        .unwrap();
     sqlx::query(
         "UPDATE content_events
             SET payload=json_set(payload,'$.delivery_event_id','orphaned-delivery')
           WHERE record_id=? AND type='intervention.execution_resumed.v1'",
     )
     .bind(message_id)
-    .execute(&crate::common::fixture_write_pool(&db).await)
+    .execute(&mut *intervention_fixture)
     .await
     .unwrap();
     let malformed = rebuild_and_diff(&db).await.unwrap_err().to_string();
@@ -1151,7 +1168,7 @@ async fn blocked_draft_is_private_and_exact_authority_resumes_delivery_atomicall
     )
     .bind(delivery_event_id)
     .bind(message_id)
-    .execute(&crate::common::fixture_write_pool(&db).await)
+    .execute(&mut *intervention_fixture)
     .await
     .unwrap();
     sqlx::query(
@@ -1161,7 +1178,7 @@ async fn blocked_draft_is_private_and_exact_authority_resumes_delivery_atomicall
     )
     .bind("0".repeat(64))
     .bind(message_id)
-    .execute(&crate::common::fixture_write_pool(&db).await)
+    .execute(&mut *intervention_fixture)
     .await
     .unwrap();
     let mismatched_fresh_digest = rebuild_and_diff(&db).await.unwrap_err().to_string();
@@ -1184,7 +1201,7 @@ async fn blocked_draft_is_private_and_exact_authority_resumes_delivery_atomicall
     )
     .bind(fresh_digest)
     .bind(message_id)
-    .execute(&crate::common::fixture_write_pool(&db).await)
+    .execute(&mut *intervention_fixture)
     .await
     .unwrap();
     sqlx::query(
@@ -1193,9 +1210,14 @@ async fn blocked_draft_is_private_and_exact_authority_resumes_delivery_atomicall
           WHERE record_id=? AND type='intervention.raised.v1'",
     )
     .bind(message_id)
-    .execute(&crate::common::fixture_write_pool(&db).await)
+    .execute(&mut *intervention_fixture)
     .await
     .unwrap();
+    sqlx::query(&intervention_update_guard)
+        .execute(&mut *intervention_fixture)
+        .await
+        .unwrap();
+    drop(intervention_fixture);
     let contradictory = rebuild_and_diff(&db).await.unwrap_err().to_string();
     assert!(
         contradictory.contains("contradicts its earlier send evaluation"),
@@ -1220,13 +1242,29 @@ async fn replay_rejects_tampered_policy_traces_and_disclosure_action_facts() {
     .unwrap();
     let message_id = sent["id"].as_str().unwrap();
     assert!(rebuild_and_diff(&db).await.unwrap().equal);
+    // content_events is append-only by trigger; this corruption sequence
+    // drops only the update guard once and restores the exact sqlite_master
+    // SQL on the same connection after the last mutation (same
+    // read-only-check reasoning as the test above).
+    let tamper_fixture_pool = crate::common::fixture_write_pool(&db).await;
+    let mut tamper_fixture = tamper_fixture_pool.acquire().await.unwrap();
+    let tamper_update_guard: String = sqlx::query_scalar(
+        "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='content_events_no_update'",
+    )
+    .fetch_one(&mut *tamper_fixture)
+    .await
+    .unwrap();
+    sqlx::query("DROP TRIGGER content_events_no_update")
+        .execute(&mut *tamper_fixture)
+        .await
+        .unwrap();
     sqlx::query(
         "UPDATE content_events
             SET payload=json_set(payload,'$.policy_trace.final_disposition','log_only')
           WHERE record_id=? AND type='message.send_evaluated.v1'",
     )
     .bind(message_id)
-    .execute(&crate::common::fixture_write_pool(&db).await)
+    .execute(&mut *tamper_fixture)
     .await
     .unwrap();
     let trace_error = rebuild_and_diff(&db).await.unwrap_err().to_string();
@@ -1242,9 +1280,14 @@ async fn replay_rejects_tampered_policy_traces_and_disclosure_action_facts() {
           WHERE record_id=? AND type='message.send_evaluated.v1'",
     )
     .bind(message_id)
-    .execute(&crate::common::fixture_write_pool(&db).await)
+    .execute(&mut *tamper_fixture)
     .await
     .unwrap();
+    sqlx::query(&tamper_update_guard)
+        .execute(&mut *tamper_fixture)
+        .await
+        .unwrap();
+    drop(tamper_fixture);
     let action_error = rebuild_and_diff(&db).await.unwrap_err().to_string();
     assert!(
         action_error.contains("action facts or digest are inconsistent"),

@@ -555,6 +555,7 @@ async fn imported_declaration_keeps_source_claim_but_loses_trusted_presentation(
             run_key: None,
             parent_key: None,
             intent: None,
+            is_member: true,
             internal: true,
             source_read_authorized: false,
         },

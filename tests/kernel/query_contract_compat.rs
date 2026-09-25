@@ -4,7 +4,7 @@
 fn established_query_contract_paths_compile_and_share_the_same_types() {
     use native_ce::query::sql_contract::*;
 
-    let top_level = native_ce::query::QueryPrincipal::authenticated("alice");
+    let top_level = native_ce::query::QueryPrincipal::authenticated("alice", true);
     let nested: native_ce::query::principal::QueryPrincipal = top_level.clone();
     assert_eq!(nested.credential(), "alice");
     assert!(!nested.trusted_local_bypass());

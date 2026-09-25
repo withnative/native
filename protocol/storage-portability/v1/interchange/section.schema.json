@@ -7,7 +7,7 @@
   "required": ["format", "revision", "name", "columns", "primary_key", "rows"],
   "properties": {
     "format": { "const": "native.canonical-interchange.section.v1" },
-    "revision": { "const": 2 },
+    "revision": { "const": 5 },
     "name": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" },
     "columns": {
       "type": "array",

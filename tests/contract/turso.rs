@@ -126,6 +126,18 @@ impl TursoHarness {
             .await
     }
 
+    pub async fn append_record_updated_for_test(
+        &self,
+        database: &TursoDatabase,
+        record_id: &str,
+        fields: Value,
+    ) -> Result<()> {
+        database
+            .runtime()?
+            .contract_append_record_updated_for_test(record_id, fields)
+            .await
+    }
+
     pub async fn restrict_record_to_account_for_test(
         &self,
         database: &TursoDatabase,

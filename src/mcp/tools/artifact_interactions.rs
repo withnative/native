@@ -2,7 +2,7 @@
 //! untrusted invocation and either commits one declared governed effect or
 //! refuses.
 //!
-//! The target runtime is `native.mdx.v2` alone. It sits outside the
+//! The supported runtimes are `native.mdx.v2` and `native.html.v1`. This sits outside the
 //! `ArtifactRuntime` trait deliberately — v2 needs database access for release
 //! and binding resolution, so it is a bespoke async host path rather than a
 //! synchronous adapter.
@@ -22,6 +22,23 @@
 //! 7. for facet writes, compare-and-set against the versions the artifact
 //!    observed and must supply for the pair it is writing.
 //! 8. commit, attributed to the actor and to the originating artifact.
+//!
+//! 5b. Optional exact personal-install guard (`alpha_install_guard`, alpha
+//! tab L2): when present, checked FIRST inside the write transaction against
+//! the same account's install (installed, verified `shell_adopt.v1`,
+//! generation CAS, exact artifact/source/version/digest/declaration, View,
+//! digest recomputation, plus consented `effects` must include
+//! `task.triage-set.v1`), reusing the `alpha_tabs` gate helpers. Scope is
+//! narrowed to the declared triage `facet.set`/`facet.unset` pair on
+//! `native.html.v1`, checked against the actual parsed entry both before the
+//! transaction (clarity) and inside it (boundary). A declared v2 manifest
+//! interaction alone, or a matching bundle digest alone, is never effect
+//! consent, and consent to triage-set never authorizes another facet or
+//! `record.create`. A refusal names the personal install only and never
+//! globally disables the artifact. Absent, the path is unchanged.
+//! Record-create with a guard is refused
+//! (`alpha_guard_unsupported_effect`): the governed-create transaction needs
+//! a wider refactor to re-check on its snapshot.
 //!
 //! A cheap preflight of the caller's Edit capability runs BEFORE step 3's
 //! Collection walk, so a caller who could never write cannot make the host
@@ -65,7 +82,7 @@ use native_artifact_runtime::mdx_v2::{
 use super::super::registry::{Caller, ToolRegistry};
 use super::super::ToolKind;
 use super::artifacts::{
-    resolve_artifact, resolve_bound_input_ports, resolve_bound_input_records,
+    resolve_artifact, resolve_bound_input_ports, resolve_bound_input_records, try_render_live_html,
     try_render_live_mdx_v2, BoundPort, V2SnapshotMode,
 };
 use super::lifecycle::{assert_required_not_worsened, parse_facet_entry, required_violations_in};
@@ -140,7 +157,13 @@ fn invocation_digest(invocation: &ArtifactInvocation) -> Result<String> {
     // replays the same commit rather than conflicting with it. The plan, if
     // asked for, is attached after the replay resolves, per the current
     // request.
-    Ok(hex::encode(Sha256::digest(serde_jcs::to_vec(&json!({
+    //
+    // `alpha_install_guard`, when present, IS part of the digest: it names a
+    // different authorization context, so a guarded creation must never replay
+    // as an unguarded one (or across generations). Absent, the digest is
+    // byte-identical to the pre-guard shape, preserving existing Workbench
+    // idempotency keys.
+    let mut envelope = json!({
         "version": invocation.version,
         "artifact_id": invocation.artifact_id,
         "entry_id": invocation.entry_id,
@@ -149,16 +172,44 @@ fn invocation_digest(invocation: &ArtifactInvocation) -> Result<String> {
         "values": invocation.values,
         "observed": invocation.observed,
         "gesture": invocation.gesture,
-    }))?)))
+    });
+    if let Some(guard) = &invocation.alpha_install_guard {
+        envelope["alpha_install_guard"] = json!({
+            "package": guard.package,
+            "expected_install_event_id": guard.expected_install_event_id,
+            "artifact_id": guard.artifact_id,
+            "source_revision": guard.source_revision,
+            "version": guard.version,
+            "digest": guard.digest,
+            "declaration_digest": guard.declaration_digest,
+        });
+    }
+    Ok(hex::encode(Sha256::digest(serde_jcs::to_vec(&envelope)?)))
+}
+
+/// Whether a facet-write replay candidate carries the same guard authorization
+/// context as the invoking call. `stored` is the replayed origin's
+/// `alpha_install_guard` field (`None` when the row predates the field);
+/// absent — legacy or explicitly unguarded — normalizes to JSON null, so
+/// ordinary unguarded replay still matches. Guarded↔unguarded and distinct
+/// guard pins never match. Value equality only: observed, values and gesture
+/// are deliberately not part of replay identity.
+fn facet_guard_context_matches(
+    stored: Option<&Value>,
+    current: &Option<native_artifact_runtime::artifact_intents::AlphaTabInstallGuard>,
+) -> bool {
+    let current_value = serde_json::to_value(current).unwrap_or(Value::Null);
+    stored.unwrap_or(&Value::Null) == &current_value
 }
 
 fn committed_creation(invocation: &ArtifactInvocation, created: Value) -> Value {
+    let act = created.get("act").cloned();
     let record_id = created
         .get("id")
         .and_then(Value::as_str)
         .expect("governed create success returns the authoritative record id")
         .to_owned();
-    encode(ArtifactIntentResult::Committed {
+    let mut result = encode(ArtifactIntentResult::Committed {
         version: native_artifact_runtime::artifact_intents::INTENT_RESULT_VERSION.into(),
         idempotency_key: invocation.idempotency_key.clone(),
         changes: vec![IntentChange {
@@ -169,22 +220,49 @@ fn committed_creation(invocation: &ArtifactInvocation, created: Value) -> Value 
             version: None,
         }],
         refresh: Some(json!({ "record": created })),
-    })
+    });
+    // The governed creation this invocation performed allocated exactly one
+    // act; hoist it to the top-level write payload alongside the refresh.
+    if let Some(act @ Value::Number(_)) = act {
+        result["act"] = act;
+    }
+    result
 }
 
-/// Merge a bonus plan into a committed `refresh`, shaped like the existing
-/// `{ "record": ... }` convention (`{ "plan": ... }`, or both keys together
-/// when a creation already refreshed the created record). Returns `None`
-/// when the merged candidate would breach the refresh size cap or the
-/// existing refresh is not an object — the caller then keeps whatever refresh
-/// the commit produced, never an invalid result.
-fn refresh_with_next_plan(current: Option<&Value>, plan: Value) -> Option<Value> {
+/// Merge a bonus render into a committed `refresh`, shaped like the existing
+/// `{ "record": ... }` convention: the fresh `plan` joins under `"plan"` (or
+/// beside the created record a creation already refreshed), and the
+/// authoritative `input` and `input_digest` the plan was rendered over join
+/// as siblings — mirroring the render result's own shape, so the caller can
+/// synthesise a settled result and continue with fresh state instead of a
+/// second render. `launch` is deliberately not forwarded: a commit never
+/// changes the artifact body, so the caller continues in place on its live
+/// launch.
+///
+/// The render fields are forwarded generically: each of `input` and
+/// `input_digest` is attached only when the rendered result carries it, so
+/// runtimes whose renders omit one still yield a usable bonus.
+///
+/// Required invariant: all-or-nothing. The merged candidate is size-checked
+/// once, so a breach drops plan, input and digest together — the caller must
+/// never see a plan without its input. Returns `None` when the rendered
+/// result carries no plan, the merged candidate would breach the refresh size
+/// cap, or the existing refresh is not an object — the caller then keeps
+/// whatever refresh the commit produced, never an invalid result.
+fn refresh_with_next_plan(current: Option<&Value>, rendered: &Value) -> Option<Value> {
+    let plan = rendered.get("plan")?;
     let mut merged = match current {
         Some(Value::Object(existing)) => existing.clone(),
         Some(_) => return None,
         None => serde_json::Map::new(),
     };
-    merged.insert("plan".into(), plan);
+    merged.insert("plan".into(), plan.clone());
+    if let Some(input) = rendered.get("input") {
+        merged.insert("input".into(), input.clone());
+    }
+    if let Some(input_digest) = rendered.get("input_digest") {
+        merged.insert("input_digest".into(), input_digest.clone());
+    }
     let candidate = Value::Object(merged);
     match serde_json::to_vec(&candidate) {
         Ok(bytes) if bytes.len() <= RESULT_REFRESH_JSON_LIMIT => Some(candidate),
@@ -193,8 +271,9 @@ fn refresh_with_next_plan(current: Option<&Value>, plan: Value) -> Option<Value>
 }
 
 /// The next-plan bonus: when the caller opted in with `include_next_plan`
-/// and the invocation committed, attach the fresh authoritative plan under
-/// `refresh.plan`, collapsing the commit and the re-render into one exchange.
+/// and the invocation committed, attach the fresh authoritative plan with the
+/// input it was rendered over under `refresh`, collapsing the commit and the
+/// re-render into one exchange.
 ///
 /// Only `Committed` results ever carry a plan. A conflict names exactly what
 /// moved — `current_version`, the conflicting event, the competing actor —
@@ -234,16 +313,9 @@ async fn maybe_include_next_plan(
     // transaction is closed — there is nothing left to conflict with the
     // render's own reads, so the plan below describes post-write state.
     //
-    // The render takes the same live path `render_artifact` takes for an
-    // mdx_v2 artifact — `try_render_live_mdx_v2`, one transaction on the live
-    // write pool — never the `render_artifact_at(.., Materialize)` cold
-    // fallback that replays the whole event log into scratch SQLite. The
-    // invoke path admits mdx_v2 artifacts only, so the fast path is the whole
-    // story: a `None`, a diagnostic, or anything but a rendered plan degrades
-    // to no plan, and the caller falls back to `render_artifact` exactly as
-    // with every other degradation here. (The fallback's scratch replay is
-    // unreachable for this runtime, so reaching for it would buy nothing and
-    // cost a full log replay per write.)
+    // Both supported runtimes use their ordinary live materialization path,
+    // with one transaction on the live write pool. A missing or diagnostic
+    // render degrades to no bonus plan; the committed effect stays successful.
     //
     // Admission is safe by construction: the invoke path holds no mdx permit
     // when this runs — permits are taken only inside render functions via the
@@ -254,16 +326,17 @@ async fn maybe_include_next_plan(
     let rendered =
         match try_render_live_mdx_v2(db, caller, &invocation.artifact_id, false, None).await {
             Ok(Some(rendered)) => rendered,
-            Ok(None) | Err(_) => return result,
+            Ok(None) => match try_render_live_html(db, caller, &invocation.artifact_id).await {
+                Ok(Some(rendered)) => rendered,
+                Ok(None) | Err(_) => return result,
+            },
+            Err(_) => return result,
         };
     if rendered.get("status").and_then(Value::as_str) != Some("rendered") {
         return result;
     }
-    let Some(plan) = rendered.get("plan").cloned() else {
-        return result;
-    };
     let current = result.get("refresh").filter(|value| !value.is_null());
-    if let Some(merged) = refresh_with_next_plan(current, plan) {
+    if let Some(merged) = refresh_with_next_plan(current, &rendered) {
         result["refresh"] = merged;
     }
     result
@@ -276,7 +349,7 @@ async fn replayed_creation(
     digest: &str,
 ) -> Result<Option<Value>> {
     let row = sqlx::query(
-        "SELECT record_id,payload FROM content_events
+        "SELECT record_id,payload,act FROM content_events
           WHERE type='record.created' AND actor=?
             AND json_extract(payload,'$.origin.artifact_id')=?
             AND json_extract(payload,'$.origin.entry_id')=?
@@ -292,6 +365,7 @@ async fn replayed_creation(
     let Some(row) = row else {
         return Ok(None);
     };
+    let replayed_act: Option<i64> = row.try_get("act")?;
     let payload: Value = serde_json::from_str(&row.try_get::<String, _>("payload")?)?;
     if payload
         .pointer("/origin/invocation_digest")
@@ -316,6 +390,14 @@ async fn replayed_creation(
         .as_object_mut()
         .expect("authoritative created record is an object")
         .insert("idempotent_retry".into(), Value::Bool(true));
+    // A keyed replay returns the original creation's act; `committed_creation`
+    // hoists it to the top level.
+    if let Some(act) = replayed_act {
+        created
+            .as_object_mut()
+            .expect("authoritative created record is an object")
+            .insert("act".into(), act.into());
+    }
     Ok(Some(committed_creation(invocation, created)))
 }
 
@@ -832,13 +914,15 @@ async fn invoke_artifact_interaction(db: Db, caller: Caller, arguments: Value) -
         Ok(resolved) => resolved,
         Err(diagnostic) => return Ok(from_diagnostic(&invocation, &diagnostic)),
     };
-    if resolved.runtime_id != mdx_v2::RUNTIME_ID {
+    if !matches!(
+        resolved.runtime_id.as_str(),
+        mdx_v2::RUNTIME_ID | crate::artifact_html::RUNTIME_ID
+    ) {
         return Ok(rejected(
             &invocation,
             "unsupported_runtime",
             format!(
-                "interaction entries are declared by {} artifacts; {} declares none",
-                mdx_v2::RUNTIME_ID,
+                "interaction entries require native.mdx.v2 or native.html.v1; {} declares none",
                 resolved.runtime_id
             ),
         ));
@@ -846,13 +930,29 @@ async fn invoke_artifact_interaction(db: Db, caller: Caller, arguments: Value) -
     let source_event_id = resolved
         .body_event_id
         .clone()
-        .expect("a resolved v2 artifact carries its source event id");
+        .expect("a resolved artifact carries its source event id");
     let partition = caller.hosting_principal().unwrap_or("local").to_owned();
     let body = resolved.body.clone();
-    let parsed =
-        match tokio::task::spawn_blocking(move || mdx_v2::parse_artifact_cached(&body, &partition))
-            .await
-            .map_err(|_| Error::engine(format!("{TOOL}: artifact compiler worker terminated")))?
+    let (source_sha256, manifest) = if resolved.runtime_id == crate::artifact_html::RUNTIME_ID {
+        match crate::artifact_html::validate_cached(&body) {
+            Ok(manifest) => (
+                manifest.body_digest.clone(),
+                manifest.interaction_manifest(),
+            ),
+            Err(failure) => {
+                return Ok(rejected(
+                    &invocation,
+                    "invalid_artifact_body",
+                    failure.message,
+                ))
+            }
+        }
+    } else {
+        let parsed = match tokio::task::spawn_blocking(move || {
+            mdx_v2::parse_artifact_cached(&body, &partition)
+        })
+        .await
+        .map_err(|_| Error::engine(format!("{TOOL}: artifact compiler worker terminated")))?
         {
             Ok((parsed, _cache_state)) => parsed,
             Err(failure) => {
@@ -863,12 +963,14 @@ async fn invoke_artifact_interaction(db: Db, caller: Caller, arguments: Value) -
                 ))
             }
         };
-    let mdx_v2::Manifest::Artifact(manifest) = &parsed.manifest else {
-        unreachable!("an artifact source yields an artifact manifest");
+        let mdx_v2::Manifest::Artifact(manifest) = parsed.manifest else {
+            unreachable!("an artifact source yields an artifact manifest");
+        };
+        (parsed.source_sha256, manifest)
     };
 
     // 1. A stale artifact cannot invoke against an edited manifest.
-    if parsed.source_sha256 != invocation.source_digest {
+    if source_sha256 != invocation.source_digest {
         return Ok(rejected(
             &invocation,
             "stale_source_digest",
@@ -886,13 +988,56 @@ async fn invoke_artifact_interaction(db: Db, caller: Caller, arguments: Value) -
             ),
         ));
     };
+    if let Some(_guard) = &invocation.alpha_install_guard {
+        // Guard scope, pre-transaction, on the actual parsed entry and the
+        // resolved runtime — never caller effect text. Consent to
+        // task.triage-set.v1 authorizes only the declared triage
+        // facet.set/unset pair on native.html.v1. The same checks repeat
+        // inside the write transaction (see commit_declared_write), so this
+        // early refusal is clarity, not the security boundary.
+        if entry.effect == InteractionEffect::RecordCreate {
+            // L2 slice is facet-only: a guard on a creation would need the
+            // governed-create transaction (`create_record_from_artifact`) to
+            // re-check the install on its write snapshot, a wider refactor.
+            // Fail closed rather than enforce a preflight-only gate that a
+            // disable→create race could slip past.
+            return Ok(rejected(
+                &invocation,
+                "alpha_guard_unsupported_effect",
+                "the personal-install guard applies only to the declared triage facet.set/facet.unset pair; record.create with a guard is refused",
+            ));
+        }
+        if resolved.runtime_id != crate::artifact_html::RUNTIME_ID {
+            return Ok(rejected(
+                &invocation,
+                "alpha_guard_unsupported_runtime",
+                "the personal-install guard requires native.html.v1, matching the alpha launch path",
+            ));
+        }
+        if !matches!(
+            entry.effect,
+            InteractionEffect::FacetSet | InteractionEffect::FacetUnset
+        ) || entry.facet != super::alpha_tabs::ALPHA_GUARD_FACET
+        {
+            return Ok(rejected(
+                &invocation,
+                "alpha_guard_facet_unconsented",
+                format!(
+                    "the personal-install guard consents only to facet '{}'; entry '{}' targets '{}'",
+                    super::alpha_tabs::ALPHA_GUARD_FACET,
+                    entry.id,
+                    entry.facet,
+                ),
+            ));
+        }
+    }
     if entry.effect == InteractionEffect::RecordCreate {
         let created = invoke_record_create(
             &db,
             &caller,
             &invocation,
             entry,
-            manifest,
+            &manifest,
             &source_event_id,
             &invocation_digest,
         )
@@ -932,9 +1077,9 @@ async fn invoke_artifact_interaction(db: Db, caller: Caller, arguments: Value) -
         &read_lens,
         &caller,
         &invocation.artifact_id,
-        manifest,
+        &manifest,
         &source_event_id,
-        &parsed.source_sha256,
+        &source_sha256,
     )
     .await?
     {
@@ -1085,7 +1230,11 @@ async fn invoke_artifact_interaction(db: Db, caller: Caller, arguments: Value) -
         before: None,
     };
     let committed = commit_declared_write(&db, &caller, entry, write, &invocation).await?;
-    Ok(maybe_include_next_plan(&db, &caller, &invocation, encode(committed)).await)
+    let mut encoded = encode(committed.0);
+    if let Some(act) = committed.1 {
+        encoded["act"] = act.into();
+    }
+    Ok(maybe_include_next_plan(&db, &caller, &invocation, encoded).await)
 }
 
 /// The one function in this module that appends, and it cannot be called
@@ -1113,11 +1262,14 @@ async fn commit_declared_write(
     entry: &mdx_v2::InteractionEntry,
     mut write: DeclaredWrite,
     invocation: &ArtifactInvocation,
-) -> Result<ArtifactIntentResult> {
+) -> Result<(ArtifactIntentResult, Option<i64>)> {
     let refuse = |code: &str, message: String| {
-        Ok(ArtifactIntentResult::rejected(
-            &invocation.idempotency_key,
-            IntentError::new(code, safe_message(message)),
+        Ok((
+            ArtifactIntentResult::rejected(
+                &invocation.idempotency_key,
+                IntentError::new(code, safe_message(message)),
+            ),
+            None,
         ))
     };
     let key = entry.facet.clone();
@@ -1185,6 +1337,32 @@ async fn commit_declared_write(
     };
 
     let mut tx = crate::db::begin_write(db.write_pool()).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
+
+    // 5b. Optional exact personal-install guard (alpha tab, task 26ba75a L2).
+    // Checked FIRST inside the write transaction — before permission, replay,
+    // schema and CAS — on the same snapshot as the append, so a concurrent
+    // disable/remove/reinstall (which also takes BEGIN IMMEDIATE) serializes
+    // with this write. Scope (triage facet.set/unset on native.html.v1) is
+    // re-checked here against the actual parsed `entry`, matching the
+    // pre-transaction refusal above; the pre-tx check is clarity, this is the
+    // boundary. A refusal names the personal install only; it never claims
+    // the artifact is globally disabled for other Workbench use. Absent,
+    // this step is skipped and existing callers are unchanged.
+    if let Some(guard) = &invocation.alpha_install_guard {
+        if let Some((code, message)) = super::alpha_tabs::check_alpha_install_guard_in(
+            &mut tx,
+            caller,
+            guard,
+            &invocation.artifact_id,
+            &invocation.source_digest,
+            entry,
+        )
+        .await?
+        {
+            return refuse(&code, message);
+        }
+    }
 
     // 6. Permission, server-side, from the AUTHENTICATED PRINCIPAL, inside the
     //    same transaction and snapshot as the append. Nothing in the envelope
@@ -1217,9 +1395,14 @@ async fn commit_declared_write(
     // so the answer comes from the log itself rather than a side table that
     // could disagree with it — but the match is scoped to the same actor,
     // artifact and entry, because the key is client-chosen and one caller must
-    // not be able to pre-burn another's.
-    let replayed: Option<i64> = sqlx::query_scalar(
-        "SELECT seq FROM content_events
+    // not be able to pre-burn another's. The persisted guard authorization
+    // context is compared below: a guarded write must never replay as an
+    // unguarded one (or across guard generations), mirroring the creation
+    // path's `invocation_digest` conflict. Observed, values and gesture stay
+    // out of the comparison — ordinary unguarded replay semantics are
+    // unchanged.
+    let replayed_row: Option<(i64, String)> = sqlx::query_as(
+        "SELECT seq, payload FROM content_events
           WHERE record_id=? AND actor=?
             AND json_extract(payload,'$.origin.idempotency_key')=?
             AND json_extract(payload,'$.origin.artifact_id')=?
@@ -1233,6 +1416,22 @@ async fn commit_declared_write(
     .bind(&entry.id)
     .fetch_optional(&mut *tx)
     .await?;
+    let replayed: Option<i64> = match replayed_row {
+        None => None,
+        Some((event_seq, payload)) => {
+            let stored: Value = serde_json::from_str(&payload)?;
+            if !facet_guard_context_matches(
+                stored.pointer("/origin/alpha_install_guard"),
+                &invocation.alpha_install_guard,
+            ) {
+                return refuse(
+                    "idempotency_conflict",
+                    "the idempotency key was already used for a different invocation".to_string(),
+                );
+            }
+            Some(event_seq)
+        }
+    };
     write.before = current_facet_value(&mut tx, &write.record_id, &key, spine).await?;
     if let Some(event_seq) = replayed {
         // A replay commits nothing, so there is no fresh state to describe.
@@ -1266,15 +1465,18 @@ async fn commit_declared_write(
         } else {
             FacetVersion::Observation { event_seq }
         };
-        return Ok(ArtifactIntentResult::committed(
-            &invocation.idempotency_key,
-            vec![IntentChange {
-                record_id: write.record_id,
-                key,
-                before: write.before.clone(),
-                after: write.before,
-                version: Some(version.encode()),
-            }],
+        return Ok((
+            ArtifactIntentResult::committed(
+                &invocation.idempotency_key,
+                vec![IntentChange {
+                    record_id: write.record_id,
+                    key,
+                    before: write.before.clone(),
+                    after: write.before,
+                    version: Some(version.encode()),
+                }],
+            ),
+            act_alloc.get(),
         ));
     }
 
@@ -1368,29 +1570,39 @@ async fn commit_declared_write(
                     }
                     None => None,
                 };
-                return Ok(ArtifactIntentResult::conflict(
-                    &invocation.idempotency_key,
-                    IntentError::retryable(
-                        "facet_conflict",
-                        format!(
-                            "facet '{observed_key}' on record {record_id} moved since it was read"
+                return Ok((
+                    ArtifactIntentResult::conflict(
+                        &invocation.idempotency_key,
+                        IntentError::retryable(
+                            "facet_conflict",
+                            format!(
+                                "facet '{observed_key}' on record {record_id} moved since it was read"
+                            ),
                         ),
+                        &current,
+                        &conflicting_event_id,
+                        competing_actor,
                     ),
-                    &current,
-                    &conflicting_event_id,
-                    competing_actor,
+                    act_alloc.get(),
                 ));
             }
         }
     }
 
     // 8. Commit, attributed to the actor and to the originating artifact.
+    // The optional guard authorization context rides along so a replay under a
+    // different context conflicts instead of replaying the earlier commit
+    // (see the replay branch above). Absent it serializes as an explicit null;
+    // a legacy row that predates the field (key missing) reads back as null
+    // too, so ordinary unguarded replay is preserved.
     let origin = json!({
         "artifact_id": invocation.artifact_id,
         "entry_id": entry.id,
         "source_digest": invocation.source_digest,
         "idempotency_key": invocation.idempotency_key,
         "gesture": invocation.gesture,
+        "alpha_install_guard": serde_json::to_value(&invocation.alpha_install_guard)
+            .unwrap_or(Value::Null),
     });
     let mut spec = match (spine, write.value.as_ref()) {
         // Spine facets are record-level field events, not facet events —
@@ -1424,7 +1636,7 @@ async fn commit_declared_write(
         payload.insert("origin".into(), origin);
     }
     let after = write.value.clone();
-    append_in(db, &mut tx, spec).await?;
+    append_in(db, &mut tx, spec, &mut act_alloc).await?;
     let after_required =
         required_violations_in(&mut tx, &schema_rows, &[write.record_id.as_str()]).await?;
     if let Err(error) = assert_required_not_worsened(TOOL, &before_required, &after_required) {
@@ -1446,15 +1658,18 @@ async fn commit_declared_write(
     // A drag that commits durably while no other surface invalidates would
     // defeat the optimistic premise this whole feature rests on.
     db.commit_content(tx).await?;
-    Ok(ArtifactIntentResult::committed(
-        &invocation.idempotency_key,
-        vec![IntentChange {
-            record_id: write.record_id,
-            key,
-            before: write.before,
-            after,
-            version: Some(version.encode()),
-        }],
+    Ok((
+        ArtifactIntentResult::committed(
+            &invocation.idempotency_key,
+            vec![IntentChange {
+                record_id: write.record_id,
+                key,
+                before: write.before,
+                after,
+                version: Some(version.encode()),
+            }],
+        ),
+        act_alloc.get(),
     ))
 }
 
@@ -1563,8 +1778,8 @@ async fn current_facet_value(
 pub fn register_artifact_interaction_tool(registry: &mut ToolRegistry) -> Result<()> {
     registry.register(
         ToolKind::InvokeArtifactInteraction,
-        "Run one interaction entry a native.mdx.v2 artifact declared in its \
-         nativeArtifact manifest. The host validates the source digest, the \
+        "Run one interaction entry a native.mdx.v2 or native.html.v1 artifact declared in its \
+         exact-source manifest. The host validates the source digest, the \
          entry, the slot fillings against their declared domains and the bound \
          input, then authorizes the caller and commits either one facet write \
          with compare-and-set or one governed record creation. The envelope never carries an actor, an \
@@ -1611,6 +1826,21 @@ pub fn register_artifact_interaction_tool(registry: &mut ToolRegistry) -> Result
                 "include_next_plan": {
                     "type": "boolean",
                     "description": "Opt-in: when true and the invocation commits, the result carries the next authoritative render plan under refresh.plan. Omit for the fast receipt."
+                },
+                "alpha_install_guard": {
+                    "type": "object",
+                    "description": "Optional exact personal-install guard for a reversible facet intent from an alpha tab. Checked inside the write transaction against the same account's install (installed, verified shell_adopt.v1, generation CAS, exact artifact/source/version/digest/declaration, View, plus consented effects must include task.triage-set.v1) and narrowed to the declared triage facet.set/facet.unset pair on native.html.v1; a manifest interaction or bundle digest alone is never consent and triage consent never authorizes another facet or record.create. Absent, the invocation behaves as before. A refusal names the personal install only and never globally disables the artifact.",
+                    "properties": {
+                        "package": { "type": "string" },
+                        "expected_install_event_id": { "type": "string" },
+                        "artifact_id": { "type": "string" },
+                        "source_revision": { "type": "string" },
+                        "version": { "type": "string" },
+                        "digest": { "type": "string" },
+                        "declaration_digest": { "type": "string" }
+                    },
+                    "required": ["package", "expected_install_event_id", "artifact_id", "source_revision", "version", "digest", "declaration_digest"],
+                    "additionalProperties": false
                 }
             },
             "required": ["version", "artifact_id", "entry_id", "source_digest", "idempotency_key"],
@@ -1706,7 +1936,7 @@ mod tests {
             .expect("the entry-taking write function exists")
             .1;
         let (parameters, _) = signature
-            .split_once(") -> Result<ArtifactIntentResult> {")
+            .split_once(") -> Result<(ArtifactIntentResult, Option<i64>)> {")
             .expect("the write function has a body");
         assert!(
             parameters.contains("entry: &mdx_v2::InteractionEntry"),
@@ -1727,33 +1957,117 @@ mod tests {
         }
     }
 
-    /// The bonus plan rides under `refresh.plan`, beside the created record a
-    /// creation already refreshed — never in place of it.
+    /// The guard authorization context is replay identity, nothing more:
+    /// absent (legacy rows predate the key, new unguarded rows store null)
+    /// replays only unguarded; a guard replays only its exact pin. Observed,
+    /// values and gesture never enter the comparison, so ordinary replay is
+    /// not tightened.
+    #[test]
+    fn facet_guard_context_matches_only_the_identical_guard() {
+        use native_artifact_runtime::artifact_intents::AlphaTabInstallGuard;
+        let guard_a = || AlphaTabInstallGuard {
+            package: "agent.attention-cockpit".into(),
+            expected_install_event_id: "evt-1".into(),
+            artifact_id: "a".into(),
+            source_revision: "evt-src-1".into(),
+            version: "0.1.0".into(),
+            digest: format!("sha256:{}", "b".repeat(64)),
+            declaration_digest: "c".repeat(64),
+        };
+        let stored_a = serde_json::to_value(guard_a()).unwrap();
+        // Legacy rows carry no guard key at all: replayable unguarded, never
+        // guarded.
+        assert!(facet_guard_context_matches(None, &None));
+        assert!(!facet_guard_context_matches(None, &Some(guard_a())));
+        // Explicit null (new unguarded rows) behaves identically.
+        assert!(facet_guard_context_matches(Some(&Value::Null), &None));
+        assert!(!facet_guard_context_matches(
+            Some(&Value::Null),
+            &Some(guard_a())
+        ));
+        // Same pin replays; any pin difference conflicts.
+        assert!(facet_guard_context_matches(
+            Some(&stored_a),
+            &Some(guard_a())
+        ));
+        let mut guard_b = guard_a();
+        guard_b.package = "agent.team-pulse".into();
+        assert!(!facet_guard_context_matches(
+            Some(&stored_a),
+            &Some(guard_b)
+        ));
+        assert!(!facet_guard_context_matches(Some(&stored_a), &None));
+    }
+
+    /// The bonus render rides under `refresh` beside the created record a
+    /// creation already refreshed — plan, input and digest together, never in
+    /// place of the record.
     #[test]
     fn next_plan_merges_with_an_existing_record_refresh() {
-        let plan = json!({ "kind": "safe_tree" });
+        let rendered = json!({
+            "status": "rendered",
+            "plan": { "kind": "safe_tree" },
+            "input": { "records": [] },
+            "input_digest": "abc",
+        });
         assert_eq!(
-            refresh_with_next_plan(None, plan.clone()),
-            Some(json!({ "plan": { "kind": "safe_tree" } }))
+            refresh_with_next_plan(None, &rendered),
+            Some(json!({
+                "plan": { "kind": "safe_tree" },
+                "input": { "records": [] },
+                "input_digest": "abc",
+            }))
         );
         let record = json!({ "record": { "id": "r" } });
         assert_eq!(
-            refresh_with_next_plan(Some(&record), plan),
-            Some(json!({ "record": { "id": "r" }, "plan": { "kind": "safe_tree" } }))
+            refresh_with_next_plan(Some(&record), &rendered),
+            Some(json!({
+                "record": { "id": "r" },
+                "plan": { "kind": "safe_tree" },
+                "input": { "records": [] },
+                "input_digest": "abc",
+            }))
         );
+        // Render fields are forwarded generically: a render that carries no
+        // input still yields a plan-only bonus.
+        let plan_only = json!({ "status": "rendered", "plan": { "kind": "safe_tree" } });
+        assert_eq!(
+            refresh_with_next_plan(None, &plan_only),
+            Some(json!({ "plan": { "kind": "safe_tree" } }))
+        );
+        // No plan, no bonus at all — even when the render carries an input.
+        let input_only = json!({ "status": "rendered", "input": { "records": [] } });
+        assert_eq!(refresh_with_next_plan(None, &input_only), None);
         // A non-object refresh is never produced by this module; if one ever
-        // arrives the plan is dropped rather than mangling it.
+        // arrives the bonus is dropped rather than mangling it.
         let scalar = json!("already-there");
-        assert_eq!(refresh_with_next_plan(Some(&scalar), json!({})), None);
+        assert_eq!(refresh_with_next_plan(Some(&scalar), &rendered), None);
     }
 
-    /// An oversized plan degrades to the refresh the commit produced on its
+    /// An oversized bonus degrades to the refresh the commit produced on its
     /// own — `None` here means "keep the original", never an invalid result.
+    /// All-or-nothing: a plan that fits on its own is still dropped when the
+    /// input it needs would breach the cap with it, so the caller never sees
+    /// a plan without its input.
     #[test]
     fn an_oversized_next_plan_degrades_to_the_commit_refresh() {
         let oversized = json!({ "tree": "x".repeat(RESULT_REFRESH_JSON_LIMIT) });
-        assert!(refresh_with_next_plan(None, oversized.clone()).is_none());
+        let oversized_rendered = json!({ "status": "rendered", "plan": oversized });
+        assert!(refresh_with_next_plan(None, &oversized_rendered).is_none());
         let record = json!({ "record": { "id": "r" } });
-        assert!(refresh_with_next_plan(Some(&record), oversized).is_none());
+        assert!(refresh_with_next_plan(Some(&record), &oversized_rendered).is_none());
+
+        let small_plan = json!({ "kind": "safe_tree" });
+        let bulky_input = json!({ "records": ["x".repeat(RESULT_REFRESH_JSON_LIMIT)] });
+        let split_breach =
+            json!({ "status": "rendered", "plan": small_plan, "input": bulky_input });
+        assert!(
+            refresh_with_next_plan(None, &split_breach).is_none(),
+            "a fitting plan must not survive without its breaching input"
+        );
+        assert!(
+            refresh_with_next_plan(Some(&record), &split_breach).is_none(),
+            "all-or-nothing holds beside an existing record refresh too"
+        );
     }
 }

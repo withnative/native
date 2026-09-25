@@ -24,7 +24,7 @@ Four questions define the promise. Each is answered here.
 | Runtime | What the person sees | What survives |
 | --- | --- | --- |
 | `native.mdx.v2` | The host resolves a fresh safe-tree plan from the current input bundle and re-renders it **in place**. | The page, the host DOM, and the component tree. The previous plan stays painted, marked `aria-busy`, until the new one settles. |
-| `native.html.v1` | If the server-computed input digest changed and the body digest did not, and the document has subscribed with `nativeArtifact.onInput`, the host delivers the new input **in place** over the bridge and the existing iframe is kept. If the document has not subscribed, does not acknowledge within the bounded wait, or the body digest changed, the host mints a fresh one-use launch and **replaces the iframe** with a new element at the new URL. If neither digest changed, the existing iframe is kept and its `src` is not touched. | The page and host DOM always survive. Frame-internal JavaScript state survives an unchanged refresh and, for a subscribed document, a changed input; an unsubscribed document or a changed body relaunches the document from its authored start. |
+| `native.html.v1` | If the server-computed input digest changed and the body digest did not, and the document has subscribed with `nativeArtifact.onInput`, the host delivers the new input **in place** over the bridge and the existing iframe is kept. If the document has not subscribed, does not acknowledge within the bounded wait, or the body digest changed, the host mints a fresh one-use launch and **replaces the iframe** with a new element at the new URL. If neither digest changed, the existing iframe is kept and its `src` is not touched. | The page and host DOM always survive. Frame-internal JavaScript state survives an unchanged refresh and, for a subscribed document, a changed input. A changed body relaunches the document, so its JavaScript heap does not survive; a document that publishes with `nativeArtifact.setViewState` has its own view state handed to the successor frame in `native-html-init`, which restores it best-effort. An unsubscribed document, or one that publishes no view state, relaunches from its authored start. |
 
 Both changed-input legs of the HTML row are proven end to end by the two HTML
 tests named below: in-place delivery for a subscribed document, relaunch for
@@ -119,27 +119,45 @@ artifact in question, not from this document.
   reconnect the `ready` fence triggers convergence; that is a catch-up, not a
   guarantee about what was missed while offline.
 - **Frame-local state in HTML v1** across a changed input when the document
-  has not subscribed to input updates, and across a changed document body in
-  every case, as stated above.
+  has not subscribed to input updates. A changed document body always
+  relaunches the frame and always destroys its JavaScript heap; what a
+  document can carry across that boundary is the view state it publishes
+  itself with `nativeArtifact.setViewState`, which the host holds opaquely and
+  hands to the successor. Restoration is the author's responsibility and
+  best-effort by construction: a rewritten body may be genuinely incompatible
+  with its predecessor's state, and neither the host nor the runtime can know.
+  A document that publishes nothing relaunches from its authored start, as
+  before.
 - **`native.mdx.v1` and `native.board.v1`.** Not claimed. Both share the
   retained render key and receive the same invalidations, but `native.board.v1`
   is deprecated and no test asserts fence convergence for `native.mdx.v1`.
 
 ## Proof
 
-Three journeys run against a real server in the `security-render` shard of the
+Four journeys run against a real server in the `security-render` shard of the
 real-server Playwright harness (`web/workbench/e2e/real-server.spec.ts`),
-with zero retries. Each opens the artifact in a fresh tab, fences the stream
-at the sequence already painted, stamps a marker on `window`, performs the
-write **out of band** through the tool route, and asserts the visible change,
-that the marker survived, that the receipt's `content_event_seq` advanced,
-and that its `authorization_revision` did not.
+with zero retries. Each opens the artifact in a fresh tab, stamps a marker on
+the host page's `window`, performs the write **out of band** through the tool
+route, and asserts the visible change and that the marker survived — the
+marker is what distinguishes an in-page update from a page reload.
+
+The first three fence the stream at the sequence already painted and
+additionally assert that the receipt's `content_event_seq` advanced while its
+`authorization_revision` did not. The view-state journey does not fence: it
+opens in a fresh tab with no tab-scoped cursor, so the server starts the
+subscription at the current high-water mark. It proves the relaunch directly
+instead — the previously painted iframe element is asserted **detached** and
+the replacement carries a different launch URL, so a same-node navigation
+cannot pass — and its two body revisions differ only in authored text, which
+is what makes the surviving tab attributable to the handoff and nothing
+else.
 
 | Runtime | Test title |
 | --- | --- |
 | `native.mdx.v2` | `a facet-grouped BarChart refreshes from one atomic real-server input snapshot` |
 | `native.html.v1`, unsubscribed document (relaunch) | `an open native.html.v1 artifact reflects a bound record change without a reload` |
 | `native.html.v1`, subscribed document (in place) | `an open native.html.v1 artifact updates in place when a subscribed document's bound record changes` |
+| `native.html.v1`, view-state handover across a body rewrite | `an open native.html.v1 artifact keeps its tab across a body rewrite` |
 
 Unit coverage for the host behaviour the tests rely on lives in
 `web/workbench/src/App.test.tsx` (`artifact realtime invalidation`,

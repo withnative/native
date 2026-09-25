@@ -36,7 +36,9 @@ use super::render;
 use super::{
     DeploymentAdmission, DeploymentMutationBarrier, DeploymentPersistenceLease, OperationAccess,
 };
-use super::{ExperimentalExecutors, EXPERIMENTAL_FRESHNESS_EXECUTOR};
+use super::{
+    ExperimentalExecutors, EXPERIMENTAL_FRESHNESS_EXECUTOR, EXPERIMENTAL_SQL_WRITE_EXECUTOR,
+};
 
 #[path = "executor_prototype/plan_store.rs"]
 mod plan_store;
@@ -292,14 +294,15 @@ fn row_is_admitted(row: &AuditRow, experimental: &ExperimentalExecutors) -> bool
     row.stability == "experimental" && experimental.contains(&row.candidate_executor)
 }
 
-/// The audited `experimental_freshness` executor descriptor, loaded verbatim
-/// from the `build_enabled_experimental` surface of the committed public
-/// projection (itself a verbatim copy of the held candidate audit's surface).
-/// Nothing about the stable inventory changes: the descriptor only enters a
-/// catalogue when its executor is allowlisted.
-fn experimental_freshness_descriptor(
+/// One audited experimental executor descriptor, loaded verbatim from the
+/// `build_enabled_experimental` surface of the committed public projection
+/// (itself a verbatim copy of the held candidate audit's surface). Nothing
+/// about the stable inventory changes: the descriptor only enters a catalogue
+/// when its executor is allowlisted.
+fn experimental_executor_descriptor(
     surface: &CandidateSurface,
     surface_name: &str,
+    executor: &str,
 ) -> Result<Value> {
     if serde_json::to_vec(&surface.descriptors)?.len() != surface.descriptor_bytes {
         return Err(Error::engine(format!(
@@ -309,15 +312,34 @@ fn experimental_freshness_descriptor(
     surface
         .descriptors
         .iter()
-        .find(|descriptor| {
-            descriptor.get("name").and_then(Value::as_str) == Some(EXPERIMENTAL_FRESHNESS_EXECUTOR)
-        })
+        .find(|descriptor| descriptor.get("name").and_then(Value::as_str) == Some(executor))
         .cloned()
         .ok_or_else(|| {
             Error::engine(format!(
-                "audited build-enabled-experimental {surface_name} surface is missing {EXPERIMENTAL_FRESHNESS_EXECUTOR}"
+                "audited build-enabled-experimental {surface_name} surface is missing {executor}"
             ))
         })
+}
+
+/// The audited `experimental_freshness` executor descriptor, loaded verbatim
+/// from the `build_enabled_experimental` surface of the committed public
+/// projection (itself a verbatim copy of the held candidate audit's surface).
+/// Nothing about the stable inventory changes: the descriptor only enters a
+/// catalogue when its executor is allowlisted.
+fn experimental_freshness_descriptor(
+    surface: &CandidateSurface,
+    surface_name: &str,
+) -> Result<Value> {
+    experimental_executor_descriptor(surface, surface_name, EXPERIMENTAL_FRESHNESS_EXECUTOR)
+}
+
+/// The audited `sql_write` executor descriptor. Like freshness, it only
+/// enters a catalogue when its executor is allowlisted.
+fn experimental_sql_write_descriptor(
+    surface: &CandidateSurface,
+    surface_name: &str,
+) -> Result<Value> {
+    experimental_executor_descriptor(surface, surface_name, EXPERIMENTAL_SQL_WRITE_EXECUTOR)
 }
 
 fn build_ordinary_catalogue(
@@ -351,9 +373,16 @@ fn build_ordinary_catalogue(
             "ordinary",
         )?);
     }
+    if experimental.contains(EXPERIMENTAL_SQL_WRITE_EXECUTOR) {
+        source_descriptors.push(experimental_sql_write_descriptor(
+            &audit.candidate_surfaces.build_enabled_experimental.ordinary,
+            "ordinary",
+        )?);
+    }
     let mut descriptors = executable_descriptors(source_descriptors, &operations_by_executor)?;
     add_ordinary_executor_format_contracts(&mut descriptors, &contracts)?;
     add_operation_field_listings(&mut descriptors, &contracts)?;
+    add_sql_read_catalog_card(&mut descriptors);
     let descriptor_bytes = serde_json::to_vec(&descriptors)?.len();
     let manifest_digest = jcs_sha256(&Value::Array(descriptors.clone()))?;
     Ok(PinnedExecutorCatalogue {
@@ -1961,8 +1990,15 @@ impl ExecutorPrototypeLensServer {
                 "lens",
             )?);
         }
+        if experimental.contains(EXPERIMENTAL_SQL_WRITE_EXECUTOR) {
+            source_descriptors.push(experimental_sql_write_descriptor(
+                &audit.candidate_surfaces.build_enabled_experimental.lens,
+                "lens",
+            )?);
+        }
         let mut descriptors = executable_descriptors(source_descriptors, &operations_by_executor)?;
         add_operation_field_listings(&mut descriptors, &contracts)?;
+        add_sql_read_catalog_card(&mut descriptors);
         let descriptor_bytes = serde_json::to_vec(&descriptors)?.len();
         let manifest_digest = jcs_sha256(&Value::Array(descriptors.clone()))?;
         Ok(Arc::new(PinnedLensExecutorCatalogue {
@@ -2861,9 +2897,14 @@ fn operation_has_execution_path_for_hosting(
 ) -> bool {
     match surface {
         ExecutorSurface::Ordinary => {
-            write_operations::advertisable(executor, operation)
+            // The workspace directory is Direct yet hosted-only: without
+            // hosted authority it is withheld exactly like the plan-gated
+            // membership operations below.
+            (write_operations::advertisable(executor, operation)
+                && !write_operations::is_workspace_operation(executor, operation))
                 || (hosted_membership_plans
-                    && write_operations::is_membership_operation(executor, operation))
+                    && (write_operations::is_membership_operation(executor, operation)
+                        || write_operations::is_workspace_operation(executor, operation)))
         }
         ExecutorSurface::Lens => !write_operations::requires_plan(executor, operation),
     }
@@ -3020,6 +3061,27 @@ fn add_ordinary_executor_format_contracts(
 ///
 /// The contracts are already projected at boot, so this derives nothing at
 /// request time.
+fn add_sql_read_catalog_card(descriptors: &mut [Value]) {
+    // E2 I-4: the served `sql_read` descriptor carries the catalog card so
+    // first contact already names every relation, the value model, the
+    // placeholder rule and worked statements. Budget enforced below.
+    let card = crate::query::sql_contract::sql_read_catalog_card();
+    debug_assert!(
+        card.len() <= crate::query::sql_contract::SQL_READ_CARD_MAX_BYTES,
+        "catalog card exceeded its byte budget"
+    );
+    for descriptor in descriptors {
+        if descriptor.get("name").and_then(Value::as_str) != Some("sql_read") {
+            continue;
+        }
+        let description = descriptor
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        descriptor["description"] = json!(format!("{description} {card}"));
+    }
+}
+
 fn add_operation_field_listings(
     descriptors: &mut [Value],
     contracts: &OperationContracts,
@@ -3076,16 +3138,25 @@ fn add_operation_field_listings(
                 ));
             }
         }
-        let listings = routed
+        // An operation whose projection is not action-specific shares one
+        // projected contract with its sibling actions, so naming its accepted
+        // fields would name theirs too. It still gets its required ones: see
+        // `required_field_listing` for why that half is sound when the whole is
+        // not.
+        let (specific, shared): (Vec<_>, Vec<_>) = routed
             .iter()
-            .filter(|contract| contract.action_specific_projection)
+            .copied()
+            .partition(|contract| contract.action_specific_projection);
+        let listings = specific
+            .iter()
             .map(|contract| operation_field_listing(&contract.operation, &contract.input_schema))
             .collect::<Vec<_>>();
-        // An operation absent from the listing shares one projected contract
-        // with its sibling actions, so naming its fields would name theirs too.
-        // Say that once, rather than restating the operation enum the caller
-        // already has.
-        let deferred = routed.len() > listings.len();
+        let shared_listings = shared
+            .iter()
+            .filter_map(|contract| {
+                required_field_listing(&contract.operation, &contract.input_schema)
+            })
+            .collect::<Vec<_>>();
         let mut clause = String::new();
         if !listings.is_empty() {
             clause.push_str(&format!(
@@ -3094,7 +3165,29 @@ fn add_operation_field_listings(
                 listings.join("; ")
             ));
         }
-        if deferred {
+        // The two sentences below are independent, not alternatives. An
+        // executor can route several flat-bag source tools, one demanding a
+        // field of every action and another demanding nothing beyond the
+        // selector — and then some shared operations are named here while
+        // others can only be covered by the catch-all. Choosing between the
+        // sentences would leave that second group described by neither, which
+        // is less disclosure than before this listing existed.
+        if !shared_listings.is_empty() {
+            // Carries its own `* = required` legend: an executor whose source
+            // tools are all flat bags — `canvas_read` — has no listing above to
+            // establish the convention.
+            if !clause.is_empty() {
+                clause.push(' ');
+            }
+            clause.push_str(&format!(
+                "An operation shown next shares one contract with its sibling \
+                 actions, so only the fields required of every action are named \
+                 for it (* = required) and its remaining fields are available \
+                 from describe_operation: {}.",
+                shared_listings.join("; ")
+            ));
+        }
+        if shared.len() > shared_listings.len() {
             // Said even when nothing could be listed, so an executor that
             // discloses no fields says so rather than saying nothing.
             if !clause.is_empty() {
@@ -3178,6 +3271,39 @@ fn operation_field_listing(operation: &str, schema: &Value) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!("{operation}: {rendered}")
+}
+
+/// `operation: field*, field*` — only the fields required of every action a
+/// shared contract routes, for an operation whose projection is not
+/// action-specific.
+///
+/// Naming a shared projection's *accepted* fields as one action's own is the
+/// defect `projection_is_action_specific` exists to prevent: a flat-bag source
+/// tool's `properties` map is the union of actions whose contracts differ, so
+/// `manage_attachments.detach` would be advertised as accepting `record_id`,
+/// which its handler rejects. The required half carries no such risk. That
+/// array sits above the action selector in the same flat bag, and
+/// `collect_required_names` walks only the top level and `allOf`, never a
+/// branch — so every name it returns is required of every action the tool
+/// routes, and starring it states what the server already enforces.
+///
+/// This is the whole disclosure for an executor whose source tools are all flat
+/// bags. `read_canvas` is one: before this, none of its four operations named a
+/// field, and a caller learned `canvas_id` by being rejected.
+fn required_field_listing(operation: &str, schema: &Value) -> Option<String> {
+    let mut required = Vec::new();
+    collect_required_names(schema, &mut required);
+    required.sort();
+    required.dedup();
+    if required.is_empty() {
+        return None;
+    }
+    let rendered = required
+        .into_iter()
+        .map(|name| format!("{name}*"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!("{operation}: {rendered}"))
 }
 
 /// Every property name an operation accepts, including those reachable only
@@ -5057,9 +5183,10 @@ mod tests {
     }
 
     /// The registry the hosted deployment actually serves, mirrored from the
-    /// composition in `held/runtime/src/serve.rs`: builtin + surface +
-    /// build-enabled experimental + snapshot + membership + reach (when the
-    /// reach sidecar is configured). The snapshot source
+    /// composition in `held/runtime/src/serve.rs`: builtin and surface tools,
+    /// build-enabled experimental tools, allowlisted experimental sources,
+    /// snapshot, membership, workspace, and reach when its sidecar is configured.
+    /// The snapshot source
     /// is the in-crate `LocalSnapshotSource` and the membership delegate is
     /// non-dispatchable; neither substitution matters here because the
     /// executor catalogue is built from descriptors, never by dispatching.
@@ -5069,11 +5196,14 @@ mod tests {
     /// generator-only `register_membership_tool_schema` (whose Sqlite
     /// unavailable marking filters the membership executors out of the
     /// catalogue before the hosted flag is consulted).
+    /// The `sql_write` source is registered explicitly here to mirror a
+    /// deployment that allowlisted its executor.
     fn hosted_registry() -> Arc<ToolRegistry> {
         let mut registry = ToolRegistry::new();
         register_builtin_tools(&mut registry).unwrap();
         register_surface_tools(&mut registry).unwrap();
         crate::mcp::register_build_enabled_experimental_tools(&mut registry).unwrap();
+        crate::mcp::tools::sql_write::register_sql_write_tool(&mut registry).unwrap();
         crate::mcp::register_snapshot_tool(
             &mut registry,
             Arc::new(crate::export::LocalSnapshotSource::new()),
@@ -5087,6 +5217,15 @@ mod tests {
                 ))
             },
         )
+        .unwrap();
+        // Hosted-only workspace directory, registered executable (not
+        // schema-only) so the audit drift guard sees the same action serve
+        // exposes.
+        crate::mcp::register_workspace_tool_with(&mut registry, |_db, _caller, _arguments| async {
+            Err(Error::engine(
+                "workspace_read fixture delegate cannot be dispatched",
+            ))
+        })
         .unwrap();
         // Hosted-only reach tools, registered executable (not schema-only) so
         // the audit drift guard sees the same actions serve exposes once the
@@ -5109,7 +5248,45 @@ mod tests {
             },
         )
         .unwrap();
+        // Hosted-only authority act transport uses an executable fixture so
+        // the audit drift guard sees the operations served by hosting.
+        crate::mcp::register_authority_act_tools(
+            &mut registry,
+            Arc::new(AuthorityActFixtureSource),
+        )
+        .unwrap();
         Arc::new(registry)
+    }
+
+    struct AuthorityActFixtureSource;
+
+    impl crate::mcp::authority_act::AuthorityActSource for AuthorityActFixtureSource {
+        fn head(
+            &self,
+            _db: crate::Db,
+            _caller: Caller,
+        ) -> BoxFuture<'static, Result<crate::standby::delta_transport::AuthorityActHeadResponseV1>>
+        {
+            Box::pin(async {
+                Err(Error::engine(
+                    "authority_act fixture delegate cannot be dispatched",
+                ))
+            })
+        }
+
+        fn delta(
+            &self,
+            _db: crate::Db,
+            _caller: Caller,
+            _request: crate::mcp::AuthorityActDeltaRequest,
+        ) -> BoxFuture<'static, Result<crate::standby::delta_transport::AuthorityActDeltaResponseV1>>
+        {
+            Box::pin(async {
+                Err(Error::engine(
+                    "authority_act fixture delegate cannot be dispatched",
+                ))
+            })
+        }
     }
 
     /// Drift guard for the executor operation catalogue.
@@ -5117,7 +5294,7 @@ mod tests {
     /// `build_contracts_for_hosting` can only select operations with a row in
     /// the committed audit projection (`AUDIT`), while dispatch serves
     /// whatever the live `ToolRegistry` registers. Before this guard, any
-    /// action added to an existing tool after the baseline freeze — e.g.
+    /// direct tool or action added after the baseline freeze — e.g.
     /// `read_canvas.export`, registered 5 Sep 2026 but unfrozen until the
     /// re-freeze that landed alongside this guard — was silently unreachable
     /// over the executor facade: no generation step failed and no test
@@ -5126,9 +5303,10 @@ mod tests {
     /// The check is one-directional on purpose: audit rows with no registered
     /// tool (notably the synthetic lens-only `materialize_record` the
     /// candidate generator injects) are allowed, because an unregistered row
-    /// advertises nothing. A registered action with no audit row is the exact
-    /// condition that made an implemented capability unselectable, so it
-    /// fails, naming the missing `tool.action` and the regeneration commands.
+    /// advertises nothing. A registered direct call or action with no audit
+    /// row is the exact condition that makes an implemented capability
+    /// unselectable, so it fails, naming the missing `tool.action` and the
+    /// regeneration commands.
     fn selector_action_values(schema: &Value, into: &mut Vec<String>) {
         // The frozen inventory evidences exactly two selector fields across
         // every registered tool (`action` everywhere, plus `intention` on the
@@ -5170,11 +5348,12 @@ mod tests {
         for spec in registry.specs() {
             let mut actions = Vec::new();
             selector_action_values(&spec.input_schema, &mut actions);
+            if actions.is_empty() {
+                actions.push("call".to_string());
+            }
             actions.sort();
             actions.dedup();
-            if !actions.is_empty() {
-                tools.push((spec.name.clone(), actions));
-            }
+            tools.push((spec.name.clone(), actions));
         }
         tools
     }
@@ -5297,6 +5476,38 @@ mod tests {
         assert!(
             contracts.contains_key(&("canvas_read".to_string(), "read_canvas.export".to_string())),
             "read_canvas.export must have an ordinary operation contract"
+        );
+    }
+
+    #[test]
+    fn workspace_read_list_is_selectable_on_the_hosted_facade() {
+        // End-to-end selectability, not just row presence: the ordinary
+        // catalogue the facade serves must route `workspace_read` /
+        // `workspace_read.list` to a read contract, and the lens catalogue
+        // must carry it too, exactly like `membership_read`.
+        let registry = hosted_registry();
+        let catalogue = build_ordinary_catalogue(
+            &registry,
+            super::super::registry::EngineKind::Sqlite,
+            true,
+            &ExperimentalExecutors::empty(),
+        )
+        .unwrap();
+        let operations = catalogue
+            .operations_by_executor
+            .get("workspace_read")
+            .expect("the ordinary facade must advertise workspace_read");
+        assert_eq!(operations, &["workspace_read.list".to_string()]);
+        assert_eq!(
+            catalogue
+                .contracts
+                .get(&(
+                    "workspace_read".to_string(),
+                    "workspace_read.list".to_string()
+                ))
+                .expect("workspace_read.list must have an ordinary operation contract")
+                .access,
+            OperationAccess::Read
         );
     }
 
@@ -5817,11 +6028,11 @@ mod tests {
         let audit: Audit = serde_json::from_str(AUDIT).unwrap();
         assert_eq!(
             audit.candidate_surfaces.stable.ordinary.descriptors.len(),
-            34
+            35
         );
         assert_eq!(
             audit.candidate_surfaces.stable.ordinary.descriptor_bytes,
-            41_663
+            43_163
         );
         assert_eq!(
             serde_json::to_vec(&audit.candidate_surfaces.stable.ordinary.descriptors)
@@ -5838,7 +6049,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             audit.candidate_surfaces.stable.lens.descriptor_bytes,
-            47_694
+            49_410
         );
         assert_eq!(
             serde_json::to_vec(&audit.candidate_surfaces.stable.lens.descriptors)
@@ -5851,6 +6062,7 @@ mod tests {
         for operation in [
             "query_record",
             "get_record",
+            "get_reuse_context",
             "resolve_many",
             "search",
             "get_structure",
@@ -5986,6 +6198,7 @@ mod tests {
         // "not there" cannot be misread as "takes no arguments".
         assert!(
             description.contains("An operation not listed here")
+                || description.contains("An operation shown next")
                 || descriptor["inputSchema"]["properties"]["operation"]["enum"]
                     .as_array()
                     .expect("operation enum")
@@ -6008,6 +6221,137 @@ mod tests {
                 "{name} must not carry an operation listing"
             );
         }
+    }
+
+    /// `437b0e9` review finding 1. An executor can route two flat-bag source
+    /// tools where one demands a field of every action and the other demands
+    /// nothing beyond the selector. No shipped executor does today, so nothing
+    /// above would have caught treating the two disclosure sentences as
+    /// alternatives — and an operation in the second group would then be
+    /// described by neither, which is less than it got before the required-only
+    /// listing existed.
+    #[test]
+    fn a_shared_operation_requiring_nothing_is_still_explained_beside_one_that_does() {
+        let mut descriptors = vec![json!({
+            "name": "mixed_executor",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "operation": { "enum": ["demanding.act", "lax.act"] },
+                    "arguments": { "type": "object", "description": "" }
+                }
+            }
+        })];
+        let mut contracts = OperationContracts::new();
+        for (operation, schema) in [
+            (
+                "demanding.act",
+                json!({"properties": {"canvas_id": {}, "limit": {}}, "required": ["canvas_id"]}),
+            ),
+            ("lax.act", json!({"properties": {"vocabulary": {}}})),
+        ] {
+            let mut contract = test_contract(operation, schema);
+            contract.executor = "mixed_executor".into();
+            contract.action_specific_projection = false;
+            contracts.insert(("mixed_executor".into(), operation.into()), contract);
+        }
+        add_operation_field_listings(&mut descriptors, &contracts).unwrap();
+        let description = descriptors[0]["inputSchema"]["properties"]["arguments"]["description"]
+            .as_str()
+            .expect("arguments description");
+
+        assert!(
+            description.contains("demanding.act: canvas_id*"),
+            "the demanding operation must name what every action requires: {description}"
+        );
+        assert!(
+            !description.contains("limit"),
+            "a shared contract must not advertise its optional half: {description}"
+        );
+        assert!(
+            description.contains("An operation not listed here"),
+            "the operation requiring nothing must still be explained rather than \
+             silently dropped: {description}"
+        );
+    }
+
+    /// `437b0e9`, option 1: an executor whose source tools are flat bags
+    /// disclosed nothing at all — every operation deferred, so the contract was
+    /// silent about fields the server unconditionally demands. It now names the
+    /// fields required of every action, and only those.
+    ///
+    /// `canvas_read` is the specimen. Its four operations come from one flat
+    /// `read_canvas` schema requiring `action` and `canvas_id`, so `canvas_id`
+    /// is required of all four; the optionals (`after`, `limit`,
+    /// `include_deleted`, `include_history`) belong to one action each and must
+    /// not travel, which is what deferral is for.
+    #[test]
+    fn flat_bag_operations_name_the_fields_required_of_every_action() {
+        let registry = registry();
+        let catalogue = build_ordinary_catalogue(
+            &registry,
+            super::super::registry::EngineKind::Sqlite,
+            false,
+            &ExperimentalExecutors::empty(),
+        )
+        .unwrap();
+        let description = |executor: &str| {
+            catalogue
+                .descriptors
+                .iter()
+                .find(|descriptor| descriptor["name"] == executor)
+                .unwrap_or_else(|| panic!("{executor} descriptor"))["inputSchema"]["properties"]
+                ["arguments"]["description"]
+                .as_str()
+                .expect("arguments description")
+                .to_string()
+        };
+
+        let canvas = description("canvas_read");
+        for operation in [
+            "read_canvas.changes",
+            "read_canvas.describe",
+            "read_canvas.export",
+            "read_canvas.get_scene",
+        ] {
+            assert!(
+                canvas.contains(&format!("{operation}: canvas_id*")),
+                "{operation} must name the field required of every action: {canvas}"
+            );
+        }
+        for optional in [
+            "after",
+            "limit",
+            "include_deleted",
+            "include_history",
+            "as_of",
+        ] {
+            assert!(
+                !canvas.contains(optional),
+                "{optional} belongs to one action and must stay behind \
+                 describe_operation: {canvas}"
+            );
+        }
+        assert!(
+            canvas.contains("available from describe_operation"),
+            "the required-only listing must say where the rest is: {canvas}"
+        );
+
+        // The honest limit of this variant, pinned so it is not mistaken for a
+        // regression. `manage_vocabularies` and `manage_schema_config` require
+        // only `action`, which is the selector and never appears in
+        // `arguments` — so there is no unconditional field to name and
+        // `schema_admin` still discloses none. Closing that gap means giving
+        // those tools per-action branches, which `437b0e9` scopes out.
+        let schema_admin = description("schema_admin");
+        assert!(
+            schema_admin.contains("An operation not listed here"),
+            "schema_admin must still explain its silence: {schema_admin}"
+        );
+        assert!(
+            !schema_admin.contains('*'),
+            "schema_admin has no unconditionally required field to star: {schema_admin}"
+        );
     }
 
     /// Only unconditionally required fields are starred. `update_record` needs
@@ -6043,7 +6387,7 @@ mod tests {
     /// This measures the shipped registry, not the test registry: the hosted
     /// fixture mirrors the composition in `held/runtime/src/serve.rs`
     /// (builtin + surface + build-enabled experimental + snapshot +
-    /// membership), built here as the hosted catalogue plus the lens surface.
+    /// membership + workspace), built here as the hosted catalogue plus the lens surface.
     /// The membership delegate is non-dispatchable on purpose. This test
     /// measures descriptor bytes and never dispatches, so what it must
     /// reproduce is the shipped descriptor shape, not execution semantics —
@@ -6074,6 +6418,7 @@ mod tests {
             "membership_read",
             "membership_admin",
             "membership_remove",
+            "workspace_read",
             "export",
         ] {
             assert!(
@@ -6088,7 +6433,7 @@ mod tests {
             .iter()
             .filter_map(|descriptor| descriptor.get("name").and_then(Value::as_str))
             .collect();
-        for executor in ["membership_read", "export"] {
+        for executor in ["membership_read", "workspace_read", "export"] {
             assert!(
                 lens_names.contains(&executor),
                 "hosted lens catalogue is missing {executor}; the budget \
@@ -6114,10 +6459,8 @@ mod tests {
     /// The opted-in `experimental_freshness` descriptor is data, not code: it
     /// is loaded verbatim from the `build_enabled_experimental` surface of
     /// the committed public projection. This asserts the loaded descriptor
-    /// exists on both surfaces with the audited name, and pins the opted-in
-    /// catalogue bytes so a projection or pipeline change fails here rather
-    /// than shipping a different discovery surface. Opting in must never be
-    /// the change that spends the ceiling's margin either.
+    /// exists on both surfaces with the audited name. Opting in must keep the
+    /// catalogue within the descriptor ceiling.
     ///
     /// Needs the experimental legacy tool registered, so it is unavailable
     /// in `--no-default-features` builds.
@@ -6164,16 +6507,9 @@ mod tests {
         let lens =
             ExecutorPrototypeLensServer::pin_catalogue_with_experimental(&registry, &experimental)
                 .unwrap();
-        assert_eq!(
-            ordinary.descriptor_bytes(),
-            69531,
-            "ordinary+experimental byte count"
-        );
-        assert_eq!(
-            lens.descriptor_bytes(),
-            41149,
-            "lens+experimental byte count"
-        );
+        // Exact byte pins relaxed to ceilings (Richard, 24 Sep 2026); a generated descriptor snapshot is tracked in Native 5af0a10.
+        // Opting in must never spend the ceiling's margin: experimental stays
+        // under the same ceiling, with actuals printed.
         for (surface, bytes) in [
             ("ordinary+experimental", ordinary.descriptor_bytes()),
             ("lens+experimental", lens.descriptor_bytes()),
@@ -6243,12 +6579,12 @@ mod tests {
     }
 
     /// Without the allowlist the catalogues are the stable-only surface. This
-    /// proves it with the exact descriptor name lists and the pinned stable
-    /// bytes (ordinary 67561, lens 39249), plus the absence of
-    /// `experimental_freshness` — including in `describe_operation`'s
-    /// executor enum — on both surfaces.
+    /// proves it with the exact descriptor name lists and the per-surface
+    /// descriptor ceilings (exact byte pins relaxed per Native 5af0a10),
+    /// plus the absence of `experimental_freshness` — including in
+    /// `describe_operation`'s executor enum — on both surfaces.
     #[test]
-    fn stable_catalogues_stay_byte_identical_without_the_opt_in() {
+    fn stable_catalogues_stay_within_budget_without_the_opt_in() {
         let registry = hosted_registry();
         let ordinary = ExecutorPrototypeStdioServer::pin_hosted_catalogue(&registry).unwrap();
         let lens = ExecutorPrototypeLensServer::pin_catalogue_with_experimental(
@@ -6295,6 +6631,7 @@ mod tests {
                 "canvas_write",
                 "reach_read",
                 "reach_connect",
+                "workspace_read",
             ],
         );
         // The lens surface withholds plan-required executors (its execution
@@ -6330,14 +6667,37 @@ mod tests {
                 "export",
                 "canvas_read",
                 "canvas_write",
+                "workspace_read",
             ],
         );
-        // Pinned byte counts, locked so an accidental catalogue change fails
-        // here rather than shipping a different discovery surface.
-        // get_record's include_history_summary adds 25 bytes (name + separator)
-        // to the accepted-field listing on each surface.
-        assert_eq!(ordinary.descriptor_bytes(), 67813, "ordinary byte count");
-        assert_eq!(lens.descriptor_bytes(), 39501, "lens byte count");
+        // Exact byte pins relaxed to ceilings (Richard, 24 Sep 2026); a generated descriptor snapshot is tracked in Native 5af0a10.
+        const EXECUTOR_DESCRIPTOR_MAX_BYTES: usize = 96 * 1024;
+        for (surface, bytes) in [
+            ("ordinary", ordinary.descriptor_bytes()),
+            ("lens", lens.descriptor_bytes()),
+        ] {
+            assert!(
+                bytes <= EXECUTOR_DESCRIPTOR_MAX_BYTES,
+                "{surface} executor descriptors are {bytes} bytes against a \
+                 {EXECUTOR_DESCRIPTOR_MAX_BYTES} ceiling."
+            );
+        }
+        // E2 I-4: the served `sql_read` descriptor carries the catalog card
+        // within its byte budget on both surfaces.
+        for descriptors in [&ordinary.descriptors, &lens.descriptors] {
+            let sql = descriptors
+                .iter()
+                .find(|descriptor| descriptor["name"] == "sql_read")
+                .expect("sql_read descriptor");
+            let bytes = serde_json::to_vec(sql).unwrap().len();
+            assert!(
+                bytes <= crate::query::sql_contract::SQL_READ_DESCRIPTOR_MAX_BYTES,
+                "sql_read descriptor is {bytes} bytes over budget"
+            );
+            let description = sql["description"].as_str().unwrap_or_default();
+            assert!(description.contains("Queryable relations"), "{description}");
+            assert!(description.contains("catalog_columns"), "{description}");
+        }
         // `describe_operation` must not name an executor that has no
         // descriptor, in either direction, on either surface.
         for descriptors in [&ordinary.descriptors, &lens.descriptors] {
@@ -6349,6 +6709,434 @@ mod tests {
         }
         assert!(!ordinary_names.contains(&EXPERIMENTAL_FRESHNESS_EXECUTOR));
         assert!(!lens_names.contains(&EXPERIMENTAL_FRESHNESS_EXECUTOR));
+    }
+
+    /// E4 M1 source contract: without the `sql_write` allowlist no executor
+    /// catalogue may name it, on either surface. With the allowlist, the
+    /// ordinary SQLite catalogue carries the full source contract while the
+    /// lens surface keeps withholding plan-required operations, which the
+    /// existing lens engine does not support.
+    #[test]
+    fn sql_write_catalogue_admission_follows_its_allowlist() {
+        let registry = hosted_registry();
+        assert!(
+            registry.get("sql_write").is_some(),
+            "seed assumption: the allowlisted-shape registry holds the sql_write source"
+        );
+        // Default and freshness-only catalogues withhold on both surfaces.
+        let empty = ExperimentalExecutors::empty();
+        let freshness = ExperimentalExecutors::from_env_value(Some(
+            EXPERIMENTAL_FRESHNESS_EXECUTOR.to_string(),
+        ))
+        .unwrap();
+        for experimental in [&empty, &freshness] {
+            let ordinary = ExecutorPrototypeStdioServer::pin_hosted_catalogue_with_experimental(
+                &registry,
+                experimental,
+            )
+            .unwrap();
+            let lens = ExecutorPrototypeLensServer::pin_catalogue_with_experimental(
+                &registry,
+                experimental,
+            )
+            .unwrap();
+            for descriptors in [&ordinary.descriptors, &lens.descriptors] {
+                assert!(
+                    !pinned_descriptor_names(descriptors).contains(&"sql_write"),
+                    "unopted catalogue must not advertise sql_write"
+                );
+                assert!(
+                    !describe_executor_enum(descriptors).contains(&"sql_write".to_string()),
+                    "unopted describe_operation must not name sql_write"
+                );
+            }
+            for contracts in [&ordinary.contracts, &lens.contracts] {
+                assert!(
+                    !contracts.contains_key(&("sql_write".to_string(), "sql_write".to_string())),
+                    "unopted catalogue must hold no sql_write contract"
+                );
+            }
+        }
+        // The sql_write allowlist admits the full source contract on the
+        // ordinary SQLite catalogue: descriptor, operation enum,
+        // describe_operation entry, and contract bound to the source tool.
+        let allowlisted = ExperimentalExecutors::from_env_value(Some(
+            EXPERIMENTAL_SQL_WRITE_EXECUTOR.to_string(),
+        ))
+        .unwrap();
+        let ordinary = ExecutorPrototypeStdioServer::pin_hosted_catalogue_with_experimental(
+            &registry,
+            &allowlisted,
+        )
+        .unwrap();
+        assert!(
+            pinned_descriptor_names(&ordinary.descriptors).contains(&"sql_write"),
+            "opted-in ordinary catalogue must advertise sql_write"
+        );
+        assert_eq!(
+            operation_names(&ordinary.descriptors, "sql_write"),
+            vec!["sql_write".to_string()],
+            "opted-in sql_write descriptor carries exactly its audited operation"
+        );
+        assert!(
+            describe_executor_enum(&ordinary.descriptors).contains(&"sql_write".to_string()),
+            "opted-in describe_operation must name sql_write"
+        );
+        let contract = ordinary
+            .contracts
+            .get(&("sql_write".to_string(), "sql_write".to_string()))
+            .expect("opted-in ordinary catalogue must hold the sql_write contract");
+        assert_eq!(contract.source_tool, "sql_write");
+        assert!(
+            contract.selector.is_none(),
+            "the single sql_write source tool needs no action selector"
+        );
+        // The lens engine supports no plan-required operations, so the lens
+        // catalogue keeps withholding the admitted pair there.
+        let lens =
+            ExecutorPrototypeLensServer::pin_catalogue_with_experimental(&registry, &allowlisted)
+                .unwrap();
+        assert!(
+            !pinned_descriptor_names(&lens.descriptors).contains(&"sql_write"),
+            "lens catalogue must withhold plan-required sql_write"
+        );
+        assert!(
+            !lens
+                .contracts
+                .contains_key(&("sql_write".to_string(), "sql_write".to_string())),
+            "lens catalogue must hold no sql_write contract"
+        );
+    }
+
+    /// Operation enum reader without the experimental-agent-intents feature
+    /// gate, so allowlist admission stays covered in every feature set.
+    fn operation_names(descriptors: &[Value], executor: &str) -> Vec<String> {
+        descriptors
+            .iter()
+            .find(|descriptor| descriptor.get("name").and_then(Value::as_str) == Some(executor))
+            .expect("executor descriptor")
+            .pointer("/inputSchema/properties/operation/enum")
+            .expect("operation enum")
+            .as_array()
+            .expect("operation enum array")
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Facade harness for the revalidate-only `sql_write` route: an opted-in
+    /// executor server with a `plan-author` caller holding Manage on the
+    /// fixture record.
+    async fn sql_write_opted_in_server(
+        db: &crate::Db,
+        caller: Caller,
+    ) -> ExecutorPrototypeStdioServer {
+        use crate::mcp::EXPERIMENTAL_SQL_WRITE_EXECUTOR;
+        let experimental = ExperimentalExecutors::from_env_value(Some(
+            EXPERIMENTAL_SQL_WRITE_EXECUTOR.to_string(),
+        ))
+        .unwrap();
+        let telemetry_sink = Arc::new(telemetry::TestTelemetrySink::default());
+        let telemetry =
+            ExecutorTelemetryContext::new(telemetry_sink, telemetry::DEFAULT_RETENTION_DAYS)
+                .unwrap();
+        ExecutorPrototypeStdioServer::new_with_telemetry_and_experimental(
+            hosted_registry(),
+            db.clone(),
+            caller,
+            None,
+            telemetry,
+            experimental,
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn sql_write_fixture(db: &crate::Db) -> (String, Caller) {
+        use crate::authorization::{replace_explicit_policy, AllowEntry, Capability};
+        let target = crate::store::create_record(
+            db,
+            json!({"id":"ec00b000-0000-4000-8000-00000000b201","type":"Document","kind":"note","name":"Confirm me"}),
+        )
+        .await
+        .unwrap();
+        replace_explicit_policy(
+            db,
+            "test:sql-write-facade",
+            &target,
+            vec![AllowEntry::account("plan-author", Capability::Manage)],
+        )
+        .await
+        .unwrap();
+        (target, Caller::authenticated("plan-author"))
+    }
+
+    fn sql_write_statement(target: &str) -> String {
+        format!(
+            "SELECT id AS record_id, 'set_field' AS op, 'name' AS key, 'Confirmed' AS value FROM records WHERE id = '{target}'"
+        )
+    }
+
+    async fn sql_write_prepare(server: &ExecutorPrototypeStdioServer, statement: &str) -> Value {
+        server
+            .handle_message(json!({
+                "jsonrpc":"2.0","id":1,"method":"tools/call",
+                "params":{"name":"sql_write","arguments":{
+                    "operation":"sql_write",
+                    "arguments":{"statement":statement,"reason":"facade probe"},
+                    "run_key":"sql-write-b2","parent_key":"sql-write-b2"
+                }}
+            }))
+            .await
+            .unwrap()
+    }
+
+    async fn sql_write_execute(
+        server: &ExecutorPrototypeStdioServer,
+        plan_id: &str,
+        target: &str,
+        effect_summary: &str,
+    ) -> Value {
+        server
+            .handle_message(json!({
+                "jsonrpc":"2.0","id":2,"method":"tools/call",
+                "params":{"name":"sql_write","arguments":{
+                    "operation":"sql_write",
+                    "plan_id":plan_id,"target":target,"effect_summary":effect_summary,
+                    "run_key":"sql-write-b2","parent_key":"sql-write-b2"
+                }}
+            }))
+            .await
+            .unwrap()
+    }
+
+    /// Plan-path responses carry the plan object directly under
+    /// `structuredContent` (unlike direct tool calls, which nest it under
+    /// `result`).
+    fn structured_result(body: &Value) -> &Value {
+        &body["result"]["structuredContent"]
+    }
+
+    fn plan_error_code(body: &Value) -> &str {
+        body["result"]["structuredContent"]["plan_error"]["code"]
+            .as_str()
+            .unwrap_or_else(|| panic!("expected a plan_error envelope: {body}"))
+    }
+
+    async fn content_event_count(db: &crate::Db) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM content_events")
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap()
+    }
+
+    async fn assert_sql_write_plan_prepared(db: &crate::Db, plan_id: &str) {
+        let store = plan_store::PlanStore::open_for_database(db.path())
+            .await
+            .unwrap();
+        let stored = store
+            .load(plan_id, chrono::Utc::now().timestamp_millis())
+            .await
+            .unwrap()
+            .expect("signed sql_write plan must remain in the store");
+        assert!(
+            matches!(stored.state, plan_store::StoredState::Prepared),
+            "sql_write confirmation must not claim its plan: {:?}",
+            stored.state
+        );
+    }
+
+    /// Prepare then execute-shaped call returns preview-current with no claim,
+    /// no dispatch, and no event; a repeated confirmation agrees, the raw
+    /// arguments shape stays refused, and the plan keeps its ten-minute TTL.
+    #[tokio::test]
+    async fn sql_write_execute_confirms_preview_current_without_mutation() {
+        let db = create_database(":memory:").await.unwrap();
+        let (target, caller) = sql_write_fixture(&db).await;
+        let server = sql_write_opted_in_server(&db, caller).await;
+        let prepared = sql_write_prepare(&server, &sql_write_statement(&target)).await;
+        assert_eq!(prepared["result"]["isError"], false, "{prepared}");
+        let plan = structured_result(&prepared);
+        assert_eq!(plan["preparation_mutated"], false);
+        let plan_id = plan["plan_id"].as_str().unwrap();
+        let target_text = plan["target"].as_str().unwrap();
+        let effect_summary = plan["effect_summary"].as_str().unwrap();
+        let events_before = content_event_count(&db).await;
+        let confirmed = sql_write_execute(&server, plan_id, target_text, effect_summary).await;
+        assert_eq!(confirmed["result"]["isError"], false, "{confirmed}");
+        let current = structured_result(&confirmed);
+        assert_eq!(current["preview_current"], true);
+        assert_eq!(current["committed"], false);
+        assert_eq!(current["plan_id"], json!(plan_id));
+        assert_eq!(current["target"], json!(target_text));
+        assert_eq!(current["effect_summary"], json!(effect_summary));
+        assert_eq!(current["source_dispatch_count"], 0);
+        assert_eq!(current["preparation_mutated"], false);
+        assert_sql_write_plan_prepared(&db, plan_id).await;
+        // Ten-minute TTL on the confirmed preview.
+        let expires_at = current["expires_at"].as_str().unwrap();
+        let expiry_ms = chrono::DateTime::parse_from_rfc3339(expires_at)
+            .unwrap()
+            .timestamp_millis();
+        let ttl_ms = expiry_ms - chrono::Utc::now().timestamp_millis();
+        assert!(
+            (540_000..=600_000).contains(&ttl_ms),
+            "preview TTL must be ten minutes, got {ttl_ms}ms"
+        );
+        assert_eq!(content_event_count(&db).await, events_before);
+        // A repeated confirmation agrees: the plan is still Prepared, never
+        // claimed or consumed.
+        let repeated = sql_write_execute(&server, plan_id, target_text, effect_summary).await;
+        assert_eq!(repeated["result"]["isError"], false, "{repeated}");
+        assert_eq!(structured_result(&repeated)["preview_current"], true);
+        assert_sql_write_plan_prepared(&db, plan_id).await;
+        assert_eq!(content_event_count(&db).await, events_before);
+        // Raw operation arguments on an execute-shaped call stay refused.
+        let raw = server
+            .handle_message(json!({
+                "jsonrpc":"2.0","id":3,"method":"tools/call",
+                "params":{"name":"sql_write","arguments":{
+                    "operation":"sql_write",
+                    "plan_id":plan_id,"target":target_text,"effect_summary":effect_summary,
+                    "arguments":{"statement":"SELECT 1"},
+                    "run_key":"sql-write-b2","parent_key":"sql-write-b2"
+                }}
+            }))
+            .await
+            .unwrap();
+        assert_eq!(plan_error_code(&raw), "raw_arguments_forbidden");
+        assert_sql_write_plan_prepared(&db, plan_id).await;
+        assert_eq!(content_event_count(&db).await, events_before);
+    }
+
+    /// A grown selection between prepare and execute is drift: the
+    /// one-operation bound trips on revalidation, so the execute-shaped call
+    /// reports `plan_stale` with no claim and no dispatch.
+    #[tokio::test]
+    async fn sql_write_grown_selection_reports_plan_stale() {
+        use crate::authorization::{replace_explicit_policy, AllowEntry, Capability};
+        let db = create_database(":memory:").await.unwrap();
+        let (_target, caller) = sql_write_fixture(&db).await;
+        let server = sql_write_opted_in_server(&db, caller).await;
+        let statement = "SELECT id AS record_id, 'set_field' AS op, 'name' AS key, 'Confirmed' AS value FROM records WHERE name LIKE 'Confirm%'";
+        let prepared = sql_write_prepare(&server, statement).await;
+        assert_eq!(prepared["result"]["isError"], false, "{prepared}");
+        let plan = structured_result(&prepared);
+        let (plan_id, target_text, effect_summary) = (
+            plan["plan_id"].as_str().unwrap().to_string(),
+            plan["target"].as_str().unwrap().to_string(),
+            plan["effect_summary"].as_str().unwrap().to_string(),
+        );
+        let grown = crate::store::create_record(
+            &db,
+            json!({"type":"Document","kind":"note","name":"Confirm me too"}),
+        )
+        .await
+        .unwrap();
+        replace_explicit_policy(
+            &db,
+            "test:sql-write-facade-grown",
+            &grown,
+            vec![AllowEntry::account("plan-author", Capability::Manage)],
+        )
+        .await
+        .unwrap();
+        let events_before = content_event_count(&db).await;
+        let stale = sql_write_execute(&server, &plan_id, &target_text, &effect_summary).await;
+        assert_eq!(plan_error_code(&stale), "plan_stale", "{stale}");
+        assert_sql_write_plan_prepared(&db, &plan_id).await;
+        assert_eq!(content_event_count(&db).await, events_before);
+        // Still stale on repeat: nothing was claimed or dispatched.
+        let repeated = sql_write_execute(&server, &plan_id, &target_text, &effect_summary).await;
+        assert_eq!(plan_error_code(&repeated), "plan_stale");
+        assert_sql_write_plan_prepared(&db, &plan_id).await;
+        assert_eq!(content_event_count(&db).await, events_before);
+    }
+
+    /// A hidden selection between prepare and execute is drift with
+    /// hidden/missing parity: the execute-shaped call reports `plan_stale`
+    /// with no claim and no dispatch.
+    #[tokio::test]
+    async fn sql_write_hidden_selection_reports_plan_stale() {
+        use crate::authorization::replace_explicit_policy;
+        let db = create_database(":memory:").await.unwrap();
+        let (target, caller) = sql_write_fixture(&db).await;
+        let server = sql_write_opted_in_server(&db, caller).await;
+        let prepared = sql_write_prepare(&server, &sql_write_statement(&target)).await;
+        assert_eq!(prepared["result"]["isError"], false, "{prepared}");
+        let plan = structured_result(&prepared);
+        let (plan_id, target_text, effect_summary) = (
+            plan["plan_id"].as_str().unwrap().to_string(),
+            plan["target"].as_str().unwrap().to_string(),
+            plan["effect_summary"].as_str().unwrap().to_string(),
+        );
+        replace_explicit_policy(&db, "test:sql-write-facade-hide", &target, vec![])
+            .await
+            .unwrap();
+        let events_before = content_event_count(&db).await;
+        let stale = sql_write_execute(&server, &plan_id, &target_text, &effect_summary).await;
+        assert_eq!(plan_error_code(&stale), "plan_stale", "{stale}");
+        assert_sql_write_plan_prepared(&db, &plan_id).await;
+        assert_eq!(content_event_count(&db).await, events_before);
+    }
+
+    /// A content version change between prepare and execute is drift: the
+    /// pinned expected version conflicts on revalidation, so the
+    /// execute-shaped call reports `plan_stale` with no claim and no dispatch.
+    #[tokio::test]
+    async fn sql_write_version_drift_reports_plan_stale() {
+        let db = create_database(":memory:").await.unwrap();
+        let (target, caller) = sql_write_fixture(&db).await;
+        let server = sql_write_opted_in_server(&db, caller).await;
+        let prepared = sql_write_prepare(&server, &sql_write_statement(&target)).await;
+        assert_eq!(prepared["result"]["isError"], false, "{prepared}");
+        let plan = structured_result(&prepared);
+        let (plan_id, target_text, effect_summary) = (
+            plan["plan_id"].as_str().unwrap().to_string(),
+            plan["target"].as_str().unwrap().to_string(),
+            plan["effect_summary"].as_str().unwrap().to_string(),
+        );
+        crate::store::update_record(&db, &target, json!({"name": "Bumped"}))
+            .await
+            .unwrap();
+        let events_before = content_event_count(&db).await;
+        let stale = sql_write_execute(&server, &plan_id, &target_text, &effect_summary).await;
+        assert_eq!(plan_error_code(&stale), "plan_stale", "{stale}");
+        assert_sql_write_plan_prepared(&db, &plan_id).await;
+        assert_eq!(content_event_count(&db).await, events_before);
+    }
+
+    /// Lost Edit between prepare and execute is drift: the capability check
+    /// fails on revalidation, so the execute-shaped call reports `plan_stale`
+    /// with no claim and no dispatch.
+    #[tokio::test]
+    async fn sql_write_lost_edit_reports_plan_stale() {
+        use crate::authorization::{replace_explicit_policy, AllowEntry, Capability};
+        let db = create_database(":memory:").await.unwrap();
+        let (target, caller) = sql_write_fixture(&db).await;
+        let server = sql_write_opted_in_server(&db, caller).await;
+        let prepared = sql_write_prepare(&server, &sql_write_statement(&target)).await;
+        assert_eq!(prepared["result"]["isError"], false, "{prepared}");
+        let plan = structured_result(&prepared);
+        let (plan_id, target_text, effect_summary) = (
+            plan["plan_id"].as_str().unwrap().to_string(),
+            plan["target"].as_str().unwrap().to_string(),
+            plan["effect_summary"].as_str().unwrap().to_string(),
+        );
+        replace_explicit_policy(
+            &db,
+            "test:sql-write-facade-demote",
+            &target,
+            vec![AllowEntry::account("plan-author", Capability::View)],
+        )
+        .await
+        .unwrap();
+        let events_before = content_event_count(&db).await;
+        let stale = sql_write_execute(&server, &plan_id, &target_text, &effect_summary).await;
+        assert_eq!(plan_error_code(&stale), "plan_stale", "{stale}");
+        assert_sql_write_plan_prepared(&db, &plan_id).await;
+        assert_eq!(content_event_count(&db).await, events_before);
     }
 
     /// With `experimental_freshness` allowlisted, both surfaces advertise the
@@ -6466,7 +7254,9 @@ mod tests {
             }))
             .await
             .unwrap();
-        let tools = list["result"]["tools"].as_array().unwrap();
+        let tools = list["result"]["tools"]
+            .as_array()
+            .unwrap_or_else(|| panic!("tools/list did not return tools: {list}"));
         let freshness = tools
             .iter()
             .find(|tool| tool["name"] == EXPERIMENTAL_FRESHNESS_EXECUTOR)
@@ -6679,11 +7469,53 @@ mod tests {
                         );
                     } else {
                         deferred += 1;
-                        assert!(
-                            !description.contains(&format!("{operation}: ")),
-                            "{surface} {name}.{operation} shares a contract but its fields \
-                             were advertised as its own"
-                        );
+                        // A shared contract may name the fields required of
+                        // every action it routes, and nothing else. An
+                        // unstarred name here would be an optional field of one
+                        // sibling advertised as this operation's own, which is
+                        // the defect the discriminator exists to prevent.
+                        let prefix = format!("{operation}: ");
+                        match required_field_listing(operation, &contract.input_schema) {
+                            None => {
+                                assert!(
+                                    !description.contains(&prefix),
+                                    "{surface} {name}.{operation} shares a contract and \
+                                     requires nothing unconditionally, so it must name no \
+                                     fields"
+                                );
+                                // Naming nothing is not the same as saying
+                                // nothing: the catch-all must still cover it,
+                                // whether or not a sibling tool on this same
+                                // executor produced a required-only listing.
+                                assert!(
+                                    description.contains("An operation not listed here"),
+                                    "{surface} {name}.{operation} names no fields and is not \
+                                     covered by the deferral sentence either: {description}"
+                                );
+                            }
+                            Some(expected) => {
+                                assert!(
+                                    description.contains(&expected),
+                                    "{surface} {name}.{operation} shares a contract but does \
+                                     not name the fields required of every action: expected \
+                                     {expected:?}"
+                                );
+                                let start = description.find(&prefix).expect("listed operation")
+                                    + prefix.len();
+                                let segment = &description[start..];
+                                let end = segment
+                                    .find(';')
+                                    .unwrap_or(segment.len())
+                                    .min(segment.find('.').unwrap_or(segment.len()));
+                                for field in segment[..end].split(", ") {
+                                    assert!(
+                                        field.ends_with('*'),
+                                        "{surface} {name}.{operation} shares a contract but \
+                                         advertised the optional field {field:?} as its own"
+                                    );
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -6830,6 +7662,383 @@ mod tests {
         assert!(!list_validator.is_valid(&json!({
             "record_id": "rec-a", "source_id": "rec-a"
         })));
+    }
+
+    /// Task 667c083 — source-derived argument-naming audit: traversal helpers.
+    ///
+    /// These walk the **runtime contract map** (the per-operation
+    /// `input_schema` that `describe_operation` serves), not the committed
+    /// JSON projection, which carries only envelope fields. Keeping the
+    /// traversal here puts it in the same place as a future cross-executor
+    /// naming build test: the snapshot test below consumes exactly these
+    /// helpers, so one traversal yields both the report input and the gate.
+    #[derive(Debug, Default)]
+    struct AuditArgEntry {
+        types: std::collections::BTreeSet<String>,
+        required_always: bool,
+        required_sometimes: bool,
+        nested: bool,
+    }
+
+    /// One-line type summary for a property subschema. Deterministic and
+    /// compact: it captures the scalar-vs-array distinction the shape-drift
+    /// class needs, while full prose stays behind `describe_operation`.
+    fn audit_branch_kind(schema: &Value) -> String {
+        if schema.get("const").is_some() {
+            return "const".into();
+        }
+        match schema.get("type") {
+            Some(Value::String(t)) => t.clone(),
+            Some(Value::Array(ts)) => ts
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join("|"),
+            _ => {
+                if schema.get("enum").is_some() {
+                    "enum".into()
+                } else if schema.get("properties").is_some() {
+                    "object".into()
+                } else if schema.get("items").is_some() {
+                    "array".into()
+                } else {
+                    "untyped".into()
+                }
+            }
+        }
+    }
+
+    fn audit_type_summary(schema: &Value) -> String {
+        if let Some(c) = schema.get("const") {
+            return format!("const:{c}");
+        }
+        let mut base = audit_branch_kind(schema);
+        if base == "untyped" {
+            for keyword in ["anyOf", "oneOf", "allOf"] {
+                if let Some(branches) = schema.get(keyword).and_then(Value::as_array) {
+                    let inner = branches
+                        .iter()
+                        .map(audit_branch_kind)
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .into_iter()
+                        .collect::<Vec<_>>()
+                        .join("|");
+                    base = format!("{keyword}[{inner}]");
+                    break;
+                }
+            }
+        }
+        if base == "array" {
+            if let Some(items) = schema.get("items") {
+                let items_vec: Vec<&Value> = match items {
+                    Value::Array(tuple) => tuple.iter().collect(),
+                    single => vec![single],
+                };
+                let inner = items_vec
+                    .iter()
+                    .map(|item| audit_branch_kind(item))
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .collect::<Vec<_>>()
+                    .join("|");
+                if !inner.is_empty() && inner != "untyped" {
+                    base = format!("array<{inner}>");
+                }
+            }
+        }
+        if let Some(values) = schema.get("enum").and_then(Value::as_array) {
+            let shown = values
+                .iter()
+                .take(12)
+                .map(|value| {
+                    value
+                        .as_str()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| value.to_string())
+                })
+                .collect::<Vec<_>>()
+                .join("|");
+            let suffix = if values.len() > 12 {
+                format!("|+{}", values.len() - 12)
+            } else {
+                String::new()
+            };
+            base = format!("{base}={shown}{suffix}");
+        }
+        base
+    }
+
+    /// Recursive walk of one operation `input_schema`. `unconditional` is
+    /// true at the top level and inside `allOf` (which every valid envelope
+    /// must satisfy), false inside `anyOf`/`oneOf`/`then` and below the first
+    /// nesting level. `if` subschemas are skipped deliberately: they restate
+    /// names for condition matching, not for acceptance. `not` subschemas
+    /// are skipped for the same reason in reverse: they forbid combinations,
+    /// they do not accept names.
+    fn audit_walk_node(
+        node: &Value,
+        unconditional: bool,
+        prefix: &str,
+        nested: bool,
+        out: &mut BTreeMap<String, AuditArgEntry>,
+    ) {
+        let required = node
+            .get("required")
+            .and_then(Value::as_array)
+            .map(|required| {
+                required
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<HashSet<&str>>()
+            })
+            .unwrap_or_default();
+        // Requiredness is applied to every name in this node's `required`
+        // set, whether or not the node declares it in `properties`. Branches
+        // of the form `{"required": ["id"]}` with no `properties` — exactly
+        // what `with_record_selector_aliases` emits when it replaces the
+        // `id`/`record_id`/`ids` required entries with a `oneOf` — still
+        // constrain the operation; the sibling branch carrying the
+        // declaration merges through the shared entry. A name required on a
+        // branch but declared in no `properties` anywhere surfaces with an
+        // empty `types` set, which is itself a finding (see the report).
+        for name in &required {
+            let full = if prefix.is_empty() {
+                (*name).to_string()
+            } else {
+                format!("{prefix}.{name}")
+            };
+            let entry = out.entry(full).or_default();
+            entry.nested = entry.nested || nested;
+            if unconditional {
+                entry.required_always = true;
+            } else {
+                entry.required_sometimes = true;
+            }
+        }
+        if let Some(properties) = node.get("properties").and_then(Value::as_object) {
+            for (name, subschema) in properties {
+                let full = if prefix.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{prefix}.{name}")
+                };
+                let entry = out.entry(full.clone()).or_default();
+                entry.types.insert(audit_type_summary(subschema));
+                entry.nested = entry.nested || nested;
+                // Requiredness was already applied above for every name in
+                // this node's `required` set, so there is exactly one
+                // application point regardless of schema layout.
+                // One nesting level for object properties and array items
+                // keeps the enumeration bounded; deeper structure stays
+                // recoverable via describe_operation.
+                if !nested {
+                    if subschema.get("properties").is_some() {
+                        audit_walk_node(subschema, false, &full, true, out);
+                    }
+                    if let Some(items) = subschema.get("items") {
+                        let items_vec: Vec<&Value> = match items {
+                            Value::Array(tuple) => tuple.iter().collect(),
+                            single => vec![single],
+                        };
+                        for item in items_vec {
+                            if item.get("properties").is_some() {
+                                audit_walk_node(item, false, &format!("{full}[]"), true, out);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(branches) = node.get("allOf").and_then(Value::as_array) {
+            for branch in branches {
+                audit_walk_node(branch, unconditional, prefix, nested, out);
+            }
+        }
+        for keyword in ["anyOf", "oneOf"] {
+            if let Some(branches) = node.get(keyword).and_then(Value::as_array) {
+                for branch in branches {
+                    audit_walk_node(branch, false, prefix, nested, out);
+                }
+            }
+        }
+        if let Some(then) = node.get("then") {
+            audit_walk_node(then, false, prefix, nested, out);
+        }
+    }
+
+    /// Task 667c083: enumerate every property name on every operation
+    /// contract in the runtime contract map, per surface. The ordinary
+    /// catalogue is the hosted one serve exposes (membership, workspace and
+    /// reach included); the lens catalogue is pinned from the same registry.
+    /// Rows are keyed `surface.executor.operation` so a same-named operation
+    /// whose schema differs per surface shows up twice rather than merging.
+    fn audit_enumeration() -> Value {
+        let registry = hosted_registry();
+        let ordinary = build_ordinary_catalogue(
+            &registry,
+            super::super::registry::EngineKind::Sqlite,
+            true,
+            &ExperimentalExecutors::empty(),
+        )
+        .unwrap();
+        let lens = ExecutorPrototypeLensServer::pin_catalogue_with_experimental(
+            &registry,
+            &ExperimentalExecutors::empty(),
+        )
+        .unwrap();
+        let mut rows = Vec::new();
+        for (surface, catalogue) in [("ordinary", &ordinary.contracts), ("lens", &lens.contracts)] {
+            for ((executor, operation), contract) in catalogue {
+                let mut args = BTreeMap::new();
+                audit_walk_node(&contract.input_schema, true, "", false, &mut args);
+                let arguments = args
+                    .into_iter()
+                    .map(|(name, entry)| {
+                        let required = if entry.required_always {
+                            "always"
+                        } else if entry.required_sometimes {
+                            "sometimes"
+                        } else {
+                            "never"
+                        };
+                        (
+                            name,
+                            json!({
+                                "types": entry.types.into_iter().collect::<Vec<_>>(),
+                                "required": required,
+                                "nested": entry.nested,
+                            }),
+                        )
+                    })
+                    .collect::<serde_json::Map<_, _>>();
+                rows.push(json!({
+                    "surface": surface,
+                    "executor": executor,
+                    "operation": operation,
+                    "source_tool": contract.source_tool,
+                    "action_specific_projection": contract.action_specific_projection,
+                    "additional_properties": contract.input_schema.get("additionalProperties"),
+                    "arguments": arguments,
+                }));
+            }
+        }
+        rows.sort_by(|left, right| {
+            let key = |row: &Value| {
+                (
+                    row["surface"].as_str().unwrap_or_default().to_string(),
+                    row["executor"].as_str().unwrap_or_default().to_string(),
+                    row["operation"].as_str().unwrap_or_default().to_string(),
+                )
+            };
+            key(left).cmp(&key(right))
+        });
+        let operation_count = rows.len();
+        let executor_count = rows
+            .iter()
+            .map(|row| (row["surface"].clone(), row["executor"].clone()))
+            .collect::<HashSet<_>>()
+            .len();
+        json!({
+            "producer": "argument_naming_audit_enumeration_matches_snapshot (task 667c083)",
+            "note": "Source-derived from the runtime contract map (input_schema per operation). Top-level argument names carry full type+requiredness; one nesting level (parent.child, array items as parent[]) is enumerated with nested=true and requiredness relative to the parent. `if` subschemas are skipped (condition matching, not acceptance). Deeper structure is recoverable via describe_operation.",
+            "operation_count": operation_count,
+            "surface_executor_count": executor_count,
+            "rows": rows,
+        })
+    }
+
+    /// Task 667c083: cross-executor naming gate (seed).
+    ///
+    /// Fails on any new operation, removed operation, or argument change
+    /// until the audit snapshot is deliberately refreshed with
+    /// `NAMING_AUDIT_UPDATE=1`, which rewrites
+    /// `docs/mcp-argument-naming-audit.raw.json` — the raw input of
+    /// `docs/mcp-argument-naming-audit.md`. A red run therefore means
+    /// either surface drift to triage into the report, or a stale
+    /// snapshot to refresh; it never means "update the snapshot blindly".
+    fn audit_index_rows(value: &Value) -> BTreeMap<String, &Value> {
+        value["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| {
+                (
+                    format!(
+                        "{}.{}.{}",
+                        row["surface"].as_str().unwrap(),
+                        row["executor"].as_str().unwrap(),
+                        row["operation"].as_str().unwrap()
+                    ),
+                    row,
+                )
+            })
+            .collect::<BTreeMap<_, _>>()
+    }
+
+    #[test]
+    fn argument_naming_audit_enumeration_matches_snapshot() {
+        let enumeration = audit_enumeration();
+        let path = format!(
+            "{}/docs/mcp-argument-naming-audit.raw.json",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        if std::env::var("NAMING_AUDIT_UPDATE").is_ok_and(|value| value == "1") {
+            std::fs::write(
+                &path,
+                serde_json::to_string_pretty(&enumeration).unwrap() + "\n",
+            )
+            .unwrap();
+            println!(
+                "naming audit snapshot refreshed: {} rows",
+                enumeration["operation_count"]
+            );
+            return;
+        }
+        let raw = std::fs::read_to_string(&path).expect(
+            "naming audit snapshot missing: run with NAMING_AUDIT_UPDATE=1 to generate docs/mcp-argument-naming-audit.raw.json",
+        );
+        let expected: Value = serde_json::from_str(&raw).unwrap();
+        if expected == enumeration {
+            return;
+        }
+        let mut detail = String::new();
+        let before = audit_index_rows(&expected);
+        let after = audit_index_rows(&enumeration);
+        for key in before.keys().filter(|key| !after.contains_key(*key)) {
+            detail.push_str(&format!("removed operation: {key}\n"));
+        }
+        for key in after.keys().filter(|key| !before.contains_key(*key)) {
+            detail.push_str(&format!("added operation: {key}\n"));
+        }
+        for key in before.keys().filter(|key| after.contains_key(*key)) {
+            let old_args = before[key]["arguments"].as_object().unwrap();
+            let new_args = after[key]["arguments"].as_object().unwrap();
+            for name in old_args.keys().filter(|name| !new_args.contains_key(*name)) {
+                detail.push_str(&format!("{key}: removed argument {name}\n"));
+            }
+            for name in new_args.keys().filter(|name| !old_args.contains_key(*name)) {
+                detail.push_str(&format!("{key}: added argument {name}\n"));
+            }
+            for name in old_args.keys().filter(|name| new_args.contains_key(*name)) {
+                if old_args.get(name.as_str()) != new_args.get(name.as_str()) {
+                    detail.push_str(&format!(
+                        "{key}: changed argument {name}: {} -> {}\n",
+                        old_args.get(name.as_str()).unwrap(),
+                        new_args.get(name.as_str()).unwrap()
+                    ));
+                }
+            }
+            if before[key]["additional_properties"] != after[key]["additional_properties"] {
+                detail.push_str(&format!(
+                    "{key}: additionalProperties {} -> {}\n",
+                    before[key]["additional_properties"], after[key]["additional_properties"]
+                ));
+            }
+        }
+        panic!(
+            "naming audit snapshot drifted ({} -> {} operations). Refresh only after triaging into docs/mcp-argument-naming-audit.md; regenerate with NAMING_AUDIT_UPDATE=1.\n{detail}",
+            expected["operation_count"], enumeration["operation_count"]
+        );
     }
 
     #[test]
@@ -7179,7 +8388,7 @@ mod tests {
                 .iter()
                 .filter(|row| row.candidate_plan_policy == "plan_required")
                 .count(),
-            34
+            37
         );
     }
 
@@ -7660,7 +8869,13 @@ mod tests {
         assert_eq!(advertised, executable);
         assert!(!descriptors.iter().any(|descriptor| matches!(
             descriptor["name"].as_str(),
-            Some("membership_read" | "membership_admin" | "membership_remove" | "export")
+            Some(
+                "membership_read"
+                    | "membership_admin"
+                    | "membership_remove"
+                    | "workspace_read"
+                    | "export"
+            )
         )));
         assert!(descriptors
             .iter()
@@ -7930,6 +9145,8 @@ mod tests {
                             "invitations_copy_link",
                             "invitations_send",
                             "invitations_revoke",
+                            "create_guest_link",
+                            "revoke_guest_link",
                             "set_role",
                             "remove"
                         ]}
@@ -8632,11 +9849,19 @@ mod tests {
                 .fetch_one(db.write_pool())
                 .await
                 .unwrap();
-        assert_eq!(
-            source_calls, 2,
-            "each of the two successful facade calls must dispatch the source tool once"
-        );
+        assert_eq!(source_calls, 0, "ordinary reads leave no raw capture rows");
         let events = server.trace_events();
+        let dispatched = events
+            .iter()
+            .filter(|event| {
+                event["selection"]["executor"] == "records_read"
+                    && event["selection"]["operation"] == "query_record"
+                    && event["validation"]["schema_valid"] == true
+                    && event["validation"]["runtime_valid"] == true
+                    && event["counts"]["tool_calls"] == 1
+            })
+            .count();
+        assert_eq!(dispatched, 2, "each successful facade call dispatches once");
         assert!(events.iter().any(|event| event["kind"] == "contract_load"));
         assert!(events
             .iter()
@@ -10003,7 +11228,7 @@ mod tests {
                     .fetch_one(db.write_pool())
                     .await
                     .unwrap();
-            assert_eq!(source_calls, 1, "{tool} must dispatch exactly once");
+            assert_eq!(source_calls, 0, "{tool} is an uncaptured ordinary read");
         }
         let events = server.trace_events();
         for operation in [
@@ -10013,13 +11238,17 @@ mod tests {
             "search",
             "get_structure",
         ] {
-            assert!(events.iter().any(|event| {
-                event["selection"]["executor"] == "records_read"
-                    && event["selection"]["operation"] == operation
-                    && event["validation"]["schema_valid"] == true
-                    && event["validation"]["runtime_valid"] == true
-                    && event["counts"]["tool_calls"] == 1
-            }));
+            let dispatched = events
+                .iter()
+                .filter(|event| {
+                    event["selection"]["executor"] == "records_read"
+                        && event["selection"]["operation"] == operation
+                        && event["validation"]["schema_valid"] == true
+                        && event["validation"]["runtime_valid"] == true
+                        && event["counts"]["tool_calls"] == 1
+                })
+                .count();
+            assert_eq!(dispatched, 1, "{operation} must dispatch exactly once");
         }
         db.close().await;
     }
@@ -10557,7 +11786,8 @@ mod tests {
             "{activity_text}"
         );
         assert!(
-            activity_text.contains("No visible aggregate read-activity rows were returned"),
+            activity_text
+                .contains("No visible aggregate activity rows were retained in this scope"),
             "{activity_text}"
         );
         assert!(serde_json::from_str::<Value>(activity_text).is_err());

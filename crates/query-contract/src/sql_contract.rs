@@ -6,6 +6,8 @@
 //! deliberately separate from `portable_sql`, which accepts only Native-owned
 //! reviewed statements.
 
+use std::collections::BTreeSet;
+
 use base64::Engine as _;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{json, Value};
@@ -26,10 +28,10 @@ pub const QUERY_DEADLINE_MS: u64 = 2_000;
 /// and relation-local changes do not bump this revision: each dependency's
 /// name/profile/semantic-version pin is its compatibility gate. Change this
 /// only when compatibility changes beyond one relation's declared contract.
-pub const LOGICAL_CATALOG_REVISION: u32 = 3;
+pub const LOGICAL_CATALOG_REVISION: u32 = 4;
 pub const LOGICAL_RELATION_VERSION: u32 = 1;
 pub const CONTENT_EVENTS_RELATION_VERSION: u32 = 2;
-pub const AGENT_ACTIVITY_RELATION_VERSION: u32 = 2;
+pub const AGENT_ACTIVITY_RELATION_VERSION: u32 = 3;
 
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
 pub struct QuerySqlRelationContract {
@@ -69,9 +71,13 @@ pub const LOGICAL_RELATIONS: &[QuerySqlRelationContract] = &[
             "maturity",
             "summary",
             "last_activity_at",
+            "last_activity_at_ms",
             "created_at",
+            "created_at_ms",
             "updated_at",
+            "updated_at_ms",
             "deleted_at",
+            "deleted_at_ms",
         ],
     },
     QuerySqlRelationContract {
@@ -81,7 +87,14 @@ pub const LOGICAL_RELATIONS: &[QuerySqlRelationContract] = &[
         caller_relative: true,
         completeness: "complete",
         profiles: ALL_PROFILES,
-        columns: &["local_seq", "id", "record_id", "type", "created_at"],
+        columns: &[
+            "local_seq",
+            "id",
+            "record_id",
+            "type",
+            "created_at",
+            "created_at_ms",
+        ],
     },
     QuerySqlRelationContract {
         identity: "native.query-sql.links",
@@ -97,6 +110,7 @@ pub const LOGICAL_RELATIONS: &[QuerySqlRelationContract] = &[
             "relationship",
             "note",
             "created_at",
+            "created_at_ms",
         ],
     },
     QuerySqlRelationContract {
@@ -114,6 +128,7 @@ pub const LOGICAL_RELATIONS: &[QuerySqlRelationContract] = &[
             "value_num",
             "vocab_ref",
             "created_at",
+            "created_at_ms",
         ],
     },
     QuerySqlRelationContract {
@@ -132,6 +147,7 @@ pub const LOGICAL_RELATIONS: &[QuerySqlRelationContract] = &[
             "vocab_ref",
             "as_of",
             "observed_at",
+            "observed_at_ms",
             "event_seq",
         ],
     },
@@ -150,6 +166,7 @@ pub const LOGICAL_RELATIONS: &[QuerySqlRelationContract] = &[
             "url",
             "etag",
             "last_seen_at",
+            "last_seen_at_ms",
         ],
     },
     QuerySqlRelationContract {
@@ -169,6 +186,7 @@ pub const LOGICAL_RELATIONS: &[QuerySqlRelationContract] = &[
             "storage_tier",
             "external_ref",
             "created_at",
+            "created_at_ms",
         ],
     },
     QuerySqlRelationContract {
@@ -178,7 +196,7 @@ pub const LOGICAL_RELATIONS: &[QuerySqlRelationContract] = &[
         caller_relative: false,
         completeness: "complete",
         profiles: ALL_PROFILES,
-        columns: &["id", "name", "created_at"],
+        columns: &["id", "name", "created_at", "created_at_ms"],
     },
     QuerySqlRelationContract {
         identity: "native.query-sql.vocabulary-values",
@@ -214,6 +232,7 @@ pub const LOGICAL_RELATIONS: &[QuerySqlRelationContract] = &[
             "applies_to_collection_id",
             "version_lineage",
             "created_at",
+            "created_at_ms",
         ],
     },
     QuerySqlRelationContract {
@@ -235,6 +254,7 @@ pub const LOGICAL_RELATIONS: &[QuerySqlRelationContract] = &[
             "support_count",
             "contest_count",
             "recomputed_at",
+            "recomputed_at_ms",
         ],
     },
     QuerySqlRelationContract {
@@ -250,10 +270,16 @@ pub const LOGICAL_RELATIONS: &[QuerySqlRelationContract] = &[
             "principal_ref",
             "principal_display_name",
             "started_at",
+            "started_at_ms",
             "ended_at",
+            "ended_at_ms",
             "last_observed_activity_at",
+            "last_observed_activity_at_ms",
             "active_until",
+            "active_until_ms",
             "appears_active",
+            "declared_intent",
+            "declared_intent_state",
         ],
     },
     QuerySqlRelationContract {
@@ -268,7 +294,9 @@ pub const LOGICAL_RELATIONS: &[QuerySqlRelationContract] = &[
             "activity_id",
             "record_id",
             "claimed_at",
+            "claimed_at_ms",
             "released_at",
+            "released_at_ms",
             "is_current",
         ],
     },
@@ -281,12 +309,309 @@ pub const LOGICAL_RELATIONS: &[QuerySqlRelationContract] = &[
         profiles: SQLITE_PROFILE,
         columns: &["message_id"],
     },
+    QuerySqlRelationContract {
+        identity: "native.query-sql.catalog-relations",
+        name: "catalog_relations",
+        semantic_version: LOGICAL_RELATION_VERSION,
+        caller_relative: false,
+        completeness: "complete",
+        profiles: ALL_PROFILES,
+        columns: &[
+            "relation_name",
+            "identity",
+            "semantic_version",
+            "caller_relative",
+            "completeness",
+            "profiles",
+            "comment",
+        ],
+    },
+    QuerySqlRelationContract {
+        identity: "native.query-sql.catalog-columns",
+        name: "catalog_columns",
+        semantic_version: LOGICAL_RELATION_VERSION,
+        caller_relative: false,
+        completeness: "complete",
+        profiles: ALL_PROFILES,
+        columns: &["relation_name", "column_name", "column_position"],
+    },
 ];
 
 pub fn is_logical_relation(name: &str) -> bool {
     LOGICAL_RELATIONS
         .iter()
         .any(|relation| relation.name == name)
+}
+
+/// Machine-readable keyset repair attached to truncated results, identical
+/// on every engine. Names the bound and the repair, not the statement.
+pub fn truncation_hint() -> String {
+    format!(
+        "result truncated at {} rows: add ORDER BY over a unique key and \
+         page with a keyset predicate (WHERE key > ?N) rather than raising LIMIT",
+        MAX_ROWS
+    )
+}
+
+/// Physical tables agents probe for, with the logical relation to use.
+/// A probed table absent here gets the full relation list instead.
+const PHYSICAL_TO_LOGICAL: &[(&str, &str)] = &[
+    ("relationships", "effective_relationships"),
+    ("relationship_endpoints", "effective_relationships"),
+    ("relationship_assertion_heads", "effective_relationships"),
+];
+
+fn is_catalog_probe(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower == "sqlite_master"
+        || lower == "sqlite_schema"
+        || lower == "information_schema"
+        || lower == "pg_catalog"
+        || lower.contains("sqlite_master")
+        || lower.contains("information_schema")
+        || lower.contains("pg_catalog")
+        || lower.starts_with("pragma_")
+        || lower.starts_with("sqlite_")
+        || lower.starts_with("pg_")
+}
+
+/// Repair suffix for a blocked catalog probe or physical table, shared by
+/// every engine so the wording cannot drift per backend. The relation list
+/// and the physical→logical map are filtered by the active profile, so a
+/// caller is never pointed at a relation their engine cannot query.
+/// Returns `None` when the name is a logical relation (or empty): the
+/// engine detail stands alone and no repair is appended.
+pub fn blocked_relation_repair(name: &str, profile: QuerySqlProfile) -> Option<String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() || is_logical_relation(&trimmed.to_ascii_lowercase()) {
+        return None;
+    }
+    if is_catalog_probe(trimmed) {
+        return Some(format!(
+            "'{trimmed}' is catalog introspection, not a queryable relation. \
+             List relations and columns with SELECT relation_name, column_name, \
+             column_position FROM catalog_columns ORDER BY relation_name, \
+             column_position, and read relation notes in catalog_relations."
+        ));
+    }
+    let profile_id = profile.contract().id;
+    if let Some((_, logical)) = PHYSICAL_TO_LOGICAL.iter().find(|(physical, logical)| {
+        physical.eq_ignore_ascii_case(trimmed)
+            && LOGICAL_RELATIONS.iter().any(|relation| {
+                relation.name == *logical && relation.profiles.contains(&profile_id)
+            })
+    }) {
+        return Some(format!(
+            "'{trimmed}' is a physical table, not a queryable relation. \
+             Use logical relation '{logical}' instead."
+        ));
+    }
+    let names = LOGICAL_RELATIONS
+        .iter()
+        .filter(|relation| relation.profiles.contains(&profile_id))
+        .map(|relation| relation.name)
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!(
+        "'{trimmed}' is not a queryable logical relation. \
+         Queryable relations on {profile_id}: {names}."
+    ))
+}
+
+/// One-line relation notes for `catalog_relations`, carrying the join keys
+/// agents otherwise guess. Descriptive only; the drift tests pin structure,
+/// not prose. No apostrophes: values render inside single-quoted SQL.
+const RELATION_COMMENTS: &[(&str, &str)] = &[
+    ("records", "one row per visible record - join links.source_id/target_id, facet_values.record_id and content_events.record_id to records.id - home_id is NULL when the home is not visible"),
+    ("content_events", "append-only history - join record_id to records.id - local_seq orders it"),
+    ("links", "edges - join source_id and target_id to records.id - both endpoints must be visible or the edge is absent"),
+    ("facet_values", "current facet per (record_id, key) - join record_id to records.id"),
+    ("facet_observations", "facet history with as_of/observed_at/event_seq - join record_id to records.id"),
+    ("bindings", "caller-owned account/email bindings - join record_id to records.id"),
+    ("blobs", "attachment payloads reachable through facet_values key blob_ref on a Document attachment"),
+    ("vocabularies", "caller-independent - join vocabulary_values.vocabulary_id to vocabularies.id"),
+    ("vocabulary_values", "join vocabulary_id to vocabularies.id"),
+    ("schema_config", "workspace configuration rows"),
+    ("effective_relationships", "governed relationships - endpoints is a JSON array with record_id per endpoint"),
+    ("agent_activity", "best-effort run presence over the last 24 hours - declared_intent is caller disclosure, not verified fact"),
+    ("agent_activity_claims", "durable claim events - join activity_id to agent_activity, record_id to records.id"),
+    ("messages_awaiting_reply", "single-column queue of message ids awaiting reply"),
+    ("catalog_relations", "this catalog - one row per declared relation, filter profiles for queryability"),
+    ("catalog_columns", "one row per (relation, column) - order by relation_name, column_position"),
+];
+
+/// Rows of `catalog_relations`, generated from `LOGICAL_RELATIONS`:
+/// (name, identity, version, caller_relative 0/1, completeness,
+/// comma-joined profiles, comment).
+pub fn catalog_relation_rows() -> Vec<(
+    &'static str,
+    &'static str,
+    u32,
+    i64,
+    &'static str,
+    String,
+    &'static str,
+)> {
+    LOGICAL_RELATIONS
+        .iter()
+        .map(|relation| {
+            let comment = RELATION_COMMENTS
+                .iter()
+                .find(|(name, _)| *name == relation.name)
+                .map(|(_, comment)| *comment)
+                .unwrap_or("");
+            (
+                relation.name,
+                relation.identity,
+                relation.semantic_version,
+                i64::from(relation.caller_relative),
+                relation.completeness,
+                relation.profiles.join(","),
+                comment,
+            )
+        })
+        .collect()
+}
+
+/// Rows of `catalog_columns`, generated from `LOGICAL_RELATIONS`:
+/// (relation, column, zero-based position).
+pub fn catalog_column_rows() -> Vec<(&'static str, &'static str, usize)> {
+    let mut rows = Vec::new();
+    for relation in LOGICAL_RELATIONS {
+        for (position, column) in relation.columns.iter().enumerate() {
+            rows.push((relation.name, *column, position));
+        }
+    }
+    rows
+}
+
+fn sql_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+/// `CREATE VIEW` statements for the two catalog relations, generated from
+/// `LOGICAL_RELATIONS` so the served catalog cannot drift from the
+/// admission catalog. Every engine executes these verbatim (SQLite/Turso
+/// as TEMP views, Postgres with its own prefix); row content is identical.
+/// Postgres has no `CREATE VIEW IF NOT EXISTS`, so it passes `false`.
+pub fn catalog_view_statements(if_not_exists: bool) -> Vec<String> {
+    // Postgres has no CREATE VIEW IF NOT EXISTS, so it passes false.
+    let guard = if if_not_exists { "IF NOT EXISTS " } else { "" };
+    let mut relations = format!("CREATE TEMP VIEW {guard}catalog_relations AS ");
+    for (index, (name, identity, version, caller_relative, completeness, profiles, comment)) in
+        catalog_relation_rows().iter().enumerate()
+    {
+        if index > 0 {
+            relations.push_str(" UNION ALL ");
+        }
+        relations.push_str(&format!(
+            "SELECT {name} AS relation_name, {identity} AS identity, \
+             {version} AS semantic_version, {caller_relative} AS caller_relative, \
+             {completeness} AS completeness, {profiles} AS profiles, {comment} AS comment",
+            name = sql_quote(name),
+            identity = sql_quote(identity),
+            profiles = sql_quote(profiles),
+            completeness = sql_quote(completeness),
+            comment = sql_quote(comment),
+        ));
+    }
+    let mut columns = format!("CREATE TEMP VIEW {guard}catalog_columns AS ");
+    for (index, (relation, column, position)) in catalog_column_rows().iter().enumerate() {
+        if index > 0 {
+            columns.push_str(" UNION ALL ");
+        }
+        columns.push_str(&format!(
+            "SELECT {relation} AS relation_name, {column} AS column_name, \
+             {position} AS column_position",
+            relation = sql_quote(relation),
+            column = sql_quote(column),
+        ));
+    }
+    vec![relations, columns]
+}
+
+/// Join-key notes for the `sql_read` catalog card, one per relation.
+/// Relation names and columns render from `LOGICAL_RELATIONS` itself, so
+/// only this prose can drift; the card test pins both directions.
+const CARD_NOTES: &[(&str, &str)] = &[
+    ("records", "containment parent is home_id (NULL when the home is not visible); join links.source_id/target_id, facet_values.record_id and content_events.record_id to id"),
+    ("content_events", "append-only history; record_id to records.id; local_seq orders it"),
+    ("links", "edges; part_of runs source (part) -> target (whole); both endpoints must be visible"),
+    ("facet_values", "current value per (record_id, key); record_id to records.id"),
+    ("facet_observations", "history; record_id to records.id"),
+    ("bindings", "caller-owned account/email bindings only; record_id to records.id"),
+    ("blobs", "attachment payloads via facet_values key blob_ref on a Document attachment"),
+    ("vocabularies", "caller-independent; join vocabulary_values.vocabulary_id to id"),
+    ("vocabulary_values", "vocabulary_id to vocabularies.id"),
+    ("schema_config", "workspace configuration rows"),
+    ("effective_relationships", "governed relationships; endpoints is a JSON array with record_id per endpoint"),
+    ("agent_activity", "best-effort run presence over the last 24 hours"),
+    ("agent_activity_claims", "activity_id to agent_activity, record_id to records.id"),
+    ("messages_awaiting_reply", "single-column queue of message ids awaiting reply"),
+    ("catalog_relations", "this catalog; one row per declared relation - filter profiles for queryability"),
+    ("catalog_columns", "one row per (relation, column); order by relation_name, column_position"),
+];
+
+/// Worked statements shipped in the card. Each runs verbatim (plus a seed
+/// scope predicate) as a conformance case in `sql_conformance::corpus()`
+/// and in the Postgres parity loop, so a card example can never fail.
+/// Placeholders are spelled `?N` here to match the SQLite/Turso convention
+/// callers write; the validator rules themselves belong to E1 M2, so
+/// review placeholder-behavior changes there, not in this text.
+pub const CARD_WORKED_STATEMENTS: &[(&str, &str)] = &[
+    ("Current work", "SELECT id, type, name, lifecycle FROM records WHERE type = 'WorkItem' AND lifecycle IN ('open', 'in_progress', 'blocked') ORDER BY last_activity_at DESC, id LIMIT 20"),
+    ("Direct children of a folder or record", "SELECT id, type, name FROM records WHERE home_id = ?1 ORDER BY name, id"),
+    ("Parts of a record (semantic part_of links run child source -> parent target)", "SELECT l.source_id, r.name FROM links l JOIN records r ON r.id = l.source_id WHERE l.target_id = ?1 AND l.relationship = 'part_of' ORDER BY r.name, l.source_id"),
+    ("Recent history of one record", "SELECT local_seq, type, created_at FROM content_events WHERE record_id = ?1 ORDER BY local_seq DESC LIMIT 10"),
+];
+
+/// Budget for the served card (bytes).
+pub const SQL_READ_CARD_MAX_BYTES: usize = 6 * 1024;
+/// Budget for the whole served `sql_read` descriptor (bytes).
+pub const SQL_READ_DESCRIPTOR_MAX_BYTES: usize = 8 * 1024;
+
+/// Compact catalog card for the `sql_read` descriptor, generated from
+/// `LOGICAL_RELATIONS` (names, columns, profile scope) with hand-written
+/// join notes and worked statements. It renders inside descriptor prose,
+/// never inside a SQL batch, so its notes may use semicolons freely.
+pub fn sql_read_catalog_card() -> String {
+    let mut card = String::from(
+        "Queryable relations (caller-visible). Full column list: \
+         SELECT relation_name, column_name, column_position FROM catalog_columns \
+         ORDER BY relation_name, column_position. \
+         Relation notes: SELECT * FROM catalog_relations ORDER BY relation_name.",
+    );
+    for relation in LOGICAL_RELATIONS {
+        let note = CARD_NOTES
+            .iter()
+            .find(|(name, _)| *name == relation.name)
+            .map(|(_, note)| *note)
+            .unwrap_or("");
+        card.push_str(&format!(
+            "\n{}({}): {}",
+            relation.name,
+            relation.columns.join(","),
+            note,
+        ));
+        if relation.profiles != ALL_PROFILES {
+            card.push_str(&format!(" [only: {}]", relation.profiles.join(",")));
+        }
+    }
+    card.push_str(
+        "\nValues: timestamps as UTC-millis text with integer *_ms companions; \
+         booleans as 0/1; binary ordering for stored text; SQL NULL as JSON null. \
+         Parameters: positional ?N (1-based, contiguous). \
+         Text matching via LIKE is literal text/wildcard only (not line- or \
+         word-aware): e.g. \
+         LIKE '%- [ ]%' also matches records that merely quote the checklist \
+         syntax, so check matched text before relying on a count. \
+         Physical tables, sqlite_master, pragma_* and information_schema are \
+         not queryable; the errors name the fix.",
+    );
+    for (intent, sql) in CARD_WORKED_STATEMENTS {
+        card.push_str(&format!("\n{intent}: {sql}"));
+    }
+    card
 }
 
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
@@ -365,7 +690,7 @@ pub const RESULT_VALUE_ENCODINGS: &[QuerySqlValueEncoding] = &[
     QuerySqlValueEncoding {
         logical_type: "boolean",
         json_encoding: "boolean",
-        qualification: "when the engine exposes a distinct boolean type; SQLite integer expressions remain signed_i64",
+        qualification: "computed boolean expressions on postgres-server only; every catalog boolean column presents 0/1 as signed_i64 on every engine",
     },
     QuerySqlValueEncoding {
         logical_type: "signed_i64",
@@ -375,12 +700,12 @@ pub const RESULT_VALUE_ENCODINGS: &[QuerySqlValueEncoding] = &[
     QuerySqlValueEncoding {
         logical_type: "finite_real",
         json_encoding: "number",
-        qualification: "finite IEEE-754 value",
+        qualification: "finite IEEE-754 value for non-integral postgres-server numerics within the double range; integer-valued numerics encode as signed-json-integer",
     },
     QuerySqlValueEncoding {
         logical_type: "arbitrary_numeric",
         json_encoding: "decimal-string",
-        qualification: "lossless canonical decimal text for values outside signed_i64 or finite_real",
+        qualification: "reserved: no current profile emits decimal strings; integer-valued numerics outside i64 and values outside the double range reject instead of encoding as text",
     },
     QuerySqlValueEncoding {
         logical_type: "text",
@@ -400,7 +725,7 @@ pub const RESULT_VALUE_ENCODINGS: &[QuerySqlValueEncoding] = &[
     QuerySqlValueEncoding {
         logical_type: "timestamp",
         json_encoding: "rfc3339-string",
-        qualification: "preserve engine precision and offset when representable",
+        qualification: "fixed UTC millisecond precision with Z suffix on every engine, plus integer epoch-millis *_ms companions for engine-managed timestamps",
     },
 ];
 
@@ -420,7 +745,7 @@ pub struct QuerySqlEngineTypeRule {
 
 pub const ENGINE_TYPE_RULES: &[QuerySqlEngineTypeRule] = &[
     QuerySqlEngineTypeRule {
-        profile: "postgres-server@5",
+        profile: "postgres-server@6",
         engine_types: &["*"],
         condition: "value is SQL NULL",
         outcome: "encode",
@@ -428,7 +753,7 @@ pub const ENGINE_TYPE_RULES: &[QuerySqlEngineTypeRule] = &[
         error_category: None,
     },
     QuerySqlEngineTypeRule {
-        profile: "postgres-server@5",
+        profile: "postgres-server@6",
         engine_types: &["bool"],
         condition: "non-null",
         outcome: "encode",
@@ -436,7 +761,7 @@ pub const ENGINE_TYPE_RULES: &[QuerySqlEngineTypeRule] = &[
         error_category: None,
     },
     QuerySqlEngineTypeRule {
-        profile: "postgres-server@5",
+        profile: "postgres-server@6",
         engine_types: &["int2", "int4", "int8"],
         condition: "non-null",
         outcome: "encode",
@@ -444,7 +769,7 @@ pub const ENGINE_TYPE_RULES: &[QuerySqlEngineTypeRule] = &[
         error_category: None,
     },
     QuerySqlEngineTypeRule {
-        profile: "postgres-server@5",
+        profile: "postgres-server@6",
         engine_types: &["float4", "float8"],
         condition: "finite",
         outcome: "encode",
@@ -452,7 +777,7 @@ pub const ENGINE_TYPE_RULES: &[QuerySqlEngineTypeRule] = &[
         error_category: None,
     },
     QuerySqlEngineTypeRule {
-        profile: "postgres-server@5",
+        profile: "postgres-server@6",
         engine_types: &["float4", "float8"],
         condition: "NaN, +Infinity, or -Infinity",
         outcome: "reject",
@@ -460,23 +785,39 @@ pub const ENGINE_TYPE_RULES: &[QuerySqlEngineTypeRule] = &[
         error_category: Some("syntax_or_type"),
     },
     QuerySqlEngineTypeRule {
-        profile: "postgres-server@5",
+        profile: "postgres-server@6",
         engine_types: &["numeric"],
-        condition: "finite",
+        condition: "integer-valued and fits in i64",
         outcome: "encode",
-        json_encoding: Some("lossless-canonical-decimal-string"),
+        json_encoding: Some("signed-json-integer"),
         error_category: None,
     },
     QuerySqlEngineTypeRule {
-        profile: "postgres-server@5",
+        profile: "postgres-server@6",
         engine_types: &["numeric"],
-        condition: "NaN, +Infinity, or -Infinity",
+        condition: "integer-valued but outside the i64 range",
         outcome: "reject",
         json_encoding: None,
         error_category: Some("syntax_or_type"),
     },
     QuerySqlEngineTypeRule {
-        profile: "postgres-server@5",
+        profile: "postgres-server@6",
+        engine_types: &["numeric"],
+        condition: "non-integral, finite, and within the IEEE-754 double range",
+        outcome: "encode",
+        json_encoding: Some("json-number"),
+        error_category: None,
+    },
+    QuerySqlEngineTypeRule {
+        profile: "postgres-server@6",
+        engine_types: &["numeric"],
+        condition: "NaN, +Infinity, -Infinity, or magnitude beyond the double range",
+        outcome: "reject",
+        json_encoding: None,
+        error_category: Some("syntax_or_type"),
+    },
+    QuerySqlEngineTypeRule {
+        profile: "postgres-server@6",
         engine_types: &["text", "varchar", "bpchar", "char", "name"],
         condition: "non-null UTF-8 text",
         outcome: "encode",
@@ -484,7 +825,7 @@ pub const ENGINE_TYPE_RULES: &[QuerySqlEngineTypeRule] = &[
         error_category: None,
     },
     QuerySqlEngineTypeRule {
-        profile: "postgres-server@5",
+        profile: "postgres-server@6",
         engine_types: &["bytea"],
         condition: "non-null",
         outcome: "encode",
@@ -492,7 +833,7 @@ pub const ENGINE_TYPE_RULES: &[QuerySqlEngineTypeRule] = &[
         error_category: None,
     },
     QuerySqlEngineTypeRule {
-        profile: "postgres-server@5",
+        profile: "postgres-server@6",
         engine_types: &["json", "jsonb"],
         condition: "non-null; preserve the engine's canonical JSON text without decoding through serde_json::Value",
         outcome: "encode",
@@ -500,7 +841,7 @@ pub const ENGINE_TYPE_RULES: &[QuerySqlEngineTypeRule] = &[
         error_category: None,
     },
     QuerySqlEngineTypeRule {
-        profile: "postgres-server@5",
+        profile: "postgres-server@6",
         engine_types: &["timestamptz"],
         condition: "non-null",
         outcome: "encode",
@@ -508,7 +849,7 @@ pub const ENGINE_TYPE_RULES: &[QuerySqlEngineTypeRule] = &[
         error_category: None,
     },
     QuerySqlEngineTypeRule {
-        profile: "postgres-server@5",
+        profile: "postgres-server@6",
         engine_types: &["timestamp"],
         condition: "non-null value has no UTC offset",
         outcome: "reject",
@@ -516,7 +857,7 @@ pub const ENGINE_TYPE_RULES: &[QuerySqlEngineTypeRule] = &[
         error_category: Some("syntax_or_type"),
     },
     QuerySqlEngineTypeRule {
-        profile: "postgres-server@5",
+        profile: "postgres-server@6",
         engine_types: &["array types (*[])"],
         condition: "unless a later contract revision explicitly supports the exact array type",
         outcome: "reject",
@@ -539,7 +880,86 @@ pub const UNSUPPORTED_TYPE_POLICY: QuerySqlUnsupportedTypePolicy =
         rule: "Reject every engine type or value form not matched by an explicit rule, including domains, enums, composites, ranges, multiranges, geometric, network, bit, vector, extension, and unknown types; never coerce or stringify implicitly.",
     };
 
-pub const RESULT_FIELDS: &[&str] = &["columns", "rows", "row_count", "truncated"];
+pub const RESULT_FIELDS: &[&str] = &[
+    "columns",
+    "rows",
+    "row_count",
+    "truncated",
+    "truncation_hint",
+    "as_of_seq",
+];
+
+/// `Some(hint)` exactly when a result was truncated, else `None`.
+pub fn truncation_hint_for(truncated: bool) -> Option<String> {
+    truncated.then(truncation_hint)
+}
+
+/// Exclusion repair for oversized stored values, identical wherever an
+/// engine can name them. Offenders are `(relation, id)` pairs because ids
+/// are per relation: each relation gets its own qualified clause
+/// (`records.id NOT IN (...) AND links.id NOT IN (...)`), so the repair
+/// stays unambiguous in joined statements. Shows at most 10 ids with the
+/// total count; `None` when no id is known (engines that cap at projection
+/// without row identity keep their existing message). Ids are single-quoted
+/// with `'` doubled, so the clause is portable SQL the validator admits.
+pub fn oversized_exclusion_hint(ids_by_relation: &[(&str, &str)]) -> Option<String> {
+    if ids_by_relation.is_empty() {
+        return None;
+    }
+    // Dedupe ids per relation, preserving first-seen relation order.
+    let mut grouped: Vec<(&str, Vec<&str>)> = Vec::new();
+    for (relation, id) in ids_by_relation {
+        match grouped.iter_mut().find(|(known, _)| *known == *relation) {
+            Some((_, ids)) => {
+                if !ids.contains(id) {
+                    ids.push(*id);
+                }
+            }
+            None => grouped.push((relation, vec![*id])),
+        }
+    }
+    let total: usize = grouped.iter().map(|(_, ids)| ids.len()).sum();
+    // At most 10 ids overall; the probe names up to 12, so the count below
+    // is reachable through the wired path.
+    let mut remaining = 10;
+    let mut clauses = Vec::new();
+    for (relation, ids) in &grouped {
+        let shown = ids
+            .iter()
+            .take(remaining)
+            .map(|id| format!("'{}'", id.replace('\'', "''")))
+            .collect::<Vec<_>>();
+        if shown.is_empty() {
+            break;
+        }
+        remaining -= shown.len();
+        clauses.push(format!("{relation}.id NOT IN ({})", shown.join(", ")));
+    }
+    let mut hint = format!(
+        "Exclude these oversized rows and retry with WHERE {}",
+        clauses.join(" AND ")
+    );
+    if total > 10 {
+        hint.push_str(&format!(" (first 10 of {total} oversized rows)"));
+    }
+    hint.push_str(
+        ". If the statement aliases a relation, qualify with its alias instead \
+         of the relation name (for example r.id when the statement reads records r).",
+    );
+    Some(hint)
+}
+
+/// Scan-versus-probe cause plus the repair, identical on every engine.
+pub fn deadline_hint() -> String {
+    format!(
+        "query exceeded the governed SQL deadline of {}ms. \
+         Scanning a caller-relative relation (records, links) rather than \
+         probing it by id usually causes this: the visibility join turns a \
+         scan into a whole-workspace authorization walk. Add a selective \
+         WHERE on an indexed key, or LIMIT with ORDER BY.",
+        QUERY_DEADLINE_MS
+    )
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -721,6 +1141,15 @@ pub struct QuerySqlResult {
     pub rows: Vec<Value>,
     pub row_count: usize,
     pub truncated: bool,
+    /// Keyset repair, present only when `truncated` is true. Rows are
+    /// untouched; this is the only shape change. Additive: no catalog or
+    /// revision bump (same rule as additive relations). Serialized on
+    /// every engine whether null or set, so the field is always present.
+    pub truncation_hint: Option<String>,
+    /// Workspace content sequence (`COALESCE(MAX(seq), 0)` over
+    /// `content_events`) observed inside the same read transaction or
+    /// snapshot as the statement itself, never before or after it.
+    pub as_of_seq: i64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -775,13 +1204,16 @@ impl QuerySqlProfile {
             },
             Self::PostgresServer => QuerySqlProfileContract {
                 id: "postgres-server",
-                revision: 5,
+                // Revision 6: caller placeholders are `?N` on every
+                // profile (I1); the Postgres path rewrites to `$N`
+                // after the classifier (I1b).
+                revision: 6,
                 mode: "network",
                 dialect: QuerySqlDialectContract {
                     name: "postgresql",
                     version: "16+".to_owned(),
                 },
-                placeholder: "$1",
+                placeholder: "?1",
                 available: true,
                 unavailable_reason: None,
             },
@@ -962,7 +1394,7 @@ pub fn request_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "sql": { "type": "string", "description": "One engine-native SELECT/WITH statement." },
+            "sql": { "type": "string", "description": "One engine-native SELECT/WITH statement, optionally prefixed with EXPLAIN QUERY PLAN to inspect its plan." },
             "parameters": {
                 "type": "array",
                 "maxItems": LIMITS.parameter_count,
@@ -996,7 +1428,20 @@ pub fn require_available(profile: QuerySqlProfile) -> Result<()> {
 /// remain authoritative. This scanner only establishes one SELECT/WITH-shaped
 /// statement and rejects obvious write/session/control tokens outside quoted
 /// and commented text.
+///
+/// `EXPLAIN QUERY PLAN <statement>` is admitted when the explained statement
+/// is itself admissible: it returns only the plan (never record data), so it
+/// lets an author see a visibility-relation scan without widening the data
+/// surface. Bare `EXPLAIN` and any other explained statement stay rejected.
 pub fn classify_single_read_statement(profile: QuerySqlProfile, sql: &str) -> Result<String> {
+    classify_single_read_statement_impl(profile, sql, true)
+}
+
+fn classify_single_read_statement_impl(
+    profile: QuerySqlProfile,
+    sql: &str,
+    allow_explain: bool,
+) -> Result<String> {
     if sql.len() > MAX_SQL_BYTES {
         return Err(categorized_error(
             QuerySqlErrorCategory::InvalidArguments,
@@ -1008,23 +1453,27 @@ pub fn classify_single_read_statement(profile: QuerySqlProfile, sql: &str) -> Re
     let mut semicolons = Vec::new();
     for token in tokens {
         match token {
-            Token::Word(word) => words.push(word),
+            Token::Word { text, end } => words.push((text, end)),
             Token::Semicolon(offset) => semicolons.push(offset),
+            Token::Placeholder { .. } => {}
         }
     }
-    let Some(first) = words.first() else {
+    let Some((first, _)) = words.first() else {
         return Err(categorized_error(
             QuerySqlErrorCategory::InvalidArguments,
             "empty query",
         ));
     };
+    if allow_explain && first == "explain" {
+        return classify_explain_query_plan(profile, sql, &words, &semicolons);
+    }
     if !matches!(first.as_str(), "select" | "with") {
         return Err(categorized_error(
             QuerySqlErrorCategory::UnsafeStatement,
             format!("read-only statement must start with SELECT or WITH, got '{first}'"),
         ));
     }
-    const FORBIDDEN: [&str; 23] = [
+    const FORBIDDEN: [&str; 24] = [
         "insert",
         "update",
         "delete",
@@ -1048,8 +1497,12 @@ pub fn classify_single_read_statement(profile: QuerySqlProfile, sql: &str) -> Re
         "rollback",
         "savepoint",
         "release",
+        "replace",
     ];
-    if let Some(word) = words.iter().find(|word| FORBIDDEN.contains(&word.as_str())) {
+    if let Some((word, _)) = words
+        .iter()
+        .find(|(word, _)| FORBIDDEN.contains(&word.as_str()))
+    {
         return Err(categorized_error(
             QuerySqlErrorCategory::UnsafeStatement,
             format!("read-only statement contains prohibited token '{word}'"),
@@ -1069,9 +1522,112 @@ pub fn classify_single_read_statement(profile: QuerySqlProfile, sql: &str) -> Re
     Ok(statement.trim().to_owned())
 }
 
+/// Admit `EXPLAIN QUERY PLAN <statement>` only. The explained statement is
+/// re-classified without `EXPLAIN` so nesting (`EXPLAIN QUERY PLAN EXPLAIN
+/// ...`) and non-read explained statements stay rejected exactly as if they
+/// had been submitted alone.
+fn classify_explain_query_plan(
+    profile: QuerySqlProfile,
+    sql: &str,
+    words: &[(String, usize)],
+    semicolons: &[usize],
+) -> Result<String> {
+    let is_query_plan = words.get(1).is_some_and(|(word, _)| word == "query")
+        && words.get(2).is_some_and(|(word, _)| word == "plan");
+    if !is_query_plan {
+        return Err(categorized_error(
+            QuerySqlErrorCategory::UnsafeStatement,
+            "EXPLAIN without QUERY PLAN is not admitted; use EXPLAIN QUERY PLAN over a SELECT or WITH statement",
+        ));
+    }
+    let plan_end = words[2].1;
+    if semicolons.iter().any(|offset| *offset < plan_end) {
+        return Err(categorized_error(
+            QuerySqlErrorCategory::UnsafeStatement,
+            "a single statement only",
+        ));
+    }
+    let inner = classify_single_read_statement_impl(profile, &sql[plan_end..], false)?;
+    Ok(format!("EXPLAIN QUERY PLAN {inner}"))
+}
+
 enum Token {
-    Word(String),
+    Word {
+        text: String,
+        end: usize,
+    },
     Semicolon(usize),
+    /// An admitted `?N` placeholder: byte span of the `?` plus its digits.
+    Placeholder {
+        start: usize,
+        end: usize,
+    },
+}
+
+/// I1b (E1 M2): rewrite caller `?N` placeholders to Postgres `$N`.
+///
+/// `statement` must already be classified (notably under
+/// `QuerySqlProfile::PostgresServer` for Postgres callers), so every `?`
+/// in code is an admitted `?N`. The spans come from `scan_tokens`, the same
+/// scanner that admitted the statement, so `?N` inside string literals,
+/// comments, quoted identifiers and dollar-quoted strings is untouched by
+/// construction. Run this before `pg_query` parse; the exact-`$n`-set check
+/// then runs on the rewritten text.
+///
+/// The classify-first precondition is asserted in debug builds: production
+/// always classifies before rewriting, and an unclassified input (e.g. a
+/// bare comment) must surface there, not here.
+pub fn rewrite_placeholders_for_postgres(
+    profile: QuerySqlProfile,
+    statement: &str,
+) -> Result<String> {
+    debug_assert!(
+        classify_single_read_statement(profile, statement).is_ok(),
+        "rewrite_placeholders_for_postgres expects a classified statement"
+    );
+    let mut rewritten = String::with_capacity(statement.len());
+    let mut cursor = 0;
+    for token in scan_tokens(profile, statement)? {
+        if let Token::Placeholder { start, end } = token {
+            rewritten.push_str(&statement[cursor..start]);
+            rewritten.push('$');
+            rewritten.push_str(&statement[start + 1..end]);
+            cursor = end;
+        }
+    }
+    rewritten.push_str(&statement[cursor..]);
+    Ok(rewritten)
+}
+
+/// I1 review: the exact-set check every engine applies once the parameter
+/// count is visible. The classifier admits `?N` without a count; the
+/// executor requires the `?N` set to be exactly `1..=parameters.len()`, so
+/// `?2` with one parameter fails here instead of binding a silent NULL
+/// (SQLite) or a positionally shifted value (Turso). Postgres enforces the
+/// equivalent rule on the rewritten `$n` set with its own message.
+pub fn check_positional_arguments(
+    profile: QuerySqlProfile,
+    statement: &str,
+    parameters_len: usize,
+) -> Result<()> {
+    let mut seen = BTreeSet::new();
+    for token in scan_tokens(profile, statement)? {
+        if let Token::Placeholder { start, end } = token {
+            seen.insert(
+                statement[start + 1..end]
+                    .parse::<usize>()
+                    .unwrap_or(usize::MAX),
+            );
+        }
+    }
+    let expected: BTreeSet<usize> = (1..=parameters_len).collect();
+    if seen != expected {
+        return Err(categorized_error(
+            QuerySqlErrorCategory::InvalidArguments,
+            "ordered parameters and `?N` placeholders must match exactly",
+        ));
+    }
+    Ok(())
 }
 
 fn scan_tokens(profile: QuerySqlProfile, sql: &str) -> Result<Vec<Token>> {
@@ -1106,15 +1662,35 @@ fn scan_tokens(profile: QuerySqlProfile, sql: &str) -> Result<Vec<Token>> {
                 i = bracket_identifier_end(bytes, i)?;
             }
             b'$' if profile == QuerySqlProfile::PostgresServer => {
-                if let Some((delimiter, after)) = dollar_delimiter(sql, i) {
-                    let rest = &sql[after..];
-                    let Some(end) = rest.find(&delimiter) else {
-                        return syntax_error("unterminated dollar-quoted string");
-                    };
-                    i = after + end + delimiter.len();
-                } else {
-                    i += 1;
+                // I1 review: `$` continues a Postgres identifier
+                // (`a$tag$`), so it opens a dollar-quoted string only
+                // when the preceding byte cannot be part of one.
+                // Otherwise a phantom string could hide statement
+                // structure (e.g. the `;` in `a$tag$; DELETE …`).
+                let ident_prev = i > 0
+                    && matches!(
+                        bytes[i - 1],
+                        b'0'..=b'9' | b'A'..=b'Z' | b'a'..=b'z' | b'_' | b'$'
+                    );
+                if !ident_prev {
+                    if let Some((delimiter, after)) = dollar_delimiter(sql, i) {
+                        let rest = &sql[after..];
+                        let Some(end) = rest.find(&delimiter) else {
+                            return syntax_error("unterminated dollar-quoted string");
+                        };
+                        i = after + end + delimiter.len();
+                        continue;
+                    }
                 }
+                i = placeholder_end(bytes, i)?;
+            }
+            b'?' => {
+                let start = i;
+                i = placeholder_end(bytes, i)?;
+                tokens.push(Token::Placeholder { start, end: i });
+            }
+            b':' | b'@' | b'$' => {
+                i = placeholder_end(bytes, i)?;
             }
             b';' => {
                 tokens.push(Token::Semicolon(i));
@@ -1126,12 +1702,127 @@ fn scan_tokens(profile: QuerySqlProfile, sql: &str) -> Result<Vec<Token>> {
                 while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
                     i += 1;
                 }
-                tokens.push(Token::Word(sql[start..i].to_ascii_lowercase()));
+                tokens.push(Token::Word {
+                    text: sql[start..i].to_ascii_lowercase(),
+                    end: i,
+                });
             }
             _ => i += 1,
         }
     }
     Ok(tokens)
+}
+
+/// I1 (E1 M2 portability validator): one placeholder syntax (`?N`) across
+/// engines. `scan_tokens` routes every `?`, `:`, `@` and `$` that is not
+/// inside a string literal, comment, quoted identifier or (on Postgres)
+/// dollar-quoted string here. `?N` with N >= 1 is admitted; `$N`, bare `?`
+/// (including `?0`), `:name`, `@name` and `$name` are rejected with the
+/// portable repair. `::` is the cast operator, not a placeholder, and `[1:2]`
+/// slice colons are left for the engine parsers. Contiguity against the
+/// parameter count stays with the engines, which see the count.
+fn placeholder_end(bytes: &[u8], start: usize) -> Result<usize> {
+    const REPAIR: &str = "use positional `?N` placeholders (1-based, contiguous); Postgres `$n` is not accepted from callers";
+    let found = |end: usize| {
+        let end = end.min(start + 16);
+        String::from_utf8_lossy(&bytes[start..end]).into_owned()
+    };
+    let reject = |end: usize| {
+        Err(categorized_error(
+            QuerySqlErrorCategory::InvalidArguments,
+            format!("non-portable placeholder `{}` — {REPAIR}", found(end)),
+        ))
+    };
+    let is_ident_start =
+        |byte: Option<&u8>| byte.is_some_and(|byte| byte.is_ascii_alphabetic() || *byte == b'_');
+    let mut end = start + 1;
+    match bytes[start] {
+        b'?' => {
+            while bytes.get(end).is_some_and(|byte| byte.is_ascii_digit()) {
+                end += 1;
+            }
+            if end == start + 1 {
+                // I1 review: a bare `?` is not a placeholder claim —
+                // Postgres `?`/`?|`/`?&` are jsonb operators, and none
+                // of them are in the portable profile.
+                return Err(categorized_error(
+                    QuerySqlErrorCategory::InvalidArguments,
+                    "`?` is not admitted: placeholders are positional `?N`, and Postgres `?`/`?|`/`?&` operators are not in the portable profile.",
+                ));
+            }
+            if bytes[start + 1] == b'0' {
+                return reject(end);
+            }
+            // I1 review: bound N even though the classifier cannot see
+            // the parameter count; `?4294967297` truncated to int32
+            // downstream. Equal-length digit strings compare numerically.
+            let max = MAX_PARAMETERS.to_string();
+            let digits = String::from_utf8_lossy(&bytes[start + 1..end]);
+            if digits.len() > max.len()
+                || (digits.len() == max.len() && digits.as_ref() > max.as_str())
+            {
+                return Err(categorized_error(
+                    QuerySqlErrorCategory::InvalidArguments,
+                    format!(
+                        "non-portable placeholder `{}` — placeholder numbers must not exceed {MAX_PARAMETERS}",
+                        found(end)
+                    ),
+                ));
+            }
+            Ok(end)
+        }
+        b':' => {
+            if bytes.get(start + 1) == Some(&b':') {
+                return Ok(start + 2);
+            }
+            if is_ident_start(bytes.get(start + 1)) {
+                end += 1;
+                while bytes
+                    .get(end)
+                    .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+                {
+                    end += 1;
+                }
+                return reject(end);
+            }
+            Ok(start + 1)
+        }
+        b'@' => {
+            if bytes
+                .get(end)
+                .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+            {
+                while bytes
+                    .get(end)
+                    .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+                {
+                    end += 1;
+                }
+                return reject(end);
+            }
+            Ok(start + 1)
+        }
+        b'$' => {
+            if bytes.get(end).is_some_and(|byte| byte.is_ascii_digit()) {
+                while bytes.get(end).is_some_and(|byte| byte.is_ascii_digit()) {
+                    end += 1;
+                }
+                return reject(end);
+            }
+            if is_ident_start(bytes.get(end)) {
+                end += 1;
+                while bytes
+                    .get(end)
+                    .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+                {
+                    end += 1;
+                }
+                return reject(end);
+            }
+            Ok(start + 1)
+        }
+        _ => Ok(start + 1),
+    }
 }
 
 fn quoted_end(bytes: &[u8], start: usize, quote: u8, backslash_escapes: bool) -> Result<usize> {
@@ -1250,7 +1941,9 @@ mod tests {
             "SELECT \"delete;\" FROM records",
             "SELECT `update;` FROM records",
             "SELECT [drop;] FROM records",
-            "SELECT $name AS value",
+            // I1: `$name` is no longer admitted (see
+            // `placeholders_use_positional_syntax_only`).
+            "SELECT id FROM records WHERE id = ?1",
         ] {
             assert!(
                 classify_single_read_statement(QuerySqlProfile::SqliteLocal, sql).is_ok(),
@@ -1262,6 +1955,186 @@ mod tests {
             "SELECT $tag$DELETE; DROP$tag$ AS body"
         )
         .is_err());
+    }
+    #[test]
+    fn oversized_exclusion_hint_bounds_the_id_list() {
+        assert!(oversized_exclusion_hint(&[]).is_none());
+        let hint = oversized_exclusion_hint(&[("records", "abc123")]).expect("hint with ids");
+        assert!(
+            hint.contains("WHERE records.id NOT IN ('abc123')"),
+            "{hint}"
+        );
+        assert!(!hint.contains("first 10"), "{hint}");
+        assert!(hint.contains("alias"), "{hint}");
+        // One clause per relation, qualified so a join stays unambiguous.
+        let mixed = oversized_exclusion_hint(&[
+            ("records", "r1"),
+            ("links", "l1"),
+            ("records", "r1"),
+            ("links", "l2"),
+        ])
+        .expect("grouped hint");
+        assert!(
+            mixed.contains("records.id NOT IN ('r1') AND links.id NOT IN ('l1', 'l2')"),
+            "{mixed}"
+        );
+        assert!(!mixed.contains("WHERE id NOT IN"), "{mixed}");
+        let ids: Vec<String> = (0..12).map(|index| format!("id{index:02}")).collect();
+        let refs: Vec<(&str, &str)> = ids.iter().map(|id| ("records", id.as_str())).collect();
+        let bounded = oversized_exclusion_hint(&refs).expect("bounded hint");
+        assert!(
+            bounded.contains("first 10 of 12 oversized rows"),
+            "{bounded}"
+        );
+        assert!(!bounded.contains("id11"), "{bounded}");
+        let quoted = oversized_exclusion_hint(&[("records", "o'brien")]).expect("quoted hint");
+        assert!(quoted.contains("'o''brien'"), "{quoted}");
+    }
+
+    #[test]
+    fn deadline_hint_names_the_cause_and_the_repair() {
+        let hint = deadline_hint();
+        assert!(hint.contains("2000ms"), "{hint}");
+        assert!(hint.contains("probing it by id"), "{hint}");
+        assert!(hint.contains("LIMIT with ORDER BY"), "{hint}");
+    }
+
+    #[test]
+    fn truncation_hint_names_the_bound_and_the_keyset_repair() {
+        assert!(truncation_hint_for(false).is_none());
+        let hint = truncation_hint_for(true).expect("hint when truncated");
+        assert!(hint.contains("1000"), "{hint}");
+        assert!(hint.contains("ORDER BY"), "{hint}");
+        assert!(hint.contains("keyset"), "{hint}");
+        assert!(hint.contains("WHERE key > ?N"), "{hint}");
+    }
+
+    #[test]
+    fn blocked_relation_repair_names_the_fix() {
+        use QuerySqlProfile::{PostgresServer, SqliteLocal};
+        let probe = blocked_relation_repair("sqlite_master", SqliteLocal).expect("probe repair");
+        assert!(probe.contains("catalog introspection"), "{probe}");
+        assert!(probe.contains("FROM catalog_columns"), "{probe}");
+        let pragma =
+            blocked_relation_repair("pragma_table_info", SqliteLocal).expect("pragma repair");
+        assert!(pragma.contains("catalog introspection"), "{pragma}");
+        let mapped = blocked_relation_repair("relationships", SqliteLocal).expect("mapped repair");
+        assert!(mapped.contains("effective_relationships"), "{mapped}");
+        let unmapped =
+            blocked_relation_repair("member_contexts", SqliteLocal).expect("list repair");
+        assert!(
+            unmapped.contains("records, content_events, links"),
+            "{unmapped}"
+        );
+        // Profile filtering: Postgres cannot query the sqlite-only
+        // relations, so the map falls through to the filtered list.
+        let pg_mapped =
+            blocked_relation_repair("relationships", PostgresServer).expect("pg fallback repair");
+        assert!(
+            !pg_mapped.contains("effective_relationships"),
+            "{pg_mapped}"
+        );
+        assert!(pg_mapped.contains("on postgres-server"), "{pg_mapped}");
+        let pg_list =
+            blocked_relation_repair("member_contexts", PostgresServer).expect("pg list repair");
+        assert!(!pg_list.contains("agent_activity"), "{pg_list}");
+        assert!(pg_list.contains("catalog_columns"), "{pg_list}");
+        assert!(blocked_relation_repair("records", SqliteLocal).is_none());
+        assert!(blocked_relation_repair("RECORDS", SqliteLocal).is_none());
+        assert!(blocked_relation_repair("", SqliteLocal).is_none());
+    }
+
+    #[test]
+    fn catalog_views_cover_every_relation_and_column() {
+        for relation in LOGICAL_RELATIONS {
+            assert!(
+                RELATION_COMMENTS
+                    .iter()
+                    .any(|(name, _)| *name == relation.name),
+                "no catalog comment for {}",
+                relation.name
+            );
+        }
+        for (name, _) in RELATION_COMMENTS {
+            assert!(
+                LOGICAL_RELATIONS
+                    .iter()
+                    .any(|relation| relation.name == *name),
+                "stale catalog comment for removed relation {name}"
+            );
+        }
+        let relation_rows = catalog_relation_rows();
+        assert_eq!(relation_rows.len(), LOGICAL_RELATIONS.len());
+        let column_rows = catalog_column_rows();
+        let expected: usize = LOGICAL_RELATIONS.iter().map(|r| r.columns.len()).sum();
+        assert_eq!(column_rows.len(), expected);
+        // Zero-based, dense positions per relation.
+        let mut seen = std::collections::BTreeMap::new();
+        for (relation, _, position) in &column_rows {
+            assert_eq!(
+                *position,
+                seen.get(relation).copied().unwrap_or(0),
+                "{relation}"
+            );
+            seen.insert(*relation, position + 1);
+        }
+        let statements = catalog_view_statements(true);
+        assert_eq!(statements.len(), 2);
+        for statement in &statements {
+            // Installers split the contract batch on semicolons, so a
+            // semicolon inside a comment would corrupt every statement
+            // after it.
+            assert!(!statement.contains(';'), "{statement}");
+            assert!(statement.contains("IF NOT EXISTS"), "{statement}");
+        }
+        let bare = catalog_view_statements(false);
+        assert_eq!(bare.len(), 2);
+        for statement in &bare {
+            assert!(!statement.contains("IF NOT EXISTS"), "{statement}");
+        }
+        assert_eq!(
+            statements[0].matches("UNION ALL").count(),
+            relation_rows.len() - 1
+        );
+        assert_eq!(
+            statements[1].matches("UNION ALL").count(),
+            column_rows.len() - 1
+        );
+    }
+
+    #[test]
+    fn catalog_card_names_every_relation_and_column() {
+        let card = sql_read_catalog_card();
+        assert!(
+            card.len() <= SQL_READ_CARD_MAX_BYTES,
+            "card is {} bytes over the {} budget",
+            card.len(),
+            SQL_READ_CARD_MAX_BYTES
+        );
+        // The card renders in descriptor prose, never in a SQL batch,
+        // so its notes may use semicolons freely.
+        for relation in LOGICAL_RELATIONS {
+            let header = format!("{}({})", relation.name, relation.columns.join(","));
+            assert!(card.contains(&header), "card omits {}", relation.name);
+            assert!(
+                CARD_NOTES.iter().any(|(name, _)| *name == relation.name),
+                "no card note for {}",
+                relation.name
+            );
+        }
+        for (name, _) in CARD_NOTES {
+            assert!(
+                LOGICAL_RELATIONS
+                    .iter()
+                    .any(|relation| relation.name == *name),
+                "stale card note for removed relation {name}"
+            );
+        }
+        // Profile scope travels with the relation line.
+        assert!(card.contains("[only: sqlite-local]"), "{card}");
+        for (_, sql) in CARD_WORKED_STATEMENTS {
+            assert!(card.contains(sql), "card omits a worked statement");
+        }
     }
 
     #[test]
@@ -1281,10 +2154,201 @@ mod tests {
     }
 
     #[test]
+    fn placeholders_use_positional_syntax_only() {
+        // I1 (E1 M2): `?N` (1-based) is the only admitted spelling, on
+        // every profile. Contiguity against the parameter count stays with
+        // the engines, which see the count.
+        for sql in [
+            "SELECT id FROM records WHERE id = ?1",
+            "SELECT id FROM records WHERE id = ?1 AND name = ?2",
+            "SELECT id FROM records WHERE id = ?12",
+        ] {
+            for profile in PROFILES {
+                assert!(
+                    classify_single_read_statement(*profile, sql).is_ok(),
+                    "{profile:?}: {sql}"
+                );
+            }
+        }
+        // Every other spelling is rejected with the portable repair.
+        for sql in [
+            "SELECT id FROM records WHERE id = $1",
+            "SELECT id FROM records WHERE id = ?0",
+            "SELECT id FROM records WHERE id = :name",
+            "SELECT id FROM records WHERE id = @name",
+            "SELECT id FROM records WHERE id = $name",
+            "SELECT id FROM records WHERE id = @1",
+        ] {
+            for profile in PROFILES {
+                let error = classify_single_read_statement(*profile, sql).unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("use positional `?N` placeholders"),
+                    "{profile:?}: {sql}: missing repair: {error}"
+                );
+            }
+        }
+        // Placeholder numbers are bounded even without a parameter
+        // count in view: `?4294967297` would truncate to int32
+        // downstream.
+        for profile in PROFILES {
+            let error = classify_single_read_statement(
+                *profile,
+                "SELECT id FROM records WHERE id = ?4294967297",
+            )
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("must not exceed"),
+                "{profile:?}: {error}"
+            );
+        }
+        // A bare `?` is not a placeholder claim: it names the jsonb
+        // operators as out of profile instead.
+        for profile in PROFILES {
+            let error =
+                classify_single_read_statement(*profile, "SELECT id FROM records WHERE id = ?")
+                    .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("Postgres `?`/`?|`/`?&` operators"),
+                "{profile:?}: {error}"
+            );
+        }
+        // The same spellings inside literals, comments and quoted
+        // identifiers are data, not placeholders, and stay admitted.
+        for sql in [
+            "SELECT '$1' AS value",
+            "SELECT ':x' AS value",
+            "SELECT id FROM records WHERE name = '$1' AND id = ?1",
+            "-- filter $1\nSELECT id FROM records",
+            "SELECT /* :name */ id FROM records",
+            "SELECT \"$1\" FROM records",
+            "SELECT 1::int FROM records",
+        ] {
+            for profile in PROFILES {
+                assert!(
+                    classify_single_read_statement(*profile, sql).is_ok(),
+                    "{profile:?}: {sql}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn postgres_rewrite_turns_positional_placeholders_into_dollar_forms() {
+        // I1b: `?N` in code becomes `$N`; the same scanner spans that the
+        // classifier walked decide what is code, so literals, comments,
+        // quoted identifiers and dollar-quotes are untouched. `?10` is one
+        // placeholder (number ten), not `?1` followed by `0`.
+        for (statement, expected) in [
+            (
+                "SELECT id FROM records WHERE id = ?1",
+                "SELECT id FROM records WHERE id = $1",
+            ),
+            (
+                "SELECT id FROM records WHERE a = ?1 AND b = ?10",
+                "SELECT id FROM records WHERE a = $1 AND b = $10",
+            ),
+            (
+                "SELECT id FROM records WHERE name = '?1' AND id = ?1",
+                "SELECT id FROM records WHERE name = '?1' AND id = $1",
+            ),
+            ("SELECT '?1' AS value", "SELECT '?1' AS value"),
+            (
+                "-- filter ?1\nSELECT id FROM records WHERE id = ?2",
+                "-- filter ?1\nSELECT id FROM records WHERE id = $2",
+            ),
+            (
+                "SELECT /* ?1 */ id FROM records WHERE id = ?1",
+                "SELECT /* ?1 */ id FROM records WHERE id = $1",
+            ),
+            (
+                "SELECT \"?1\" FROM records WHERE id = ?1",
+                "SELECT \"?1\" FROM records WHERE id = $1",
+            ),
+            (
+                "SELECT $tag$?1$tag$ AS body FROM records WHERE id = ?1",
+                "SELECT $tag$?1$tag$ AS body FROM records WHERE id = $1",
+            ),
+            (
+                "SELECT 1::int FROM records WHERE id = ?1",
+                "SELECT 1::int FROM records WHERE id = $1",
+            ),
+        ] {
+            assert_eq!(
+                rewrite_placeholders_for_postgres(QuerySqlProfile::PostgresServer, statement)
+                    .unwrap(),
+                expected,
+                "{statement}"
+            );
+        }
+    }
+
+    #[test]
+    fn positional_arguments_require_the_exact_set() {
+        // I1 review: once the count is visible, `?N` must be exactly
+        // `1..=len` — on every profile, since the helper takes one.
+        for profile in PROFILES {
+            check_positional_arguments(*profile, "SELECT 1", 0).unwrap();
+            check_positional_arguments(*profile, "SELECT id FROM records WHERE id = ?1", 1)
+                .unwrap();
+            check_positional_arguments(
+                *profile,
+                "SELECT id FROM records WHERE a = ?1 AND b = ?2",
+                2,
+            )
+            .unwrap();
+            for (sql, len) in [
+                ("SELECT id FROM records WHERE id = ?2", 1),
+                ("SELECT id FROM records WHERE a = ?1 AND b = ?3", 2),
+                ("SELECT id FROM records WHERE id = ?1", 0),
+                ("SELECT id FROM records WHERE id = ?1", 2),
+            ] {
+                let error = check_positional_arguments(*profile, sql, len).unwrap_err();
+                assert!(
+                    error.to_string().contains("must match exactly"),
+                    "{profile:?}: {sql}/{len}: {error}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dollar_quotes_do_not_open_inside_identifiers() {
+        // I1 review: on Postgres `$` continues an identifier, so
+        // `a$tag$` must not open a dollar-quoted string that hides a
+        // `?1` from the rewrite or a `;` from the single-statement
+        // check. Every profile rejects both inputs.
+        for sql in [
+            "SELECT a$tag$?1 xyz$tag$ FROM records",
+            "SELECT 1 a$tag$; DELETE FROM records$tag$",
+        ] {
+            for profile in PROFILES {
+                assert!(
+                    classify_single_read_statement(*profile, sql).is_err(),
+                    "{profile:?}: unexpectedly admitted {sql}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_profile_advertises_positional_placeholders() {
+        // I1 review: callers send `?N` on every profile; the Postgres
+        // `$N` form is the execution rewrite, never caller syntax.
+        for profile in PROFILES {
+            assert_eq!(profile.contract().placeholder, "?1", "{profile:?}");
+        }
+    }
+
+    #[test]
     fn classifier_rejects_multiple_and_data_modifying_ctes() {
         for sql in [
             "SELECT 1; SELECT 2",
             "WITH changed AS (DELETE FROM records RETURNING id) SELECT * FROM changed",
+            "WITH x AS (SELECT 1) REPLACE INTO records VALUES(1,'z')",
             "COPY records TO PROGRAM 'cat'",
         ] {
             for profile in PROFILES {
@@ -1294,6 +2358,64 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn explain_query_plan_admits_only_a_plan_over_an_admissible_statement() {
+        for profile in PROFILES {
+            for sql in [
+                "EXPLAIN QUERY PLAN SELECT id FROM records",
+                "explain query plan select id from records where id = 'x'",
+                "EXPLAIN QUERY PLAN WITH visible AS (SELECT id FROM records) SELECT count(*) FROM visible",
+                "-- lead\nEXPLAIN /* mid */ QUERY PLAN SELECT 1; -- tail",
+            ] {
+                let classified =
+                    classify_single_read_statement(*profile, sql).unwrap_or_else(|error| {
+                        panic!("{profile:?}: {sql}: {error}")
+                    });
+                assert!(
+                    classified.starts_with("EXPLAIN QUERY PLAN "),
+                    "{profile:?}: {sql}: {classified}"
+                );
+                assert!(!classified.contains(';'), "{profile:?}: {sql}: {classified}");
+            }
+            // Bare EXPLAIN (without QUERY PLAN) stays rejected.
+            for sql in [
+                "EXPLAIN SELECT id FROM records",
+                "EXPLAIN QUERY SELECT id FROM records",
+                "EXPLAIN PLAN SELECT id FROM records",
+                "EXPLAIN",
+            ] {
+                assert!(
+                    classify_single_read_statement(*profile, sql).is_err(),
+                    "{profile:?}: unexpectedly admitted {sql}"
+                );
+            }
+            // An explained statement that is not itself admissible stays
+            // rejected exactly as if submitted alone.
+            for sql in [
+                "EXPLAIN QUERY PLAN DELETE FROM records",
+                "EXPLAIN QUERY PLAN WITH changed AS (DELETE FROM records RETURNING id) SELECT * FROM changed",
+                "EXPLAIN QUERY PLAN WITH x AS (SELECT 1) REPLACE INTO records VALUES(1,'z')",
+                "EXPLAIN QUERY PLAN SELECT 1; SELECT 2",
+                "EXPLAIN QUERY PLAN EXPLAIN QUERY PLAN SELECT 1",
+                "EXPLAIN QUERY PLAN",
+                "EXPLAIN; QUERY PLAN SELECT 1",
+            ] {
+                assert!(
+                    classify_single_read_statement(*profile, sql).is_err(),
+                    "{profile:?}: unexpectedly admitted {sql}"
+                );
+            }
+        }
+        assert_eq!(
+            classify_single_read_statement(
+                QuerySqlProfile::SqliteLocal,
+                "explain query plan select 1;"
+            )
+            .unwrap(),
+            "EXPLAIN QUERY PLAN select 1"
+        );
     }
 
     #[test]
@@ -1347,10 +2469,14 @@ mod tests {
             relation("agent_activity").semantic_version,
             AGENT_ACTIVITY_RELATION_VERSION
         );
-        assert_eq!(relation("agent_activity").semantic_version, 2);
+        assert_eq!(relation("agent_activity").semantic_version, 3);
         assert_eq!(
             &relation("agent_activity").columns[..2],
             &["activity_id", "run_key"]
+        );
+        assert_eq!(
+            &relation("agent_activity").columns[12..],
+            &["appears_active", "declared_intent", "declared_intent_state"]
         );
         assert_eq!(relation("agent_activity_claims").semantic_version, 1);
     }
@@ -1361,12 +2487,19 @@ mod tests {
             .iter()
             .find(|relation| relation.name == "content_events")
             .unwrap();
-        assert_eq!(LOGICAL_CATALOG_REVISION, 3);
+        assert_eq!(LOGICAL_CATALOG_REVISION, 4);
         assert_eq!(content.semantic_version, CONTENT_EVENTS_RELATION_VERSION);
         assert_eq!(content.semantic_version, 2);
         assert_eq!(
             content.columns,
-            &["local_seq", "id", "record_id", "type", "created_at"]
+            &[
+                "local_seq",
+                "id",
+                "record_id",
+                "type",
+                "created_at",
+                "created_at_ms"
+            ]
         );
         assert!(LOGICAL_RELATIONS
             .iter()
@@ -1378,7 +2511,7 @@ mod tests {
     fn postgres_reports_the_qualified_server_profile() {
         let contract = QuerySqlProfile::PostgresServer.contract();
         assert!(contract.available);
-        assert_eq!(contract.revision, 5);
+        assert_eq!(contract.revision, 6);
         assert_eq!(contract.unavailable_reason, None);
     }
 
@@ -1395,7 +2528,7 @@ mod tests {
     }
 
     #[test]
-    fn postgres_result_type_rules_are_total_and_lossless() {
+    fn postgres_result_type_rules_are_total() {
         let find = |types: &[&str], condition: &str| {
             ENGINE_TYPE_RULES
                 .iter()
@@ -1404,27 +2537,40 @@ mod tests {
         };
         let encoded = |types: &[&str], condition: &str, encoding: &str| {
             let rule = find(types, condition);
-            assert_eq!(rule.profile, "postgres-server@5");
+            assert_eq!(rule.profile, "postgres-server@6");
             assert_eq!(rule.outcome, "encode");
             assert_eq!(rule.json_encoding, Some(encoding));
             assert_eq!(rule.error_category, None);
         };
         let rejected = |types: &[&str], condition: &str| {
             let rule = find(types, condition);
-            assert_eq!(rule.profile, "postgres-server@5");
+            assert_eq!(rule.profile, "postgres-server@6");
             assert_eq!(rule.outcome, "reject");
             assert_eq!(rule.json_encoding, None);
             assert_eq!(rule.error_category, Some("syntax_or_type"));
         };
 
-        assert_eq!(ENGINE_TYPE_RULES.len(), 13);
+        assert_eq!(ENGINE_TYPE_RULES.len(), 15);
         encoded(&["*"], "value is SQL NULL", "null");
         encoded(&["bool"], "non-null", "boolean");
         encoded(&["int2", "int4", "int8"], "non-null", "signed-json-integer");
         encoded(&["float4", "float8"], "finite", "json-number");
         rejected(&["float4", "float8"], "NaN, +Infinity, or -Infinity");
-        encoded(&["numeric"], "finite", "lossless-canonical-decimal-string");
-        rejected(&["numeric"], "NaN, +Infinity, or -Infinity");
+        encoded(
+            &["numeric"],
+            "integer-valued and fits in i64",
+            "signed-json-integer",
+        );
+        rejected(&["numeric"], "integer-valued but outside the i64 range");
+        encoded(
+            &["numeric"],
+            "non-integral, finite, and within the IEEE-754 double range",
+            "json-number",
+        );
+        rejected(
+            &["numeric"],
+            "NaN, +Infinity, -Infinity, or magnitude beyond the double range",
+        );
         encoded(
             &["text", "varchar", "bpchar", "char", "name"],
             "non-null UTF-8 text",

@@ -30,8 +30,8 @@ use crate::store::{append_in, append_with_event_id_in, AppendSpec};
 use super::super::registry::{Caller, ToolRegistry};
 use super::super::{ToolKind, ToolResult, TransientEvidence};
 use super::{
-    can_record, parse_args, previous_record_seq_in, require_record, require_record_in,
-    PREVIOUS_SEQ_DESCRIPTION,
+    can_record, echo_act, parse_args, previous_record_seq_in, require_record, require_record_in,
+    ACT_DESCRIPTION, PREVIOUS_SEQ_DESCRIPTION,
 };
 
 use native_artifact_runtime::{mdx, mdx_v2};
@@ -416,12 +416,25 @@ async fn revalidate_governed_sql_ports(
         let query_relation = match governed_sql_query_in(tx, collection_id).await {
             Ok(query_kind) => query_kind,
             Err(error) => {
+                let stale = stale_saved_query_relation_in(tx, collection_id).await;
+                let (message, mut details) = match &stale {
+                    Some(stale) => (
+                        stale_pin_observation(port, stale),
+                        json!({
+                            "port": port,
+                            "stale_pin": stale,
+                            "remedy": "advance_artifact_port_pin",
+                        }),
+                    ),
+                    None => (error.to_string(), json!({ "port": port })),
+                };
+                details["collection_id"] = json!(collection_id);
                 return Err(v2_host_diagnostic(
                     artifact_id,
                     "named_input_incompatible",
-                    error.to_string(),
-                    json!({ "artifact_id": artifact_id, "port": port, "collection_id": collection_id }),
-                ))
+                    message,
+                    details,
+                ));
             }
         };
         let QueryRelationKind::GovernedSql { schema_sha256, .. } = &query_relation else {
@@ -430,11 +443,13 @@ async fn revalidate_governed_sql_ports(
         if !query_relation_matches_port(&query_relation, declaration)
             || declaration.schema_sha256.as_deref() != Some(schema_sha256.as_str())
         {
+            let (message, mut details) = port_query_mismatch(port, declaration, &query_relation);
+            details["collection_id"] = json!(collection_id);
             return Err(v2_host_diagnostic(
                 artifact_id,
                 "named_input_incompatible",
-                format!("input '{port}' relation schema does not match its bound query"),
-                json!({ "artifact_id": artifact_id, "port": port, "collection_id": collection_id }),
+                message,
+                details,
             ));
         }
         let sql_started = Instant::now();
@@ -626,6 +641,886 @@ fn query_relation_matches_port(query: &QueryRelationKind, declaration: &mdx_v2::
             declaration.schema_sha256.as_deref() == Some(schema_sha256)
                 && (declaration.relations.is_empty() || &declaration.relations == relations)
         }
+    }
+}
+
+/// A legible explanation of why a governed-SQL port no longer matches its bound
+/// query, built from the already-parsed port declaration and saved-query
+/// relation map.
+///
+/// This is deliberately computed from the attested descriptor and the parsed
+/// query definition, never from a scan of `records.body`: body values in real
+/// workspaces exceed SQLite's 262144-byte ceiling, and a body-scanning detector
+/// would skip exactly the largest artifacts — the same silent failure the
+/// stale-pin diagnostic exists to end.
+fn port_query_mismatch(
+    port: &str,
+    declaration: &mdx_v2::InputDecl,
+    query: &QueryRelationKind,
+) -> (String, Value) {
+    const REMEDY: &str =
+        "advance the pin to the current catalog version with advance_artifact_port_pin";
+    let QueryRelationKind::GovernedSql {
+        schema_sha256,
+        relations,
+    } = query
+    else {
+        return (
+            format!("input '{port}' relation declaration does not match its bound query"),
+            json!({
+                "port": port,
+                "remedy": "rebind the port to a query that matches its declaration, or repair the declaration with update_record",
+            }),
+        );
+    };
+    if declaration.schema_sha256.as_deref() != Some(schema_sha256.as_str()) {
+        return (
+            format!(
+                "input '{port}' output schema does not match its bound query; this is a declaration change, not a version pin"
+            ),
+            json!({
+                "port": port,
+                "schema_sha256": {
+                    "port": declaration.schema_sha256,
+                    "query": schema_sha256,
+                },
+                "remedy": "repair the port and saved query together with update_record and manage_artifact_inputs",
+            }),
+        );
+    }
+    let names = declaration
+        .relations
+        .keys()
+        .chain(relations.keys())
+        .collect::<BTreeSet<_>>();
+    let mut differing = Vec::new();
+    for name in names {
+        let pinned = declaration.relations.get(name);
+        let current = relations.get(name);
+        if pinned.map(|dependency| (&dependency.identity, dependency.semantic_version))
+            != current.map(|dependency| (&dependency.identity, dependency.semantic_version))
+        {
+            differing.push(json!({
+                "relation": name,
+                "identity": pinned
+                    .map(|dependency| dependency.identity.clone())
+                    .or_else(|| current.map(|dependency| dependency.identity.clone())),
+                "pinned_version": pinned.map(|dependency| dependency.semantic_version),
+                "current_version": current.map(|dependency| dependency.semantic_version),
+            }));
+        }
+    }
+    let first = differing.first().cloned().unwrap_or(Value::Null);
+    let relation = first["relation"].as_str().unwrap_or("unknown");
+    let pinned = first["pinned_version"].clone();
+    let current = first["current_version"].clone();
+    let message = match (pinned.as_u64(), current.as_u64()) {
+        (Some(pinned), Some(current)) if pinned != current => format!(
+            "input '{port}' pins governed SQL relation '{relation}' at version {pinned}, but the current catalog serves version {current}; {REMEDY}"
+        ),
+        (Some(pinned), None) => format!(
+            "input '{port}' pins governed SQL relation '{relation}' at version {pinned}, which is no longer declared by its bound query; repair the saved query and this port together"
+        ),
+        _ => format!(
+            "input '{port}' governed SQL relation '{relation}' does not match its bound query; {REMEDY}"
+        ),
+    };
+    (
+        message,
+        json!({
+            "port": port,
+            "relation": relation,
+            "identity": first["identity"],
+            "pinned_version": pinned,
+            "current_version": current,
+            "differing_relations": differing,
+            "remedy": REMEDY,
+        }),
+    )
+}
+
+/// The first relation in a saved query whose pin disagrees with the current
+/// catalog, read from the parsed query facet. Returns the pin, the version it
+/// should move to, and the identity, or `None` when nothing is stale.
+///
+/// This is consulted whenever `governed_sql_query_in` fails, for any reason. A
+/// query can be independently broken *and* carry a stale pin, so the caller
+/// must present the stale pin as an observation rather than as the diagnosis;
+/// [`stale_pin_observation`] words it that way.
+async fn stale_saved_query_relation_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    collection_id: &str,
+) -> Option<Value> {
+    let raw: String =
+        sqlx::query_scalar("SELECT value FROM facet_values WHERE record_id=? AND key='query'")
+            .bind(collection_id)
+            .fetch_optional(&mut **tx)
+            .await
+            .ok()??;
+    let definition: super::querying::SavedSqlDefinition = serde_json::from_str(&raw).ok()?;
+    for (name, dependency) in &definition.relations {
+        let Some(contract) = crate::query::sql_contract::LOGICAL_RELATIONS
+            .iter()
+            .find(|relation| relation.identity == dependency.identity)
+        else {
+            continue;
+        };
+        if dependency.semantic_version != contract.semantic_version {
+            return Some(json!({
+                "relation": name,
+                "identity": dependency.identity,
+                "pinned_version": dependency.semantic_version,
+                "current_version": contract.semantic_version,
+            }));
+        }
+    }
+    None
+}
+
+/// Word a stale saved-query pin as an observation, not a diagnosis. The pin is
+/// real and actionable, but its presence does not prove it is the reason a
+/// query failed to resolve — the query may be broken for an unrelated reason —
+/// so the remedy is offered conditionally.
+fn stale_pin_observation(port: &str, stale: &Value) -> String {
+    format!(
+        "input '{port}' saved query carries a stale relation pin: relation '{}' is pinned at version {}, while the current catalog serves version {}. That may not be the only problem; if it is the cause, advance the pin to {} with advance_artifact_port_pin.",
+        stale["relation"].as_str().unwrap_or("unknown"),
+        stale["pinned_version"],
+        stale["current_version"],
+        stale["current_version"],
+    )
+}
+
+#[cfg(test)]
+mod stale_pin_diagnostic_tests {
+    use super::*;
+
+    fn declaration(version: u32) -> mdx_v2::InputDecl {
+        mdx_v2::InputDecl {
+            envelope: mdx_v2::RELATION_ENVELOPE.into(),
+            required: true,
+            expose_to_root: true,
+            projection: None,
+            schema_sha256: Some("a".repeat(64)),
+            relations: BTreeMap::from([(
+                "agent_activity".into(),
+                mdx_v2::SemanticRelationDependency {
+                    identity: "native.semantic.agent_activity".into(),
+                    semantic_version: version,
+                },
+            )]),
+        }
+    }
+
+    fn governed(version: u32) -> QueryRelationKind {
+        QueryRelationKind::GovernedSql {
+            schema_sha256: "a".repeat(64),
+            relations: BTreeMap::from([(
+                "agent_activity".into(),
+                mdx_v2::SemanticRelationDependency {
+                    identity: "native.semantic.agent_activity".into(),
+                    semantic_version: version,
+                },
+            )]),
+        }
+    }
+
+    #[test]
+    fn stale_port_pin_names_the_relation_versions_and_remedy() {
+        let (message, details) = port_query_mismatch("presence", &declaration(1), &governed(2));
+        assert!(
+            message.contains("'presence'")
+                && message.contains("'agent_activity'")
+                && message.contains("version 1")
+                && message.contains("version 2")
+                && message.contains("advance_artifact_port_pin"),
+            "{message}"
+        );
+        assert_eq!(details["relation"], "agent_activity");
+        assert_eq!(details["pinned_version"], 1);
+        assert_eq!(details["current_version"], 2);
+        assert_eq!(details["port"], "presence");
+    }
+
+    #[test]
+    fn schema_mismatch_is_not_reported_as_a_version_pin() {
+        let mut declaration = declaration(2);
+        declaration.schema_sha256 = Some("b".repeat(64));
+        let (message, details) = port_query_mismatch("presence", &declaration, &governed(2));
+        assert!(message.contains("output schema"), "{message}");
+        assert!(details["remedy"]
+            .as_str()
+            .unwrap()
+            .contains("update_record"));
+    }
+
+    #[test]
+    fn legacy_query_mismatch_has_a_repair_route_and_no_version_claim() {
+        let (message, details) = port_query_mismatch(
+            "presence",
+            &declaration(1),
+            &QueryRelationKind::LegacyRecords,
+        );
+        assert!(!message.contains("version"), "{message}");
+        assert!(details.get("relation").is_none());
+    }
+
+    #[test]
+    fn a_current_pin_produces_no_mismatch() {
+        assert!(query_relation_matches_port(&governed(2), &declaration(2)));
+    }
+}
+
+#[cfg(test)]
+mod advance_pin_end_to_end_tests {
+    use super::*;
+
+    fn content_events_definition(version: u32) -> crate::mcp::tools::querying::SavedSqlDefinition {
+        use crate::mcp::tools::querying::{
+            SavedSqlBounds, SavedSqlColumn, SavedSqlColumnType, SavedSqlDefinition,
+            SavedSqlDirection, SavedSqlOrder, SavedSqlOutput, SavedSqlProfile,
+            SavedSqlRelationDependency,
+        };
+        let columns = vec![
+            SavedSqlColumn {
+                name: "id".into(),
+                column_type: SavedSqlColumnType::Identifier,
+                nullable: false,
+            },
+            SavedSqlColumn {
+                name: "local_seq".into(),
+                column_type: SavedSqlColumnType::Integer,
+                nullable: false,
+            },
+            SavedSqlColumn {
+                name: "record_id".into(),
+                column_type: SavedSqlColumnType::Identifier,
+                nullable: false,
+            },
+            SavedSqlColumn {
+                name: "type".into(),
+                column_type: SavedSqlColumnType::Text,
+                nullable: false,
+            },
+            SavedSqlColumn {
+                name: "created_at".into(),
+                column_type: SavedSqlColumnType::Timestamp,
+                nullable: false,
+            },
+        ];
+        let schema_sha256 = mdx::sha256_hex(&mdx_v2::canonical_json_bytes(&json!(columns)));
+        SavedSqlDefinition {
+            v: "1.1".into(),
+            kind: "governed_sql".into(),
+            profile: SavedSqlProfile {
+                id: "sqlite-local".into(),
+                revision: 1,
+            },
+            catalog_revision: crate::query::sql_contract::LOGICAL_CATALOG_REVISION,
+            relations: BTreeMap::from([(
+                "content_events".into(),
+                SavedSqlRelationDependency {
+                    identity: "native.query-sql.content-events".into(),
+                    semantic_version: version,
+                },
+            )]),
+            sql:
+                "SELECT id,local_seq,record_id,type,created_at FROM content_events ORDER BY id ASC"
+                    .into(),
+            parameters: vec![],
+            output: SavedSqlOutput {
+                columns,
+                schema_sha256,
+                row_identity: vec!["id".into()],
+                order: vec![SavedSqlOrder {
+                    column: "id".into(),
+                    direction: SavedSqlDirection::Asc,
+                }],
+            },
+            bounds: SavedSqlBounds { rows: 10 },
+        }
+    }
+
+    fn artifact_source(schema_sha256: &str, version: u32) -> String {
+        format!(
+            r#"export const nativeArtifact = {{
+  schema: "native.mdx.artifact.v2",
+  inputs: {{
+    rows: {{
+      envelope: "native.relation-envelope.v1",
+      required: true,
+      expose_to_root: true,
+      schema_sha256: "{schema_sha256}",
+      relations: {{ content_events: {{ identity: "native.query-sql.content-events", semantic_version: {version} }} }}
+    }}
+  }},
+  module_inputs: {{}},
+  capability_requests: [ {{ capability: "input.read", scope: {{ port: "rows" }} }} ]
+}}
+
+<Metric label="Rows" value={{native.inputs.rows.relation.rows.length}} />"#
+        )
+    }
+
+    fn html_artifact_source(schema_sha256: &str, version: u32) -> String {
+        let declaration = json!({
+            "schema": crate::artifact_html::MANIFEST_SCHEMA,
+            "inputs": {
+                "rows": {
+                    "envelope": "native.relation-envelope.v1",
+                    "required": true,
+                    "expose_to_root": true,
+                    "schema_sha256": schema_sha256,
+                    "relations": {
+                        "content_events": {
+                            "identity": "native.query-sql.content-events",
+                            "semantic_version": version
+                        }
+                    }
+                }
+            },
+            "capability_requests": [
+                {"capability": "input.read", "scope": {"port": "rows"}}
+            ]
+        });
+        format!(
+            "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width\"><title>Rows</title><script type=\"application/json\" id=\"native-artifact-manifest\">{}</script></head><body><main><h1>Rows</h1></main><script>window.nativeArtifact.onInput(function () {{}});</script></body></html>",
+            serde_json::to_string_pretty(&declaration).unwrap()
+        )
+    }
+
+    #[tokio::test]
+    async fn advances_a_bound_port_and_reissues_its_grant() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let mut registry = crate::mcp::ToolRegistry::new();
+        crate::mcp::register_surface_tools(&mut registry).unwrap();
+        let query_id = "9b100000-0000-4000-8000-000000000001";
+        let artifact_id = "9b100000-0000-4000-8000-000000000002";
+        let definition = content_events_definition(2);
+        registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "create_record",
+                json!({
+                    "id": query_id, "type": "Collection", "kind": "query",
+                    "name": "Content events",
+                    "facets": {"query": serde_json::to_string(&definition).unwrap()},
+                    "reason": "Bind a port to a current-version governed relation."
+                }),
+            )
+            .await
+            .unwrap();
+        registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "create_record",
+                json!({
+                    "id": artifact_id, "type": "Document", "kind": "artifact",
+                    "name": "Content events port",
+                    "body": artifact_source(&definition.output.schema_sha256, 1),
+                    "facets": {"runtime": mdx_v2::RUNTIME_ID},
+                    "reason": "Author a port pinned one version behind the catalog."
+                }),
+            )
+            .await
+            .unwrap();
+
+        // The pre-migration state: a binding made while the port was still at
+        // the older version. The binding projection is inserted directly
+        // because `manage_artifact_inputs.bind` correctly refuses a port whose
+        // declared pin no longer matches the saved query.
+        let row = sqlx::query(
+            "SELECT attestation_event_id,source_event_id,source_sha256
+               FROM artifact_source_attestations WHERE artifact_id=?
+              ORDER BY event_seq DESC LIMIT 1",
+        )
+        .bind(artifact_id)
+        .fetch_one(db.write_pool())
+        .await
+        .unwrap();
+        let attestation_event_id: String = row.try_get("attestation_event_id").unwrap();
+        let old_source_event_id: String = row.try_get("source_event_id").unwrap();
+        let old_source_sha256: String = row.try_get("source_sha256").unwrap();
+        sqlx::query(
+            "INSERT INTO artifact_inputs
+               (artifact_id,port_name,collection_id,artifact_source_attestation_event_id,
+                artifact_source_event_id,artifact_source_sha256,event_seq)
+             VALUES(?,?,?,?,?,?,?)",
+        )
+        .bind(artifact_id)
+        .bind("rows")
+        .bind(query_id)
+        .bind(&attestation_event_id)
+        .bind(&old_source_event_id)
+        .bind(&old_source_sha256)
+        .bind(0_i64)
+        .execute(db.write_pool())
+        .await
+        .unwrap();
+        registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "manage_artifact_module_grants",
+                json!({
+                    "action": "grant", "artifact_id": artifact_id,
+                    "subject_kind": "artifact_source", "subject_record_id": artifact_id,
+                    "subject_event_id": old_source_event_id, "source_sha256": old_source_sha256,
+                    "capability": "input.read", "scope": {"artifact_port": "rows"}
+                }),
+            )
+            .await
+            .unwrap();
+
+        // Advancing to anything but the current catalog version is refused.
+        let target_error = registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "advance_artifact_port_pin",
+                json!({
+                    "artifact_id": artifact_id, "port_name": "rows",
+                    "target_version": 3, "reason": "Try a non-current target."
+                }),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            target_error.contains("not the current catalog version"),
+            "{target_error}"
+        );
+
+        let advanced = registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "advance_artifact_port_pin",
+                json!({
+                    "artifact_id": artifact_id, "port_name": "rows",
+                    "reason": "Advance the content_events pin."
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(advanced["status"], "advanced", "{advanced:#}");
+        assert_eq!(advanced["port_pin_advanced"], true, "{advanced:#}");
+        assert_eq!(advanced["query_pin_advanced"], false, "{advanced:#}");
+        assert_eq!(advanced["grants_reissued"], 1, "{advanced:#}");
+
+        // The binding now names a new exact source whose port declaration
+        // carries the current version.
+        let binding = sqlx::query(
+            "SELECT artifact_source_attestation_event_id,artifact_source_event_id,
+                    artifact_source_sha256
+               FROM artifact_inputs WHERE artifact_id=? AND port_name='rows'",
+        )
+        .bind(artifact_id)
+        .fetch_one(db.write_pool())
+        .await
+        .unwrap();
+        let new_attestation_event_id: String = binding
+            .try_get("artifact_source_attestation_event_id")
+            .unwrap();
+        let new_source_event_id: String = binding.try_get("artifact_source_event_id").unwrap();
+        let new_source_sha256: String = binding.try_get("artifact_source_sha256").unwrap();
+        assert_ne!(new_source_event_id, old_source_event_id);
+        let descriptor: String = sqlx::query_scalar(
+            "SELECT descriptor FROM artifact_source_attestations
+              WHERE artifact_id=? AND attestation_event_id=?",
+        )
+        .bind(artifact_id)
+        .bind(&new_attestation_event_id)
+        .fetch_one(db.write_pool())
+        .await
+        .unwrap();
+        let descriptor: Value = serde_json::from_str(&descriptor).unwrap();
+        assert_eq!(
+            descriptor["artifact_ports"]["rows"]["relations"]["content_events"]["semantic_version"],
+            2
+        );
+        assert_eq!(descriptor["source_sha256"], json!(new_source_sha256));
+
+        // The grant is a fresh artifact.module_grant_set event against the new
+        // exact source; the predecessor event remains for the audit trail.
+        let reissued: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM content_events
+              WHERE record_id=? AND type='artifact.module_grant_set'
+                AND json_extract(payload,'$.subject_event_id')=?",
+        )
+        .bind(artifact_id)
+        .bind(&new_source_event_id)
+        .fetch_one(db.write_pool())
+        .await
+        .unwrap();
+        assert_eq!(reissued, 1);
+        let predecessor: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM artifact_module_grants WHERE artifact_id=? AND subject_event_id=?",
+        )
+        .bind(artifact_id)
+        .bind(&old_source_event_id)
+        .fetch_one(db.write_pool())
+        .await
+        .unwrap();
+        assert_eq!(predecessor, 1);
+
+        // An unbound port is refused rather than silently skipped.
+        let unbound_error = registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "advance_artifact_port_pin",
+                json!({
+                    "artifact_id": artifact_id, "port_name": "missing",
+                    "reason": "Try an unbound port."
+                }),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(unbound_error.contains("is not bound"), "{unbound_error}");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn advances_a_bound_html_script_manifest_port_atomically() {
+        let _guard = mdx::test_guard();
+        let db = crate::create_database(":memory:").await.unwrap();
+        let mut registry = crate::mcp::ToolRegistry::new();
+        crate::mcp::register_surface_tools(&mut registry).unwrap();
+        crate::artifact_html::configure(
+            crate::artifact_html::RuntimeConfig::new(
+                "http://localhost:8080",
+                "http://artifact.localhost:8080",
+            )
+            .expect("HTML test runtime configuration"),
+        );
+        let query_id = "9b100000-0000-4000-8000-000000000011";
+        let artifact_id = "9b100000-0000-4000-8000-000000000012";
+        let definition = content_events_definition(2);
+        registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "create_record",
+                json!({
+                    "id": query_id, "type": "Collection", "kind": "query",
+                    "name": "HTML content events",
+                    "facets": {"query": serde_json::to_string(&definition).unwrap()},
+                    "reason": "Create the current governed query."
+                }),
+            )
+            .await
+            .unwrap();
+        registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "create_record",
+                json!({
+                    "id": artifact_id, "type": "Document", "kind": "artifact",
+                    "name": "HTML stale pin",
+                    "body": html_artifact_source(&definition.output.schema_sha256, 1),
+                    "facets": {"runtime": HTML_RUNTIME},
+                    "reason": "Create an HTML port pinned one version behind."
+                }),
+            )
+            .await
+            .unwrap();
+        let row = sqlx::query(
+            "SELECT attestation_event_id,source_event_id,source_sha256
+               FROM artifact_source_attestations WHERE artifact_id=?
+              ORDER BY event_seq DESC LIMIT 1",
+        )
+        .bind(artifact_id)
+        .fetch_one(db.write_pool())
+        .await
+        .unwrap();
+        let attestation_event_id: String = row.try_get("attestation_event_id").unwrap();
+        let old_source_event_id: String = row.try_get("source_event_id").unwrap();
+        let old_source_sha256: String = row.try_get("source_sha256").unwrap();
+        sqlx::query(
+            "INSERT INTO artifact_inputs
+               (artifact_id,port_name,collection_id,artifact_source_attestation_event_id,
+                artifact_source_event_id,artifact_source_sha256,event_seq)
+             VALUES(?,?,?,?,?,?,?)",
+        )
+        .bind(artifact_id)
+        .bind("rows")
+        .bind(query_id)
+        .bind(&attestation_event_id)
+        .bind(&old_source_event_id)
+        .bind(&old_source_sha256)
+        .bind(0_i64)
+        .execute(db.write_pool())
+        .await
+        .unwrap();
+        registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "manage_artifact_module_grants",
+                json!({
+                    "action": "grant", "artifact_id": artifact_id,
+                    "subject_kind": "artifact_source", "subject_record_id": artifact_id,
+                    "subject_event_id": old_source_event_id, "source_sha256": old_source_sha256,
+                    "capability": "input.read", "scope": {"artifact_port": "rows"}
+                }),
+            )
+            .await
+            .unwrap();
+
+        let advanced = registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "advance_artifact_port_pin",
+                json!({
+                    "artifact_id": artifact_id, "port_name": "rows",
+                    "reason": "Advance the HTML content_events pin."
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(advanced["status"], "advanced", "{advanced:#}");
+        assert_eq!(advanced["port_pin_advanced"], true, "{advanced:#}");
+        assert_eq!(advanced["query_pin_advanced"], false, "{advanced:#}");
+        assert_eq!(advanced["grants_reissued"], 1, "{advanced:#}");
+
+        let descriptor: String = sqlx::query_scalar(
+            "SELECT descriptor FROM artifact_source_attestations
+              WHERE artifact_id=? ORDER BY event_seq DESC LIMIT 1",
+        )
+        .bind(artifact_id)
+        .fetch_one(db.write_pool())
+        .await
+        .unwrap();
+        let descriptor: Value = serde_json::from_str(&descriptor).unwrap();
+        assert_eq!(descriptor["runtime"], HTML_RUNTIME);
+        assert_eq!(
+            descriptor["artifact_ports"]["rows"]["relations"]["content_events"]["semantic_version"],
+            2
+        );
+        let rendered = registry
+            .call(
+                db,
+                Caller::local(),
+                "render_artifact",
+                json!({"id": artifact_id}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rendered["status"], "rendered", "{rendered:#}");
+        assert_eq!(rendered["runtime"]["id"], HTML_RUNTIME, "{rendered:#}");
+    }
+
+    fn artifact_source_two_ports(
+        schema_sha256: &str,
+        rows_version: u32,
+        other_version: u32,
+    ) -> String {
+        format!(
+            r#"export const nativeArtifact = {{
+  schema: "native.mdx.artifact.v2",
+  inputs: {{
+    rows: {{
+      envelope: "native.relation-envelope.v1",
+      required: true,
+      expose_to_root: true,
+      schema_sha256: "{schema_sha256}",
+      relations: {{ content_events: {{ identity: "native.query-sql.content-events", semantic_version: {rows_version} }} }}
+    }},
+    other: {{
+      envelope: "native.relation-envelope.v1",
+      required: true,
+      expose_to_root: true,
+      schema_sha256: "{schema_sha256}",
+      relations: {{ content_events: {{ identity: "native.query-sql.content-events", semantic_version: {other_version} }} }}
+    }}
+  }},
+  module_inputs: {{}},
+  capability_requests: [
+    {{ capability: "input.read", scope: {{ port: "rows" }} }},
+    {{ capability: "input.read", scope: {{ port: "other" }} }}
+  ]
+}}
+
+<Metric label="Rows" value={{native.inputs.rows.relation.rows.length}} />
+<Metric label="Other" value={{native.inputs.other.relation.rows.length}} />"#
+        )
+    }
+
+    /// A body-changing advance mints a new source event. Render selects each
+    /// port's binding by exact source, so every other live binding must be
+    /// carried to that new source in the same write or the pane breaks for a
+    /// second reason. This is the regression the review found.
+    #[tokio::test]
+    async fn advancing_one_port_carries_every_other_binding_to_the_new_source() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let mut registry = crate::mcp::ToolRegistry::new();
+        crate::mcp::register_surface_tools(&mut registry).unwrap();
+        let query_id = "9b200000-0000-4000-8000-000000000001";
+        let artifact_id = "9b200000-0000-4000-8000-000000000002";
+        let definition = content_events_definition(2);
+        registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "create_record",
+                json!({
+                    "id": query_id, "type": "Collection", "kind": "query",
+                    "name": "Content events",
+                    "facets": {"query": serde_json::to_string(&definition).unwrap()},
+                    "reason": "Share one query across two ports."
+                }),
+            )
+            .await
+            .unwrap();
+        registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "create_record",
+                json!({
+                    "id": artifact_id, "type": "Document", "kind": "artifact",
+                    "name": "Two ports",
+                    "body": artifact_source_two_ports(&definition.output.schema_sha256, 1, 2),
+                    "facets": {"runtime": mdx_v2::RUNTIME_ID},
+                    "reason": "One stale port and one current port share one body."
+                }),
+            )
+            .await
+            .unwrap();
+
+        let row = sqlx::query(
+            "SELECT attestation_event_id,source_event_id,source_sha256
+               FROM artifact_source_attestations WHERE artifact_id=?
+              ORDER BY event_seq DESC LIMIT 1",
+        )
+        .bind(artifact_id)
+        .fetch_one(db.write_pool())
+        .await
+        .unwrap();
+        let attestation_event_id: String = row.try_get("attestation_event_id").unwrap();
+        let old_source_event_id: String = row.try_get("source_event_id").unwrap();
+        let old_source_sha256: String = row.try_get("source_sha256").unwrap();
+        for port in ["rows", "other"] {
+            sqlx::query(
+                "INSERT INTO artifact_inputs
+                   (artifact_id,port_name,collection_id,artifact_source_attestation_event_id,
+                    artifact_source_event_id,artifact_source_sha256,event_seq)
+                 VALUES(?,?,?,?,?,?,?)",
+            )
+            .bind(artifact_id)
+            .bind(port)
+            .bind(query_id)
+            .bind(&attestation_event_id)
+            .bind(&old_source_event_id)
+            .bind(&old_source_sha256)
+            .bind(0_i64)
+            .execute(db.write_pool())
+            .await
+            .unwrap();
+        }
+        let subjects = registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "manage_artifact_module_grants",
+                json!({ "action": "read", "artifact_id": artifact_id }),
+            )
+            .await
+            .unwrap();
+        let subject = subjects["subjects"]
+            .as_array()
+            .and_then(|subjects| subjects.first())
+            .cloned()
+            .unwrap();
+        for port in ["rows", "other"] {
+            registry
+                .call(
+                    db.clone(),
+                    Caller::local(),
+                    "manage_artifact_module_grants",
+                    json!({
+                        "action": "grant", "artifact_id": artifact_id,
+                        "subject_kind": "artifact_source", "subject_record_id": artifact_id,
+                        "subject_event_id": subject["subject_event_id"],
+                        "source_sha256": subject["source_sha256"],
+                        "capability": "input.read", "scope": {"artifact_port": port}
+                    }),
+                )
+                .await
+                .unwrap();
+        }
+        let before = registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "render_artifact",
+                json!({ "id": artifact_id }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(before["status"], "error", "{before:#}");
+
+        let advanced = registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "advance_artifact_port_pin",
+                json!({
+                    "artifact_id": artifact_id, "port_name": "rows",
+                    "reason": "Advance the stale port."
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(advanced["status"], "advanced", "{advanced:#}");
+        assert_eq!(advanced["bindings_carried"], 1, "{advanced:#}");
+
+        let mut sources = BTreeMap::new();
+        for port in ["rows", "other"] {
+            let row = sqlx::query(
+                "SELECT artifact_source_event_id,artifact_source_sha256
+                   FROM artifact_inputs WHERE artifact_id=? AND port_name=?",
+            )
+            .bind(artifact_id)
+            .bind(port)
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap();
+            sources.insert(
+                port,
+                (
+                    row.try_get::<String, _>("artifact_source_event_id")
+                        .unwrap(),
+                    row.try_get::<String, _>("artifact_source_sha256").unwrap(),
+                ),
+            );
+        }
+        let (rows_event, rows_sha) = &sources["rows"];
+        let (other_event, other_sha) = &sources["other"];
+        assert_ne!(rows_event, &old_source_event_id);
+        assert_ne!(rows_sha, &old_source_sha256);
+        assert_eq!(
+            rows_event, other_event,
+            "every other port must move to the new source"
+        );
+        assert_eq!(rows_sha, other_sha);
+
+        let rendered = registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "render_artifact",
+                json!({ "id": artifact_id }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rendered["status"], "rendered", "{rendered:#}");
     }
 }
 
@@ -1221,8 +2116,20 @@ pub(crate) async fn verify_artifact_source_for_projection(
     payload: &ArtifactSourceAttestedPayload,
 ) -> Result<()> {
     let descriptor = &payload.artifact_source;
+    // `write_diagnostics` is an optional advisory member on the HTML descriptor:
+    // it is covered by the projection digest, but it must not change how the
+    // declaration shape is classified. A descriptor that omits a required key
+    // (for example `interactions`) still classifies as before and fails the
+    // exact declaration-surface check rather than the shape check.
+    let descriptor_shape = {
+        let mut shape = descriptor.clone();
+        if let Some(object) = shape.as_object_mut() {
+            object.remove("write_diagnostics");
+        }
+        shape
+    };
     let legacy_shape = exact_keys(
-        descriptor,
+        &descriptor_shape,
         &[
             "schema",
             "artifact_id",
@@ -1236,7 +2143,7 @@ pub(crate) async fn verify_artifact_source_for_projection(
         ],
     );
     let named_shape = exact_keys(
-        descriptor,
+        &descriptor_shape,
         &[
             "schema",
             "runtime",
@@ -1250,12 +2157,31 @@ pub(crate) async fn verify_artifact_source_for_projection(
             "capability_requests",
         ],
     );
+    let interactive_html_shape = descriptor_shape.get("runtime").and_then(Value::as_str)
+        == Some(HTML_RUNTIME)
+        && exact_keys(
+            &descriptor_shape,
+            &[
+                "schema",
+                "runtime",
+                "artifact_id",
+                "attestation_event_id",
+                "source_event_id",
+                "source_sha256",
+                "artifact_ports",
+                "imports",
+                "module_inputs",
+                "capability_requests",
+                "interactions",
+            ],
+        );
     let descriptor_runtime = descriptor
         .get("runtime")
         .and_then(Value::as_str)
         .unwrap_or(mdx_v2::RUNTIME_ID);
     let html_descriptor = descriptor_runtime == HTML_RUNTIME;
-    if ((!supports_named_input_runtime(descriptor_runtime) || (!legacy_shape && !named_shape))
+    if ((!supports_named_input_runtime(descriptor_runtime)
+        || (!legacy_shape && !named_shape && !interactive_html_shape))
         || (html_descriptor && descriptor["schema"] != "native.html.artifact-source.v1")
         || (!html_descriptor && descriptor["schema"] != "native.mdx.artifact-source.v1"))
         || descriptor["artifact_id"] != event_record_id
@@ -1324,6 +2250,11 @@ pub(crate) async fn verify_artifact_source_for_projection(
         if descriptor["artifact_ports"]
             != Value::Object(manifest.artifact_ports.into_iter().collect())
             || descriptor["capability_requests"] != Value::Array(manifest.capability_requests)
+            || descriptor
+                .get("interactions")
+                .cloned()
+                .unwrap_or_else(|| json!([]))
+                != serde_json::to_value(&manifest.interactions)?
         {
             return Err(Error::engine(
                 "native.html.v1 source attestation does not match the exact declaration surface",
@@ -1481,6 +2412,39 @@ pub(crate) fn declaration_surface_sha256(descriptor: &Value) -> Result<String> {
         .filter(|ports| ports.is_object())
         .ok_or_else(|| Error::engine("artifact declaration surface is malformed"))?;
     Ok(mdx::sha256_hex(&mdx_v2::canonical_json_bytes(ports)))
+}
+
+/// Ports whose declarations differ between two artifact descriptors, compared
+/// under the same canonical JSON the whole-surface digest uses, so per-port
+/// comparison has identical semantics (this covers `schema_sha256`,
+/// `required`, envelope, everything). A port present on only one side counts
+/// as changed, so a renamed port is a drop and an added port changes nothing
+/// already bound.
+pub(crate) fn changed_ports(
+    old_descriptor: &Value,
+    new_descriptor: &Value,
+) -> Result<BTreeSet<String>> {
+    let old_ports = old_descriptor
+        .get("artifact_ports")
+        .and_then(Value::as_object)
+        .ok_or_else(|| Error::engine("artifact declaration surface is malformed"))?;
+    let new_ports = new_descriptor
+        .get("artifact_ports")
+        .and_then(Value::as_object)
+        .ok_or_else(|| Error::engine("artifact declaration surface is malformed"))?;
+    let mut changed = BTreeSet::new();
+    let mut ports: BTreeSet<&String> = old_ports.keys().collect();
+    ports.extend(new_ports.keys());
+    for port in ports {
+        let old_declaration = old_ports.get(port).cloned().unwrap_or(Value::Null);
+        let new_declaration = new_ports.get(port).cloned().unwrap_or(Value::Null);
+        if mdx_v2::canonical_json_bytes(&old_declaration)
+            != mdx_v2::canonical_json_bytes(&new_declaration)
+        {
+            changed.insert(port.clone());
+        }
+    }
+    Ok(changed)
 }
 
 pub(crate) fn carried_input_payload(
@@ -2131,6 +3095,7 @@ async fn manage_renderer_binding(db: Db, caller: Caller, arguments: Value) -> Re
             collection_id,
         } => {
             let mut tx = crate::db::begin_write(db.write_pool()).await?;
+            let mut act_alloc = crate::act::ActAllocation::new();
             require_record_in(&mut tx, &caller, TOOL, &artifact_id, Capability::Edit).await?;
             require_record_in(&mut tx, &caller, TOOL, &collection_id, Capability::View).await?;
             assert_live_artifact_in(&mut tx, TOOL, &artifact_id).await?;
@@ -2169,22 +3134,27 @@ async fn manage_renderer_binding(db: Db, caller: Caller, arguments: Value) -> Re
                     })?,
                     actor: Some(caller.actor().into()),
                 },
+                &mut act_alloc,
             )
             .await?;
             db.commit_content(tx).await?;
-            Ok(json!({
+            Ok(echo_act(
+                json!({
                 "artifact_id": artifact_id,
                 "status": "bound",
                 "bindings": [{ "collection_id": collection_id, "kind": kind, "valid": true }],
                 "changed_collection_id": collection_id,
                 "previous_seq": previous_seq,
-            }))
+                }),
+                act_alloc.get(),
+            )?)
         }
         ManageRendererBindingArgs::Unbind {
             artifact_id,
             collection_id,
         } => {
             let mut tx = crate::db::begin_write(db.write_pool()).await?;
+            let mut act_alloc = crate::act::ActAllocation::new();
             require_record_in(&mut tx, &caller, TOOL, &artifact_id, Capability::Edit).await?;
             assert_live_artifact_in(&mut tx, TOOL, &artifact_id).await?;
             let targets = render_targets_in(&mut tx, &artifact_id).await?;
@@ -2238,19 +3208,23 @@ async fn manage_renderer_binding(db: Db, caller: Caller, arguments: Value) -> Re
                     })?,
                     actor: Some(caller.actor().into()),
                 },
+                &mut act_alloc,
             )
             .await?;
             let remaining_targets = render_targets_in(&mut tx, &artifact_id).await?;
             let bindings = renderer_bindings_in(&mut tx, &caller, &remaining_targets).await?;
             let status = renderer_binding_status(&bindings);
             db.commit_content(tx).await?;
-            Ok(json!({
+            Ok(echo_act(
+                json!({
                 "artifact_id": artifact_id,
                 "status": status,
                 "bindings": bindings,
                 "changed_collection_id": target,
                 "previous_seq": previous_seq,
-            }))
+                }),
+                act_alloc.get(),
+            )?)
         }
     }
 }
@@ -2273,6 +3247,7 @@ async fn instantiate_artifact(db: Db, caller: Caller, arguments: Value) -> Resul
     let args: InstantiateArtifactArgs = parse_args(TOOL, arguments)?;
     let id = Uuid::new_v4().to_string();
     let mut tx = crate::db::begin_write(db.write_pool()).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
     require_record_in(&mut tx, &caller, TOOL, &args.source_id, Capability::View).await?;
     require_record_in(
         &mut tx,
@@ -2375,12 +3350,14 @@ async fn instantiate_artifact(db: Db, caller: Caller, arguments: Value) -> Resul
             payload: created,
             actor: Some(caller.actor().into()),
         },
+        &mut act_alloc,
     )
     .await?;
     append_in(
         &db,
         &mut tx,
         super::lifecycle::facet_set_spec(&id, &runtime_facet, caller.actor()),
+        &mut act_alloc,
     )
     .await?;
     if let Some(compiler_attestation) = artifact_attestation {
@@ -2405,6 +3382,7 @@ async fn instantiate_artifact(db: Db, caller: Caller, arguments: Value) -> Resul
                 payload: serde_json::to_value(payload)?,
                 actor: Some(caller.actor().into()),
             },
+            &mut act_alloc,
         )
         .await?;
     }
@@ -2423,6 +3401,7 @@ async fn instantiate_artifact(db: Db, caller: Caller, arguments: Value) -> Resul
             })?,
             actor: Some(caller.actor().into()),
         },
+        &mut act_alloc,
     )
     .await?;
 
@@ -2451,6 +3430,9 @@ async fn instantiate_artifact(db: Db, caller: Caller, arguments: Value) -> Resul
         .expect("EnrichedRecord serializes as an object");
     object.insert("source_id".into(), Value::String(args.source_id));
     object.insert("previous_seq".into(), Value::Null);
+    if let Some(act) = act_alloc.get() {
+        object.insert("act".into(), act.into());
+    }
     Ok(result)
 }
 
@@ -2548,12 +3530,16 @@ pub(crate) async fn validate_prospective_artifact(
                         failure.message, failure.code
                     ))
                 })?;
+        let diagnostics = serde_json::to_value(&manifest.diagnostics)
+            .unwrap_or_else(|_| Value::Array(Vec::new()));
         return Ok(Some(json!({
             "runtime": HTML_RUNTIME,
             "artifact_ports": manifest.artifact_ports,
             "imports": [],
             "module_inputs": {},
             "capability_requests": manifest.capability_requests,
+            "interactions": manifest.interactions,
+            "diagnostics": diagnostics,
         })));
     }
     let permit = mdx::try_admit().map_err(|failure| {
@@ -2597,6 +3583,39 @@ pub(crate) async fn validate_prospective_artifact(
     })
 }
 
+/// The persisted write-time findings for one attested HTML source.
+///
+/// `render_artifact` serves these as `write_diagnostics` so the workbench shows
+/// a person the same findings an agent gets from the write receipt. They are
+/// read from the `artifact.source_attested` descriptor rather than recomputed:
+/// the wording is "flagged when saved". An attestation predating this capability
+/// has no member, which reads as no findings.
+pub(crate) async fn persisted_html_write_diagnostics(
+    pool: &sqlx::SqlitePool,
+    artifact_id: &str,
+    source_event_id: &str,
+) -> Result<Vec<Value>> {
+    let descriptor: Option<String> = sqlx::query_scalar(
+        "SELECT descriptor FROM artifact_source_attestations
+          WHERE artifact_id=? AND source_event_id=? ORDER BY event_seq DESC LIMIT 1",
+    )
+    .bind(artifact_id)
+    .bind(source_event_id)
+    .fetch_optional(pool)
+    .await?;
+    let Some(descriptor) = descriptor else {
+        return Ok(Vec::new());
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&descriptor) else {
+        return Ok(Vec::new());
+    };
+    Ok(value
+        .get("write_diagnostics")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default())
+}
+
 pub(crate) fn artifact_source_attestation_payload(
     artifact_id: &str,
     attestation_event_id: &str,
@@ -2613,25 +3632,40 @@ pub(crate) fn artifact_source_attestation_payload(
             "native artifact compiler returned an unsupported runtime attestation",
         ));
     }
-    if !exact_keys(
-        &compiler_attestation,
-        &[
-            "runtime",
-            "artifact_ports",
-            "imports",
-            "module_inputs",
-            "capability_requests",
-        ],
-    ) && !(runtime == mdx_v2::RUNTIME_ID
+    let interactive_html = runtime == HTML_RUNTIME
         && exact_keys(
             &compiler_attestation,
             &[
+                "runtime",
+                "artifact_ports",
+                "imports",
+                "module_inputs",
+                "capability_requests",
+                "interactions",
+                "diagnostics",
+            ],
+        );
+    if !interactive_html
+        && !exact_keys(
+            &compiler_attestation,
+            &[
+                "runtime",
                 "artifact_ports",
                 "imports",
                 "module_inputs",
                 "capability_requests",
             ],
-        ))
+        )
+        && !(runtime == mdx_v2::RUNTIME_ID
+            && exact_keys(
+                &compiler_attestation,
+                &[
+                    "artifact_ports",
+                    "imports",
+                    "module_inputs",
+                    "capability_requests",
+                ],
+            ))
     {
         return Err(Error::engine(
             "native artifact compiler returned a malformed root attestation",
@@ -2672,6 +3706,16 @@ pub(crate) fn artifact_source_attestation_payload(
     // it deliberately shares the source-attestation table without being an
     // MDX compiler artifact.
     if runtime == HTML_RUNTIME {
+        if let Some(interactions) = compiler_attestation.get("interactions") {
+            artifact_source["interactions"] = interactions.clone();
+        }
+        // Persisted so `render_artifact` can serve `write_diagnostics` from the
+        // exact source that was attested. Always an array for HTML: absent (an
+        // attestation predating this capability) reads as no findings.
+        artifact_source["write_diagnostics"] = compiler_attestation
+            .get("diagnostics")
+            .cloned()
+            .unwrap_or_else(|| Value::Array(Vec::new()));
         artifact_source
             .as_object_mut()
             .expect("artifact source descriptor is an object")
@@ -3385,6 +4429,8 @@ async fn open_collection(db: Db, caller: Caller, arguments: Value) -> Result<Val
     }
 }
 
+#[path = "artifacts/advance_pin.rs"]
+mod advance_pin;
 #[path = "artifacts/grants.rs"]
 mod grants;
 #[path = "artifacts/inputs.rs"]
@@ -3392,6 +4438,7 @@ mod inputs;
 #[path = "artifacts/modules.rs"]
 mod modules;
 
+use advance_pin::*;
 #[allow(unused_imports)]
 pub(crate) use grants::build_grant_attestation_in;
 pub(crate) use grants::try_build_carried_grant_attestation_in;
@@ -4487,12 +5534,25 @@ async fn render_mdx_v2_in(
             match governed_sql_query_in(tx, collection_id).await {
                 Ok(query_kind) => Some(query_kind),
                 Err(error) => {
+                    let stale = stale_saved_query_relation_in(tx, collection_id).await;
+                    let (message, mut details) = match &stale {
+                        Some(stale) => (
+                            stale_pin_observation(port, stale),
+                            json!({
+                                "port": port,
+                                "stale_pin": stale,
+                                "remedy": "advance_artifact_port_pin",
+                            }),
+                        ),
+                        None => (error.to_string(), json!({ "port": port })),
+                    };
+                    details["collection_id"] = json!(collection_id);
                     return v2_host_diagnostic(
                         artifact_id,
                         "named_input_incompatible",
-                        error.to_string(),
-                        json!({ "artifact_id": artifact_id, "port": port, "collection_id": collection_id }),
-                    )
+                        message,
+                        details,
+                    );
                 }
             }
         } else {
@@ -4506,12 +5566,13 @@ async fn render_mdx_v2_in(
             .as_ref()
             .is_some_and(|query| !query_relation_matches_port(query, declaration))
         {
-            return v2_host_diagnostic(
-                artifact_id,
-                "named_input_incompatible",
-                format!("input '{port}' relation schema does not match its bound query"),
-                json!({ "artifact_id": artifact_id, "port": port, "collection_id": collection_id }),
+            let (message, mut details) = port_query_mismatch(
+                port,
+                declaration,
+                query_relation.as_ref().expect("mismatch implies a query"),
             );
+            details["collection_id"] = json!(collection_id);
+            return v2_host_diagnostic(artifact_id, "named_input_incompatible", message, details);
         }
         match (governed_schema, declaration.schema_sha256.as_ref()) {
             (Some(_), Some(_)) => {}
@@ -5738,39 +6799,6 @@ async fn render_interaction_availability(
         .chain(create_destinations.values().cloned())
         .collect::<BTreeSet<_>>();
 
-    let mut record_labels = BTreeMap::<String, Value>::new();
-    let projected_record_ids = projected_ports
-        .iter()
-        .filter(|(port, _)| label_ports.contains(port.as_str()))
-        .flat_map(|(_, records)| records.iter().cloned())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
-    for chunk in projected_record_ids.chunks(400) {
-        if chunk.is_empty() {
-            continue;
-        }
-        let placeholders = vec!["?"; chunk.len()].join(",");
-        let sql = format!(
-            "SELECT id,name,type,kind FROM records WHERE deleted_at IS NULL AND id IN ({placeholders})"
-        );
-        let mut query = sqlx::query(&sql);
-        for record_id in chunk {
-            query = query.bind(record_id);
-        }
-        for row in query.fetch_all(&mut **tx).await? {
-            let record_id: String = row.try_get("id")?;
-            record_labels.insert(
-                record_id,
-                json!({
-                    "name": row.try_get::<Option<String>, _>("name")?,
-                    "type": row.try_get::<String, _>("type")?,
-                    "kind": row.try_get::<Option<String>, _>("kind")?,
-                }),
-            );
-        }
-    }
-
     let (authorized_records, authority_revision) = if super::is_legacy_local(caller) {
         (candidate_records, None)
     } else {
@@ -5812,9 +6840,42 @@ async fn render_interaction_availability(
         (editable, capabilities.1)
     };
 
-    for (entry_id, destination) in create_destinations {
-        if authorized_records.contains(&destination) {
-            supported_entries.insert(entry_id);
+    // At most one destination per declared entry (bounded by MAX_INTERACTION_ENTRIES).
+    // Only supported entries with current Edit authority disclose a destination.
+    create_destinations.retain(|_, destination| authorized_records.contains(destination));
+    supported_entries.extend(create_destinations.keys().cloned());
+
+    let mut record_labels = BTreeMap::<String, Value>::new();
+    let projected_record_ids = projected_ports
+        .iter()
+        .filter(|(port, _)| label_ports.contains(port.as_str()))
+        .flat_map(|(_, records)| records.iter().cloned())
+        .chain(create_destinations.values().cloned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    for chunk in projected_record_ids.chunks(400) {
+        if chunk.is_empty() {
+            continue;
+        }
+        let placeholders = vec!["?"; chunk.len()].join(",");
+        let sql = format!(
+            "SELECT id,name,type,kind FROM records WHERE deleted_at IS NULL AND id IN ({placeholders})"
+        );
+        let mut query = sqlx::query(&sql);
+        for record_id in chunk {
+            query = query.bind(record_id);
+        }
+        for row in query.fetch_all(&mut **tx).await? {
+            let record_id: String = row.try_get("id")?;
+            record_labels.insert(
+                record_id,
+                json!({
+                    "name": row.try_get::<Option<String>, _>("name")?,
+                    "type": row.try_get::<String, _>("type")?,
+                    "kind": row.try_get::<Option<String>, _>("kind")?,
+                }),
+            );
         }
     }
     let editable_records = authorized_records
@@ -5827,6 +6888,9 @@ async fn render_interaction_availability(
         "editable_records": editable_records,
         "records_by_port": projected_ports,
     });
+    if !create_destinations.is_empty() {
+        availability["create_destinations"] = json!(create_destinations);
+    }
     if !record_labels.is_empty() {
         availability
             .as_object_mut()
@@ -5950,6 +7014,8 @@ struct PreparedHtml {
     input_bundle: Option<Value>,
     snapshot_event_id: Option<String>,
     snapshot_event_seq: Option<i64>,
+    observed: BTreeMap<String, BTreeMap<String, String>>,
+    interaction_availability: Option<Value>,
 }
 
 impl ArtifactRuntime for BoardRuntime {
@@ -6612,7 +7678,7 @@ async fn materialize_live_html(
     }
 }
 
-async fn try_render_live_html(
+pub(crate) async fn try_render_live_html(
     db: &Db,
     caller: &Caller,
     artifact_id: &str,
@@ -6646,6 +7712,9 @@ async fn try_render_live_html(
         "profile": prepared.manifest.profile.as_str(),
         "body_digest": prepared.manifest.body_digest,
         "slides": prepared.manifest.slides,
+        "interactions": prepared.manifest.interactions,
+        "observed": prepared.observed,
+        "interaction_availability": prepared.interaction_availability,
         "provenance": {
             "record_id": artifact_id,
             "source_event_id": materialization.rendered.get("source_event_id"),
@@ -6662,6 +7731,11 @@ async fn try_render_live_html(
             .expect("HTML plan is an object")
             .insert("input_bundle".into(), bundle);
     }
+    let source_event_id = materialization
+        .rendered
+        .get("source_event_id")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
     let mut result = materialization.rendered;
     let object = result
         .as_object_mut()
@@ -6677,6 +7751,14 @@ async fn try_render_live_html(
             "bridge_version": crate::artifact_html::BRIDGE_VERSION,
         }),
     );
+    if let Some(source_event_id) = source_event_id {
+        let findings =
+            persisted_html_write_diagnostics(db.write_pool(), artifact_id, &source_event_id)
+                .await?;
+        if !findings.is_empty() {
+            object.insert("write_diagnostics".into(), Value::Array(findings));
+        }
+    }
     Ok(Some(result))
 }
 
@@ -7112,7 +8194,7 @@ pub(crate) async fn resolve_artifact(
     }))
 }
 
-/// One `native.mdx.v2` input port that survived every binding check, resolved
+/// One supported artifact input port that survived every binding check, resolved
 /// against LIVE state.
 pub(crate) struct BoundPort {
     pub(crate) port: String,
@@ -7162,7 +8244,7 @@ pub(crate) async fn resolve_bound_input_ports(
     let Some(attestation_event_id) = attestation_event_id else {
         return Ok(Err(diagnostic(
             "artifact_source_unattested",
-            "the exact native.mdx.v2 artifact source attestation is unavailable",
+            "the exact artifact source attestation is unavailable",
             json!({ "artifact_id": artifact_id, "source_event_id": source_event_id }),
         )));
     };
@@ -7386,6 +8468,8 @@ fn prepare_html(resolved: &ResolvedArtifact) -> std::result::Result<PreparedHtml
         input_bundle: None,
         snapshot_event_id: None,
         snapshot_event_seq: None,
+        observed: BTreeMap::new(),
+        interaction_availability: None,
     })
 }
 
@@ -7433,11 +8517,11 @@ fn attach_empty_timing_if_requested(mut result: Value, include_timing: bool) -> 
 
 /// Resolve an HTML artifact's declared inputs inside the transaction that
 /// pinned its source and content head. This is deliberately independent of the
-/// MDX compiler/module graph: HTML has no imports or mutation machinery, but it
-/// consumes the same typed envelopes, source-pinned bindings and grants.
+/// MDX compiler/module graph: HTML has no imports, and consumes the same
+/// typed envelopes, source-pinned bindings, grants and interaction metadata.
 #[allow(clippy::too_many_arguments)]
 async fn resolve_html_named_inputs_in(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
     historical_lens: Option<&lens::ReadLens<'_>>,
     caller: &Caller,
     artifact_id: &str,
@@ -7574,15 +8658,33 @@ async fn resolve_html_named_inputs_in(
         };
         let query_relation = if declaration.envelope == mdx_v2::RELATION_ENVELOPE && kind == "query"
         {
-            Some(
-                governed_sql_query_in(tx, collection_id)
-                    .await
-                    .map_err(|error| {
-                        Error::engine(format!(
-                            "native.html.v1 input '{port}' relation is invalid: {error}"
-                        ))
-                    })?,
-            )
+            match governed_sql_query_in(tx, collection_id).await {
+                Ok(query_kind) => Some(query_kind),
+                Err(error) => {
+                    let stale = stale_saved_query_relation_in(tx, collection_id).await;
+                    let (message, mut details) = match &stale {
+                        Some(stale) => (
+                            stale_pin_observation(port, stale),
+                            json!({
+                                "artifact_id": artifact_id,
+                                "port": port,
+                                "stale_pin": stale,
+                                "remedy": "advance_artifact_port_pin",
+                            }),
+                        ),
+                        None => (
+                            format!("native.html.v1 input '{port}' relation is invalid: {error}"),
+                            json!({ "artifact_id": artifact_id, "port": port }),
+                        ),
+                    };
+                    details["collection_id"] = json!(collection_id);
+                    return Ok(Err(diagnostic(
+                        "named_input_incompatible",
+                        message,
+                        details,
+                    )));
+                }
+            }
         } else {
             None
         };
@@ -7590,10 +8692,17 @@ async fn resolve_html_named_inputs_in(
             .as_ref()
             .is_some_and(|query| !query_relation_matches_port(query, &declaration))
         {
+            let (message, mut details) = port_query_mismatch(
+                port,
+                &declaration,
+                query_relation.as_ref().expect("mismatch implies a query"),
+            );
+            details["artifact_id"] = json!(artifact_id);
+            details["collection_id"] = json!(collection_id);
             return Ok(Err(diagnostic(
                 "named_input_incompatible",
-                format!("input '{port}' relation schema does not match its bound query"),
-                json!({ "artifact_id": artifact_id, "port": port, "collection_id": collection_id }),
+                message,
+                details,
             )));
         }
         let governed_schema = match query_relation.as_ref() {
@@ -7839,6 +8948,52 @@ async fn resolve_html_named_inputs_in(
         authorization_revision,
         &meta_sha256,
     );
+    // Host authority stays alongside the plan, never in the authored input.
+    // Membership, CAS versions and provisional availability all come from the
+    // same pinned transaction that produced this input bundle.
+    let records_by_port = named_inputs
+        .iter()
+        .filter(|(_, envelope)| {
+            envelope.get("version").and_then(Value::as_str) == Some(mdx_v2::COLLECTION_ENVELOPE)
+        })
+        .map(|(port, envelope)| {
+            (
+                port.clone(),
+                envelope["records"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|record| record["id"].as_str().map(str::to_owned))
+                    .collect::<BTreeSet<_>>(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let all_records = records_by_port
+        .values()
+        .flat_map(BTreeSet::iter)
+        .cloned()
+        .collect();
+    let observed =
+        render_observed_versions(tx, &manifest.interactions, &records_by_port, all_records).await?;
+    let bound_collections = bound
+        .iter()
+        .map(|(port, (id, _))| (port.clone(), id.clone()))
+        .collect();
+    let resolved_bound_ports = named_inputs.keys().cloned().collect();
+    let root_readable_ports = root_context_inputs.keys().cloned().collect();
+    let (interaction_availability, _) = render_interaction_availability(
+        tx,
+        historical_lens,
+        caller,
+        InteractionAvailabilityInputs {
+            interactions: &manifest.interactions,
+            records_by_port: &records_by_port,
+            bound_collections: &bound_collections,
+            resolved_bound_ports: &resolved_bound_ports,
+            root_readable_ports: &root_readable_ports,
+        },
+    )
+    .await?;
     Ok(Ok(PreparedHtml {
         input,
         input_digest,
@@ -7846,6 +9001,8 @@ async fn resolve_html_named_inputs_in(
         input_bundle: Some(input_bundle),
         snapshot_event_id: Some(snapshot_event_id.to_owned()),
         snapshot_event_seq: Some(snapshot_event_seq),
+        observed,
+        interaction_availability,
     }))
 }
 
@@ -7941,6 +9098,9 @@ async fn render_artifact_at(
             "profile": prepared.manifest.profile.as_str(),
             "body_digest": prepared.manifest.body_digest,
             "slides": prepared.manifest.slides,
+            "interactions": prepared.manifest.interactions,
+            "observed": prepared.observed,
+            "interaction_availability": prepared.interaction_availability,
         });
         if let Some(bundle) = prepared.input_bundle.clone() {
             plan["provenance"] = json!({
@@ -7955,22 +9115,34 @@ async fn render_artifact_at(
             });
             plan["input_bundle"] = bundle;
         }
-        return Ok(attach_empty_timing_if_requested(
-            json!({
-                "status": "rendered",
-                "artifact_id": resolved.artifact_id,
-                "runtime": with_verification(adapter.descriptor(), HTML_RUNTIME),
-                "input": prepared.input,
-                "input_digest": prepared.input_digest,
-                "plan": plan,
-                "launch": {
-                    "url": launch.url,
-                    "expires_in_ms": launch.expires_in_ms,
-                    "bridge_version": crate::artifact_html::BRIDGE_VERSION,
-                },
-            }),
-            include_timing,
-        ));
+        let mut rendered = json!({
+            "status": "rendered",
+            "artifact_id": resolved.artifact_id.clone(),
+            "runtime": with_verification(adapter.descriptor(), HTML_RUNTIME),
+            "input": prepared.input,
+            "input_digest": prepared.input_digest,
+            "plan": plan,
+            "launch": {
+                "url": launch.url,
+                "expires_in_ms": launch.expires_in_ms,
+                "bridge_version": crate::artifact_html::BRIDGE_VERSION,
+            },
+        });
+        if let Some(source_event_id) = resolved.body_event_id.as_deref() {
+            let findings = persisted_html_write_diagnostics(
+                lens.projection().snapshot_pool(),
+                &resolved.artifact_id,
+                source_event_id,
+            )
+            .await?;
+            if !findings.is_empty() {
+                rendered
+                    .as_object_mut()
+                    .expect("HTML render result is an object")
+                    .insert("write_diagnostics".into(), Value::Array(findings));
+            }
+        }
+        return Ok(attach_empty_timing_if_requested(rendered, include_timing));
     }
     let descriptor = adapter.descriptor();
     let runtime_context = RuntimeContext {
@@ -8850,7 +10022,7 @@ pub fn register_artifact_tools(registry: &mut ToolRegistry) -> Result<()> {
     registry.register(
         ToolKind::ManageRendererBinding,
         &format!(
-            "Read, bind, or unbind the exact zero-or-one outgoing renders edge of a governed Document kind:artifact. Bind validates a live Collection kind:query|selection|folder atomically; generic manage_links remains open, so read/render report invalid graph states explicitly. {PREVIOUS_SEQ_DESCRIPTION}"
+            "Read, bind, or unbind the exact zero-or-one outgoing renders edge of a governed Document kind:artifact. Bind validates a live Collection kind:query|selection|folder atomically; generic manage_links remains open, so read/render report invalid graph states explicitly. {PREVIOUS_SEQ_DESCRIPTION} {ACT_DESCRIPTION}"
         ),
         json!({
             "type": "object",
@@ -8884,13 +10056,14 @@ pub fn register_artifact_tools(registry: &mut ToolRegistry) -> Result<()> {
     )?;
     registry.register(
         ToolKind::ManageArtifactInputs,
-        "Read, bind, or unbind exact named native.mdx.v2 or native.html.v1 artifact input ports to governed Collection records. The reserved default port remains the ordinary zero-or-one renders edge; named ports are read-only and source-pinned.",
+        "Read, bind, bind_many, or unbind exact named native.mdx.v2 or native.html.v1 artifact input ports to governed Collection records. The reserved default port remains the ordinary zero-or-one renders edge; named ports are read-only and source-pinned. bind_many applies between 1 and 100 port bindings atomically: one invalid entry leaves the whole set unchanged.",
         json!({
             "type": "object",
             "properties": {
-                "action": { "type": "string", "enum": ["read","bind","unbind"] },
+                "action": { "type": "string", "enum": ["read","bind","bind_many","unbind"] },
                 "artifact_id": { "type": "string" }, "port_name": { "type": "string" },
                 "collection_id": { "type": "string" },
+                "bindings": { "type": "array", "minItems": 1, "maxItems": 100, "description": "Required for bind_many: between 1 and 100 {\"port_name\",\"collection_id\"} entries applied atomically.", "items": { "type": "object", "properties": { "port_name": { "type": "string" }, "collection_id": { "type": "string" } }, "required": ["port_name","collection_id"], "additionalProperties": false } },
                 "event_seq": { "type": "integer", "description": "Required with the exact current collection_id for unbind compare-and-set." }
             }, "required": ["action","artifact_id"], "additionalProperties": false
         }),
@@ -8912,6 +10085,24 @@ pub fn register_artifact_tools(registry: &mut ToolRegistry) -> Result<()> {
             }, "required": ["action","artifact_id"], "additionalProperties": false
         }),
         manage_artifact_module_grants,
+    )?;
+    registry.register(
+        ToolKind::AdvanceArtifactPortPin,
+        "Advance one bound native.mdx.v2 or script-manifest native.html.v1 artifact port's pinned governed-SQL relation to the current catalog version as one authorized action: re-pins the saved query, re-pins the port declaration, rebinds the port to the new exact source, and re-issues every capability grant against that new source as a fresh event. Refuses when anything other than the named relation's version pin would change, when the target is not the current catalog version, when schema_sha256 or the port set would change, or when the saved query cannot be made valid. Meta-manifest HTML and real declaration changes must use update_record.",
+        json!({
+            "type": "object",
+            "properties": {
+                "artifact_id": { "type": "string" },
+                "port_name": { "type": "string", "description": "The bound artifact input port whose relation pin should advance." },
+                "relation_name": { "type": "string", "description": "The pinned relation under that port. Required when the port pins more than one relation." },
+                "target_version": { "type": "integer", "minimum": 1, "description": "Optional; must equal the current catalog version when supplied. Advancing to any other version is refused." },
+                "if_body_digest": { "type": "string", "description": "Optional compare-and-set against the current artifact body_digest." },
+                "reason": { "type": "string", "description": "Why this pin is being advanced." }
+            },
+            "required": ["artifact_id", "port_name"],
+            "additionalProperties": false
+        }),
+        advance_artifact_port_pin,
     )?;
     registry.register(
         ToolKind::RenderArtifact,
@@ -9818,6 +11009,457 @@ mod admission_tests {
         grant_artifact_source_ports(registry, db, LIVE_SNAPSHOT_ARTIFACT, &["left", "right"]).await;
     }
 
+    const BIND_MANY_LEFT_COLLECTION: &str = "bbbb0000-0000-4000-8000-000000000001";
+    const BIND_MANY_RIGHT_COLLECTION: &str = "bbbb0000-0000-4000-8000-000000000002";
+    const BIND_MANY_ITEM: &str = "bbbb0000-0000-4000-8000-000000000003";
+
+    async fn create_bind_many_fixture(registry: &crate::mcp::ToolRegistry, db: &Db) {
+        for arguments in [
+            json!({
+                "id": LIVE_SNAPSHOT_ARTIFACT, "type": "Document", "kind": "artifact",
+                "name": "Dual-port bind_many artifact", "body": dual_identical_collection_source(),
+                "facets": { "runtime": mdx_v2::RUNTIME_ID },
+                "reason": "Exercise plural input binding."
+            }),
+            json!({
+                "id": BIND_MANY_LEFT_COLLECTION, "type": "Collection", "kind": "selection",
+                "name": "Left items", "reason": "Bind the left port."
+            }),
+            json!({
+                "id": BIND_MANY_RIGHT_COLLECTION, "type": "Collection", "kind": "selection",
+                "name": "Right items", "reason": "Bind the right port."
+            }),
+            json!({
+                "id": BIND_MANY_ITEM, "type": "WorkItem", "kind": "task",
+                "name": "Shared item", "reason": "Populate both collections."
+            }),
+        ] {
+            registry
+                .call(db.clone(), Caller::local(), "create_record", arguments)
+                .await
+                .expect("create bind_many fixture record");
+        }
+        for collection_id in [BIND_MANY_LEFT_COLLECTION, BIND_MANY_RIGHT_COLLECTION] {
+            registry
+                .call(
+                    db.clone(),
+                    Caller::local(),
+                    "manage_links",
+                    json!({
+                        "action": "add", "source_id": BIND_MANY_ITEM,
+                        "target_id": collection_id, "relationship": "member_of"
+                    }),
+                )
+                .await
+                .expect("add selection member");
+        }
+    }
+
+    async fn bound_port_count(db: &Db, artifact_id: &str) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM artifact_inputs WHERE artifact_id=?")
+            .bind(artifact_id)
+            .fetch_one(db.write_pool())
+            .await
+            .expect("count bound ports")
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn bind_many_applies_every_port_in_one_call() {
+        let _guard = mdx::test_guard();
+        let db = crate::create_database(":memory:")
+            .await
+            .expect("test database");
+        let mut registry = crate::mcp::ToolRegistry::new();
+        crate::mcp::register_surface_tools(&mut registry).expect("artifact tools register");
+        create_bind_many_fixture(&registry, &db).await;
+        let result = registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "manage_artifact_inputs",
+                json!({
+                    "action": "bind_many", "artifact_id": LIVE_SNAPSHOT_ARTIFACT,
+                    "bindings": [
+                        { "port_name": "left", "collection_id": BIND_MANY_LEFT_COLLECTION },
+                        { "port_name": "right", "collection_id": BIND_MANY_RIGHT_COLLECTION },
+                    ],
+                }),
+            )
+            .await
+            .expect("bind_many applies");
+        assert_eq!(result["status"], "bound", "{result:#}");
+        assert_eq!(
+            result["bindings"].as_array().unwrap().len(),
+            2,
+            "{result:#}"
+        );
+        assert!(
+            result["bindings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|binding| binding.get("event_seq").and_then(Value::as_i64).is_some()),
+            "plural receipt carries per-port event seqs: {result:#}"
+        );
+        let read = registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "manage_artifact_inputs",
+                json!({ "action": "read", "artifact_id": LIVE_SNAPSHOT_ARTIFACT }),
+            )
+            .await
+            .expect("read plural bindings");
+        assert_eq!(read["bindings"].as_array().unwrap().len(), 2, "{read:#}");
+        let acts: Vec<Option<i64>> = sqlx::query_scalar(
+            "SELECT act FROM content_events WHERE record_id=? AND type='artifact.input_bound' ORDER BY seq",
+        )
+        .bind(LIVE_SNAPSHOT_ARTIFACT)
+        .fetch_all(db.write_pool())
+        .await
+        .expect("read bound acts");
+        assert_eq!(acts.len(), 2, "{acts:?}");
+        assert!(
+            acts[0].is_some() && acts[0] == acts[1],
+            "one batch stamps one act: {acts:?}"
+        );
+        db.close().await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn bind_many_failure_leaves_no_binding_applied() {
+        let _guard = mdx::test_guard();
+        let db = crate::create_database(":memory:")
+            .await
+            .expect("test database");
+        let mut registry = crate::mcp::ToolRegistry::new();
+        crate::mcp::register_surface_tools(&mut registry).expect("artifact tools register");
+        create_bind_many_fixture(&registry, &db).await;
+        let error = registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "manage_artifact_inputs",
+                json!({
+                    "action": "bind_many", "artifact_id": LIVE_SNAPSHOT_ARTIFACT,
+                    "bindings": [
+                        { "port_name": "left", "collection_id": BIND_MANY_LEFT_COLLECTION },
+                        { "port_name": "undeclared", "collection_id": BIND_MANY_RIGHT_COLLECTION },
+                    ],
+                }),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("bind_many item 1"), "{error}");
+        assert_eq!(bound_port_count(&db, LIVE_SNAPSHOT_ARTIFACT).await, 0);
+        let read = registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "manage_artifact_inputs",
+                json!({ "action": "read", "artifact_id": LIVE_SNAPSHOT_ARTIFACT }),
+            )
+            .await
+            .expect("read after failed bind_many");
+        assert_eq!(read["bindings"].as_array().unwrap().len(), 0, "{read:#}");
+        db.close().await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn bind_many_rejects_duplicate_ports_without_applying() {
+        let _guard = mdx::test_guard();
+        let db = crate::create_database(":memory:")
+            .await
+            .expect("test database");
+        let mut registry = crate::mcp::ToolRegistry::new();
+        crate::mcp::register_surface_tools(&mut registry).expect("artifact tools register");
+        create_bind_many_fixture(&registry, &db).await;
+        let error = registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "manage_artifact_inputs",
+                json!({
+                    "action": "bind_many", "artifact_id": LIVE_SNAPSHOT_ARTIFACT,
+                    "bindings": [
+                        { "port_name": "left", "collection_id": BIND_MANY_LEFT_COLLECTION },
+                        { "port_name": "left", "collection_id": BIND_MANY_RIGHT_COLLECTION },
+                    ],
+                }),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("duplicate port"), "{error}");
+        assert_eq!(bound_port_count(&db, LIVE_SNAPSHOT_ARTIFACT).await, 0);
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn bind_many_enforces_batch_bounds() {
+        let db = crate::create_database(":memory:")
+            .await
+            .expect("test database");
+        let mut registry = crate::mcp::ToolRegistry::new();
+        crate::mcp::register_surface_tools(&mut registry).expect("artifact tools register");
+        let empty = registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "manage_artifact_inputs",
+                json!({ "action": "bind_many", "artifact_id": LIVE_SNAPSHOT_ARTIFACT, "bindings": [] }),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(empty.contains("between 1 and 100"), "{empty}");
+        let oversized = (0..101)
+            .map(|index| {
+                json!({ "port_name": format!("port{index}"), "collection_id": BIND_MANY_LEFT_COLLECTION })
+            })
+            .collect::<Vec<_>>();
+        let error = registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "manage_artifact_inputs",
+                json!({ "action": "bind_many", "artifact_id": LIVE_SNAPSHOT_ARTIFACT, "bindings": oversized }),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("between 1 and 100"), "{error}");
+        db.close().await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn bind_many_repeated_call_reports_unchanged() {
+        let _guard = mdx::test_guard();
+        let db = crate::create_database(":memory:")
+            .await
+            .expect("test database");
+        let mut registry = crate::mcp::ToolRegistry::new();
+        crate::mcp::register_surface_tools(&mut registry).expect("artifact tools register");
+        create_bind_many_fixture(&registry, &db).await;
+        let bindings = json!([
+            { "port_name": "left", "collection_id": BIND_MANY_LEFT_COLLECTION },
+            { "port_name": "right", "collection_id": BIND_MANY_RIGHT_COLLECTION },
+        ]);
+        registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "manage_artifact_inputs",
+                json!({ "action": "bind_many", "artifact_id": LIVE_SNAPSHOT_ARTIFACT, "bindings": bindings }),
+            )
+            .await
+            .expect("first bind_many applies");
+        let repeated = registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "manage_artifact_inputs",
+                json!({ "action": "bind_many", "artifact_id": LIVE_SNAPSHOT_ARTIFACT, "bindings": bindings }),
+            )
+            .await
+            .expect("repeated bind_many reports unchanged");
+        assert_eq!(repeated["status"], "unchanged", "{repeated:#}");
+        assert_eq!(
+            repeated["bindings"].as_array().unwrap().len(),
+            2,
+            "{repeated:#}"
+        );
+        db.close().await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn bind_many_denied_collection_fails_whole_batch() {
+        let _guard = mdx::test_guard();
+        let db = crate::create_database(":memory:")
+            .await
+            .expect("test database");
+        let mut registry = crate::mcp::ToolRegistry::new();
+        crate::mcp::register_surface_tools(&mut registry).expect("artifact tools register");
+        create_bind_many_fixture(&registry, &db).await;
+        let account = "acct:bind-many-auth";
+        crate::authorization::replace_explicit_policy(
+            &db,
+            "test:bind-many-auth-artifact",
+            LIVE_SNAPSHOT_ARTIFACT,
+            vec![crate::authorization::AllowEntry::account(
+                account,
+                Capability::Edit,
+            )],
+        )
+        .await
+        .expect("grant artifact edit");
+        crate::authorization::replace_explicit_policy(
+            &db,
+            "test:bind-many-auth-left",
+            BIND_MANY_LEFT_COLLECTION,
+            vec![crate::authorization::AllowEntry::account(
+                account,
+                Capability::View,
+            )],
+        )
+        .await
+        .expect("grant left view");
+        // Lock the right collection to someone else: the fixture default is
+        // permissive, so absence of a grant would still allow View.
+        crate::authorization::replace_explicit_policy(
+            &db,
+            "test:bind-many-auth-right",
+            BIND_MANY_RIGHT_COLLECTION,
+            vec![crate::authorization::AllowEntry::account(
+                "acct:someone-else",
+                Capability::View,
+            )],
+        )
+        .await
+        .expect("restrict right view");
+        let error = registry
+            .call(
+                db.clone(),
+                Caller::authenticated(account),
+                "manage_artifact_inputs",
+                json!({
+                    "action": "bind_many", "artifact_id": LIVE_SNAPSHOT_ARTIFACT,
+                    "bindings": [
+                        { "port_name": "left", "collection_id": BIND_MANY_LEFT_COLLECTION },
+                        { "port_name": "right", "collection_id": BIND_MANY_RIGHT_COLLECTION },
+                    ],
+                }),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("bind_many item 1"), "{error}");
+        assert_eq!(bound_port_count(&db, LIVE_SNAPSHOT_ARTIFACT).await, 0);
+        db.close().await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn bind_many_denied_artifact_edit_fails_whole_batch() {
+        let _guard = mdx::test_guard();
+        let db = crate::create_database(":memory:")
+            .await
+            .expect("test database");
+        let mut registry = crate::mcp::ToolRegistry::new();
+        crate::mcp::register_surface_tools(&mut registry).expect("artifact tools register");
+        create_bind_many_fixture(&registry, &db).await;
+        let account = "acct:bind-many-auth";
+        // View on the artifact is not enough: binding a port needs Edit, so
+        // install a View-only explicit policy and leave the caller below it.
+        crate::authorization::replace_explicit_policy(
+            &db,
+            "test:bind-many-auth-artifact",
+            LIVE_SNAPSHOT_ARTIFACT,
+            vec![crate::authorization::AllowEntry::account(
+                account,
+                Capability::View,
+            )],
+        )
+        .await
+        .expect("grant artifact view");
+        for (policy_id, collection_id) in [
+            ("test:bind-many-auth-left", BIND_MANY_LEFT_COLLECTION),
+            ("test:bind-many-auth-right", BIND_MANY_RIGHT_COLLECTION),
+        ] {
+            crate::authorization::replace_explicit_policy(
+                &db,
+                policy_id,
+                collection_id,
+                vec![crate::authorization::AllowEntry::account(
+                    account,
+                    Capability::View,
+                )],
+            )
+            .await
+            .expect("grant collection view");
+        }
+        let error = registry
+            .call(
+                db.clone(),
+                Caller::authenticated(account),
+                "manage_artifact_inputs",
+                json!({
+                    "action": "bind_many", "artifact_id": LIVE_SNAPSHOT_ARTIFACT,
+                    "bindings": [
+                        { "port_name": "left", "collection_id": BIND_MANY_LEFT_COLLECTION },
+                        { "port_name": "right", "collection_id": BIND_MANY_RIGHT_COLLECTION },
+                    ],
+                }),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("requires edit capability"), "{error}");
+        assert_eq!(bound_port_count(&db, LIVE_SNAPSHOT_ARTIFACT).await, 0);
+        db.close().await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn singular_bind_reports_port_and_target_before_attestation() {
+        let _guard = mdx::test_guard();
+        let db = crate::create_database(":memory:")
+            .await
+            .expect("test database");
+        let mut registry = crate::mcp::ToolRegistry::new();
+        crate::mcp::register_surface_tools(&mut registry).expect("artifact tools register");
+        create_bind_many_fixture(&registry, &db).await;
+        sqlx::query("DELETE FROM artifact_source_attestations WHERE artifact_id = ?")
+            .bind(LIVE_SNAPSHOT_ARTIFACT)
+            .execute(db.write_pool())
+            .await
+            .expect("drop attestation row");
+        let reserved = registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "manage_artifact_inputs",
+                json!({
+                    "action": "bind", "artifact_id": LIVE_SNAPSHOT_ARTIFACT,
+                    "port_name": "default",
+                    "collection_id": BIND_MANY_LEFT_COLLECTION,
+                }),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            reserved.contains("invalid or reserved port name"),
+            "{reserved}"
+        );
+        let ungoverned = registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "manage_artifact_inputs",
+                json!({
+                    "action": "bind", "artifact_id": LIVE_SNAPSHOT_ARTIFACT,
+                    "port_name": "left",
+                    "collection_id": BIND_MANY_ITEM,
+                }),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            ungoverned.contains("target must be a governed Collection"),
+            "{ungoverned}"
+        );
+        assert_eq!(bound_port_count(&db, LIVE_SNAPSHOT_ARTIFACT).await, 0);
+        db.close().await;
+    }
+
     async fn create_identical_items_artifact_on_existing_collection(
         registry: &crate::mcp::ToolRegistry,
         db: &Db,
@@ -10394,6 +12036,7 @@ export const nativeArtifact = {{
             causal_envelope: crate::events::CausalEnvelopeV1::complete(
                 crate::events::CausalFrontierV1::empty(),
             ),
+            act: None,
         };
         let mut conn = db.write_pool().acquire().await.expect("source connection");
         crate::projector::project(&mut conn, &source_event)
@@ -10434,6 +12077,7 @@ export const nativeArtifact = {{
             causal_envelope: crate::events::CausalEnvelopeV1::complete(
                 crate::events::CausalFrontierV1::empty(),
             ),
+            act: None,
         };
         let mut conn = db.write_pool().acquire().await.expect("facet connection");
         crate::projector::project(&mut conn, &facet_event)
@@ -10507,6 +12151,7 @@ export const nativeArtifact = {{
             causal_envelope: crate::events::CausalEnvelopeV1::complete(
                 crate::events::CausalFrontierV1::empty(),
             ),
+            act: None,
         };
         let mut conn = db
             .write_pool()
@@ -11393,7 +13038,7 @@ export const nativeArtifact = {{
         }))
         .expect("HTML declaration serializes");
         format!(
-            "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>Named inputs</title><script type=\"application/json\" id=\"native-artifact-manifest\">{declaration}</script><style>body{{margin:0}}</style></head><body><main><h1>Named inputs</h1></main></body></html>"
+            "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>Named inputs</title><script type=\"application/json\" id=\"native-artifact-manifest\">{declaration}</script><style>body{{margin:0}}</style></head><body><main><h1>Named inputs</h1></main><script>\n  const probe = taskClientNames();\n</script></body></html>"
         )
     }
 
@@ -11615,6 +13260,14 @@ export const nativeArtifact = {{
         .await
         .expect("render HTML named artifact");
         assert_eq!(first["status"], "rendered", "{first:#}");
+        // The named-input live path serves the persisted write-time findings too.
+        let findings = first["write_diagnostics"]
+            .as_array()
+            .expect("named render carries write-time findings");
+        assert_eq!(findings.len(), 1, "{first:#}");
+        assert_eq!(findings[0]["code"], "html_undefined_identifier");
+        assert_eq!(findings[0]["name"], "taskClientNames");
+        assert_eq!(findings[0]["severity"], "warning");
         assert_eq!(first["input"]["version"], mdx_v2::NAMED_INPUT_ABI);
         assert_eq!(
             first["input"]["inputs"]["details"]["version"],
@@ -13348,6 +15001,7 @@ export const nativeArtifact = {{
             .await
             .unwrap();
         let mut revocation = crate::db::begin_write(db.write_pool()).await.unwrap();
+        let mut act_alloc = crate::act::ActAllocation::new();
         crate::authorization::replace_explicit_policy_on(
             &mut revocation,
             "test:race-revoke",
@@ -13356,6 +15010,7 @@ export const nativeArtifact = {{
                 "acct:alice",
                 Capability::Manage,
             )],
+            &mut act_alloc,
         )
         .await
         .unwrap();
@@ -13421,6 +15076,7 @@ export const nativeArtifact = {{
                 "acct:alice",
                 Capability::Manage,
             )],
+            &mut act_alloc,
         )
         .await
         .unwrap();
@@ -13432,6 +15088,7 @@ export const nativeArtifact = {{
                 "acct:alice",
                 Capability::Manage,
             )],
+            &mut act_alloc,
         )
         .await
         .unwrap();
@@ -13676,7 +15333,20 @@ export const nativeArtifact = {{
             // The current API writes only the current revision. Replacing this
             // fixture's immutable publication bytes models a genuine event written
             // by the prior binary; both the live row and portable event carry the
-            // same historical bytes.
+            // same historical bytes. content_events is append-only by trigger,
+            // so the fixture drops the update guard and restores it verbatim
+            // around the rewrite, all on one acquired connection.
+            let mut fixture = db.write_pool().acquire().await.expect("fixture connection");
+            let update_guard: String = sqlx::query_scalar(
+                "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='content_events_no_update'",
+            )
+            .fetch_one(&mut *fixture)
+            .await
+            .expect("content_events update guard");
+            sqlx::query("DROP TRIGGER content_events_no_update")
+                .execute(&mut *fixture)
+                .await
+                .expect("drop content_events update guard for fixture");
             let mut release_core = published["release"]["release_core"].clone();
             release_core["runtime"] = contract;
             let release_sha256 = mdx_sha256_for_projection(&release_core);
@@ -13688,9 +15358,14 @@ export const nativeArtifact = {{
             sqlx::query("UPDATE content_events SET payload=? WHERE id=?")
                 .bind(payload)
                 .bind(publication_event_id)
-                .execute(db.write_pool())
+                .execute(&mut *fixture)
                 .await
                 .expect("install portable prior-revision event bytes");
+            sqlx::query(&update_guard)
+                .execute(&mut *fixture)
+                .await
+                .expect("restore content_events update guard");
+            drop(fixture);
             sqlx::query(
             "UPDATE module_releases SET descriptor=?,release_sha256=? WHERE publication_event_id=?",
         )
@@ -14211,6 +15886,7 @@ export function Grouped() { return <Metric label="Grouped" value={1} /> }"#,
             causal_envelope: crate::events::CausalEnvelopeV1::complete(
                 crate::events::CausalFrontierV1::empty(),
             ),
+            act: None,
         };
         let mut conn = db.write_pool().acquire().await.expect("source connection");
         crate::projector::project(&mut conn, &source_event)
@@ -14256,6 +15932,7 @@ export function Grouped() { return <Metric label="Grouped" value={1} /> }"#,
             causal_envelope: crate::events::CausalEnvelopeV1::complete(
                 crate::events::CausalFrontierV1::new([source_event_id.to_string()]).unwrap(),
             ),
+            act: None,
         };
         let mut conn = db.write_pool().acquire().await.expect("facet connection");
         crate::projector::project(&mut conn, &facet_event)
@@ -14328,6 +16005,7 @@ export function Grouped() { return <Metric label="Grouped" value={1} /> }"#,
                 ])
                 .unwrap(),
             ),
+            act: None,
         };
         let mut conn = db
             .write_pool()
@@ -15262,6 +16940,20 @@ export function Grouped() { return <Metric label="Grouped" value={1} /> }"#,
         // artifact whole and then strip `$.body` from its events. The live
         // materializer then sees a v2 runtime with no authoritative body and
         // takes the pre-telemetry `invalid_artifact_body` path.
+        // content_events is append-only by trigger, so the fixture drops the
+        // update guard and restores it verbatim around the strip, all on one
+        // acquired connection.
+        let mut fixture = db.write_pool().acquire().await.expect("fixture connection");
+        let update_guard: String = sqlx::query_scalar(
+            "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='content_events_no_update'",
+        )
+        .fetch_one(&mut *fixture)
+        .await
+        .expect("content_events update guard");
+        sqlx::query("DROP TRIGGER content_events_no_update")
+            .execute(&mut *fixture)
+            .await
+            .expect("drop content_events update guard for fixture");
         registry
             .call(
                 db.clone(),
@@ -15281,9 +16973,14 @@ export function Grouped() { return <Metric label="Grouped" value={1} /> }"#,
             .expect("create v2 artifact");
         sqlx::query("UPDATE content_events SET payload = json_remove(payload, '$.body') WHERE record_id = ?")
             .bind(artifact_id)
-            .execute(db.write_pool())
+            .execute(&mut *fixture)
             .await
             .expect("strip artifact body");
+        sqlx::query(&update_guard)
+            .execute(&mut *fixture)
+            .await
+            .expect("restore content_events update guard");
+        drop(fixture);
 
         let without = render_artifact(db.clone(), Caller::local(), json!({ "id": artifact_id }))
             .await

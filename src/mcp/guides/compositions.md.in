@@ -14,13 +14,60 @@ found rather than asserting that a capability is unsupported.
 Use `schema_read.preview_record_shape` with `type:"Document", kind:"artifact"`
 for current shape advice; include candidate `facets` to check runtime values.
 For new record-backed layouts,
-start with `native.mdx.v2`: it provides host-rendered components, named inputs
-and declared host-mediated interactions. Choose `native.html.v1` when the
-presentation needs custom JavaScript or canvas; its self-contained HTML uses
-an isolated runtime with read-only inputs, no ambient network and no mutation
-surface. Existing `native.board.v1` and `native.mdx.v1` artifacts have their own
+start with `native.html.v1`, and prefer it for anything a person is meant to
+look at: its self-contained HTML renders as authored, and a
+`native.html.artifact.v2` declaration carries the same typed `interactions`
+entries as MDX v2, so a write surface is no longer a reason to prefer MDX
+(`native.html.artifact.v1` remains read-only). Choose `native.mdx.v2` when the
+artifact must sit inside Native's own chrome and match it, or when an agent
+must point at part of the rendered view: it renders through host-owned
+components, and `render_artifact` returns a typed plan whose typed regions
+establish semantic placement, where HTML returns only an isolated launch
+descriptor. `verify_artifact` serves both, differently: a bounded attested
+screen/print matrix for HTML, one advisory canonical-screen observation for
+MDX v2. HTML's isolated runtime has no module
+imports, no host theming and no ambient network, so a consistent look across
+many HTML artifacts is an authoring discipline rather than something the host
+supplies. Existing
+`native.board.v1` and `native.mdx.v1` artifacts have their own
 contracts; do not assume they accept a v2 manifest. A runtime name alone does
 not adapt a static file into a live view.
+
+For HTML interactions, put `schema`, `inputs`, `capability_requests` and
+`interactions` in the existing inert `native-artifact-manifest` JSON element.
+Request `input.read` for each exposed port and bind/grant the exact source as
+usual. There is no separate write-proposal grant. From authored JavaScript,
+`await nativeArtifact.propose({request_id:"triage-1",entry_id:"mark_triaged",slots:{record:recordId},values:{}})`
+proposes declared writes. A newer proposal supersedes an older one still
+awaiting review; only a write already being applied cannot be torn down. The
+host supplies artifact/source identity,
+observed CAS versions and idempotency; none belong in the proposal or
+authored input. Settlement is commit-on-gesture: a proposal made during the
+terminal event of a completed gesture (`click`, `drop`) carries the frame's
+gesture-backed mark — necessary but never sufficient, since the host
+additionally requires its own `navigator.userActivation` — and only a
+declared, in-scope, reversible write then commits with no Apply step. A
+proposal made outside a gesture still reaches the host and routes to the
+Apply tray rather than throwing; irreversible effects such as record
+creation, and browsers without `userActivation`, likewise keep the Apply
+step. Apply resolves the current declaration, bound input and authenticated
+caller again through `artifacts_execute.invoke_artifact_interaction`.
+A committed write leaves a host-owned settled-change trace with a real
+reversal through an ordinary declared entry. Relation rows
+remain read-only; writable record slots require Collection-envelope inputs.
+
+Reversibility is resolved against the value the write replaced, so a
+`facet.set` on a facet that can be absent also needs a `facet.unset` declared
+on the same facet. Only `facet.unset` can assert an absent prior value, so
+without one a write replacing an absent value is not reversible and routes to
+the Apply tray even though the artifact and the gesture are both valid; the
+prior is read per record, so this is per record rather than once overall.
+Later writes commit on the gesture when a declared `facet.set` can assert the
+value they replace — for a toggle-shaped facet, a tray that appears only the
+first time, but a facet holding a value from outside the declaration keeps
+traying until it holds a covered one. A declared facet value must be a
+string, number or object (booleans are refused; carry `"true"`/`"false"` as
+strings), and `facet.unset` declares no value and no value slot.
 
 For an ongoing Native view, bind canonical inputs and let the host re-resolve
 them under the current viewer's authority; do not paste current records or
@@ -99,6 +146,12 @@ contract when needed.
    when available; report a missing verifier rather than claiming pixels were
    checked.
 
+A later body edit carries each port's binding and grant forward unless that
+port's own declaration changed or the manifest withdrew the matching capability
+request, so adding a port drops nothing and a port-less grant such as
+`navigation.record.user_gesture` survives while its request stands; whatever
+does drop is named in the write receipt's `artifact_input_continuity.dropped`.
+
 The body consumes `native.inputs.items.records`; binding alone does not make
 hard-coded cards live. Later renders re-resolve the bound Collection under the
 opener's authority, and an already-open MDX v2 view follows the host's live
@@ -137,10 +190,25 @@ the smallest source first, then add presentation features and re-render after
 each change, including binding changes. A render from before the final write
 does not verify the final artifact.
 
+### Fields outside the nine fixed record fields
+
+The record row carries nine fixed fields: `id`, `type`, `kind`, `name`,
+`summary`, `lifecycle_interpretation`, `maturity`, `persistence`, and `facets`.
+The shape stays closed — there is no wider row to request. For anything else —
+aggregates, joins, derived values — use a governed SQL relation port: save the
+computation as a `governed_sql` query Collection, declare a
+`native.relation-envelope.v1` port carrying its `schema_sha256` and relation
+dependencies, and bind that Collection. Rendering reruns the saved query under
+the viewer's authority and delivers authorization-filtered rows beside the
+record grain; `native.html.v1` accepts the port. Do not mirror derived values
+into record facets to smuggle them through the record grain. The relationship
+map below and the comment-count aggregate after it are two instances of this
+rule: one draws edges, the other counts per record.
+
 ### Minimal HTML relationship map
 
-Use HTML when the presentation needs browser JavaScript, while keeping data in
-governed inputs. This complete document expects a `nodes` Collection and an
+HTML suits this map: the artifact draws the graph itself, while the data stays
+in governed inputs. This complete document expects a `nodes` Collection and an
 `edges` governed-SQL query Collection. The edge query must select only the
 intended cohort from `links`, declare these output columns in this order, and
 use `row_identity:["id"]` with a final `id` order key:
@@ -162,6 +230,104 @@ profile and catalog revisions when creating the saved query; do not copy those
 values from an example. Restrict both endpoints in SQL. Filtering again in the
 document prevents cross-scope lines from being painted, but cannot recover a
 relevant edge omitted by an over-broad bounded query.
+
+Write the document's scripts as plain JavaScript with JSDoc type annotations
+on functions and non-obvious values (strongly recommended, not required):
+your source is never transpiled, and its own bytes are what `body_digest`
+covers, so JSDoc keeps most of the rigour with no runtime transform and no
+change to the digest model. (The delivered document is your source
+untransformed plus the host's injected bootstrap script — not byte-identical
+to what you wrote, but never rewritten.) TypeScript syntax does not work here:
+no transform runs over the body, so annotations would reach the browser as-is
+and fail at parse. Every identifier a script references must be defined in the
+document, be a browser global, or be the runtime bridge: there are no imports
+and no external scripts (the CSP forbids both, and `eval`). Declare the bridge
+and the named input port shapes with `@typedef`, so later type checking has
+something to check against. For example, against the `nodes`/`edges` ports of
+the document below:
+
+```js
+/**
+ * Bridge the host injects before authored scripts run.
+ * @typedef {object} NativeArtifactBridge
+ * @property {Promise<{input: ArtifactInputEnvelope}>} ready - resolves with the first delivery object.
+ * @property {function(function({input: ArtifactInputEnvelope}): void): function(): void} onInput - repaint on refresh; returns an unsubscribe function.
+ */
+
+/** @typedef {object} ArtifactInputEnvelope
+ * @property {string} version
+ * @property {string} mode
+ * @property {ArtifactInputs} inputs
+ */
+
+/** @typedef {object} ArtifactInputs
+ * @property {{records: NodeRecord[]}} nodes
+ * @property {{relation: {rows: EdgeRow[]}}} edges
+ */
+
+/** @typedef {object} NodeRecord
+ * @property {string} id
+ * @property {string} name
+ */
+
+/** @typedef {object} EdgeRow
+ * @property {string} id
+ * @property {string} source_id
+ * @property {string} target_id
+ * @property {string} relationship
+ */
+
+/**
+ * The host guarantees this global before authored scripts run; the cast only
+ * tells the checker its shape. Never redeclare it with
+ * `var nativeArtifact = ...`: that assigns to a non-writable global, which
+ * silently no-ops in sloppy mode and throws under "use strict".
+ * @type {NativeArtifactBridge}
+ */
+var bridge = /** @type {any} */ (window).nativeArtifact;
+
+/**
+ * Count edges with both endpoints visible.
+ * @param {NodeRecord[]} nodes
+ * @param {EdgeRow[]} rows
+ * @returns {number}
+ */
+function countVisibleEdges(nodes, rows) {
+  var ids = new Set(nodes.map(function (node) { return node.id; }));
+  return rows.filter(function (edge) {
+    return ids.has(edge.source_id) && ids.has(edge.target_id);
+  }).length;
+}
+
+/**
+ * Write the status line; the element is defined by the document below.
+ * @param {string} text
+ * @returns {void}
+ */
+function setStatus(text) {
+  var statusNode = document.querySelector("#status");
+  if (statusNode === null) {
+    return;
+  }
+  statusNode.textContent = text;
+}
+
+/**
+ * Paint one delivery: the port map lives at `delivery.input.inputs`.
+ * @param {{input: ArtifactInputEnvelope}} delivery
+ * @returns {void}
+ */
+function paint(delivery) {
+  var inputs = delivery.input.inputs;
+  var visible = countVisibleEdges(inputs.nodes.records, inputs.edges.relation.rows);
+  setStatus(visible + " visible relationships.");
+}
+
+bridge.onInput(paint);
+bridge.ready.then(paint).catch(function () {
+  setStatus("Inputs unavailable.");
+});
+```
 
 ```html
 <!doctype html>
@@ -310,6 +476,118 @@ The host re-resolves both ports in one snapshot on each live refresh. Registerin
 `onInput` lets the same frame repaint when its input digest changes; `ready`
 paints the initial delivery. Without an input subscriber, changed input still
 stays live by relaunching the frame, but frame-local JavaScript state is lost.
+
+### Comment counts per record
+
+The same port answers "a count on each row", the case the closed row cannot
+express. A comment is an `Annotation` record of kind `comment`, and its
+`part_of` link points at its record for a root comment but at the root comment
+for a reply, so counting links to the record alone would silently omit every
+reply. The statement below counts both — each root through the record, each
+reply through its root — with two ordinary joins and `COUNT(DISTINCT …)`, never
+a per-row subquery, so it stays inside the query deadline. A governed comment is
+itself a record, so the `WHERE` clause excludes comment rows: every returned row
+is a non-comment record and `comment_count` means the same thing throughout.
+Declare these output columns in this order, with `row_identity:["id"]` and a
+final `id` order key:
+
+```json
+[
+  {"name":"id","type":"identifier","nullable":false},
+  {"name":"name","type":"text","nullable":false},
+  {"name":"comment_count","type":"integer","nullable":false}
+]
+```
+
+Its `schema_sha256` is
+`ad03fda0c28b28adfc455e456a7cb0f319d9530a4be386ed04b6c1f57d5da8b1`,
+and its exact semantic dependencies are
+`records` → `native.query-sql.records` version 1 and
+`links` → `native.query-sql.links` version 1. Read `engine_info` for the active
+profile and catalog revisions when creating the saved query; do not copy those
+values from an example. The statement joins the record to its root comments,
+then each root comment to its replies, and counts both within one home;
+`comment_count` is zero for a record with none:
+
+```sql
+SELECT r.id AS id, r.name AS name,
+       COUNT(DISTINCT root_comment.id) + COUNT(DISTINCT reply.id) AS comment_count
+FROM records r
+LEFT JOIN links root_link
+  ON root_link.target_id = r.id AND root_link.relationship = 'part_of'
+LEFT JOIN records root_comment
+  ON root_comment.id = root_link.source_id
+ AND root_comment.type = 'Annotation' AND root_comment.kind = 'comment'
+LEFT JOIN links reply_link
+  ON reply_link.target_id = root_comment.id AND reply_link.relationship = 'part_of'
+LEFT JOIN records reply
+  ON reply.id = reply_link.source_id
+ AND reply.type = 'Annotation' AND reply.kind = 'comment'
+WHERE r.home_id = ?1
+  AND (r.type <> 'Annotation' OR r.kind IS NULL OR r.kind <> 'comment')
+GROUP BY r.id, r.name
+ORDER BY r.name ASC, r.id ASC
+```
+
+Scope the aggregate to the same cohort as the bound `items` collection — here,
+its home, passed as `?1` with
+`"parameters":[{"type":"text","value":"<home folder id>"}]` — because an
+unscoped aggregate returns a row for every visible record, exceeds the row
+bound, and silently truncates, leaving the artifact's own rows uncounted rather
+than visibly wrong.
+
+Declare the aggregate beside the record grain, bind the saved-query Collection
+to it, and grant it exactly as in the map above — one
+`manage_artifact_inputs.bind` per port and one exact-source `input.read` grant
+per port:
+
+```json
+{"artifact_id":"<artifact ID>","port_name":"items","collection_id":"<record Collection ID>"}
+```
+
+```json
+{"artifact_id":"<artifact ID>","port_name":"comment_counts","collection_id":"<query Collection ID>"}
+```
+
+```json
+{"artifact_id":"<artifact ID>","subject_kind":"artifact_source","subject_record_id":"<artifact ID>","subject_event_id":"<source event ID>","source_sha256":"<source digest>","capability":"input.read","scope":{"artifact_port":"items"}}
+```
+
+```json
+{"artifact_id":"<artifact ID>","subject_kind":"artifact_source","subject_record_id":"<artifact ID>","subject_event_id":"<source event ID>","source_sha256":"<source digest>","capability":"input.read","scope":{"artifact_port":"comment_counts"}}
+```
+
+with this port beside the record grain in the manifest:
+
+```json
+"comment_counts": {"envelope": "native.relation-envelope.v1", "required": true, "expose_to_root": true, "schema_sha256": "ad03fda0c28b28adfc455e456a7cb0f319d9530a4be386ed04b6c1f57d5da8b1", "relations": {"records": {"identity": "native.query-sql.records", "semantic_version": 1}, "links": {"identity": "native.query-sql.links", "semantic_version": 1}}}
+```
+
+The document joins each count to its record by `id` from the same delivery
+shape the map reads — `delivery.input.inputs` — wired to `onInput` and `ready`
+the same way:
+
+```js
+function paintCounts(delivery) {
+  var inputs = delivery && delivery.input && delivery.input.inputs;
+  var relation = inputs && inputs.comment_counts && inputs.comment_counts.relation;
+  var rows = relation && relation.rows;
+  if (!Array.isArray(rows)) return;
+  var counts = new Map(rows.map(function (row) { return [row.id, row.comment_count]; }));
+  var partial = relation.extent && relation.extent.complete !== true;
+  var bestEffort = relation.extent &&
+    relation.extent.source_completeness === "best_effort";
+  // ...render each record with counts.get(record.id), labelling partial/bestEffort
+}
+```
+
+`extent.complete:false` means the returned count result is partial and its
+`total` is null — it never claims a known total.
+`extent.source_completeness:"best_effort"` separately means the source
+observation was best effort. Saving validates the same contract execution
+rechecks: declared relations must match the relations the statement reads,
+output columns must match the statement labels, the digest must match the
+columns, and the final order key must be the one non-null identifier.
 
 ## Attention and dashboard view with bounded queries
 

@@ -4,10 +4,10 @@
 
 This inventory covers only the legacy transport that advertises each registered operation as a direct tool. It does not describe the contract-derived executor catalogue.
 
-**76 tools** are registered in the legacy complete surface; 70 have a text renderer. The legacy default complete profile advertises all of them. Focused and custom filtering are intentionally lossy: hidden tools can be undiscoverable and visible workflows can lose dependencies. Filtering does not change exact-name dispatch or authorization.
+**86 tools** are registered in the legacy complete surface; 77 have a text renderer. The legacy default complete profile advertises all of them. Focused and custom filtering are intentionally lossy: hidden tools can be undiscoverable and visible workflows can lose dependencies. Filtering does not change exact-name dispatch or authorization.
 
-- **focused**: 27 tools, 69040 compact UTF-8 bytes
-- **complete**: 76 tools, 184338 compact UTF-8 bytes
+- **focused**: 27 tools, 71137 compact UTF-8 bytes
+- **complete**: 86 tools, 216653 compact UTF-8 bytes
 
 Totals are the exact compact JSON `result.tools` arrays. Per-tool bytes below are descriptor deltas before array commas/brackets.
 
@@ -17,10 +17,10 @@ Schema annotations are the recursively removed JSON Schema annotation keywords `
 
 | Surface | Tools | Name/title | Tool descriptions | Schema structure | Schema annotations | App metadata | Envelope | Total |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| legacy ordinary focused | 27 | 592 | 9280 | 31103 | 27983 | 0 | 82 | 69040 |
-| legacy ordinary complete | 76 | 1867 | 30893 | 86295 | 64736 | 318 | 229 | 184338 |
-| legacy lens focused | 28 | 619 | 9651 | 31630 | 27558 | 0 | 85 | 69543 |
-| legacy lens complete | 77 | 1894 | 31264 | 86897 | 63755 | 318 | 232 | 184360 |
+| legacy ordinary focused | 27 | 592 | 9939 | 31910 | 28614 | 0 | 82 | 71137 |
+| legacy ordinary complete | 86 | 2135 | 39615 | 99421 | 74905 | 318 | 259 | 216653 |
+| legacy lens focused | 28 | 619 | 10310 | 32437 | 28189 | 0 | 85 | 71640 |
+| legacy lens complete | 87 | 2162 | 39986 | 100340 | 74366 | 318 | 262 | 217434 |
 
 ## Largest exact repetitions
 
@@ -30,35 +30,35 @@ Schema annotations are the recursively removed JSON Schema annotation keywords `
 
 | Kind | Occurrences | Bytes each | Wire bytes | Repeated excess | Preview |
 |---|---:|---:|---:|---:|---|
-| schema fragment | 75 | 188 | 14100 | 13912 | {"type":"string","description":"Run correlation handle from bootstrap. Reuse the same key on eve… |
-| schema fragment | 68 | 196 | 13328 | 13132 | {"type":"string","enum":["text","json"],"default":"text","description":"Response representation.… |
-| description | 75 | 156 | 11700 | 11544 | Run correlation handle from bootstrap. Reuse the same key on every call, reads included. Mint wi… |
-| schema fragment | 75 | 143 | 10725 | 10582 | {"type":"string","description":"Optional spawning run_key; an unverified lineage hint. Minting s… |
-| description | 74 | 124 | 9176 | 9052 | Response representation. text is the compact model-facing rendering; json is exact serialized JS… |
-| description | 75 | 111 | 8325 | 8214 | Optional spawning run_key; an unverified lineage hint. Minting sentinels are invalid. See coordi… |
-| schema fragment | 27 | 205 | 5535 | 5330 | {"type":"string","minLength":1,"description":"Why this change: reasoning and alternatives, inclu… |
-| schema fragment | 9 | 563 | 5067 | 4504 | {"run_key":{"type":"string","description":"Run correlation handle from bootstrap. Reuse the same… |
-| description | 29 | 159 | 4611 | 4452 | Why this change: reasoning and alternatives, including what you were arguing against. Restating … |
+| schema fragment | 85 | 188 | 15980 | 15792 | {"type":"string","description":"Run correlation handle from bootstrap. Reuse the same key on eve… |
+| schema fragment | 75 | 196 | 14700 | 14504 | {"type":"string","enum":["text","json"],"default":"text","description":"Response representation.… |
+| description | 85 | 156 | 13260 | 13104 | Run correlation handle from bootstrap. Reuse the same key on every call, reads included. Mint wi… |
+| schema fragment | 85 | 143 | 12155 | 12012 | {"type":"string","description":"Optional spawning run_key; an unverified lineage hint. Minting s… |
+| description | 84 | 124 | 10416 | 10292 | Response representation. text is the compact model-facing rendering; json is exact serialized JS… |
+| description | 85 | 111 | 9435 | 9324 | Optional spawning run_key; an unverified lineage hint. Minting sentinels are invalid. See coordi… |
+| schema fragment | 11 | 563 | 6193 | 5630 | {"run_key":{"type":"string","description":"Run correlation handle from bootstrap. Reuse the same… |
+| schema fragment | 29 | 205 | 5945 | 5740 | {"type":"string","minLength":1,"description":"Why this change: reasoning and alternatives, inclu… |
+| description | 31 | 159 | 4929 | 4770 | Why this change: reasoning and alternatives, including what you were arguing against. Restating … |
 | schema fragment | 4 | 1131 | 4524 | 3393 | {"oneOf":[{"type":"object","properties":{"type":{"const":"text_quote"},"exact":{"type":"string",… |
 | schema fragment | 3 | 1421 | 4263 | 2842 | {"type":"object","properties":{"target_record_id":{"type":"string"},"source_slot":{"type":"strin… |
 | schema fragment | 3 | 1303 | 3909 | 2606 | {"target_record_id":{"type":"string"},"source_slot":{"type":"string","enum":["body","blob"]},"pu… |
 | schema fragment | 3 | 1169 | 3507 | 2338 | {"type":"array","minItems":1,"items":{"oneOf":[{"type":"object","properties":{"type":{"const":"t… |
 | schema fragment | 4 | 664 | 2656 | 1992 | {"type":"object","description":"Strict v1 CSV fragment: conforms_to must be https://www.rfc-edit… |
-| schema fragment | 4 | 465 | 1860 | 1395 | {"oneOf":[{"type":"object","properties":{"kind":{"const":"members"}},"required":["kind"],"additi… |
+| schema fragment | 4 | 556 | 2224 | 1668 | {"run_key":{"type":"string","description":"Run correlation handle from bootstrap. Reuse the same… |
 
 ### Legacy federated lens complete
 
 | Kind | Occurrences | Bytes each | Wire bytes | Repeated excess | Preview |
 |---|---:|---:|---:|---:|---|
-| schema fragment | 75 | 188 | 14100 | 13912 | {"type":"string","description":"Run correlation handle from bootstrap. Reuse the same key on eve… |
-| description | 75 | 156 | 11700 | 11544 | Run correlation handle from bootstrap. Reuse the same key on every call, reads included. Mint wi… |
-| schema fragment | 124 | 94 | 11656 | 11562 | {"type":"string","description":"Destination database ID; required for a multi-database lens."} |
-| schema fragment | 75 | 143 | 10725 | 10582 | {"type":"string","description":"Optional spawning run_key; an unverified lineage hint. Minting s… |
-| description | 75 | 111 | 8325 | 8214 | Optional spawning run_key; an unverified lineage hint. Minting sentinels are invalid. See coordi… |
-| description | 124 | 62 | 7688 | 7626 | Destination database ID; required for a multi-database lens. |
-| schema fragment | 12 | 472 | 5664 | 5192 | {"run_key":{"type":"string","description":"Run correlation handle from bootstrap. Reuse the same… |
-| schema fragment | 27 | 205 | 5535 | 5330 | {"type":"string","minLength":1,"description":"Why this change: reasoning and alternatives, inclu… |
-| description | 29 | 159 | 4611 | 4452 | Why this change: reasoning and alternatives, including what you were arguing against. Restating … |
+| schema fragment | 85 | 188 | 15980 | 15792 | {"type":"string","description":"Run correlation handle from bootstrap. Reuse the same key on eve… |
+| schema fragment | 150 | 94 | 14100 | 14006 | {"type":"string","description":"Destination database ID; required for a multi-database lens."} |
+| description | 85 | 156 | 13260 | 13104 | Run correlation handle from bootstrap. Reuse the same key on every call, reads included. Mint wi… |
+| schema fragment | 85 | 143 | 12155 | 12012 | {"type":"string","description":"Optional spawning run_key; an unverified lineage hint. Minting s… |
+| description | 85 | 111 | 9435 | 9324 | Optional spawning run_key; an unverified lineage hint. Minting sentinels are invalid. See coordi… |
+| description | 150 | 62 | 9300 | 9238 | Destination database ID; required for a multi-database lens. |
+| schema fragment | 15 | 472 | 7080 | 6608 | {"run_key":{"type":"string","description":"Run correlation handle from bootstrap. Reuse the same… |
+| schema fragment | 29 | 205 | 5945 | 5740 | {"type":"string","minLength":1,"description":"Why this change: reasoning and alternatives, inclu… |
+| description | 31 | 159 | 4929 | 4770 | Why this change: reasoning and alternatives, including what you were arguing against. Restating … |
 | schema fragment | 4 | 1131 | 4524 | 3393 | {"oneOf":[{"type":"object","properties":{"type":{"const":"text_quote"},"exact":{"type":"string",… |
 | schema fragment | 3 | 1421 | 4263 | 2842 | {"type":"object","properties":{"target_record_id":{"type":"string"},"source_slot":{"type":"strin… |
 | schema fragment | 3 | 1303 | 3909 | 2606 | {"target_record_id":{"type":"string"},"source_slot":{"type":"string","enum":["body","blob"]},"pu… |
@@ -72,52 +72,59 @@ Schema annotations are the recursively removed JSON Schema annotation keywords `
 |---|---|---|---:|---:|---:|---|---|
 | `ping` | system | discoverability | — | 726 | — | — | Liveness check — returns { ok: true }. |
 | `engine_info` | system | discoverability | — | 1247 | — | — | Engine, schema, and active storage-profile information; optionally performs a read-only portability audit against exact target profile revisions. |
-| `bootstrap` | system | discoverability | yes | 998 | 998 | yes | Read-only orientation, instructions and run key; declare intent via set_intent. |
+| `bootstrap` | system | discoverability | yes | 1072 | 1072 | yes | Read-only orientation and run key. |
 | `get_structure` | records | bounded-context-or-calls | yes | 1913 | 1913 | yes | Bounded containment tree from a root, live or pinned by optional as_of. |
 | `get_dashboard` | records | bounded-context-or-calls | — | 1449 | — | yes | Attention view: active and stale records (split by last_activity_at against a staleness floor; records whose lifecycle is terminal in its governing vocabulary are finished and appear in neither), link-derived blocked records, a lifecycle census, and an unclassified_lifecycle diagnostic naming which of the returned records carry an uninterpretable lifecycle and why — optionally scoped to a subtree. |
-| `describe_schema` | schema | correctness-under-ignorance | — | 1101 | — | yes | Physical tables and columns with authority roles (authoritative log / projection / substrate / meta tier): orientation for sql_read. |
+| `describe_schema` | schema | correctness-under-ignorance | — | 1321 | — | yes | sql_read queries logical relations, not these physical tables: 16 relations on sqlite-local, 12 on every profile (4 are sqlite-local only). |
 | `quickstart` | guidance | correctness-under-ignorance | — | 594 | — | yes | Launch Native's first-use flow. |
 | `read_guide` | guidance | correctness-under-ignorance | yes | 1309 | 1309 | yes | Read one compiled cross-cutting guide by topic. |
-| `create_record` | records | atomicity | yes | 5717 | 5717 | yes | Create atomically. |
+| `create_record` | records | atomicity | yes | 6326 | 6326 | yes | Create atomically. |
 | `get_record` | records | discoverability | yes | 3969 | 3969 | yes | Batch get by full ids or short record references: partial success, visible totals, paged enrichments. |
-| `update_record` | records | atomicity | yes | 4913 | 4913 | yes | Default summary; response_mode=verbose is full. |
+| `update_record` | records | atomicity | yes | 5521 | 5521 | yes | Summary default; verbose full. |
 | `claim_unowned_record` | records | atomicity | — | 2088 | — | yes | Exceptional ownership recovery for one exact, full record id naming a visible, live, ordinary record whose owner_id is null; abbreviated ids are not resolved. |
 | `correct_record_type` | records | atomicity | — | 1884 | — | yes | Correct a live record's mistaken spine type through a governed plan. |
 | `delete_record` | records | atomicity | yes | 1539 | 1539 | yes | Soft-delete: sets the deleted_at tombstone; the record is frozen (the projector rejects all further mutation events). |
 | `archive_record` | records | atomicity | yes | 1712 | 1712 | yes | Archive (archived: true, the default) or restore (archived: false) a record via the engine-reserved archived facet. |
 | `render_record` | records | discoverability | — | 1324 | — | yes | Deterministic record/enrichment Markdown, with no model. |
-| `create_many` | records | atomicity | — | 4377 | — | yes | Create up to 25 non-Message records as one dependency graph. |
+| `save_account` | records | atomicity | — | 3043 | — | yes | Save the body of an existing ordinary Document kind:note together with its exact declared record-body source basis through one Receipt aggregate. |
+| `get_reuse_context` | records | bounded-context-or-calls | — | 2056 | — | yes | Bounded reuse context for one ordinary Document: current body with exact revision, declared source basis from the latest Receipt (current vs historical), direct open concerns with bounded replies, compact resolved treatment history, inherited Receipt uncertainty, and a versioned drafting instruction. |
+| `create_many` | records | atomicity | — | 4819 | — | yes | Create up to 25 non-Message records as one dependency graph. |
+| `batch_write` | records | atomicity | — | 3459 | — | yes | Atomic batch of up to 25 existing-record writes under one reason and idempotency key: update_record-style field/facet patches (name, summary, maturity, home_id, facets), manage_links.add link additions, and archive_record transitions. |
 | `get_history` | history | correctness-under-ignorance | yes | 1900 | 1900 | yes | Authorized database-local replay pages. |
-| `whats_changed` | history | bounded-context-or-calls | yes | 2786 | 2786 | yes | Return a stable, authorization-filtered window over the authoritative content event log. |
+| `whats_changed` | history | bounded-context-or-calls | yes | 2749 | 2749 | yes | Authorization-filtered window over the content event log; first page pins high water, next_request round-trips verbatim. |
 | `get_run_activity` | coordination | bounded-context-or-calls | — | 2486 | — | yes | With for_run, aggregate read activity for that run and optional descendants; no intent or raw trace data. |
 | `resolve_external` | identity | correctness-under-ignorance | — | 1673 | — | yes | Resolve governed external identities to exactly one visible local record. |
 | `manage_bindings` | identity | correctness-under-ignorance | — | 1954 | — | yes | List or govern plural external identities. |
 | `observe_external` | identity | correctness-under-ignorance | — | 3495 | — | yes | Atomically resolve/create a shadow and append a qualified external observation. |
 | `manage_record_policy` | records | atomicity | — | 8336 | — | yes | Inspect effective record access without disclosing its roster; policy administrators can list entries, apply transactional grant/revoke/baseline deltas, or atomically converge a bounded input-ordered set of exact per-subject capabilities. |
 | `manage_instructions` | guidance | correctness-under-ignorance | — | 1707 | — | yes | Read and configure portable workspace/member standing instruction bindings, and inspect or safely update seeded defaults. |
-| `manage_onboarding` | guidance | correctness-under-ignorance | — | 3758 | — | yes | Configure portable onboarding programmes and sources; preview/publish generations; record bounded non-terminal progress; or explicitly resolve/reopen only the authenticated member's own obligation. |
+| `manage_onboarding` | guidance | correctness-under-ignorance | — | 3778 | — | yes | Configure portable onboarding programmes and sources; preview/publish generations; record bounded non-terminal progress; or explicitly resolve/reopen only the authenticated member's own obligation. |
 | `render_record_version_diff` | history | bounded-context-or-calls | — | 1133 | — | yes | Open a read-only App comparing one historical record revision with its current state. |
 | `manage_links` | records | atomicity | yes | 2418 | 2418 | yes | Add, remove, or page typed links. |
 | `manage_relationships` | records | atomicity | — | 6090 | — | yes | Assert, contest, evidence, retract, read, explain, or find governed semantic relationships. |
 | `manage_messages` | messaging | atomicity | yes | 4979 | 4979 | yes | Send/read direct or Collection contexts; classify/share; manage reactions, 👍 acknowledgement, Inbox, destinations, awareness, routing, preferences. |
 | `manage_interventions` | messaging | atomicity | — | 1662 | — | yes | Get/query viewer-relative Message-rooted interventions, cancel one, or atomically deliver and resume a blocked Message using exact target-authored authority evidence. |
 | `instantiate_artifact` | artifacts | atomicity | — | 1498 | — | yes | Copy one live artifact into a standalone governed Document kind:artifact, preserving its body, name (unless title overrides it), and governed runtime facet, with exactly one immediate-source instantiated_from edge. |
-| `manage_renderer_binding` | artifacts | correctness-under-ignorance | — | 1393 | — | yes | Read, bind, or unbind the exact zero-or-one outgoing renders edge of a governed Document kind:artifact. |
+| `manage_renderer_binding` | artifacts | correctness-under-ignorance | — | 1557 | — | yes | Read, bind, or unbind the exact zero-or-one outgoing renders edge of a governed Document kind:artifact. |
 | `manage_mdx_modules` | artifacts | atomicity | — | 1388 | — | yes | Publish, inspect, deprecate, withdraw, or inspect reverse impact for immutable native.mdx.v2 module releases. |
-| `manage_artifact_inputs` | artifacts | atomicity | — | 1246 | — | yes | Read, bind, or unbind exact named native.mdx.v2 or native.html.v1 artifact input ports to governed Collection records. |
+| `manage_artifact_inputs` | artifacts | atomicity | — | 1732 | — | yes | Read, bind, bind_many, or unbind exact named native.mdx.v2 or native.html.v1 artifact input ports to governed Collection records. |
 | `manage_artifact_module_grants` | artifacts | correctness-under-ignorance | — | 1688 | — | yes | Read, grant, or revoke one exact named-input artifact capability subject. |
+| `advance_artifact_port_pin` | artifacts | atomicity | — | 2028 | — | yes | Advance one bound native.mdx.v2 or script-manifest native.html.v1 artifact port's pinned governed-SQL relation to the current catalog version as one authorized action: re-pins the saved query, re-pins the port declaration, rebinds the port to the new exact source, and re-issues every capability grant against that new source as a fresh event. |
 | `render_artifact` | artifacts | bounded-context-or-calls | — | 4786 | — | yes | Open one saved artifact through its declared runtime adapter. |
 | `verify_artifact` | artifacts | correctness-under-ignorance | — | 1817 | — | yes | Run bounded browser evidence for the exact current native.html.v1 or native.mdx.v2 artifact revision when a question requires painted colour or pixel-layout observations beyond render_artifact's typed semantics. |
 | `open_collection` | artifacts | bounded-context-or-calls | — | 981 | — | yes | Open one Collection directly on the deterministic neutral table surface. |
-| `invoke_artifact_interaction` | artifacts | atomicity | — | 2318 | — | yes | Run one interaction entry a native.mdx.v2 artifact declared in its nativeArtifact manifest. |
-| `manage_facet_observations` | facets | correctness-under-ignorance | — | 4355 | — | yes | Set or unset one valid-time open-facet observation without changing the record's current facet value, or list one bounded series oldest-first. |
+| `manage_surface_bindings` | artifacts | correctness-under-ignorance | — | 3291 | — | yes | List, get, set, or reset a surface binding. |
+| `manage_alpha_tabs` | artifacts | correctness-under-ignorance | — | 7441 | — | yes | Inspect, list, launch, live_read, install, disable, restore, or remove a personal alpha tab install, or preview one exact artifact/package pin against host-owned sample input only. |
+| `invoke_artifact_interaction` | artifacts | atomicity | — | 3456 | — | yes | Run one interaction entry a native.mdx.v2 or native.html.v1 artifact declared in its exact-source manifest. |
+| `manage_facet_observations` | facets | correctness-under-ignorance | — | 4519 | — | yes | Set or unset one valid-time open-facet observation without changing the record's current facet value, or list one bounded series oldest-first. |
 | `resolve_facets` | facets | correctness-under-ignorance | yes | 1283 | 1283 | yes | Resolve the effective facet shape for a record or a type: spine columns, the pack → user schema_config cascade (both the pack view and the resolved view), and — for a record — its current values, derived bears_shape capability. |
 | `suggest_facet_values` | facets | correctness-under-ignorance | — | 1158 | — | yes | Valid values for a facet key from its governing vocabulary (active, alias-resolved). |
 | `query_record` | query | bounded-context-or-calls | yes | 8979 | 8979 | yes | Structured query; as_of pins content, not authorization/schema. |
 | `resolve_rollup` | query | bounded-context-or-calls | yes | 1343 | 1343 | yes | Resolve one live named rollup stored in a record's string-valued 'rollup' facet. |
 | `search` | query | bounded-context-or-calls | yes | 1862 | 1862 | yes | Full-text search over record names and bodies (FTS5, stemmed, caller-filtered and corpus-independently ranked), optionally scoped to a subtree. |
-| `query_sql` | query | discoverability | — | 2580 | — | yes | Caller-filtered engine-native read-only SQL: one validated SELECT/WITH against audited logical relations, with optional lossless tagged positional parameters. |
+| `query_sql` | query | discoverability | — | 2792 | — | yes | Caller-filtered engine-native read-only SQL: one validated SELECT/WITH against audited logical relations, with optional lossless tagged positional parameters. |
 | `scan` | query | bounded-context-or-calls | yes | 2450 | 2450 | yes | Cross-axis orientation before querying: a census (counts by type/kind/lifecycle/provenance) plus sampled axes — authored-by account, lexical (with a query), recent activity, high link degree, largest containers — each with its FULL pool count and a 3-record sample carrying evidence: authored_by has authored_at; lexical has score + snippet; recent has last_activity_at; high_degree has degree; containers has child_count. |
+| `get_workspace_snapshot` | query | bounded-context-or-calls | — | 1800 | — | yes | Pinned per-principal workspace snapshot over the materialised index: open pins the caller's filtered records/facets/links plus stamps, page reads one section of that pin across calls, catch_up diffs the pin against a fresh view with exact row upserts/deletes and a new token. |
 | `resolve_many` | query | bounded-context-or-calls | — | 1744 | — | yes | Resolve a bounded list of exact record names in one caller-authorized snapshot. |
 | `manage_vocabularies` | schema | correctness-under-ignorance | yes | 4035 | 4035 | yes | Governed vocabularies and their values. |
 | `manage_schema_config` | schema | correctness-under-ignorance | yes | 2095 | 2095 | yes | Read the resolved pack → user schema_config cascade (both views, closest-wins) and write the user layer — the only editable one; pack rows are seed-only. |
@@ -136,74 +143,84 @@ Schema annotations are the recursively removed JSON Schema annotation keywords `
 | `manage_change_summaries` | artifacts | atomicity | — | 7499 | — | yes | Create or reuse a private Document kind:note change-summary workflow, derive one validated candidate from exact source events and context records, inspect it, explicitly confirm the selected revision for shipping, or revoke that confirmation. |
 | `query_change_summaries` | artifacts | correctness-under-ignorance | — | 2345 | — | yes | List only currently applicable, explicitly confirmed change-summary notes visible to the authenticated account; get one exact relationally recognized summary; or page through its authoritative evidence inputs and run provenance. |
 | `create_exploration` | records | atomicity | — | 3280 | — | yes | Create a group of deliberate alternatives as one atomic act: an ordinary visible Collection kind:selection marked with the governed facet decision.selection_role='alternative_set', every candidate record or comment, and every member_of membership link, in one transaction. |
-| `get_event_context` | coordination | bounded-context-or-calls | — | 1721 | — | yes | One moment in a run, addressed by immutable event id: the selected event, the intent in force at that event rather than the run's latest intent, the exact before/after body delta that event itself produced (correct even after later edits), neighbouring events in the same run, and up to eight records the same run most recently OPENED beforehand. |
-| `set_intent` | coordination | correctness-under-ignorance | yes | 943 | 943 | yes | Declare this run's current intent and receive a bounded structural briefing. |
+| `get_event_context` | coordination | bounded-context-or-calls | — | 1718 | — | yes | One moment in a run, addressed by immutable event id: the selected event, the intent in force at that event rather than the run's latest intent, the exact before/after body delta that event itself produced (correct even after later edits), neighbouring events in the same run, and any retained records the run opened beforehand. |
+| `set_intent` | coordination | correctness-under-ignorance | yes | 1786 | 1786 | yes | Declare this run's current intent and receive a bounded structural briefing. |
 | `close_run` | coordination | atomicity | — | 781 | — | yes | Explicitly close this run's durable activity lifecycle. |
 | `preview_record_shape` | schema | correctness-under-ignorance | yes | 1606 | 1606 | yes | Preview the live effective record shape for an optional spine type and kind, and assess supplied open-facet values with the facet-specific predicates create_record applies under this snapshot; advisory only: create_record revalidates current state and accepts no preview token or field. |
 | `read_canvas` | records | bounded-context-or-calls | — | 1860 | — | yes | Read a Document kind:canvas: the scene (get_scene), accepted batches after a canvas:N version (changes), a prose outline (describe), or one export bundle (export: scene plus full history). |
 | `manage_canvas` | records | atomicity | — | 1823 | — | yes | Write to a Document kind:canvas: commit one atomic native.canvas-batch.v1 batch (commit_batch), make a connector between two record cards a governed link (assert_connector), or turn canvas objects into governed records (promote: plan-required, dry_run first). |
 | `export_snapshot` | export | correctness-under-ignorance | yes | 1765 | 1765 | — | Owner-only verified SQLite snapshot. |
-| `manage_memberships` | identity | atomicity | — | 4431 | — | — | Hosted database membership administration. |
+| `manage_memberships` | identity | atomicity | — | 5451 | — | — | Hosted database membership administration. |
+| `workspace_read` | identity | bounded-context-or-calls | — | 970 | — | — | Hosted workspace directory. |
 | `reach_read` | identity | bounded-context-or-calls | — | 3019 | — | — | Hosted Slack/Notion/Linear discovery through the reach sidecar (absent unless configured). |
 | `reach_connect` | identity | atomicity | — | 1072 | — | — | Hosted provider consent (absent unless the deployment configures reach). |
+| `authority_act_head` | export | correctness-under-ignorance | — | 1001 | — | — | Owner-only replicated authority act-head probe for local standby delta refresh. |
+| `authority_act_delta` | export | correctness-under-ignorance | — | 1256 | — | — | Owner-only exact canonical authority act-delta cut for local standby delta refresh. |
 
 ## Federated lens projection
 
 Lens discovery overlays composite references and routing arguments, then adds the explicitly classified lens-only `materialize_record` capability. These are the actual lens `result.tools` bytes.
 
-- **focused**: 28 tools, 69543 compact UTF-8 bytes
-- **complete**: 77 tools, 184360 compact UTF-8 bytes
+- **focused**: 28 tools, 71640 compact UTF-8 bytes
+- **complete**: 87 tools, 217434 compact UTF-8 bytes
 
 | Tool | Family | Admission | Focused | Complete bytes | Focused bytes |
 |---|---|---|---:|---:|---:|
 | `ping` | system | discoverability | — | 642 | — |
 | `engine_info` | system | discoverability | — | 1163 | — |
-| `bootstrap` | system | discoverability | yes | 907 | 907 |
+| `bootstrap` | system | discoverability | yes | 981 | 981 |
 | `get_structure` | records | bounded-context-or-calls | yes | 1822 | 1822 |
 | `get_dashboard` | records | bounded-context-or-calls | — | 1358 | — |
-| `describe_schema` | schema | correctness-under-ignorance | — | 1010 | — |
+| `describe_schema` | schema | correctness-under-ignorance | — | 1230 | — |
 | `quickstart` | guidance | correctness-under-ignorance | — | 503 | — |
 | `read_guide` | guidance | correctness-under-ignorance | yes | 1218 | 1218 |
-| `create_record` | records | atomicity | yes | 5626 | 5626 |
+| `create_record` | records | atomicity | yes | 6235 | 6235 |
 | `get_record` | records | discoverability | yes | 4261 | 4261 |
-| `update_record` | records | atomicity | yes | 5143 | 5143 |
+| `update_record` | records | atomicity | yes | 5751 | 5751 |
 | `claim_unowned_record` | records | atomicity | — | 1916 | — |
 | `correct_record_type` | records | atomicity | — | 1712 | — |
 | `delete_record` | records | atomicity | yes | 1367 | 1367 |
 | `archive_record` | records | atomicity | yes | 1540 | 1540 |
 | `render_record` | records | discoverability | — | 1152 | — |
-| `create_many` | records | atomicity | — | 4286 | — |
+| `save_account` | records | atomicity | — | 2952 | — |
+| `get_reuse_context` | records | bounded-context-or-calls | — | 1965 | — |
+| `create_many` | records | atomicity | — | 4728 | — |
+| `batch_write` | records | atomicity | — | 3368 | — |
 | `get_history` | history | correctness-under-ignorance | yes | 1809 | 1809 |
-| `whats_changed` | history | bounded-context-or-calls | yes | 2695 | 2695 |
+| `whats_changed` | history | bounded-context-or-calls | yes | 2658 | 2658 |
 | `get_run_activity` | coordination | bounded-context-or-calls | — | 2395 | — |
 | `resolve_external` | identity | correctness-under-ignorance | — | 1582 | — |
 | `manage_bindings` | identity | correctness-under-ignorance | — | 1863 | — |
 | `observe_external` | identity | correctness-under-ignorance | — | 3404 | — |
 | `manage_record_policy` | records | atomicity | — | 9069 | — |
 | `manage_instructions` | guidance | correctness-under-ignorance | — | 1616 | — |
-| `manage_onboarding` | guidance | correctness-under-ignorance | — | 3667 | — |
+| `manage_onboarding` | guidance | correctness-under-ignorance | — | 3687 | — |
 | `render_record_version_diff` | history | bounded-context-or-calls | — | 1248 | — |
 | `manage_links` | records | atomicity | yes | 2555 | 2555 |
 | `manage_relationships` | records | atomicity | — | 6617 | — |
 | `manage_messages` | messaging | atomicity | yes | 4888 | 4888 |
 | `manage_interventions` | messaging | atomicity | — | 1571 | — |
 | `instantiate_artifact` | artifacts | atomicity | — | 1407 | — |
-| `manage_renderer_binding` | artifacts | correctness-under-ignorance | — | 1302 | — |
+| `manage_renderer_binding` | artifacts | correctness-under-ignorance | — | 1466 | — |
 | `manage_mdx_modules` | artifacts | atomicity | — | 1297 | — |
-| `manage_artifact_inputs` | artifacts | atomicity | — | 1155 | — |
+| `manage_artifact_inputs` | artifacts | atomicity | — | 1641 | — |
 | `manage_artifact_module_grants` | artifacts | correctness-under-ignorance | — | 1597 | — |
+| `advance_artifact_port_pin` | artifacts | atomicity | — | 1937 | — |
 | `render_artifact` | artifacts | bounded-context-or-calls | — | 4695 | — |
 | `verify_artifact` | artifacts | correctness-under-ignorance | — | 1726 | — |
 | `open_collection` | artifacts | bounded-context-or-calls | — | 890 | — |
-| `invoke_artifact_interaction` | artifacts | atomicity | — | 2227 | — |
-| `manage_facet_observations` | facets | correctness-under-ignorance | — | 4330 | — |
+| `manage_surface_bindings` | artifacts | correctness-under-ignorance | — | 3612 | — |
+| `manage_alpha_tabs` | artifacts | correctness-under-ignorance | — | 8380 | — |
+| `invoke_artifact_interaction` | artifacts | atomicity | — | 3365 | — |
+| `manage_facet_observations` | facets | correctness-under-ignorance | — | 4494 | — |
 | `resolve_facets` | facets | correctness-under-ignorance | yes | 1192 | 1192 |
 | `suggest_facet_values` | facets | correctness-under-ignorance | — | 1067 | — |
 | `query_record` | query | bounded-context-or-calls | yes | 9416 | 9416 |
 | `resolve_rollup` | query | bounded-context-or-calls | yes | 1171 | 1171 |
 | `search` | query | bounded-context-or-calls | yes | 2104 | 2104 |
-| `query_sql` | query | discoverability | — | 2489 | — |
+| `query_sql` | query | discoverability | — | 2701 | — |
 | `scan` | query | bounded-context-or-calls | yes | 2359 | 2359 |
+| `get_workspace_snapshot` | query | bounded-context-or-calls | — | 1709 | — |
 | `resolve_many` | query | bounded-context-or-calls | — | 1653 | — |
 | `manage_vocabularies` | schema | correctness-under-ignorance | yes | 3944 | 3944 |
 | `manage_schema_config` | schema | correctness-under-ignorance | yes | 2004 | 2004 |
@@ -222,14 +239,17 @@ Lens discovery overlays composite references and routing arguments, then adds th
 | `manage_change_summaries` | artifacts | atomicity | — | 7923 | — |
 | `query_change_summaries` | artifacts | correctness-under-ignorance | — | 2563 | — |
 | `create_exploration` | records | atomicity | — | 3189 | — |
-| `get_event_context` | coordination | bounded-context-or-calls | — | 1630 | — |
-| `set_intent` | coordination | correctness-under-ignorance | yes | 852 | 852 |
+| `get_event_context` | coordination | bounded-context-or-calls | — | 1627 | — |
+| `set_intent` | coordination | correctness-under-ignorance | yes | 1695 | 1695 |
 | `close_run` | coordination | atomicity | — | 690 | — |
 | `preview_record_shape` | schema | correctness-under-ignorance | yes | 1515 | 1515 |
 | `read_canvas` | records | bounded-context-or-calls | — | 1769 | — |
 | `manage_canvas` | records | atomicity | — | 1732 | — |
 | `export_snapshot` | export | correctness-under-ignorance | yes | 1681 | 1681 |
-| `manage_memberships` | identity | atomicity | — | 5274 | — |
+| `manage_memberships` | identity | atomicity | — | 6500 | — |
+| `workspace_read` | identity | bounded-context-or-calls | — | 886 | — |
 | `reach_read` | identity | bounded-context-or-calls | — | 3450 | — |
 | `reach_connect` | identity | atomicity | — | 988 | — |
+| `authority_act_head` | export | correctness-under-ignorance | — | 917 | — |
+| `authority_act_delta` | export | correctness-under-ignorance | — | 1172 | — |
 | `materialize_record` | identity | atomicity | yes | 1255 | 1255 |

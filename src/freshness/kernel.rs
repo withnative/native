@@ -414,6 +414,7 @@ pub async fn promote_idea(
         return Err(Error::engine("invalid idea promotion input"));
     }
     let mut tx = begin_write(db.write_pool()).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
     // Authorize the command subject before consulting its idempotency
     // namespace. A denied caller must not be able to probe key occupancy.
     require_capability_on(
@@ -505,9 +506,17 @@ pub async fn promote_idea(
             }),
             actor: Some(actor.into()),
         },
+        &mut act_alloc,
     )
     .await?;
-    replace_explicit_policy_on(&mut tx, actor, unit_id.as_str(), source_policy_entries).await?;
+    replace_explicit_policy_on(
+        &mut tx,
+        actor,
+        unit_id.as_str(),
+        source_policy_entries,
+        &mut act_alloc,
+    )
+    .await?;
     append_in(
         db,
         &mut tx,
@@ -521,6 +530,7 @@ pub async fn promote_idea(
             },
             actor,
         )?,
+        &mut act_alloc,
     )
     .await?;
     let content_sha256 = input.first_content.sha256();
@@ -541,6 +551,7 @@ pub async fn promote_idea(
             },
             actor,
         )?,
+        &mut act_alloc,
     )
     .await?;
     let revision = revision_ref_from_unit_event(&revision_event, content_sha256);
@@ -569,6 +580,7 @@ pub async fn promote_idea(
             },
             actor,
         )?,
+        &mut act_alloc,
     )
     .await?;
     db.commit_content(tx).await?;
@@ -604,6 +616,7 @@ pub async fn bind_occurrence(
         return Err(Error::engine("invalid Occurrence binding input"));
     }
     let mut tx = begin_write(db.write_pool()).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
     let bearer = unit_bearer_on(&mut tx, &input.unit_revision.subject_id)
         .await
         .map_err(|error| semantic_read_error(principal, "Unit unavailable", error))?;
@@ -724,6 +737,7 @@ pub async fn bind_occurrence(
             },
             actor,
         )?,
+        &mut act_alloc,
     )
     .await?;
     let occurrence = load_occurrence_on(&mut tx, occurrence_id.as_str()).await?;
@@ -756,6 +770,7 @@ pub async fn revise_unit(
         return Err(Error::engine("invalid Unit revision input"));
     }
     let mut tx = begin_write(db.write_pool()).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
     let bearer = unit_bearer_on(&mut tx, input.unit_id.as_str())
         .await
         .map_err(|error| semantic_read_error(principal, "Unit unavailable", error))?;
@@ -838,6 +853,7 @@ pub async fn revise_unit(
             },
             actor,
         )?,
+        &mut act_alloc,
     )
     .await?;
     let new_revision = revision_ref_from_unit_event(&event, content_sha256);

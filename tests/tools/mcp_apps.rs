@@ -71,6 +71,63 @@ async fn version_diff_launcher_composes_historical_head_and_ordered_events() {
 }
 
 #[tokio::test]
+async fn version_diff_current_state_includes_later_related_record_events() {
+    let db = create_database(":memory:").await.unwrap();
+    let registry = registry();
+    let folder = registry
+        .call(
+            db.clone(),
+            Caller::local(),
+            "create_record",
+            json!({
+                "type":"Collection", "kind":"folder", "name":"Folder", "reason":"fixture"
+            }),
+        )
+        .await
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let before_seq: i64 =
+        sqlx::query_scalar("SELECT MAX(seq) FROM content_events WHERE record_id=?")
+            .bind(&folder)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    registry
+        .call(
+            db.clone(),
+            Caller::local(),
+            "create_record",
+            json!({
+                "type":"Document", "kind":"note", "name":"Later child", "home_id":folder,
+                "reason":"fixture"
+            }),
+        )
+        .await
+        .unwrap();
+    let diff = registry
+        .call(
+            db.clone(),
+            Caller::local(),
+            "render_record_version_diff",
+            json!({
+                "record_id":folder, "before_seq":before_seq
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(diff["before"]["record"]["child_count"], 0);
+    assert_eq!(diff["after"]["record"]["child_count"], 1);
+    assert!(diff["after"]["as_of_seq"].as_i64().unwrap() > before_seq);
+    assert!(
+        diff["events"].as_array().unwrap().is_empty(),
+        "related events affect the current enrichment but are not target events"
+    );
+    db.close().await;
+}
+
+#[tokio::test]
 async fn suggestion_review_launcher_is_a_small_bootstrap_not_an_aggregated_reader() {
     let db = create_database(":memory:").await.unwrap();
     native_ce::meta::seed_vocabularies(&db).await.unwrap();

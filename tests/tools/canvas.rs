@@ -897,11 +897,16 @@ fn canvas_descriptors_fit_the_boot_shaped_profile_budgets() {
     // than as a budget error. Reproduce the hosted total here so the next
     // widening of a canvas descriptor fails on this line instead.
     //
-    // The delta is measured, not guessed: a hosted boot came to 196,733 bytes
-    // where this registry came to 188,785, and `manage_memberships` is 7,947
-    // of that. It will drift as hosted-only tools change; treat a surprise
-    // here as a reason to re-measure rather than to raise the number.
-    const HOSTED_ONLY_BYTES: usize = 7_948;
+    // The delta is measured, not guessed — in parts. A hosted boot once came
+    // to 196,733 bytes where this registry came to 188,785, fixing the prior
+    // constant at 7,948. Remeasured on this tree through the same lens
+    // projection: `manage_memberships` contributes 5,275 and `workspace_read`
+    // contributes 887 (886-byte descriptor plus one array separator), so the
+    // constant is 8,835. The remaining 2,673 of the original boot delta is
+    // unaccounted for — possibly the reach sidecar or configured origins in
+    // that boot — and predates this change; treat a surprise here as a reason
+    // to re-measure rather than to raise the number.
+    const HOSTED_ONLY_BYTES: usize = 8_835;
     let lens_bytes = native_ce::mcp::descriptor_projection_bytes(
         &native_ce::mcp::lens_descriptor_projection(&registry, ExposureProfile::Complete).unwrap(),
     );
@@ -1147,6 +1152,68 @@ async fn assert_connector_needs_edit_on_the_source_record_and_view_on_the_target
     assert_eq!(links, 0, "a refused assertion writes nothing");
 
     assert!(rebuild_and_diff(&fx.db).await.unwrap().equal);
+}
+
+/// `surface_binding` is reserved to `manage_surface_bindings`.
+///
+/// A canvas connector demands only Edit on the source record and View on the
+/// target — weaker than the Manage the workspace default requires. Without the
+/// reservation, an Edit-but-not-Manage holder could name `native:root` as the
+/// source, write the workspace Home binding through generic link authority,
+/// and bypass that gate.
+#[tokio::test]
+async fn assert_connector_refuses_the_reserved_surface_binding_relationship() {
+    let fx = fixture().await;
+    // Grant Bea Edit on the workspace root, so authority is satisfied and only
+    // the reservation stands between her and the workspace Home binding.
+    replace_explicit_policy(
+        &fx.db,
+        "test:canvas-policy",
+        "native:root",
+        vec![AllowEntry::account("acct:bea", Capability::Edit)],
+    )
+    .await
+    .unwrap();
+    commit(
+        &fx,
+        alice(),
+        batch(
+            &fx.canvas,
+            "seed-root",
+            json!([
+                card("c-root", 0.0, "native:root"),
+                card("c-shared", 400.0, &fx.shared),
+                connector("k1", "c-root", "c-shared"),
+            ]),
+        ),
+    )
+    .await;
+
+    let refused = assert_connector(&fx, bea(), "k1", "surface_binding").await;
+    assert_eq!(refused["outcome"], json!("rejected"), "{refused:#}");
+    assert_eq!(
+        refused["error"]["code"],
+        json!("reserved_relationship"),
+        "{refused:#}"
+    );
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("manage_surface_bindings"),
+        "{refused:#}"
+    );
+
+    let links: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM links WHERE source_id='native:root' AND relationship='surface_binding'",
+    )
+    .fetch_one(&crate::common::fixture_write_pool(&fx.db).await)
+    .await
+    .unwrap();
+    assert_eq!(links, 0, "a reserved relationship is refused, not written");
+
+    assert!(rebuild_and_diff(&fx.db).await.unwrap().equal);
+    fx.db.close().await;
 }
 
 /// The replay branch is an authorization boundary, not just a fast path.
@@ -1618,6 +1685,73 @@ async fn promotion_writes_intra_cluster_links_between_records_that_did_not_exist
     );
 
     assert!(rebuild_and_diff(&fx.db).await.unwrap().equal);
+}
+
+/// Promotion writes links with generic link authority, so it must refuse the
+/// reserved `surface_binding` relationship for the same reason `manage_links`
+/// does: naming `native:root` as the source would forge the workspace Home
+/// default. The dry run refuses it too, so an approved plan cannot fail after
+/// the records are minted.
+#[tokio::test]
+async fn promotion_refuses_the_reserved_surface_binding_relationship() {
+    let fx = seeded().await;
+    // Grant Alice Edit on the workspace root, so the authority a promotion
+    // demands is satisfied and only the reservation stops the write.
+    replace_explicit_policy(
+        &fx.db,
+        "test:canvas-policy",
+        "native:root",
+        vec![AllowEntry::account("acct:alice", Capability::Edit)],
+    )
+    .await
+    .unwrap();
+
+    let arguments = json!({
+        "action": "promote",
+        "canvas_id": fx.canvas,
+        "reason": "forge the workspace Home",
+        "dry_run": true,
+        "items": [{ "object_id": "n1", "type": "WorkItem", "kind": "task", "name": "Home" }],
+        "links": [{ "from": "native:root", "to": "n1", "relationship": "surface_binding" }],
+    });
+    let planned = commit(&fx, alice(), arguments.clone()).await;
+    assert_eq!(planned["outcome"], json!("planned"), "{planned:#}");
+    assert_eq!(
+        planned["links"][0]["status"],
+        json!("would_conflict"),
+        "{planned:#}"
+    );
+    assert!(
+        planned["links"][0]["note"]
+            .as_str()
+            .unwrap()
+            .contains("manage_surface_bindings"),
+        "{planned:#}"
+    );
+
+    // Execution refuses the same plan rather than writing the edge.
+    let mut execute = arguments;
+    execute["dry_run"] = json!(false);
+    execute["plan_digest"] = planned["plan_digest"].clone();
+    let refused = fx
+        .registry
+        .call(fx.db.clone(), alice(), "manage_canvas", execute)
+        .await;
+    assert!(
+        refused.is_err(),
+        "the reserved relationship must not execute: {refused:?}"
+    );
+
+    let links: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM links WHERE source_id='native:root' AND relationship='surface_binding'",
+    )
+    .fetch_one(&crate::common::fixture_write_pool(&fx.db).await)
+    .await
+    .unwrap();
+    assert_eq!(links, 0, "a reserved relationship is refused, not written");
+
+    assert!(rebuild_and_diff(&fx.db).await.unwrap().equal);
+    fx.db.close().await;
 }
 
 #[tokio::test]

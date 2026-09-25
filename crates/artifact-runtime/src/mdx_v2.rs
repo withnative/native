@@ -1855,10 +1855,11 @@ pub const RECORD_CREATE_FIELD_KEYS: [&str; 6] = [
 pub const RECORD_CREATE_SPINE_FACET_KEYS: [&str; 4] =
     ["lifecycle", "owner", "persistence", "maturity"];
 
-/// Compile-time validation of the declared interaction entry set. Every
+/// Runtime-neutral validation of the declared interaction entry set, shared
+/// by MDX compilation and HTML's inert declaration parser. Every
 /// diagnostic names the failing entry, in the message and in `entry_id`, so an
 /// author is never told only that "an entry" is wrong.
-fn validate_interactions(
+pub fn validate_interactions(
     entries: &[InteractionEntry],
     inputs: &BTreeMap<String, InputDecl>,
 ) -> Result<(), mdx::Failure> {

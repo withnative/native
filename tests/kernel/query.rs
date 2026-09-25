@@ -827,14 +827,21 @@ async fn fts_search_stems_and_applies_default_visibility() {
     let db = db().await;
     let (_root, a, _b, c, _d, _goal) = seed(&db).await;
     // porter: query 'runs' stems to 'run', matching 'running' in name/body.
-    let hits = fts::search(&db, "test-account", "runs", &fts::FtsOptions::default())
-        .await
-        .unwrap();
+    let hits = fts::search(
+        &db,
+        "test-account",
+        true,
+        "runs",
+        &fts::FtsOptions::default(),
+    )
+    .await
+    .unwrap();
     assert!(hits.iter().any(|h| h.id == a));
     // Archived record excluded by default…
     let hits = fts::search(
         &db,
         "test-account",
+        true,
         "obsolete survey",
         &fts::FtsOptions::default(),
     )
@@ -845,6 +852,7 @@ async fn fts_search_stems_and_applies_default_visibility() {
     let hits = fts::search(
         &db,
         "test-account",
+        true,
         "obsolete survey",
         &fts::FtsOptions {
             include_archived: true,
@@ -856,9 +864,15 @@ async fn fts_search_stems_and_applies_default_visibility() {
     assert!(hits.iter().any(|h| h.id == c));
     // Tombstoned records never come back (triggers keep them indexed).
     delete_record(&db, &a).await.unwrap();
-    let hits = fts::search(&db, "test-account", "runs", &fts::FtsOptions::default())
-        .await
-        .unwrap();
+    let hits = fts::search(
+        &db,
+        "test-account",
+        true,
+        "runs",
+        &fts::FtsOptions::default(),
+    )
+    .await
+    .unwrap();
     assert!(!hits.iter().any(|h| h.id == a));
 }
 
@@ -880,14 +894,21 @@ async fn fts_neutralizes_query_syntax_and_scopes_to_subtree() {
         "(weaving",
         "-weaving",
     ] {
-        let _ = fts::search(&db, "test-account", hostile, &fts::FtsOptions::default())
-            .await
-            .unwrap();
+        let _ = fts::search(
+            &db,
+            "test-account",
+            true,
+            hostile,
+            &fts::FtsOptions::default(),
+        )
+        .await
+        .unwrap();
     }
     // Subtree scope: only the in-tree hit.
     let hits = fts::search(
         &db,
         "test-account",
+        true,
         "weaving",
         &fts::FtsOptions {
             scope: Some(root.clone()),
@@ -906,9 +927,15 @@ async fn name_prefix_matches_unstemmed() {
     let (_root, a, ..) = seed(&db).await;
     // porter stores 'running' as 'run', so 'runni*' fails on records_fts —
     // the unstemmed sibling is exactly for this (3c40677).
-    let hits = fts::name_prefix(&db, "test-account", "runni", &fts::FtsOptions::default())
-        .await
-        .unwrap();
+    let hits = fts::name_prefix(
+        &db,
+        "test-account",
+        true,
+        "runni",
+        &fts::FtsOptions::default(),
+    )
+    .await
+    .unwrap();
     assert!(hits.iter().any(|h| h.id == a));
 }
 

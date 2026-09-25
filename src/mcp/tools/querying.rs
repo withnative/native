@@ -25,7 +25,9 @@ use sqlx::Row;
 
 use crate::db::{apply_schema, open_database, Db};
 use crate::error::{Error, Result};
-use crate::query::fts::{self, FtsOptions, SearchHit, NEAR_MISS_CAP, THIN_RESULTS_THRESHOLD};
+use crate::query::fts::{
+    self, FtsOptions, SearchHit, CAPPED_RESULTS_GUIDANCE, NEAR_MISS_CAP, THIN_RESULTS_THRESHOLD,
+};
 use crate::query::lens::{self, ReadLens};
 use crate::query::{activity, events, pipeline, sql};
 
@@ -2641,8 +2643,9 @@ fn validate_saved_sql(definition: &SavedSqlDefinition) -> Result<()> {
     }
     if definition.catalog_revision != contract::LOGICAL_CATALOG_REVISION {
         return Err(Error::engine(format!(
-            "saved governed SQL catalog revision {} is incompatible with {}",
+            "saved governed SQL pins catalog revision {}, but the active catalog is revision {} (value-model change): re-save the definition against the current catalog — set catalog_revision to {}, re-validate the output columns, and re-run",
             definition.catalog_revision,
+            contract::LOGICAL_CATALOG_REVISION,
             contract::LOGICAL_CATALOG_REVISION
         )));
     }
@@ -2741,10 +2744,12 @@ fn validate_saved_sql(definition: &SavedSqlDefinition) -> Result<()> {
             prepared_labels.join(", ")
         )));
     }
-    if saved_sql_schema_sha256(&definition.output.columns)? != definition.output.schema_sha256 {
-        return Err(Error::engine(
-            "saved governed SQL output schema digest mismatch",
-        ));
+    let expected_schema = saved_sql_schema_sha256(&definition.output.columns)?;
+    if expected_schema != definition.output.schema_sha256 {
+        return Err(Error::engine(format!(
+            "saved governed SQL output schema digest mismatch (expected {expected_schema}, supplied {})",
+            definition.output.schema_sha256
+        )));
     }
     if definition.output.row_identity.len() != 1 || definition.output.order.is_empty() {
         return Err(Error::engine(
@@ -3203,6 +3208,7 @@ async fn resolve_rollup_once(db: &Db, caller: &Caller, args: &ResolveRollupArgs)
     let key = crate::db::RollupCacheKey {
         principal: caller.credential().to_string(),
         trusted_local_bypass: super::is_legacy_local(caller),
+        is_member: caller.is_host_member(),
         spec_digest: spec_digest.clone(),
         bearer_id: args.record_id.clone(),
         rollup_name: args.rollup_name.clone(),
@@ -3278,10 +3284,12 @@ fn hit_json(hit: &SearchHit) -> Value {
 /// scope root has siblings outside the requested subtree, and the scope
 /// contract binds near-misses as much as strict hits — so sibling rows are
 /// membership-filtered, not assumed in-scope by construction.
+#[allow(clippy::too_many_arguments)]
 async fn tree_siblings(
     db: &Db,
     credential: &str,
     trusted_local_bypass: bool,
+    is_member: bool,
     hits: &[SearchHit],
     exclude: &HashSet<String>,
     scope: Option<&HashSet<String>>,
@@ -3333,6 +3341,7 @@ async fn tree_siblings(
     query = query
         .bind(trusted_local_bypass)
         .bind(credential)
+        .bind(is_member)
         .bind(credential);
     query = query.bind(json!(exclude.iter().collect::<Vec<_>>()).to_string());
     if let Some(scope) = scope {
@@ -3344,6 +3353,7 @@ async fn tree_siblings(
         db,
         credential,
         trusted_local_bypass,
+        is_member,
         &home_ids,
     )
     .await?;
@@ -3362,7 +3372,7 @@ async fn tree_siblings(
     Ok(out)
 }
 
-async fn search(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
+pub(crate) async fn search(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
     const TOOL: &str = "search";
     let args: SearchArgs = parse_args(TOOL, arguments)?;
     if args.query.trim().is_empty() {
@@ -3399,11 +3409,20 @@ async fn search(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
         &db,
         caller.credential(),
         trusted_local_bypass,
+        caller.is_host_member(),
         &args.query,
         &opts,
     )
     .await?;
-    let thin = hits.len() < THIN_RESULTS_THRESHOLD;
+    // One evaluation, two readers: the payload field and the guidance branch
+    // below must not be able to drift apart.
+    let limit_reached = hits.len() as i64 == limit;
+    // Thin means "few matches exist", not "few matches were asked for". A
+    // caller who set limit 3 and got 3 has a truncated result set, possibly
+    // out of hundreds — treating that as scarcity both contradicts
+    // `limit_reached` in the same payload and appends up to
+    // 3 x NEAR_MISS_CAP rows nobody requested.
+    let thin = hits.len() < THIN_RESULTS_THRESHOLD && !limit_reached;
 
     let mut payload = json!({
         "query": args.query,
@@ -3412,7 +3431,7 @@ async fn search(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
         "total": hits.len(),
         "returned": hits.len(),
         "limit": limit,
-        "limit_reached": hits.len() as i64 == limit,
+        "limit_reached": limit_reached,
         "thin": thin,
     });
     let object = payload.as_object_mut().expect("search payload");
@@ -3440,6 +3459,7 @@ async fn search(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
                 &db,
                 caller.credential(),
                 trusted_local_bypass,
+                caller.is_host_member(),
                 &args.query,
                 &near_opts,
             )
@@ -3450,6 +3470,7 @@ async fn search(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
                 &db,
                 caller.credential(),
                 trusted_local_bypass,
+                caller.is_host_member(),
                 &args.query,
                 &near_opts,
             )
@@ -3459,6 +3480,7 @@ async fn search(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
             &db,
             caller.credential(),
             trusted_local_bypass,
+            caller.is_host_member(),
             &hits,
             &seen,
             scope_set.as_ref(),
@@ -3499,6 +3521,13 @@ async fn search(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
             );
         }
         object.insert("guidance".into(), json!(guidance));
+    } else if limit_reached {
+        // The capped branch is the false-negative risk: the caller sees a
+        // full page and cannot tell what was cut off. Point at the
+        // narrow-answer route. A capped result is never also thin — `thin`
+        // excludes `limit_reached` by construction — so these two branches
+        // cannot both describe one response.
+        object.insert("guidance".into(), json!(CAPPED_RESULTS_GUIDANCE));
     }
     annotate_search_record_paths(&db, &caller, &mut payload).await?;
     Ok(payload)
@@ -3580,6 +3609,8 @@ async fn query_sql(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
         "rows": result.rows,
         "row_count": result.row_count,
         "truncated": result.truncated,
+        "truncation_hint": result.truncation_hint,
+        "as_of_seq": result.as_of_seq,
     }))
 }
 
@@ -3808,6 +3839,7 @@ fn finish_saved_sql(
         "rows": rows,
         "row_count": row_count,
         "truncated": truncated,
+        "as_of_seq": result.as_of_seq,
         "receipt": {
             "version": "native.governed-sql-receipt.v1",
             "snapshot": snapshot,
@@ -4664,6 +4696,7 @@ async fn scan(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
             &db,
             caller.credential(),
             trusted_local_bypass,
+            caller.is_host_member(),
             query_text,
             &fts_opts,
         )
@@ -4672,6 +4705,7 @@ async fn scan(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
             &db,
             caller.credential(),
             trusted_local_bypass,
+            caller.is_host_member(),
             query_text,
             &fts_opts,
         )
@@ -4841,8 +4875,10 @@ pub fn register_query_tools(registry: &mut ToolRegistry) -> Result<()> {
         ToolKind::QuerySql,
         "Caller-filtered engine-native read-only SQL: one validated SELECT/WITH \
          against audited logical relations, with optional lossless tagged positional \
-         parameters. Call engine_info and read_guide(topic='query-sql') before use. \
-         Unsupported profiles fail closed. SQL is capped at 64 KiB; rows at 1000, \
+         parameters. The sql_read descriptor carries the catalog card with relations, \
+         value model, placeholders and worked statements; engine_info and \
+         read_guide(topic='query-sql') remain available for profile and revision \
+         detail. Unsupported profiles fail closed. SQL is capped at 64 KiB; rows at 1000, \
          columns at 64, encoded cells at 256 KiB, and encoded results at 4 MiB.",
         crate::query::sql_contract::request_schema(),
         query_sql,
@@ -5287,6 +5323,37 @@ mod governed_sql_tests {
     }
 
     #[test]
+    fn saved_sql_pinned_to_a_prior_catalog_revision_fails_legibly() {
+        let valid = definition("SELECT name,id FROM records WHERE type=?1", 10);
+        validate_saved_sql(&valid).unwrap();
+        // A definition saved before the E1 M1 value-model revision must fail
+        // with the revision change and the repair named, never silently.
+        let mut stale = valid.clone();
+        stale.catalog_revision = 3;
+        let error = validate_saved_sql(&stale).unwrap_err().to_string();
+        let current = crate::query::sql_contract::LOGICAL_CATALOG_REVISION;
+        assert!(
+            error.contains("pins catalog revision 3")
+                && error.contains(&format!("active catalog is revision {current}"))
+                && error.contains("re-save the definition"),
+            "stale revision must fail legibly, got: {error}"
+        );
+    }
+
+    #[test]
+    fn saved_sql_schema_digest_mismatch_reports_the_expected_digest() {
+        let valid = definition("SELECT name,id FROM records WHERE type=?1", 10);
+        validate_saved_sql(&valid).expect("fixture digest is current");
+        let mut wrong_digest = valid.clone();
+        wrong_digest.output.schema_sha256 = "0".repeat(64);
+        let error = validate_saved_sql(&wrong_digest).unwrap_err().to_string();
+        let expected = saved_sql_schema_sha256(&wrong_digest.output.columns).unwrap();
+        assert!(error.contains("output schema digest mismatch"), "{error}");
+        assert!(error.contains(&expected), "{error}");
+        assert!(error.contains(&"0".repeat(64)), "{error}");
+    }
+
+    #[test]
     fn saved_sql_receipt_folds_best_effort_dependency_completeness() {
         let mut definition = definition(
             "SELECT r.name,r.id FROM records r WHERE r.type=?1 AND EXISTS (SELECT 1 FROM agent_activity a WHERE a.activity_id=r.id)",
@@ -5314,6 +5381,8 @@ mod governed_sql_tests {
             rows: vec![],
             row_count: 0,
             truncated: false,
+            truncation_hint: None,
+            as_of_seq: 17,
         };
         let output = finish_saved_sql(
             &definition,
@@ -5343,6 +5412,7 @@ mod governed_sql_tests {
             "native.semantic.agent_activity"
         );
         assert_eq!(output["columns"], json!(["name", "id"]));
+        assert_eq!(output["as_of_seq"], 17);
 
         let boolean_columns = vec![
             SavedSqlColumn {
@@ -5382,6 +5452,8 @@ mod governed_sql_tests {
                 rows: vec![json!({"appears_active":1,"id":"activity"})],
                 row_count: 1,
                 truncated: false,
+                truncation_hint: None,
+                as_of_seq: 17,
             },
         )
         .unwrap();
@@ -5395,6 +5467,8 @@ mod governed_sql_tests {
             ],
             row_count: 2,
             truncated: false,
+            truncation_hint: None,
+            as_of_seq: 17,
         };
         let mut one_row = definition;
         one_row.bounds.rows = 1;
@@ -5466,9 +5540,14 @@ mod governed_sql_tests {
             .await
             .unwrap();
 
-        crate::control::ensure_agent_run(&db, "scout-chair-a748b2", "hidden-account")
-            .await
-            .unwrap();
+        crate::control::ensure_agent_run(
+            &db,
+            "scout-chair-a748b2",
+            "hidden-account",
+            crate::control::ReportedRunIdentity::default(),
+        )
+        .await
+        .unwrap();
         replace_explicit_policy(
             &db,
             "agent:test",
@@ -6046,7 +6125,7 @@ mod scan_record_path_tests {
     }
 }
 
-/// Scalability guardrails for `scan`.
+/// Scalability guardrails for scoped queries.
 ///
 /// `scan` used to expand a scope subtree into one host variable per id and to
 /// authorize every corpus, provenance, link and child row with its own
@@ -6275,6 +6354,102 @@ mod scan_scalability_tests {
             .iter()
             .map(|sample| sample["id"].as_str().expect("sample id").to_string())
             .collect()
+    }
+
+    #[tokio::test]
+    async fn scoped_search_infix_survives_a_corpus_wider_than_the_variable_limit() {
+        const CORPUS: usize = 600;
+        const LOWERED_LIMIT: i32 = 500;
+        let db = create_database(":memory:").await.unwrap();
+        let scope = folder(&db, "Holding folder", None).await;
+        replace_explicit_policy(
+            &db,
+            "test:policy",
+            &scope,
+            vec![AllowEntry::account("acct:viewer", Capability::View)],
+        )
+        .await
+        .unwrap();
+        let mut ids = vec![scope.clone()];
+        for index in 0..CORPUS {
+            ids.push(note(&db, &format!("CamelRecallTarget{index:04}"), &scope).await);
+        }
+        // These sort before the valid matches. Neither visibility nor archive
+        // exclusion may be postponed until after the near-miss row cap.
+        let hidden = note(&db, "CamelRecallA", &scope).await;
+        replace_explicit_policy(&db, "test:policy", &hidden, vec![])
+            .await
+            .unwrap();
+        let archived = note(&db, "CamelRecallB", &scope).await;
+        archive(&db, &archived).await;
+        let outside = note(&db, "CamelRecallC", "native:unfiled").await;
+        replace_explicit_policy(
+            &db,
+            "test:policy",
+            &outside,
+            vec![AllowEntry::account("acct:viewer", Capability::View)],
+        )
+        .await
+        .unwrap();
+
+        let (trace, default_limit) = PoolTrace::install(&db, Some(LOWERED_LIMIT)).await;
+        assert!(default_limit > LOWERED_LIMIT);
+        assert!(scalar_in_list_error(&db, &ids)
+            .await
+            .contains("too many SQL variables"));
+        trace.reset(&db).await;
+        let result = search(
+            db.clone(),
+            Caller::authenticated("acct:viewer"),
+            json!({ "scope": scope, "query": "camel recall" }),
+        )
+        .await
+        .expect("thin scoped search must not expand the subtree into host variables");
+        assert_eq!(result["hits"], json!([]));
+        let infix = result["near_misses"]["name_infix"].as_array().unwrap();
+        assert_eq!(infix.len(), NEAR_MISS_CAP as usize);
+        assert_eq!(
+            infix
+                .iter()
+                .map(|hit| hit["id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ids[1..=NEAR_MISS_CAP as usize]
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+        );
+
+        // The lower-level API also accepts type sets. Their width must not
+        // consume the bind budget alongside the scope (duplicates are valid
+        // set input and should not alter membership).
+        let typed = fts::name_infix(
+            &db,
+            "acct:viewer",
+            true,
+            "camel recall",
+            &FtsOptions {
+                scope: Some(scope),
+                types: vec!["Document".into(); CORPUS],
+                limit: Some(NEAR_MISS_CAP),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            typed.iter().map(|hit| hit.id.as_str()).collect::<Vec<_>>(),
+            ids[1..=NEAR_MISS_CAP as usize]
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+        );
+        let work = trace.finish(&db).await;
+        eprintln!("scoped infix search: {CORPUS} records, {work:?}");
+        assert!(
+            work.max_bind_parameters < LOWERED_LIMIT as usize,
+            "{work:?}"
+        );
+        db.close().await;
     }
 
     #[tokio::test]

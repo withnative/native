@@ -36,12 +36,16 @@ mod contribution_provenance;
 mod embed_seam;
 #[path = "records/identity.rs"]
 mod identity;
+#[path = "records/inbox_snapshot_batching.rs"]
+mod inbox_snapshot_batching;
 #[path = "records/interpretive_claims.rs"]
 mod interpretive_claims;
 #[path = "records/interventions.rs"]
 mod interventions;
 #[path = "records/member_destinations.rs"]
 mod member_destinations;
+#[path = "records/mentions.rs"]
+mod mentions;
 #[path = "records/message_expectation.rs"]
 mod message_expectation;
 #[path = "records/message_first_conversations.rs"]

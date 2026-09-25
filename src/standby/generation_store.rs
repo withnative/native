@@ -13,7 +13,7 @@ use crate::standby_snapshot::{ObservedInstalledConsumerIdentity, StandbySnapshot
 const POINTER_CONTRACT: &str = "native.standby-current-pointer.v1";
 const STARTUP_STATE_CONTRACT: &str = "native.standby-startup-state.v1";
 
-const SEQUENCED_LOGS: &[&str] = &[
+pub(crate) const SEQUENCED_LOGS: &[&str] = &[
     "content_events",
     "policy_events",
     "awareness_events",
@@ -25,7 +25,7 @@ const SEQUENCED_LOGS: &[&str] = &[
     "derivation_events",
     "relationship_events",
 ];
-const UNSEQUENCED_APPEND_ONLY: &[&str] = &[
+pub(crate) const UNSEQUENCED_APPEND_ONLY: &[&str] = &[
     "content_event_sources",
     "replicated_message_provenance",
     "destination_message_ingest",
@@ -46,7 +46,7 @@ const UNSEQUENCED_APPEND_ONLY: &[&str] = &[
 ];
 // These physical domains have no ratified successor log/fold. Until one exists
 // a refresh may not silently replace them.
-const UNFENCED_EXACT: &[&str] = &["storage_portability_policy"];
+pub(crate) const UNFENCED_EXACT: &[&str] = &["storage_portability_policy"];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PublishTransition {
@@ -167,6 +167,54 @@ impl GenerationStore {
 
     pub fn staging_dir(&self) -> PathBuf {
         self.root.join("staging")
+    }
+
+    /// Resolve the immutable generation named by the durable pointer without
+    /// hashing or opening its database. This is the no-op refresh hot path;
+    /// a generation returned here is identity/pointer checked but is not yet a
+    /// trusted delta base.
+    pub(super) fn current_for_head_probe(&self) -> Result<Option<InstalledGeneration>> {
+        let pointer = match self.read_pointer() {
+            Ok(pointer) => pointer,
+            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(None)
+            }
+            Err(error) => return Err(error),
+        };
+        let generation = self.verify_generation_identity(&pointer.generation_id)?;
+        if generation.manifest.snapshot.sha256 != pointer.snapshot_sha256 {
+            return Err(Error::engine(
+                "standby current pointer digest does not match its generation",
+            ));
+        }
+        Ok(Some(generation))
+    }
+
+    /// Resolve and fully verify the generation named by the durable pointer
+    /// immediately before a delta refresh clones it. A missing pointer is the ordinary
+    /// first-install case; malformed or unusable pointed state remains an
+    /// error so the controller can take the independently verified snapshot
+    /// path without treating untrusted bytes as a delta base.
+    pub(super) async fn current_for_refresh(
+        &self,
+        observed: &ObservedInstalledConsumerIdentity,
+    ) -> Result<Option<InstalledGeneration>> {
+        let pointer = match self.read_pointer() {
+            Ok(pointer) => pointer,
+            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(None)
+            }
+            Err(error) => return Err(error),
+        };
+        let generation = self
+            .verify_generation_for_startup(&pointer.generation_id, observed)
+            .await?;
+        if generation.manifest.snapshot.sha256 != pointer.snapshot_sha256 {
+            return Err(Error::engine(
+                "standby current pointer digest does not match its generation",
+            ));
+        }
+        Ok(Some(generation))
     }
 
     /// Inspect accepted generations for status disclosure without changing the
@@ -580,6 +628,18 @@ impl GenerationStore {
         id: &str,
         observed: &ObservedInstalledConsumerIdentity,
     ) -> Result<InstalledGeneration> {
+        let generation = self.verify_generation_identity(id)?;
+        verify_snapshot(
+            &generation.snapshot_path,
+            &generation.manifest,
+            Some(observed),
+            &self.staging_dir(),
+        )
+        .await?;
+        Ok(generation)
+    }
+
+    fn verify_generation_identity(&self, id: &str) -> Result<InstalledGeneration> {
         if !is_generation_id(id) {
             return Err(Error::engine("invalid standby generation id"));
         }
@@ -600,13 +660,6 @@ impl GenerationStore {
             ));
         }
         let snapshot_path = directory.join("snapshot.db");
-        verify_snapshot(
-            &snapshot_path,
-            &manifest,
-            Some(observed),
-            &self.staging_dir(),
-        )
-        .await?;
         Ok(InstalledGeneration {
             id: id.to_string(),
             snapshot_path,
@@ -1650,10 +1703,24 @@ mod tests {
         let divergent = directory.path().join("divergent.db");
         fs::copy(&current, &divergent).unwrap();
         let mut conn = open_raw(&divergent).await;
+        // content_events is append-only by trigger, so the divergence fixture
+        // drops the update guard and restores it verbatim around the mutation:
+        // the verifier must reject the divergent payload, not a missing guard.
+        let update_guard: String = sqlx::query_scalar(
+            "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='content_events_no_update'",
+        )
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+        sqlx::query("DROP TRIGGER content_events_no_update")
+            .execute(&mut conn)
+            .await
+            .unwrap();
         sqlx::query("UPDATE content_events SET payload='{}' WHERE seq=1")
             .execute(&mut conn)
             .await
             .unwrap();
+        sqlx::query(&update_guard).execute(&mut conn).await.unwrap();
         conn.close().await.unwrap();
         let error = verify_database_successor(&current, &divergent)
             .await

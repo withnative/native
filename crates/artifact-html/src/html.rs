@@ -45,6 +45,7 @@ pub const BRIDGE_VERSION: &str = "native.html.bridge.v1";
 /// delivery; the host later turns the same values into the shared named-input
 /// envelopes used by native.mdx.v2.
 pub const MANIFEST_SCHEMA: &str = "native.html.artifact.v1";
+pub const INTERACTIVE_MANIFEST_SCHEMA: &str = "native.html.artifact.v2";
 pub const NAMED_INPUT_ABI: &str = "native.named-artifact-input.v1";
 pub const COLLECTION_ENVELOPE: &str = "native.collection-envelope.v1";
 pub const GROUPED_COUNT_ENVELOPE: &str = "native.grouped-count-envelope.v1";
@@ -79,18 +80,101 @@ const PERMISSIONS_POLICY: &str = "camera=(), microphone=(), geolocation=(), disp
 /// cannot fabricate host navigation/slide messages by posting at the parent.
 const BOOTSTRAP: &str = r#"(()=>{"use strict";
 const HOST=__NATIVE_WORKBENCH_ORIGIN__, VERSION="native.html.bridge.v1";
-const apply=Reflect.apply,own=Object.getOwnPropertyDescriptor,parentOf=Object.getPrototypeOf,define=Object.defineProperty,freezeObject=Object.freeze,objectKeys=Object.keys,isFrozen=Object.isFrozen,NativeString=String,arrayPush=Array.prototype.push,arrayIndexOf=Array.prototype.indexOf,arraySplice=Array.prototype.splice;
+const apply=Reflect.apply,own=Object.getOwnPropertyDescriptor,parentOf=Object.getPrototypeOf,define=Object.defineProperty,freezeObject=Object.freeze,objectKeys=Object.keys,isFrozen=Object.isFrozen,NativeString=String,arrayPush=Array.prototype.push,arrayIndexOf=Array.prototype.indexOf,arraySplice=Array.prototype.splice,arrayIncludes=Array.prototype.includes;
 const getter=(proto,name)=>{for(let current=proto;current;current=parentOf(current)){const descriptor=own(current,name);if(descriptor?.get)return descriptor.get}};
 const read=(nativeGetter,value)=>apply(nativeGetter,value,[]),eventAdd=EventTarget.prototype.addEventListener,eventRemove=EventTarget.prototype.removeEventListener,eventPrevent=Event.prototype.preventDefault,eventStop=Event.prototype.stopImmediatePropagation,portPost=MessagePort.prototype.postMessage,portStart=MessagePort.prototype.start,elementClosest=Element.prototype.closest,elementAttribute=Element.prototype.getAttribute;
-const pristineEvent=new Event("native-html-bootstrap"),messageData=getter(MessageEvent.prototype,"data"),messageSource=getter(MessageEvent.prototype,"source"),messageOrigin=getter(MessageEvent.prototype,"origin"),messagePorts=getter(MessageEvent.prototype,"ports"),eventTarget=getter(Event.prototype,"target"),eventTrusted=own(pristineEvent,"isTrusted")?.get||getter(Event.prototype,"isTrusted"),eventPrevented=getter(Event.prototype,"defaultPrevented"),nodeType=getter(Node.prototype,"nodeType"),keyValue=getter(KeyboardEvent.prototype,"key"),shiftValue=getter(KeyboardEvent.prototype,"shiftKey"),pageTransitionPersisted=getter(PageTransitionEvent.prototype,"persisted");
+const pristineEvent=new Event("native-html-bootstrap"),messageData=getter(MessageEvent.prototype,"data"),messageSource=getter(MessageEvent.prototype,"source"),messageOrigin=getter(MessageEvent.prototype,"origin"),messagePorts=getter(MessageEvent.prototype,"ports"),eventTarget=getter(Event.prototype,"target"),eventTrusted=own(pristineEvent,"isTrusted")?.get||getter(Event.prototype,"isTrusted"),eventPrevented=getter(Event.prototype,"defaultPrevented"),nodeType=getter(Node.prototype,"nodeType"),keyValue=getter(KeyboardEvent.prototype,"key"),shiftValue=getter(KeyboardEvent.prototype,"shiftKey"),mouseCtrl=getter(MouseEvent.prototype,"ctrlKey"),mouseMeta=getter(MouseEvent.prototype,"metaKey"),mouseButton=getter(MouseEvent.prototype,"button"),pageTransitionPersisted=getter(PageTransitionEvent.prototype,"persisted"),eventType=getter(Event.prototype,"type"),keyRepeat=getter(KeyboardEvent.prototype,"repeat");
 const listen=(target,type,listener,options)=>apply(eventAdd,target,[type,listener,options]),unlisten=(target,type,listener,options)=>apply(eventRemove,target,[type,listener,options]),prevent=event=>apply(eventPrevent,event,[]),stop=event=>apply(eventStop,event,[]),post=(port,value,transfer)=>apply(portPost,port,transfer?[value,transfer]:[value]),start=port=>apply(portStart,port,[]),isElement=value=>!!value&&read(nodeType,value)===1,attribute=(element,name)=>apply(elementAttribute,element,[name]),closest=(element,selector)=>apply(elementClosest,element,[selector]),trusted=event=>!!eventTrusted&&read(eventTrusted,event)===true,prevented=event=>!!eventPrevented&&read(eventPrevented,event)===true;
-let channel=null, initialized=false, current=0, slides=[], queued=[], heldInput, heldSeq=null, heldDigest, inputSubscribers=[];
+let channel=null, initialized=false, current=0, slides=[], queued=[], heldInput, heldSeq=null, heldDigest, heldViewState, inputSubscribers=[];
 let resolveReady, rejectReady;
 const ready=new Promise((resolve,reject)=>{resolveReady=resolve;rejectReady=reject});
-const propose=intent=>{if(!intent||typeof intent!=="object"||Array.isArray(intent))throw new TypeError("artifact intent must be an object");send({version:VERSION,type:"intent",intent});};
+const jsonStringify=JSON.stringify,jsonParse=JSON.parse,isArray=Array.isArray,NativePromise=Promise,pendingIntents=Object.create(null);let pendingIntentCount=0;
+/* Disarm on a macrotask, not a microtask. Chromium runs a microtask checkpoint
+   between a capture listener and the target listener, so a microtask disarm
+   cleared the flag before the author's own click handler ran. The consumed flag
+   still bounds the event at one proposal. */
+const setTimer=setTimeout,requestFrame=requestAnimationFrame;
+const intentId=value=>typeof value==="string"&&value.length>0&&value.length<=128&&value.trim()===value&&!/[\u0000-\u001f\u007f]/.test(value);
+const intentMap=value=>!!value&&typeof value==="object"&&!isArray(value)&&objectKeys(value).length<=32;
+/* Layer 1 of the activation gate, mirroring navigation's trusted-click runtime.
+   Only the event that COMPLETES a gesture may arm a proposal. A mouse click, a
+   touch tap, and Enter/Space on a control each dispatch exactly one trusted
+   click; an HTML5 drag dispatches exactly one trusted drop. Arming on every
+   event in the sequence instead (pointerdown/mousedown/pointerup/mouseup/click)
+   admitted five proposals for one physical click. Message/load/focus/submit are
+   deliberately absent: postMessage, requestSubmit() and focus() all dispatch
+   trusted events, so admitting them would hand author code the gesture it must
+   not have. A proposal made while unarmed is NOT refused: it is sent marked as
+   not gesture-backed, and the host routes it to the Apply tray. The mark is a
+   frame-supplied claim, so the host treats it as necessary but never
+   sufficient. */
+const gestureEvents=["click","drop"];
+let gestureArmed=false,gestureUsed=false,keyRepeating=false;
+const releaseGesture=()=>{gestureArmed=false;gestureUsed=false};
+/* `gestureArmed` also bounds a single physical action that dispatches more than
+   one terminal event in one task: a click on a label[for] dispatches a trusted
+   click on the label and a synthesised trusted click on its control. Re-arming
+   on the second would reset the consumed flag, so an armed gesture stays armed
+   until its macrotask release. Separate gestures are separate tasks, so the
+   release has always run before the next one. */
+const armGesture=event=>{if(!trusted(event))return;const type=read(eventType,event);if(!apply(arrayIncludes,gestureEvents,[type]))return;if(type==="click"&&keyRepeating)return;if(gestureArmed)return;gestureArmed=true;gestureUsed=false;setTimer(releaseGesture,0)};
+for(const name of gestureEvents)listen(window,name,armGesture,true);
+/* A held key autorepeats trusted keydown, and on a control each repeat also
+   dispatches a trusted click. Track the repeat state so only the click from the
+   initial press arms; a fresh pointer gesture clears it. */
+const trackKeyRepeat=event=>{if(!trusted(event))return;keyRepeating=read(keyRepeat,event)===true};
+const clearKeyRepeat=event=>{if(trusted(event))keyRepeating=false};
+listen(window,"keydown",trackKeyRepeat,true);
+listen(window,"keyup",clearKeyRepeat,true);
+for(const name of ["pointerdown","mousedown","touchstart"])listen(window,name,clearKeyRepeat,true);
+/* A refused proposal is reported through the existing diagnostic channel so an
+   author can see why a control did nothing instead of a bare console exception.
+   Only a bounded reason code crosses the bridge -- the host owns the wording.
+   Throttled to one report per 250ms and 16 per frame, so a loop cannot flood
+   the host. The thrown TypeError is unchanged; this is an addition. Only a
+   malformed, duplicate or oversized proposal is refused: a well-formed proposal
+   made outside a completed gesture is still sent, marked as not gesture-backed,
+   and the host routes it to the Apply tray rather than committing it. */
+let refusalReported=false,refusalReports=0;
+const reportBoundedRefusal=(code,reason)=>{if(refusalReports>=16||refusalReported)return;refusalReported=true;refusalReports+=1;setTimer(()=>{refusalReported=false},250);report(code,{reason})};
+const refuseProposal=(reason,message)=>{reportBoundedRefusal("html_intent_refused",reason);throw new TypeError(message)};
+const propose=intent=>{const backed=gestureArmed&&!gestureUsed;if(backed)gestureUsed=true;if(!intent||typeof intent!=="object"||isArray(intent)||objectKeys(intent).some(key=>!["request_id","entry_id","slots","values"].includes(key)))refuseProposal("malformed","artifact intent contains unsupported fields");const request_id=intent.request_id,entry_id=intent.entry_id,slots=intent.slots??{},values=intent.values??{};if(!intentId(request_id)||!intentId(entry_id)||!intentMap(slots)||!intentMap(values)||objectKeys(slots).some(key=>!intentId(key)||typeof slots[key]!=="string"||slots[key].length>256)||objectKeys(values).some(key=>!intentId(key)))refuseProposal("malformed","artifact intent is malformed");if(own(pendingIntents,request_id)||pendingIntentCount>=32)refuseProposal("duplicate","artifact intent request is duplicate or queue is full");const encoded=jsonStringify({request_id,entry_id,slots,values});if(encoded.length>65536)refuseProposal("too_large","artifact intent exceeds bridge limit");const payload=jsonParse(encoded);return new NativePromise((resolve,reject)=>{pendingIntents[request_id]={resolve,reject};pendingIntentCount+=1;try{send({version:VERSION,type:"intent",intent:payload,gesture_backed:backed})}catch(error){delete pendingIntents[request_id];pendingIntentCount-=1;reject(error)}})};
+const settleIntent=data=>{if(!intentId(data.request_id)||!own(pendingIntents,data.request_id)||!data.result||typeof data.result!=="object"||isArray(data.result))return;let result;try{const encoded=jsonStringify(data.result);if(encoded.length>65536)return;result=freeze(jsonParse(encoded))}catch{return}const pending=pendingIntents[data.request_id];delete pendingIntents[data.request_id];pendingIntentCount-=1;pending.resolve(result)};
+/* Eager view-state publish for the successor frame. A body change is a new
+   document, so no framework state survives it; the frame hands its own view
+   state (open tab, expanded rows, wizard step) to the host, which holds the
+   opaque blob and delivers it in the successor's init before first paint.
+   Validated like propose() so authors get a synchronous TypeError at the call
+   site rather than silent loss: the value must survive a pristine JSON
+   round-trip and fit the same 65536 bound, and the optional schema is an
+   advisory intent id. Coalesced to at most one posted message per animation
+   frame, latest wins, so a per-keystroke publisher costs one message a frame.
+   There is deliberately no acknowledgement and no bounded wait: no host
+   decision rides on this message, so it adds no wall-clock liveness surface.
+   If it is lost the successor cold-boots, which is today's behaviour. Before
+   the port opens it takes one reserved slot in `queued`, collapsing onto any
+   view state already waiting there, so it cannot exhaust the 32-slot buffer.
+   Refusals share propose()'s single throttled refusal budget rather than
+   arming a second timer: one budget for artifact misbehaviour, and no new
+   wall-clock surface on this path. */
+const refuseViewState=(reason,message)=>{reportBoundedRefusal("html_view_state_refused",reason);throw new TypeError(message)};
+const sendViewState=value=>{if(channel)post(channel,value);else{for(let index=0;index<queued.length;index+=1){if(queued[index]&&queued[index].type==="view-state"){queued[index]=value;return}}if(queued.length<32)pushValue(queued,value)}};
+let pendingViewState=null,viewStateScheduled=false;
+const flushViewState=()=>{viewStateScheduled=false;const message=pendingViewState;pendingViewState=null;if(message)sendViewState(message)};
+const setViewState=(value,options)=>{let schema;if(options!==undefined){if(!options||typeof options!=="object"||isArray(options))refuseViewState("malformed","view state options must be an object");if(objectKeys(options).some(key=>key!=="schema"))refuseViewState("malformed","view state options contain unsupported fields");const givenSchema=options.schema;if(givenSchema!==undefined){if(!intentId(givenSchema))refuseViewState("malformed","view state schema must be an intent id");schema=givenSchema}}let encoded;try{encoded=jsonStringify(value)}catch{refuseViewState("malformed","view state must be JSON-serializable")}if(typeof encoded!=="string")refuseViewState("malformed","view state must be JSON-serializable");if(encoded.length>65536)refuseViewState("too_large","view state exceeds bridge limit");const payload=jsonParse(encoded);pendingViewState={version:VERSION,type:"view-state",view_state:schema===undefined?{value:payload}:{value:payload,schema}};if(!viewStateScheduled){viewStateScheduled=true;if(typeof requestFrame==="function")apply(requestFrame,window,[flushViewState]);else flushViewState()}};
 const pushValue=(array,value)=>apply(arrayPush,array,[value]),indexOfValue=(array,value)=>apply(arrayIndexOf,array,[value]),spliceValue=(array,start,deleteCount)=>apply(arraySplice,array,[start,deleteCount]);
+/* On-request reads. Offered only for the needs the host lists in its init,
+   so a host without the capability refuses at the call site instead of
+   leaving a promise that never settles. The frame names a need and bounded
+   params; the host decides, re-checking consent and the viewer's authority
+   on every request, and answers with {status, code, need, result}. At most
+   8 reads in flight; params are bounded like proposals. */
+let offeredNeeds=[],pendingReadCount=0,readSeq=0;const pendingReads=Object.create(null);
+const refuseRead=(reason,message)=>{reportBoundedRefusal("html_read_refused",reason);throw new TypeError(message)};
+const readNeed=(need,params)=>{if(!intentId(need)||!apply(arrayIncludes,offeredNeeds,[need]))refuseRead("undeclared","this host offers no such read");const given=params===undefined?{}:params;if(!given||typeof given!=="object"||isArray(given))refuseRead("malformed","read params must be an object");let encoded;try{encoded=jsonStringify(given)}catch{refuseRead("malformed","read params must be JSON-serializable")}if(typeof encoded!=="string"||encoded.length>4096)refuseRead("too_large","read params exceed bridge limit");if(pendingReadCount>=8)refuseRead("busy","too many reads in flight");readSeq+=1;const request_id="read-"+readSeq;const payload=jsonParse(encoded);return new NativePromise((resolve,reject)=>{pendingReads[request_id]={resolve,reject};pendingReadCount+=1;try{send({version:VERSION,type:"read",request_id,need,params:payload})}catch(error){delete pendingReads[request_id];pendingReadCount-=1;reject(error)}})};
+const settleRead=data=>{if(typeof data.request_id!=="string"||!own(pendingReads,data.request_id))return;let answer;try{const encoded=jsonStringify({status:data.status,code:data.code,need:data.need,result:data.result});answer=encoded.length>1048576?freezeObject({status:"unavailable",code:"too_large"}):freeze(jsonParse(encoded))}catch{answer=freezeObject({status:"unavailable",code:"malformed"})}const pending=pendingReads[data.request_id];delete pendingReads[data.request_id];pendingReadCount-=1;pending.resolve(answer)};
 const onInput=callback=>{if(typeof callback!=="function")throw new TypeError("input subscriber must be a function");pushValue(inputSubscribers,callback);return()=>{const index=indexOfValue(inputSubscribers,callback);if(index>=0)spliceValue(inputSubscribers,index,1)}};
-define(window,"nativeArtifact",{value:freezeObject({ready,propose,onInput,get input(){return heldInput}}),writable:false,configurable:false});
+define(window,"nativeArtifact",{value:freezeObject({ready,propose,read:readNeed,onInput,setViewState,get input(){return heldInput},get viewState(){return heldViewState}}),writable:false,configurable:false});
 const bounded=value=>NativeString(value??"").slice(0,512);
 const send=value=>{if(channel)post(channel,value);else if(queued.length<32)pushValue(queued,value)};
 const report=(code,detail={})=>send({version:VERSION,type:"diagnostic",code,detail});
@@ -105,8 +189,11 @@ function interactive(target){return isElement(target)&&!!closest(target,"input,t
 function show(index){if(!slides.length)return;current=Math.max(0,Math.min(index,slides.length-1));slides.forEach((slide,i)=>{slide.hidden=i!==current;slide.setAttribute("aria-hidden",NativeString(i!==current))});let live=document.getElementById("native-slide-status");if(!live){live=document.createElement("div");live.id="native-slide-status";live.setAttribute("role","status");live.setAttribute("aria-live","polite");live.style.cssText="position:fixed;width:1px;height:1px;overflow:hidden;clip-path:inset(50%)";document.body.append(live)}live.textContent=`Slide ${current+1} of ${slides.length}`;dispatchEvent(new CustomEvent("native:slidechange",{detail:freezeObject({index:current,number:current+1,total:slides.length,id:slides[current].id})}));send({version:VERSION,type:"slidechange",index:current,total:slides.length})}
 function command(action){if(action==="first")show(0);else if(action==="previous")show(current-1);else if(action==="next")show(current+1);else if(action==="last")show(slides.length-1)}
 function setupSlides(){const deck=document.querySelector("main[data-native-deck]");if(!deck)return;slides=[...deck.children].filter(node=>node.matches("section[data-native-slide]"));show(0);listen(window,"keydown",event=>{const target=read(eventTarget,event),key=read(keyValue,event),shift=read(shiftValue,event);if(prevented(event)||interactive(target))return;const backwards=key==="ArrowLeft"||key==="PageUp"||(key===" "&&shift);const forwards=key==="ArrowRight"||key==="PageDown"||(key===" "&&!shift);if(backwards||forwards||key==="Home"||key==="End"){prevent(event);command(key==="Home"?"first":key==="End"?"last":backwards?"previous":"next")}},true)}
-listen(window,"click",event=>{if(!trusted(event)||prevented(event))return;const target=read(eventTarget,event),link=isElement(target)?closest(target,"[data-native-record-id],[data-native-external-url]"):null;if(!link)return;prevent(event);send({version:VERSION,type:"navigation",recordId:attribute(link,"data-native-record-id"),href:attribute(link,"data-native-external-url")})},true);
-function receive(event){const data=read(messageData,event),ports=read(messagePorts,event);if(initialized||read(messageSource,event)!==parent||read(messageOrigin,event)!==HOST||data?.type!=="native-html-init"||data?.version!==VERSION||ports.length!==1)return;stop(event);initialized=true;unlisten(window,"message",receive,true);channel=ports[0];listen(channel,"message",message=>{const commandData=read(messageData,message);if(commandData?.version!==VERSION)return;if(commandData?.type==="command"&&["first","previous","next","last"].includes(commandData.action))command(commandData.action);else if(commandData?.type==="input")deliverInput(commandData)});start(channel);for(const item of queued)post(channel,item);queued=[];listen(window,"pagehide",event=>{if(trusted(event)&&read(pageTransitionPersisted,event)!==true)send({version:VERSION,type:"unloading"})},true);try{const input=freeze(data.input);heldInput=input;if(typeof data.input_digest==="string")heldDigest=data.input_digest;const initRevision=data.revision;if(initRevision&&typeof initRevision==="object"&&typeof initRevision.content_event_seq==="number")heldSeq=initRevision.content_event_seq;setupSlides();resolveReady(freezeObject({input}));send({version:VERSION,type:"ready",profile:slides.length?"slides":"document",slides:slides.length})}catch(error){rejectReady(error);report("html_delivery_failed",{message:bounded(error)})}}
+function navigationDisposition(event){return read(mouseCtrl,event)===true||read(mouseMeta,event)===true}
+function navigationMessage(link,newTab){const message={version:VERSION,type:"navigation",recordId:attribute(link,"data-native-record-id"),href:attribute(link,"data-native-external-url")};if(newTab===true)message.newTab=true;return message}
+listen(window,"click",event=>{if(!trusted(event)||prevented(event))return;const target=read(eventTarget,event),link=isElement(target)?closest(target,"[data-native-record-id],[data-native-external-url]"):null;if(!link)return;prevent(event);send(navigationMessage(link,navigationDisposition(event)))},true);
+listen(window,"auxclick",event=>{if(!trusted(event)||prevented(event))return;if(read(mouseButton,event)!==1)return;const target=read(eventTarget,event),link=isElement(target)?closest(target,"[data-native-record-id],[data-native-external-url]"):null;if(!link)return;prevent(event);send(navigationMessage(link,true))},true);
+function receive(event){const data=read(messageData,event),ports=read(messagePorts,event);if(initialized||read(messageSource,event)!==parent||read(messageOrigin,event)!==HOST||data?.type!=="native-html-init"||data?.version!==VERSION||ports.length!==1)return;stop(event);initialized=true;unlisten(window,"message",receive,true);channel=ports[0];listen(channel,"message",message=>{const commandData=read(messageData,message);if(commandData?.version!==VERSION)return;if(commandData?.type==="command"&&["first","previous","next","last"].includes(commandData.action))command(commandData.action);else if(commandData?.type==="input")deliverInput(commandData);else if(commandData?.type==="intent-result")settleIntent(commandData);else if(commandData?.type==="read-result")settleRead(commandData)});start(channel);listen(window,"pagehide",event=>{if(trusted(event)&&read(pageTransitionPersisted,event)!==true)send({version:VERSION,type:"unloading"})},true);try{if(isArray(data.needs))for(const need of data.needs)if(intentId(need)&&offeredNeeds.length<32)pushValue(offeredNeeds,need);const input=freeze(data.input);heldInput=input;if(typeof data.input_digest==="string")heldDigest=data.input_digest;const initRevision=data.revision;if(initRevision&&typeof initRevision==="object"&&typeof initRevision.content_event_seq==="number")heldSeq=initRevision.content_event_seq;const incomingViewState=data.view_state;if(incomingViewState&&typeof incomingViewState==="object"&&!isArray(incomingViewState)&&"value"in incomingViewState){const envelope={value:incomingViewState.value};if(incomingViewState.schema!==undefined)envelope.schema=incomingViewState.schema;if(incomingViewState.from_body_digest!==undefined)envelope.from_body_digest=incomingViewState.from_body_digest;heldViewState=freeze(envelope)}setupSlides();resolveReady(heldViewState===undefined?freezeObject({input}):freezeObject({input,viewState:heldViewState}));send({version:VERSION,type:"ready",profile:slides.length?"slides":"document",slides:slides.length});for(const item of queued)post(channel,item);queued=[]}catch(error){rejectReady(error);report("html_delivery_failed",{message:bounded(error)})}}
 listen(window,"message",receive,true);
 const hostPost=parent.postMessage;apply(hostPost,parent,[{type:"native-html-bootstrap",version:VERSION},HOST]);
 })();"#;
@@ -253,12 +340,50 @@ pub struct Manifest {
     pub artifact_ports: BTreeMap<String, Value>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capability_requests: Vec<Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub interactions: Vec<native_artifact_runtime::mdx_v2::InteractionEntry>,
     /// True when the author supplied the declaration surface, including an
     /// explicitly empty manifest. It is intentionally omitted from the
     /// serialized validation manifest because it is an implementation detail,
     /// not source data.
     #[serde(skip)]
     pub named_inputs_declared: bool,
+    /// Tier 1 write-path script diagnostics: undefined identifiers, unknown
+    /// interaction entry ids, and unknown input port reads. Always warnings;
+    /// an empty list is the ordinary state and is omitted from serialization.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<crate::write_diagnostics::WriteDiagnostic>,
+}
+
+impl Manifest {
+    /// The shared, runtime-neutral host interaction declaration. HTML has no
+    /// module graph; its input ports and entries use the same executor schema.
+    pub fn interaction_manifest(&self) -> native_artifact_runtime::mdx_v2::ArtifactManifest {
+        native_artifact_runtime::mdx_v2::ArtifactManifest {
+            schema: INTERACTIVE_MANIFEST_SCHEMA.into(),
+            inputs: self
+                .artifact_ports
+                .iter()
+                .map(|(port, declaration)| {
+                    (
+                        port.clone(),
+                        serde_json::from_value(declaration.clone())
+                            .expect("validated HTML input declaration"),
+                    )
+                })
+                .collect(),
+            module_inputs: BTreeMap::new(),
+            capability_requests: self
+                .capability_requests
+                .iter()
+                .map(|request| {
+                    serde_json::from_value(request.clone())
+                        .expect("validated HTML capability request")
+                })
+                .collect(),
+            interactions: self.interactions.clone(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -297,6 +422,14 @@ struct Inspection {
     deck_slides: Vec<(String, String, bool)>,
     deck_count: usize,
     declaration_values: Vec<String>,
+    /// Element `id` values that are valid JavaScript identifiers. Browsers
+    /// expose these as named globals on `window`, so an authored script may
+    /// reference them without declaring them.
+    element_ids: Vec<String>,
+    /// Every inline `<script>` in document order, JS or not, so the raw-source
+    /// scan can pair bodies by index and recover the body offset each script
+    /// parsed at. Non-JS bodies are recorded but never analyzed.
+    scripts: Vec<crate::write_diagnostics::ScriptElement>,
 }
 
 fn attrs(handle: &Handle) -> BTreeMap<String, String> {
@@ -352,6 +485,18 @@ fn valid_port_name(value: &str) -> bool {
         && bytes
             .iter()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'_')
+}
+
+/// Element `id` values become named properties on `window` in every browser,
+/// so only an id that is itself a valid JavaScript identifier can be read as a
+/// bare identifier.
+fn valid_js_identifier(value: &str) -> bool {
+    let mut bytes = value.bytes();
+    let Some(first) = bytes.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == b'_' || first == b'$')
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'$')
 }
 
 fn valid_sha256(value: &str) -> bool {
@@ -473,13 +618,18 @@ fn valid_input_declaration(value: &Value) -> bool {
     }
 }
 
-type ParsedNamedDeclaration = (BTreeMap<String, Value>, Vec<Value>, bool);
+type ParsedNamedDeclaration = (
+    BTreeMap<String, Value>,
+    Vec<Value>,
+    Vec<native_artifact_runtime::mdx_v2::InteractionEntry>,
+    bool,
+);
 
 fn parse_named_declaration(
     values: &[String],
 ) -> std::result::Result<ParsedNamedDeclaration, ValidationFailure> {
     if values.is_empty() {
-        return Ok((BTreeMap::new(), Vec::new(), false));
+        return Ok((BTreeMap::new(), Vec::new(), Vec::new(), false));
     }
     if values.len() != 1 {
         return Err(declaration_failure(
@@ -507,17 +657,19 @@ fn parse_named_declaration(
             "declaration-shape",
         )
     })?;
-    if object
-        .keys()
-        .any(|key| !matches!(key.as_str(), "schema" | "inputs" | "capability_requests"))
-        || object.len() != 3
+    let interactive =
+        object.get("schema").and_then(Value::as_str) == Some(INTERACTIVE_MANIFEST_SCHEMA);
+    if object.keys().any(|key| {
+        !matches!(key.as_str(), "schema" | "inputs" | "capability_requests")
+            && !(interactive && key == "interactions")
+    }) || object.len() != if interactive { 4 } else { 3 }
     {
         return Err(declaration_failure(
             "native HTML input declaration has unknown or missing fields",
             "declaration-fields",
         ));
     }
-    if object.get("schema").and_then(Value::as_str) != Some(MANIFEST_SCHEMA) {
+    if !interactive && object.get("schema").and_then(Value::as_str) != Some(MANIFEST_SCHEMA) {
         return Err(declaration_failure(
             format!("native HTML input declaration must use schema '{MANIFEST_SCHEMA}'"),
             "declaration-schema",
@@ -610,10 +762,27 @@ fn parse_named_declaration(
             ));
         }
     }
-    Ok((inputs, normalized_requests, true))
+    let interactions = if interactive {
+        serde_json::from_value(object["interactions"].clone()).map_err(|error| {
+            declaration_failure(
+                format!("invalid interaction declaration: {error}"),
+                "interactions",
+            )
+        })?
+    } else {
+        Vec::new()
+    };
+    let typed_inputs = serde_json::from_value(
+        serde_json::to_value(&inputs).expect("inputs serialize"),
+    )
+    .map_err(|error| declaration_failure(format!("invalid typed inputs: {error}"), "inputs"))?;
+    native_artifact_runtime::mdx_v2::validate_interactions(&interactions, &typed_inputs).map_err(
+        |failure| ValidationFailure::new(failure.code, failure.message, failure.details),
+    )?;
+    Ok((inputs, normalized_requests, interactions, true))
 }
 
-fn source_position(source: &str, byte_offset: usize) -> (usize, usize) {
+pub(crate) fn source_position(source: &str, byte_offset: usize) -> (usize, usize) {
     let before = &source[..byte_offset.min(source.len())];
     let line = before.bytes().filter(|byte| *byte == b'\n').count() + 1;
     let column = before.rsplit_once('\n').map_or_else(
@@ -658,7 +827,7 @@ fn attach_source_location(source: &str, failure: &mut ValidationFailure) {
     }
 }
 
-fn tag_end(source: &str, start: usize) -> Option<usize> {
+pub(crate) fn tag_end(source: &str, start: usize) -> Option<usize> {
     let mut quote = None;
     for (offset, byte) in source.as_bytes().get(start..)?.iter().copied().enumerate() {
         match (quote, byte) {
@@ -768,6 +937,11 @@ fn inspect_node(
     if let NodeData::Element { name, .. } = &node.data {
         let tag = name.local.to_string().to_ascii_lowercase();
         let attributes = attrs(node);
+        if let Some(id) = attributes.get("id") {
+            if valid_js_identifier(id) {
+                inspection.element_ids.push(id.clone());
+            }
+        }
         match tag.as_str() {
             "html" => {
                 inspection.html += 1;
@@ -857,6 +1031,18 @@ fn inspect_node(
                 if is_manifest {
                     inspection.declaration_values.push(text_content(node));
                 }
+                // Every inline script is listed in document order, manifest
+                // included, so the raw-source scan can pair bodies by order.
+                // The manifest is inert JSON and is marked non-executable.
+                inspection
+                    .scripts
+                    .push(crate::write_diagnostics::ScriptElement {
+                        text: text_content(node),
+                        executable: !is_manifest
+                            && crate::write_diagnostics::executable_script_type(
+                                attributes.get("type").map(String::as_str),
+                            ),
+                    });
             }
             "link" => {
                 return Err(policy(
@@ -1193,8 +1379,26 @@ pub fn validate(source: &str) -> std::result::Result<Manifest, ValidationFailure
         }
         0
     };
-    let (artifact_ports, capability_requests, named_inputs_declared) =
+    let (artifact_ports, capability_requests, interactions, named_inputs_declared) =
         parse_named_declaration(&inspection.declaration_values)?;
+    // The script pass runs last so it can name declared ports and interaction
+    // entries. It is warning-only: a finding never reaches the failure path.
+    let diagnostics = crate::write_diagnostics::html_write_diagnostics(
+        source,
+        &inspection.scripts,
+        &artifact_ports.keys().cloned().collect::<Vec<_>>(),
+        &interactions
+            .iter()
+            .map(|entry| entry.id.clone())
+            .collect::<Vec<_>>(),
+        &inspection.element_ids,
+    );
+    // Test probe: only a body with an executable script runs the pass, so a
+    // no-script body proves the fast path and a repeated body proves the cache.
+    #[cfg(test)]
+    if inspection.scripts.iter().any(|script| script.executable) {
+        crate::write_diagnostics::test_probe::note(&digest);
+    }
     Ok(Manifest {
         profile,
         body_digest: digest,
@@ -1205,7 +1409,9 @@ pub fn validate(source: &str) -> std::result::Result<Manifest, ValidationFailure
         slides,
         artifact_ports,
         capability_requests,
+        interactions,
         named_inputs_declared,
+        diagnostics,
     })
 }
 
@@ -1221,7 +1427,7 @@ fn cache_key(source: &str) -> String {
     let limits = format!(
         "{BODY_LIMIT}:{DATA_ASSET_EACH_LIMIT}:{DATA_ASSET_TOTAL_LIMIT}:{DOM_NODE_LIMIT}:{CSS_RULE_LIMIT}:{SLIDE_LIMIT}"
     );
-    let parts: [&[u8]; 9] = [
+    let parts: [&[u8]; 10] = [
         b"native.artifact-html-cache.v1",
         &body_digest,
         RUNTIME_ID.as_bytes(),
@@ -1231,6 +1437,7 @@ fn cache_key(source: &str) -> String {
         b"native-ce.html-csp@1",
         limits.as_bytes(),
         b"html5ever@0.39.0",
+        b"native-ce.html-write-diagnostics@1",
     ];
     let mut digest = Sha256::new();
     for part in parts {
@@ -1273,7 +1480,7 @@ pub fn descriptor() -> Value {
         "input_envelope_version":"native.artifact-input.v1","named_input_envelope_version":NAMED_INPUT_ABI,
         "collection_envelope_version":COLLECTION_ENVELOPE,"relation_envelope_version":RELATION_ENVELOPE,
         "bridge_version":BRIDGE_VERSION,
-        "declaration_surface":{"schema":MANIFEST_SCHEMA,"element":"script[type=application/json][id=native-artifact-manifest] or meta[name=native-artifact-manifest]","exact_source":true,"capability":"input.read"},
+        "declaration_surface":{"schema":MANIFEST_SCHEMA,"interactive_schema":INTERACTIVE_MANIFEST_SCHEMA,"element":"script[type=application/json][id=native-artifact-manifest] or meta[name=native-artifact-manifest]","exact_source":true,"capability":"input.read"},
         "execution_profile":"sandboxed-browser","profiles":["document","slides"],
         "requested_capabilities":["inline-script","inline-style","data-image","data-font","exact-input-read","host-mediated-navigation","host-mediated-write-proposal","host-fullscreen","ephemeral-render-verification"],
         "output_surface":"workbench.isolated-html-frame","diagnostic_format":"native.artifact-diagnostic.v1",
@@ -1896,6 +2103,485 @@ mod tests {
     }
 
     #[test]
+    fn write_diagnostics_flag_an_undefined_identifier_at_its_body_position() {
+        // The `taskClientNames` case from commit 3c2461b: a call to a function
+        // the document never defines. Exactly one finding, at the body line a
+        // person would click.
+        let source = document("<script>\n  const names = taskClientNames();\n</script>");
+        let manifest = validate(&source).expect("document validates; warnings never reject");
+        assert_eq!(manifest.diagnostics.len(), 1);
+        let finding = &manifest.diagnostics[0];
+        assert_eq!(
+            finding.format,
+            crate::write_diagnostics::WRITE_DIAGNOSTIC_FORMAT
+        );
+        assert_eq!(finding.code, "html_undefined_identifier");
+        assert_eq!(finding.severity, "warning");
+        assert_eq!(finding.name.as_deref(), Some("taskClientNames"));
+        assert_eq!(
+            finding.message,
+            "`taskClientNames` is not defined in this document"
+        );
+        let line = source.lines().nth(finding.line - 1).expect("line exists");
+        assert!(
+            line.contains("taskClientNames"),
+            "points at the identifier: {line}"
+        );
+        assert_eq!(finding.column, line.find("taskClientNames").unwrap() + 1);
+    }
+
+    #[test]
+    fn write_diagnostics_subtract_browser_and_ecmascript_globals() {
+        let source = document(
+            "<script>\n  var map = new Map();\n  var text = JSON.stringify(Object.keys({a: 1}));\n  var t = Promise.resolve(requestAnimationFrame).then(function () { return document.title; });\n  window.__probe = { map: map, text: text, t: t, crypto: crypto, url: new URL(\"about:blank\") };\n</script>",
+        );
+        let manifest = validate(&source).expect("document validates");
+        assert_eq!(
+            manifest.diagnostics,
+            Vec::new(),
+            "a browser or ECMAScript global is not a finding: {:?}",
+            manifest.diagnostics
+        );
+    }
+
+    #[test]
+    fn write_diagnostics_flag_an_undeclared_input_port_read() {
+        let source = named_document(
+            json!({
+                "records": { "envelope": COLLECTION_ENVELOPE, "required": true, "expose_to_root": true }
+            }),
+            json!([{ "capability": "input.read", "scope": { "port": "records" } }]),
+        );
+        let source = source.replace(
+            "</main>",
+            "<script>window.nativeArtifact.ready.then(function (delivery) { return delivery.input.inputs.archive; });</script></main>",
+        );
+        let manifest = validate(&source).expect("document validates");
+        let ports: Vec<_> = manifest
+            .diagnostics
+            .iter()
+            .filter(|finding| finding.code == "html_unknown_input_port")
+            .collect();
+        assert_eq!(ports.len(), 1, "{:?}", manifest.diagnostics);
+        assert_eq!(ports[0].severity, "warning");
+        assert_eq!(ports[0].name.as_deref(), Some("archive"));
+        assert_eq!(ports[0].message, "No input port named `archive` is bound");
+
+        // A declared port is not a finding.
+        let declared = source.replace("inputs.archive", "inputs.records");
+        let manifest = validate(&declared).expect("document validates");
+        assert_eq!(
+            manifest.diagnostics,
+            Vec::new(),
+            "{:?}",
+            manifest.diagnostics
+        );
+    }
+
+    #[test]
+    fn write_diagnostics_flag_an_undeclared_interaction_entry() {
+        let declaration = json!({
+            "schema": INTERACTIVE_MANIFEST_SCHEMA,
+            "inputs": {"rows":{"envelope":COLLECTION_ENVELOPE,"required":true,"expose_to_root":true}},
+            "capability_requests":[{"capability":"input.read","scope":{"port":"rows"}}],
+            "interactions":[{"id":"triage","label":"Triage","effect":"facet.set",
+                "slots":{"record":{"domain":{"kind":"bound_input","port":"rows"}}},
+                "facet":"triage","value":{"from":"literal","value":"done"}}],
+        });
+        let source = document(&format!(
+            "<script type=\"application/json\" id=\"native-artifact-manifest\">{declaration}</script><script>window.nativeArtifact.propose({{request_id:\"r1\",entry_id:\"missing\",slots:{{}},values:{{}}}});</script>"
+        ));
+        let manifest = validate(&source).expect("document validates");
+        let entries: Vec<_> = manifest
+            .diagnostics
+            .iter()
+            .filter(|finding| finding.code == "html_unknown_interaction_entry")
+            .collect();
+        assert_eq!(entries.len(), 1, "{:?}", manifest.diagnostics);
+        assert_eq!(entries[0].name.as_deref(), Some("missing"));
+        assert_eq!(
+            entries[0].message,
+            "No interaction entry named `missing` is declared in this document"
+        );
+
+        // The declared entry id is not a finding.
+        let declared = source.replace("entry_id:\"missing\"", "entry_id:\"triage\"");
+        let manifest = validate(&declared).expect("document validates");
+        assert_eq!(
+            manifest.diagnostics,
+            Vec::new(),
+            "{:?}",
+            manifest.diagnostics
+        );
+    }
+
+    #[test]
+    fn write_diagnostics_pass_is_cached_and_skipped_for_scriptless_bodies() {
+        let source =
+            document("<script>window.__cache_probe_marker = Object.keys({a: 1});</script>");
+        let digest = digest_of(&source);
+        let first = validate_cached(&source).expect("document validates");
+        let second = validate_cached(&source).expect("document validates");
+        assert_eq!(
+            crate::write_diagnostics::test_probe::runs_for(&digest),
+            1,
+            "the same body digest must not re-run the pass"
+        );
+        assert_eq!(first.diagnostics, second.diagnostics);
+
+        let scriptless = document("<p>no script here</p>");
+        let scriptless_digest = digest_of(&scriptless);
+        let _ = validate_cached(&scriptless).expect("document validates");
+        assert_eq!(
+            crate::write_diagnostics::test_probe::runs_for(&scriptless_digest),
+            0,
+            "a body with no inline script must not run the pass"
+        );
+    }
+
+    fn digest_of(source: &str) -> String {
+        hex::encode(Sha256::digest(source.as_bytes()))
+    }
+
+    #[test]
+    fn write_diagnostics_share_top_level_declarations_across_script_blocks() {
+        // Classic scripts run in one shared global scope, so a top-level
+        // declaration in one block is defined in every later block. Splitting
+        // bootstrap from app code is ordinary authoring and must not be noisy.
+        for body in [
+            "<script>function helper(){return 1;}</script><script>window.__x = helper();</script>",
+            "<script>var shared = 1;</script><script>window.__x = shared + 1;</script>",
+            "<script>let lexical = 1;</script><script>window.__x = lexical + 1;</script>",
+            "<script>if (true) { var hoisted = 1; }</script><script>window.__x = hoisted;</script>",
+        ] {
+            let manifest = validate(&document(body)).expect("document validates");
+            assert!(
+                manifest.diagnostics.is_empty(),
+                "{body} produced {:?}",
+                manifest.diagnostics
+            );
+        }
+        // A name declared only inside a function is still not defined outside.
+        let nested = document(
+            "<script>function outer(){ var inner = 1; }</script><script>window.__x = inner;</script>",
+        );
+        let manifest = validate(&nested).expect("document validates");
+        assert_eq!(manifest.diagnostics.len(), 1, "{:?}", manifest.diagnostics);
+        assert_eq!(manifest.diagnostics[0].name.as_deref(), Some("inner"));
+    }
+
+    #[test]
+    fn write_diagnostics_exempt_the_typeof_operand() {
+        let source = document(
+            "<script>if (typeof analytics !== \"undefined\") { window.__x = analytics; }</script>",
+        );
+        let manifest = validate(&source).expect("document validates");
+        let findings: Vec<_> = manifest
+            .diagnostics
+            .iter()
+            .filter(|finding| finding.code == "html_undefined_identifier")
+            .collect();
+        assert_eq!(findings.len(), 1, "{:?}", manifest.diagnostics);
+        assert_eq!(findings[0].name.as_deref(), Some("analytics"));
+        // The survivor is the guarded use, not the `typeof` operand.
+        let line = source.lines().nth(findings[0].line - 1).expect("line");
+        assert!(
+            findings[0].column - 1 > line.find("analytics").unwrap(),
+            "finding {} should be the later occurrence on {line:?}",
+            findings[0].column
+        );
+    }
+
+    #[test]
+    fn write_diagnostics_map_positions_for_crlf_authored_bodies() {
+        let lf = document("<script>\n  const names = taskClientNames();\n</script>");
+        let crlf = lf.replace('\n', "\r\n");
+        let lf_manifest = validate(&lf).expect("LF document validates");
+        let crlf_manifest = validate(&crlf).expect("CRLF document validates");
+        assert_eq!(
+            lf_manifest.diagnostics.len(),
+            1,
+            "{:?}",
+            lf_manifest.diagnostics
+        );
+        assert_eq!(
+            crlf_manifest.diagnostics.len(),
+            1,
+            "a CRLF body must not silently disable the pass: {:?}",
+            crlf_manifest.diagnostics
+        );
+        assert_eq!(
+            lf_manifest.diagnostics[0].line,
+            crlf_manifest.diagnostics[0].line
+        );
+        assert_eq!(
+            lf_manifest.diagnostics[0].column,
+            crlf_manifest.diagnostics[0].column
+        );
+    }
+
+    #[test]
+    fn write_diagnostics_place_findings_at_the_script_body_not_an_earlier_comment() {
+        let source =
+            document("<!-- window.__x = nosuch4(); --><script>window.__x = nosuch4();</script>");
+        let manifest = validate(&source).expect("document validates");
+        assert_eq!(manifest.diagnostics.len(), 1, "{:?}", manifest.diagnostics);
+        let finding = &manifest.diagnostics[0];
+        let line = source.lines().nth(finding.line - 1).expect("line");
+        let real = line.rfind("nosuch4").expect("real call") + 1;
+        assert_eq!(
+            finding.column, real,
+            "finding must point at the script body"
+        );
+    }
+
+    #[test]
+    fn write_diagnostics_do_not_take_offsets_from_a_commented_out_script() {
+        // Two raw bodies with byte-identical text: the commented-out copy and
+        // the live script. The finding must point at the live one.
+        let source = document(
+            "<!-- <script>window.__x = nosuch5();</script> --><script>window.__x = nosuch5();</script>",
+        );
+        let manifest = validate(&source).expect("document validates");
+        assert_eq!(manifest.diagnostics.len(), 1, "{:?}", manifest.diagnostics);
+        let finding = &manifest.diagnostics[0];
+        let line = source.lines().nth(finding.line - 1).expect("line");
+        let calls: Vec<usize> = line
+            .match_indices("nosuch5")
+            .map(|(index, _)| index + 1)
+            .collect();
+        assert_eq!(calls.len(), 2, "{line:?}");
+        assert_eq!(
+            finding.column, calls[1],
+            "the live script's offset, not the comment's"
+        );
+    }
+
+    #[test]
+    fn write_diagnostics_cross_script_union_is_order_insensitive() {
+        // Documented warning-only trade: a call in an earlier block to a
+        // function declared in a later block is not reported, though it throws
+        // at runtime. Step 4 must revisit this before promoting to rejection.
+        let source = document(
+            "<script>window.__a = laterDef();</script><script>function laterDef(){}</script>",
+        );
+        let manifest = validate(&source).expect("document validates");
+        assert_eq!(
+            manifest.diagnostics,
+            Vec::new(),
+            "{:?}",
+            manifest.diagnostics
+        );
+    }
+
+    #[test]
+    fn write_diagnostics_ignore_a_reassigned_port_map_alias() {
+        let source = named_document(
+            json!({
+                "records": { "envelope": COLLECTION_ENVELOPE, "required": true, "expose_to_root": true }
+            }),
+            json!([{ "capability": "input.read", "scope": { "port": "records" } }]),
+        )
+        .replace(
+            "</main>",
+            "<script>var d = { input: { inputs: {} } }; var m = d.input.inputs; m = {}; window.__x = m.anything;</script></main>",
+        );
+        let manifest = validate(&source).expect("document validates");
+        assert!(
+            manifest
+                .diagnostics
+                .iter()
+                .all(|finding| finding.code != "html_unknown_input_port"),
+            "a reassigned alias is not the port map: {:?}",
+            manifest.diagnostics
+        );
+    }
+
+    #[test]
+    fn write_diagnostics_do_not_treat_an_arbitrary_object_as_the_bridge() {
+        let source = document(
+            "<script>var o = {}; o.nativeArtifact = { propose: function () {} }; o.nativeArtifact.propose({ entry_id: \"ghost\" });</script>",
+        );
+        let manifest = validate(&source).expect("document validates");
+        assert!(
+            manifest
+                .diagnostics
+                .iter()
+                .all(|finding| finding.code != "html_unknown_interaction_entry"),
+            "only the real bridge is policed: {:?}",
+            manifest.diagnostics
+        );
+    }
+
+    #[test]
+    fn write_diagnostics_do_not_report_port_map_prototype_members() {
+        let source = named_document(
+            json!({
+                "records": { "envelope": COLLECTION_ENVELOPE, "required": true, "expose_to_root": true }
+            }),
+            json!([{ "capability": "input.read", "scope": { "port": "records" } }]),
+        )
+        .replace(
+            "</main>",
+            "<script>window.nativeArtifact.ready.then(function (delivery) { var inputs = delivery.input.inputs; inputs.forEach(function () {}); Object.keys(inputs); });</script></main>",
+        );
+        let manifest = validate(&source).expect("document validates");
+        assert!(
+            manifest
+                .diagnostics
+                .iter()
+                .all(|finding| finding.code != "html_unknown_input_port"),
+            "Object/Map prototype members are not ports: {:?}",
+            manifest.diagnostics
+        );
+    }
+
+    #[test]
+    fn write_diagnostics_allow_element_id_globals_and_suppress_with() {
+        let ids = document("<div id=\"panel\"></div><script>panel.innerHTML = \"\";</script>");
+        let manifest = validate(&ids).expect("document validates");
+        assert_eq!(
+            manifest.diagnostics,
+            Vec::new(),
+            "{:?}",
+            manifest.diagnostics
+        );
+
+        // `with` makes static scope unsound, so the script gets no undefined
+        // findings rather than a stream of false positives.
+        let with = document("<script>with (document) { window.__x = title; }</script>");
+        let manifest = validate(&with).expect("document validates");
+        assert_eq!(
+            manifest.diagnostics,
+            Vec::new(),
+            "{:?}",
+            manifest.diagnostics
+        );
+    }
+
+    /// Every real `native.html.v1` artifact checked into the repository, plus
+    /// the HTML documents in the authoring guide. The test prints every finding
+    /// so the pull request can carry the corpus list verbatim, and fails if a
+    /// known-good artifact is flagged at all: a false positive is a bug in the
+    /// allowlist or a rule, not an accepted warning.
+    #[test]
+    fn checked_in_html_corpus_reports_its_write_diagnostics() {
+        let mut corpus: Vec<(String, String)> = vec![
+            (
+                "tests/fixtures/native-html-v1-document.html".into(),
+                include_str!("../../../tests/fixtures/native-html-v1-document.html").into(),
+            ),
+            (
+                "tests/fixtures/native-html-v1-slides.html".into(),
+                include_str!("../../../tests/fixtures/native-html-v1-slides.html").into(),
+            ),
+            (
+                "tests/fixtures/native-html-v1-named-input.html".into(),
+                include_str!("../../../tests/fixtures/native-html-v1-named-input.html").into(),
+            ),
+            (
+                "tests/fixtures/native-html-v1-live-input.html".into(),
+                include_str!("../../../tests/fixtures/native-html-v1-live-input.html").into(),
+            ),
+            (
+                "tests/fixtures/native-html-v1-view-state.html".into(),
+                include_str!("../../../tests/fixtures/native-html-v1-view-state.html").into(),
+            ),
+            (
+                "crates/artifact-html/tests/fixtures/adversarial-native-html.html".into(),
+                include_str!("../tests/fixtures/adversarial-native-html.html").into(),
+            ),
+        ];
+        let guide = include_str!("../../../src/mcp/guides/compositions.md");
+        for (index, block) in fenced_html_documents(guide).into_iter().enumerate() {
+            corpus.push((format!("src/mcp/guides/compositions.md #{index}"), block));
+        }
+        // The guide's recommended authoring pattern, injected into its own
+        // document: the JSDoc-typed plain-JS script the guide tells authors to
+        // write. It must not be flagged, and its `inputs.nodes`/`inputs.edges`
+        // reads must be recognised as declared ports.
+        if let (Some(document), Some(script)) = (
+            fenced_html_documents(guide).into_iter().next(),
+            fenced_block(guide, "js"),
+        ) {
+            corpus.push((
+                "src/mcp/guides/compositions.md JSDoc example".into(),
+                document.replace("</body>", &format!("<script>\n{script}\n</script></body>")),
+            ));
+        }
+
+        let mut false_positives = Vec::new();
+        for (name, source) in &corpus {
+            match validate(source) {
+                Ok(manifest) => {
+                    if manifest.diagnostics.is_empty() {
+                        println!("== {name}: no findings");
+                    } else {
+                        for finding in &manifest.diagnostics {
+                            println!(
+                                "== {name}: {} [{}] line {} column {} name {:?}\n   {}",
+                                finding.code,
+                                finding.severity,
+                                finding.line,
+                                finding.column,
+                                finding.name.as_deref().unwrap_or("-"),
+                                finding.message
+                            );
+                        }
+                        false_positives.push(name.clone());
+                    }
+                }
+                Err(failure) => {
+                    println!("== {name}: rejected [{}] {}", failure.code, failure.message);
+                }
+            }
+        }
+        assert!(
+            false_positives.is_empty(),
+            "in-repo artifacts must not be flagged: {false_positives:?}"
+        );
+
+        // The motivating case: exactly one finding, named and positioned.
+        let motivating = document("<script>\n  const names = taskClientNames();\n</script>");
+        let manifest = validate(&motivating).expect("document validates");
+        assert_eq!(manifest.diagnostics.len(), 1, "{:?}", manifest.diagnostics);
+        println!(
+            "== reconstructed:taskClientNames(3c2461b): {} [{}] line {} column {} name {:?}\n   {}",
+            manifest.diagnostics[0].code,
+            manifest.diagnostics[0].severity,
+            manifest.diagnostics[0].line,
+            manifest.diagnostics[0].column,
+            manifest.diagnostics[0].name.as_deref().unwrap_or("-"),
+            manifest.diagnostics[0].message,
+        );
+    }
+
+    fn fenced_html_documents(markdown: &str) -> Vec<String> {
+        let mut documents = Vec::new();
+        let mut remaining = markdown;
+        while let Some(start) = remaining.find("```html") {
+            let after = &remaining[start + "```html".len()..];
+            let Some(end) = after.find("```") else {
+                break;
+            };
+            let block = after[..end].trim_start_matches('\n');
+            if block.trim_start().starts_with("<!doctype") {
+                documents.push(block.to_owned());
+            }
+            remaining = &after[end + 3..];
+        }
+        documents
+    }
+
+    fn fenced_block(markdown: &str, tag: &str) -> Option<String> {
+        let opener = format!("```{tag}\n");
+        let start = markdown.find(&opener)? + opener.len();
+        let after = &markdown[start..];
+        let end = after.find("```")?;
+        Some(after[..end].trim_end().to_owned())
+    }
+
+    #[test]
     fn named_declaration_is_exact_and_admits_relation_and_grouped_ports() {
         let relation_schema = "a".repeat(64);
         let source = named_document(
@@ -2000,6 +2686,155 @@ mod tests {
     }
 
     #[test]
+    fn interactive_declaration_reuses_closed_entries_and_keeps_v1_read_only() {
+        let mut declaration = json!({
+            "schema": INTERACTIVE_MANIFEST_SCHEMA,
+            "inputs": {"rows":{"envelope":COLLECTION_ENVELOPE,"required":true,"expose_to_root":true}},
+            "capability_requests":[{"capability":"input.read","scope":{"port":"rows"}}],
+            "interactions":[{"id":"triage","label":"Triage","effect":"facet.set",
+                "slots":{"record":{"domain":{"kind":"bound_input","port":"rows"}}},
+                "facet":"triage","value":{"from":"literal","value":"done"}}],
+        });
+        let source = |value: &Value| {
+            document(&format!("<script type=\"application/json\" id=\"native-artifact-manifest\">{value}</script>"))
+        };
+        let manifest = validate(&source(&declaration)).unwrap();
+        assert_eq!(manifest.interactions.len(), 1);
+        assert_eq!(
+            manifest.interaction_manifest().interactions,
+            manifest.interactions
+        );
+        for facet in ["runtime", "archived", "blob_ref"] {
+            let mut invalid = declaration.clone();
+            invalid["interactions"][0]["facet"] = json!(facet);
+            assert_eq!(
+                validate(&source(&invalid)).unwrap_err().code,
+                "interaction_entry_invalid"
+            );
+        }
+        let mut invalid = declaration.clone();
+        invalid["interactions"][0]["actor"] = json!("forged");
+        assert!(validate(&source(&invalid)).is_err());
+        invalid = declaration.clone();
+        invalid["interactions"][0]["slots"]["record"]["domain"]["port"] = json!("outside");
+        assert_eq!(
+            validate(&source(&invalid)).unwrap_err().code,
+            "interaction_entry_invalid"
+        );
+        invalid = declaration.clone();
+        invalid["interactions"]
+            .as_array_mut()
+            .unwrap()
+            .push(declaration["interactions"][0].clone());
+        assert_eq!(
+            validate(&source(&invalid)).unwrap_err().code,
+            "interaction_entry_invalid"
+        );
+        declaration["schema"] = json!(MANIFEST_SCHEMA);
+        assert!(validate(&source(&declaration)).is_err());
+        declaration.as_object_mut().unwrap().remove("interactions");
+        assert!(validate(&source(&declaration))
+            .unwrap()
+            .interactions
+            .is_empty());
+    }
+
+    #[test]
+    fn bootstrap_correlates_bounded_proposals_and_settlements() {
+        assert!(BOOTSTRAP.contains("[\"request_id\",\"entry_id\",\"slots\",\"values\"]"));
+        assert!(BOOTSTRAP.contains("pendingIntentCount>=32"));
+        assert!(BOOTSTRAP.contains("encoded.length>65536"));
+        assert!(
+            BOOTSTRAP.contains("commandData?.type===\"intent-result\")settleIntent(commandData)")
+        );
+        assert!(BOOTSTRAP.contains("own(pendingIntents,data.request_id)"));
+        // On-request reads: offered only for needs listed in the host's
+        // init, bounded in flight and in size, settled only by request id.
+        assert!(BOOTSTRAP.contains("read:readNeed"));
+        assert!(BOOTSTRAP.contains("apply(arrayIncludes,offeredNeeds,[need])"));
+        assert!(BOOTSTRAP.contains("pendingReadCount>=8"));
+        assert!(BOOTSTRAP.contains("encoded.length>4096"));
+        assert!(BOOTSTRAP.contains("commandData?.type===\"read-result\")settleRead(commandData)"));
+        assert!(BOOTSTRAP.contains("own(pendingReads,data.request_id)"));
+        assert!(BOOTSTRAP.contains("if(isArray(data.needs))"));
+        assert!(BOOTSTRAP.contains("pending.resolve(result)"));
+    }
+
+    #[test]
+    fn bootstrap_admits_a_proposal_only_for_the_event_that_completes_a_gesture() {
+        // Layer 1 of the activation gate, mirroring navigation's trusted-click
+        // runtime. A proposal made outside a completed gesture is not refused:
+        // it is sent marked as not gesture-backed and the host routes it to the
+        // tray, so the old no_gesture refusal is gone entirely.
+        assert!(!BOOTSTRAP.contains("no_gesture"));
+        assert!(BOOTSTRAP.contains("const backed=gestureArmed&&!gestureUsed;"));
+        assert!(BOOTSTRAP.contains("if(backed)gestureUsed=true;"));
+        assert!(BOOTSTRAP.contains("gesture_backed:backed"));
+        assert!(BOOTSTRAP.contains("gestureUsed=true"));
+        // Only genuine refusals report a diagnostic, with a bounded reason code
+        // throttled so a loop cannot flood the host.
+        assert!(BOOTSTRAP.contains("refuseProposal(\"malformed\""));
+        assert!(BOOTSTRAP.contains("refuseProposal(\"duplicate\""));
+        assert!(BOOTSTRAP.contains("refuseProposal(\"too_large\""));
+        assert!(BOOTSTRAP.contains("reportBoundedRefusal(\"html_intent_refused\",reason)"));
+        assert!(BOOTSTRAP.contains("refusalReports>=16"));
+        assert!(BOOTSTRAP.contains("setTimer(()=>{refusalReported=false},250)"));
+        // Disarm on a macrotask. A microtask checkpoint runs between a capture
+        // listener and the target listener, so a microtask disarm would clear
+        // the flag before the author's own handler ran.
+        assert!(BOOTSTRAP.contains("setTimer(releaseGesture,0)"));
+        assert!(!BOOTSTRAP.contains("microtask(releaseGesture)"));
+        // The event type, trust bit and key repeat flag are read through
+        // pristine getters, so author code cannot shadow what the gate reads.
+        assert!(BOOTSTRAP.contains("eventType=getter(Event.prototype,\"type\")"));
+        assert!(BOOTSTRAP.contains("keyRepeat=getter(KeyboardEvent.prototype,\"repeat\")"));
+        assert!(BOOTSTRAP.contains("Array.prototype.includes"));
+        // Only the terminal event of a gesture arms. Arming on the whole
+        // pointer/mouse sequence admitted five proposals for one physical click.
+        assert!(BOOTSTRAP.contains(r#"const gestureEvents=["click","drop"];"#));
+        // A held key autorepeats trusted keydown, and on a control each repeat
+        // also dispatches a trusted click; the repeat state suppresses that
+        // click so one sustained keypress admits one proposal.
+        assert!(BOOTSTRAP.contains("if(type===\"click\"&&keyRepeating)return;"));
+        // A label click also synthesises a trusted click on its control in the
+        // same task; the armed flag is not reset until its release, so the pair
+        // admits one proposal.
+        assert!(BOOTSTRAP.contains("if(gestureArmed)return;"));
+        assert!(BOOTSTRAP.contains("trackKeyRepeat"));
+        assert!(BOOTSTRAP.contains("clearKeyRepeat"));
+        // Everything that completes a gesture exactly once is admitted; every
+        // other event, and every trusted event author code can cause, is not.
+        let list_start =
+            BOOTSTRAP.find("gestureEvents=[").expect("gesture set") + "gestureEvents=[".len();
+        let list_end = BOOTSTRAP[list_start..].find("];").expect("gesture set end") + list_start;
+        let gesture_list = &BOOTSTRAP[list_start..list_end];
+        for excluded in [
+            "\"message\"",
+            "\"submit\"",
+            "\"focus\"",
+            "\"load\"",
+            "\"scroll\"",
+            "\"pointerdown\"",
+            "\"mousedown\"",
+            "\"pointerup\"",
+            "\"mouseup\"",
+            "\"pointercancel\"",
+            "\"touchstart\"",
+            "\"touchend\"",
+            "\"keydown\"",
+            "\"keyup\"",
+            "\"dblclick\"",
+            "\"contextmenu\"",
+            "\"auxclick\"",
+        ] {
+            assert!(
+                !gesture_list.contains(excluded),
+                "gestureEvents must not admit {excluded}"
+            );
+        }
+    }
+
+    #[test]
     fn validates_complete_self_contained_documents_and_rejects_authority() {
         let valid = validate(&document(
             "<img alt=\"\" src=\"data:image/png;base64,aQ==\">",
@@ -2047,6 +2882,76 @@ mod tests {
         assert!(BOOTSTRAP.contains("Array.prototype.splice"));
         assert!(BOOTSTRAP.contains("native-html-init"));
         assert!(BOOTSTRAP.contains("VERSION"));
+        // Readiness is announced before queued proposals are delivered, so a
+        // proposal made on load is not refused as not-ready.
+        let ready = BOOTSTRAP.find("type:\"ready\"").expect("ready message");
+        let flush = BOOTSTRAP
+            .find("for(const item of queued)")
+            .expect("queue flush");
+        assert!(ready < flush, "ready must precede the queued flush");
+    }
+
+    #[test]
+    fn bootstrap_carries_the_view_state_handoff() {
+        // Eager publish, boot-time delivery: the frame hands its own view
+        // state to the host, which holds the opaque blob and delivers it in
+        // the successor's init before first paint. Additive throughout: a
+        // document that never calls the new API sees no behavioural change.
+        assert!(BOOTSTRAP.contains("setViewState"));
+        assert!(BOOTSTRAP.contains("get viewState"));
+        assert!(BOOTSTRAP.contains("type:\"view-state\""));
+        assert!(BOOTSTRAP.contains("view_state"));
+        assert!(BOOTSTRAP.contains("from_body_digest"));
+        assert!(BOOTSTRAP.contains("viewState:heldViewState"));
+        assert!(BOOTSTRAP.contains("data.view_state"));
+        // Synchronous TypeErrors at the call site, mirroring propose(): the
+        // value must survive a pristine JSON round-trip inside the same
+        // 65536 bound, and the advisory schema is intentId-shaped.
+        assert!(BOOTSTRAP.contains("refuseViewState(\"malformed\""));
+        assert!(BOOTSTRAP.contains("refuseViewState(\"too_large\""));
+        assert!(BOOTSTRAP.contains("view state exceeds bridge limit"));
+        // Refusals share propose()'s single throttled refusal budget rather
+        // than standing up a second timer: one budget for artifact
+        // misbehaviour, with the view-state diagnostic code on it.
+        assert!(BOOTSTRAP.contains("reportBoundedRefusal(\"html_view_state_refused\",reason)"));
+        assert!(!BOOTSTRAP.contains("viewStateReported"));
+        assert_eq!(
+            BOOTSTRAP.matches("setTimer(").count(),
+            2,
+            "the only wall-clock arms are the gesture release and the one shared refusal throttle"
+        );
+        // The advisory schema is read once into a local, so a getter cannot
+        // pass validation and then return something else.
+        assert!(BOOTSTRAP.contains("const givenSchema=options.schema;"));
+        // At most one posted message per animation frame, latest wins. The
+        // delivery path itself arms no clock at all: no acknowledgement and
+        // no bounded wait, so no host decision ever waits on a timer here.
+        // The only reachable wall-clock arm is the shared refusal throttle
+        // counted above, which nothing waits on.
+        assert!(BOOTSTRAP.contains("requestAnimationFrame"));
+        assert!(BOOTSTRAP.contains("pendingViewState"));
+        assert!(BOOTSTRAP.contains("viewStateScheduled"));
+        assert!(!BOOTSTRAP.contains("setInterval"));
+        // One reserved slot before the port opens: a waiting view state
+        // collapses onto itself instead of exhausting the 32-slot buffer.
+        assert!(BOOTSTRAP.contains("queued[index].type===\"view-state\""));
+        assert!(BOOTSTRAP.contains("if(queued.length<32)pushValue(queued,value)"));
+        // The successor's evidence travels in the init envelope and is frozen
+        // with the same freeze used for input; without it the frame cold-boots.
+        assert!(BOOTSTRAP.contains("heldViewState=freeze(envelope)"));
+        assert!(BOOTSTRAP.contains("heldViewState===undefined?freezeObject({input})"));
+    }
+
+    #[test]
+    fn bootstrap_carries_new_tab_disposition_from_trusted_gestures() {
+        // Ctrl/Cmd-click sends the navigation with `newTab: true`;
+        // middle-click arrives as `auxclick` with button 1. Both read through
+        // pristine `MouseEvent` getters so authored code cannot forge them.
+        assert!(BOOTSTRAP.contains("newTab"));
+        assert!(BOOTSTRAP.contains("auxclick"));
+        assert!(BOOTSTRAP.contains("MouseEvent.prototype,\"ctrlKey\""));
+        assert!(BOOTSTRAP.contains("MouseEvent.prototype,\"metaKey\""));
+        assert!(BOOTSTRAP.contains("MouseEvent.prototype,\"button\""));
     }
 
     #[test]
@@ -2152,6 +3057,21 @@ mod tests {
         assert!(store.entries.contains_key("other"));
         assert_eq!(store.oldest, VecDeque::from(["other".to_string()]));
         assert_eq!(store.bytes, 4);
+    }
+
+    #[test]
+    fn view_state_tabs_fixture_validates_for_the_handoff_journey() {
+        // The real-server journey opens this document, switches to the
+        // non-default tab, and rewrites the body out of band. Both revisions
+        // must validate: the journey can only prove the handoff if the only
+        // thing changing is authored text.
+        let first = include_str!("../../../tests/fixtures/native-html-v1-view-state.html");
+        assert_eq!(validate(first).unwrap().profile, Profile::Document);
+        let second = first
+            .replace("Workspace tabs</h1>", "Workspace tabs revised</h1>")
+            .replace("data-body-revision=\"1\"", "data-body-revision=\"2\"");
+        assert_ne!(second, first);
+        assert_eq!(validate(&second).unwrap().profile, Profile::Document);
     }
 
     #[test]

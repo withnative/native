@@ -1,6 +1,6 @@
 {
   "format": "native.backend-contract-classifications.v1",
-  "revision": 18,
+  "revision": 20,
   "profiles": [
     {
       "id": "sqlite-local",
@@ -278,6 +278,20 @@
         "libsql-embedded-replica": "U"
       },
       "notes": "The v1 graph orchestrator is qualified only on SQLite; other backends do not register an implementation."
+    },
+    {
+      "id": "batch_write",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:batch_write",
+        "postgres-server": "N",
+        "turso-local": "N",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      },
+      "notes": "The atomic batch is qualified only on SQLite; other backends do not register an implementation."
     },
     {
       "id": "create_exploration",
@@ -632,11 +646,50 @@
       }
     },
     {
+      "id": "advance_artifact_port_pin",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:advance_artifact_port_pin",
+        "postgres-server": "N",
+        "turso-local": "N",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
       "id": "manage_artifact_module_grants",
       "kind": "tool",
       "surface": "primary",
       "profiles": {
         "sqlite-local": "F|sqlite-reference-ci:manage_artifact_module_grants",
+        "postgres-server": "N",
+        "turso-local": "N",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "manage_surface_bindings",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:manage_surface_bindings",
+        "postgres-server": "N",
+        "turso-local": "N",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "manage_alpha_tabs",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:manage_alpha_tabs",
         "postgres-server": "N",
         "turso-local": "N",
         "turso-remote": "N",
@@ -832,6 +885,20 @@
         "libsql-embedded-replica": "U"
       },
       "notes": "Postgres and Turso-local implement census, provenance, authorship, recent, relationship, container, and convergence axes; lexical scan fails closed and remains a search qualification."
+    },
+    {
+      "id": "get_workspace_snapshot",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:get_workspace_snapshot",
+        "postgres-server": "N",
+        "turso-local": "N",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      },
+      "notes": "The pinned per-principal index snapshot lives in the sqlite-local engine beside the M1/M2 index it serves; other profiles stay on the governed query path."
     },
     {
       "id": "manage_vocabularies",
@@ -1095,6 +1162,48 @@
         "libsql-embedded-replica": "U"
       },
       "notes": "Hosted membership administration belongs to the host catalog plane, not the selected content backend."
+    },
+    {
+      "id": "workspace_read",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:workspace_read",
+        "postgres-server": "A",
+        "turso-local": "A",
+        "turso-remote": "A",
+        "turso-embedded-sync": "A",
+        "libsql-embedded-replica": "U"
+      },
+      "notes": "Hosted workspace directory belongs to the host catalog plane, not the selected content backend."
+    },
+    {
+      "id": "authority_act_head",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:authority_act_head",
+        "postgres-server": "A",
+        "turso-local": "A",
+        "turso-remote": "A",
+        "turso-embedded-sync": "A",
+        "libsql-embedded-replica": "U"
+      },
+      "notes": "Hosted authority act-head probe is the hosted, owner-only door to the SQLite standby delta transport; no other content backend serves it."
+    },
+    {
+      "id": "authority_act_delta",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:authority_act_delta",
+        "postgres-server": "A",
+        "turso-local": "A",
+        "turso-remote": "A",
+        "turso-embedded-sync": "A",
+        "libsql-embedded-replica": "U"
+      },
+      "notes": "Hosted authority exact act cut is the hosted, owner-only door to the SQLite standby delta transport; no other content backend serves it."
     },
     {
       "id": "reach_read",
@@ -1688,6 +1797,34 @@
         "libsql-embedded-replica": "U"
       },
       "notes": "Native Canvas v1 batch commits and connector assertions are implemented on the reference SQLite engine and exercised by tests/tools/canvas.rs, but not yet declared into the sqlite-reference-ci evidence suite. Declared unsupported on Postgres by decision 97b5cb2; Turso projectors refuse extended content events in v1."
+    },
+    {
+      "id": "save_account",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "N",
+        "postgres-server": "U",
+        "turso-local": "U",
+        "turso-remote": "U",
+        "turso-embedded-sync": "U",
+        "libsql-embedded-replica": "U"
+      },
+      "notes": "Inspectable authoring v1 uses the SQLite Receipt and record authorities. Focused ordinary-authoring, authorization and journey tests exercise this operation; full sqlite-reference-ci backend qualification declarations and receipts are not claimed. Other backend adapters are unsupported for this slice."
+    },
+    {
+      "id": "get_reuse_context",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "N",
+        "postgres-server": "U",
+        "turso-local": "U",
+        "turso-remote": "U",
+        "turso-embedded-sync": "U",
+        "libsql-embedded-replica": "U"
+      },
+      "notes": "Inspectable authoring v1 uses the SQLite Receipt and record authorities. Focused ordinary-authoring, authorization and journey tests exercise this operation; full sqlite-reference-ci backend qualification declarations and receipts are not claimed. Other backend adapters are unsupported for this slice."
     }
   ]
 }

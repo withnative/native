@@ -1213,7 +1213,7 @@ async fn messages_home_pane_reexecutes_governed_sql_beside_a_legacy_collection()
         "v": "1.1",
         "kind": "governed_sql",
         "profile": { "id": "sqlite-local", "revision": 1 },
-        "catalog_revision": 3,
+        "catalog_revision": 4,
         "relations": {
             "messages_awaiting_reply": {
                 "identity": "native.query-sql.messages-awaiting-reply",
@@ -1446,11 +1446,11 @@ async fn standalone_agents_artifact_joins_separate_governed_ports_and_expires_on
         "v": "1.1",
         "kind": "governed_sql",
         "profile": { "id": "sqlite-local", "revision": 1 },
-        "catalog_revision": 3,
+        "catalog_revision": 4,
         "relations": {
             "agent_activity": {
                 "identity": "native.semantic.agent_activity",
-                "semantic_version": 2
+                "semantic_version": 3
             }
         },
         "sql": "SELECT activity_id,run_key,principal_ref,principal_display_name,started_at,ended_at,last_observed_activity_at,active_until,appears_active FROM agent_activity ORDER BY last_observed_activity_at DESC,activity_id ASC",
@@ -1470,7 +1470,7 @@ async fn standalone_agents_artifact_joins_separate_governed_ports_and_expires_on
         "v": "1.1",
         "kind": "governed_sql",
         "profile": { "id": "sqlite-local", "revision": 1 },
-        "catalog_revision": 3,
+        "catalog_revision": 4,
         "relations": {
             "agent_activity_claims": {
                 "identity": "native.semantic.agent_activity_claims",
@@ -1747,6 +1747,7 @@ async fn standalone_agents_artifact_joins_separate_governed_ports_and_expires_on
                     "native:workspace-member:agents-viewer",
                 ),
             ],
+            true,
         )
     }
     .unwrap();
@@ -1960,7 +1961,7 @@ async fn standalone_agents_artifact_joins_separate_governed_ports_and_expires_on
     let incompatible = call_as(
         &registry,
         &db,
-        hosted_viewer,
+        hosted_viewer.clone(),
         "render_artifact",
         json!({ "id": AGENTS_ARTIFACT }),
     )
@@ -1969,6 +1970,46 @@ async fn standalone_agents_artifact_joins_separate_governed_ports_and_expires_on
         incompatible["diagnostic"]["code"], "named_input_incompatible",
         "{incompatible:#}"
     );
+    let message = incompatible["diagnostic"]["message"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        message.contains("agent_activity")
+            && message.contains("version 1")
+            && message.contains("version 3")
+            && message.contains("advance_artifact_port_pin"),
+        "the stale pin must name the relation, both versions and the remedy: {incompatible:#}"
+    );
+    let details = &incompatible["diagnostic"]["details"];
+    assert_eq!(details["port"], "presence", "{incompatible:#}");
+    assert_eq!(details["stale_pin"]["relation"], "agent_activity");
+    assert_eq!(details["stale_pin"]["pinned_version"], 1);
+    assert_eq!(details["stale_pin"]["current_version"], 3);
+
+    // The stale pin is repairable without re-authoring the artifact. The port
+    // is already at the current version here, so advancing the saved query's
+    // pin alone makes the pane live again in one call while stale pins exist.
+    let repaired = call(
+        &registry,
+        &db,
+        "advance_artifact_port_pin",
+        json!({
+            "artifact_id": AGENTS_ARTIFACT,
+            "port_name": "presence",
+            "reason": "Recover the saved query's stale relation pin."
+        }),
+    )
+    .await;
+    assert_eq!(repaired["status"], "query_advanced", "{repaired:#}");
+    let recovered = call_as(
+        &registry,
+        &db,
+        hosted_viewer,
+        "render_artifact",
+        json!({ "id": AGENTS_ARTIFACT }),
+    )
+    .await;
+    assert_eq!(recovered["status"], "rendered", "{recovered:#}");
 }
 
 #[tokio::test]
@@ -2369,6 +2410,100 @@ async fn refusing_a_manifest_spelled_grant_scope_names_the_resolved_port_key() {
     )
     .await;
 }
+#[tokio::test(flavor = "multi_thread")]
+async fn a_total_drop_with_no_declaration_change_is_not_called_a_declaration_change() {
+    let (db, registry, _guard) = fixture().await;
+    // No ports at all, so nothing can be bound and the only existing state is
+    // a port-less navigation grant. Withdrawing its request drops everything
+    // while every declaration stays byte-identical — the shape that used to
+    // force the status to name a cause that had not happened.
+    let with_navigation = r#"export const nativeArtifact = {
+  schema: "native.mdx.artifact.v2",
+  inputs: {},
+  module_inputs: {},
+  capability_requests: [
+    { capability: "navigation.record.user_gesture", scope: {} }
+  ]
+}
+
+<Callout>Navigation only</Callout>
+"#;
+    create_artifact(&registry, &db, ARTIFACT_A, with_navigation).await;
+    let exact = call(
+        &registry,
+        &db,
+        "manage_artifact_module_grants",
+        json!({ "action": "read", "artifact_id": ARTIFACT_A }),
+    )
+    .await;
+    let subject = &exact["subjects"].as_array().unwrap()[0];
+    let event = subject["subject_event_id"].as_str().unwrap().to_owned();
+    let digest = subject["source_sha256"].as_str().unwrap().to_owned();
+    call(
+        &registry,
+        &db,
+        "manage_artifact_module_grants",
+        json!({
+            "action": "grant", "artifact_id": ARTIFACT_A, "subject_kind": "artifact_source",
+            "subject_record_id": ARTIFACT_A, "subject_event_id": event,
+            "source_sha256": digest, "capability": "navigation.record.user_gesture",
+            "scope": {}
+        }),
+    )
+    .await;
+
+    let without_navigation = r#"export const nativeArtifact = {
+  schema: "native.mdx.artifact.v2",
+  inputs: {},
+  module_inputs: {},
+  capability_requests: []
+}
+
+<Callout>Navigation only</Callout>
+"#;
+    let updated = call(
+        &registry,
+        &db,
+        "update_record",
+        json!({
+            "id": ARTIFACT_A,
+            "body": without_navigation,
+            "if_body_digest": current_body_digest(&registry, &db, ARTIFACT_A).await,
+            "reason": "Withdraw the only capability request"
+        }),
+    )
+    .await;
+    let continuity = &updated["artifact_input_continuity"];
+    assert_eq!(
+        continuity["status"], "artifact_inputs_dropped",
+        "nothing survived, so the status reports a total drop: {updated:#}"
+    );
+    assert_eq!(continuity["carried_grant_count"], 0, "{updated:#}");
+    assert_eq!(continuity["dropped_grant_count"], 1, "{updated:#}");
+    assert_eq!(
+        continuity["changed_ports"],
+        json!([]),
+        "no declaration moved: {updated:#}"
+    );
+    let message = updated["warnings"]
+        .as_array()
+        .expect("update receipt carries warnings")
+        .iter()
+        .find(|warning| warning["code"] == "artifact_inputs_dropped")
+        .expect("the total-drop warning is present")["message"]
+        .as_str()
+        .expect("the warning carries a message")
+        .to_owned();
+    assert!(
+        !message.contains("declaration"),
+        "the cause was a withdrawn request, not a declaration change: {message}"
+    );
+    assert!(
+        !message.contains("partially carried"),
+        "nothing was carried, so nothing was partial: {message}"
+    );
+}
+
 #[tokio::test]
 async fn dropping_a_capability_request_drops_its_carried_grant_and_says_so() {
     let (db, registry, _guard) = fixture().await;
@@ -2463,16 +2598,34 @@ async fn dropping_a_capability_request_drops_its_carried_grant_and_says_so() {
     );
     assert_eq!(continuity["carried_grant_count"], 1, "{updated:#}");
     assert_eq!(continuity["dropped_grant_count"], 1, "{updated:#}");
+    // Nothing about the ports moved, so the receipt must not send the author
+    // hunting for a declaration diff that does not exist.
+    assert_eq!(
+        continuity["changed_ports"],
+        json!([]),
+        "withdrawing a request changes no port declaration: {updated:#}"
+    );
+    assert_eq!(
+        continuity["old_declaration_surface_sha256"], continuity["new_declaration_surface_sha256"],
+        "{updated:#}"
+    );
+    let warning = updated["warnings"]
+        .as_array()
+        .expect("update receipt carries warnings")
+        .iter()
+        .find(|warning| warning["code"] == "artifact_inputs_partially_carried")
+        .expect("the partial-carry warning is present")
+        .clone();
+    let message = warning["message"]
+        .as_str()
+        .expect("the warning carries a message");
     assert!(
-        updated["warnings"]
-            .as_array()
-            .is_some_and(|warnings| warnings.iter().any(|warning| {
-                warning["code"] == "artifact_inputs_partially_carried"
-                    && warning["message"]
-                        .as_str()
-                        .is_some_and(|message| message.contains("manage_artifact_module_grants"))
-            })),
+        message.contains("manage_artifact_module_grants"),
         "the author is warned at edit time and told how to restore: {updated:#}"
+    );
+    assert!(
+        !message.contains("declaration change"),
+        "the drop was a withdrawn request, not a declaration change: {message}"
     );
     let write_text = native_ce::mcp::render::render("update_record", &updated).unwrap();
     for (label, field) in [
@@ -2569,6 +2722,7 @@ async fn artifact_source_attestations_fail_closed_on_tamper_order_digest_and_byp
             intent: None,
             created_at: row.get("created_at"),
             causal_envelope: native_ce::events::CausalEnvelopeV1::default(),
+            act: None,
         };
         let mut conn = crate::common::fixture_write_pool(&db)
             .await
@@ -2636,6 +2790,7 @@ async fn artifact_source_attestations_fail_closed_on_tamper_order_digest_and_byp
         intent: None,
         created_at: "2026-01-01T00:00:00.000Z".into(),
         causal_envelope: bypass_envelope,
+        act: None,
     };
     let mut conn = crate::common::fixture_write_pool(&db)
         .await
@@ -2863,6 +3018,7 @@ export const nativeArtifact = {{
         intent: None,
         created_at: row.get("created_at"),
         causal_envelope: native_ce::events::CausalEnvelopeV1::default(),
+        act: None,
     };
     let mut conn = crate::common::fixture_write_pool(&db)
         .await
@@ -2917,6 +3073,7 @@ export const nativeArtifact = {{
             intent: None,
             created_at: row.get("created_at"),
             causal_envelope: native_ce::events::CausalEnvelopeV1::default(),
+            act: None,
         };
         let mut conn = crate::common::fixture_write_pool(&db)
             .await
@@ -3614,4 +3771,377 @@ export const nativeArtifact = {{ schema: "native.mdx.artifact.v2", inputs: {{}},
         1,
         "{denied:#}"
     );
+}
+
+/// `ab3a991`: `manage_artifact_module_grants.grant` with
+/// `subject_kind: "artifact_source"` demands the artifact's *current* source
+/// event id, but no write or read response used to publish it — the only route
+/// was provoking a render failure and reading the id out of the error. The
+/// write receipt that mints a body-bearing event now names it as
+/// `source_event_id`, next to the `body_digest` the receipt already returned
+/// (which is the `source_sha256` the grant needs).
+///
+/// This test uses no `manage_artifact_module_grants.read` and no SQL to learn
+/// either value: the grant below is built from receipt fields alone, which is
+/// exactly the workflow that failed before the change (the receipt carried no
+/// `source_event_id`, so the assertion on its presence failed).
+fn orders_nav_artifact_source() -> String {
+    r#"export const nativeArtifact = {
+  schema: "native.mdx.artifact.v2",
+  inputs: {
+    orders: { envelope: "native.collection-envelope.v1", required: true, expose_to_root: true }
+  },
+  module_inputs: {},
+  capability_requests: [
+    { capability: "input.read", scope: { port: "orders" } },
+    { capability: "navigation.record.user_gesture", scope: {} }
+  ]
+}
+
+<RecordCard record={native.inputs.orders.records[0]} fields={["name"]} />
+"#
+    .to_owned()
+}
+
+async fn latest_body_event_id(db: &Db, record_id: &str) -> String {
+    sqlx::query_scalar(
+        "SELECT id FROM content_events WHERE record_id=?
+          AND type IN ('record.created','record.updated','receipt.committed.v1')
+          AND json_type(payload,'$.body') IS NOT NULL ORDER BY seq DESC LIMIT 1",
+    )
+    .bind(record_id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn write_receipts_publish_the_source_event_id_next_to_body_digest() {
+    let (db, registry, _guard) = fixture().await;
+    let source = orders_nav_artifact_source();
+    let created = call(
+        &registry,
+        &db,
+        "create_record",
+        json!({
+            "id": ARTIFACT_A, "type": "Document", "kind": "artifact", "name": "Receipt source",
+            "body": source, "facets": { "runtime": "native.mdx.v2" },
+            "reason": "Publish the source event id on the creating receipt."
+        }),
+    )
+    .await;
+    let created_event = created["source_event_id"]
+        .as_str()
+        .expect("create receipt names the source event id")
+        .to_owned();
+    assert_eq!(
+        created["body_digest"],
+        json!(hex::encode(Sha256::digest(source.as_bytes()))),
+        "{created:#}"
+    );
+    assert_eq!(created_event, latest_body_event_id(&db, ARTIFACT_A).await);
+
+    // A body edit mints a new source event and the update receipt names it.
+    let edited = format!("{source}\n");
+    let updated = call(
+        &registry,
+        &db,
+        "update_record",
+        json!({
+            "id": ARTIFACT_A, "body": edited,
+            "if_body_digest": current_body_digest(&registry, &db, ARTIFACT_A).await,
+            "reason": "Mint a second source event."
+        }),
+    )
+    .await;
+    let updated_event = updated["source_event_id"]
+        .as_str()
+        .expect("update receipt names the new source event id")
+        .to_owned();
+    assert_ne!(updated_event, created_event);
+    assert_eq!(updated_event, latest_body_event_id(&db, ARTIFACT_A).await);
+    assert_eq!(
+        updated["body_digest"],
+        json!(hex::encode(Sha256::digest(edited.as_bytes()))),
+        "{updated:#}"
+    );
+
+    // The verbose shape carries the same token.
+    let verbose = call(
+        &registry,
+        &db,
+        "update_record",
+        json!({
+            "id": ARTIFACT_A, "body": format!("{edited}\n"),
+            "if_body_digest": current_body_digest(&registry, &db, ARTIFACT_A).await,
+            "response_mode": "verbose",
+            "reason": "Prove the verbose receipt names the source event too."
+        }),
+    )
+    .await;
+    assert_eq!(
+        verbose["source_event_id"].as_str().unwrap(),
+        latest_body_event_id(&db, ARTIFACT_A).await,
+        "{verbose:#}"
+    );
+
+    // A grant built ONLY from receipt values succeeds: no read, no SQL, no
+    // provoked failure was needed to learn either required input.
+    call(
+        &registry,
+        &db,
+        "manage_artifact_module_grants",
+        json!({
+            "action": "grant", "artifact_id": ARTIFACT_A, "subject_kind": "artifact_source",
+            "subject_record_id": ARTIFACT_A, "subject_event_id": verbose["source_event_id"],
+            "source_sha256": verbose["body_digest"], "capability": "input.read",
+            "scope": { "artifact_port": "orders" }
+        }),
+    )
+    .await;
+}
+
+/// `ab3a991`: after an artifact write that drops grants, the invalidation
+/// warning must carry the new source identity so the caller can restore with
+/// `manage_artifact_module_grants.grant` straight from responses it already
+/// holds. The warning below is built from the update receipt and its warning
+/// alone; the test performs no grant-read and no SQL between the invalidating
+/// edit and the restoring grant.
+#[tokio::test]
+async fn grant_invalidation_warning_names_the_new_source_identity() {
+    let (db, registry, _guard) = fixture().await;
+    let source = orders_nav_artifact_source();
+    let created = call(
+        &registry,
+        &db,
+        "create_record",
+        json!({
+            "id": ARTIFACT_A, "type": "Document", "kind": "artifact", "name": "Warning source",
+            "body": source, "facets": { "runtime": "native.mdx.v2" },
+            "reason": "Set up the grant-invalidation fixture."
+        }),
+    )
+    .await;
+    for (id, record_type, kind, name) in [
+        (ORDERS, "Collection", "selection", "Orders"),
+        (ORDER_ONE, "WorkItem", "task", "Order one"),
+    ] {
+        call(
+            &registry,
+            &db,
+            "create_record",
+            json!({ "id": id, "type": record_type, "kind": kind, "name": name,
+                    "reason": "Provide the bound input." }),
+        )
+        .await;
+    }
+    call(
+        &registry,
+        &db,
+        "manage_links",
+        json!({ "action": "add", "source_id": ORDER_ONE,
+                "target_id": ORDERS, "relationship": "member_of" }),
+    )
+    .await;
+    call(
+        &registry,
+        &db,
+        "manage_artifact_inputs",
+        json!({ "action": "bind", "artifact_id": ARTIFACT_A,
+                "port_name": "orders", "collection_id": ORDERS }),
+    )
+    .await;
+    for (capability, scope) in [
+        ("input.read", json!({ "artifact_port": "orders" })),
+        ("navigation.record.user_gesture", json!({})),
+    ] {
+        call(
+            &registry,
+            &db,
+            "manage_artifact_module_grants",
+            json!({
+                "action": "grant", "artifact_id": ARTIFACT_A, "subject_kind": "artifact_source",
+                "subject_record_id": ARTIFACT_A, "subject_event_id": created["source_event_id"],
+                "source_sha256": created["body_digest"], "capability": capability, "scope": scope
+            }),
+        )
+        .await;
+    }
+
+    // Tightening the input declaration drops the changed port's binding and
+    // grant while the navigation grant — which names no port — carries, so
+    // the dropped set can be restored.
+    let tightened = source.replace("required: true", "required: false");
+    assert_ne!(tightened, source);
+    let updated = call(
+        &registry,
+        &db,
+        "update_record",
+        json!({
+            "id": ARTIFACT_A, "body": tightened,
+            "if_body_digest": current_body_digest(&registry, &db, ARTIFACT_A).await,
+            "reason": "Change the declared input contract."
+        }),
+    )
+    .await;
+    assert_eq!(
+        updated["artifact_input_continuity"]["status"], "artifact_inputs_partially_carried",
+        "{updated:#}"
+    );
+    assert_eq!(
+        updated["artifact_input_continuity"]["dropped_grant_count"], 1,
+        "{updated:#}"
+    );
+    assert_eq!(
+        updated["artifact_input_continuity"]["carried_grant_count"], 1,
+        "{updated:#}"
+    );
+    let warning = updated["warnings"]
+        .as_array()
+        .expect("update receipt carries warnings")
+        .iter()
+        .find(|warning| warning["code"] == "artifact_inputs_partially_carried")
+        .expect("the invalidation warning is present")
+        .clone();
+    let warning_event = warning["source_event_id"]
+        .as_str()
+        .expect("the warning names the new source event id")
+        .to_owned();
+    let warning_digest = warning["source_sha256"]
+        .as_str()
+        .expect("the warning names the new source digest")
+        .to_owned();
+    assert!(
+        warning["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("subject_event_id")
+                && message.contains("manage_artifact_module_grants")),
+        "the warning must name the argument the restoring grant needs: {warning:#}"
+    );
+    assert_eq!(warning_event, updated["source_event_id"], "{updated:#}");
+    assert_eq!(warning_digest, updated["body_digest"], "{updated:#}");
+
+    // Restoring the dropped set from the warning's values alone succeeds —
+    // re-bind first, then the dropped input.read grant (the navigation grant
+    // carried, so it needs no restore) — and the artifact renders again: the
+    // full invalidated workflow closes without any out-of-band lookup.
+    call(
+        &registry,
+        &db,
+        "manage_artifact_inputs",
+        json!({ "action": "bind", "artifact_id": ARTIFACT_A,
+                "port_name": "orders", "collection_id": ORDERS }),
+    )
+    .await;
+    for (capability, scope) in [("input.read", json!({ "artifact_port": "orders" }))] {
+        call(
+            &registry,
+            &db,
+            "manage_artifact_module_grants",
+            json!({
+                "action": "grant", "artifact_id": ARTIFACT_A, "subject_kind": "artifact_source",
+                "subject_record_id": ARTIFACT_A, "subject_event_id": warning_event.clone(),
+                "source_sha256": warning_digest.clone(), "capability": capability, "scope": scope
+            }),
+        )
+        .await;
+    }
+    let rendered = call(
+        &registry,
+        &db,
+        "render_artifact",
+        json!({ "id": ARTIFACT_A }),
+    )
+    .await;
+    assert_eq!(rendered["status"], "rendered", "{rendered:#}");
+}
+
+/// `ab3a991` keeps the exact-source guarantee unchanged: a grant still names
+/// one revision, and a grant against revision N is refused once the artifact
+/// has moved to revision N+1. This test pins that refusal with a once-valid
+/// (not forged) revision identity, so the receipt and warning changes above
+/// cannot silently weaken revision binding into "any recent revision".
+#[tokio::test]
+async fn artifact_source_grant_against_a_superseded_revision_is_refused() {
+    let (db, registry, _guard) = fixture().await;
+    let source = orders_nav_artifact_source();
+    let created = call(
+        &registry,
+        &db,
+        "create_record",
+        json!({
+            "id": ARTIFACT_A, "type": "Document", "kind": "artifact", "name": "Revision binding",
+            "body": source, "facets": { "runtime": "native.mdx.v2" },
+            "reason": "Pin revision N."
+        }),
+    )
+    .await;
+    let revision_n_event = created["source_event_id"].clone();
+    let revision_n_digest = created["body_digest"].clone();
+    call(
+        &registry,
+        &db,
+        "manage_artifact_module_grants",
+        json!({
+            "action": "grant", "artifact_id": ARTIFACT_A, "subject_kind": "artifact_source",
+            "subject_record_id": ARTIFACT_A, "subject_event_id": revision_n_event,
+            "source_sha256": revision_n_digest, "capability": "input.read",
+            "scope": { "artifact_port": "orders" }
+        }),
+    )
+    .await;
+
+    // A comment-only body edit keeps every request, so grants carry — but the
+    // source revision still advances to N+1.
+    let updated = call(
+        &registry,
+        &db,
+        "update_record",
+        json!({
+            "id": ARTIFACT_A, "body": format!("{source}\n"),
+            "if_body_digest": current_body_digest(&registry, &db, ARTIFACT_A).await,
+            "reason": "Advance to revision N+1 without withdrawing requests."
+        }),
+    )
+    .await;
+    assert_eq!(
+        updated["artifact_input_continuity"]["status"], "artifact_inputs_carried_forward",
+        "{updated:#}"
+    );
+    assert_ne!(updated["source_event_id"], revision_n_event);
+
+    // The once-valid revision-N identity is now refused for a new grant.
+    let stale = registry
+        .call(
+            db.clone(),
+            Caller::local(),
+            "manage_artifact_module_grants",
+            json!({
+                "action": "grant", "artifact_id": ARTIFACT_A, "subject_kind": "artifact_source",
+                "subject_record_id": ARTIFACT_A, "subject_event_id": revision_n_event,
+                "source_sha256": revision_n_digest, "capability": "navigation.record.user_gesture",
+                "scope": {}
+            }),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        stale.contains("exact"),
+        "a superseded revision must be refused as inexact: {stale}"
+    );
+
+    // The current revision from the receipt is honoured.
+    call(
+        &registry,
+        &db,
+        "manage_artifact_module_grants",
+        json!({
+            "action": "grant", "artifact_id": ARTIFACT_A, "subject_kind": "artifact_source",
+            "subject_record_id": ARTIFACT_A, "subject_event_id": updated["source_event_id"],
+            "source_sha256": updated["body_digest"], "capability": "navigation.record.user_gesture",
+            "scope": {}
+        }),
+    )
+    .await;
 }

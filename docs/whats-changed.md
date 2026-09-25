@@ -117,6 +117,8 @@ progress state.
       "actor": "account-token",
       "actor_name": "Current display name",
       "run_key": "scout-chair-a748b2",
+      "channel": {"kind": "mcp", "assurance": "server_observed"},
+      "executor": {"kind": "authenticated_principal", "assurance": "engine_attested"},
       "first_local_seq": 125,
       "last_local_seq": 180,
       "first_event_at": "2026-08-02T08:00:00.000Z",
@@ -138,13 +140,24 @@ progress state.
 ```
 
 Matching events are grouped within a page by
-`(record_id, actor, run_key)`. Both `scanned_event_count` (retained for wire
+`(record_id, actor, run_key, channel, executor)`, so one record/actor/run
+touched over two transports surfaces as two groups rather than coalescing.
+Each group carries non-identifying server-observed provenance:
+`channel` is `{kind, assurance}` with `kind` one of
+`web | mcp | webhook | local | unknown`, and `executor` is the attested
+`{kind, assurance}` kept on a separate field — never derived from the channel
+or the run key. Missing or invalidated attestations collapse to
+`channel.kind: unknown` with `unknown_or_withheld` assurance (and a null
+executor kind); the channel survives actor redaction. Grouping happens after
+authorization and every filter, so cursor, `matched_event_count`, and
+redaction semantics are unchanged.
+Both `scanned_event_count` (retained for wire
 compatibility) and `matched_event_count` count only caller-visible events in the
 page, after all filters; neither reports how many raw rows the engine examined.
 Reading oldest-first, groups are ordered by their first visible sequence
 ascending; reading newest-first, by their last visible sequence descending,
 so a record touched both long ago and just now sorts on its recent activity.
-`(record_id, actor, run_key)` ties break on the group key in both directions.
+The group key breaks ties in both directions.
 `first_local_seq`/`last_local_seq` and `first_event_at`/`last_event_at` are the minimum and
 maximum over the group's visible events regardless of traversal direction.
 Page boundaries may split and repeat a group; `first_local_seq`, `last_local_seq`, and

@@ -689,6 +689,12 @@ pub struct EventRow {
     pub intent: Option<String>,
     pub created_at: String,
     pub causal_envelope: CausalEnvelopeV1,
+    /// The workspace act this event was stamped with, or `None` for legacy
+    /// pre-cutover rows whose transaction grouping is permanently unknown.
+    /// Replay must preserve this value verbatim — allocating a fresh act
+    /// would fabricate grouping the decision behind acts forbids.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub act: Option<i64>,
 }
 
 #[cfg(test)]

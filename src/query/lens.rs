@@ -13,6 +13,7 @@ use sqlx::Row;
 
 use crate::db::Db;
 use crate::error::Result;
+use crate::events::EventRow;
 
 use super::error::contract_violation;
 
@@ -235,13 +236,20 @@ pub async fn resolve_as_of_in_pool(
     pool: &sqlx::SqlitePool,
     selector: AsOfSelector,
 ) -> Result<ResolvedAsOf> {
+    // One connection for the whole resolution, including the holding
+    // observation below. It does not make the two a single snapshot — that
+    // would need a transaction — but it keeps them on one reader rather than
+    // two, and the residue is bounded: only a compaction interleaving exactly
+    // here could let a position pass the guard and then be gone, and
+    // compaction is a single transactional writer that does not exist yet.
+    let mut conn = pool.acquire().await?;
     let (resolved_content_seq, content_head_seq) = match &selector {
         AsOfSelector::ContentSeq(value) => {
             if value.content_seq < 0 {
                 return Err(contract_violation("as_of content_seq must be >= 0"));
             }
             let head: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(seq), 0) FROM content_events")
-                .fetch_one(pool)
+                .fetch_one(&mut *conn)
                 .await?;
             if value.content_seq > head {
                 return Err(contract_violation(format!(
@@ -267,11 +275,27 @@ pub async fn resolve_as_of_in_pool(
                    FROM content_events",
             )
             .bind(normalized)
-            .fetch_one(pool)
+            .fetch_one(&mut *conn)
             .await?;
             (row.try_get("resolved")?, row.try_get("head")?)
         }
     };
+    // Honest absence (`docs/honest-absence-contract.md` §3, §5c). An as-of
+    // read is served by replaying the content prefix into a scratch
+    // projection, which is only correct when the whole prefix is held. Over a
+    // windowed log it would replay a *suffix* as though it were a prefix and
+    // return a rendering of an empty workspace as truthful history — a
+    // confident wrong answer, not a short one. So the surface refuses.
+    //
+    // At window = ∞ the floor is the first event and this cannot fire: every
+    // caller-supplied position is at or above the position before it.
+    let holding = crate::holding::HoldingDisclosure::observe(&mut conn).await?;
+    if !holding.holds_content_position(resolved_content_seq) {
+        return Err(holding.not_held(
+            "as_of",
+            &format!("the state at content_seq {resolved_content_seq}"),
+        ));
+    }
     Ok(ResolvedAsOf {
         as_of: selector,
         resolved_content_seq,
@@ -318,10 +342,17 @@ pub(crate) async fn replay_projection_in_pool(
     seq: i64,
 ) -> Result<()> {
     let events = crate::query::events::log_prefix_in_pool(live_pool, seq).await?;
+    replay_projection_events(scratch, &events).await
+}
+
+/// Advance a private replay projection with the next ordered, disjoint slice
+/// of the content log. The caller owns the sequence boundary; the projector
+/// still applies every event exactly once and in order.
+pub(crate) async fn replay_projection_events(scratch: &Db, events: &[EventRow]) -> Result<()> {
     let mut tx = scratch.write_pool().begin().await?;
     // Blob identities are projector prerequisites only. Read paths never treat
     // these placeholders as retained evidence; the lens routes bytes live.
-    crate::projector::replay_with_blob_placeholders(&mut tx, &events).await?;
+    crate::projector::replay_with_blob_placeholders(&mut tx, events).await?;
     tx.commit().await?;
     Ok(())
 }
@@ -382,6 +413,143 @@ pub fn as_of_input_schema() -> Value {
         ],
         "description": "Replay the pinned content projection at exactly one sequence or RFC 3339 timestamp. Schema/vocabulary and retained blob bytes resolve live."
     })
+}
+
+#[cfg(test)]
+mod incremental_replay_tests {
+    use serde_json::json;
+    use sqlx::Row;
+
+    use super::*;
+    use crate::db::{apply_schema, create_database, open_database};
+    use crate::events::CausalEnvelopeV1;
+    use crate::mcp::{register_surface_tools, Caller, ToolRegistry};
+
+    #[tokio::test]
+    async fn advancing_replay_preserves_blob_placeholders_and_legacy_cutover() {
+        let db = create_database(":memory:").await.unwrap();
+        let mut registry = ToolRegistry::new();
+        register_surface_tools(&mut registry).unwrap();
+        let bearer = registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "create_record",
+                json!({
+                    "type":"WorkItem", "kind":"task", "name":"Bearer", "reason":"fixture"
+                }),
+            )
+            .await
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let attachment = registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "attach_text",
+                json!({
+                    "record_id":bearer, "text":"alpha beta", "filename":"evidence.txt",
+                "mime":"text/plain"
+                }),
+            )
+            .await
+            .unwrap()["attachment_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        for (start, end) in [(0, 5), (6, 10)] {
+            registry
+                .call(
+                    db.clone(),
+                    Caller::local(),
+                    "create_record",
+                    json!({
+                        "type":"Annotation", "kind":"citation", "name":format!("Cite {start}"),
+                        "links":[{"target_id":bearer,"relationship":"part_of"}],
+                        "target":{"target_record_id":attachment,"source_slot":"blob",
+                                  "selectors":[{"type":"data_position","start":start,"end":end}]},
+                        "reason":"fixture"
+                    }),
+                )
+                .await
+                .unwrap();
+        }
+        let head: i64 = sqlx::query_scalar("SELECT MAX(seq) FROM content_events")
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap();
+        let mut events = crate::query::events::log_prefix(&db, head).await.unwrap();
+        let target_seqs = events
+            .iter()
+            .filter(|event| event.event_type == "annotation.target.set")
+            .map(|event| event.local_seq)
+            .collect::<Vec<_>>();
+        assert_eq!(target_seqs.len(), 2);
+        // Both target events reference the same retained blob. An older event
+        // also marks the causal cutover; the later slice has no legacy event.
+        let blob_id: String = sqlx::query_scalar(
+            "SELECT value FROM facet_values WHERE record_id=? AND key='blob_ref'",
+        )
+        .bind(&attachment)
+        .fetch_one(db.write_pool())
+        .await
+        .unwrap();
+        events[0].causal_envelope = CausalEnvelopeV1::legacy_unknown();
+        let split = events.partition_point(|event| event.local_seq <= target_seqs[0]);
+
+        let incremental = open_database(":memory:").await.unwrap();
+        apply_schema(&incremental).await.unwrap();
+        replay_projection_events(&incremental, &events[..split])
+            .await
+            .unwrap();
+        replay_projection_events(&incremental, &events[split..])
+            .await
+            .unwrap();
+        let full = open_database(":memory:").await.unwrap();
+        apply_schema(&full).await.unwrap();
+        replay_projection_events(&full, &events).await.unwrap();
+
+        for scratch in [&incremental, &full] {
+            let blobs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM blobs WHERE id=?")
+                .bind(&blob_id)
+                .fetch_one(scratch.write_pool())
+                .await
+                .unwrap();
+            assert_eq!(blobs, 1);
+            let target_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM annotation_targets")
+                .fetch_one(scratch.write_pool())
+                .await
+                .unwrap();
+            assert_eq!(target_count, 2);
+            let cutover: i64 = sqlx::query(
+                "SELECT last_legacy_local_seq FROM content_event_causal_cutover WHERE singleton=1",
+            )
+            .fetch_one(scratch.write_pool())
+            .await
+            .unwrap()
+            .try_get(0)
+            .unwrap();
+            assert_eq!(cutover, events[0].local_seq);
+        }
+        let incremental_targets: Vec<(String, String)> = sqlx::query_as(
+            "SELECT annotation_id, blob_id FROM annotation_targets ORDER BY annotation_id",
+        )
+        .fetch_all(incremental.write_pool())
+        .await
+        .unwrap();
+        let full_targets: Vec<(String, String)> = sqlx::query_as(
+            "SELECT annotation_id, blob_id FROM annotation_targets ORDER BY annotation_id",
+        )
+        .fetch_all(full.write_pool())
+        .await
+        .unwrap();
+        assert_eq!(incremental_targets, full_targets);
+        incremental.close().await;
+        full.close().await;
+        db.close().await;
+    }
 }
 
 #[cfg(test)]

@@ -91,6 +91,7 @@ pub fn register_create_many_tool(registry: &mut ToolRegistry) -> Result<()> {
                             "owner_id": { "type": "string" },
                             "persistence": { "type": "string", "enum": ["enduring", "occurrent"] },
                             "maturity": { "type": "string" },
+                            "sources": lifecycle::source_basis_input_schema(),
                             "facets": { "type": "object", "additionalProperties": true },
                             "links": {
                                 "type": "array",
@@ -407,6 +408,28 @@ async fn execute(
     let mut warnings = Vec::new();
     let mut body_digests = Vec::new();
     let mut verbose_results = Vec::new();
+    // One act per succeeded item, not one for the batch: each item is a
+    // separate `create_record` transaction (`create_record_verbose_excluding`
+    // below), so the items do not share a write. Summary mode surfaces the
+    // per-item coordinate here; verbose mode already carries it on each
+    // `results[].record.act`.
+    let mut acts = Vec::new();
+    // Every identity this batch reserved. Passing them as the similar-records
+    // exclusion set keeps one item's notice from naming a sibling created by
+    // the same call while still letting it name a genuine match outside the
+    // batch. Suppressing notices for the whole batch instead would also hide
+    // real matches with pre-existing records, which is the case the notice
+    // exists for.
+    let batch_ids = records
+        .iter()
+        .filter_map(|record| {
+            record
+                .arguments
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .collect::<Vec<_>>();
 
     for index in order {
         let record = &records[index];
@@ -440,8 +463,13 @@ async fn execute(
         // create_many owns its own response_mode contract. It needs the full
         // singular shape to preserve its existing verbose item results, even
         // though public create_record now defaults to a compact receipt.
-        match lifecycle::create_record_verbose(db.clone(), caller.clone(), record.arguments.clone())
-            .await
+        match lifecycle::create_record_verbose_excluding(
+            db.clone(),
+            caller.clone(),
+            record.arguments.clone(),
+            &batch_ids,
+        )
+        .await
         {
             Ok(created) => {
                 states[index] = ItemState::Succeeded;
@@ -451,6 +479,9 @@ async fn execute(
                     .expect("ordinary create_record success carries id")
                     .to_owned();
                 ids[index] = Value::String(id.clone());
+                if let Some(act) = created.get("act").and_then(Value::as_i64) {
+                    acts.push(json!({ "index": index, "id": id, "act": act }));
+                }
                 if let Some(body) = &record.materialized_body {
                     if let Some(digest) = created.get("body_digest").and_then(Value::as_str) {
                         body_digests.push(json!({
@@ -514,6 +545,9 @@ async fn execute(
     if response_mode == ResponseMode::Verbose {
         verbose_results.sort_by_key(|result| result["index"].as_u64().unwrap_or_default());
         object.insert("results".into(), Value::Array(verbose_results));
+    } else if !acts.is_empty() {
+        acts.sort_by_key(|entry| entry["index"].as_u64().unwrap_or_default());
+        object.insert("acts".into(), Value::Array(acts));
     }
     Ok(result)
 }

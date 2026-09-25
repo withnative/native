@@ -268,7 +268,7 @@ async fn series_definition_digest(conn: &mut SqliteConnection, series_id: &str) 
         .ok_or_else(|| Error::engine("derivation series does not exist"))
 }
 
-pub(super) async fn project_event(
+pub(crate) async fn project_event(
     conn: &mut SqliteConnection,
     event: &DerivationEventRow,
 ) -> Result<()> {

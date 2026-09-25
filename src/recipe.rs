@@ -638,6 +638,7 @@ pub async fn publish_recipe_release(
         .map_err(|_| unavailable(RECIPE_UNAVAILABLE))?
         .to_owned();
     let mut tx = begin_write(db.write_pool()).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
     require_public_capability_on(
         &mut tx,
         principal,
@@ -675,6 +676,7 @@ pub async fn publish_recipe_release(
             })?,
             actor: Some(actor),
         },
+        &mut act_alloc,
     )
     .await?;
     let release = read_release_on(&mut tx, &input.program_id, &event.id)
@@ -708,6 +710,7 @@ async fn change_status(
         .map_err(|_| unavailable(RECIPE_UNAVAILABLE))?
         .to_owned();
     let mut tx = begin_write(db.write_pool()).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
     require_public_capability_on(
         &mut tx,
         principal,
@@ -742,6 +745,7 @@ async fn change_status(
             })?,
             actor: Some(actor),
         },
+        &mut act_alloc,
     )
     .await?;
     let release = read_release_on(&mut tx, &input.program_id, &input.publication_event_id)
@@ -1364,7 +1368,7 @@ mod tests {
         // contains a future body edit. Its meaning must remain fixed at the
         // source and publication sequence, not at the latest row today.
         let event_row = sqlx::query(
-            "SELECT seq,id,record_id,type,payload,actor,run_key,parent_key,intent,created_at
+            "SELECT seq,id,record_id,type,payload,actor,run_key,parent_key,intent,created_at,act
                FROM content_events WHERE id=?",
         )
         .bind(&published.descriptor.publication_event_id)
@@ -1385,6 +1389,7 @@ mod tests {
             causal_envelope: crate::events::CausalEnvelopeV1::complete(
                 crate::events::CausalFrontierV1::empty(),
             ),
+            act: event_row.try_get("act").unwrap(),
         };
         let mut replay_tx = begin_write(db.write_pool()).await.unwrap();
         sqlx::query("DELETE FROM recipe_release_input_classes WHERE publication_event_id=?")
@@ -1505,6 +1510,7 @@ mod tests {
         .await
         .unwrap();
         let mut series_tx = begin_write(db.write_pool()).await.unwrap();
+        let mut act_alloc = crate::act::ActAllocation::new();
         append_derivation_event_in(
             &mut series_tx,
             NewDerivationEvent::authored(
@@ -1519,6 +1525,7 @@ mod tests {
                 }),
             )
             .unwrap(),
+            &mut act_alloc,
         )
         .await
         .unwrap();

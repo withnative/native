@@ -29,6 +29,23 @@ use super::super::registry::{Caller, ToolRegistry};
 use super::super::ToolKind;
 use super::{parse_args, require_record, require_record_in, visible_ids_in_pool};
 
+/// How long a holder run keeps reading `open` after its last observed
+/// activity. This shares the `active_until` horizon the `agent_activity`
+/// relation publishes (`+5 minutes` in `src/query/sql.rs`): the value is
+/// shared, so moving it is a change to a ratified relation semantic, not a
+/// local tuning knob. Sharing the value does not mean the two surfaces
+/// agree about the same run — [`neighbour_run_state_at`] lists the
+/// deliberate divergences, in both directions. *This* derivation reads
+/// durable content events and nothing else; the relation also folds in
+/// read-log observations when its capture helper is present, and that fold
+/// is a tolerated legacy rather than a standard to match. Native builds
+/// collective intelligence from acts, not attention. A delegate's reads are
+/// oversight for its principal to inspect, and enter the shared world only
+/// when an act names them, so reads never move this horizon. Claim and
+/// release events do count — they are calls on a coordination surface,
+/// which are acts.
+const HOLDER_ACTIVE_HORIZON: &str = "+5 minutes";
+
 const ACTION_CLAIM: &str = "claim";
 const ACTION_PREVIEW: &str = "preview";
 const ACTION_RELEASE: &str = "release";
@@ -50,8 +67,11 @@ struct ProjectedClaimState {
     claimed_at: Option<String>,
     claim_event_id: Option<String>,
     activity_id: Option<String>,
-    /// Holder liveness resolved with the canonical [`neighbour_run_state`],
-    /// so preview, claim refusal and the overlap notice share one vocabulary.
+    /// Holder liveness resolved with the canonical [`neighbour_run_state`].
+    /// Preview (`work_state`) and the overlap notice carry it as `run_state`
+    /// alongside `holder_tier`; the claim refusal (`already_claimed`) returns
+    /// `Err` before any `work_state` is assembled, so it carries only
+    /// `holder_tier` and the run key, never `run_state`.
     /// Meaningful only for same-account rows; cross-principal rows stay
     /// `withheld` before it is read.
     holder_run_state: &'static str,
@@ -465,11 +485,12 @@ async fn overlap_neighbourhood(
 
 /// Same-credential run liveness for a neighbourhood holder, resolved the same
 /// way `project_work_states_in` resolves it for the caller's own exact tuple:
-/// `open` while the run is live, `closed` once it ended, `missing` when no
-/// `agent_runs` row exists for the key, `not_applicable` when the claim
-/// carries no run key at all. Only ever called for a holder sharing the
-/// caller's account — resolving it for another principal would build the
-/// cross-account oracle the projection above deliberately refuses.
+/// `open` when observed inside the horizon, `silent` when observable but
+/// quiet past it, `closed` once it ended, `missing` when no `agent_runs` row
+/// exists for the key, `not_applicable` when the claim carries no run key at
+/// all. Only ever called for a holder sharing the caller's account —
+/// resolving it for another principal would build the cross-account oracle
+/// the projection above deliberately refuses.
 async fn neighbour_run_state(
     pool: &SqlitePool,
     account: &str,
@@ -488,25 +509,89 @@ async fn neighbour_run_state(
 /// Connection-scoped form of [`neighbour_run_state`], and the single place
 /// the `agent_runs` liveness query lives: a handler already holding a
 /// connection reads liveness on it instead of taking a second pool slot.
+///
+/// Delegates to [`neighbour_run_state_at`] against the engine clock.
 async fn neighbour_run_state_on(
     conn: &mut SqliteConnection,
     account: &str,
     run_key: Option<&str>,
 ) -> Result<&'static str> {
+    neighbour_run_state_at(conn, account, run_key, &crate::store::now_iso()).await
+}
+
+/// Resolve a holder run's state against an injected observation time.
+///
+/// `open` means observed within the horizon, not merely un-closed. The
+/// distinction matters because `ended_at` is written by `close_run`, a
+/// terminal act the overwhelming majority of runs never perform: reading
+/// liveness from it alone reports every abandoned holder as `open`, which
+/// makes a claim held by a dead run indistinguishable from one held by a
+/// run working right now. Recency is derived from activity the run cannot
+/// omit, so it needs no cooperation from the holder.
+///
+/// The four values:
+///
+/// * `missing` — no such run for this account.
+/// * `closed` — the run ended. Terminal, and takes precedence over recency.
+/// * `open` — observed inside the horizon.
+/// * `silent` — observable, and quiet past the horizon. This is evidence
+///   about the run, never proof: silence cannot prove inactivity, and an
+///   agent that is working without calling Native is silent by definition.
+///
+/// Two deliberate divergences from the `agent_activity` relation, which
+/// derives the same recency (`src/query/sql.rs`):
+///
+/// 1. The relation excludes claim-tuple updates from recency so that hiding
+///    a claim can never alter presence or ordering. That guarantee protects
+///    a surface this one is inside: holder liveness resolves for
+///    same-account holders only, and the caller already sees the claim. The
+///    exclusion also costs a `json_type` scan of every run-scoped payload
+///    under the caller ceiling, which is the open defect `768eb1d`; this
+///    path opens no payload and so cannot inherit it.
+/// 2. The relation folds in the disposable read-log observation when the
+///    protected helper is available. That helper is a temp projection built
+///    per governed query and is absent here, leaving the durable subset —
+///    which is what the relation itself falls back to.
+///
+/// An unparseable stored timestamp yields `silent` rather than an error,
+/// matching the relation, whose `appears_active` likewise resolves false
+/// when its comparison is not computable.
+async fn neighbour_run_state_at(
+    conn: &mut SqliteConnection,
+    account: &str,
+    run_key: Option<&str>,
+    observed_at: &str,
+) -> Result<&'static str> {
     let Some(run_key) = run_key else {
         return Ok("not_applicable");
     };
-    let row: Option<(String, Option<String>)> = sqlx::query_as(
-        "SELECT activity_id, ended_at FROM agent_runs WHERE run_key = ? AND account_id = ?",
-    )
+    let row: Option<(i64, i64)> = sqlx::query_as(&format!(
+        "WITH holder AS ( \
+           SELECT run.ended_at AS ended_at, \
+                  max(run.started_at, \
+                      coalesce((SELECT max(event.created_at) FROM content_events event \
+                                  WHERE event.run_key=run.run_key \
+                                    AND event.actor=run.account_id), \
+                               run.started_at)) AS last_observed_activity_at \
+             FROM agent_runs run \
+            WHERE run.run_key=? AND run.account_id=? \
+         ) \
+         SELECT ended_at IS NOT NULL AS closed, \
+                coalesce(julianday(?) \
+                         < julianday(last_observed_activity_at, '{HOLDER_ACTIVE_HORIZON}'), 0) \
+                  AS within_horizon \
+           FROM holder"
+    ))
     .bind(run_key)
     .bind(account)
+    .bind(observed_at)
     .fetch_optional(&mut *conn)
     .await?;
     Ok(match row {
         None => "missing",
-        Some((_, Some(_))) => "closed",
-        Some((_, None)) => "open",
+        Some((closed, _)) if closed != 0 => "closed",
+        Some((_, within_horizon)) if within_horizon != 0 => "open",
+        Some(_) => "silent",
     })
 }
 
@@ -1033,6 +1118,7 @@ struct Outcome {
     held_by_account: Option<String>,
     held_by_run_key: Option<String>,
     claimed_at: Option<String>,
+    act: Option<i64>,
 }
 
 impl Outcome {
@@ -1046,12 +1132,14 @@ impl Outcome {
             held_by_account: state.claimed_by_account,
             held_by_run_key: state.claimed_run_key,
             claimed_at: state.claimed_at,
+            act: None,
         }
     }
 }
 
 async fn claim(db: &Db, caller: &Caller, tool: &str, args: &StartWorkArgs) -> Result<Outcome> {
     let mut tx = crate::db::begin_write(db.write_pool()).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
     require_record_in(&mut tx, caller, tool, &args.record_id, Capability::Edit).await?;
     if let Some(run_key) = caller.run_key() {
         let lifecycle: Option<(String, Option<String>)> =
@@ -1090,6 +1178,7 @@ async fn claim(db: &Db, caller: &Caller, tool: &str, args: &StartWorkArgs) -> Re
             }),
             actor: Some(caller.actor().to_string()),
         },
+        &mut act_alloc,
     )
     .await?;
     db.commit_content(tx).await?;
@@ -1107,11 +1196,13 @@ async fn claim(db: &Db, caller: &Caller, tool: &str, args: &StartWorkArgs) -> Re
         held_by_account: Some(caller.credential().to_string()),
         held_by_run_key: caller.run_key().map(String::from),
         claimed_at: Some(event.created_at),
+        act: act_alloc.get(),
     })
 }
 
 async fn release(db: &Db, caller: &Caller, tool: &str, args: &StartWorkArgs) -> Result<Outcome> {
     let mut tx = crate::db::begin_write(db.write_pool()).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
     require_record_in(&mut tx, caller, tool, &args.record_id, Capability::Edit).await?;
     let state = claim_state_in(&mut tx, &args.record_id).await?;
     if !state.is_claimed() {
@@ -1177,6 +1268,7 @@ async fn release(db: &Db, caller: &Caller, tool: &str, args: &StartWorkArgs) -> 
             payload,
             actor: Some(caller.actor().to_string()),
         },
+        &mut act_alloc,
     )
     .await?;
     db.commit_content(tx).await?;
@@ -1188,6 +1280,7 @@ async fn release(db: &Db, caller: &Caller, tool: &str, args: &StartWorkArgs) -> 
         held_by_account: None,
         held_by_run_key: None,
         claimed_at: None,
+        act: act_alloc.get(),
     })
 }
 
@@ -1253,6 +1346,14 @@ async fn start_work(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
             .as_object_mut()
             .expect("start_work response is an object")
             .insert("work_overlap".into(), overlap);
+    }
+    // A preview or an already-held claim appended nothing canonical and
+    // allocates no act; omit the field rather than reporting a value.
+    if let Some(act) = outcome.act {
+        response
+            .as_object_mut()
+            .expect("start_work response is an object")
+            .insert("act".into(), act.into());
     }
     Ok(response)
 }
@@ -1571,12 +1672,22 @@ mod tests {
         let closed = subject(&db).await;
         let missing = subject(&db).await;
 
-        crate::control::ensure_agent_run(&db, open_run, account)
-            .await
-            .unwrap();
-        crate::control::ensure_agent_run(&db, closed_run, account)
-            .await
-            .unwrap();
+        crate::control::ensure_agent_run(
+            &db,
+            open_run,
+            account,
+            crate::control::ReportedRunIdentity::default(),
+        )
+        .await
+        .unwrap();
+        crate::control::ensure_agent_run(
+            &db,
+            closed_run,
+            account,
+            crate::control::ReportedRunIdentity::default(),
+        )
+        .await
+        .unwrap();
         let open_holder =
             Caller::authenticated(account).with_run_context(Some(open_run.to_string()), None);
         let closed_holder =
@@ -1642,9 +1753,14 @@ mod tests {
 
         // Correlation keys are not authority: another account later creating
         // the claimed key must not enrich the original holder's target.
-        crate::control::ensure_agent_run(&db, missing_run, "account:other")
-            .await
-            .unwrap();
+        crate::control::ensure_agent_run(
+            &db,
+            missing_run,
+            "account:other",
+            crate::control::ReportedRunIdentity::default(),
+        )
+        .await
+        .unwrap();
         let reused_projection = project_work_states_in(&mut conn, &missing_holder, &ids)
             .await
             .unwrap();
@@ -1728,5 +1844,430 @@ mod tests {
         .await
         .unwrap();
         assert!(!recovered.claimed);
+    }
+
+    /// Far-future observation time used to push a run started "now" past the
+    /// 5-minute horizon without backdating any stored timestamp.
+    const FAR_FUTURE_OBSERVED_AT: &str = "2999-01-01T00:00:00.000Z";
+
+    async fn run_state_at(
+        db: &Db,
+        account: &str,
+        run_key: Option<&str>,
+        observed_at: &str,
+    ) -> &'static str {
+        let mut conn = db.write_pool().acquire().await.unwrap();
+        neighbour_run_state_at(&mut conn, account, run_key, observed_at)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn neighbour_run_state_at_resolves_liveness_states() {
+        let db = create_database(":memory:").await.unwrap();
+        let account = "account:a";
+
+        // No key, no liveness question.
+        assert_eq!(
+            run_state_at(&db, account, None, FAR_FUTURE_OBSERVED_AT).await,
+            "not_applicable"
+        );
+        // Admitted keys are account-scoped: another account's row is missing.
+        crate::control::ensure_agent_run(
+            &db,
+            "scout-chair-d748b2",
+            "account:other",
+            crate::control::ReportedRunIdentity::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            run_state_at(
+                &db,
+                account,
+                Some("scout-chair-d748b2"),
+                FAR_FUTURE_OBSERVED_AT
+            )
+            .await,
+            "missing"
+        );
+        // Never-admitted key for this account is missing too.
+        assert_eq!(
+            run_state_at(
+                &db,
+                account,
+                Some("heron-river-d748b2"),
+                FAR_FUTURE_OBSERVED_AT
+            )
+            .await,
+            "missing"
+        );
+
+        // Admitted run observed at its own start is inside the horizon.
+        let live = crate::control::ensure_agent_run(
+            &db,
+            "scout-chair-e748b2",
+            account,
+            crate::control::ReportedRunIdentity::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            run_state_at(&db, account, Some("scout-chair-e748b2"), &live.started_at).await,
+            "open"
+        );
+        // The same run observed far past the horizon is silent, not open:
+        // nobody called close_run, yet recency still reports the quiet.
+        assert_eq!(
+            run_state_at(
+                &db,
+                account,
+                Some("scout-chair-e748b2"),
+                FAR_FUTURE_OBSERVED_AT
+            )
+            .await,
+            "silent"
+        );
+
+        // Terminality takes precedence over recency: a closed run observed
+        // at its own (recent) start still reads closed.
+        let closing = crate::control::ensure_agent_run(
+            &db,
+            "pilot-river-d748b2",
+            account,
+            crate::control::ReportedRunIdentity::default(),
+        )
+        .await
+        .unwrap();
+        crate::control::close_agent_run(&db, "pilot-river-d748b2", account)
+            .await
+            .unwrap();
+        assert_eq!(
+            run_state_at(
+                &db,
+                account,
+                Some("pilot-river-d748b2"),
+                &closing.started_at
+            )
+            .await,
+            "closed"
+        );
+        assert_eq!(
+            run_state_at(
+                &db,
+                account,
+                Some("pilot-river-d748b2"),
+                FAR_FUTURE_OBSERVED_AT
+            )
+            .await,
+            "closed"
+        );
+    }
+
+    #[tokio::test]
+    async fn neighbour_run_state_at_counts_later_content_event_as_activity() {
+        // The case the ended_at-only read got wrong: started_at is far past
+        // the horizon at observation time, but a later run-correlated event
+        // keeps the holder open.
+        let db = create_database(":memory:").await.unwrap();
+        let account = "account:a";
+        let run_key = "scout-chair-f748b2";
+        crate::control::ensure_agent_run(
+            &db,
+            run_key,
+            account,
+            crate::control::ReportedRunIdentity::default(),
+        )
+        .await
+        .unwrap();
+        // Baseline without any event: started_at is ~973 years stale here.
+        assert_eq!(
+            run_state_at(&db, account, Some(run_key), FAR_FUTURE_OBSERVED_AT).await,
+            "silent"
+        );
+
+        let record_id = subject(&db).await;
+        // An event stamped with this run key but another actor is not the
+        // run's activity, so the holder stays silent.
+        sqlx::query(
+            "INSERT INTO content_events(id,record_id,type,payload,actor,run_key,\
+             created_at,causal_envelope_version,causal_status) \
+             VALUES(?,?,?,?,?,?,?,1,'complete')",
+        )
+        .bind("11111111-1111-4111-8111-111111111111")
+        .bind(&record_id)
+        .bind("test.activity-probe")
+        .bind("{}")
+        .bind("account:other")
+        .bind(run_key)
+        .bind(FAR_FUTURE_OBSERVED_AT)
+        .execute(db.write_pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            run_state_at(&db, account, Some(run_key), FAR_FUTURE_OBSERVED_AT).await,
+            "silent"
+        );
+
+        // The run's own later event observes it inside the horizon.
+        sqlx::query(
+            "INSERT INTO content_events(id,record_id,type,payload,actor,run_key,\
+             created_at,causal_envelope_version,causal_status) \
+             VALUES(?,?,?,?,?,?,?,1,'complete')",
+        )
+        .bind("22222222-2222-4222-8222-222222222222")
+        .bind(&record_id)
+        .bind("test.activity-probe")
+        .bind("{}")
+        .bind(account)
+        .bind(run_key)
+        .bind(FAR_FUTURE_OBSERVED_AT)
+        .execute(db.write_pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            run_state_at(&db, account, Some(run_key), FAR_FUTURE_OBSERVED_AT).await,
+            "open"
+        );
+    }
+
+    #[tokio::test]
+    async fn neighbour_run_state_at_boundary_is_exclusive() {
+        // The horizon comparison is strict `<`, matching the relation: at
+        // precisely last_observed + 5 minutes the holder is already silent.
+        let db = create_database(":memory:").await.unwrap();
+        let account = "account:a";
+        let run_key = "scout-chair-c749b2";
+        crate::control::ensure_agent_run(
+            &db,
+            run_key,
+            account,
+            crate::control::ReportedRunIdentity::default(),
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE agent_runs SET started_at=? WHERE run_key=?")
+            .bind("2026-01-01T00:00:00.000Z")
+            .bind(run_key)
+            .execute(db.write_pool())
+            .await
+            .unwrap();
+        // Just inside the horizon is still open ...
+        assert_eq!(
+            run_state_at(&db, account, Some(run_key), "2026-01-01T00:04:59.999Z").await,
+            "open"
+        );
+        // ... while the exact boundary instant is silent.
+        assert_eq!(
+            run_state_at(&db, account, Some(run_key), "2026-01-01T00:05:00.000Z").await,
+            "silent"
+        );
+    }
+
+    #[tokio::test]
+    async fn neighbour_run_state_at_unparseable_timestamp_resolves_silent() {
+        // An uncomputable recency comparison resolves `silent`, never an
+        // error — matching the relation, whose `appears_active` likewise
+        // resolves false. NULL stored timestamps take the same `coalesce`
+        // path; the schema forbids NULL `started_at`, so a garbage string
+        // exercises the shared julianday-NULL branch.
+        let db = create_database(":memory:").await.unwrap();
+        let account = "account:a";
+        let run_key = "scout-chair-d749b2";
+        crate::control::ensure_agent_run(
+            &db,
+            run_key,
+            account,
+            crate::control::ReportedRunIdentity::default(),
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE agent_runs SET started_at=? WHERE run_key=?")
+            .bind("not-a-timestamp")
+            .bind(run_key)
+            .execute(db.write_pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            run_state_at(&db, account, Some(run_key), FAR_FUTURE_OBSERVED_AT).await,
+            "silent"
+        );
+    }
+
+    #[tokio::test]
+    async fn neighbour_run_state_on_reads_through_engine_clock() {
+        // Drive the production path — the engine-clock `neighbour_run_state_on`
+        // form the handlers actually call — rather than only the
+        // injected-clock `_at` form: a freshly admitted run is `open`, and a
+        // closed one stays `closed`.
+        let db = create_database(":memory:").await.unwrap();
+        let account = "account:a";
+        let run_key = "scout-chair-e749b2";
+        crate::control::ensure_agent_run(
+            &db,
+            run_key,
+            account,
+            crate::control::ReportedRunIdentity::default(),
+        )
+        .await
+        .unwrap();
+        let mut conn = db.write_pool().acquire().await.unwrap();
+        assert_eq!(
+            neighbour_run_state_on(&mut conn, account, Some(run_key))
+                .await
+                .unwrap(),
+            "open"
+        );
+        crate::control::close_agent_run(&db, run_key, account)
+            .await
+            .unwrap();
+        assert_eq!(
+            neighbour_run_state_on(&mut conn, account, Some(run_key))
+                .await
+                .unwrap(),
+            "closed"
+        );
+    }
+
+    #[tokio::test]
+    async fn neighbour_run_state_at_counts_the_holders_own_claim() {
+        // Regression guard for the other half of the acts-not-attention
+        // stance, symmetric with `neighbour_run_state_at_ignores_reads`.
+        // The `agent_activity` relation excludes claim-tuple updates from
+        // recency so that hiding a claim cannot alter presence or ordering.
+        // This derivation counts them, deliberately: a claim is a call on a
+        // coordination surface, which is an act, and the caller already sees
+        // the claim it is being told about. Align this path with the
+        // relation's exclusion and a holder whose only act is its own fresh
+        // claim flips to `silent` the moment `started_at` ages out.
+        let db = create_database(":memory:").await.unwrap();
+        let account = "account:a";
+        let run_key = "scout-chair-g749b2";
+        crate::control::ensure_agent_run(
+            &db,
+            run_key,
+            account,
+            crate::control::ReportedRunIdentity::default(),
+        )
+        .await
+        .unwrap();
+        // Stale admission: the run started well outside the horizon.
+        sqlx::query("UPDATE agent_runs SET started_at=? WHERE run_key=?")
+            .bind("2026-01-01T00:00:00.000Z")
+            .bind(run_key)
+            .execute(db.write_pool())
+            .await
+            .unwrap();
+        let record_id = subject(&db).await;
+        let claimed_at = "2026-01-01T02:00:00.000Z";
+        let observed_at = "2026-01-01T02:03:00.000Z";
+        // Baseline: nothing but the stale admission, so the holder is quiet.
+        assert_eq!(
+            run_state_at(&db, account, Some(run_key), observed_at).await,
+            "silent"
+        );
+
+        // A claim-shaped durable act: `record.updated` carrying the claim
+        // tuple, stamped with the holder's actor and run key exactly as the
+        // dispatch choke point stamps a real `start_work` claim.
+        sqlx::query(
+            "INSERT INTO content_events(id,record_id,type,payload,actor,run_key,\
+             created_at,causal_envelope_version,causal_status) \
+             VALUES(?,?,'record.updated',?,?,?,?,1,'complete')",
+        )
+        .bind("44444444-4444-4444-8444-444444444444")
+        .bind(&record_id)
+        .bind(format!(
+            "{{\"claimed_by_account\":\"{account}\",\"claimed_run_key\":\"{run_key}\"}}"
+        ))
+        .bind(account)
+        .bind(run_key)
+        .bind(claimed_at)
+        .execute(db.write_pool())
+        .await
+        .unwrap();
+
+        // Three minutes after the claim, inside the horizon: the act counts.
+        assert_eq!(
+            run_state_at(&db, account, Some(run_key), observed_at).await,
+            "open"
+        );
+        // And it still ages out on its own recency, not the run's.
+        assert_eq!(
+            run_state_at(&db, account, Some(run_key), "2026-01-01T02:06:00.000Z").await,
+            "silent"
+        );
+    }
+
+    #[tokio::test]
+    async fn neighbour_run_state_at_ignores_reads() {
+        // Regression guard for the acts-not-attention stance: a holder whose
+        // only activity since its last content event is *reading* still reads
+        // `silent`. The read log is oversight for the principal to inspect,
+        // not a stigmergic substrate, so read-log calls must never move the
+        // liveness horizon — only durable content events do.
+        let db = create_database(":memory:").await.unwrap();
+        let account = "account:a";
+        let run_key = "scout-chair-f749b2";
+        crate::control::ensure_agent_run(
+            &db,
+            run_key,
+            account,
+            crate::control::ReportedRunIdentity::default(),
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE agent_runs SET started_at=? WHERE run_key=?")
+            .bind("2026-01-01T00:00:00.000Z")
+            .bind(run_key)
+            .execute(db.write_pool())
+            .await
+            .unwrap();
+        let observed_at = "2026-01-01T00:10:00.000Z";
+        // Baseline: ten minutes past the only content signal, silent.
+        assert_eq!(
+            run_state_at(&db, account, Some(run_key), observed_at).await,
+            "silent"
+        );
+
+        // The holder reads right at the observation instant: a read-log call
+        // with an `opened` touch, the same shape a real read leaves behind.
+        let record_id = subject(&db).await;
+        let call_id = sqlx::query(
+            "INSERT INTO read_log_calls(id,tool,run_key,actor,arguments,outcome,\
+             started_at,ended_at) \
+             VALUES(?,?,?,?,?,'ok',?,?)",
+        )
+        .bind("33333333-3333-4333-8333-333333333333")
+        .bind("search")
+        .bind(run_key)
+        .bind(account)
+        .bind("{}")
+        .bind(observed_at)
+        .bind(observed_at)
+        .execute(db.write_pool())
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        sqlx::query("INSERT OR IGNORE INTO read_log_record_ids (record_id) VALUES (?)")
+            .bind(&record_id)
+            .execute(db.write_pool())
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO read_log_touches(call_seq,record_ref,interaction,result_rank) \
+             VALUES(?,(SELECT record_ref FROM read_log_record_ids WHERE record_id=?),'opened',NULL)",
+        )
+        .bind(call_id)
+        .bind(&record_id)
+        .execute(db.write_pool())
+        .await
+        .unwrap();
+
+        // Reading moved nothing: still silent, not open.
+        assert_eq!(
+            run_state_at(&db, account, Some(run_key), observed_at).await,
+            "silent"
+        );
     }
 }

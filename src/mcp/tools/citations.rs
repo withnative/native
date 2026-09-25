@@ -15,7 +15,8 @@ use crate::store::{append_in, AppendSpec};
 use super::super::registry::{Caller, ToolRegistry};
 use super::super::ToolKind;
 use super::{
-    can_record, parse_args, require_nonblank_reason, require_record_in, REASON_DESCRIPTION,
+    can_record, echo_act, parse_args, require_nonblank_reason, require_record_in,
+    REASON_DESCRIPTION,
 };
 
 fn citation_not_found(tool: &str, citation_id: &str) -> Error {
@@ -261,6 +262,7 @@ async fn manage_citations(db: Db, caller: Caller, arguments: Value) -> Result<Va
     const TOOL: &str = "manage_citations";
     let args: ManageCitationsArgs = parse_args(TOOL, arguments)?;
     let mut tx = crate::db::begin_write(db.write_pool()).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
     let (citation_id, event_type, payload, reason) = match args {
         ManageCitationsArgs::Reanchor {
             citation_id,
@@ -376,15 +378,19 @@ async fn manage_citations(db: Db, caller: Caller, arguments: Value) -> Result<Va
             payload,
             actor: Some(caller.actor().into()),
         },
+        &mut act_alloc,
     )
     .await?;
     db.commit_content(tx).await?;
-    Ok(json!({
+    echo_act(
+        json!({
         "citation_id": citation_id,
         "action": if event_type.ends_with("removed") { "removed" } else { "reanchored" },
         "event_seq": event.local_seq,
         "reason": reason
-    }))
+        }),
+        act_alloc.get(),
+    )
 }
 
 pub(crate) fn target_schema() -> Value {

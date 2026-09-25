@@ -15,9 +15,9 @@ use base64::Engine as _;
 use native_ce::standby::GenerationStore;
 use native_ce::standby_snapshot::{
     CanonicalFrontierV1, ObservedInstalledConsumerIdentity, StandbyConsumerIdentity,
-    StandbyConsumerPlatform, StandbySnapshotBytes, StandbySnapshotEngineIdentity,
-    StandbySnapshotManifest, STANDBY_CONSUMER_CONTRACT, STANDBY_FRONTIER_CONTRACT,
-    STANDBY_SNAPSHOT_MANIFEST_CONTRACT, STANDBY_SNAPSHOT_MEDIA_TYPE,
+    StandbyConsumerPlatform, StandbyGenerationMaterialization, StandbySnapshotBytes,
+    StandbySnapshotEngineIdentity, StandbySnapshotManifest, STANDBY_CONSUMER_CONTRACT,
+    STANDBY_FRONTIER_CONTRACT, STANDBY_SNAPSHOT_MANIFEST_CONTRACT, STANDBY_SNAPSHOT_MEDIA_TYPE,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -62,13 +62,45 @@ fn run_mcp(path: &Path, standby: bool, messages: &[Value]) -> ProcessOutput {
     run_mcp_with_env(path, standby, messages, &[])
 }
 
+fn generated_native_local_entry() -> Option<(PathBuf, Vec<String>)> {
+    let config_path = std::env::var_os("NATIVE_STANDBY_GENERATED_MCP_CONFIG")?;
+    let config: Value = serde_json::from_slice(&std::fs::read(config_path).unwrap()).unwrap();
+    let entry = &config["mcpServers"]["native-local"];
+    let command = entry["command"]
+        .as_str()
+        .expect("generated native-local command");
+    let args = entry["args"]
+        .as_array()
+        .expect("generated native-local args")
+        .iter()
+        .map(|arg| {
+            arg.as_str()
+                .expect("generated native-local string arg")
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        Path::new(command).is_absolute(),
+        "native-local command must be absolute"
+    );
+    assert_eq!(args.first().map(String::as_str), Some("--standby"));
+    assert!(args.get(1).is_some_and(|arg| Path::new(arg).is_absolute()));
+    Some((PathBuf::from(command), args))
+}
+
 fn run_mcp_with_env(
     path: &Path,
     standby: bool,
     messages: &[Value],
     environment: &[(&str, String)],
 ) -> ProcessOutput {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_mcp-stdio"));
+    let generated_entry = generated_native_local_entry();
+    let binary = generated_entry
+        .as_ref()
+        .map(|(command, _)| command.clone())
+        .or_else(|| std::env::var_os("NATIVE_STANDBY_TEST_BINARY").map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_mcp-stdio")));
+    let mut command = Command::new(binary);
     command
         .env_clear()
         .current_dir(path.parent().unwrap())
@@ -81,15 +113,17 @@ fn run_mcp_with_env(
     if let Ok(profile) = std::env::var("LLVM_PROFILE_FILE") {
         command.env("LLVM_PROFILE_FILE", profile);
     }
-    if standby {
+    if let Some((_, args)) = generated_entry {
+        command.args(args);
+    } else if standby {
         // Standby must override the configured default executor before it can
         // construct a plan store or telemetry sink.
         command.env("NATIVE_CE_MCP_SURFACE", "executor");
-        command.arg("--standby");
+        command.arg("--standby").arg(path);
     } else {
         command.env("NATIVE_CE_MCP_SURFACE", "legacy");
+        command.arg(path);
     }
-    command.arg(path);
 
     let mut child = command.spawn().unwrap();
     let mut stdin = child.stdin.take().unwrap();
@@ -126,8 +160,10 @@ fn run_mcp_with_env(
         }
         if Instant::now() >= deadline {
             let _ = child.kill();
-            let _ = child.wait();
-            panic!("mcp-stdio did not exit after stdin reached EOF");
+            let status = child.wait().unwrap();
+            let stdout = String::from_utf8(stdout.join().unwrap()).unwrap_or_default();
+            let stderr = String::from_utf8(stderr.join().unwrap()).unwrap_or_default();
+            panic!("mcp-stdio did not exit after stdin reached EOF (status {status})\nstdout: {stdout}\nstderr: {stderr}");
         }
         std::thread::sleep(Duration::from_millis(10));
     };
@@ -288,7 +324,7 @@ fn sha256_path(path: &Path) -> String {
     hex::encode(Sha256::digest(std::fs::read(path).unwrap()))
 }
 
-fn frontier_from_snapshot(path: &Path) -> CanonicalFrontierV1 {
+fn frontier_from_snapshot(path: &Path) -> (CanonicalFrontierV1, i64) {
     use rusqlite::OpenFlags;
 
     let connection = rusqlite::Connection::open_with_flags(
@@ -297,7 +333,7 @@ fn frontier_from_snapshot(path: &Path) -> CanonicalFrontierV1 {
     )
     .unwrap();
     let scalar = |sql: &str| connection.query_row(sql, [], |row| row.get(0)).unwrap();
-    CanonicalFrontierV1 {
+    let frontier = CanonicalFrontierV1 {
         contract: STANDBY_FRONTIER_CONTRACT.into(),
         version: 1,
         content_event_seq: scalar("SELECT COALESCE(MAX(seq),0) FROM content_events"),
@@ -320,7 +356,9 @@ fn frontier_from_snapshot(path: &Path) -> CanonicalFrontierV1 {
         storage_portability_policy_revision: scalar(
             "SELECT COALESCE((SELECT policy_revision FROM storage_portability_policy WHERE singleton=1),0)",
         ),
-    }
+    };
+    let head_act = scalar("SELECT next_act FROM act_state WHERE singleton=1");
+    (frontier, head_act)
 }
 
 fn write_runtime_config(path: &Path, replica_root: &Path, origin: &str) {
@@ -377,8 +415,10 @@ async fn snapshot_fixture(
     StandbySnapshotManifest,
     ObservedInstalledConsumerIdentity,
 ) {
-    let executable = Path::new(env!("CARGO_BIN_EXE_mcp-stdio"));
-    let artifact_sha256 = sha256_path(executable);
+    let executable = std::env::var_os("NATIVE_STANDBY_TEST_BINARY")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_mcp-stdio")));
+    let artifact_sha256 = sha256_path(&executable);
     let consumer = StandbyConsumerIdentity {
         contract: STANDBY_CONSUMER_CONTRACT.into(),
         version: 1,
@@ -404,7 +444,7 @@ async fn snapshot_fixture(
     export_source.close().await;
     let snapshot_path = export.path();
     let snapshot_bytes = std::fs::read(&snapshot_path).unwrap();
-    let frontier = frontier_from_snapshot(&snapshot_path);
+    let (frontier, head_act) = frontier_from_snapshot(&snapshot_path);
     export.cleanup().await;
     let manifest = StandbySnapshotManifest {
         contract: STANDBY_SNAPSHOT_MANIFEST_CONTRACT.into(),
@@ -421,6 +461,8 @@ async fn snapshot_fixture(
         },
         consumer,
         frontier,
+        head_act: Some(head_act),
+        materialization: StandbyGenerationMaterialization::Snapshot,
         snapshot: StandbySnapshotBytes {
             media_type: STANDBY_SNAPSHOT_MEDIA_TYPE.into(),
             size_bytes: snapshot_bytes.len() as u64,
@@ -591,10 +633,24 @@ async fn standby_process_refreshes_in_background_for_the_next_activation() {
     let (snapshot, manifest, _) = snapshot_fixture(&source_path, &origin_id).await;
     let (hosted_origin, server) = spawn_snapshot_endpoint(snapshot, manifest, BEARER);
 
-    let replica_root = directory.path().join("replica");
+    let generated_entry = generated_native_local_entry();
+    let (replica_root, runtime_config) = if let Some((_, args)) = generated_entry.as_ref() {
+        let runtime_config = PathBuf::from(&args[1]);
+        let mut config: Value =
+            serde_json::from_slice(&std::fs::read(&runtime_config).unwrap()).unwrap();
+        let replica_root = PathBuf::from(config["replica_root"].as_str().unwrap());
+        config["hosted_route_database_id"] = Value::String(HOSTED_ROUTE_ID.into());
+        config["origin_database_id"] = Value::String(origin_id.clone());
+        std::fs::write(&runtime_config, serde_json::to_vec(&config).unwrap()).unwrap();
+        (replica_root, runtime_config)
+    } else {
+        let replica_root = directory.path().join("replica");
+        GenerationStore::open(&replica_root, HOSTED_ROUTE_ID, Some(origin_id.clone())).unwrap();
+        let runtime_config = directory.path().join("standby.json");
+        write_runtime_config(&runtime_config, &replica_root, &origin_id);
+        (replica_root, runtime_config)
+    };
     GenerationStore::open(&replica_root, HOSTED_ROUTE_ID, Some(origin_id.clone())).unwrap();
-    let runtime_config = directory.path().join("standby.json");
-    write_runtime_config(&runtime_config, &replica_root, &origin_id);
     let credential = directory.path().join("snapshot.credential");
     std::fs::write(&credential, format!("{BEARER}\n")).unwrap();
     #[cfg(unix)]
@@ -615,12 +671,22 @@ async fn standby_process_refreshes_in_background_for_the_next_activation() {
     )
     .unwrap();
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_mcp-stdio"))
+    let binary = generated_entry
+        .as_ref()
+        .map(|(command, _)| command.clone())
+        .or_else(|| std::env::var_os("NATIVE_STANDBY_TEST_BINARY").map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_mcp-stdio")));
+    let mut command = Command::new(binary);
+    command
         .env_clear()
         .env("NATIVE_CE_MCP_SURFACE", "executor")
-        .env("NATIVE_CE_STANDBY_REFRESH_CONFIG", &refresh_config)
-        .arg("--standby")
-        .arg(&runtime_config)
+        .env("NATIVE_CE_STANDBY_REFRESH_CONFIG", &refresh_config);
+    if let Some((_, args)) = generated_entry.as_ref() {
+        command.args(args);
+    } else {
+        command.arg("--standby").arg(&runtime_config);
+    }
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -643,7 +709,13 @@ async fn standby_process_refreshes_in_background_for_the_next_activation() {
     writeln!(
         stdin,
         "{}",
-        tool_call(2, "get_record", json!({"ids":[FIXTURE_ID],"format":"json"}))
+        tool_call(2, "bootstrap", json!({"format":"json"}))
+    )
+    .unwrap();
+    writeln!(
+        stdin,
+        "{}",
+        tool_call(3, "get_record", json!({"ids":[FIXTURE_ID],"format":"json"}))
     )
     .unwrap();
     stdin.flush().unwrap();
@@ -662,7 +734,7 @@ async fn standby_process_refreshes_in_background_for_the_next_activation() {
         std::thread::sleep(Duration::from_millis(10));
     }
     assert!(current.is_file());
-    writeln!(stdin, "{}", tool_call(3, "standby_status", json!({}))).unwrap();
+    writeln!(stdin, "{}", tool_call(4, "standby_status", json!({}))).unwrap();
     stdin.flush().unwrap();
     drop(stdin);
     let first = child.wait_with_output().unwrap();
@@ -672,9 +744,18 @@ async fn standby_process_refreshes_in_background_for_the_next_activation() {
         .lines()
         .map(|line| serde_json::from_str::<Value>(line).unwrap())
         .collect::<Vec<_>>();
-    let unavailable = first_responses
+    let bootstrap = first_responses
         .iter()
         .find(|value| value["id"] == 2)
+        .unwrap();
+    assert_eq!(bootstrap["result"]["isError"], false);
+    assert_eq!(
+        bootstrap["result"]["structuredContent"]["mode"],
+        "status_only"
+    );
+    let unavailable = first_responses
+        .iter()
+        .find(|value| value["id"] == 3)
         .unwrap();
     assert_eq!(unavailable["result"]["isError"], true);
     assert_eq!(
@@ -683,7 +764,7 @@ async fn standby_process_refreshes_in_background_for_the_next_activation() {
     );
     let live_status = first_responses
         .iter()
-        .find(|value| value["id"] == 3)
+        .find(|value| value["id"] == 4)
         .unwrap()["result"]["structuredContent"]
         .clone();
     assert_eq!(live_status["contract"], "native.standby-status.v1");
@@ -720,11 +801,16 @@ async fn standby_process_refreshes_in_background_for_the_next_activation() {
                 "initialize",
                 json!({"protocolVersion":"2024-11-05","capabilities":{}}),
             ),
-            tool_call(2, "get_record", json!({"ids":[FIXTURE_ID],"format":"json"})),
+            tool_call(2, "bootstrap", json!({"format":"json"})),
+            tool_call(3, "get_record", json!({"ids":[FIXTURE_ID],"format":"json"})),
         ],
     );
     assert!(output.status.success(), "{output:#?}");
-    assert_eq!(successful_tool(&output, 2)["records"][0]["id"], FIXTURE_ID);
+    assert_eq!(
+        successful_tool(&output, 2)["tool_exposure"]["runtime"]["mode"],
+        "standby"
+    );
+    assert_eq!(successful_tool(&output, 3)["records"][0]["id"], FIXTURE_ID);
 }
 
 #[tokio::test]

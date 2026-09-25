@@ -28,10 +28,13 @@ use crate::db::Db;
 use crate::error::{Error, Result};
 use crate::query::lens;
 use crate::store::{append_in, AppendSpec};
+use crate::surface_binding::{is_reserved_relationship, refuse_reserved_surface_binding};
 
 use super::super::registry::{Caller, ToolRegistry};
 use super::super::ToolKind;
-use super::{can_record, can_record_in, parse_args, require_record_in, visible_ids_preloaded_in};
+use super::{
+    can_record, can_record_in, echo_act, parse_args, require_record_in, visible_ids_preloaded_in,
+};
 
 const READ_TOOL: &str = "read_canvas";
 const WRITE_TOOL: &str = "manage_canvas";
@@ -1360,6 +1363,7 @@ async fn manage_canvas(db: Db, caller: Caller, arguments: Value) -> Result<Value
     }
 
     let mut tx = crate::db::begin_write(db.write_pool()).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
 
     // 2. Re-check as the authenticated principal inside the same snapshot as
     //    the append; the preflight above is a courtesy, not the decision.
@@ -1425,15 +1429,17 @@ async fn manage_canvas(db: Db, caller: Caller, arguments: Value) -> Result<Value
         }
         let event_id: String = ledger.try_get("event_id")?;
         let event_seq: i64 = ledger.try_get("event_seq")?;
-        let payload: Option<String> =
-            sqlx::query_scalar("SELECT payload FROM content_events WHERE id=?")
+        let (payload, replayed_act): (Option<String>, Option<i64>) =
+            sqlx::query_as("SELECT payload, act FROM content_events WHERE id=?")
                 .bind(&event_id)
                 .fetch_one(&mut *tx)
                 .await?;
         let stored: StoredBatch = serde_json::from_str(payload.as_deref().unwrap_or("null"))?;
-        // A replay commits nothing.
+        // A replay commits nothing, but returns the original batch's act so
+        // the replay receipt is indistinguishable from the commit.
         tx.rollback().await?;
-        return Ok(json!({
+        return echo_act(
+            json!({
             "action": "commit_batch",
             "version": RESULT_VERSION,
             "outcome": "replayed",
@@ -1442,7 +1448,9 @@ async fn manage_canvas(db: Db, caller: Caller, arguments: Value) -> Result<Value
             "event_id": event_id,
             "objects": versions_after(event_seq, &stored.ops, &stored.pre_images, &stored.detached),
             "conflicts": [],
-        }));
+            }),
+            replayed_act,
+        );
     }
 
     // 4. Compare-and-set at the granularity each group moves at.
@@ -1573,11 +1581,13 @@ async fn manage_canvas(db: Db, caller: Caller, arguments: Value) -> Result<Value
             payload: serde_json::to_value(&stored)?,
             actor: Some(caller.actor().into()),
         },
+        &mut act_alloc,
     )
     .await?;
     let objects = versions_after(event.local_seq, &envelope.ops, &pre_images, &detached_ids);
     db.commit_content(tx).await?;
-    Ok(json!({
+    echo_act(
+        json!({
         "action": "commit_batch",
         "version": RESULT_VERSION,
         "outcome": "committed",
@@ -1596,7 +1606,9 @@ async fn manage_canvas(db: Db, caller: Caller, arguments: Value) -> Result<Value
                 "created_at": event.created_at,
             }
         },
-    }))
+        }),
+        act_alloc.get(),
+    )
 }
 
 /// `manage_canvas.assert_connector` — promote a decorative connector between
@@ -1625,6 +1637,18 @@ async fn assert_connector(
             "relationship must be a non-empty token",
         )));
     }
+    // `surface_binding` is reserved to `manage_surface_bindings`; a canvas
+    // connector is generic link authority (Edit on the source, View on the
+    // target), which is weaker than the Manage the workspace default demands.
+    if is_reserved_relationship(&relationship) {
+        return Ok(deny(&refusal(
+            "reserved_relationship",
+            format!(
+                "'{relationship}' is a reserved surface binding; use manage_surface_bindings \
+                 to set or reset it"
+            ),
+        )));
+    }
 
     // Preflight outside the write lock; nothing here substitutes for the
     // in-transaction checks below.
@@ -1638,6 +1662,7 @@ async fn assert_connector(
     }
 
     let mut tx = crate::db::begin_write(db.write_pool()).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
     if !is_live_canvas(&mut tx, &canvas_id).await? {
         tx.rollback().await?;
         return Ok(deny(&refusal(
@@ -1890,6 +1915,7 @@ async fn assert_connector(
             &relationship,
             note.clone(),
             &draft,
+            &mut act_alloc,
         )
         .await?;
         // The relationship route's compatibility row is projected from the
@@ -1920,6 +1946,7 @@ async fn assert_connector(
                 })?,
                 actor: Some(caller.actor().into()),
             },
+            &mut act_alloc,
         )
         .await?;
         Some(format!(
@@ -2014,13 +2041,15 @@ async fn assert_connector(
             payload: serde_json::to_value(&stored)?,
             actor: Some(caller.actor().into()),
         },
+        &mut act_alloc,
     )
     .await?;
     let objects = versions_after(event.local_seq, &ops, &pre_images, &[]);
     crate::provenance::issue_reserved_pending_action_in(&mut tx, draft).await?;
     db.commit_content(tx).await?;
 
-    Ok(json!({
+    echo_act(
+        json!({
         "action": "assert_connector",
         "version": RESULT_VERSION,
         "outcome": "committed",
@@ -2034,7 +2063,9 @@ async fn assert_connector(
         "target_id": target_record,
         "objects": objects,
         "conflicts": [],
-    }))
+        }),
+        act_alloc.get(),
+    )
 }
 
 /// Does a link row still join these two records with this relationship?
@@ -2127,6 +2158,7 @@ async fn promote(
     }
 
     let mut tx = crate::db::begin_write(db.write_pool()).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
     if !is_live_canvas(&mut tx, &canvas_id).await? {
         tx.rollback().await?;
         return Ok(deny(&refusal(
@@ -2254,6 +2286,11 @@ async fn promote(
         let to_planned = items.iter().any(|item| item.object_id == link.to);
         let (status, note) = if link.relationship.trim().is_empty() {
             ("would_conflict", "a link relationship must not be blank")
+        } else if is_reserved_relationship(&link.relationship) {
+            (
+                "would_conflict",
+                "the surface_binding relationship is reserved to manage_surface_bindings",
+            )
         } else if !from_planned
             && !can_record_in(&mut tx, &caller, &link.from, Capability::Edit).await?
         {
@@ -2364,6 +2401,7 @@ async fn promote(
                 workitem_lifecycle_default: true,
             },
             &draft,
+            &mut act_alloc,
         )
         .await?;
         minted.insert(item.object_id.clone(), record_id);
@@ -2402,6 +2440,7 @@ async fn promote(
             &link.relationship,
             link.note.clone(),
             &draft,
+            &mut act_alloc,
         )
         .await?;
     }
@@ -2417,6 +2456,7 @@ async fn promote(
             "derived_from",
             Some(format!("promoted from this canvas: {reason}")),
             &draft,
+            &mut act_alloc,
         )
         .await?;
     }
@@ -2489,6 +2529,7 @@ async fn promote(
             payload: serde_json::to_value(&stored)?,
             actor: Some(caller.actor().into()),
         },
+        &mut act_alloc,
     )
     .await?;
 
@@ -2509,6 +2550,7 @@ async fn promote(
             &db,
             &mut tx,
             crate::domain_transaction::facet_set_spec(record_id, &facet, caller.actor()),
+            &mut act_alloc,
         )
         .await?;
     }
@@ -2517,7 +2559,8 @@ async fn promote(
     crate::provenance::issue_reserved_pending_action_in(&mut tx, draft).await?;
     db.commit_content(tx).await?;
 
-    Ok(json!({
+    echo_act(
+        json!({
         "action": "promote",
         "version": PROMOTE_VERSION,
         "outcome": "committed",
@@ -2532,7 +2575,9 @@ async fn promote(
             .collect::<Vec<_>>(),
         "objects": objects_after,
         "conflicts": [],
-    }))
+        }),
+        act_alloc.get(),
+    )
 }
 
 /// Does this frame still hold live children?
@@ -2635,12 +2680,18 @@ async fn write_link_in(
     relationship: &str,
     note: Option<String>,
     draft: &crate::provenance::ActionAttestationDraft,
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<()> {
     if relationship.trim().is_empty() {
         return Err(Error::engine(
             "manage_canvas.promote: a link relationship must not be blank",
         ));
     }
+    // Same reservation as `manage_links`: generic link authority is weaker than
+    // the workspace default's Manage on `native:root`, so promotion must not
+    // author a `surface_binding` edge. The dry-run preflight refuses it too, so
+    // an approved plan cannot fail here after the records are minted.
+    refuse_reserved_surface_binding("manage_canvas.promote", relationship)?;
     // A comment's bearer is immutable, and `manage_links.add` refuses to move
     // one. Promotion writes links through the same governed path, so it owes
     // the same refusal.
@@ -2660,6 +2711,7 @@ async fn write_link_in(
             relationship,
             note,
             draft,
+            act_alloc,
         )
         .await?;
     } else {
@@ -2678,6 +2730,7 @@ async fn write_link_in(
                 })?,
                 actor: Some(caller.actor().into()),
             },
+            act_alloc,
         )
         .await?;
     }

@@ -303,8 +303,11 @@ fn descriptor_exposes_closed_nested_contracts_and_run_correlation() {
         ToolKind::StandbyStatus,
         ToolKind::ExportSnapshot,
         ToolKind::ManageMemberships,
+        ToolKind::WorkspaceRead,
         ToolKind::ReachRead,
         ToolKind::ReachConnect,
+        ToolKind::AuthorityActHead,
+        ToolKind::AuthorityActDelta,
     ];
     assert_eq!(
         stable_count,

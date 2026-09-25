@@ -26,6 +26,7 @@ use tempfile::TempDir;
 use crate::embed::EmbedderRef;
 use crate::error::{Error, Result};
 use crate::schema::DDL_STATEMENTS;
+use crate::write_contention::WriteDomain;
 
 const ROLLUP_CACHE_MAX_ENTRIES: usize = 128;
 const ROLLUP_CACHE_MAX_BYTES: usize = 1024 * 1024;
@@ -46,6 +47,12 @@ const SQLITE_DEFAULT_VALUE_LIMIT: i32 = 1_000_000_000;
 pub(crate) struct RollupCacheKey {
     pub principal: String,
     pub trusted_local_bypass: bool,
+    /// Live catalog membership footing. Member- and guest-footed evaluations
+    /// of the same credential must never share a cache entry: a demotion
+    /// does not bump `authorization_revision` (catalog roles are
+    /// host-supplied, not portable inputs), so without this bit a guest
+    /// would be served the member-era aggregate.
+    pub is_member: bool,
     pub spec_digest: String,
     pub bearer_id: String,
     pub rollup_name: String,
@@ -103,7 +110,7 @@ impl RollupCache {
 
 /// Engine schema stored in each ejectable user database's file header.
 /// This is independent of the product's SemVer and the catalog schema.
-pub const CURRENT_ENGINE_SCHEMA_VERSION: i64 = 55;
+pub const CURRENT_ENGINE_SCHEMA_VERSION: i64 = 65;
 /// The deliberately selected historical support baseline, once one exists.
 ///
 /// `None` is a product contract, not an implementation gap: development
@@ -229,6 +236,55 @@ pub(crate) const ENGINE_53_SHAPE_CONTRACT_SHA256: &str =
 pub(crate) const ENGINE_54_SHAPE_CONTRACT_SHA256: &str =
     "ecc7fb3964c4af2ee281aa2bf0f3a898958ab5559660d8f295a47591b7fca96f";
 
+/// Engine 55's shape is byte-identical to engine 54's: the 54→55 edge only
+/// vacuums interned read-log dictionary pages and moves no schema objects.
+/// Measured from the pre-56 tree (engine-55 DDL) and held honest by the
+/// 55→56 migration test, which reconstructs this shape from current.
+pub(crate) const ENGINE_55_SHAPE_CONTRACT_SHA256: &str =
+    "ecc7fb3964c4af2ee281aa2bf0f3a898958ab5559660d8f295a47591b7fca96f";
+
+/// Engine 56's shape, measured from the pre-57 tree (engine-56 DDL) before
+/// the content-event append-only triggers landed. Held honest by the 56→57
+/// migration test, which reconstructs this shape from current by dropping
+/// exactly those two triggers.
+pub(crate) const ENGINE_56_SHAPE_CONTRACT_SHA256: &str =
+    "4eca539d36e8cff93dc26df5bf39820a2d432c5eb8679111d1af2b9e4e71f311";
+
+/// Engine 57's shape, measured from the pre-58 tree (engine-57 DDL) before
+/// the `agent_runs` reported-identity columns landed. Held honest by the
+/// 57→58 migration test, which reconstructs this shape from current by
+/// dropping exactly those three columns.
+pub(crate) const ENGINE_57_SHAPE_CONTRACT_SHA256: &str =
+    "535cc09d6a3d13c835c6d7288e0e7231811d50baa7b9677ae440c1f2740b5a9e";
+
+/// Engine 58's shape from current main before the act-delta-specific edges.
+pub(crate) const ENGINE_58_SHAPE_CONTRACT_SHA256: &str =
+    "20fb571ac2147221b2649790472b611896459cfae938613e06751dfe9c575503";
+
+/// Engine 59's shape after main's record-mentions projection.
+pub(crate) const ENGINE_59_SHAPE_CONTRACT_SHA256: &str =
+    "2c82766059d70f706df1716508cdb070dd3877f3a39d6d0c8913ce648dcf1bbc";
+
+/// Engine 60's shape after provenance-validity act stamping.
+pub(crate) const ENGINE_60_SHAPE_CONTRACT_SHA256: &str =
+    "e9e661f0c23ea380d3627e493514d0d9628e5afd479b78ee581b81bd62656b9d";
+
+/// Engine 61's shape after canonical act indexes and binding-system freeze.
+pub(crate) const ENGINE_61_SHAPE_CONTRACT_SHA256: &str =
+    "9a42a495e8ee711711af757d77e6d1ac7b3fe6393a0b27a38fdf4692bba7242a";
+
+/// Engine 62's exact shape from main 324b93a11, before the data-only
+/// read-log cleanup. Engine 63 changes rows only, so its shape is identical.
+pub(crate) const ENGINE_62_SHAPE_CONTRACT_SHA256: &str =
+    "638c15fe61dc9b2bf4f9b995abc141d60cb94dce954bea4e207ffb626ca65257";
+pub(crate) const ENGINE_63_SHAPE_CONTRACT_SHA256: &str = ENGINE_62_SHAPE_CONTRACT_SHA256;
+
+/// Engine 64's shape is main64's released shape: the 63→64 edge only
+/// compacts the freelist (VACUUM) without changing any schema object, so the
+/// contract is identical to engine 63's. Held honest by the 64→65 migration
+/// test, which reconstructs this shape from current by dropping exactly the
+/// `alpha_tab_installs` projection table and its index.
+pub(crate) const ENGINE_64_SHAPE_CONTRACT_SHA256: &str = ENGINE_63_SHAPE_CONTRACT_SHA256;
 /// A read-only classification of an on-disk SQLite database.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(tag = "state", content = "detail", rename_all = "snake_case")]
@@ -267,9 +323,9 @@ impl std::fmt::Display for DatabaseVersionState {
 
 /// An open native-ce database: a pool of connections to one SQLite file.
 ///
-/// Cheap to clone (all clones share both pools). `close()` closes both; if
-/// the database was an ephemeral `:memory:` one, its backing temp directory is
-/// removed when the last clone drops.
+/// Cheap to clone (all clones share all three pools). `close()` closes all
+/// three; if the database was an ephemeral `:memory:` one, its backing temp
+/// directory is removed when the last clone drops.
 #[derive(Clone, Debug)]
 pub struct Db {
     /// Engine-internal pool. Every mutation must enter through `begin_write`;
@@ -279,6 +335,13 @@ pub struct Db {
     /// Keeping this physically separate makes raw external SQL useful for
     /// inspection without exposing an alternate mutation path.
     read_pool: SqlitePool,
+    /// Governed-SQL pool (Tier 1.2): read-write connections reserved for
+    /// `query_sql`'s connection-local TEMP-contract path. Dedicated so
+    /// governed reads — which hold their connection through per-row JSON
+    /// encoding — no longer occupy write-pool slots, and so rung 1.3 can
+    /// retain the TEMP contract here without risking unqualified-name
+    /// shadowing on any other pool's borrowers.
+    governed_pool: SqlitePool,
     /// Filesystem location backing this pool. Snapshot sources use it only for
     /// scratch placement; caller-supplied tool arguments can never override it.
     /// The opening authority shares this existing allocation so adding standby
@@ -296,12 +359,39 @@ pub struct Db {
     /// Disposable successful rollup results for this opened handle. Clones
     /// share it; reopening the same file deliberately starts cold.
     rollup_cache: Arc<Mutex<RollupCache>>,
+    /// Per-principal visible-record-id sets keyed on (principal bits,
+    /// authorization epoch, unit fence) — Tier 1.4, record `fd6c1f2`. Clones
+    /// share it; reopening the same file deliberately starts cold.
+    visible_set_cache: Arc<Mutex<crate::visible_set_cache::VisibleSetCache>>,
     /// Bounded, handle-local state behind opaque Inbox snapshot nonces. Exact
     /// Message ids and pinned item projections never travel in client tokens.
     inbox_snapshots: Arc<Mutex<HashMap<String, InboxSnapshotCacheEntry>>>,
     /// Optional hosted realtime publisher. Standalone handles leave this unset;
     /// routed handles and active subscribers share one database-scoped hub.
     realtime_hub: Option<Arc<crate::realtime::RealtimeHub>>,
+    /// Per-handle workspace index (M1, epic 6b1f3c2): records-minus-body,
+    /// facet_values, links, and a bounded content window. Clones share it;
+    /// reopening starts cold and dropping the handle evicts it with the
+    /// 64-handle LRU. Built on the read-only pool on first request, folded
+    /// off the commit wake; never a write-pool slot, never a TTL.
+    workspace_index: Arc<tokio::sync::RwLock<Option<crate::workspace_index::WorkspaceIndex>>>,
+    /// At-most-one in-flight commit-wake fold for the index above.
+    workspace_index_fold: Arc<AtomicBool>,
+    /// Bounded over-cap refusal marker (M4): the fences of the rejected
+    /// snapshot itself — `(content_seq, relationship_seq,
+    /// authorization_epoch)` — never a later live read, so a concurrent
+    /// commit that shrank the workspace during the build cannot suppress
+    /// the retry that now fits under cap.
+    /// While the live fences still equal the marker, `ensure` skips the
+    /// rebuild instead of reconstructing — and discarding — the whole index
+    /// on every read. Any write moves a fence and re-arms the next attempt
+    /// (a delete may have shrunk the workspace back under cap). One triple,
+    /// O(1) memory; correctness fallback stays governed throughout.
+    workspace_index_refused: Arc<Mutex<Option<(i64, i64, i64)>>>,
+    /// M3 pinned snapshot tokens (epic 6b1f3c2): immutable per-principal
+    /// public copies of the filtered index, bounded by count, bytes, and TTL.
+    /// Clones share it; reopening starts cold. See `crate::workspace_snapshot`.
+    pub(crate) workspace_snapshots: Arc<Mutex<crate::workspace_snapshot::SnapshotStore>>,
     /// Serializes strict-portability policy changes against admitted requests
     /// for this shared handle. SQLite remains the durable authority; this lease
     /// closes the in-process admission-to-write race for handlers using any
@@ -363,22 +453,135 @@ tokio::task_local! {
     static REQUEST_REALTIME_COMPLETION: Arc<RequestRealtimeCompletion>;
 }
 
-// Handler-body count of write-pool connection acquisitions, for the
-// readonly-pool migration (stage 1: the instrument only; no handler moves).
-// The production request-work counter and the older test-only migration
-// counter share these acquisition hooks. Both are task-local, so concurrent
-// requests keep independent totals; outside a scope each hook is a cheap miss.
+/// Clears the per-handle workspace-index fold flag when it leaves scope,
+/// including on panic or task abort. Without it a fold that panicked mid-run
+/// would leave `workspace_index_fold` set forever and silently disable every
+/// later fold for the life of the handle.
+///
+/// The drain loop clears and re-acquires the flag on each pass under the
+/// existing clear-then-recheck protocol, so the guard is `armed` for the whole
+/// task and only disarmed when the task explicitly hands ownership to another
+/// fold task that has already set the flag — it must not clobber that task's
+/// ownership on the way out.
+struct WorkspaceIndexFoldGuard {
+    flag: Arc<AtomicBool>,
+    armed: bool,
+}
+
+impl WorkspaceIndexFoldGuard {
+    fn new(flag: Arc<AtomicBool>) -> Self {
+        Self { flag, armed: true }
+    }
+
+    fn hand_off(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for WorkspaceIndexFoldGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.flag.store(false, Ordering::SeqCst);
+        }
+    }
+}
+
+#[cfg(test)]
+mod workspace_index_fold_guard_tests {
+    use super::WorkspaceIndexFoldGuard;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    #[test]
+    fn the_guard_clears_the_flag_on_panic() {
+        let flag = Arc::new(AtomicBool::new(true));
+        let armed = flag.clone();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = WorkspaceIndexFoldGuard::new(armed);
+            panic!("fold panicked");
+        }));
+        assert!(result.is_err());
+        assert!(
+            !flag.load(Ordering::SeqCst),
+            "a panicked fold must not leave folding disabled for the handle"
+        );
+    }
+
+    #[test]
+    fn a_handed_off_guard_leaves_the_new_owners_flag_set() {
+        let flag = Arc::new(AtomicBool::new(true));
+        {
+            let mut guard = WorkspaceIndexFoldGuard::new(flag.clone());
+            // The takeover protocol: another fold task has set the flag and we
+            // must not clear it on the way out.
+            guard.hand_off();
+        }
+        assert!(flag.load(Ordering::SeqCst));
+
+        // An armed guard still clears on ordinary drop.
+        {
+            let _guard = WorkspaceIndexFoldGuard::new(flag.clone());
+        }
+        assert!(!flag.load(Ordering::SeqCst));
+    }
+}
+
+#[cfg(test)]
+mod workspace_index_refusal_tests {
+    /// The refusal marker suppresses repeat full builds while nothing
+    /// changed, and any fence movement re-arms the next attempt. This pins
+    /// the keying without needing a 32 MiB over-cap workspace.
+    #[tokio::test]
+    async fn refusal_marker_tracks_live_fences() {
+        let db = super::open_database(":memory:").await.unwrap();
+        crate::apply_schema(&db).await.unwrap();
+        crate::seed_content_tier(&db).await.unwrap();
+        crate::identity::seed_database_identity(&db).await.unwrap();
+        assert!(
+            !db.workspace_index_refusal_current().await.unwrap(),
+            "fresh handle must hold no refusal"
+        );
+        db.note_workspace_index_refusal(db.live_index_fences().await.unwrap())
+            .unwrap();
+        assert!(
+            db.workspace_index_refusal_current().await.unwrap(),
+            "a just-stamped refusal must suppress the rebuild"
+        );
+        crate::store::create_record(
+            &db,
+            serde_json::json!({
+                "id": "e5555555-5555-4555-8555-555555555555",
+                "type": "Document", "kind": "note", "name": "fence mover",
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !db.workspace_index_refusal_current().await.unwrap(),
+            "a content write must re-arm the build attempt"
+        );
+        db.close().await;
+    }
+}
+
+// Handler-body counts of workspace-pool connection acquisitions, for the
+// readonly-pool migration. The production request-work counters and the
+// test-only migration counters share these acquisition hooks. Both are
+// task-local, so concurrent requests keep independent totals; outside a scope
+// each hook is a cheap miss.
 #[cfg(test)]
 tokio::task_local! {
     static WRITE_POOL_ACQUISITIONS: Arc<AtomicU64>;
+    static READ_POOL_ACQUISITIONS: Arc<AtomicU64>;
 }
 
 // Test-only handoff for the handler-body count. Production dispatch discards
 // the count; tests observe it by wrapping `registry.call(...)` in
-// `with_write_pool_acquisition_sink` and reading the sink afterwards.
+// the matching acquisition sink and reading it afterwards.
 #[cfg(test)]
 tokio::task_local! {
     static WRITE_POOL_ACQUISITION_SINK: Arc<AtomicU64>;
+    static READ_POOL_ACQUISITION_SINK: Arc<AtomicU64>;
 }
 
 /// Run `future` with a fresh write-pool acquisition counter and return its
@@ -428,15 +631,13 @@ tokio::task_local! {
 /// one:
 /// - direct `SqliteConnection::connect` calls (migrations/probes), which
 ///   never touch the pool at all;
-/// - the physically separate read pool, which carries no hooks;
 /// - `try_acquire` / `try_begin` / `try_begin_with`: these pop an idle
 ///   connection directly (`PoolInner::try_acquire`) and skip
 ///   `check_idle_conn`, so **no hook fires** for a genuine pooled
-///   acquisition. Nothing in the tree calls these on a pool today (verified
-///   by grep — the `try_begin` hits are non-pool types), so this is latent;
-///   but a stage-2 handler switching to `write_pool().try_begin()` would
-///   hold a write-pool slot while reporting zero, certifying the migration
-///   on a lie;
+///   acquisition from either workspace pool. Nothing in the tree calls these
+///   on a pool today (verified by grep — the `try_begin` hits are non-pool
+///   types), so this is latent; but a handler switching to a pool's
+///   `try_begin()` would hold a slot while reporting zero;
 /// - work handed to the handle's background capture queue, since the queue
 ///   worker never runs inside the scoped future. Load-bearing for capture
 ///   exclusion (`interactions::enqueue_record_call` returns before the
@@ -478,6 +679,18 @@ where
     (output, counter.load(Ordering::Relaxed))
 }
 
+#[cfg(test)]
+pub(crate) async fn with_read_pool_acquisition_counter<F>(future: F) -> (F::Output, u64)
+where
+    F: std::future::Future,
+{
+    let counter = Arc::new(AtomicU64::new(0));
+    let output = READ_POOL_ACQUISITIONS
+        .scope(Arc::clone(&counter), future)
+        .await;
+    (output, counter.load(Ordering::Relaxed))
+}
+
 /// Acquisitions so far in the enclosing
 /// [`with_write_pool_acquisition_counter`] scope, or 0 outside one.
 /// Test-only: the only readers are the instrument's own tests.
@@ -501,6 +714,14 @@ where
     WRITE_POOL_ACQUISITION_SINK.scope(sink, future).await
 }
 
+#[cfg(test)]
+pub(crate) async fn with_read_pool_acquisition_sink<F>(sink: Arc<AtomicU64>, future: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    READ_POOL_ACQUISITION_SINK.scope(sink, future).await
+}
+
 /// Called by production dispatch with the just-finished handler-body count.
 /// Stores into the test sink when one is scoped, otherwise a no-op.
 #[cfg(test)]
@@ -510,6 +731,51 @@ pub(crate) fn publish_write_pool_acquisitions(count: u64) {
             sink.store(count, Ordering::Relaxed);
         })
         .ok();
+}
+
+#[cfg(test)]
+pub(crate) fn publish_read_pool_acquisitions(count: u64) {
+    READ_POOL_ACQUISITION_SINK
+        .try_with(|sink| {
+            sink.store(count, Ordering::Relaxed);
+        })
+        .ok();
+}
+
+fn count_read_pool_reuse(
+    _connection: &mut SqliteConnection,
+    _metadata: sqlx::pool::PoolConnectionMetadata,
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = std::result::Result<bool, sqlx::Error>> + Send + '_>,
+> {
+    Box::pin(async move {
+        crate::request_work::record_workspace_reader_acquisition();
+        #[cfg(test)]
+        READ_POOL_ACQUISITIONS
+            .try_with(|counter| {
+                counter.fetch_add(1, Ordering::Relaxed);
+            })
+            .ok();
+        Ok(true)
+    })
+}
+
+fn count_read_pool_new_connection(
+    _connection: &mut SqliteConnection,
+    _metadata: sqlx::pool::PoolConnectionMetadata,
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = std::result::Result<(), sqlx::Error>> + Send + '_>,
+> {
+    Box::pin(async move {
+        crate::request_work::record_workspace_reader_acquisition();
+        #[cfg(test)]
+        READ_POOL_ACQUISITIONS
+            .try_with(|counter| {
+                counter.fetch_add(1, Ordering::Relaxed);
+            })
+            .ok();
+        Ok(())
+    })
 }
 
 /// One half of the acquisition counter. Runs inline on the acquiring task
@@ -658,6 +924,7 @@ fn attach_catalog_trace_on_reuse(
     Box<dyn std::future::Future<Output = std::result::Result<bool, sqlx::Error>> + Send + '_>,
 > {
     Box::pin(async move {
+        crate::request_work::record_catalog_acquisition();
         attach_catalog_trace(connection).await?;
         Ok(true)
     })
@@ -669,7 +936,208 @@ fn attach_catalog_trace_on_connect(
 ) -> std::pin::Pin<
     Box<dyn std::future::Future<Output = std::result::Result<(), sqlx::Error>> + Send + '_>,
 > {
-    Box::pin(attach_catalog_trace(connection))
+    Box::pin(async move {
+        crate::request_work::record_catalog_acquisition();
+        attach_catalog_trace(connection).await
+    })
+}
+
+#[cfg(test)]
+mod write_contention_measurement_tests {
+    use super::*;
+    use crate::write_contention::observed::{observing, section_for};
+    use crate::write_contention::WriteDomain;
+
+    /// Contention needs one database, and every connection to `:memory:` gets
+    /// a private one — two writers there can never meet. Anything asserting
+    /// about the reserved lock has to be file-backed.
+    async fn file_backed_database() -> (TempDir, Db) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("contention.db");
+        let db = create_database(path.to_str().unwrap()).await.unwrap();
+        (directory, db)
+    }
+
+    /// Wait for the connection's section to close. The close runs when SQLx
+    /// returns the connection to its pool, which is not guaranteed to be this
+    /// task, so the sample can land just after `commit()` resolves.
+    async fn closed_section(key: usize) -> (WriteDomain, Duration) {
+        for _ in 0..200 {
+            if let Some(section) = section_for(key) {
+                return section;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the critical section for {key:#x} never closed");
+    }
+
+    #[tokio::test]
+    async fn a_committed_write_records_its_critical_section() {
+        let (_directory, db) = file_backed_database().await;
+        let (key, observations) = observing(async {
+            let mut transaction = begin_write(db.write_pool()).await.unwrap();
+            let key = connection_key(&mut transaction).await.unwrap();
+            // Returning the connection to the pool is what closes the section,
+            // so an open transaction must have no sample yet. If this ever
+            // fails, the instrument is timing something shorter than the
+            // reserved lock is actually held.
+            assert!(
+                section_for(key).is_none(),
+                "a section was closed while its transaction was still open"
+            );
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            transaction.commit().await.unwrap();
+            key
+        })
+        .await;
+        assert_eq!(observations.begins.len(), 1);
+        assert_eq!(observations.begins[0].domain, WriteDomain::Workspace);
+        assert!(!observations.begins[0].failed);
+        let (domain, held) = closed_section(key).await;
+        assert_eq!(domain, WriteDomain::Workspace);
+        assert!(
+            held >= Duration::from_millis(30),
+            "the measured section is shorter than the lock was demonstrably held: {held:?}"
+        );
+    }
+
+    /// A rollback returns its connection the same way a commit does. This is
+    /// the half a commit-site measurement would miss, and missing it would
+    /// bias the distribution towards whatever ordinary commits look like.
+    #[tokio::test]
+    async fn a_rolled_back_write_records_its_critical_section() {
+        let (_directory, db) = file_backed_database().await;
+        let mut transaction = begin_write(db.write_pool()).await.unwrap();
+        let key = connection_key(&mut transaction).await.unwrap();
+        transaction.rollback().await.unwrap();
+        closed_section(key).await;
+    }
+
+    /// An ordinary query on the write pool takes a pool slot without ever
+    /// taking the reserved lock. It must contribute no sample at all: a zero
+    /// would drag every percentile down, and read traffic on the write pool is
+    /// common enough to swamp the writes this exists to describe.
+    #[tokio::test]
+    async fn a_non_transactional_write_pool_query_records_nothing() {
+        let (_directory, db) = file_backed_database().await;
+        let ((), observations) = observing(async {
+            sqlx::query_scalar::<_, i64>("SELECT 1")
+                .fetch_one(db.write_pool())
+                .await
+                .unwrap();
+        })
+        .await;
+        assert!(observations.begins.is_empty());
+    }
+
+    /// The number this whole instrument exists to stop discarding: a writer
+    /// that had to queue behind another writer.
+    #[tokio::test]
+    async fn a_writer_that_queues_is_counted_as_having_retried() {
+        let (_directory, db) = file_backed_database().await;
+        let holder_pool = db.write_pool().clone();
+        let (released, wait_for_release) = tokio::sync::oneshot::channel::<()>();
+        let (held, holding) = tokio::sync::oneshot::channel::<()>();
+        let holder = tokio::spawn(async move {
+            let transaction = begin_write(&holder_pool).await.unwrap();
+            held.send(()).unwrap();
+            // Hold the reserved lock past at least one 20ms retry iteration,
+            // then release it so the contender completes rather than
+            // exhausting its 15s deadline.
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            transaction.rollback().await.unwrap();
+            released.send(()).unwrap();
+        });
+        holding.await.unwrap();
+        let ((), observations) = observing(async {
+            begin_write(db.write_pool())
+                .await
+                .unwrap()
+                .rollback()
+                .await
+                .unwrap();
+        })
+        .await;
+        wait_for_release.await.unwrap();
+        holder.await.unwrap();
+        assert_eq!(observations.begins.len(), 1);
+        let begin = observations.begins[0];
+        // Note what is *not* asserted: a retry. SQLite's own `busy_timeout` is
+        // 5s, so a contending `BEGIN IMMEDIATE` blocks inside SQLite and the
+        // bounded retry loop above it never iterates until the queue exceeds
+        // that. The retry count therefore only counts waits longer than five
+        // seconds, and the elapsed wait is the measurement that actually
+        // answers how often and how long writers queue.
+        assert_eq!(
+            begin.retries.busy, 0,
+            "a busy retry appeared below the 5s busy timeout, so the instrument's \
+             premise about where queueing shows up has changed"
+        );
+        assert!(
+            begin.wait >= Duration::from_millis(60),
+            "the queueing time was not retained: {:?}",
+            begin.wait
+        );
+    }
+
+    /// Request-local counters are the operator-facing half, and they must see
+    /// the same event. The opt-in scope is what `X-Native-Measure` installs.
+    #[tokio::test]
+    async fn the_request_scoped_counters_see_the_same_write() {
+        let (_directory, db) = file_backed_database().await;
+        let work = crate::request_work::RequestWork::new();
+        work.scope(async {
+            begin_write(db.write_pool())
+                .await
+                .unwrap()
+                .commit()
+                .await
+                .unwrap();
+        })
+        .await;
+        let counts = work.snapshot();
+        assert_eq!(counts.write_transactions, 1);
+        assert_eq!(counts.write_begin_busy_retried_transactions, 0);
+        assert_eq!(counts.write_begin_busy_retries, 0);
+        assert_eq!(counts.write_begin_cleanup_retries, 0);
+    }
+
+    /// Outside a measured request the counters stay untouched, so an ordinary
+    /// request pays a failed task-local lookup and nothing else.
+    #[tokio::test]
+    async fn an_unmeasured_write_leaves_the_request_counters_alone() {
+        let (_directory, db) = file_backed_database().await;
+        let work = crate::request_work::RequestWork::new();
+        begin_write(db.write_pool())
+            .await
+            .unwrap()
+            .commit()
+            .await
+            .unwrap();
+        assert_eq!(work.snapshot().write_transactions, 0);
+    }
+
+    /// The hosted control-plane catalogue is a different database under
+    /// different pressure. Mixing it into the workspace distribution would
+    /// corrupt the only number the MVCC question turns on.
+    #[tokio::test]
+    async fn control_plane_writes_are_kept_out_of_the_workspace_distribution() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("catalog.db");
+        let pool = open_pool(path.to_str().unwrap(), true, WritePoolKind::HostCatalog)
+            .await
+            .unwrap();
+        let (key, observations) = observing(async {
+            let mut transaction = begin_host_control_plane_sqlite_write(&pool).await.unwrap();
+            let key = connection_key(&mut transaction).await.unwrap();
+            transaction.commit().await.unwrap();
+            key
+        })
+        .await;
+        assert_eq!(observations.begins.len(), 1);
+        assert_eq!(observations.begins[0].domain, WriteDomain::HostCatalog);
+        assert_eq!(closed_section(key).await.0, WriteDomain::HostCatalog);
+    }
 }
 
 #[cfg(test)]
@@ -782,8 +1250,28 @@ mod write_pool_acquisition_tests {
         db.close().await;
     }
 
-    /// Read-pool work and idle scopes report zero, and so does the reader
-    /// outside any scope. The read pool carries no hooks by design.
+    #[tokio::test]
+    async fn request_work_counts_host_catalog_checkouts() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("catalog-acquisitions.db");
+        let pool = open_pool(path.to_str().unwrap(), true, WritePoolKind::HostCatalog)
+            .await
+            .unwrap();
+        let work = crate::request_work::RequestWork::new();
+        work.scope(async {
+            sqlx::query("SELECT 1").execute(&pool).await.unwrap();
+        })
+        .await;
+        let snapshot = work.snapshot();
+        assert_eq!(snapshot.catalog_acquisitions, 1);
+        assert!(
+            snapshot.catalog_statements > 0,
+            "the measured checkout did not attach its statement trace"
+        );
+        pool.close().await;
+    }
+
+    /// Read-pool work remains separate from the write-pool count.
     #[tokio::test]
     async fn untouched_write_pool_reports_zero() {
         let db = open_database(":memory:").await.unwrap();
@@ -805,6 +1293,34 @@ mod write_pool_acquisition_tests {
         assert_eq!(idle, 0);
         assert_eq!(write_pool_acquisitions(), 0);
         db.close().await;
+    }
+
+    #[tokio::test]
+    async fn reused_and_new_read_pool_connections_are_counted() {
+        let fresh_db = open_database(":memory:").await.unwrap();
+        let held = fresh_db.pool().acquire().await.unwrap();
+        assert_eq!(fresh_db.pool().num_idle(), 0);
+        let (_, fresh) = with_read_pool_acquisition_counter(async {
+            sqlx::query_scalar::<_, i64>("SELECT 1")
+                .fetch_one(fresh_db.pool())
+                .await
+                .unwrap();
+        })
+        .await;
+        assert_eq!(fresh, 1, "fresh read-pool checkout was not counted");
+        drop(held);
+        fresh_db.close().await;
+
+        let reused_db = open_database(":memory:").await.unwrap();
+        let (_, reused) = with_read_pool_acquisition_counter(async {
+            sqlx::query_scalar::<_, i64>("SELECT 1")
+                .fetch_one(reused_db.pool())
+                .await
+                .unwrap();
+        })
+        .await;
+        assert_eq!(reused, 1, "reused read-pool checkout was not counted");
+        reused_db.close().await;
     }
 
     /// The spawn boundary the capture exclusion relies on: a write-pool query
@@ -868,6 +1384,51 @@ impl crate::query::lens::ContentLogCapability for Db {
     }
 }
 
+/// Tri-state outcome of one optimistic M4 point-read attempt, so the caller
+/// repairs only what moved: nothing on a hit, a content fold on content lag,
+/// a full rebuild on authorization/relationship movement, and neither on an
+/// absent index or an unheld record.
+enum FacetsRecordAttempt {
+    // Boxed: the point-read payload dwarfs the other variants (clippy
+    // large_enum_variant); only the hit path allocates it.
+    Hit(Box<crate::workspace_index::IndexedFacetsRecord>),
+    Absent,
+    StaleContent,
+    StaleFences,
+}
+
+/// Tri-state outcome of one optimistic M4 links point-read attempt. Same
+/// repair contract as `FacetsRecordAttempt`, sharing its drivers (ensure,
+/// content fold, refusal-aware rebuild, live triple) so the slices cannot
+/// thrash over-cap builds against each other. Kept as a sibling enum because
+/// the hit payload differs: a touching-link subset, where empty is servable
+/// (anchor existence/visibility stays governed at the call site), rather
+/// than a single held record.
+enum LinksCandidatesAttempt {
+    // Boxed for the same dwarfing reason as above.
+    Hit(Box<crate::workspace_index::IndexedLinkCandidates>),
+    Absent,
+    StaleContent,
+    StaleFences,
+}
+
+/// Only the requested record heads, with the held index's physical fences.
+/// A caller must compare these fences inside its read transaction before
+/// combining the heads with any live body or enrichment rows.
+pub(crate) struct IndexedRecordHeads {
+    pub heads: std::collections::HashMap<String, crate::workspace_index::RecordHead>,
+    pub fences: (i64, i64, i64),
+}
+
+/// A header batch may contain absent ids; those are still a valid indexed
+/// hit because the governed reader distinguishes their final status.
+enum RecordHeadsAttempt {
+    Hit(Box<IndexedRecordHeads>),
+    Absent,
+    StaleContent,
+    StaleFences,
+}
+
 impl Db {
     /// The physically read-only pool. A serving path, not only a diagnostic
     /// one: `bootstrap` and `get_structure` read exclusively through it, and
@@ -904,6 +1465,14 @@ impl Db {
     /// raw route around `begin_write` and strict-portability enforcement.
     pub(crate) fn write_pool(&self) -> &SqlitePool {
         &self.write_pool
+    }
+
+    /// Governed-SQL pool serving `query_sql`'s owned path. Crate-private like
+    /// `write_pool`: callers must go through `query_sql`, never raw pool
+    /// access, so one request's TEMP principal state cannot leak into the
+    /// next borrower's visibility computation.
+    pub(crate) fn governed_pool(&self) -> &SqlitePool {
+        &self.governed_pool
     }
 
     #[cfg(feature = "postgres-tests")]
@@ -975,6 +1544,9 @@ impl Db {
     }
 
     fn complete_realtime_commit(&self) {
+        // The index folds off the same commit wake that drives the hub, on
+        // the read-only pool only. Unbuilt handles no-op; see the method.
+        self.spawn_workspace_index_fold();
         if REQUEST_REALTIME_COMPLETION
             .try_with(|completion| completion.mark_committed())
             .is_err()
@@ -1051,6 +1623,24 @@ impl Db {
         Ok(())
     }
 
+    /// Read the workspace's current act number without allocating one: the
+    /// act of the most recently committed write transaction, or 0 when no
+    /// write has been stamped yet. This is the read side of the act-number
+    /// contract (decision 4e152d5): producers stamp, and anything that must
+    /// describe or verify whole-write coverage reads here.
+    pub async fn current_act(&self) -> Result<i64> {
+        let mut conn = self.write_pool.acquire().await?;
+        crate::act::current_act(&mut conn).await
+    }
+
+    /// Read the recorded act cutover for one canonical domain: the last
+    /// replay position whose transaction grouping is permanently unknown.
+    /// `None` names no canonical domain.
+    pub async fn act_cutover_for(&self, domain: &str) -> Result<Option<i64>> {
+        let mut conn = self.write_pool.acquire().await?;
+        crate::act::act_cutover_for(&mut conn, domain).await
+    }
+
     pub(crate) fn rollup_cache_get(&self, key: &RollupCacheKey) -> Option<serde_json::Value> {
         self.rollup_cache.lock().ok()?.get(key)
     }
@@ -1059,6 +1649,783 @@ impl Db {
         if let Ok(mut cache) = self.rollup_cache.lock() {
             cache.insert(key, value);
         }
+    }
+
+    /// Look up one cached visible-id set. `None` is a miss, never an empty
+    /// workspace — the caller evaluates live and may store the answer.
+    pub(crate) fn visible_set_cache_get(
+        &self,
+        key: &crate::visible_set_cache::VisibleSetCacheKey,
+    ) -> Option<std::sync::Arc<std::collections::HashSet<String>>> {
+        self.visible_set_cache.lock().ok()?.get(key)
+    }
+
+    /// Store one evaluated visible-id set. Refusal (oversize) returns
+    /// `false`; the caller still serves the live answer it just computed.
+    pub(crate) fn visible_set_cache_insert(
+        &self,
+        key: crate::visible_set_cache::VisibleSetCacheKey,
+        ids: std::sync::Arc<std::collections::HashSet<String>>,
+    ) -> bool {
+        if let Ok(mut cache) = self.visible_set_cache.lock() {
+            cache.insert(key, ids)
+        } else {
+            false
+        }
+    }
+
+    /// Record a lookup that found no entry, so hit/miss ratios stay honest
+    /// across the live-fallback path.
+    pub(crate) fn visible_set_cache_record_miss(&self) {
+        if let Ok(mut cache) = self.visible_set_cache.lock() {
+            cache.record_miss();
+        }
+    }
+
+    /// (hits, misses) for the handle cache. Measurement only.
+    #[cfg(test)]
+    pub(crate) fn visible_set_cache_stats(&self) -> (u64, u64) {
+        self.visible_set_cache
+            .lock()
+            .map(|cache| cache.stats())
+            .unwrap_or((0, 0))
+    }
+
+    /// Build the per-handle workspace index on first request (read-only
+    /// pool), or return immediately when already built. The build runs inside
+    /// one read transaction, so it is consistent by construction; this then
+    /// folds to the current fence, because a commit that landed after the
+    /// build snapshot may have fired its wake while this handle had no index
+    /// (the wake no-ops then) and would otherwise wait for an unrelated later
+    /// commit. Reopening starts cold; dropping the handle evicts the whole
+    /// index with the LRU entry. Consumed by the M3 snapshot read and the M4
+    /// point reads (`indexed_facets_record`, `indexed_link_candidates`); M1
+    /// wires the state and the wake.
+    #[allow(dead_code)]
+    pub(crate) async fn ensure_workspace_index(&self) -> Result<()> {
+        if self.workspace_index.read().await.is_some() {
+            return Ok(());
+        }
+        // Steady over-cap: a current refusal marker skips the rebuild. The
+        // full build below reads every record, facet, and link only to
+        // discard them again; one triple SELECT replaces that per read.
+        if self.workspace_index_refusal_current().await? {
+            return Ok(());
+        }
+        let mut built = crate::workspace_index::build_on(&self.read_pool).await?;
+        if !built.within_cap(crate::workspace_index::MAX_INDEX_BYTES) {
+            // Refuse rather than hold a subset: partially evicting records,
+            // facets or links would silently break the equivalence contract.
+            // Nothing is stored, so callers stay on the governed path. The
+            // marker stamps the REJECTED snapshot's own fences (not a later
+            // live read): a concurrent commit that shrank the workspace
+            // during the build must not suppress the retry that would now
+            // fit under cap.
+            self.note_workspace_index_refusal((
+                built.cursor_seq,
+                built.relationship_seq,
+                built.authorization_epoch,
+            ))?;
+            return Ok(());
+        }
+        crate::workspace_index::refresh_from(&self.read_pool, &mut built).await?;
+        let mut guard = self.workspace_index.write().await;
+        if guard.is_none() {
+            *guard = Some(built);
+        }
+        Ok(())
+    }
+
+    /// The live index fence triple, one row on the read pool. Shared by the
+    /// refusal marker and the M4 point-read gate so both key to the same
+    /// fences.
+    async fn live_index_fences(&self) -> Result<(i64, i64, i64)> {
+        let live: (i64, i64, i64) = sqlx::query_as(
+            "SELECT (SELECT COALESCE(MAX(seq), 0) FROM content_events), \
+                    (SELECT COALESCE(MAX(seq), 0) FROM relationship_events), \
+                    (SELECT epoch FROM authorization_revision WHERE id = 1)",
+        )
+        .fetch_one(&self.read_pool)
+        .await?;
+        Ok(live)
+    }
+
+    /// True when a refusal marker is held and the live fences still equal
+    /// it: nothing changed, so a rebuild would refuse again. Any fence
+    /// movement (including a shrinking delete) re-arms the next attempt.
+    async fn workspace_index_refusal_current(&self) -> Result<bool> {
+        let marker: Option<(i64, i64, i64)> = *self
+            .workspace_index_refused
+            .lock()
+            .map_err(|_| Error::engine("workspace index refusal lock is unavailable"))?;
+        let Some(marked) = marker else {
+            return Ok(false);
+        };
+        Ok(self.live_index_fences().await? == marked)
+    }
+
+    /// Stamp a refusal marker: the fences of the rejected snapshot itself.
+    /// Stamping a later live read would be wrong — a concurrent commit that
+    /// shrank the workspace during the build would suppress, until the next
+    /// write, the retry that now fits under cap. Every other refuse site
+    /// funnels through here. Synchronous: no fence read, just the store.
+    fn note_workspace_index_refusal(&self, refused_fences: (i64, i64, i64)) -> Result<()> {
+        *self
+            .workspace_index_refused
+            .lock()
+            .map_err(|_| Error::engine("workspace index refusal lock is unavailable"))? =
+            Some(refused_fences);
+        Ok(())
+    }
+
+    /// Fold committed content events into the handle index (read-only pool).
+    /// Builds on first use. Returns events folded. Never a write-pool slot.
+    /// Consumed by the M3 snapshot read; M1 wires the state and the wake.
+    #[allow(dead_code)]
+    pub(crate) async fn refresh_workspace_index(&self) -> Result<usize> {
+        self.ensure_workspace_index().await?;
+        let mut guard = self.workspace_index.write().await;
+        let Some(index) = guard.as_mut() else {
+            // No index held: the workspace was refused as over-cap (or the
+            // handle has none), so there is nothing to fold. Callers fall
+            // back to the governed path.
+            return Ok(0);
+        };
+        let folded = crate::workspace_index::refresh_from(&self.read_pool, index).await?;
+        if !index.within_cap(crate::workspace_index::MAX_INDEX_BYTES) {
+            let refused = (
+                index.cursor_seq,
+                index.relationship_seq,
+                index.authorization_epoch,
+            );
+            *guard = None;
+            drop(guard);
+            self.note_workspace_index_refusal(refused)?;
+        }
+        Ok(folded)
+    }
+
+    /// Extract a bounded batch of body-free heads for live `get_record`.
+    /// A stable hit uses the read lock only. Content lag gets one fold;
+    /// authorization or relationship movement gets one refusal-aware rebuild.
+    /// Any failed repair, absent index, or over-cap refusal falls back to the
+    /// governed reader rather than implying the requested ids are absent.
+    pub(crate) async fn indexed_record_heads_for(
+        &self,
+        ids: &[String],
+    ) -> Option<IndexedRecordHeads> {
+        if self.ensure_workspace_index().await.is_err() {
+            return None;
+        }
+        match self.indexed_record_heads_attempt(ids).await.ok()? {
+            RecordHeadsAttempt::Hit(hit) => Some(*hit),
+            RecordHeadsAttempt::Absent => None,
+            RecordHeadsAttempt::StaleContent => {
+                self.refresh_workspace_index().await.ok()?;
+                match self.indexed_record_heads_attempt(ids).await.ok()? {
+                    RecordHeadsAttempt::Hit(hit) => Some(*hit),
+                    _ => None,
+                }
+            }
+            RecordHeadsAttempt::StaleFences => {
+                self.rebuild_workspace_index().await.ok()?;
+                match self.indexed_record_heads_attempt(ids).await.ok()? {
+                    RecordHeadsAttempt::Hit(hit) => Some(*hit),
+                    _ => None,
+                }
+            }
+        }
+    }
+
+    async fn indexed_record_heads_attempt(&self, ids: &[String]) -> Result<RecordHeadsAttempt> {
+        let held = {
+            let guard = self.workspace_index.read().await;
+            let Some(index) = guard.as_ref() else {
+                return Ok(RecordHeadsAttempt::Absent);
+            };
+            let heads = ids
+                .iter()
+                .filter_map(|id| {
+                    index
+                        .records
+                        .get(id)
+                        .cloned()
+                        .map(|head| (id.clone(), head))
+                })
+                .collect();
+            IndexedRecordHeads {
+                heads,
+                fences: (
+                    index.cursor_seq,
+                    index.relationship_seq,
+                    index.authorization_epoch,
+                ),
+            }
+        };
+        let live = self.live_index_fences().await?;
+        if held.fences != live {
+            return Ok(if held.fences.1 != live.1 || held.fences.2 != live.2 {
+                RecordHeadsAttempt::StaleFences
+            } else {
+                RecordHeadsAttempt::StaleContent
+            });
+        }
+        Ok(RecordHeadsAttempt::Hit(Box::new(held)))
+    }
+
+    /// Live authorization, relationship, and semantic-unit fences for M3 page validation.
+    /// Content may advance under a pin (pages are immutable); fences may not.
+    /// One row, read-pool only, no visibility evaluation.
+    pub(crate) async fn live_snapshot_fences(&self) -> Result<(i64, i64, i64)> {
+        let fences: (i64, i64, i64) = sqlx::query_as(
+            "SELECT (SELECT epoch FROM authorization_revision WHERE id = 1), \
+                    (SELECT COALESCE(MAX(seq), 0) FROM relationship_events), \
+                    (SELECT COALESCE(MAX(creation_event_seq), 0) FROM semantic_units)",
+        )
+        .fetch_one(&self.read_pool)
+        .await?;
+        Ok(fences)
+    }
+
+    /// M2 backend seam for one principal's sequence- and epoch-stamped index.
+    /// `None` explicitly requests a governed fallback: it never means an empty
+    /// workspace. M3 will own the HTTP/MCP projection and fallback response.
+    #[allow(dead_code)]
+    pub(crate) async fn filtered_workspace_index(
+        &self,
+        principal: crate::query::QueryPrincipal,
+    ) -> Result<Option<crate::workspace_index::FilteredWorkspaceIndex>> {
+        // This is the single governed visibility evaluation for the request.
+        let visible = crate::query::sql::workspace_visible_set(self, principal).await?;
+        self.refresh_workspace_index().await?;
+        let stale_fences = self
+            .workspace_index
+            .read()
+            .await
+            .as_ref()
+            .is_some_and(|index| {
+                index.authorization_epoch != visible.authorization_epoch
+                    || index.relationship_seq != visible.relationship_seq
+            });
+        if stale_fences {
+            // Content folding cannot repair descendant policy anchors or
+            // relationship-owned links. Rebuild the full physical index, then
+            // require an exact fence match before intersecting.
+            let mut rebuilt = crate::workspace_index::build_on(&self.read_pool).await?;
+            if !rebuilt.within_cap(crate::workspace_index::MAX_INDEX_BYTES) {
+                *self.workspace_index.write().await = None;
+                return Ok(None);
+            }
+            crate::workspace_index::refresh_from(&self.read_pool, &mut rebuilt).await?;
+            if !rebuilt.within_cap(crate::workspace_index::MAX_INDEX_BYTES) {
+                *self.workspace_index.write().await = None;
+                return Ok(None);
+            }
+            *self.workspace_index.write().await = Some(rebuilt);
+        }
+        // The visibility transaction has ended, so reject any write between
+        // its snapshot and the held index. One SELECT gives a coherent current
+        // fence tuple. A later commit cannot mutate the read-locked index.
+        let live: (i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT (SELECT COALESCE(MAX(seq), 0) FROM content_events), \
+                    (SELECT COALESCE(MAX(seq), 0) FROM relationship_events), \
+                    (SELECT epoch FROM authorization_revision WHERE id = 1), \
+                    (SELECT COALESCE(MAX(creation_event_seq), 0) FROM semantic_units)",
+        )
+        .fetch_one(&self.read_pool)
+        .await?;
+        if live
+            != (
+                visible.content_seq,
+                visible.relationship_seq,
+                visible.authorization_epoch,
+                visible.unit_seq_max,
+            )
+        {
+            return Ok(None);
+        }
+        let guard = self.workspace_index.read().await;
+        let Some(index) = guard.as_ref() else {
+            return Ok(None);
+        };
+        if !index.within_cap(crate::workspace_index::MAX_INDEX_BYTES)
+            || index.cursor_seq != visible.content_seq
+            || index.authorization_epoch != visible.authorization_epoch
+            || index.relationship_seq != visible.relationship_seq
+        {
+            return Ok(None);
+        }
+        Ok(Some(
+            crate::workspace_index::FilteredWorkspaceIndex::intersect(
+                index,
+                &visible.ids,
+                visible.authorization_epoch,
+                visible.relationship_seq,
+                visible.unit_seq_max,
+            ),
+        ))
+    }
+
+    /// M4 point read for the `resolve_facets` record path: clone one record's
+    /// head plus its facet rows under the read lock, gated on the exact live
+    /// fence triple. No `FilteredWorkspaceIndex::intersect`, no full-index
+    /// clone, no write-pool slot. `None` is always a governed-fallback signal
+    /// — absent/refused index, fence race, or unheld record — never an empty
+    /// result. Record-level visibility itself stays governed at the call site
+    /// (`can_record_in_pool` on the read pool), exactly as the existing
+    /// handler gates with `can_record`.
+    pub(crate) async fn indexed_facets_record(
+        &self,
+        record_id: &str,
+    ) -> Result<Option<crate::workspace_index::IndexedFacetsRecord>> {
+        // Steady state takes only the read lock: ensure (cold build only),
+        // then an optimistic read-lock extraction gated on the exact live
+        // fence triple. The write lock is taken only when the held fences are
+        // stale — a fold for content lag, a rebuild for authorization or
+        // relationship movement (which content folding cannot repair, per the
+        // M1 fold boundary) — and never for a hit, so concurrent M4 readers
+        // do not serialize behind each other. Anything still mismatched
+        // after one repair falls back to governed rather than serving stale.
+        self.ensure_workspace_index().await?;
+        match self.indexed_facets_record_attempt(record_id).await? {
+            FacetsRecordAttempt::Hit(hit) => Ok(Some(*hit)),
+            // Absent index (cold-build refused over-cap) or a record the
+            // current index does not hold: no fold, no rebuild. A second
+            // full build would just refuse again; an unheld record under
+            // current fences is for the governed path to distinguish
+            // (nonexistent vs hidden), which the index alone cannot.
+            FacetsRecordAttempt::Absent => Ok(None),
+            FacetsRecordAttempt::StaleContent => {
+                self.refresh_workspace_index().await?;
+                match self.indexed_facets_record_attempt(record_id).await? {
+                    FacetsRecordAttempt::Hit(hit) => Ok(Some(*hit)),
+                    _ => Ok(None),
+                }
+            }
+            FacetsRecordAttempt::StaleFences => {
+                self.rebuild_workspace_index().await?;
+                match self.indexed_facets_record_attempt(record_id).await? {
+                    FacetsRecordAttempt::Hit(hit) => Ok(Some(*hit)),
+                    _ => Ok(None),
+                }
+            }
+        }
+    }
+    /// Single optimistic attempt with a tri-state outcome. Read lock plus one
+    /// live fence triple only — no write lock, no fold, no rebuild.
+    async fn indexed_facets_record_attempt(&self, record_id: &str) -> Result<FacetsRecordAttempt> {
+        let held = {
+            let guard = self.workspace_index.read().await;
+            let Some(index) = guard.as_ref() else {
+                // No index held: cold build refused over-cap (or was dropped
+                // for the same reason). Never rebuild here — it would just
+                // refuse again.
+                return Ok(FacetsRecordAttempt::Absent);
+            };
+            let head = index.records.get(record_id).cloned();
+            let mut facets: Vec<crate::workspace_index::FacetRow> = index
+                .facets
+                .values()
+                .filter(|facet| facet.record_id == record_id)
+                .cloned()
+                .collect();
+            // Governed reads `ORDER BY fv.key`; facet keys are unique per
+            // record, so the id tiebreak only orders a state the governed
+            // path leaves unspecified. The differential oracle pins this.
+            facets.sort_by(|a, b| a.key.cmp(&b.key).then(a.id.cmp(&b.id)));
+            head.map(|head| {
+                (
+                    head,
+                    facets,
+                    index.cursor_seq,
+                    index.authorization_epoch,
+                    index.relationship_seq,
+                )
+            })
+        };
+        let live: (i64, i64, i64) = self.live_index_fences().await?;
+        let Some((head, facets, index_content, index_auth, index_rel)) = held else {
+            // Fences are current enough to check first would be ideal, but a
+            // missing head under a stale cursor is indistinguishable from a
+            // missing record without the live triple — which we now have.
+            let (live_content, live_rel, live_auth) = live;
+            // Re-read held fences cheaply: if any fence moved, repair can
+            // still bring this record in, so classify stale, not absent.
+            let guard = self.workspace_index.read().await;
+            let stale = guard.as_ref().is_some_and(|index| {
+                index.cursor_seq != live_content
+                    || index.relationship_seq != live_rel
+                    || index.authorization_epoch != live_auth
+            });
+            return Ok(if stale {
+                if guard.as_ref().is_some_and(|index| {
+                    index.relationship_seq != live_rel || index.authorization_epoch != live_auth
+                }) {
+                    FacetsRecordAttempt::StaleFences
+                } else {
+                    FacetsRecordAttempt::StaleContent
+                }
+            } else {
+                FacetsRecordAttempt::Absent
+            });
+        };
+        if (index_content, index_rel, index_auth) != live {
+            let (_, live_rel, live_auth) = live;
+            // Content folding cannot repair descendant policy anchors or
+            // relationship-owned links (M1 fold boundary): those need the
+            // full rebuild below, mirroring `filtered_workspace_index`.
+            return Ok(if index_rel != live_rel || index_auth != live_auth {
+                FacetsRecordAttempt::StaleFences
+            } else {
+                FacetsRecordAttempt::StaleContent
+            });
+        }
+        Ok(FacetsRecordAttempt::Hit(Box::new(
+            crate::workspace_index::IndexedFacetsRecord {
+                head,
+                facets,
+                content_seq: index_content,
+                authorization_epoch: index_auth,
+                relationship_seq: index_rel,
+            },
+        )))
+    }
+
+    /// Full physical rebuild for authorization/relationship fence movement,
+    /// mirroring `filtered_workspace_index`. Content folding alone cannot
+    /// repair those tiers; without this, indexed hits would never return
+    /// after a narrowing event. Over-cap refusal drops the index and stamps
+    /// the marker (so steady over-cap reads skip the rebuild); a successful
+    /// install clears it. The caller falls back — never a partial hold.
+    async fn rebuild_workspace_index(&self) -> Result<()> {
+        let mut rebuilt = crate::workspace_index::build_on(&self.read_pool).await?;
+        if !rebuilt.within_cap(crate::workspace_index::MAX_INDEX_BYTES) {
+            let refused = (
+                rebuilt.cursor_seq,
+                rebuilt.relationship_seq,
+                rebuilt.authorization_epoch,
+            );
+            *self.workspace_index.write().await = None;
+            self.note_workspace_index_refusal(refused)?;
+            return Ok(());
+        }
+        crate::workspace_index::refresh_from(&self.read_pool, &mut rebuilt).await?;
+        if !rebuilt.within_cap(crate::workspace_index::MAX_INDEX_BYTES) {
+            let refused = (
+                rebuilt.cursor_seq,
+                rebuilt.relationship_seq,
+                rebuilt.authorization_epoch,
+            );
+            *self.workspace_index.write().await = None;
+            self.note_workspace_index_refusal(refused)?;
+            return Ok(());
+        }
+        *self.workspace_index.write().await = Some(rebuilt);
+        *self
+            .workspace_index_refused
+            .lock()
+            .map_err(|_| Error::engine("workspace index refusal lock is unavailable"))? = None;
+        Ok(())
+    }
+
+    /// M4 point read for `manage_links.list`: clone one record's touching
+    /// links under the read lock, gated on the exact live fence triple. No
+    /// full-index clone, no write-pool slot. Same repair policy as
+    /// `indexed_facets_record` — one content fold on content lag, one
+    /// refusal-aware rebuild on authorization/relationship movement, neither
+    /// on an absent index — so steady over-cap reads skip the rebuild via
+    /// the shared marker instead of reconstructing and discarding the whole
+    /// index on every read. `None` is always a governed-fallback signal,
+    /// never an empty link set.
+    pub(crate) async fn indexed_link_candidates(
+        &self,
+        record_id: &str,
+    ) -> Result<Option<crate::workspace_index::IndexedLinkCandidates>> {
+        // Steady state takes only the read lock: ensure (cold build only,
+        // refusal-skipped while fences are current), then an optimistic
+        // read-lock extraction gated on the exact live fence triple. The
+        // write lock is taken only when the held fences are stale, and never
+        // for a hit, so concurrent M4 readers do not serialize behind each
+        // other. Anything still mismatched after one repair falls back to
+        // governed rather than serving stale.
+        self.ensure_workspace_index().await?;
+        match self.indexed_link_candidates_attempt(record_id).await? {
+            LinksCandidatesAttempt::Hit(hit) => Ok(Some(*hit)),
+            // Absent index (cold-build refused over-cap): no fold, no
+            // rebuild. A second full build would just refuse again — the
+            // marker in `ensure` already covers the steady case.
+            LinksCandidatesAttempt::Absent => Ok(None),
+            LinksCandidatesAttempt::StaleContent => {
+                self.refresh_workspace_index().await?;
+                match self.indexed_link_candidates_attempt(record_id).await? {
+                    LinksCandidatesAttempt::Hit(hit) => Ok(Some(*hit)),
+                    _ => Ok(None),
+                }
+            }
+            LinksCandidatesAttempt::StaleFences => {
+                self.rebuild_workspace_index().await?;
+                match self.indexed_link_candidates_attempt(record_id).await? {
+                    LinksCandidatesAttempt::Hit(hit) => Ok(Some(*hit)),
+                    _ => Ok(None),
+                }
+            }
+        }
+    }
+
+    /// Single optimistic attempt with a tri-state outcome. Read lock plus one
+    /// live fence triple only — no write lock, no fold, no rebuild, no
+    /// per-call cap scan (cap discipline is the shared refusal marker, owned
+    /// by the build/refresh/rebuild paths). Unlike the facets point read, an
+    /// unheld record — zero touching links — is a Hit, not Absent: anchor
+    /// existence and visibility stay governed at the call site through the
+    /// visible set, which the index alone cannot distinguish.
+    async fn indexed_link_candidates_attempt(
+        &self,
+        record_id: &str,
+    ) -> Result<LinksCandidatesAttempt> {
+        let held = {
+            let guard = self.workspace_index.read().await;
+            let Some(index) = guard.as_ref() else {
+                // No index held: cold build refused over-cap (or was dropped
+                // for the same reason). Never rebuild here — it would just
+                // refuse again.
+                return Ok(LinksCandidatesAttempt::Absent);
+            };
+            let links: Vec<crate::workspace_index::LinkRow> = index
+                .links
+                .values()
+                .filter(|link| link.source_id == record_id || link.target_id == record_id)
+                .cloned()
+                .collect();
+            (
+                links,
+                index.cursor_seq,
+                index.authorization_epoch,
+                index.relationship_seq,
+            )
+        };
+        let live: (i64, i64, i64) = self.live_index_fences().await?;
+        let (links, index_content, index_auth, index_rel) = held;
+        if (index_content, index_rel, index_auth) != live {
+            let (_, live_rel, live_auth) = live;
+            // Content folding cannot repair descendant policy anchors or
+            // relationship-owned links (M1 fold boundary): those need the
+            // full rebuild above, mirroring `filtered_workspace_index`.
+            return Ok(if index_rel != live_rel || index_auth != live_auth {
+                LinksCandidatesAttempt::StaleFences
+            } else {
+                LinksCandidatesAttempt::StaleContent
+            });
+        }
+        Ok(LinksCandidatesAttempt::Hit(Box::new(
+            crate::workspace_index::IndexedLinkCandidates {
+                links,
+                content_seq: index_content,
+                authorization_epoch: index_auth,
+                relationship_seq: index_rel,
+            },
+        )))
+    }
+
+    /// Borrow the physical index for one live structure walk. The governed
+    /// visibility set and all three physical fences must describe the same
+    /// committed state. No rows are cloned out of the index on a hit.
+    pub(crate) async fn indexed_structure_nodes(
+        &self,
+        principal: crate::query::QueryPrincipal,
+        root_id: &str,
+        opts: &crate::query::tree::TreeOptions,
+    ) -> Result<Option<(Vec<crate::query::tree::TreeNode>, (i64, i64, i64))>> {
+        let Ok(visible) = crate::query::sql::workspace_visible_set(self, principal).await else {
+            return Ok(None);
+        };
+        let expected = (
+            visible.content_seq,
+            visible.relationship_seq,
+            visible.authorization_epoch,
+        );
+        let held = self.workspace_index.read().await.as_ref().map(|index| {
+            (
+                index.cursor_seq,
+                index.relationship_seq,
+                index.authorization_epoch,
+            )
+        });
+        let maintenance = match held {
+            None => self.ensure_workspace_index().await.map(|_| ()),
+            Some((_, relationship, authorization))
+                if (relationship, authorization) != (expected.1, expected.2) =>
+            {
+                // Content folding cannot repair relationship-owned links or
+                // policy anchors. Share the refusal-aware physical rebuild
+                // used by the other M4 point reads, once per stale attempt.
+                self.rebuild_workspace_index().await.map(|_| ())
+            }
+            Some((content, relationship, authorization))
+                if (relationship, authorization) == (expected.1, expected.2)
+                    && content != expected.0 =>
+            {
+                self.refresh_workspace_index().await.map(|_| ())
+            }
+            _ => Ok(()),
+        };
+        if maintenance.is_err() {
+            return Ok(None);
+        }
+        let live: std::result::Result<(i64, i64, i64), _> = sqlx::query_as(
+            "SELECT (SELECT COALESCE(MAX(seq), 0) FROM content_events), \
+                    (SELECT COALESCE(MAX(seq), 0) FROM relationship_events), \
+                    (SELECT epoch FROM authorization_revision WHERE id = 1)",
+        )
+        .fetch_one(&self.read_pool)
+        .await;
+        if live.ok() != Some(expected) {
+            return Ok(None);
+        }
+        let guard = self.workspace_index.read().await;
+        let Some(index) = guard.as_ref() else {
+            return Ok(None);
+        };
+        if !index.within_cap(crate::workspace_index::MAX_INDEX_BYTES)
+            || (
+                index.cursor_seq,
+                index.relationship_seq,
+                index.authorization_epoch,
+            ) != expected
+        {
+            return Ok(None);
+        }
+        let nodes = crate::query::tree::descendants_from_index(index, &visible.ids, root_id, opts);
+        drop(guard);
+        // A commit during the in-memory walk would otherwise let the response
+        // combine an old tree with later live successor decoration.
+        let after: std::result::Result<(i64, i64, i64), _> = sqlx::query_as(
+            "SELECT (SELECT COALESCE(MAX(seq), 0) FROM content_events), \
+                    (SELECT COALESCE(MAX(seq), 0) FROM relationship_events), \
+                    (SELECT epoch FROM authorization_revision WHERE id = 1)",
+        )
+        .fetch_one(&self.read_pool)
+        .await;
+        Ok((after.ok() == Some(expected))
+            .then_some(nodes)
+            .flatten()
+            .map(|nodes| (nodes, expected)))
+    }
+
+    /// The final live fence after successor decoration, which may perform
+    /// separate SQL reads. An index hit is discarded if a commit moved any
+    /// tier while those reads were in flight.
+    pub(crate) async fn structure_index_fences_match(&self, expected: (i64, i64, i64)) -> bool {
+        let live: std::result::Result<(i64, i64, i64), _> = sqlx::query_as(
+            "SELECT (SELECT COALESCE(MAX(seq), 0) FROM content_events), \
+                    (SELECT COALESCE(MAX(seq), 0) FROM relationship_events), \
+                    (SELECT epoch FROM authorization_revision WHERE id = 1)",
+        )
+        .fetch_one(&self.read_pool)
+        .await;
+        live.ok() == Some(expected)
+    }
+
+    /// Best-effort commit-wake fold: the same wake that drives the realtime
+    /// hub. At most one fold task runs per handle; the drain loop re-checks
+    /// the fence after clearing so a commit landing mid-fold re-arms rather
+    /// than being missed. Errors are logged, never propagated: fan-out must
+    /// not turn a completed write into a transport failure.
+    fn spawn_workspace_index_fold(&self) {
+        let built = self
+            .workspace_index
+            .try_read()
+            .map(|guard| guard.is_some())
+            .unwrap_or(true);
+        if !built {
+            return;
+        }
+        if self
+            .workspace_index_fold
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+        if tokio::runtime::Handle::try_current().is_err() {
+            self.workspace_index_fold.store(false, Ordering::SeqCst);
+            return;
+        }
+        let this = self.clone();
+        tokio::spawn(async move {
+            this.fold_workspace_index_drain().await;
+        });
+    }
+
+    async fn fold_workspace_index_drain(&self) {
+        // Panic/abort backstop: if this task dies mid-fold the guard clears the
+        // flag on unwind rather than disabling folding for the handle's life.
+        let mut fold_guard = WorkspaceIndexFoldGuard::new(self.workspace_index_fold.clone());
+        loop {
+            {
+                let mut guard = self.workspace_index.write().await;
+                if let Some(index) = guard.as_mut() {
+                    if let Err(error) =
+                        crate::workspace_index::refresh_from(&self.read_pool, index).await
+                    {
+                        eprintln!("[native-ce] workspace index fold failed: {error}");
+                    }
+                    if !index.within_cap(crate::workspace_index::MAX_INDEX_BYTES) {
+                        // A wake can grow a previously admitted index past
+                        // the cap. Refuse the whole index just as a cold build
+                        // does; the next request uses the governed fallback.
+                        *guard = None;
+                    }
+                }
+            }
+            self.workspace_index_fold.store(false, Ordering::SeqCst);
+            // Clear-then-recheck: a commit that landed between the last fence
+            // read above and the clear re-arms here instead of being missed.
+            let fence =
+                sqlx::query_scalar::<_, i64>("SELECT COALESCE(MAX(seq), 0) FROM content_events")
+                    .fetch_one(&self.read_pool)
+                    .await;
+            let guard = self.workspace_index.read().await;
+            let Some(index) = guard.as_ref() else {
+                return;
+            };
+            match fence {
+                Err(_) => return,
+                Ok(fence) if fence <= index.cursor_seq => return,
+                Ok(_) => {
+                    if self
+                        .workspace_index_fold
+                        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                        .is_err()
+                    {
+                        // A fresh fold task took over and owns the flag now, so
+                        // leave it set for that task rather than clobbering it.
+                        fold_guard.hand_off();
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn workspace_index_built_for_tests(&self) -> bool {
+        self.workspace_index.read().await.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn workspace_index_snapshot_for_tests(
+        &self,
+    ) -> Option<crate::workspace_index::WorkspaceIndex> {
+        self.workspace_index.read().await.clone()
+    }
+
+    /// Test-only oracle lever for the M4 differential test: drop the held
+    /// index so the next read takes the governed fallback. Production code
+    /// never calls this; over-cap refusal uses the same `None` signal.
+    #[cfg(test)]
+    pub(crate) async fn clear_workspace_index_for_tests(&self) {
+        *self.workspace_index.write().await = None;
     }
 
     pub(crate) fn put_inbox_snapshot(&self, value: serde_json::Value) -> Result<String> {
@@ -1106,15 +2473,16 @@ impl Db {
             .ok_or_else(|| Error::engine("cursor_reset_required: invalid inbox snapshot"))
     }
 
-    /// Mark both pools closed before returning a future to their physical
+    /// Mark all three pools closed before returning a future to their physical
     /// shutdown. This is intentionally synchronous: every clone must refuse a
     /// new public read or internal write as soon as handle lifecycle ends.
     fn mark_pools_closed(&self) {
         drop(self.read_pool.close());
         drop(self.write_pool.close());
+        drop(self.governed_pool.close());
     }
 
-    /// Close both pools, draining response-independent captures first.
+    /// Close all three pools, draining response-independent captures first.
     /// Queued captures are awaited (bounded by
     /// [`crate::mcp::interactions::CAPTURE_DRAIN_TIMEOUT`]) before the pools
     /// refuse checkouts, so graceful shutdown keeps captures rather than
@@ -1127,7 +2495,8 @@ impl Db {
         self.mark_pools_closed();
         tokio::join!(
             close_pool_and_drain(&self.read_pool),
-            close_pool_and_drain(&self.write_pool)
+            close_pool_and_drain(&self.write_pool),
+            close_pool_and_drain(&self.governed_pool)
         );
     }
 
@@ -1182,7 +2551,7 @@ impl Db {
     }
 
     /// End a shared handle from a synchronous lifecycle boundary such as LRU
-    /// eviction. Both pools are marked closed before this function returns;
+    /// eviction. All three pools are marked closed before this function returns;
     /// when a runtime is available it also drains their physical shutdown in
     /// the background.
     ///
@@ -1194,11 +2563,13 @@ impl Db {
         self.mark_pools_closed();
         let read_pool = self.read_pool.clone();
         let write_pool = self.write_pool.clone();
+        let governed_pool = self.governed_pool.clone();
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
                 tokio::join!(
                     close_pool_and_drain(&read_pool),
-                    close_pool_and_drain(&write_pool)
+                    close_pool_and_drain(&write_pool),
+                    close_pool_and_drain(&governed_pool)
                 );
             });
         }
@@ -1221,7 +2592,7 @@ async fn close_pool_and_drain(pool: &SqlitePool) {
 }
 
 /// Retire a cached hosted-router handle from a synchronous eviction or
-/// shutdown boundary. Both pools refuse new work before this returns; a live
+/// shutdown boundary. All pools refuse new work before this returns; a live
 /// runtime drains their physical shutdown in the background.
 #[doc(hidden)]
 pub fn close_hosted_router_database_in_background(db: &Db) {
@@ -1289,15 +2660,23 @@ mod hosted_adoption_checkpoint_tests {
 mod close_tests {
     use super::*;
 
-    async fn assert_both_pools_closed(db: &Db) {
+    async fn assert_all_pools_closed(db: &Db) {
         assert!(db.pool().is_closed(), "public read pool remained open");
         assert!(
             db.write_pool().is_closed(),
             "internal write pool remained open"
         );
+        assert!(
+            db.governed_pool().is_closed(),
+            "governed SQL pool remained open"
+        );
         assert!(sqlx::query("SELECT 1").fetch_one(db.pool()).await.is_err());
         assert!(sqlx::query("SELECT 1")
             .fetch_one(db.write_pool())
+            .await
+            .is_err());
+        assert!(sqlx::query("SELECT 1")
+            .fetch_one(db.governed_pool())
             .await
             .is_err());
     }
@@ -1307,7 +2686,7 @@ mod close_tests {
         let db = create_database(":memory:").await.unwrap();
         let clone = db.clone();
         db.close().await;
-        assert_both_pools_closed(&clone).await;
+        assert_all_pools_closed(&clone).await;
     }
 
     #[tokio::test]
@@ -1360,7 +2739,7 @@ mod close_tests {
         let db = create_database(":memory:").await.unwrap();
         let clone = db.clone();
         db.close_in_background();
-        assert_both_pools_closed(&clone).await;
+        assert_all_pools_closed(&clone).await;
     }
 }
 
@@ -1374,16 +2753,68 @@ mod close_tests {
 pub(crate) async fn begin_write(
     pool: &SqlitePool,
 ) -> Result<sqlx::Transaction<'static, sqlx::Sqlite>> {
+    begin_write_in(pool, WriteDomain::Workspace).await
+}
+
+/// [`begin_write`], told which pool it is opening on.
+///
+/// The domain is a parameter rather than something inferred from the pool
+/// because the measurement in [`crate::write_contention`] must not mix the
+/// per-workspace writer — the serialisation point whose cost is the open
+/// question — with the hosted control-plane catalogue, which is a different
+/// database under different pressure. Every ordinary caller reaches this
+/// through `begin_write` and is a workspace write; the one control-plane
+/// caller declares itself.
+async fn begin_write_in(
+    pool: &SqlitePool,
+    domain: WriteDomain,
+) -> Result<sqlx::Transaction<'static, sqlx::Sqlite>> {
     #[cfg(test)]
     BEFORE_BEGIN_WRITE_NOTIFICATION
         .try_with(|notification| notification.notify_one())
         .ok();
-    let mut transaction = begin_write_with(|| pool.begin_with("BEGIN IMMEDIATE")).await?;
+    let started_at = Instant::now();
+    let begun =
+        begin_write_attempts_with(|| pool.begin_with("BEGIN IMMEDIATE"), WRITER_DEADLINE).await;
+    let wait = started_at.elapsed();
+    let (retries, failed) = match &begun {
+        Ok(success) => (success.retries, false),
+        Err(failure) => (failure.retries, true),
+    };
+    // The retry count and the queueing time this loop computes used to be
+    // discarded on every ordinary write, which is why nobody could say whether
+    // the single-writer rule was under pressure. Retain both before the error
+    // path can return.
+    crate::write_contention::record_begin(domain, retries, wait, failed);
+    crate::request_work::record_write_begin(
+        retries,
+        u64::try_from(wait.as_micros()).unwrap_or(u64::MAX),
+    );
+    crate::mcp::request_timing::record_write_wait(wait);
+    let mut transaction = begun
+        .map(|success| success.transaction)
+        .map_err(|failure| failure.error)?;
+    // The reserved lock is held from here. The section closes when this
+    // connection returns to its pool — the seam that sees commits, rollbacks
+    // and drops alike. Not every ending reaches it; `write_contention`'s module
+    // doc names the cases that do not and how they are counted.
+    if let Some(key) = connection_key(&mut transaction).await {
+        crate::write_contention::open_critical_section(domain, key, None);
+    }
     if let Err(error) = crate::storage_profile::enforce_write_boundary(&mut transaction).await {
         let _ = transaction.rollback().await;
         return Err(error);
     }
     Ok(transaction)
+}
+
+/// The raw SQLite connection pointer, used only as an identity for pairing a
+/// `BEGIN IMMEDIATE` with the release of the connection that ran it. The
+/// pointer is never dereferenced and never outlives the pairing: the entry is
+/// removed when the connection is released.
+async fn connection_key(connection: &mut SqliteConnection) -> Option<usize> {
+    let mut handle = connection.lock_handle().await.ok()?;
+    Some(handle.as_raw_handle().as_ptr() as usize)
 }
 
 /// The opened half of a capture-path write: the transaction plus the bounded
@@ -1401,11 +2832,21 @@ pub(crate) struct CaptureBegin {
 /// 200, and the count is what distinguishes contention from a poisoned lock.
 pub(crate) async fn begin_capture_write(pool: &SqlitePool) -> Result<CaptureBegin> {
     let started_at = Instant::now();
-    let begun = begin_write_attempts_with(
-        || pool.begin_with("BEGIN IMMEDIATE"),
-        Duration::from_secs(15),
-    )
-    .await;
+    let begun =
+        begin_write_attempts_with(|| pool.begin_with("BEGIN IMMEDIATE"), WRITER_DEADLINE).await;
+    let wait = started_at.elapsed();
+    // Capture writes are the dominant source of per-workspace write pressure,
+    // so they belong in the same aggregate as ordinary writes rather than only
+    // in the exhaustion message below.
+    crate::write_contention::record_begin(
+        WriteDomain::Workspace,
+        match &begun {
+            Ok(success) => success.retries,
+            Err(failure) => failure.retries,
+        },
+        wait,
+        begun.is_err(),
+    );
     let success = match begun {
         Ok(success) => success,
         Err(failure) => {
@@ -1413,12 +2854,15 @@ pub(crate) async fn begin_capture_write(pool: &SqlitePool) -> Result<CaptureBegi
                 "interaction capture begin_write {} after {} retries in {}ms: {}",
                 failure.retry_outcome,
                 failure.retry_count,
-                started_at.elapsed().as_millis(),
+                wait.as_millis(),
                 failure.error
             )));
         }
     };
     let mut transaction = success.transaction;
+    if let Some(key) = connection_key(&mut transaction).await {
+        crate::write_contention::open_critical_section(WriteDomain::Workspace, key, None);
+    }
     if let Err(error) = crate::storage_profile::enforce_write_boundary(&mut transaction).await {
         let _ = transaction.rollback().await;
         return Err(error);
@@ -1439,7 +2883,7 @@ pub(crate) async fn begin_capture_write(pool: &SqlitePool) -> Result<CaptureBegi
 pub async fn begin_host_control_plane_sqlite_write(
     pool: &SqlitePool,
 ) -> Result<sqlx::Transaction<'static, sqlx::Sqlite>> {
-    begin_write(pool).await
+    begin_write_in(pool, WriteDomain::HostCatalog).await
 }
 
 /// A hosted control-plane write carrying bounded-BEGIN diagnostics through its
@@ -1528,15 +2972,41 @@ pub async fn begin_diagnosed_host_control_plane_sqlite_write(
     pool: &SqlitePool,
     operation: &'static str,
 ) -> Result<DiagnosedHostControlPlaneSqliteWrite> {
+    begin_diagnosed_host_control_plane_sqlite_write_with_deadline(pool, operation, WRITER_DEADLINE)
+        .await
+}
+
+/// [`begin_diagnosed_host_control_plane_sqlite_write`] with an explicit
+/// bounded-BEGIN deadline. The hosted migration journal retries a busy begin
+/// across several [`WRITER_DEADLINE`] windows; tests pass a short deadline so
+/// they exercise the retry without waiting out the production budget.
+#[doc(hidden)]
+pub async fn begin_diagnosed_host_control_plane_sqlite_write_with_deadline(
+    pool: &SqlitePool,
+    operation: &'static str,
+    retry_for: Duration,
+) -> Result<DiagnosedHostControlPlaneSqliteWrite> {
     let started_at = Instant::now();
-    let begin = begin_write_attempts_with(
-        || pool.begin_with("BEGIN IMMEDIATE"),
-        Duration::from_secs(15),
-    )
-    .await;
+    let begin = begin_write_attempts_with(|| pool.begin_with("BEGIN IMMEDIATE"), retry_for).await;
+    // This path predates the measurement and kept its own diagnostics, but it
+    // is ordinary hosted control-plane write traffic: leaving it out would make
+    // the catalogue domain silently undercount while presenting itself as a
+    // measured distribution.
+    let wait = started_at.elapsed();
+    let retries = match &begin {
+        Ok(success) => success.retries,
+        Err(failure) => failure.retries,
+    };
+    crate::write_contention::record_begin(WriteDomain::HostCatalog, retries, wait, begin.is_err());
+    crate::request_work::record_write_begin(
+        retries,
+        u64::try_from(wait.as_micros()).unwrap_or(u64::MAX),
+    );
+    crate::mcp::request_timing::record_write_wait(wait);
     let BeginWriteSuccess {
         mut transaction,
         retry_count,
+        retries: _,
     } = match begin {
         Ok(begin) => begin,
         Err(failure) => {
@@ -1551,6 +3021,13 @@ pub async fn begin_diagnosed_host_control_plane_sqlite_write(
             return Err(contextualize_write_error(context, failure.error));
         }
     };
+    if let Some(key) = connection_key(&mut transaction).await {
+        crate::write_contention::open_critical_section(
+            WriteDomain::HostCatalog,
+            key,
+            Some(operation),
+        );
+    }
     if let Err(error) = crate::storage_profile::enforce_write_boundary(&mut transaction).await {
         let context = write_diagnostic_context(
             operation,
@@ -1674,28 +3151,36 @@ impl DatabaseError for ContextualDatabaseError {
     }
 }
 
+/// How long a writer will queue for `BEGIN IMMEDIATE` before giving up.
+/// Derived from the measurement's largest histogram bucket, rather than stated
+/// twice, so the bound and the deadline it exists to describe cannot drift.
+pub(crate) const WRITER_DEADLINE: Duration =
+    Duration::from_micros(crate::write_contention::WRITER_DEADLINE_MICROS);
+
 struct BeginWriteSuccess {
     transaction: sqlx::Transaction<'static, sqlx::Sqlite>,
     retry_count: usize,
+    retries: BeginRetries,
 }
 
 struct BeginWriteFailure {
     error: Error,
     retry_count: usize,
     retry_outcome: &'static str,
+    retries: BeginRetries,
 }
 
-async fn begin_write_with<F, Fut>(mut begin: F) -> Result<sqlx::Transaction<'static, sqlx::Sqlite>>
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<
-        Output = std::result::Result<sqlx::Transaction<'static, sqlx::Sqlite>, sqlx::Error>,
-    >,
-{
-    begin_write_attempts_with(&mut begin, Duration::from_secs(15))
-        .await
-        .map(|success| success.transaction)
-        .map_err(|failure| failure.error)
+/// Why a bounded `BEGIN IMMEDIATE` had to go round again. The two causes are
+/// counted apart because they mean opposite things: `busy` is a writer queueing
+/// behind another writer for longer than SQLite's own five-second
+/// `busy_timeout`, which is an incident; `cleanup` is a canceled transaction's
+/// rollback still draining before pooled reuse, which is ordinary housekeeping
+/// and carries a 20ms sleep rather than five seconds of contention. Summed
+/// together they describe neither.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct BeginRetries {
+    pub busy: usize,
+    pub cleanup: usize,
 }
 
 async fn begin_write_attempts_with<F, Fut>(
@@ -1710,12 +3195,14 @@ where
 {
     let deadline = Instant::now() + retry_for;
     let mut retry_count = 0;
+    let mut retries = BeginRetries::default();
     loop {
         match begin().await {
             Ok(transaction) => {
                 return Ok(BeginWriteSuccess {
                     transaction,
                     retry_count,
+                    retries,
                 })
             }
             Err(sqlx_error) => {
@@ -1738,10 +3225,16 @@ where
                         } else {
                             "not_retriable"
                         },
+                        retries,
                     });
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
                 retry_count += 1;
+                if cleanup_pending {
+                    retries.cleanup += 1;
+                } else {
+                    retries.busy += 1;
+                }
             }
         }
     }
@@ -1798,21 +3291,25 @@ mod begin_write_tests {
     async fn retries_a_transient_invalid_savepoint_before_begin_immediate() {
         let db = create_database(":memory:").await.unwrap();
         let attempts = Arc::new(AtomicUsize::new(0));
-        let transaction = begin_write_with(|| {
-            let pool = db.write_pool().clone();
-            let attempts = attempts.clone();
-            async move {
-                if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
-                    Err(sqlx::Error::InvalidSavePointStatement)
-                } else {
-                    pool.begin_with("BEGIN IMMEDIATE").await
+        let begun = begin_write_attempts_with(
+            || {
+                let pool = db.write_pool().clone();
+                let attempts = attempts.clone();
+                async move {
+                    if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                        Err(sqlx::Error::InvalidSavePointStatement)
+                    } else {
+                        pool.begin_with("BEGIN IMMEDIATE").await
+                    }
                 }
-            }
-        })
+            },
+            WRITER_DEADLINE,
+        )
         .await
-        .unwrap();
+        .unwrap_or_else(|failure| panic!("bounded begin did not retry: {}", failure.error));
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
-        transaction.rollback().await.unwrap();
+        assert_eq!(begun.retry_count, 1, "the retry was not counted");
+        begun.transaction.rollback().await.unwrap();
     }
 
     #[tokio::test]
@@ -1904,7 +3401,16 @@ mod begin_write_tests {
 
     #[tokio::test]
     async fn diagnosed_write_contextualizes_an_actual_commit_failure() {
-        let db = create_database(":memory:").await.unwrap();
+        // File-backed, and the diagnosed write goes through a pool of the kind
+        // it declares. Handing it a workspace pool would still exercise the
+        // diagnostics, but the contention measurement would see a section
+        // opened as the catalogue and released by the workspace and correctly
+        // refuse it — a test quietly driving the error path of an unrelated
+        // subsystem.
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("diagnosed.db");
+        let path = path.to_str().unwrap();
+        let db = create_database(path).await.unwrap();
         let mut setup = begin_write(db.write_pool()).await.unwrap();
         sqlx::query("CREATE TABLE diagnostic_parent (id INTEGER PRIMARY KEY)")
             .execute(&mut *setup)
@@ -1921,12 +3427,13 @@ mod begin_write_tests {
         .unwrap();
         setup.commit().await.unwrap();
 
-        let mut write = begin_diagnosed_host_control_plane_sqlite_write(
-            db.write_pool(),
-            "finish_migration_run",
-        )
-        .await
-        .unwrap();
+        let catalog = open_pool(path, false, WritePoolKind::HostCatalog)
+            .await
+            .unwrap();
+        let mut write =
+            begin_diagnosed_host_control_plane_sqlite_write(&catalog, "finish_migration_run")
+                .await
+                .unwrap();
         sqlx::query("INSERT INTO diagnostic_child (parent_id) VALUES (42)")
             .execute(write.connection())
             .await
@@ -2042,6 +3549,8 @@ fn immutable_read_only_connect_options(path: &str) -> Result<SqliteConnectOption
 // Public views precede their internal dependencies. SQLite permits dropping a
 // referenced object, so keeping this teardown order explicit prevents a pooled
 // connection from retaining a dangling public view if the contract changes.
+// Trailing entries are helper tables, dropped as tables rather than views;
+// VIEW_COUNT below must stay in step with their number.
 const QUERY_SQL_TEMP_CONTRACT_OBJECTS: &[&str] = &[
     "records",
     "content_events",
@@ -2057,14 +3566,19 @@ const QUERY_SQL_TEMP_CONTRACT_OBJECTS: &[&str] = &[
     "agent_activity",
     "agent_activity_claims",
     "messages_awaiting_reply",
+    "catalog_relations",
+    "catalog_columns",
     "_query_sql_visible_records",
     "_query_sql_authorization_subjects",
     "_query_sql_principal",
     "_query_sql_activity_observations",
+    "_query_sql_activity_capture",
     "_query_sql_activity_members",
     "_query_sql_messages_awaiting_reply",
+    "_query_sql_claim_candidates",
+    "_query_sql_claim_releases",
 ];
-const QUERY_SQL_TEMP_VIEW_COUNT: usize = QUERY_SQL_TEMP_CONTRACT_OBJECTS.len() - 4;
+const QUERY_SQL_TEMP_VIEW_COUNT: usize = QUERY_SQL_TEMP_CONTRACT_OBJECTS.len() - 7;
 
 #[cfg(test)]
 mod wal_journal_size_limit_tests {
@@ -2194,6 +3708,20 @@ async fn open_pool(path: &str, create_if_missing: bool, kind: WritePoolKind) -> 
         // unqualified relation names must never resolve to the TEMP contract.
         .after_release(move |connection, _metadata| {
             Box::pin(async move {
+                // The reserved lock is gone by the time a connection comes
+                // back, whether it committed, rolled back, or was dropped, so
+                // this is the unbiased close for the critical-section
+                // measurement. A connection that never opened one — an
+                // ordinary query on the write pool — closes nothing.
+                if let Some(key) = connection_key(connection).await {
+                    crate::write_contention::close_critical_section(
+                        match kind {
+                            WritePoolKind::Workspace => WriteDomain::Workspace,
+                            WritePoolKind::HostCatalog => WriteDomain::HostCatalog,
+                        },
+                        key,
+                    );
+                }
                 if matches!(kind, WritePoolKind::HostCatalog) {
                     // The snapshot counts statements executed while this
                     // request owns the checkout. Pool housekeeping below is
@@ -2273,8 +3801,11 @@ async fn sanitize_released_write_connection(
     for table in [
         "_query_sql_principal",
         "_query_sql_activity_observations",
+        "_query_sql_activity_capture",
         "_query_sql_activity_members",
         "_query_sql_messages_awaiting_reply",
+        "_query_sql_claim_candidates",
+        "_query_sql_claim_releases",
     ] {
         if sqlx::query(&format!("DROP TABLE IF EXISTS temp.{table}"))
             .execute(&mut *connection)
@@ -2333,18 +3864,205 @@ mod released_write_connection_tests {
         reloaded.rollback().await.unwrap();
         pool.close().await;
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn write_pool_release_still_drops_the_temp_contract() {
+        // Tier 1.2 adds a pool; it must not relax this one. Pin one physical
+        // connection, plant governed TEMP state on it, release, and require
+        // the same connection back clean.
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("write-sanitize.db");
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .after_release(|connection, _metadata| {
+                Box::pin(sanitize_released_write_connection(connection))
+            })
+            .connect_with(connect_options(path.to_str().unwrap(), true).unwrap())
+            .await
+            .unwrap();
+        {
+            let mut connection = pool.acquire().await.unwrap();
+            sqlx::query("CREATE TEMP VIEW temp.records AS SELECT 1 AS id")
+                .execute(&mut *connection)
+                .await
+                .unwrap();
+            sqlx::query("CREATE TEMP VIEW temp.catalog_columns AS SELECT 1 AS column_position")
+                .execute(&mut *connection)
+                .await
+                .unwrap();
+            sqlx::query(
+                "CREATE TEMP TABLE temp._query_sql_principal (
+                   singleton INTEGER PRIMARY KEY, account_id TEXT NOT NULL,
+                   trusted_local_bypass INTEGER NOT NULL,
+                   activity_read INTEGER NOT NULL, observed_at TEXT NOT NULL)",
+            )
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        }
+        let leftover: bool = {
+            let mut connection = pool.acquire().await.unwrap();
+            let leftover: bool = sqlx::query_scalar(
+                "SELECT EXISTS (
+                   SELECT 1 FROM temp.sqlite_schema
+                    WHERE name IN ('records', 'catalog_columns', '_query_sql_principal'))",
+            )
+            .fetch_one(&mut *connection)
+            .await
+            .unwrap();
+            leftover
+        };
+        assert!(
+            !leftover,
+            "write-pool release stopped dropping the TEMP contract"
+        );
+        pool.close().await;
+    }
 }
 
 async fn open_read_pool(path: &str) -> Result<SqlitePool> {
     Ok(SqlitePoolOptions::new()
         .max_connections(5)
+        .before_acquire(count_read_pool_reuse)
+        .after_connect(count_read_pool_new_connection)
         .connect_with(read_only_connect_options(path)?)
         .await?)
+}
+
+/// Default governed-SQL pool size (Tier 1.2).
+///
+/// Why 3, and why not Postgres's 4: the Postgres governed pool bounds
+/// *backend sessions* on a server that multiplexes many databases; this pool
+/// bounds *SQLite connections* on one file, so the number answers to SQLite's
+/// costs, not Postgres's. Three is the smallest size at which one governed
+/// read holding its connection through per-row JSON encoding cannot serialize
+/// every other viewer (two slots remain); it stays strictly below the
+/// five-connection write pool so the governed tier is never the largest
+/// writer-side pool; and it caps the per-connection TEMP-contract memory — and
+/// rung 1.4's per-connection visible-set cache copies — at three. Tune with
+/// [`GOVERNED_SQL_POOL_SIZE_ENV`] after live measurement; saturation then
+/// surfaces as a bounded acquire wait, never as writer starvation.
+pub const DEFAULT_GOVERNED_SQL_POOL_SIZE: u32 = 3;
+
+/// Environment override for the governed-SQL pool size. Unset, unparseable, or
+/// zero values fall back to [`DEFAULT_GOVERNED_SQL_POOL_SIZE`]: a zero-slot
+/// pool would refuse every governed read, so misconfiguration fails safe to
+/// the default rather than to an unusable handle.
+pub const GOVERNED_SQL_POOL_SIZE_ENV: &str = "NATIVE_CE_GOVERNED_SQL_POOL_SIZE";
+
+/// Bounded wait for a governed-SQL slot. Saturation must surface as an error a
+/// surface can report, not a hang: a surface in a loop that outruns the pool
+/// waits at most this long before its excess queries fail while the slots
+/// they waited for keep serving. Shorter than SQLx's 30-second default and
+/// inside `begin_write`'s 15-second writer deadline, so a governed burst can
+/// never out-wait a writer.
+pub const GOVERNED_SQL_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(10);
+
+pub(crate) fn governed_sql_pool_size() -> u32 {
+    parse_governed_sql_pool_size(std::env::var(GOVERNED_SQL_POOL_SIZE_ENV).ok().as_deref())
+}
+
+fn parse_governed_sql_pool_size(raw: Option<&str>) -> u32 {
+    raw.and_then(|value| value.parse::<u32>().ok())
+        .filter(|size| *size >= 1)
+        .unwrap_or(DEFAULT_GOVERNED_SQL_POOL_SIZE)
+}
+
+/// Open the governed-SQL pool: read-write connections (the governed path
+/// writes TEMP tables and opens a transaction, so the read-only tier cannot
+/// serve it) with the TEMP-contract half of the write pool's release hook.
+///
+/// Release runs [`sanitize_released_write_connection`] and nothing else — a
+/// deliberate subset of `open_pool`'s `after_release`, not an omission:
+/// governed connections never open a write critical section (only
+/// `begin_write_in` opens one; the governed path takes a deferred read
+/// transaction), so a contention close could only consume a pointer-reused
+/// key as a domain mismatch; the catalog trace is a HostCatalog-pool concern;
+/// and the acquisition counters feed the write/read-pool handler-body
+/// migration instruments, which a third pool must not inflate. Like the write
+/// pool, the hook drops the TEMP contract, clears the progress handler, and
+/// restores per-connection limits, so no principal state survives a borrow.
+/// Rung 1.3 may retain the *contract* portion of that teardown — safe only
+/// here, because these connections never serve the unqualified-name queries
+/// (`bootstrap`, `get_structure`) that retained TEMP state would shadow — but
+/// principal cleanup stays regardless of what 1.3 retains.
+async fn open_governed_pool(path: &str, create_if_missing: bool) -> Result<SqlitePool> {
+    open_governed_pool_with_size(path, create_if_missing, governed_sql_pool_size()).await
+}
+
+async fn open_governed_pool_with_size(
+    path: &str,
+    create_if_missing: bool,
+    size: u32,
+) -> Result<SqlitePool> {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(size.max(1))
+        .acquire_timeout(GOVERNED_SQL_ACQUIRE_TIMEOUT)
+        .after_release(|connection, _metadata| {
+            Box::pin(sanitize_released_write_connection(connection))
+        })
+        .connect_with(connect_options(path, create_if_missing)?)
+        .await?;
+    Ok(pool)
+}
+
+#[cfg(test)]
+mod governed_sql_pool_config_tests {
+    use super::*;
+
+    #[test]
+    fn pool_size_defaults_and_rejects_misconfiguration() {
+        assert_eq!(
+            parse_governed_sql_pool_size(None),
+            DEFAULT_GOVERNED_SQL_POOL_SIZE
+        );
+        assert_eq!(
+            parse_governed_sql_pool_size(Some("")),
+            DEFAULT_GOVERNED_SQL_POOL_SIZE
+        );
+        assert_eq!(
+            parse_governed_sql_pool_size(Some("not-a-number")),
+            DEFAULT_GOVERNED_SQL_POOL_SIZE
+        );
+        // A zero-slot pool would refuse every governed read; fail safe to the
+        // default rather than opening an unusable handle.
+        assert_eq!(
+            parse_governed_sql_pool_size(Some("0")),
+            DEFAULT_GOVERNED_SQL_POOL_SIZE
+        );
+        assert_eq!(parse_governed_sql_pool_size(Some("1")), 1);
+        assert_eq!(parse_governed_sql_pool_size(Some("8")), 8);
+    }
+
+    #[tokio::test]
+    async fn open_databases_expose_a_separate_governed_pool() {
+        let db = create_database(":memory:").await.unwrap();
+        // Pools open lazily: check out every configured slot so `size`
+        // observes the bound rather than the warm-up state.
+        let mut held = Vec::new();
+        for _ in 0..governed_sql_pool_size() {
+            held.push(db.governed_pool().acquire().await.unwrap());
+        }
+        assert_eq!(
+            db.governed_pool().size(),
+            governed_sql_pool_size(),
+            "governed pool ignores its configured size"
+        );
+        assert_eq!(
+            governed_sql_pool_size(),
+            DEFAULT_GOVERNED_SQL_POOL_SIZE,
+            "default governed pool size changed without updating its recorded reason"
+        );
+        drop(held);
+        db.close().await;
+    }
 }
 
 async fn open_immutable_read_pool(path: &str) -> Result<SqlitePool> {
     Ok(SqlitePoolOptions::new()
         .max_connections(5)
+        .before_acquire(count_read_pool_reuse)
+        .after_connect(count_read_pool_new_connection)
         .connect_with(immutable_read_only_connect_options(path)?)
         .await?)
 }
@@ -2363,9 +4081,11 @@ async fn open_database_with_write_pool_kind(url: &str, kind: WritePoolKind) -> R
         let (path, tmp) = ephemeral_file()?;
         let write_pool = open_pool(&path, true, kind).await?;
         let read_pool = open_read_pool(&path).await?;
+        let governed_pool = open_governed_pool(&path, true).await?;
         return Ok(Db {
             write_pool,
             read_pool,
+            governed_pool,
             location: Arc::new(DatabaseLocation {
                 path: std::path::PathBuf::from(path),
                 open_mode: DatabaseOpenMode::ReadWrite,
@@ -2373,8 +4093,17 @@ async fn open_database_with_write_pool_kind(url: &str, kind: WritePoolKind) -> R
             handle_id: uuid::Uuid::new_v4(),
             embedder: None,
             rollup_cache: Arc::new(Mutex::new(RollupCache::default())),
+            visible_set_cache: Arc::new(Mutex::new(
+                crate::visible_set_cache::VisibleSetCache::default(),
+            )),
             inbox_snapshots: Arc::new(Mutex::new(HashMap::new())),
             realtime_hub: None,
+            workspace_index: Arc::new(tokio::sync::RwLock::new(None)),
+            workspace_index_fold: Arc::new(AtomicBool::new(false)),
+            workspace_index_refused: Arc::new(Mutex::new(None)),
+            workspace_snapshots: Arc::new(Mutex::new(
+                crate::workspace_snapshot::SnapshotStore::default(),
+            )),
             portability_policy_gate: Arc::new(tokio::sync::RwLock::new(())),
             capture_queue: crate::mcp::interactions::CaptureQueue::spawn(),
             database_id_cache: Arc::new(tokio::sync::OnceCell::new()),
@@ -2383,9 +4112,18 @@ async fn open_database_with_write_pool_kind(url: &str, kind: WritePoolKind) -> R
     }
     let write_pool = open_pool(url, true, kind).await?;
     let read_pool = open_read_pool(url).await?;
+    let governed_pool = match open_governed_pool(url, true).await {
+        Ok(pool) => pool,
+        Err(error) => {
+            write_pool.close().await;
+            read_pool.close().await;
+            return Err(error);
+        }
+    };
     Ok(Db {
         write_pool,
         read_pool,
+        governed_pool,
         location: Arc::new(DatabaseLocation {
             path: std::path::PathBuf::from(url.strip_prefix("file:").unwrap_or(url)),
             open_mode: DatabaseOpenMode::ReadWrite,
@@ -2393,8 +4131,17 @@ async fn open_database_with_write_pool_kind(url: &str, kind: WritePoolKind) -> R
         handle_id: uuid::Uuid::new_v4(),
         embedder: None,
         rollup_cache: Arc::new(Mutex::new(RollupCache::default())),
+        visible_set_cache: Arc::new(Mutex::new(
+            crate::visible_set_cache::VisibleSetCache::default(),
+        )),
         inbox_snapshots: Arc::new(Mutex::new(HashMap::new())),
         realtime_hub: None,
+        workspace_index: Arc::new(tokio::sync::RwLock::new(None)),
+        workspace_index_fold: Arc::new(AtomicBool::new(false)),
+        workspace_index_refused: Arc::new(Mutex::new(None)),
+        workspace_snapshots: Arc::new(Mutex::new(
+            crate::workspace_snapshot::SnapshotStore::default(),
+        )),
         portability_policy_gate: Arc::new(tokio::sync::RwLock::new(())),
         capture_queue: crate::mcp::interactions::CaptureQueue::spawn(),
         database_id_cache: Arc::new(tokio::sync::OnceCell::new()),
@@ -2759,6 +4506,56 @@ pub(crate) async fn validate_engine_shape_on(
             schema_shape_contract_sha256(&actual_contract) == ENGINE_54_SHAPE_CONTRACT_SHA256
         );
     }
+    if version == 55 {
+        return Ok(
+            schema_shape_contract_sha256(&actual_contract) == ENGINE_55_SHAPE_CONTRACT_SHA256
+        );
+    }
+    if version == 56 {
+        return Ok(
+            schema_shape_contract_sha256(&actual_contract) == ENGINE_56_SHAPE_CONTRACT_SHA256
+        );
+    }
+    if version == 57 {
+        return Ok(
+            schema_shape_contract_sha256(&actual_contract) == ENGINE_57_SHAPE_CONTRACT_SHA256
+        );
+    }
+    if version == 58 {
+        return Ok(
+            schema_shape_contract_sha256(&actual_contract) == ENGINE_58_SHAPE_CONTRACT_SHA256
+        );
+    }
+    if version == 59 {
+        return Ok(
+            schema_shape_contract_sha256(&actual_contract) == ENGINE_59_SHAPE_CONTRACT_SHA256
+        );
+    }
+    if version == 60 {
+        return Ok(
+            schema_shape_contract_sha256(&actual_contract) == ENGINE_60_SHAPE_CONTRACT_SHA256
+        );
+    }
+    if version == 61 {
+        return Ok(
+            schema_shape_contract_sha256(&actual_contract) == ENGINE_61_SHAPE_CONTRACT_SHA256
+        );
+    }
+    if version == 62 {
+        return Ok(
+            schema_shape_contract_sha256(&actual_contract) == ENGINE_62_SHAPE_CONTRACT_SHA256
+        );
+    }
+    if version == 63 {
+        return Ok(
+            schema_shape_contract_sha256(&actual_contract) == ENGINE_63_SHAPE_CONTRACT_SHA256
+        );
+    }
+    if version == 64 {
+        return Ok(
+            schema_shape_contract_sha256(&actual_contract) == ENGINE_64_SHAPE_CONTRACT_SHA256
+        );
+    }
     if version != CURRENT_ENGINE_SCHEMA_VERSION {
         return Err(Error::engine(format!(
             "no frozen engine structural shape is registered for schema {version}"
@@ -3103,9 +4900,18 @@ pub async fn open_existing_database(url: &str) -> Result<Db> {
     }
     let write_pool = open_pool(url, false, WritePoolKind::Workspace).await?;
     let read_pool = open_read_pool(url).await?;
+    let governed_pool = match open_governed_pool(url, false).await {
+        Ok(pool) => pool,
+        Err(error) => {
+            write_pool.close().await;
+            read_pool.close().await;
+            return Err(error);
+        }
+    };
     let db = Db {
         write_pool,
         read_pool,
+        governed_pool,
         location: Arc::new(DatabaseLocation {
             path: path.to_path_buf(),
             open_mode: DatabaseOpenMode::ReadWrite,
@@ -3113,8 +4919,17 @@ pub async fn open_existing_database(url: &str) -> Result<Db> {
         handle_id: uuid::Uuid::new_v4(),
         embedder: None,
         rollup_cache: Arc::new(Mutex::new(RollupCache::default())),
+        visible_set_cache: Arc::new(Mutex::new(
+            crate::visible_set_cache::VisibleSetCache::default(),
+        )),
         inbox_snapshots: Arc::new(Mutex::new(HashMap::new())),
         realtime_hub: None,
+        workspace_index: Arc::new(tokio::sync::RwLock::new(None)),
+        workspace_index_fold: Arc::new(AtomicBool::new(false)),
+        workspace_index_refused: Arc::new(Mutex::new(None)),
+        workspace_snapshots: Arc::new(Mutex::new(
+            crate::workspace_snapshot::SnapshotStore::default(),
+        )),
         portability_policy_gate: Arc::new(tokio::sync::RwLock::new(())),
         capture_queue: crate::mcp::interactions::CaptureQueue::spawn(),
         database_id_cache: Arc::new(tokio::sync::OnceCell::new()),
@@ -3195,9 +5010,23 @@ pub async fn open_existing_database_standby_read_only(url: &str) -> Result<Db> {
             return Err(error);
         }
     };
+    // Standby keeps today's behaviour exactly: the governed path acquires from
+    // the same physically read-only tier as the write pool does, so governed
+    // SQL neither gains nor loses capability in standby mode. A dedicated
+    // read-write governed pool here would be the only writable handle on an
+    // immutable open.
+    let governed_pool = match open_immutable_read_pool(url).await {
+        Ok(pool) => pool,
+        Err(error) => {
+            write_pool.close().await;
+            read_pool.close().await;
+            return Err(error);
+        }
+    };
     let db = Db {
         write_pool,
         read_pool,
+        governed_pool,
         location: Arc::new(DatabaseLocation {
             path: path.to_path_buf(),
             open_mode: DatabaseOpenMode::StandbyReadOnly,
@@ -3205,8 +5034,17 @@ pub async fn open_existing_database_standby_read_only(url: &str) -> Result<Db> {
         handle_id: uuid::Uuid::new_v4(),
         embedder: None,
         rollup_cache: Arc::new(Mutex::new(RollupCache::default())),
+        visible_set_cache: Arc::new(Mutex::new(
+            crate::visible_set_cache::VisibleSetCache::default(),
+        )),
         inbox_snapshots: Arc::new(Mutex::new(HashMap::new())),
         realtime_hub: None,
+        workspace_index: Arc::new(tokio::sync::RwLock::new(None)),
+        workspace_index_fold: Arc::new(AtomicBool::new(false)),
+        workspace_index_refused: Arc::new(Mutex::new(None)),
+        workspace_snapshots: Arc::new(Mutex::new(
+            crate::workspace_snapshot::SnapshotStore::default(),
+        )),
         portability_policy_gate: Arc::new(tokio::sync::RwLock::new(())),
         capture_queue: crate::mcp::interactions::CaptureQueue::spawn(),
         database_id_cache: Arc::new(tokio::sync::OnceCell::new()),
@@ -3265,13 +5103,13 @@ mod standby_read_only_open_tests {
     }
 
     #[tokio::test]
-    async fn standby_open_makes_both_query_tiers_physically_read_only() {
+    async fn standby_open_makes_all_query_tiers_physically_read_only() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("standby.db");
         let source = create_database(path.to_str().unwrap()).await.unwrap();
         // Immutable standby readers deliberately ignore WAL sidecars. Publish
         // the fixture through the same verified checkpoint boundary as a real
-        // whole-file handoff; merely closing both pools concurrently can leave
+        // whole-file handoff; merely closing all three pools concurrently can leave
         // committed schema frames in the WAL under a parallel test load.
         checkpoint_and_close_hosted_adoption_database(source)
             .await
@@ -3293,6 +5131,12 @@ mod standby_read_only_open_tests {
                 .await
                 .is_err()
         );
+        assert!(
+            sqlx::query("CREATE TABLE governed_pool_write_probe (value INTEGER)")
+                .execute(db.governed_pool())
+                .await
+                .is_err()
+        );
         db.close().await;
     }
 }
@@ -3310,6 +5154,12 @@ pub async fn apply_schema(db: &Db) -> Result<()> {
         sqlx::query(statement).execute(&mut *tx).await?;
     }
     tx.commit().await?;
+    sqlx::query(&format!(
+        "PRAGMA application_id = {}",
+        crate::interchange::source_history_application_id(crate::interchange::REVISION)
+    ))
+    .execute(db.write_pool())
+    .await?;
     let revision_violations = crate::authorization_revision::state_violations(db).await?;
     if !revision_violations.is_empty() {
         return Err(crate::error::Error::engine(format!(
@@ -3429,6 +5279,7 @@ mod rollup_cache_tests {
         RollupCacheKey {
             principal: "test-principal".into(),
             trusted_local_bypass: false,
+            is_member: true,
             spec_digest: format!("digest-{index}"),
             bearer_id: "bearer".into(),
             rollup_name: "total".into(),
@@ -3463,6 +5314,26 @@ mod rollup_cache_tests {
         );
         assert!(cache.entries.is_empty());
         assert_eq!(cache.bytes, 0);
+    }
+
+    #[test]
+    fn rollup_cache_keys_distinguish_member_from_guest_footing() {
+        // A demotion does not bump authorization_revision (catalog roles are
+        // host-supplied, not portable inputs), so the footing bit is the
+        // only thing stopping a guest from being served a member-era entry.
+        let mut member = key(0);
+        member.is_member = true;
+        let mut guest = key(0);
+        guest.is_member = false;
+        assert_ne!(member, guest);
+        let mut cache = RollupCache::default();
+        cache.insert(member.clone(), json!({ "value": "member" }));
+        assert_eq!(
+            cache.get(&guest),
+            None,
+            "guest footing must miss the member entry"
+        );
+        assert!(cache.get(&member).is_some());
     }
 }
 
@@ -3570,7 +5441,7 @@ mod release_preflight_shape_tests {
     /// assertion is only meaningful when no WAL checkpoint can land in the
     /// snapshot window. `Db::close`/`SqliteConnection::close` are awaited, but
     /// SQLite skips the close-time checkpoint whenever another handle still
-    /// has the file open (the two pools of a `Db` close concurrently, and a
+    /// has the file open (the three pools of a `Db` close concurrently, and a
     /// physical close can lag under heavy load, e.g. coverage
     /// instrumentation). A residual `-wal` left by such a skipped checkpoint
     /// is later folded into the main file by whichever writable handle closes

@@ -553,6 +553,7 @@ pub async fn check_required_kind(db: &Db) -> Result<CheckResult> {
                     intent: None,
                     created_at: "2026-01-01T00:00:00.000Z".into(),
                     causal_envelope: crate::events::CausalEnvelopeV1::default(),
+                    act: None,
                 };
                 crate::projector::project(tx, &event).await
             })
@@ -977,6 +978,7 @@ fn update_probe_event(record_id: &str, payload: &str) -> EventRow {
         intent: None,
         created_at: "2026-01-01T00:00:00.000Z".into(),
         causal_envelope: crate::events::CausalEnvelopeV1::default(),
+        act: None,
     }
 }
 
@@ -1006,6 +1008,7 @@ fn type_correction_probe_event(record_id: &str, valid: bool) -> EventRow {
         intent: None,
         created_at: "2026-01-01T00:00:00.000Z".into(),
         causal_envelope: crate::events::CausalEnvelopeV1::default(),
+        act: None,
     }
 }
 
@@ -1025,30 +1028,45 @@ fn guarded(name: &str, result: Result<CheckResult>) -> CheckResult {
 
 /// All spine-contract checks, in report order (rebuild-and-diff is folded in by the suite runner).
 pub async fn run_spine_checks(db: &Db) -> Vec<CheckResult> {
+    run_spine_checks_with_progress(db, &mut |_, _| {}).await
+}
+
+/// Report start and completion of each named spine check. Progress contains
+/// only the static check name and elapsed milliseconds; no database content.
+pub(crate) async fn run_spine_checks_with_progress(
+    db: &Db,
+    on_check: &mut impl FnMut(&str, Option<u128>),
+) -> Vec<CheckResult> {
+    macro_rules! timed {
+        ($name:literal, $check:expr) => {{
+            on_check($name, None);
+            let started = std::time::Instant::now();
+            let result = guarded($name, $check.await);
+            on_check($name, Some(started.elapsed().as_millis()));
+            result
+        }};
+    }
     vec![
-        guarded("required-tables", check_required_tables(db).await),
-        guarded("event-log-shape", check_event_log_shape(db).await),
-        guarded(
-            "content-event-causality",
-            check_content_event_causality(db).await,
-        ),
-        guarded("meta-event-log-shape", check_meta_event_log_shape(db).await),
-        guarded(
+        timed!("required-tables", check_required_tables(db)),
+        timed!("event-log-shape", check_event_log_shape(db)),
+        timed!("content-event-causality", check_content_event_causality(db)),
+        timed!("meta-event-log-shape", check_meta_event_log_shape(db)),
+        timed!(
             "command-event-log-shapes",
-            check_command_event_log_shapes(db).await,
+            check_command_event_log_shapes(db)
         ),
-        guarded(
+        timed!(
             "derivation-request-shape",
-            check_derivation_request_shape(db).await,
+            check_derivation_request_shape(db)
         ),
-        guarded("closed-types", check_closed_types(db).await),
-        guarded("type-immutability", check_type_immutability(db).await),
-        guarded("open-kind", check_open_kind(db).await),
-        guarded("required-kind", check_required_kind(db).await),
-        guarded("spine-facets", check_spine_facets(db).await),
-        guarded("spine-relationships", check_spine_relationships(db).await),
-        guarded("home-contract", check_home_contract(db).await),
-        guarded("substrate-boundary", check_substrate_boundary(db).await),
+        timed!("closed-types", check_closed_types(db)),
+        timed!("type-immutability", check_type_immutability(db)),
+        timed!("open-kind", check_open_kind(db)),
+        timed!("required-kind", check_required_kind(db)),
+        timed!("spine-facets", check_spine_facets(db)),
+        timed!("spine-relationships", check_spine_relationships(db)),
+        timed!("home-contract", check_home_contract(db)),
+        timed!("substrate-boundary", check_substrate_boundary(db)),
     ]
 }
 
@@ -1064,11 +1082,29 @@ mod causal_conformance_tests {
                 .fetch_one(db.write_pool())
                 .await
                 .unwrap();
-        sqlx::query("UPDATE content_events SET causal_status='import_incomplete' WHERE id=?")
-            .bind(first_local_event_id)
-            .execute(db.write_pool())
+        // content_events is append-only by trigger, so the corruption fixture
+        // drops the update guard and restores it verbatim around the setup.
+        // The delete guard is untouched: this probe rewrites, never removes.
+        // All four statements share one acquired connection: the pool may
+        // hand sequential statements to different connections.
+        let mut fixture = db.write_pool().acquire().await.unwrap();
+        let trigger: String = sqlx::query_scalar(
+            "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='content_events_no_update'",
+        )
+        .fetch_one(&mut *fixture)
+        .await
+        .unwrap();
+        sqlx::query("DROP TRIGGER content_events_no_update")
+            .execute(&mut *fixture)
             .await
             .unwrap();
+        sqlx::query("UPDATE content_events SET causal_status='import_incomplete' WHERE id=?")
+            .bind(first_local_event_id)
+            .execute(&mut *fixture)
+            .await
+            .unwrap();
+        sqlx::query(&trigger).execute(&mut *fixture).await.unwrap();
+        drop(fixture);
 
         let result = check_content_event_causality(&db).await.unwrap();
         assert!(!result.ok);

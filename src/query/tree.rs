@@ -20,6 +20,7 @@ use super::lens::{ProjectionRead, ReadLens};
 use crate::db::Db;
 use crate::error::Result;
 use crate::schema::{ARCHIVED_FACET_KEY, SPINE_TYPES};
+use crate::workspace_index::{RecordHead, WorkspaceIndex};
 
 use super::error::contract_violation;
 
@@ -91,6 +92,146 @@ impl Default for TreeOptions {
             exclude_types: Vec::new(),
         }
     }
+}
+
+/// Live index projection. `None` requests the governed SQL walk for shapes
+/// whose hidden-kind eligibility depends on live vocabulary resolution. The
+/// caller owns the matching content, relationship and authorization fences.
+pub(crate) fn descendants_from_index(
+    index: &WorkspaceIndex,
+    visible: &HashSet<String>,
+    root_id: &str,
+    opts: &TreeOptions,
+) -> Option<Vec<TreeNode>> {
+    if opts.max_depth < 0 || opts.max_children_per_node < 0 {
+        return None;
+    }
+    let root = index.records.get(root_id)?;
+    if root.deleted_at.is_some() || !visible.contains(root_id) || unsupported_index_shape(root) {
+        return None;
+    }
+    let archived: HashSet<&str> = index
+        .facets
+        .values()
+        .filter(|facet| facet.key == ARCHIVED_FACET_KEY)
+        .map(|facet| facet.record_id.as_str())
+        .collect();
+    let mut children: HashMap<&str, Vec<&RecordHead>> = HashMap::new();
+    for head in index.records.values() {
+        if let Some(parent) = head.home_id.as_deref() {
+            children.entry(parent).or_default().push(head);
+        }
+    }
+    let mut root_path_visible = root_id == crate::schema::ROOT_RECORD_ID;
+    if !root_path_visible {
+        let mut cursor = root.home_id.as_deref();
+        let mut seen = HashSet::from([root_id]);
+        let mut chain = Vec::new();
+        while let Some(id) = cursor {
+            if chain.len() >= MAX_WALK_DEPTH as usize || !seen.insert(id) {
+                break;
+            }
+            chain.push(id);
+            let ancestor = index.records.get(id)?;
+            if unsupported_index_shape(ancestor) {
+                return None;
+            }
+            cursor = ancestor.home_id.as_deref();
+        }
+        root_path_visible = chain.last() == Some(&crate::schema::ROOT_RECORD_ID)
+            && chain.iter().all(|id| visible.contains(*id));
+    }
+    let mut nodes = Vec::new();
+    let mut visited = HashSet::new();
+    let mut stack = vec![(root, 0)];
+    while let Some((head, depth)) = stack.pop() {
+        if !visited.insert(head.id.as_str()) {
+            continue;
+        }
+        let mut eligible = Vec::new();
+        if let Some(siblings) = children.get(head.id.as_str()) {
+            for child in siblings {
+                if child.deleted_at.is_some() {
+                    continue;
+                }
+                if unsupported_index_shape(child) {
+                    return None;
+                }
+                if !visible.contains(&child.id) {
+                    continue;
+                }
+                if (!opts.include_archived && archived.contains(child.id.as_str()))
+                    || opts.exclude_types.contains(&child.record_type)
+                {
+                    continue;
+                }
+                eligible.push(*child);
+            }
+        }
+        eligible.sort_by(|a, b| (&a.name, &a.id).cmp(&(&b.name, &b.id)));
+        let parent_anchor = head.home_id.as_ref().and_then(|id| index.records.get(id));
+        nodes.push(TreeNode {
+            id: head.id.clone(),
+            record_type: head.record_type.clone(),
+            kind: head.kind.clone(),
+            name: head.name.clone(),
+            home_id: head
+                .home_id
+                .as_ref()
+                .filter(|id| visible.contains(*id))
+                .cloned(),
+            persistence: head.persistence.clone(),
+            last_activity_at: head.last_activity_at.clone(),
+            custody_boundary: parent_anchor.is_some_and(|parent| {
+                head.policy_anchor_id.is_some()
+                    && parent.policy_anchor_id.is_some()
+                    && head.policy_anchor_id != parent.policy_anchor_id
+            }),
+            containment_path_visible: root_path_visible,
+            depth,
+            child_count: eligible.len() as i64,
+            archived: archived.contains(head.id.as_str()),
+        });
+        if depth < opts.max_depth.min(MAX_WALK_DEPTH) {
+            for child in eligible
+                .into_iter()
+                .take(opts.max_children_per_node as usize)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+            {
+                stack.push((child, depth + 1));
+            }
+        }
+    }
+    // SQL selects a capped sibling window by (name,id), then emits the
+    // selected subtrees in id-path order.
+    let mut paths: HashMap<String, String> = HashMap::new();
+    for node in &nodes {
+        let path = node
+            .home_id
+            .as_deref()
+            .and_then(|parent| paths.get(parent).cloned())
+            .unwrap_or_else(|| format!(",{},", root_id));
+        let path = if node.id == root_id {
+            path
+        } else {
+            format!("{}{},", path, node.id)
+        };
+        paths.insert(node.id.clone(), path);
+    }
+    nodes.sort_by(|a, b| paths[a.id.as_str()].cmp(&paths[b.id.as_str()]));
+    Some(nodes)
+}
+
+fn unsupported_index_shape(head: &RecordHead) -> bool {
+    // Annotation visibility depends on live kind aliases; attachment
+    // visibility can resolve through its bearer; semantic-unit envelopes are
+    // intentionally absent from generic reads. Their policy and presentation
+    // gates cannot be inferred from record heads alone.
+    head.record_type == "Annotation"
+        || (head.record_type == "Document" && head.kind.as_deref() == Some("attachment"))
+        || (head.record_type == "Entity" && head.kind.as_deref() == Some("semantic-unit"))
 }
 
 /// SQL fragment for explicit type exclusion. Values are inlined as quoted

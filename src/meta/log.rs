@@ -70,6 +70,7 @@ impl MetaAppendSpec {
 pub(super) async fn append_meta_in(
     tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
     spec: MetaAppendSpec,
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<MetaEventRow> {
     let payload = if spec.payload.is_null() {
         json!({})
@@ -86,8 +87,8 @@ pub(super) async fn append_meta_in(
         created_at: now_iso(),
     };
     let inserted = sqlx::query(
-        "INSERT INTO meta_events (id, subject_id, type, payload, actor, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+        "INSERT INTO meta_events (id, subject_id, type, payload, actor, created_at, act)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             RETURNING seq",
     )
     .bind(&event.id)
@@ -96,6 +97,7 @@ pub(super) async fn append_meta_in(
     .bind(&event.payload)
     .bind(&event.actor)
     .bind(&event.created_at)
+    .bind(act_alloc.get_or_allocate(&mut *tx).await?)
     .fetch_one(&mut **tx)
     .await?;
     event.seq = inserted.try_get::<i64, _>("seq")?;
@@ -110,21 +112,128 @@ pub async fn read_all_meta_events(conn: &mut sqlx::SqliteConnection) -> Result<V
         "SELECT seq, id, subject_id, type, payload, actor, created_at
           FROM meta_events ORDER BY seq",
     )
-    .fetch_all(conn)
+    .fetch_all(&mut *conn)
     .await?;
-    // try_get, not get: same contract as the content harness — a malformed log
-    // must surface as a reportable error, never a decode panic.
-    rows.into_iter()
-        .map(|r| {
-            Ok(MetaEventRow {
-                seq: r.try_get("seq")?,
-                id: r.try_get("id")?,
-                subject_id: r.try_get("subject_id")?,
-                event_type: r.try_get("type")?,
-                payload: r.try_get("payload")?,
-                actor: r.try_get("actor")?,
-                created_at: r.try_get("created_at")?,
-            })
-        })
-        .collect()
+    rows.into_iter().map(row_from_sql).collect()
+}
+
+/// The meta-only act-range reader: exactly the rows whose `act` falls in the
+/// half-open interval `(from_exclusive, to_inclusive]`, in `seq` order, decoded
+/// by the same [`row_from_sql`] the full reader uses. Legacy rows whose act is
+/// `NULL` never satisfy the strict `act > ?` predicate and are excluded.
+#[allow(dead_code)] // R3 wires the bounded fold; the reader lands ahead of its caller.
+pub(crate) async fn meta_events_in_act_range(
+    conn: &mut sqlx::SqliteConnection,
+    from_exclusive_act: i64,
+    to_inclusive_act: i64,
+) -> Result<Vec<MetaEventRow>> {
+    let rows = sqlx::query(
+        "SELECT seq, id, subject_id, type, payload, actor, created_at
+          FROM meta_events WHERE act > ? AND act <= ? ORDER BY seq",
+    )
+    .bind(from_exclusive_act)
+    .bind(to_inclusive_act)
+    .fetch_all(&mut *conn)
+    .await?;
+    rows.into_iter().map(row_from_sql).collect()
+}
+
+// try_get, not get: same contract as the content harness — a malformed log
+// must surface as a reportable error, never a decode panic.
+fn row_from_sql(r: sqlx::sqlite::SqliteRow) -> Result<MetaEventRow> {
+    Ok(MetaEventRow {
+        seq: r.try_get("seq")?,
+        id: r.try_get("id")?,
+        subject_id: r.try_get("subject_id")?,
+        event_type: r.try_get("type")?,
+        payload: r.try_get("payload")?,
+        actor: r.try_get("actor")?,
+        created_at: r.try_get("created_at")?,
+    })
+}
+
+#[cfg(test)]
+mod act_range_tests {
+    use std::collections::BTreeMap;
+
+    use super::*;
+    use crate::db::create_database;
+    use crate::meta::vocabulary::create_vocabulary;
+
+    const LEGACY: &str = "meta-event-legacy-null-act";
+
+    /// Bounded meta reads select exactly the half-open `(from, to]` interval,
+    /// preserve `seq` order, exclude a legacy `NULL` act, and agree exactly with
+    /// the full reader filtered to the same observed acts.
+    #[tokio::test]
+    async fn meta_events_in_act_range_is_bounded_ordered_and_excludes_null_acts() {
+        let db = create_database(":memory:").await.unwrap();
+        // Three real authored vocabularies, each committed by its own seam call
+        // so each carries its own act stamp.
+        for name in ["act-range-alpha", "act-range-beta", "act-range-gamma"] {
+            create_vocabulary(&db, name, None).await.unwrap();
+        }
+        // A legacy grouping-unknown row: `NULL` act, schema-valid, narrow.
+        sqlx::query(
+            "INSERT INTO meta_events (id, subject_id, type, payload, actor, created_at, act)
+             VALUES (?, 'voc:legacy', 'vocabulary.created', '{}', 'engine:seed',
+                     '2026-01-01T00:00:00.000Z', NULL)",
+        )
+        .bind(LEGACY)
+        .execute(db.write_pool())
+        .await
+        .unwrap();
+
+        let mut conn = db.pool().acquire().await.unwrap();
+        let full = read_all_meta_events(&mut conn).await.unwrap();
+
+        let act_of: BTreeMap<i64, Option<i64>> = sqlx::query("SELECT seq, act FROM meta_events")
+            .fetch_all(&mut *conn)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.get("seq"), row.get("act")))
+            .collect();
+        let mut acts: Vec<i64> = act_of.values().flatten().copied().collect();
+        acts.sort_unstable();
+        acts.dedup();
+        assert!(
+            acts.len() >= 3,
+            "the test expects at least three stamped acts"
+        );
+
+        for (from_exclusive, to_inclusive) in
+            [(acts[0], acts[2]), (acts[1], acts[2]), (acts[0], acts[1])]
+        {
+            let bounded = meta_events_in_act_range(&mut conn, from_exclusive, to_inclusive)
+                .await
+                .unwrap();
+            assert!(bounded.windows(2).all(|pair| pair[0].seq < pair[1].seq));
+            let expected: Vec<MetaEventRow> = full
+                .iter()
+                .filter(|event| {
+                    act_of[&event.seq]
+                        .is_some_and(|act| act > from_exclusive && act <= to_inclusive)
+                })
+                .cloned()
+                .collect();
+            assert_eq!(
+                bounded, expected,
+                "range ({from_exclusive}, {to_inclusive}]"
+            );
+            assert!(
+                !bounded.iter().any(|event| event.id == LEGACY),
+                "a NULL-act row never matches the range predicate"
+            );
+        }
+
+        // Equal bounds are the empty half-open interval, not a widening.
+        assert!(meta_events_in_act_range(&mut conn, acts[2], acts[2])
+            .await
+            .unwrap()
+            .is_empty());
+        // The NULL row is still part of the full log, proving it was excluded by
+        // the predicate and not dropped by the decoder.
+        assert!(full.iter().any(|event| event.id == LEGACY));
+    }
 }

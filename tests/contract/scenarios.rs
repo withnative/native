@@ -3426,6 +3426,17 @@ pub async fn portable_native_search<H: ContractHarness>(harness: &H) -> Result<(
         .await?;
     assert_eq!(page["returned"], 1);
     assert_eq!(page["limit_reached"], true);
+    // A cap the caller set is not scarcity. This runs through the shared
+    // contract, so it is the only assertion covering the Postgres and Turso
+    // copy of the rule; without it that line can be reverted with CI green.
+    assert_eq!(
+        page["thin"], false,
+        "a caller-set cap was reported as scarcity: {page}"
+    );
+    assert!(
+        page.get("near_misses").is_none(),
+        "near misses appended to a result set the caller truncated: {page}"
+    );
 
     let redacted_path_hit = harness
         .call(

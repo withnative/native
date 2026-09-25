@@ -23,7 +23,7 @@ use crate::store::{append_in, now_iso, AppendSpec};
 
 use super::super::registry::{Caller, ToolRegistry};
 use super::super::ToolKind;
-use super::{parse_args, require_nonblank_reason, REASON_DESCRIPTION};
+use super::{echo_act, parse_args, require_nonblank_reason, REASON_DESCRIPTION};
 
 const DATABASE_SCOPE_ID: &str = "native:database";
 
@@ -344,7 +344,7 @@ async fn starting_context_is_current_private(
     }
     let capability = authorization::effective_capability_on(
         tx,
-        Principal::bound(caller.credential(), true),
+        Principal::bound(caller.credential(), caller.is_host_member()),
         artifact_id,
     )
     .await;
@@ -396,11 +396,14 @@ fn require_idempotency(tool: &str, key: &str) -> Result<()> {
 }
 
 fn require_trigger(tool: &str, trigger: &str) -> Result<()> {
-    if matches!(trigger, "on_owner_first_run" | "on_member_joined") {
+    if matches!(
+        trigger,
+        "on_owner_first_run" | "on_member_joined" | "on_guest_welcomed"
+    ) {
         Ok(())
     } else {
         Err(Error::engine(format!(
-            "{tool}: trigger_key must be on_owner_first_run or on_member_joined"
+            "{tool}: trigger_key must be on_owner_first_run, on_member_joined, or on_guest_welcomed"
         )))
     }
 }
@@ -451,6 +454,7 @@ async fn append_authored(
     aggregate_id: String,
     reason: String,
     payload: ControlEventPayload,
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<()> {
     append_control_event_in(
         tx,
@@ -462,6 +466,7 @@ async fn append_authored(
             reason,
             payload,
         )?,
+        act_alloc,
     )
     .await?;
     Ok(())
@@ -472,6 +477,7 @@ async fn reappend_published_child(
     caller: &Caller,
     key: String,
     reason: &str,
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<()> {
     let (kind, aggregate, actor, prior_reason, payload) = prior_event(tx, &key)
         .await?
@@ -494,7 +500,7 @@ async fn reappend_published_child(
             ))
         }
     };
-    append_authored(tx, caller, key, aggregate, prior_reason, payload).await
+    append_authored(tx, caller, key, aggregate, prior_reason, payload, act_alloc).await
 }
 
 async fn require_document_source(
@@ -517,7 +523,7 @@ async fn require_document_source(
     let principal = if workspace_wide {
         Principal::bound("native:prospective-member", true)
     } else {
-        Principal::bound(caller.credential(), true)
+        Principal::bound(caller.credential(), caller.is_host_member())
     };
     let capability = authorization::effective_capability_on(tx, principal, source).await?;
     if !capability.allows(Capability::View) {
@@ -618,6 +624,7 @@ async fn apply_or_reset_seeded_default(
     };
     let expected_body_digest = expected_body_digest.to_ascii_lowercase();
     let mut tx = crate::db::begin_write(db.write_pool()).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
     require_seed_authority_in(&mut tx, caller, tool, &source_record_id).await?;
     if let Some((kind, aggregate, actor, prior_reason, raw_payload)) =
         prior_event(&mut tx, &idempotency_key).await?
@@ -642,12 +649,14 @@ async fn apply_or_reset_seeded_default(
             source_record_id.clone(),
             reason,
             ControlEventPayload::SeededInstructionSourceApplied(payload.clone()),
+            &mut act_alloc,
         )
         .await?;
         let stacks = instructions::validate_all_known_stacks_in(&mut tx, tool).await?;
         tx.commit().await?;
         let template = crate::instruction_templates::instruction_template(&payload.template_key);
-        return Ok(json!({
+        return echo_act(
+            json!({
             "source_record_id": source_record_id,
             "template_key": payload.template_key,
             "template_version": payload.template_version,
@@ -658,7 +667,9 @@ async fn apply_or_reset_seeded_default(
             "provenance_changed": false,
             "idempotent_retry": true,
             "stacks": stacks,
-        }));
+            }),
+            act_alloc.get(),
+        );
     }
     let row = sqlx::query(
         "SELECT s.template_key,s.template_version,s.last_applied_digest,r.body
@@ -708,6 +719,7 @@ async fn apply_or_reset_seeded_default(
                 payload: json!({ "body": template.body, "reason": reason }),
                 actor: Some(caller.actor().into()),
             },
+            &mut act_alloc,
         )
         .await?;
     }
@@ -730,6 +742,7 @@ async fn apply_or_reset_seeded_default(
                 expected_body_digest: Some(expected_body_digest),
             },
         ),
+        &mut act_alloc,
     )
     .await?;
     let stacks = instructions::validate_all_known_stacks_in(&mut tx, tool).await?;
@@ -738,7 +751,8 @@ async fn apply_or_reset_seeded_default(
     } else {
         tx.commit().await?;
     }
-    Ok(json!({
+    echo_act(
+        json!({
         "source_record_id": source_record_id,
         "template_key": template_key,
         "template_version": template.version,
@@ -748,7 +762,9 @@ async fn apply_or_reset_seeded_default(
         "body_changed": body_changed,
         "provenance_changed": provenance_changed,
         "stacks": stacks,
-    }))
+        }),
+        act_alloc.get(),
+    )
 }
 
 async fn manage_instructions(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
@@ -779,7 +795,7 @@ async fn manage_instructions(db: Db, caller: Caller, arguments: Value) -> Result
                 let source_record_id: String = row.try_get("source_record_id")?;
                 let readable = authorization::effective_capability_on(
                     &mut tx,
-                    Principal::bound(caller.credential(), true),
+                    Principal::bound(caller.credential(), caller.is_host_member()),
                     &source_record_id,
                 )
                 .await
@@ -823,6 +839,7 @@ async fn manage_instructions(db: Db, caller: Caller, arguments: Value) -> Result
             require_idempotency(TOOL, &idempotency_key)?;
             require_position(TOOL, position)?;
             let mut tx = crate::db::begin_write(db.write_pool()).await?;
+            let mut act_alloc = crate::act::ActAllocation::new();
             let prior = prior_event(&mut tx, &idempotency_key).await?;
             let id = binding_id
                 .or_else(|| prior.as_ref().map(|(_, id, _, _, _)| id.clone()))
@@ -854,13 +871,15 @@ async fn manage_instructions(db: Db, caller: Caller, arguments: Value) -> Result
                     created_at: timestamp.clone(),
                     updated_at: timestamp,
                 }),
+                &mut act_alloc,
             )
             .await?;
             let measures = instructions::validate_all_known_stacks_in(&mut tx, TOOL).await?;
             tx.commit().await?;
-            Ok(
+            Ok(echo_act(
                 json!({ "binding_id": id, "source_record_id": source_record_id, "changed": true, "stacks": measures }),
-            )
+                act_alloc.get(),
+            )?)
         }
         ManageInstructionsArgs::RetargetBinding {
             binding_id,
@@ -871,6 +890,7 @@ async fn manage_instructions(db: Db, caller: Caller, arguments: Value) -> Result
             require_nonblank_reason(TOOL, &reason)?;
             require_idempotency(TOOL, &idempotency_key)?;
             let mut tx = crate::db::begin_write(db.write_pool()).await?;
+            let mut act_alloc = crate::act::ActAllocation::new();
             let mut state = binding_for_actor(&mut tx, &caller, TOOL, &binding_id).await?;
             require_document_source(
                 &mut tx,
@@ -889,13 +909,15 @@ async fn manage_instructions(db: Db, caller: Caller, arguments: Value) -> Result
                 binding_id.clone(),
                 reason,
                 ControlEventPayload::InstructionBindingChanged(state),
+                &mut act_alloc,
             )
             .await?;
             let measures = instructions::validate_all_known_stacks_in(&mut tx, TOOL).await?;
             tx.commit().await?;
-            Ok(
+            Ok(echo_act(
                 json!({ "binding_id": binding_id, "source_record_id": source_record_id, "changed": true, "stacks": measures }),
-            )
+                act_alloc.get(),
+            )?)
         }
         ManageInstructionsArgs::ReorderBinding {
             binding_id,
@@ -907,6 +929,7 @@ async fn manage_instructions(db: Db, caller: Caller, arguments: Value) -> Result
             require_nonblank_reason(TOOL, &reason)?;
             require_idempotency(TOOL, &idempotency_key)?;
             let mut tx = crate::db::begin_write(db.write_pool()).await?;
+            let mut act_alloc = crate::act::ActAllocation::new();
             binding_for_actor(&mut tx, &caller, TOOL, &binding_id).await?;
             let updated_at = event_time(&mut tx, &idempotency_key, "updated_at").await?;
             append_authored(
@@ -921,10 +944,14 @@ async fn manage_instructions(db: Db, caller: Caller, arguments: Value) -> Result
                         updated_at,
                     },
                 ),
+                &mut act_alloc,
             )
             .await?;
             tx.commit().await?;
-            Ok(json!({ "binding_id": binding_id, "position": position, "changed": true }))
+            Ok(echo_act(
+                json!({ "binding_id": binding_id, "position": position, "changed": true }),
+                act_alloc.get(),
+            )?)
         }
         action @ (ManageInstructionsArgs::EnableBinding { .. }
         | ManageInstructionsArgs::DisableBinding { .. }) => {
@@ -945,6 +972,7 @@ async fn manage_instructions(db: Db, caller: Caller, arguments: Value) -> Result
             require_nonblank_reason(TOOL, &reason)?;
             require_idempotency(TOOL, &idempotency_key)?;
             let mut tx = crate::db::begin_write(db.write_pool()).await?;
+            let mut act_alloc = crate::act::ActAllocation::new();
             binding_for_actor(&mut tx, &caller, TOOL, &binding_id).await?;
             let updated_at = event_time(&mut tx, &idempotency_key, "updated_at").await?;
             let payload = InstructionBindingTogglePayload { updated_at };
@@ -959,6 +987,7 @@ async fn manage_instructions(db: Db, caller: Caller, arguments: Value) -> Result
                 } else {
                     ControlEventPayload::InstructionBindingDisabled(payload)
                 },
+                &mut act_alloc,
             )
             .await?;
             let measures = if enable {
@@ -967,9 +996,10 @@ async fn manage_instructions(db: Db, caller: Caller, arguments: Value) -> Result
                 None
             };
             tx.commit().await?;
-            Ok(
+            Ok(echo_act(
                 json!({ "binding_id": binding_id, "enabled": enable, "changed": true, "stacks": measures }),
-            )
+                act_alloc.get(),
+            )?)
         }
         ManageInstructionsArgs::RemoveBinding {
             binding_id,
@@ -979,6 +1009,7 @@ async fn manage_instructions(db: Db, caller: Caller, arguments: Value) -> Result
             require_nonblank_reason(TOOL, &reason)?;
             require_idempotency(TOOL, &idempotency_key)?;
             let mut tx = crate::db::begin_write(db.write_pool()).await?;
+            let mut act_alloc = crate::act::ActAllocation::new();
             if let Some((kind, aggregate, actor, prior_reason, payload)) =
                 prior_event(&mut tx, &idempotency_key).await?
             {
@@ -999,11 +1030,13 @@ async fn manage_instructions(db: Db, caller: Caller, arguments: Value) -> Result
                     binding_id.clone(),
                     reason,
                     ControlEventPayload::InstructionBindingRemoved(EmptyPayload::default()),
+                    &mut act_alloc,
                 )
                 .await?;
                 tx.commit().await?;
-                return Ok(
+                return echo_act(
                     json!({ "binding_id": binding_id, "removed": true, "changed": false, "idempotent_retry": true }),
+                    act_alloc.get(),
                 );
             }
             binding_for_actor(&mut tx, &caller, TOOL, &binding_id).await?;
@@ -1014,17 +1047,21 @@ async fn manage_instructions(db: Db, caller: Caller, arguments: Value) -> Result
                 binding_id.clone(),
                 reason,
                 ControlEventPayload::InstructionBindingRemoved(EmptyPayload::default()),
+                &mut act_alloc,
             )
             .await?;
             tx.commit().await?;
-            Ok(json!({ "binding_id": binding_id, "removed": true, "changed": true }))
+            Ok(echo_act(
+                json!({ "binding_id": binding_id, "removed": true, "changed": true }),
+                act_alloc.get(),
+            )?)
         }
         ManageInstructionsArgs::CompareSeededDefault { source_record_id } => {
             let mut tx = crate::db::begin_write(db.write_pool()).await?;
             require_seed_authority_in(&mut tx, &caller, TOOL, &source_record_id).await?;
             let readable = authorization::effective_capability_on(
                 &mut tx,
-                Principal::bound(caller.credential(), true),
+                Principal::bound(caller.credential(), caller.is_host_member()),
                 &source_record_id,
             )
             .await
@@ -1302,7 +1339,7 @@ async fn manage_onboarding(db: Db, caller: Caller, arguments: Value) -> Result<V
                     }
                     let readable = authorization::effective_capability_on(
                         &mut tx,
-                        Principal::bound(caller.credential(), true),
+                        Principal::bound(caller.credential(), caller.is_host_member()),
                         &source_record_id,
                     )
                     .await
@@ -1365,6 +1402,7 @@ async fn manage_onboarding(db: Db, caller: Caller, arguments: Value) -> Result<V
             require_nonblank_reason(TOOL, &reason)?;
             require_idempotency(TOOL, &idempotency_key)?;
             let mut tx = crate::db::begin_write(db.write_pool()).await?;
+            let mut act_alloc = crate::act::ActAllocation::new();
             let prior = prior_event(&mut tx, &idempotency_key).await?;
             let id = programme_id
                 .or_else(|| prior.as_ref().map(|(_, id, _, _, _)| id.clone()))
@@ -1387,10 +1425,14 @@ async fn manage_onboarding(db: Db, caller: Caller, arguments: Value) -> Result<V
                     created_at: created_at.clone(),
                     updated_at: created_at,
                 }),
+                &mut act_alloc,
             )
             .await?;
             tx.commit().await?;
-            Ok(json!({ "programme_id": id, "generation": 1, "changed": true }))
+            Ok(echo_act(
+                json!({ "programme_id": id, "generation": 1, "changed": true }),
+                act_alloc.get(),
+            )?)
         }
         ManageOnboardingArgs::ConfigureProgramme {
             programme_id,
@@ -1410,6 +1452,7 @@ async fn manage_onboarding(db: Db, caller: Caller, arguments: Value) -> Result<V
                 require_position(TOOL, position)?;
             }
             let mut tx = crate::db::begin_write(db.write_pool()).await?;
+            let mut act_alloc = crate::act::ActAllocation::new();
             let mut state = programme_state(&mut tx, TOOL, &programme_id).await?;
             if let Some(trigger) = trigger_key {
                 state.trigger_key = trigger;
@@ -1429,6 +1472,7 @@ async fn manage_onboarding(db: Db, caller: Caller, arguments: Value) -> Result<V
                 programme_id.clone(),
                 reason,
                 ControlEventPayload::OnboardingProgrammeChanged(state.into()),
+                &mut act_alloc,
             )
             .await?;
             let measures = if enabling {
@@ -1437,7 +1481,10 @@ async fn manage_onboarding(db: Db, caller: Caller, arguments: Value) -> Result<V
                 None
             };
             tx.commit().await?;
-            Ok(json!({ "programme_id": programme_id, "changed": true, "stacks": measures }))
+            Ok(echo_act(
+                json!({ "programme_id": programme_id, "changed": true, "stacks": measures }),
+                act_alloc.get(),
+            )?)
         }
         action @ (ManageOnboardingArgs::AddSource { .. }
         | ManageOnboardingArgs::ChangeSource { .. }) => {
@@ -1475,6 +1522,7 @@ async fn manage_onboarding(db: Db, caller: Caller, arguments: Value) -> Result<V
             require_nonblank_reason(TOOL, &reason)?;
             require_idempotency(TOOL, &idempotency_key)?;
             let mut tx = crate::db::begin_write(db.write_pool()).await?;
+            let mut act_alloc = crate::act::ActAllocation::new();
             programme_state(&mut tx, TOOL, &programme_id).await?;
             require_document_source(&mut tx, &caller, TOOL, &source_record_id, true).await?;
             let payload = OnboardingProgrammeSourcePayload {
@@ -1494,13 +1542,15 @@ async fn manage_onboarding(db: Db, caller: Caller, arguments: Value) -> Result<V
                 } else {
                     ControlEventPayload::OnboardingProgrammeSourceChanged(payload)
                 },
+                &mut act_alloc,
             )
             .await?;
             let measures = instructions::validate_all_known_stacks_in(&mut tx, TOOL).await?;
             tx.commit().await?;
-            Ok(
+            Ok(echo_act(
                 json!({ "programme_id": programme_id, "source_record_id": source_record_id, "changed": true, "stacks": measures }),
-            )
+                act_alloc.get(),
+            )?)
         }
         ManageOnboardingArgs::ReorderSource {
             programme_id,
@@ -1514,6 +1564,7 @@ async fn manage_onboarding(db: Db, caller: Caller, arguments: Value) -> Result<V
             require_nonblank_reason(TOOL, &reason)?;
             require_idempotency(TOOL, &idempotency_key)?;
             let mut tx = crate::db::begin_write(db.write_pool()).await?;
+            let mut act_alloc = crate::act::ActAllocation::new();
             let role: String = sqlx::query_scalar("SELECT source_role FROM onboarding_programme_sources WHERE programme_id=? AND source_record_id=?")
                 .bind(&programme_id).bind(&source_record_id).fetch_optional(&mut *tx).await?
                 .ok_or_else(|| Error::engine(format!("{TOOL}: programme source does not exist")))?;
@@ -1531,12 +1582,14 @@ async fn manage_onboarding(db: Db, caller: Caller, arguments: Value) -> Result<V
                         position,
                     },
                 ),
+                &mut act_alloc,
             )
             .await?;
             tx.commit().await?;
-            Ok(
+            Ok(echo_act(
                 json!({ "programme_id": programme_id, "source_record_id": source_record_id, "position": position, "changed": true }),
-            )
+                act_alloc.get(),
+            )?)
         }
         ManageOnboardingArgs::RemoveSource {
             programme_id,
@@ -1548,6 +1601,7 @@ async fn manage_onboarding(db: Db, caller: Caller, arguments: Value) -> Result<V
             require_nonblank_reason(TOOL, &reason)?;
             require_idempotency(TOOL, &idempotency_key)?;
             let mut tx = crate::db::begin_write(db.write_pool()).await?;
+            let mut act_alloc = crate::act::ActAllocation::new();
             let aggregate_id = programme_source_aggregate_id(&programme_id, &source_record_id);
             if let Some((kind, aggregate, actor, prior_reason, payload)) =
                 prior_event(&mut tx, &idempotency_key).await?
@@ -1578,11 +1632,13 @@ async fn manage_onboarding(db: Db, caller: Caller, arguments: Value) -> Result<V
                             source_record_id: source_record_id.clone(),
                         },
                     ),
+                    &mut act_alloc,
                 )
                 .await?;
                 tx.commit().await?;
-                return Ok(
+                return echo_act(
                     json!({ "programme_id": programme_id, "source_record_id": source_record_id, "removed": true, "changed": false, "idempotent_retry": true }),
+                    act_alloc.get(),
                 );
             }
             let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM onboarding_programme_sources WHERE programme_id=? AND source_record_id=?)")
@@ -1604,12 +1660,14 @@ async fn manage_onboarding(db: Db, caller: Caller, arguments: Value) -> Result<V
                         source_record_id: source_record_id.clone(),
                     },
                 ),
+                &mut act_alloc,
             )
             .await?;
             tx.commit().await?;
-            Ok(
+            Ok(echo_act(
                 json!({ "programme_id": programme_id, "source_record_id": source_record_id, "removed": true, "changed": true }),
-            )
+                act_alloc.get(),
+            )?)
         }
         ManageOnboardingArgs::PublishGeneration {
             programme_id,
@@ -1623,6 +1681,7 @@ async fn manage_onboarding(db: Db, caller: Caller, arguments: Value) -> Result<V
             require_nonblank_reason(TOOL, &reason)?;
             require_idempotency(TOOL, &idempotency_key)?;
             let mut tx = crate::db::begin_write(db.write_pool()).await?;
+            let mut act_alloc = crate::act::ActAllocation::new();
             let mut requested_account_ids = audience.account_ids.clone();
             requested_account_ids.sort();
             requested_account_ids.dedup();
@@ -1652,6 +1711,7 @@ async fn manage_onboarding(db: Db, caller: Caller, arguments: Value) -> Result<V
                     programme_id.clone(),
                     reason.clone(),
                     ControlEventPayload::ProgrammeGenerationPublished(payload.clone()),
+                    &mut act_alloc,
                 )
                 .await?;
                 for account in &account_ids {
@@ -1660,12 +1720,14 @@ async fn manage_onboarding(db: Db, caller: Caller, arguments: Value) -> Result<V
                         &caller,
                         format!("{idempotency_key}/obligation/{account}"),
                         &reason,
+                        &mut act_alloc,
                     )
                     .await?;
                 }
                 tx.commit().await?;
-                return Ok(
+                return echo_act(
                     json!({ "programme_id": programme_id, "generation": payload.generation, "account_ids": account_ids, "changed": false, "idempotent_retry": true }),
+                    act_alloc.get(),
                 );
             }
             let preview = preview_audience_in(&mut tx, TOOL, &programme_id, &audience).await?;
@@ -1699,6 +1761,7 @@ async fn manage_onboarding(db: Db, caller: Caller, arguments: Value) -> Result<V
                         requested_account_ids,
                     },
                 ),
+                &mut act_alloc,
             )
             .await?;
             for account in &preview.pending_to_rebase {
@@ -1718,6 +1781,7 @@ async fn manage_onboarding(db: Db, caller: Caller, arguments: Value) -> Result<V
                         created_at: now.clone(),
                         updated_at: now.clone(),
                     }),
+                    &mut act_alloc,
                 )
                 .await?;
             }
@@ -1736,6 +1800,7 @@ async fn manage_onboarding(db: Db, caller: Caller, arguments: Value) -> Result<V
                         created_at: now.clone(),
                         updated_at: now.clone(),
                     }),
+                    &mut act_alloc,
                 )
                 .await?;
             }
@@ -1744,7 +1809,7 @@ async fn manage_onboarding(db: Db, caller: Caller, arguments: Value) -> Result<V
             let mut result = preview_json(&preview);
             result["changed"] = json!(true);
             result["stacks"] = json!(measures);
-            Ok(result)
+            Ok(echo_act(result, act_alloc.get())?)
         }
         ManageOnboardingArgs::RecordProgress {
             programme_id,
@@ -1899,6 +1964,7 @@ async fn manage_onboarding(db: Db, caller: Caller, arguments: Value) -> Result<V
             require_progress_evidence(TOOL, &evidence)?;
 
             let mut tx = crate::db::begin_write(db.write_pool()).await?;
+            let mut act_alloc = crate::act::ActAllocation::new();
             let aggregate_id =
                 member_obligation_aggregate_id(caller.credential(), &programme_id, generation);
             if let Some((kind, aggregate, actor, prior_reason, raw_payload)) =
@@ -1952,6 +2018,7 @@ async fn manage_onboarding(db: Db, caller: Caller, arguments: Value) -> Result<V
                     aggregate_id,
                     reason,
                     ControlEventPayload::MemberObligationProgressed(payload),
+                    &mut act_alloc,
                 )
                 .await?;
                 let current = sqlx::query(
@@ -1973,7 +2040,8 @@ async fn manage_onboarding(db: Db, caller: Caller, arguments: Value) -> Result<V
                 let current_resume_after: Option<String> = current.try_get("resume_after")?;
                 let selected_route_id: Option<String> = current.try_get("selected_route_id")?;
                 tx.commit().await?;
-                return Ok(json!({
+                return echo_act(
+                    json!({
                     "programme_id": programme_id,
                     "generation": generation,
                     "state": current_state,
@@ -1984,7 +2052,9 @@ async fn manage_onboarding(db: Db, caller: Caller, arguments: Value) -> Result<V
                     "resume_after": current_resume_after,
                     "changed": false,
                     "idempotent_retry": true,
-                }));
+                    }),
+                    act_alloc.get(),
+                );
             }
             if phase == "artifact_previewed" {
                 let content_event_floor_seq: i64 =
@@ -2277,7 +2347,7 @@ async fn manage_onboarding(db: Db, caller: Caller, arguments: Value) -> Result<V
                 }
                 let capability = authorization::effective_capability_on(
                     &mut tx,
-                    Principal::bound(caller.credential(), true),
+                    Principal::bound(caller.credential(), caller.is_host_member()),
                     artifact_id,
                 )
                 .await
@@ -2390,6 +2460,7 @@ async fn manage_onboarding(db: Db, caller: Caller, arguments: Value) -> Result<V
                         artifact_id: artifact_id.clone(),
                     },
                 ),
+                &mut act_alloc,
             )
             .await?;
             let current = sqlx::query(
@@ -2406,7 +2477,8 @@ async fn manage_onboarding(db: Db, caller: Caller, arguments: Value) -> Result<V
             let current_resume_after: Option<String> = current.try_get("resume_after")?;
             let selected_route_id: Option<String> = current.try_get("selected_route_id")?;
             tx.commit().await?;
-            Ok(json!({
+            Ok(echo_act(
+                json!({
                 "programme_id": programme_id,
                 "generation": generation,
                 "state": "pending",
@@ -2416,7 +2488,9 @@ async fn manage_onboarding(db: Db, caller: Caller, arguments: Value) -> Result<V
                 "selected_route_id": selected_route_id,
                 "resume_after": current_resume_after,
                 "changed": true,
-            }))
+                }),
+                act_alloc.get(),
+            )?)
         }
         ManageOnboardingArgs::ResolveObligation {
             programme_id,
@@ -2443,6 +2517,7 @@ async fn manage_onboarding(db: Db, caller: Caller, arguments: Value) -> Result<V
                 )));
             }
             let mut tx = crate::db::begin_write(db.write_pool()).await?;
+            let mut act_alloc = crate::act::ActAllocation::new();
             let aggregate_id =
                 member_obligation_aggregate_id(caller.credential(), &programme_id, generation);
             if let Some((kind, aggregate, actor, prior_reason, raw_payload)) =
@@ -2470,11 +2545,13 @@ async fn manage_onboarding(db: Db, caller: Caller, arguments: Value) -> Result<V
                     aggregate_id,
                     reason,
                     ControlEventPayload::MemberObligationResolved(payload),
+                    &mut act_alloc,
                 )
                 .await?;
                 tx.commit().await?;
-                return Ok(
+                return echo_act(
                     json!({ "programme_id": programme_id, "generation": generation, "state": resolution, "changed": false, "idempotent_retry": true }),
+                    act_alloc.get(),
                 );
             }
             let pending: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM member_obligations WHERE account_id=? AND programme_id=? AND generation=? AND state='pending')")
@@ -2492,8 +2569,13 @@ async fn manage_onboarding(db: Db, caller: Caller, arguments: Value) -> Result<V
                         "{TOOL}: completion requires declared completion criteria"
                     )));
                 }
-                instructions::validate_account_stack_in(&mut tx, TOOL, Some(caller.credential()))
-                    .await?;
+                instructions::validate_account_stack_in(
+                    &mut tx,
+                    TOOL,
+                    Some(caller.credential()),
+                    caller.is_host_member(),
+                )
+                .await?;
             }
             let updated_at = event_time(&mut tx, &idempotency_key, "updated_at").await?;
             append_authored(
@@ -2510,12 +2592,14 @@ async fn manage_onboarding(db: Db, caller: Caller, arguments: Value) -> Result<V
                     updated_at,
                     evidence,
                 }),
+                &mut act_alloc,
             )
             .await?;
             tx.commit().await?;
-            Ok(
+            Ok(echo_act(
                 json!({ "programme_id": programme_id, "generation": generation, "state": resolution, "changed": true }),
-            )
+                act_alloc.get(),
+            )?)
         }
         ManageOnboardingArgs::ReopenObligation {
             programme_id,
@@ -2533,6 +2617,7 @@ async fn manage_onboarding(db: Db, caller: Caller, arguments: Value) -> Result<V
                 )));
             }
             let mut tx = crate::db::begin_write(db.write_pool()).await?;
+            let mut act_alloc = crate::act::ActAllocation::new();
             let aggregate_id =
                 member_obligation_aggregate_id(caller.credential(), &programme_id, generation);
             if let Some((kind, aggregate, actor, prior_reason, raw_payload)) =
@@ -2559,17 +2644,20 @@ async fn manage_onboarding(db: Db, caller: Caller, arguments: Value) -> Result<V
                     aggregate_id,
                     reason,
                     ControlEventPayload::MemberObligationReopened(payload),
+                    &mut act_alloc,
                 )
                 .await?;
                 let measure = instructions::validate_account_stack_in(
                     &mut tx,
                     TOOL,
                     Some(caller.credential()),
+                    caller.is_host_member(),
                 )
                 .await?;
                 tx.commit().await?;
-                return Ok(
+                return echo_act(
                     json!({ "programme_id": programme_id, "generation": generation, "state": "pending", "changed": false, "idempotent_retry": true, "stack": measure }),
+                    act_alloc.get(),
                 );
             }
             let previous_state: String = sqlx::query_scalar("SELECT state FROM member_obligations WHERE account_id=? AND programme_id=? AND generation=? AND state IN ('completed','declined')")
@@ -2590,15 +2678,21 @@ async fn manage_onboarding(db: Db, caller: Caller, arguments: Value) -> Result<V
                     updated_at,
                     evidence,
                 }),
+                &mut act_alloc,
             )
             .await?;
-            let measure: StackMeasure =
-                instructions::validate_account_stack_in(&mut tx, TOOL, Some(caller.credential()))
-                    .await?;
-            tx.commit().await?;
-            Ok(
-                json!({ "programme_id": programme_id, "generation": generation, "state": "pending", "changed": true, "stack": measure }),
+            let measure: StackMeasure = instructions::validate_account_stack_in(
+                &mut tx,
+                TOOL,
+                Some(caller.credential()),
+                caller.is_host_member(),
             )
+            .await?;
+            tx.commit().await?;
+            Ok(echo_act(
+                json!({ "programme_id": programme_id, "generation": generation, "state": "pending", "changed": true, "stack": measure }),
+                act_alloc.get(),
+            )?)
         }
     }
 }
@@ -2624,7 +2718,7 @@ pub fn register_instruction_tools(registry: &mut ToolRegistry) -> Result<()> {
             "type":"object",
             "properties":{
                 "action":{"type":"string","enum":["list_programmes","create_programme","configure_programme","add_source","change_source","reorder_source","remove_source","preview_generation","publish_generation","record_progress","resolve_obligation","reopen_obligation"]},
-                "programme_id":{"type":"string"}, "trigger_key":{"type":"string","enum":["on_owner_first_run","on_member_joined"]},
+                "programme_id":{"type":"string"}, "trigger_key":{"type":"string","enum":["on_owner_first_run","on_member_joined","on_guest_welcomed"]},
                 "position":{"type":"integer","minimum":0}, "enabled":{"type":"boolean"}, "source_record_id":{"type":"string"},
                 "source_role":{"type":"string","enum":["guidance","completion_criteria"]},
                 "audience":{"type":"object","properties":{"kind":{"type":"string","enum":["all","terminal","pending","accounts"]},"account_ids":{"type":"array","items":{"type":"string"}}},"required":["kind"],"additionalProperties":false},

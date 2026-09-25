@@ -326,6 +326,30 @@
       "rationale": "One composite act authorizes several destinations and link targets at once. Its atomicity is the authorization property: a partially admitted exploration would be indistinguishable from a complete one, so the whole request clears the threshold or nothing lands."
     },
     {
+      "tool": "batch_write",
+      "action": "$tool",
+      "disposition": "specialized",
+      "risk_tier": "high",
+      "fixture": "heterogeneous-atomic-batch",
+      "expected_threshold": "edit-or-manage-per-item-with-view-link-targets",
+      "access": "mutation",
+      "non_disclosure": true,
+      "no_write_on_deny": true,
+      "positive_evidence": {
+        "status": "test",
+        "file": "tests/tools/batch_write.rs",
+        "test": "heterogeneous_e0_style_batch_succeeds",
+        "claim": "Authorized batch_write.$tool succeeds at threshold edit-or-manage-per-item-with-view-link-targets, committing every item together."
+      },
+      "negative_evidence": {
+        "status": "test",
+        "file": "tests/tools/batch_write.rs",
+        "test": "hidden_and_missing_refuse_identically",
+        "claim": "batch_write.$tool rejects a batch with an item below its threshold and writes nothing, naming the item index without revealing hidden rows."
+      },
+      "rationale": "One atomic batch authorizes every item's record (and link target) up front. Its atomicity is the authorization property: a partially admitted batch would leave some records changed and others not, so the whole cohort clears the threshold or nothing lands."
+    },
+    {
       "tool": "get_record",
       "action": "$tool",
       "disposition": "record_view",
@@ -1927,6 +1951,38 @@
     },
     {
       "tool": "manage_artifact_inputs",
+      "action": "bind_many",
+      "disposition": "specialized",
+      "risk_tier": "specialized",
+      "fixture": "artifact-inputs",
+      "expected_threshold": "edit-artifact-and-view-collection",
+      "access": "mutation",
+      "non_disclosure": true,
+      "no_write_on_deny": true,
+      "positive_evidence": {
+        "status": "test",
+        "file": "src/mcp/tools/artifacts.rs",
+        "test": "bind_many_applies_every_port_in_one_call",
+        "claim": "Authorized manage_artifact_inputs.bind_many succeeds at threshold edit-artifact-and-view-collection and binds every port in one call."
+      },
+      "negative_evidence": [
+        {
+          "status": "test",
+          "file": "src/mcp/tools/artifacts.rs",
+          "test": "bind_many_denied_artifact_edit_fails_whole_batch",
+          "claim": "manage_artifact_inputs.bind_many rejects a caller below edit-artifact-and-view-collection by denying Edit on the artifact and leaves its governed writes unchanged."
+        },
+        {
+          "status": "test",
+          "file": "src/mcp/tools/artifacts.rs",
+          "test": "bind_many_denied_collection_fails_whole_batch",
+          "claim": "manage_artifact_inputs.bind_many rejects a caller below edit-artifact-and-view-collection by denying View on a collection and leaves its governed writes unchanged."
+        }
+      ],
+      "rationale": "Input ports derive authority from both artifact and bound collection with historical event constraints."
+    },
+    {
+      "tool": "manage_artifact_inputs",
       "action": "unbind",
       "disposition": "specialized",
       "risk_tier": "specialized",
@@ -2371,6 +2427,78 @@
         "test": "diagnostics_scan_facets_and_work_context_use_only_visible_related_rows",
         "claim": "scan.$tool rejects a caller below caller-filtered-and-view-on-scope-root."
       }
+    },
+    {
+      "tool": "get_workspace_snapshot",
+      "action": "open",
+      "disposition": "caller_filtered_read",
+      "risk_tier": "high",
+      "fixture": "snapshot-visibility",
+      "expected_threshold": "caller-filtered",
+      "access": "read",
+      "non_disclosure": true,
+      "no_write_on_deny": false,
+      "positive_evidence": {
+        "status": "test",
+        "file": "tests/tools/authorization_tools.rs",
+        "test": "workspace_snapshot_serves_only_visible_rows_and_restarts_on_revoke",
+        "claim": "Authorized get_workspace_snapshot.open succeeds at threshold caller-filtered."
+      },
+      "negative_evidence": {
+        "status": "test",
+        "file": "tests/tools/authorization_tools.rs",
+        "test": "workspace_snapshot_serves_only_visible_rows_and_restarts_on_revoke",
+        "claim": "get_workspace_snapshot.open pins only caller-visible rows; hidden rows never appear."
+      },
+      "rationale": "The snapshot pin is the caller's filtered index; opening it must intersect visibility before any row is held."
+    },
+    {
+      "tool": "get_workspace_snapshot",
+      "action": "page",
+      "disposition": "caller_filtered_read",
+      "risk_tier": "high",
+      "fixture": "snapshot-visibility",
+      "expected_threshold": "caller-filtered",
+      "access": "read",
+      "non_disclosure": true,
+      "no_write_on_deny": false,
+      "positive_evidence": {
+        "status": "test",
+        "file": "tests/tools/authorization_tools.rs",
+        "test": "workspace_snapshot_serves_only_visible_rows_and_restarts_on_revoke",
+        "claim": "Authorized get_workspace_snapshot.page succeeds at threshold caller-filtered."
+      },
+      "negative_evidence": {
+        "status": "test",
+        "file": "tests/tools/authorization_tools.rs",
+        "test": "workspace_snapshot_serves_only_visible_rows_and_restarts_on_revoke",
+        "claim": "get_workspace_snapshot.page restarts with no rows after a revoke instead of serving the pre-revoke pin."
+      },
+      "rationale": "Pages are checked against the live fences before any row is returned; a moved fence restarts rather than serving stale rows."
+    },
+    {
+      "tool": "get_workspace_snapshot",
+      "action": "catch_up",
+      "disposition": "caller_filtered_read",
+      "risk_tier": "high",
+      "fixture": "snapshot-visibility",
+      "expected_threshold": "caller-filtered",
+      "access": "read",
+      "non_disclosure": true,
+      "no_write_on_deny": false,
+      "positive_evidence": {
+        "status": "test",
+        "file": "tests/tools/authorization_tools.rs",
+        "test": "workspace_snapshot_serves_only_visible_rows_and_restarts_on_revoke",
+        "claim": "Authorized get_workspace_snapshot.catch_up succeeds at threshold caller-filtered."
+      },
+      "negative_evidence": {
+        "status": "test",
+        "file": "tests/tools/authorization_tools.rs",
+        "test": "workspace_snapshot_serves_only_visible_rows_and_restarts_on_revoke",
+        "claim": "get_workspace_snapshot.catch_up restarts with no rows after a revoke instead of diffing from a stale pin."
+      },
+      "rationale": "Catch-up diffs the old pin against a fresh filtered view; fence moves and unheld indexes never yield old rows."
     },
     {
       "tool": "manage_vocabularies",
@@ -2978,6 +3106,54 @@
         "test": "hosted_pages_use_the_selected_shared_database_and_reauthorize_every_retry",
         "claim": "export_snapshot.$tool rejects a caller below host-owner."
       }
+    },
+    {
+      "tool": "authority_act_head",
+      "action": "$tool",
+      "disposition": "host_owner",
+      "risk_tier": "high",
+      "fixture": "host-authority-act",
+      "expected_threshold": "host-owner",
+      "access": "read",
+      "non_disclosure": true,
+      "no_write_on_deny": false,
+      "positive_evidence": {
+        "status": "test",
+        "file": "held/hosting/src/hosting/authority_act.rs",
+        "test": "authority_act_observes_head_and_delta_for_the_route_owner",
+        "claim": "Authorized authority_act_head.$tool succeeds at threshold host-owner and is bound to the caller's selected route."
+      },
+      "negative_evidence": {
+        "status": "test",
+        "file": "held/hosting/src/hosting/authority_act.rs",
+        "test": "authority_act_refuses_a_non_owner_and_a_local_caller",
+        "claim": "authority_act_head.$tool refuses a local caller and a non-owner member of the selected route before any read."
+      },
+      "rationale": "The authority act transport exposes the hosted canonical authority's full-corpus head/cut, so it shares the export capability's HostOwner permission shape and is registered only by the hosted runtime."
+    },
+    {
+      "tool": "authority_act_delta",
+      "action": "$tool",
+      "disposition": "host_owner",
+      "risk_tier": "high",
+      "fixture": "host-authority-act",
+      "expected_threshold": "host-owner",
+      "access": "read",
+      "non_disclosure": true,
+      "no_write_on_deny": false,
+      "positive_evidence": {
+        "status": "test",
+        "file": "held/hosting/src/hosting/authority_act.rs",
+        "test": "authority_act_observes_head_and_delta_for_the_route_owner",
+        "claim": "Authorized authority_act_delta.$tool succeeds at threshold host-owner and is bound to the caller's selected route."
+      },
+      "negative_evidence": {
+        "status": "test",
+        "file": "held/hosting/src/hosting/authority_act.rs",
+        "test": "authority_act_refuses_a_non_owner_and_a_local_caller",
+        "claim": "authority_act_delta.$tool refuses a local caller and a non-owner member of the selected route before any read."
+      },
+      "rationale": "The authority act transport exposes the hosted canonical authority's full-corpus head/cut, so it shares the export capability's HostOwner permission shape and is registered only by the hosted runtime."
     },
     {
       "tool": "resolve_citation",
@@ -3892,6 +4068,78 @@
       "rationale": "Revocation terminates a live join route and is hosted control-plane authority."
     },
     {
+      "tool": "manage_memberships",
+      "action": "create_guest_link",
+      "disposition": "specialized",
+      "risk_tier": "high",
+      "fixture": "hosting-membership",
+      "expected_threshold": "host-owner-with-live-catalog-recheck",
+      "access": "mutation",
+      "non_disclosure": true,
+      "no_write_on_deny": true,
+      "positive_evidence": {
+        "status": "test",
+        "file": "held/hosting/src/hosting/memberships.rs",
+        "test": "guest_link_mcp_actions_are_owner_only_and_bounded",
+        "claim": "Authorized manage_memberships.create_guest_link succeeds at threshold host-owner-with-live-catalog-recheck and returns one bearer join path over a reachable scope record."
+      },
+      "negative_evidence": {
+        "status": "test",
+        "file": "held/hosting/src/hosting/memberships.rs",
+        "test": "guest_link_mcp_actions_are_owner_only_and_bounded",
+        "claim": "manage_memberships.create_guest_link rejects a member and a guest of the same database, and rejects a scope the owner cannot reach, writing no invitation row for any of them."
+      },
+      "rationale": "Minting a bearer guest link grants future record-subtree access and is hosted control-plane authority."
+    },
+    {
+      "tool": "manage_memberships",
+      "action": "revoke_guest_link",
+      "disposition": "specialized",
+      "risk_tier": "high",
+      "fixture": "hosting-membership",
+      "expected_threshold": "host-owner-with-live-catalog-recheck",
+      "access": "mutation",
+      "non_disclosure": true,
+      "no_write_on_deny": true,
+      "positive_evidence": {
+        "status": "test",
+        "file": "held/hosting/src/hosting/memberships.rs",
+        "test": "revoke_guest_link_mcp_offboards_guests_of_an_expired_link",
+        "claim": "Authorized manage_memberships.revoke_guest_link succeeds at threshold host-owner-with-live-catalog-recheck and offboards the guests the link admitted through the tool path (idempotency claim, catalog flip, offboarding, completed claim), including a link that is already terminal-expired rather than pending."
+      },
+      "negative_evidence": {
+        "status": "test",
+        "file": "held/hosting/src/hosting/memberships.rs",
+        "test": "guest_link_mcp_actions_are_owner_only_and_bounded",
+        "claim": "manage_memberships.revoke_guest_link rejects a member of the same database with no guest link found and leaves the link untouched."
+      },
+      "rationale": "Revoking a guest link ends a live bearer route and offboards the guests it admitted."
+    },
+    {
+      "tool": "workspace_read",
+      "action": "list",
+      "disposition": "specialized",
+      "risk_tier": "high",
+      "fixture": "hosting-membership",
+      "expected_threshold": "live-member-with-catalog-recheck",
+      "access": "read",
+      "non_disclosure": true,
+      "no_write_on_deny": false,
+      "positive_evidence": {
+        "status": "test",
+        "file": "held/hosting/src/hosting/workspaces.rs",
+        "test": "workspace_read_omits_a_membership_revoked_during_the_listing",
+        "claim": "A live member lists their workspace directory after the catalog recheck; a membership revoked between the first read and the response is absent."
+      },
+      "negative_evidence": {
+        "status": "test",
+        "file": "held/hosting/tests/service/hosting.rs",
+        "test": "workspace_read_lists_the_callers_workspaces_with_connect_paths",
+        "claim": "workspace_read.list rejects a caller with no hosted context rather than answering from ambient authority."
+      },
+      "rationale": "Directory listing is live-member-visible; the handler re-reads the catalog per request and refuses callers without a hosted principal."
+    },
+    {
       "tool": "reach_read",
       "action": "source_status",
       "disposition": "specialized",
@@ -4586,6 +4834,428 @@
         "claim": "manage_messages.get_attention rejects a caller below caller-filtered-pinned-audience with no signal and no writes."
       },
       "rationale": "Messaging combines sealed audiences, exact human/agent authority, snapshot paging, and per-action mutations."
+    },
+    {
+      "tool": "save_account",
+      "action": "$tool",
+      "disposition": "specialized",
+      "risk_tier": "specialized",
+      "fixture": "authoring-journey",
+      "expected_threshold": "edit consumer and view every declared source",
+      "access": "mutation",
+      "non_disclosure": true,
+      "no_write_on_deny": true,
+      "positive_evidence": {
+        "status": "test",
+        "file": "tests/tools/authoring_journey.rs",
+        "test": "authoring_operations_enforce_authority_and_redact_hidden_basis",
+        "claim": "Authorized writer saves and reads the exact declared basis; a reader may read the account with hidden basis redacted."
+      },
+      "negative_evidence": {
+        "status": "test",
+        "file": "tests/tools/authoring_journey.rs",
+        "test": "authoring_operations_enforce_authority_and_redact_hidden_basis",
+        "claim": "Hidden account access is refused without writes; source identifiers and content are withheld from a reader, and view alone cannot replay the save."
+      },
+      "rationale": "The consumer has its own authority boundary while each source and inherited lineage is independently authorized."
+    },
+    {
+      "tool": "get_reuse_context",
+      "action": "$tool",
+      "disposition": "specialized",
+      "risk_tier": "specialized",
+      "fixture": "authoring-journey",
+      "expected_threshold": "view account; basis filtered by source view",
+      "access": "read",
+      "non_disclosure": true,
+      "no_write_on_deny": false,
+      "positive_evidence": {
+        "status": "test",
+        "file": "tests/tools/authoring_journey.rs",
+        "test": "authoring_operations_enforce_authority_and_redact_hidden_basis",
+        "claim": "Authorized writer saves and reads the exact declared basis; a reader may read the account with hidden basis redacted."
+      },
+      "negative_evidence": {
+        "status": "test",
+        "file": "tests/tools/authoring_journey.rs",
+        "test": "authoring_operations_enforce_authority_and_redact_hidden_basis",
+        "claim": "Hidden account access is refused without writes; source identifiers and content are withheld from a reader, and view alone cannot replay the save."
+      },
+      "rationale": "The consumer has its own authority boundary while each source and inherited lineage is independently authorized."
+    },
+    {
+      "tool": "manage_surface_bindings",
+      "action": "list",
+      "disposition": "specialized",
+      "risk_tier": "specialized",
+      "fixture": "surface-binding",
+      "expected_threshold": "none",
+      "access": "read",
+      "non_disclosure": true,
+      "no_write_on_deny": false,
+      "positive_evidence": {
+        "status": "test",
+        "file": "tests/tools/surface_bindings.rs",
+        "test": "surface_binding_personal_override_wins_and_reset_restores_workspace_default",
+        "claim": "Authorized manage_surface_bindings.list returns the caller's own personal and workspace bindings with their targets."
+      },
+      "negative_evidence": {
+        "status": "test",
+        "file": "tests/tools/surface_bindings.rs",
+        "test": "surface_binding_degrades_when_bound_target_is_lost_or_unauthorized",
+        "claim": "A binding whose target the caller may no longer view is skipped with its reason rather than disclosed."
+      },
+      "rationale": "Resolution is a caller-filtered read: only bindings the viewer may act on are visible."
+    },
+    {
+      "tool": "manage_surface_bindings",
+      "action": "get",
+      "disposition": "specialized",
+      "risk_tier": "specialized",
+      "fixture": "surface-binding",
+      "expected_threshold": "none",
+      "access": "read",
+      "non_disclosure": true,
+      "no_write_on_deny": false,
+      "positive_evidence": {
+        "status": "test",
+        "file": "tests/tools/surface_bindings.rs",
+        "test": "surface_binding_personal_override_wins_and_reset_restores_workspace_default",
+        "claim": "Authorized manage_surface_bindings.get returns the effective binding, its precedence, source, target and mode."
+      },
+      "negative_evidence": {
+        "status": "test",
+        "file": "tests/tools/surface_bindings.rs",
+        "test": "surface_binding_degrades_when_bound_target_is_lost_or_unauthorized",
+        "claim": "get skips an unauthorized target with an honest reason and resolves to the app fallback instead."
+      },
+      "rationale": "Resolution is a caller-filtered read: only bindings the viewer may act on are visible."
+    },
+    {
+      "tool": "manage_surface_bindings",
+      "action": "set",
+      "disposition": "specialized",
+      "risk_tier": "specialized",
+      "fixture": "surface-binding",
+      "expected_threshold": "view-artifact-and-edit-scope",
+      "access": "mutation",
+      "non_disclosure": true,
+      "no_write_on_deny": true,
+      "positive_evidence": {
+        "status": "test",
+        "file": "tests/tools/surface_bindings.rs",
+        "test": "surface_binding_personal_override_wins_and_reset_restores_workspace_default",
+        "claim": "Authorized manage_surface_bindings.set succeeds at threshold view-artifact-and-edit-scope and returns what it resolved."
+      },
+      "negative_evidence": {
+        "status": "test",
+        "file": "tests/tools/surface_bindings.rs",
+        "test": "surface_binding_refuses_below_threshold_writes_without_adding_links",
+        "claim": "A caller below the artifact-view or scope-edit threshold is refused and leaves no surface_binding edge."
+      },
+      "rationale": "A personal override needs edit on the member's own record; the workspace default needs manage on the root."
+    },
+    {
+      "tool": "manage_surface_bindings",
+      "action": "reset",
+      "disposition": "specialized",
+      "risk_tier": "specialized",
+      "fixture": "surface-binding",
+      "expected_threshold": "edit-scope",
+      "access": "mutation",
+      "non_disclosure": true,
+      "no_write_on_deny": true,
+      "positive_evidence": {
+        "status": "test",
+        "file": "tests/tools/surface_bindings.rs",
+        "test": "surface_binding_personal_override_wins_and_reset_restores_workspace_default",
+        "claim": "Authorized manage_surface_bindings.reset succeeds at threshold edit-scope and reports the resulting resolution."
+      },
+      "negative_evidence": {
+        "status": "test",
+        "file": "tests/tools/surface_bindings.rs",
+        "test": "surface_binding_refuses_below_threshold_writes_without_adding_links",
+        "claim": "A caller below the scope-edit threshold cannot remove another scope's binding and leaves it intact."
+      },
+      "rationale": "Reset removes the caller's own scoped override; it never reaches a scope the caller cannot edit."
+    },
+    {
+      "tool": "manage_alpha_tabs",
+      "action": "inspect",
+      "disposition": "specialized",
+      "risk_tier": "specialized",
+      "fixture": "alpha-tab-install",
+      "expected_threshold": "none",
+      "access": "read",
+      "non_disclosure": true,
+      "no_write_on_deny": false,
+      "positive_evidence": {
+        "status": "test",
+        "file": "tests/tools/alpha_tabs.rs",
+        "test": "install_inspect_list_round_trip_with_stored_pin",
+        "claim": "Authorized manage_alpha_tabs.inspect returns the caller's install with its pin, status, and read-gate verdict."
+      },
+      "negative_evidence": {
+        "status": "test",
+        "file": "tests/tools/alpha_tabs.rs",
+        "test": "install_inspect_list_round_trip_with_stored_pin",
+        "claim": "Inspecting a package the caller never installed reports installed false without touching other accounts' rows."
+      },
+      "rationale": "Reads are caller-filtered to the viewer's own install rows; no cross-account install is addressable."
+    },
+    {
+      "tool": "manage_alpha_tabs",
+      "action": "list",
+      "disposition": "specialized",
+      "risk_tier": "specialized",
+      "fixture": "alpha-tab-install",
+      "expected_threshold": "none",
+      "access": "read",
+      "non_disclosure": true,
+      "no_write_on_deny": false,
+      "positive_evidence": {
+        "status": "test",
+        "file": "tests/tools/alpha_tabs.rs",
+        "test": "install_inspect_list_round_trip_with_stored_pin",
+        "claim": "Authorized manage_alpha_tabs.list returns one entry per install with status and skip reasons."
+      },
+      "negative_evidence": {
+        "status": "test",
+        "file": "tests/tools/alpha_tabs.rs",
+        "test": "accounts_are_isolated_and_authority_loss_degrades_honestly",
+        "claim": "A caller who lost View sees resolves false with skip reason unauthorized rather than stale data."
+      },
+      "rationale": "Reads are caller-filtered to the viewer's own install rows; no cross-account install is addressable."
+    },
+    {
+      "tool": "manage_alpha_tabs",
+      "action": "install",
+      "disposition": "specialized",
+      "risk_tier": "specialized",
+      "fixture": "alpha-tab-install",
+      "expected_threshold": "view-artifact",
+      "access": "mutation",
+      "non_disclosure": true,
+      "no_write_on_deny": true,
+      "positive_evidence": {
+        "status": "test",
+        "file": "tests/tools/alpha_tabs.rs",
+        "test": "install_inspect_list_round_trip_with_stored_pin",
+        "claim": "Authorized manage_alpha_tabs.install pins package, version, digest, artifact, source revision, and declaration at threshold view-artifact."
+      },
+      "negative_evidence": {
+        "status": "test",
+        "file": "tests/tools/alpha_tabs.rs",
+        "test": "install_refuses_missing_wrong_typed_and_unauthorized_targets",
+        "claim": "A missing, wrong-typed, or unviewable target is refused at bind time and folds no install row."
+      },
+      "rationale": "Installs address only the caller's own account rows and require View on a live Document kind:artifact target."
+    },
+    {
+      "tool": "manage_alpha_tabs",
+      "action": "disable",
+      "disposition": "specialized",
+      "risk_tier": "specialized",
+      "fixture": "alpha-tab-install",
+      "expected_threshold": "install-event-cas",
+      "access": "mutation",
+      "non_disclosure": true,
+      "no_write_on_deny": true,
+      "positive_evidence": {
+        "status": "test",
+        "file": "tests/tools/alpha_tabs.rs",
+        "test": "cas_lifecycle_disable_restore_remove_with_stale_token_refusal",
+        "claim": "Authorized manage_alpha_tabs.disable moves an installed tab to disabled at threshold install-event-cas."
+      },
+      "negative_evidence": {
+        "status": "test",
+        "file": "tests/tools/alpha_tabs.rs",
+        "test": "cas_lifecycle_disable_restore_remove_with_stale_token_refusal",
+        "claim": "A stale compare-and-set token fails visibly with installation changed and moves no state."
+      },
+      "rationale": "Transitions compare-and-set on the install's current event token within the caller's own account rows."
+    },
+    {
+      "tool": "manage_alpha_tabs",
+      "action": "restore",
+      "disposition": "specialized",
+      "risk_tier": "specialized",
+      "fixture": "alpha-tab-install",
+      "expected_threshold": "install-event-cas",
+      "access": "mutation",
+      "non_disclosure": true,
+      "no_write_on_deny": true,
+      "positive_evidence": {
+        "status": "test",
+        "file": "tests/tools/alpha_tabs.rs",
+        "test": "cas_lifecycle_disable_restore_remove_with_stale_token_refusal",
+        "claim": "Authorized manage_alpha_tabs.restore returns a disabled tab to installed after re-validating its target at threshold install-event-cas."
+      },
+      "negative_evidence": {
+        "status": "test",
+        "file": "tests/tools/alpha_tabs.rs",
+        "test": "cas_lifecycle_disable_restore_remove_with_stale_token_refusal",
+        "claim": "Restoring a removed tab or spending a stale token fails without moving state."
+      },
+      "rationale": "Transitions compare-and-set on the install's current event token within the caller's own account rows."
+    },
+    {
+      "tool": "manage_alpha_tabs",
+      "action": "remove",
+      "disposition": "specialized",
+      "risk_tier": "specialized",
+      "fixture": "alpha-tab-install",
+      "expected_threshold": "install-event-cas",
+      "access": "mutation",
+      "non_disclosure": true,
+      "no_write_on_deny": true,
+      "positive_evidence": {
+        "status": "test",
+        "file": "tests/tools/alpha_tabs.rs",
+        "test": "cas_lifecycle_disable_restore_remove_with_stale_token_refusal",
+        "claim": "Authorized manage_alpha_tabs.remove moves an installed or disabled tab to the terminal removed state at threshold install-event-cas."
+      },
+      "negative_evidence": {
+        "status": "test",
+        "file": "tests/tools/alpha_tabs.rs",
+        "test": "cas_lifecycle_disable_restore_remove_with_stale_token_refusal",
+        "claim": "A stale token or a second remove over the spent token fails without moving state."
+      },
+      "rationale": "Transitions compare-and-set on the install's current event token within the caller's own account rows."
+    },
+    {
+      "tool": "manage_alpha_tabs",
+      "action": "launch",
+      "disposition": "specialized",
+      "risk_tier": "specialized",
+      "fixture": "alpha-tab-install",
+      "expected_threshold": "view-artifact-and-verified-install",
+      "access": "read",
+      "non_disclosure": true,
+      "no_write_on_deny": false,
+      "positive_evidence": {
+        "status": "test",
+        "file": "tests/tools/alpha_tabs.rs",
+        "test": "launch_binds_verified_install_and_refuses_stale_or_revoked_state",
+        "claim": "A verified install with current event token and viewer View issues a one-use URL from exact pinned source bytes with sample input only."
+      },
+      "negative_evidence": {
+        "status": "test",
+        "file": "tests/tools/alpha_tabs.rs",
+        "test": "launch_binds_verified_install_and_refuses_stale_or_revoked_state",
+        "claim": "Unadopted, stale-token, other-account, and disabled launches refuse without returning source bytes or a URL."
+      },
+      "rationale": "Launch binds the current verified personal install event, target View, exact source event and digest before issuing an ephemeral sample-only HTML ticket."
+    },
+    {
+      "tool": "manage_alpha_tabs",
+      "action": "live_read",
+      "disposition": "specialized",
+      "risk_tier": "specialized",
+      "fixture": "alpha-tab-install",
+      "expected_threshold": "view-artifact-and-verified-install-and-declared-need",
+      "access": "read",
+      "non_disclosure": true,
+      "no_write_on_deny": false,
+      "positive_evidence": {
+        "status": "test",
+        "file": "tests/tools/alpha_tabs.rs",
+        "test": "live_read_returns_governed_rows_with_revision_and_provenance",
+        "claim": "An adopted install with the declared attention read returns only viewer-authorized rows with revision and exact pin provenance."
+      },
+      "negative_evidence": [
+        {
+          "status": "test",
+          "file": "tests/tools/alpha_tabs.rs",
+          "test": "live_read_refuses_on_view_loss",
+          "claim": "Losing View on the installed artifact refuses live_read without returning rows."
+        },
+        {
+          "status": "test",
+          "file": "tests/tools/alpha_tabs.rs",
+          "test": "live_read_refuses_by_undeclared_need",
+          "claim": "A missing declared read need refuses live_read."
+        },
+        {
+          "status": "test",
+          "file": "tests/tools/alpha_tabs.rs",
+          "test": "live_read_refuses_when_disabled",
+          "claim": "A disabled install cannot continue its previously authorized live read."
+        }
+      ],
+      "rationale": "The host executes only the consented attention query under viewer authority and rechecks adoption, install generation, source pin and declaration before returning rows."
+    },
+    {
+      "tool": "manage_alpha_tabs",
+      "action": "preview",
+      "disposition": "specialized",
+      "risk_tier": "specialized",
+      "fixture": "alpha-tab-install",
+      "expected_threshold": "view-artifact",
+      "access": "read",
+      "non_disclosure": true,
+      "no_write_on_deny": false,
+      "positive_evidence": {
+        "status": "test",
+        "file": "tests/tools/alpha_tabs.rs",
+        "test": "preview_renders_pinned_bytes_against_sample_input_only",
+        "claim": "Authorized manage_alpha_tabs.preview renders the pinned bundle bytes against host-owned sample input with no live reads and mints the server-held receipt."
+      },
+      "negative_evidence": {
+        "status": "test",
+        "file": "tests/tools/alpha_tabs.rs",
+        "test": "preview_refuses_mcp_and_unattested_callers_at_tool_layer",
+        "claim": "A caller without the hosted cookie-session attestation is refused before any verification work and receives no preview bytes or receipt."
+      },
+      "rationale": "Preview requires the hosted cookie-session attestation for the exact pin plus viewer View on the artifact, and renders the pinned bytes against sample input only."
+    },
+    {
+      "tool": "manage_alpha_tabs",
+      "action": "adopt",
+      "disposition": "specialized",
+      "risk_tier": "specialized",
+      "fixture": "alpha-tab-install",
+      "expected_threshold": "install-event-cas",
+      "access": "mutation",
+      "non_disclosure": true,
+      "no_write_on_deny": true,
+      "positive_evidence": {
+        "status": "test",
+        "file": "tests/tools/alpha_tabs.rs",
+        "test": "adopt_flips_install_to_verified_and_stays_fail_closed",
+        "claim": "Authorized manage_alpha_tabs.adopt flips a caller-asserted install to verified adoption against its live server-held receipt at threshold install-event-cas, spending the receipt."
+      },
+      "negative_evidence": {
+        "status": "test",
+        "file": "tests/tools/alpha_tabs.rs",
+        "test": "adopt_receipt_is_single_use_and_cas_refuses_before_consume",
+        "claim": "A stale compare-and-set token or a replayed receipt is refused without state change and without spending a live receipt on CAS refusal."
+      },
+      "rationale": "Adopt binds the exact account plus pin through the hosted cookie-session attestation and the single-use server-held receipt, compare-and-set on the install's current event token within the caller's own account rows."
+    },
+    {
+      "tool": "advance_artifact_port_pin",
+      "action": "$tool",
+      "disposition": "specialized",
+      "risk_tier": "specialized",
+      "fixture": "artifact-port-pin",
+      "expected_threshold": "edit-artifact-and-edit-collection",
+      "access": "mutation",
+      "non_disclosure": true,
+      "no_write_on_deny": true,
+      "positive_evidence": {
+        "status": "test",
+        "file": "src/mcp/tools/artifacts.rs",
+        "test": "advances_a_bound_port_and_reissues_its_grant",
+        "claim": "Authorized advance_artifact_port_pin advances a bound port's relation pin, rebinds it to the new exact source, and re-issues its grant as a fresh event."
+      },
+      "negative_evidence": {
+        "status": "test",
+        "file": "src/mcp/tools/artifacts/advance_pin.rs",
+        "test": "pin_only_change_refuses_a_schema_change",
+        "claim": "advance_artifact_port_pin refuses a declaration change that is more than the named version pin and writes nothing."
+      },
+      "rationale": "Re-pinning a governed-SQL relation version rewrites the saved query, the artifact port declaration, its binding and its capability grants together; the operation accepts only the version change and refuses every other declaration diff."
     }
   ]
 }

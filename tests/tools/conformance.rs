@@ -76,6 +76,26 @@ async fn passes_on_a_fresh_install_and_does_not_mutate_it() {
     let client = create_database(":memory:").await.unwrap();
     let report = run_conformance(&client).await;
     assert!(report.ok, "{}", format_report(&report));
+    assert_eq!(report.check_timings.len(), report.checks.len());
+    for (timing, check) in report.check_timings.iter().zip(&report.checks) {
+        assert_eq!(timing.check, check.check);
+    }
+    let formatted = format_report(&report);
+    assert!(formatted.contains("PASS  rebuild-and-diff  elapsed_ms="));
+    let serialized = serde_json::to_value(&report).unwrap();
+    assert_eq!(
+        serialized["check_timings"].as_array().unwrap().len(),
+        report.checks.len()
+    );
+    assert!(serialized["check_timings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|item| item
+            .as_object()
+            .unwrap()
+            .keys()
+            .all(|key| key == "check" || key == "elapsed_ms")));
     for (table, expected) in [
         ("content_events", 2),
         ("records", 2),

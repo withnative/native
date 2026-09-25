@@ -4,7 +4,8 @@
 use std::collections::BTreeSet;
 
 use native_ce::mcp::{register_surface_tools, Caller, ToolRegistry};
-use native_ce::{apply_schema, open_database, Db};
+use native_ce::provenance::Channel;
+use native_ce::{apply_schema, create_database, open_database, Db};
 use serde_json::{json, Value};
 use sqlx::Row;
 
@@ -600,9 +601,11 @@ async fn every_family_and_semantic_field_is_explicit_and_groups_deterministicall
             "actor",
             "actor_name",
             "changed_fields",
+            "channel",
             "event_count",
             "event_families",
             "event_types",
+            "executor",
             "first_event_at",
             "first_local_seq",
             "last_event_at",
@@ -1962,5 +1965,440 @@ async fn unsatisfiable_actor_conjunctions_match_nothing() {
         assert_eq!(result["next_request"], Value::Null);
         assert_eq!(result["scanned_through_local_seq"], 2);
     }
+    db.close().await;
+}
+
+// ---------------------------------------------------------------------------
+// Server-observed provenance channel on change groups
+// ---------------------------------------------------------------------------
+
+/// Wordlist-valid full run key (`handle-disambiguator-id`); anything else is
+/// fail-open dropped to `None` before it ever reaches the event envelope.
+const CHANNEL_RUN: &str = "plover-archery-aaaaaa";
+
+/// Attested writes go through `create_record`, which homes new records under
+/// `native:root`. The shared `db()` helper skips that seed, so channel tests
+/// needing real attestations use a fully seeded database instead.
+async fn attested_db() -> Db {
+    let db = create_database(":memory:").await.unwrap();
+    native_ce::meta::seed_vocabularies(&db).await.unwrap();
+    db
+}
+
+/// An attested write on one observed transport: the registry stamps the
+/// caller correlation, the engine stamps the channel. Never invented here.
+async fn write_as(
+    registry: &ToolRegistry,
+    db: &Db,
+    channel: Channel,
+    run_key: Option<&str>,
+    tool: &str,
+    args: Value,
+) -> Value {
+    write_as_account(registry, db, SELF, channel, run_key, tool, args).await
+}
+
+async fn write_as_account(
+    registry: &ToolRegistry,
+    db: &Db,
+    account: &str,
+    channel: Channel,
+    run_key: Option<&str>,
+    tool: &str,
+    args: Value,
+) -> Value {
+    let mut args = args;
+    if let Some(run_key) = run_key {
+        args.as_object_mut()
+            .expect("tool arguments are an object")
+            .insert("run_key".into(), json!(run_key));
+    }
+    let args = crate::common::with_test_reason(tool, args);
+    registry
+        .call(
+            db.clone(),
+            Caller::authenticated(account).with_channel(channel),
+            tool,
+            args,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{tool} on {channel:?} failed: {error}"))
+}
+
+/// Bind `account:self` to a visible person record so attested writes have a
+/// portable account footing on a fully seeded database.
+async fn bind_self_person(registry: &ToolRegistry, db: &Db) {
+    registry
+        .call(
+            db.clone(),
+            Caller::local(),
+            "create_record",
+            crate::common::with_test_reason(
+                "create_record",
+                json!({ "id": "c07b0000-0000-4000-8000-000000000070",
+                        "type": "Entity", "kind": "person", "name": "Self" }),
+            ),
+        )
+        .await
+        .expect("person seed failed");
+    sqlx::query(
+        "INSERT INTO bindings(record_id, system, identifier, is_canonical)
+         VALUES('c07b0000-0000-4000-8000-000000000070', 'account', ?, 1)",
+    )
+    .bind(SELF)
+    .execute(&crate::common::fixture_write_pool(db).await)
+    .await
+    .unwrap();
+}
+
+async fn attestation_id_for_event(db: &Db, event_id: &str) -> Option<String> {
+    let pool = crate::common::fixture_write_pool(db).await;
+    sqlx::query_scalar::<_, String>(
+        "SELECT action_attestation_id FROM provenance_action_outputs
+          WHERE output_domain = 'content' AND output_event_id = ?",
+    )
+    .bind(event_id)
+    .fetch_optional(&pool)
+    .await
+    .unwrap()
+}
+
+async fn invalidate_attestation(db: &Db, attestation_id: &str) {
+    let pool = crate::common::fixture_write_pool(db).await;
+    sqlx::query(
+        "INSERT INTO provenance_attestation_validity_events
+         (id, attestation_id, ordinal, status, reason, issuer, issued_at)
+         VALUES (?, ?, 0, 'invalidated', 'channel test compromise',
+                 'channel test operator', '2026-08-02T00:00:00.000Z')",
+    )
+    .bind(format!("validity:{attestation_id}"))
+    .bind(attestation_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+}
+
+/// One record, one actor, one run, two transports: the groups must split on
+/// channel rather than coalesce, and the executor class rides separately —
+/// never inferred from the channel or the run key.
+#[tokio::test]
+async fn same_run_mixed_channels_split_into_two_groups() {
+    let db = attested_db().await;
+    let registry = registry();
+    bind_self_person(&registry, &db).await;
+    write_as(
+        &registry,
+        &db,
+        Channel::Web,
+        Some(CHANNEL_RUN),
+        "create_record",
+        json!({ "id": "c07b0000-0000-4000-8000-000000000071", "type": "Document",
+                "name": "mix", "body": "v1" }),
+    )
+    .await;
+    write_as(
+        &registry,
+        &db,
+        Channel::Mcp,
+        Some(CHANNEL_RUN),
+        "update_record",
+        json!({ "id": "c07b0000-0000-4000-8000-000000000071",
+                "summary": "second transport" }),
+    )
+    .await;
+
+    let page = call(
+        &registry,
+        &db,
+        json!({ "scope_record_id": "c07b0000-0000-4000-8000-000000000071" }),
+    )
+    .await;
+    assert_eq!(page["matched_event_count"], 2);
+    let changes = page["changes"].as_array().unwrap();
+    assert_eq!(changes.len(), 2, "{changes:?}");
+    for change in changes {
+        assert_eq!(change["record_id"], "c07b0000-0000-4000-8000-000000000071");
+        assert_eq!(change["actor"], SELF);
+        assert_eq!(change["run_key"], CHANNEL_RUN);
+        assert_eq!(change["event_count"], 1);
+    }
+    let kinds: BTreeSet<String> = changes
+        .iter()
+        .map(|change| change["channel"]["kind"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        kinds,
+        BTreeSet::from(["mcp".to_string(), "web".to_string()])
+    );
+    for change in changes {
+        assert_eq!(change["channel"]["assurance"], "server_observed");
+        assert_eq!(
+            change["executor"]["kind"], "authenticated_principal",
+            "executor rides separately: {change:?}"
+        );
+        assert_eq!(change["executor"]["assurance"], "engine_attested");
+    }
+    db.close().await;
+}
+
+/// Events with no covering attestation — legacy rows and redacted actors
+/// alike — report `unknown`, and every group carries the channel shape.
+#[tokio::test]
+async fn legacy_and_redacted_events_are_unknown_channel() {
+    let db = db().await;
+    let registry = registry();
+    insert_event(
+        &db,
+        "record:legacy-channel",
+        "record.updated",
+        Some(json!({ "summary": "legacy" })),
+        None,
+        None,
+        None,
+    )
+    .await;
+    insert_event(
+        &db,
+        "record:redacted-channel",
+        "record.updated",
+        Some(json!({ "summary": "other author" })),
+        Some(OTHER),
+        None,
+        None,
+    )
+    .await;
+
+    let page = call(&registry, &db, json!({})).await;
+    assert_eq!(page["matched_event_count"], 2);
+    for change in page["changes"].as_array().unwrap() {
+        assert_eq!(change["channel"]["kind"], "unknown", "{change:?}");
+        assert_eq!(change["channel"]["assurance"], "unknown_or_withheld");
+        assert!(change["executor"]["kind"].is_null(), "{change:?}");
+        assert_eq!(change["executor"]["assurance"], "unknown_or_withheld");
+    }
+    let others = call(&registry, &db, json!({ "actor_scope": "others" })).await;
+    let redacted = others["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|change| change["record_id"] == "record:redacted-channel")
+        .expect("redacted group is visible");
+    assert!(redacted["actor"].is_null());
+    assert_eq!(redacted["channel"]["kind"], "unknown");
+    db.close().await;
+}
+
+/// An attested channel is non-identifying: it survives actor redaction.
+/// OTHER writes once over web and once over MCP in one run; SELF may read
+/// the record but not OTHER's person, so actor and run null out while both
+/// channels — and the separate executor class — stay exactly as attested.
+#[tokio::test]
+async fn attested_channel_survives_hidden_actor_redaction() {
+    let db = attested_db().await;
+    let registry = registry();
+    bind_self_person(&registry, &db).await;
+    insert_private_record(&db, "person:hidden-other", "Hidden Other", OTHER).await;
+    sqlx::query(
+        "INSERT INTO bindings(record_id, system, identifier, is_canonical)
+         VALUES('person:hidden-other', 'account', ?, 1)",
+    )
+    .bind(OTHER)
+    .execute(&crate::common::fixture_write_pool(&db).await)
+    .await
+    .unwrap();
+    write_as_account(
+        &registry,
+        &db,
+        OTHER,
+        Channel::Web,
+        Some(CHANNEL_RUN),
+        "create_record",
+        json!({ "id": "c07b0000-0000-4000-8000-000000000074", "type": "Document",
+                "name": "redacted", "body": "v1" }),
+    )
+    .await;
+    write_as_account(
+        &registry,
+        &db,
+        OTHER,
+        Channel::Mcp,
+        Some(CHANNEL_RUN),
+        "update_record",
+        json!({ "id": "c07b0000-0000-4000-8000-000000000074",
+                "summary": "second transport" }),
+    )
+    .await;
+
+    let page = call(
+        &registry,
+        &db,
+        json!({ "scope_record_id": "c07b0000-0000-4000-8000-000000000074" }),
+    )
+    .await;
+    assert_eq!(page["matched_event_count"], 2);
+    let changes = page["changes"].as_array().unwrap();
+    assert_eq!(changes.len(), 2, "{changes:?}");
+    for change in changes {
+        assert!(change["actor"].is_null(), "{change:?}");
+        assert!(change["run_key"].is_null(), "{change:?}");
+        assert_eq!(change["channel"]["assurance"], "server_observed");
+        assert_eq!(
+            change["executor"]["kind"], "authenticated_principal",
+            "executor is attested, not inferred: {change:?}"
+        );
+        assert_eq!(change["executor"]["assurance"], "engine_attested");
+    }
+    let kinds: BTreeSet<String> = changes
+        .iter()
+        .map(|change| change["channel"]["kind"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        kinds,
+        BTreeSet::from(["mcp".to_string(), "web".to_string()])
+    );
+    db.close().await;
+}
+
+/// An invalidated attestation stops being evidence: the group falls back to
+/// `unknown` rather than quoting the disowned channel.
+#[tokio::test]
+async fn invalidated_attestation_collapses_to_unknown() {
+    let db = attested_db().await;
+    let registry = registry();
+    bind_self_person(&registry, &db).await;
+    write_as(
+        &registry,
+        &db,
+        Channel::Mcp,
+        Some(CHANNEL_RUN),
+        "create_record",
+        json!({ "id": "c07b0000-0000-4000-8000-000000000072", "type": "Document",
+                "name": "doomed", "body": "v1" }),
+    )
+    .await;
+    let scope = json!({ "scope_record_id": "c07b0000-0000-4000-8000-000000000072" });
+    let before = call(&registry, &db, scope.clone()).await;
+    assert_eq!(before["changes"][0]["channel"]["kind"], "mcp");
+
+    let pool = crate::common::fixture_write_pool(&db).await;
+    let event_id: String = sqlx::query_scalar(
+        "SELECT id FROM content_events WHERE record_id = ?
+         ORDER BY seq DESC LIMIT 1",
+    )
+    .bind("c07b0000-0000-4000-8000-000000000072")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let attestation = attestation_id_for_event(&db, &event_id)
+        .await
+        .expect("attested write has an attestation");
+    invalidate_attestation(&db, &attestation).await;
+
+    let after = call(&registry, &db, scope).await;
+    assert_eq!(after["matched_event_count"], 1);
+    let change = &after["changes"][0];
+    assert_eq!(change["channel"]["kind"], "unknown", "{change:?}");
+    assert_eq!(change["channel"]["assurance"], "unknown_or_withheld");
+    assert!(change["executor"]["kind"].is_null(), "{change:?}");
+    assert_eq!(change["executor"]["assurance"], "unknown_or_withheld");
+    db.close().await;
+}
+
+/// Splitting groups on channel must not move the cursor contract: visible
+/// event counts, `has_more`, and verbatim `next_request` paging behave as
+/// before, with per-page event counts summing to the unpaged total.
+#[tokio::test]
+async fn mixed_channel_paging_preserves_cursor_and_counts() {
+    let db = attested_db().await;
+    let registry = registry();
+    bind_self_person(&registry, &db).await;
+    write_as(
+        &registry,
+        &db,
+        Channel::Web,
+        Some(CHANNEL_RUN),
+        "create_record",
+        json!({ "id": "c07b0000-0000-4000-8000-000000000073", "type": "Document",
+                "name": "paged", "body": "v1" }),
+    )
+    .await;
+    write_as(
+        &registry,
+        &db,
+        Channel::Mcp,
+        Some(CHANNEL_RUN),
+        "update_record",
+        json!({ "id": "c07b0000-0000-4000-8000-000000000073",
+                "summary": "second transport" }),
+    )
+    .await;
+    insert_record(
+        &db,
+        "record:paged-legacy",
+        "legacy",
+        Some("c07b0000-0000-4000-8000-000000000073"),
+        false,
+    )
+    .await;
+    insert_event(
+        &db,
+        "record:paged-legacy",
+        "record.updated",
+        Some(json!({ "summary": "legacy" })),
+        Some(SELF),
+        None,
+        None,
+    )
+    .await;
+
+    let scope = json!({ "scope_record_id": "c07b0000-0000-4000-8000-000000000073" });
+    let whole = call(&registry, &db, scope.clone()).await;
+    assert_eq!(whole["matched_event_count"], 3);
+
+    let mut first_args = scope.clone();
+    first_args
+        .as_object_mut()
+        .unwrap()
+        .insert("limit".into(), json!(1));
+    let first = call(&registry, &db, first_args).await;
+    assert_eq!(first["matched_event_count"], 1);
+    assert_eq!(first["has_more"], true);
+    assert!(first["next_request"].is_object());
+    let second = call(&registry, &db, first["next_request"].clone()).await;
+    assert_eq!(second["matched_event_count"], 1);
+    assert_eq!(second["has_more"], true);
+    let third = call(&registry, &db, second["next_request"].clone()).await;
+    assert_eq!(third["matched_event_count"], 1);
+    assert_eq!(third["has_more"], false);
+    assert_eq!(third["next_request"], Value::Null);
+
+    let total: i64 = [&first, &second, &third]
+        .iter()
+        .map(|page| page["changes"][0]["event_count"].as_i64().unwrap())
+        .sum();
+    assert_eq!(total, 3);
+    let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
+    for page in [&first, &second, &third] {
+        for change in page["changes"].as_array().unwrap() {
+            seen.insert((
+                change["record_id"].as_str().unwrap().to_string(),
+                change["channel"]["kind"].as_str().unwrap().to_string(),
+            ));
+        }
+    }
+    assert_eq!(
+        seen,
+        BTreeSet::from([
+            (
+                "c07b0000-0000-4000-8000-000000000073".to_string(),
+                "web".to_string()
+            ),
+            (
+                "c07b0000-0000-4000-8000-000000000073".to_string(),
+                "mcp".to_string()
+            ),
+            ("record:paged-legacy".to_string(), "unknown".to_string()),
+        ])
+    );
     db.close().await;
 }

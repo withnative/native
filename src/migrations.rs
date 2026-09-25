@@ -16,6 +16,8 @@ use sqlx::{Connection, Row, SqliteConnection};
 
 use crate::db::{probe_database, DatabaseVersionState, CURRENT_ENGINE_SCHEMA_VERSION};
 use crate::error::{Error, Result};
+#[cfg(test)]
+use crate::mcp::{AuthoritativeDisposition, ToolKind};
 
 pub trait EngineMigrationStep: std::fmt::Debug + Send + Sync {
     fn from(&self) -> i64;
@@ -32,8 +34,8 @@ pub trait EngineMigrationStep: std::fmt::Debug + Send + Sync {
     /// Whether the runner must `VACUUM` this file in autocommit *before*
     /// opening the step's ordinary `BEGIN IMMEDIATE` apply transaction.
     ///
-    /// SQLite refuses `VACUUM` inside a transaction. The compacting 52→53
-    /// and 54→55 edges return true. The runner then
+    /// SQLite refuses `VACUUM` inside a transaction. The compacting 52→53,
+    /// 54→55, and 63→64 edges return true. The runner then
     /// keeps every ordinary contract: fenced apply, version stamp inside
     /// `BEGIN IMMEDIATE`, and `ROLLBACK` if a later fence or apply fails so
     /// `user_version` cannot advance in autocommit. Failure or kill leaves
@@ -198,6 +200,16 @@ fn production_migrations() -> Vec<Arc<dyn EngineMigrationStep>> {
         Arc::new(Engine52To53Migration),
         Arc::new(Engine53To54Migration),
         Arc::new(Engine54To55Migration),
+        Arc::new(Engine55To56Migration),
+        Arc::new(Engine56To57Migration),
+        Arc::new(Engine57To58Migration),
+        Arc::new(Engine58To59Migration),
+        Arc::new(Engine59To60Migration),
+        Arc::new(Engine60To61Migration),
+        Arc::new(Engine61To62Migration),
+        Arc::new(Engine62To63Migration),
+        Arc::new(Engine63To64Migration),
+        Arc::new(Engine64To65Migration),
     ]
 }
 
@@ -1571,6 +1583,1170 @@ impl EngineMigrationStep for Engine54To55Migration {
     }
 }
 
+/// The exact engine-55-to-56 statements: the single authoritative source for
+/// this schema edge.
+///
+/// Both the reference SQLite runner (`Engine55To56Migration::apply` below)
+/// and the Turso-local runner
+/// (`crate::turso_local::migrate_existing_engine_schema`) execute this same
+/// sequence. Each runner keeps its own connection API, transaction and pragma
+/// handling, error mapping, and fault behavior; only the backend-neutral
+/// schema and data statements are shared.
+///
+/// Every `ALTER TABLE ... ADD COLUMN act` is metadata-only with a NULL
+/// default, so existing rows are left unstamped (grouping unknown) and the
+/// edge stays cheap on large files. The `act_cutover` seed records the
+/// per-domain grouping-unknown frontier explicitly rather than fabricating
+/// grouping for legacy rows.
+pub(crate) const ENGINE_55_TO_56_STATEMENTS: [&str; 14] = [
+    "ALTER TABLE content_events ADD COLUMN act INTEGER",
+    "ALTER TABLE policy_events ADD COLUMN act INTEGER",
+    "ALTER TABLE awareness_events ADD COLUMN act INTEGER",
+    "ALTER TABLE notification_candidate_events ADD COLUMN act INTEGER",
+    "ALTER TABLE binding_audit ADD COLUMN act INTEGER",
+    "ALTER TABLE database_identity_audit ADD COLUMN act INTEGER",
+    "ALTER TABLE meta_events ADD COLUMN act INTEGER",
+    "ALTER TABLE control_events ADD COLUMN act INTEGER",
+    "ALTER TABLE derivation_events ADD COLUMN act INTEGER",
+    "ALTER TABLE relationship_events ADD COLUMN act INTEGER",
+    r#"CREATE TABLE act_state (
+     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+     next_act  INTEGER NOT NULL CHECK (next_act >= 0)
+    )"#,
+    r#"INSERT INTO act_state (singleton, next_act) VALUES (1, 0)"#,
+    r#"CREATE TABLE act_cutover (
+     domain            TEXT PRIMARY KEY CHECK (domain IN ('content_events','policy_events','awareness_events','notification_candidate_events','binding_audit','database_identity_audit','meta_events','control_events','derivation_events','relationship_events')),
+     last_legacy_seq   INTEGER NOT NULL CHECK (last_legacy_seq >= 0),
+     cutover_at        TEXT NOT NULL,
+     from_engine_schema INTEGER
+    )"#,
+    r#"INSERT INTO act_cutover (domain,last_legacy_seq,cutover_at,from_engine_schema)
+       VALUES ('awareness_events',(SELECT COALESCE(MAX(seq),0) FROM awareness_events),strftime('%Y-%m-%dT%H:%M:%fZ','now'),55),
+              ('binding_audit',(SELECT COALESCE(MAX(seq),0) FROM binding_audit),strftime('%Y-%m-%dT%H:%M:%fZ','now'),55),
+              ('content_events',(SELECT COALESCE(MAX(seq),0) FROM content_events),strftime('%Y-%m-%dT%H:%M:%fZ','now'),55),
+              ('control_events',(SELECT COALESCE(MAX(seq),0) FROM control_events),strftime('%Y-%m-%dT%H:%M:%fZ','now'),55),
+              ('database_identity_audit',(SELECT COALESCE(MAX(seq),0) FROM database_identity_audit),strftime('%Y-%m-%dT%H:%M:%fZ','now'),55),
+              ('derivation_events',(SELECT COALESCE(MAX(seq),0) FROM derivation_events),strftime('%Y-%m-%dT%H:%M:%fZ','now'),55),
+              ('meta_events',(SELECT COALESCE(MAX(seq),0) FROM meta_events),strftime('%Y-%m-%dT%H:%M:%fZ','now'),55),
+              ('notification_candidate_events',(SELECT COALESCE(MAX(seq),0) FROM notification_candidate_events),strftime('%Y-%m-%dT%H:%M:%fZ','now'),55),
+              ('policy_events',(SELECT COALESCE(MAX(seq),0) FROM policy_events),strftime('%Y-%m-%dT%H:%M:%fZ','now'),55),
+              ('relationship_events',(SELECT COALESCE(MAX(seq),0) FROM relationship_events),strftime('%Y-%m-%dT%H:%M:%fZ','now'),55)"#,
+];
+
+/// The exact engine-56-to-57 statements: the single authoritative source for
+/// this schema edge.
+///
+/// The reference SQLite runner (`Engine56To57Migration::apply` below)
+/// executes the frozen trigger text shared with fresh-schema DDL
+/// (`crate::schema::ddl::CONTENT_EVENTS_APPEND_ONLY_TRIGGERS`), so migrated
+/// databases are byte-identical to fresh ones. The Turso-local runner
+/// deliberately does not execute this edge: its contract corpus requires
+/// physical content-event mutation probes, so it advances the version stamp
+/// without installing these triggers (see `migrate_existing_engine_schema`).
+pub(crate) const ENGINE_56_TO_57_STATEMENTS: [&str; 2] =
+    crate::schema::ddl::CONTENT_EVENTS_APPEND_ONLY_TRIGGERS;
+
+/// Stamp every canonical event with a gapless per-workspace act number
+/// (decision 4e152d5): nullable `act` columns on the ten sequenced logs plus
+/// the `act_state` counter and the recorded `act_cutover`. Historical rows
+/// keep NULL acts and stay grouping-unknown; the counter starts at zero so
+/// the first post-cutover transaction allocates act 1.
+#[derive(Debug)]
+struct Engine55To56Migration;
+
+impl EngineMigrationStep for Engine55To56Migration {
+    fn from(&self) -> i64 {
+        55
+    }
+
+    fn to(&self) -> i64 {
+        56
+    }
+
+    fn name(&self) -> &str {
+        "engine-55-to-56-act-number-stamping"
+    }
+
+    fn preflight<'a>(&'a self, connection: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move {
+            let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+                .fetch_one(&mut *connection)
+                .await?;
+            if version == 55 {
+                crate::db::validate_supported_engine_migration_source(connection, 55).await?;
+            }
+            Ok(())
+        }
+        .boxed()
+    }
+
+    fn apply<'a>(&'a self, connection: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move {
+            for statement in ENGINE_55_TO_56_STATEMENTS {
+                sqlx::query(statement).execute(&mut *connection).await?;
+            }
+            Ok(())
+        }
+        .boxed()
+    }
+}
+
+/// The content-event append-only edge (engine 56 → 57).
+///
+/// SQLite `content_events` gains the same durable UPDATE/DELETE rejection
+/// Postgres already enforces (`content_events_append_only`), spelled in this
+/// repository's SQLite convention (`content_events_no_update` /
+/// `content_events_no_delete`, `'content_events is append-only'`), matching
+/// the existing `relationship_events`, `policy_events`, and
+/// `provenance_action_attestations` triggers. Purely additive: no existing
+/// table, index, or row is touched, and every production writer appends via
+/// INSERT, so no legitimate rewrite path exists to preserve.
+#[derive(Debug)]
+struct Engine56To57Migration;
+
+impl EngineMigrationStep for Engine56To57Migration {
+    fn from(&self) -> i64 {
+        56
+    }
+
+    fn to(&self) -> i64 {
+        57
+    }
+
+    fn name(&self) -> &str {
+        "engine-56-to-57-content-events-append-only"
+    }
+
+    fn preflight<'a>(&'a self, connection: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move {
+            let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+                .fetch_one(&mut *connection)
+                .await?;
+            if version == 56 {
+                crate::db::validate_supported_engine_migration_source(connection, 56).await?;
+            }
+            Ok(())
+        }
+        .boxed()
+    }
+
+    fn apply<'a>(&'a self, connection: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move {
+            for statement in ENGINE_56_TO_57_STATEMENTS {
+                sqlx::query(statement).execute(&mut *connection).await?;
+            }
+            Ok(())
+        }
+        .boxed()
+    }
+}
+
+/// The exact engine-57-to-58 statements: the single authoritative source for
+/// this schema edge.
+///
+/// Both the reference SQLite runner (`Engine57To58Migration::apply` below)
+/// and the Turso-local runner
+/// (`crate::turso_local::migrate_existing_engine_schema`) execute this same
+/// sequence. Each runner keeps its own connection API, transaction and pragma
+/// handling, error mapping, and fault behavior; only the backend-neutral
+/// schema statements are shared.
+///
+/// Every `ALTER TABLE ... ADD COLUMN` is metadata-only with a NULL default,
+/// so existing runs keep NULL reported identity (admitted before any client
+/// could declare it) and the edge stays cheap on large files. The fresh-DDL
+/// `agent_runs` definition carries the three columns last, so the appended
+/// columns land in the identical physical position and migrated databases are
+/// byte-identical to fresh ones under the shape contract.
+pub(crate) const ENGINE_57_TO_58_STATEMENTS: [&str; 3] = [
+    "ALTER TABLE agent_runs ADD COLUMN reported_mcp_client_name TEXT",
+    "ALTER TABLE agent_runs ADD COLUMN reported_mcp_client_version TEXT",
+    "ALTER TABLE agent_runs ADD COLUMN reported_model TEXT",
+];
+
+/// The reported-client-identity edge (engine 57 → 58).
+///
+/// Nullable column adds only: no row is rebuilt, no existing table, index, or
+/// trigger is touched, and every production writer inserts with explicit
+/// column lists, so no legitimate statement path needs preserving.
+#[derive(Debug)]
+struct Engine57To58Migration;
+
+impl EngineMigrationStep for Engine57To58Migration {
+    fn from(&self) -> i64 {
+        57
+    }
+
+    fn to(&self) -> i64 {
+        58
+    }
+
+    fn name(&self) -> &str {
+        "engine-57-to-58-agent-run-client-identity"
+    }
+
+    fn preflight<'a>(&'a self, connection: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move {
+            let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+                .fetch_one(&mut *connection)
+                .await?;
+            if version == 57 {
+                crate::db::validate_supported_engine_migration_source(connection, 57).await?;
+            }
+            Ok(())
+        }
+        .boxed()
+    }
+
+    fn apply<'a>(&'a self, connection: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move {
+            for statement in ENGINE_57_TO_58_STATEMENTS {
+                sqlx::query(statement).execute(&mut *connection).await?;
+            }
+            Ok(())
+        }
+        .boxed()
+    }
+}
+
+/// The exact engine-58-to-59 DDL: the single authoritative source for this
+/// schema edge's structural change.
+///
+/// Both the reference SQLite runner (`Engine58To59Migration::apply` below)
+/// and the Turso-local runner
+/// (`crate::turso_local::migrate_existing_engine_schema`) execute this same
+/// sequence. Each runner keeps its own connection API, transaction and pragma
+/// handling, error mapping, and fault behavior; only the backend-neutral
+/// schema statements are shared. The data backfill is a Rust loop over the
+/// parser (see `backfill_record_mentions`), so it cannot be shared as SQL:
+///
+/// - SQLite applies DDL + backfill together, inside the runner's
+///   `BEGIN IMMEDIATE` transaction.
+/// - Turso-local applies DDL + its own `backfill_record_mentions` mirror
+///   together, inside the same `BEGIN IMMEDIATE` transaction. Both backfills
+///   share `record_body::BODY_CARRYING_EVENT_SQL` and the same scan/coercion
+///   semantics, so a migrated database converges with the live fold and replay
+///   on either backend.
+///
+/// The three statements must stay byte-identical to the corresponding
+/// `crate::schema::DDL_STATEMENTS` entries; the 58→59 migration test asserts
+/// that rather than assuming it.
+pub(crate) const ENGINE_58_TO_59_STATEMENTS: [&str; 3] = [
+    r#"CREATE TABLE record_mentions (
+      source_id          TEXT NOT NULL REFERENCES records(id) ON DELETE CASCADE,
+      occurrence_ix      INTEGER NOT NULL,
+      source_event_seq   INTEGER NOT NULL REFERENCES content_events(seq),
+      span_start         INTEGER NOT NULL CHECK (span_start >= 0),
+      span_end           INTEGER NOT NULL CHECK (span_end > span_start),
+      authored_reference TEXT NOT NULL CHECK (length(trim(authored_reference)) > 0),
+      lookup_key         TEXT NOT NULL CHECK (length(trim(lookup_key)) > 0),
+      form               TEXT NOT NULL CHECK (form IN ('url', 'wiki_hex', 'wiki_name', 'bare_hex')),
+      parser_version     INTEGER NOT NULL CHECK (parser_version > 0),
+      PRIMARY KEY (source_id, occurrence_ix)
+    )"#,
+    r#"CREATE INDEX idx_record_mentions_lookup
+        ON record_mentions(lookup_key, source_id)"#,
+    r#"CREATE INDEX idx_record_mentions_source
+        ON record_mentions(source_id)"#,
+];
+
+/// The current-state body-mention projection edge (engine 58 → 59).
+///
+/// DDL-additive plus a backfill that converges with the live fold: the table
+/// holds only occurrences from each live record's current body, stamped with
+/// that body's provenance.
+#[derive(Debug)]
+struct Engine58To59Migration;
+
+impl EngineMigrationStep for Engine58To59Migration {
+    fn from(&self) -> i64 {
+        58
+    }
+
+    fn to(&self) -> i64 {
+        59
+    }
+
+    fn name(&self) -> &str {
+        "engine-58-to-59-record-mentions-projection"
+    }
+
+    fn preflight<'a>(&'a self, connection: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move {
+            let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+                .fetch_one(&mut *connection)
+                .await?;
+            if version == 58 {
+                crate::db::validate_supported_engine_migration_source(connection, 58).await?;
+            }
+            Ok(())
+        }
+        .boxed()
+    }
+
+    fn apply<'a>(&'a self, connection: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move {
+            for statement in ENGINE_58_TO_59_STATEMENTS {
+                sqlx::query(statement).execute(&mut *connection).await?;
+            }
+            backfill_record_mentions(connection).await?;
+            Ok(())
+        }
+        .boxed()
+    }
+}
+
+/// Backfill `record_mentions` from live current bodies.
+///
+/// For each live (`deleted_at IS NULL`) record whose stored body is non-empty
+/// text, scan the CURRENT body text and stamp every row with the latest
+/// body-carrying event's sequence, not `MAX(seq)` overall: metadata-only
+/// updates and deletions carry higher sequences but no body, and stamping
+/// those would diverge from the live fold, which keeps the body's own event
+/// sequence. The event set is exactly the projector's four body writers
+/// (`crate::record_body::BODY_CARRYING_EVENT_SQL`) — `record.created`,
+/// `record.updated`, `receipt.committed.v1` through `$.body`, and
+/// `unit.revision.recorded.v1` through `$.content.content`. Tombstoned,
+/// removed (null/empty body) and never-written sources yield no rows — the
+/// same replacement semantics as the live fold, so backfill, live folding and
+/// replay converge.
+///
+/// A live non-empty body with no body-carrying event (only possible when the
+/// row was written outside the projector, never through an append) is left
+/// without rows rather than stamped with an invented sequence; the next
+/// body-carrying write folds it. Skipping also preserves rebuild equality
+/// there, since a replay over the same log produces no rows either.
+///
+/// `typeof(body)='text'` excludes non-text storage classes the scanner cannot
+/// read; a stored body is already the canonical text the projector coerced,
+/// so the live fold scans the same bytes.
+pub(crate) async fn backfill_record_mentions(connection: &mut SqliteConnection) -> Result<()> {
+    let sources: Vec<(String, String)> = sqlx::query_as(
+        "SELECT id, body FROM records
+          WHERE deleted_at IS NULL AND typeof(body) = 'text' AND body <> ''
+          ORDER BY id",
+    )
+    .fetch_all(&mut *connection)
+    .await?;
+    let provenance_sql = format!(
+        "SELECT MAX(seq) FROM content_events
+          WHERE record_id = ? AND ({})",
+        crate::record_body::BODY_CARRYING_EVENT_SQL
+    );
+    for (source_id, body) in sources {
+        let source_event_seq: Option<i64> = sqlx::query_scalar(&provenance_sql)
+            .bind(&source_id)
+            .fetch_one(&mut *connection)
+            .await?;
+        let Some(source_event_seq) = source_event_seq else {
+            continue;
+        };
+        sqlx::query("DELETE FROM record_mentions WHERE source_id = ?")
+            .bind(&source_id)
+            .execute(&mut *connection)
+            .await?;
+        for (occurrence_ix, occurrence) in crate::mentions::scan_body(&body).iter().enumerate() {
+            sqlx::query(
+                "INSERT INTO record_mentions
+                   (source_id, occurrence_ix, source_event_seq, span_start, span_end,
+                    authored_reference, lookup_key, form, parser_version)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&source_id)
+            .bind(occurrence_ix as i64)
+            .bind(source_event_seq)
+            .bind(occurrence.span_start as i64)
+            .bind(occurrence.span_end as i64)
+            .bind(&occurrence.authored_reference)
+            .bind(&occurrence.lookup_key)
+            .bind(occurrence.form.as_str())
+            .bind(crate::mentions::MENTION_PARSER_VERSION)
+            .execute(&mut *connection)
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+/// Add workspace-act membership to provenance validity changes. Historical
+/// rows remain NULL because their transaction grouping is unknown.
+pub(crate) const ENGINE_59_TO_60_STATEMENTS: [&str; 2] = [
+    "ALTER TABLE provenance_attestation_validity_events ADD COLUMN act INTEGER",
+    "CREATE INDEX idx_provenance_validity_act ON provenance_attestation_validity_events(act) WHERE act IS NOT NULL",
+];
+#[derive(Debug)]
+struct Engine59To60Migration;
+
+impl EngineMigrationStep for Engine59To60Migration {
+    fn from(&self) -> i64 {
+        59
+    }
+    fn to(&self) -> i64 {
+        60
+    }
+    fn name(&self) -> &str {
+        "engine-59-to-60-provenance-validity-act-stamping"
+    }
+
+    fn preflight<'a>(&'a self, connection: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move {
+            let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+                .fetch_one(&mut *connection)
+                .await?;
+            if version == 59 {
+                crate::db::validate_supported_engine_migration_source(connection, 59).await?;
+            }
+            Ok(())
+        }
+        .boxed()
+    }
+
+    fn apply<'a>(&'a self, connection: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move {
+            for statement in ENGINE_59_TO_60_STATEMENTS {
+                sqlx::query(statement).execute(&mut *connection).await?;
+            }
+            Ok(())
+        }
+        .boxed()
+    }
+}
+
+/// Add partial act-range indexes to the ten sequenced canonical logs and
+/// freeze the unwatermarked binding-system registry.
+pub(crate) const ENGINE_60_TO_61_STATEMENTS: [&str; 13] = [
+    "CREATE INDEX idx_content_events_act ON content_events(act) WHERE act IS NOT NULL",
+    "CREATE INDEX idx_policy_events_act ON policy_events(act) WHERE act IS NOT NULL",
+    "CREATE INDEX idx_awareness_events_act ON awareness_events(act) WHERE act IS NOT NULL",
+    "CREATE INDEX idx_notification_candidate_events_act ON notification_candidate_events(act) WHERE act IS NOT NULL",
+    "CREATE INDEX idx_binding_audit_act ON binding_audit(act) WHERE act IS NOT NULL",
+    "CREATE INDEX idx_database_identity_audit_act ON database_identity_audit(act) WHERE act IS NOT NULL",
+    "CREATE INDEX idx_meta_events_act ON meta_events(act) WHERE act IS NOT NULL",
+    "CREATE INDEX idx_control_events_act ON control_events(act) WHERE act IS NOT NULL",
+    "CREATE INDEX idx_derivation_events_act ON derivation_events(act) WHERE act IS NOT NULL",
+    "CREATE INDEX idx_relationship_events_act ON relationship_events(act) WHERE act IS NOT NULL",
+    "CREATE TRIGGER binding_systems_no_insert BEFORE INSERT ON binding_systems BEGIN SELECT RAISE(ABORT, 'binding_systems is immutable'); END",
+    "CREATE TRIGGER binding_systems_no_update BEFORE UPDATE ON binding_systems BEGIN SELECT RAISE(ABORT, 'binding_systems is immutable'); END",
+    "CREATE TRIGGER binding_systems_no_delete BEFORE DELETE ON binding_systems BEGIN SELECT RAISE(ABORT, 'binding_systems is immutable'); END",
+];
+
+#[derive(Debug)]
+struct Engine60To61Migration;
+
+impl EngineMigrationStep for Engine60To61Migration {
+    fn from(&self) -> i64 {
+        60
+    }
+    fn to(&self) -> i64 {
+        61
+    }
+    fn name(&self) -> &str {
+        "engine-60-to-61-canonical-act-range-indexes"
+    }
+
+    fn preflight<'a>(&'a self, connection: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move {
+            let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+                .fetch_one(&mut *connection)
+                .await?;
+            if version == 60 {
+                crate::db::validate_supported_engine_migration_source(connection, 60).await?;
+            }
+            Ok(())
+        }
+        .boxed()
+    }
+
+    fn apply<'a>(&'a self, connection: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move {
+            for statement in ENGINE_60_TO_61_STATEMENTS {
+                sqlx::query(statement).execute(&mut *connection).await?;
+            }
+            Ok(())
+        }
+        .boxed()
+    }
+}
+
+/// Stamp workspace acts on external observations and awareness command
+/// intents. Historical rows remain NULL because their grouping is unknown.
+pub(crate) const ENGINE_61_TO_62_STATEMENTS: [&str; 4] = [
+    "ALTER TABLE external_observations ADD COLUMN act INTEGER",
+    "CREATE INDEX idx_external_observations_act ON external_observations(act) WHERE act IS NOT NULL",
+    "ALTER TABLE awareness_command_intents ADD COLUMN act INTEGER",
+    "CREATE INDEX idx_awareness_command_intents_act ON awareness_command_intents(act) WHERE act IS NOT NULL",
+];
+
+#[derive(Debug)]
+struct Engine61To62Migration;
+
+impl EngineMigrationStep for Engine61To62Migration {
+    fn from(&self) -> i64 {
+        61
+    }
+    fn to(&self) -> i64 {
+        62
+    }
+    fn name(&self) -> &str {
+        "engine-61-to-62-observation-intent-act-stamping"
+    }
+
+    fn preflight<'a>(&'a self, connection: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move {
+            let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+                .fetch_one(&mut *connection)
+                .await?;
+            if version == 61 {
+                crate::db::validate_supported_engine_migration_source(connection, 61).await?;
+            }
+            Ok(())
+        }
+        .boxed()
+    }
+
+    fn apply<'a>(&'a self, connection: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move {
+            for statement in ENGINE_61_TO_62_STATEMENTS {
+                sqlx::query(statement).execute(&mut *connection).await?;
+            }
+            Ok(())
+        }
+        .boxed()
+    }
+}
+
+/// The selective read-log cleanup edge (engine 62 → 63, task 8a6377f PR B).
+///
+/// Data-only: no schema object moves (62 and 63 share one structural shape),
+/// so there is no `requires_foreign_keys_disabled` rebuild and no
+/// `requires_pre_apply_compaction` VACUUM hop. Foreign keys stay enforced so
+/// deleting a disposable call cascades to its touches, and any dangling
+/// reference would fail the edge closed inside the runner's transaction.
+///
+/// The row predicate mirrors PR A's live-capture retention predicate
+/// (`crate::mcp::interactions::should_retain_capture`, task 8a6377f PR A)
+/// for the reviewed engine-59 corpus, with frozen tool sets below. The
+/// equality test detects later drift from PR A without changing historical
+/// replay; tools added after that freeze remain retained pending audit:
+///
+/// * run issuance (`bootstrap`, plus read/mixed-read calls carrying a
+///   `"new"` / `"new:<agent>"` run-key selector) keeps its call row but
+///   loses its attention touches, and its arguments shrink to the run-key
+///   selector alone — the same row/touch split PR A writes for new traffic.
+///   Rows whose `arguments` are not valid JSON are retained byte-identical
+///   (never normalized, never deleted): malformed history fails closed;
+/// * annotation-bearing rows, rows with `mutated` touches, successful
+///   `set_intent` declarations, failed declaration attempts, every
+///   `Mutation`-disposition call, and mixed-tool write/unknown/malformed
+///   actions are kept with verbatim arguments, ordering, and touches
+///   (fail-closed: unknown tool names are never disposable);
+/// * only known-observational calls are deleted: `Read`-disposition tools
+///   (other than issuance) and the read actions of mixed (`Actions`) tools
+///   for these exact arguments.
+/// * `result_count`, `result_bytes`, and per-touch `result_rank` keep their
+///   historical values: PR A nulls them at write time for new rows, but the
+///   cleanup preserves retained evidence verbatim rather than scrubbing it.
+///
+/// Dictionary entries (`read_log_record_ids`) survive only while referenced:
+/// entries orphaned by the touch/call deletions — including pre-existing
+/// orphans — are purged. Call `seq` values are never renumbered, so
+/// intra-run ordering (`ORDER BY ended_at, seq`), `parent_key` chains, and
+/// the `sqlite_sequence` high-water mark survive the edge.
+#[derive(Debug)]
+struct Engine62To63Migration;
+
+impl EngineMigrationStep for Engine62To63Migration {
+    fn from(&self) -> i64 {
+        62
+    }
+
+    fn to(&self) -> i64 {
+        63
+    }
+
+    fn name(&self) -> &str {
+        "engine-62-to-63-read-log-selective-cleanup"
+    }
+
+    fn preflight<'a>(&'a self, connection: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move {
+            let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+                .fetch_one(&mut *connection)
+                .await?;
+            if version == 62 {
+                crate::db::validate_supported_engine_migration_source(connection, 62).await?;
+            }
+            Ok(())
+        }
+        .boxed()
+    }
+
+    fn apply<'a>(&'a self, connection: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move { apply_read_log_selective_cleanup(connection).await }.boxed()
+    }
+}
+
+/// Reclaim the pages released by 62→63 without changing any logical row or
+/// schema object. VACUUM runs in autocommit before this hop's fenced, no-op
+/// apply transaction. A kill or lost fence before the stamp leaves engine 63
+/// retryable; current engine 64 opens do not vacuum.
+#[derive(Debug)]
+struct Engine63To64Migration;
+
+impl EngineMigrationStep for Engine63To64Migration {
+    fn from(&self) -> i64 {
+        63
+    }
+
+    fn to(&self) -> i64 {
+        64
+    }
+
+    fn name(&self) -> &str {
+        "engine-63-to-64-read-log-freelist-compaction"
+    }
+
+    fn requires_pre_apply_compaction(&self) -> bool {
+        true
+    }
+
+    fn preflight<'a>(&'a self, connection: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move {
+            let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+                .fetch_one(&mut *connection)
+                .await?;
+            if version == 63 {
+                crate::db::validate_supported_engine_migration_source(connection, 63).await?;
+            }
+            Ok(())
+        }
+        .boxed()
+    }
+
+    fn apply<'a>(&'a self, _connection: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move { Ok(()) }.boxed()
+    }
+}
+
+/// The exact engine-64-to-65 DDL: the single authoritative source for this
+/// schema edge's structural change.
+///
+/// Both the reference SQLite runner (`Engine64To65Migration::apply` below)
+/// and the Turso-local runner
+/// (`crate::turso_local::migrate_existing_engine_schema`) execute this same
+/// sequence. The edge is DDL-only: `alpha_tab_installs` is new install state
+/// with no pre-existing rows to backfill, so a migrated database gains the
+/// empty projection and converges with a fresh database trivially.
+///
+/// The two statements must stay byte-identical to the corresponding
+/// `crate::schema::DDL_STATEMENTS` entries; the 64→65 migration test asserts
+/// that rather than assuming it.
+pub(crate) const ENGINE_64_TO_65_STATEMENTS: [&str; 2] = [
+    r#"CREATE TABLE alpha_tab_installs (
+     account_id                TEXT NOT NULL CHECK (length(trim(account_id)) > 0),
+     package                   TEXT NOT NULL CHECK (length(trim(package)) > 0),
+     version                   TEXT NOT NULL CHECK (length(trim(version)) > 0),
+     digest                    TEXT NOT NULL CHECK (length(trim(digest)) > 0),
+     artifact_id               TEXT NOT NULL REFERENCES records(id),
+     consented_source_revision TEXT NOT NULL CHECK (length(trim(consented_source_revision)) > 0),
+     declaration_digest        TEXT NOT NULL CHECK (length(declaration_digest) = 64),
+     consented_declaration     TEXT NOT NULL CHECK (json_valid(consented_declaration) AND json_type(consented_declaration) = 'object'),
+     adoption                  TEXT NOT NULL CHECK (adoption IN ('caller_asserted','shell_adopt.v1')),
+     status                    TEXT NOT NULL CHECK (status IN ('installed','disabled','removed')),
+     event_id                  TEXT NOT NULL UNIQUE REFERENCES control_events(id),
+     event_seq                 INTEGER NOT NULL UNIQUE REFERENCES control_events(seq),
+     updated_at                TEXT NOT NULL,
+     PRIMARY KEY (account_id, package)
+    )"#,
+    r#"CREATE INDEX idx_alpha_tab_installs_artifact ON alpha_tab_installs(artifact_id)"#,
+];
+
+/// The personal alpha-tab install projection edge (engine 64 → 65).
+#[derive(Debug)]
+struct Engine64To65Migration;
+
+impl EngineMigrationStep for Engine64To65Migration {
+    fn from(&self) -> i64 {
+        64
+    }
+
+    fn to(&self) -> i64 {
+        65
+    }
+
+    fn name(&self) -> &str {
+        "engine-64-to-65-alpha-tab-installs-projection"
+    }
+
+    fn preflight<'a>(&'a self, connection: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move {
+            let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+                .fetch_one(&mut *connection)
+                .await?;
+            if version == 64 {
+                crate::db::validate_supported_engine_migration_source(connection, 64).await?;
+            }
+            Ok(())
+        }
+        .boxed()
+    }
+
+    fn apply<'a>(&'a self, connection: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move {
+            for statement in ENGINE_64_TO_65_STATEMENTS {
+                sqlx::query(statement).execute(&mut *connection).await?;
+            }
+            Ok(())
+        }
+        .boxed()
+    }
+}
+
+/// Frozen 62→63 deletion policy: the `Read`-disposition tools whose calls
+/// are disposable unless kept by an earlier retention rule, minus
+/// `bootstrap`, which is always issuance rather than exhaust.
+///
+/// Frozen, not derived: historical deletion must not change when a later
+/// release adds tools or reclassifies them. Measured from the reviewed
+/// engine-59 policy before the 62→63 edge was renumbered. The equality test
+/// compares this snapshot to the current PR A capture disposition
+/// with only explicitly named post-freeze tools excluded, so later drift
+/// fails loudly instead of silently retargeting history.
+const ENGINE_62_TO_63_PURE_READ_TOOLS: &[&str] = &[
+    "describe_schema",
+    "engine_info",
+    "get_dashboard",
+    "get_event_context",
+    "get_history",
+    "get_record",
+    "get_reuse_context",
+    "get_run_activity",
+    "get_structure",
+    "open_collection",
+    "ping",
+    "preview_record_shape",
+    "query_record",
+    "query_sql",
+    "reach_read",
+    "read_attachment",
+    "read_attributions",
+    "read_canvas",
+    "read_guide",
+    "render_artifact",
+    "render_record",
+    "render_record_version_diff",
+    "render_suggestion_review",
+    "resolve_citation",
+    "resolve_facets",
+    "resolve_many",
+    "resolve_rollup",
+    "scan",
+    "search",
+    "standby_status",
+    "suggest_facet_values",
+    "verify_artifact",
+    "whats_changed",
+    "workspace_read",
+];
+
+/// Frozen 62→63 deletion policy: `(tool, read-actions)` for every
+/// mixed-disposition shipped tool in the reviewed engine-59 policy. A call on one of
+/// these tools is disposable only when its exact `action` argument is one
+/// of the listed read actions; missing, non-string, or unknown actions fail
+/// closed (kept), exactly like PR A capture. Frozen for the same reason as
+/// [`ENGINE_62_TO_63_PURE_READ_TOOLS`].
+const ENGINE_62_TO_63_MIXED_READS: &[(&str, &[&str])] = &[
+    ("manage_artifact_inputs", &["read"]),
+    ("manage_artifact_module_grants", &["read"]),
+    ("manage_attachments", &["inspect", "list"]),
+    ("manage_bindings", &["list", "observations"]),
+    ("manage_change_summaries", &["inspect"]),
+    ("manage_facet_observations", &["list"]),
+    ("manage_instructions", &["compare_seeded_default", "list"]),
+    ("manage_interventions", &["get", "query"]),
+    ("manage_links", &["list"]),
+    ("manage_mdx_modules", &["impact", "inspect"]),
+    (
+        "manage_memberships",
+        &["invitations_inspect", "invitations_list", "list"],
+    ),
+    (
+        "manage_messages",
+        &[
+            "get_attention",
+            "list_context",
+            "list_conversation",
+            "list_destinations",
+            "list_inbox",
+            "list_message_state",
+            "list_my_conversations",
+            "list_notification_candidates",
+            "list_unclassified",
+        ],
+    ),
+    (
+        "manage_onboarding",
+        &["list_programmes", "preview_generation"],
+    ),
+    ("manage_record_policy", &["inspect", "list"]),
+    ("manage_relationships", &["find", "read", "why"]),
+    ("manage_renderer_binding", &["read"]),
+    ("manage_schema_config", &["read"]),
+    ("manage_surface_bindings", &["get", "list"]),
+    ("manage_vocabularies", &["list_values"]),
+    ("query_change_summaries", &["drill", "get", "list"]),
+    ("start_work", &["preview"]),
+];
+
+/// Frozen 62→63 policy: the `Mutation`-disposition tools in the reviewed
+/// engine-59 policy, pinned for the dry-run report and equality test.
+/// Mutation calls are always retained, so this list never appears in a
+/// `DELETE`, but the report needs it to tell unknown tools apart from
+/// known mutations. Frozen for the same reason as
+/// [`ENGINE_62_TO_63_PURE_READ_TOOLS`].
+const ENGINE_62_TO_63_MUTATION_TOOLS: &[&str] = &[
+    "advance_artifact_port_pin",
+    "archive_record",
+    "attach_from_url",
+    "attach_text",
+    "batch_write",
+    "claim_unowned_record",
+    "close_run",
+    "correct_record_type",
+    "create_attribution",
+    "create_exploration",
+    "create_many",
+    "create_record",
+    "delete_record",
+    "export_snapshot",
+    "instantiate_artifact",
+    "invoke_artifact_interaction",
+    "manage_attributions",
+    "manage_canvas",
+    "manage_citations",
+    "observe_external",
+    "quickstart",
+    "reach_connect",
+    "resolve_external",
+    "resolve_suggestions",
+    "save_account",
+    "set_intent",
+    "update_record",
+];
+
+/// These read tools arrived after the reviewed deletion set was frozen.
+/// PR A capture drops their new observational calls. Historical rows with
+/// these names remain retained pending a separate consumer/corpus audit;
+/// neither renumbering nor a current Read disposition silently widens DELETE.
+const ENGINE_62_TO_63_POST_FREEZE_TOOLS: &[&str] = &[
+    "get_workspace_snapshot",
+    "authority_act_head",
+    "authority_act_delta",
+    "manage_alpha_tabs",
+];
+
+/// Shipped tools whose calls are disposable unless kept by an earlier
+/// retention rule (issuance, annotation, mutated touch, `set_intent`): the
+/// frozen [`ENGINE_62_TO_63_PURE_READ_TOOLS`] list.
+fn read_log_disposable_pure_reads() -> Vec<&'static str> {
+    ENGINE_62_TO_63_PURE_READ_TOOLS.to_vec()
+}
+
+/// `(tool, read-actions)` for every mixed-disposition shipped tool: the
+/// frozen [`ENGINE_62_TO_63_MIXED_READS`] list.
+fn read_log_mixed_reads() -> Vec<(&'static str, Vec<&'static str>)> {
+    ENGINE_62_TO_63_MIXED_READS
+        .iter()
+        .map(|(tool, actions)| (*tool, actions.to_vec()))
+        .collect()
+}
+
+/// Quote a shipped tool or action name as a SQL string literal. Names are
+/// compile-time `[a-z_]` constants from `ToolKind`; the assertion keeps a
+/// future rename honest rather than letting it become an injection.
+fn read_log_name_literal(name: &str) -> String {
+    debug_assert!(
+        !name.is_empty()
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte == b'_'),
+        "unexpected tool/action name in read-log predicate: {name}"
+    );
+    format!("'{name}'")
+}
+
+/// Total-args expression for every `json_*` call below. The bundled SQLite
+/// build aborts the whole statement on malformed text (`malformed JSON`)
+/// rather than returning `NULL`, and `WHERE`-conjunct evaluation order is
+/// the planner's choice, so a bare `json_valid(...) AND ...` guard cannot
+/// protect a later extract on its own. Reading through this `CASE`
+/// substitutes `'{}'` for anything that does not parse, which folds every
+/// malformed row to non-issuance / non-disposable — retained, fail-closed.
+fn read_log_parseable_args_sql(args_expression: &str) -> String {
+    format!("(CASE WHEN json_valid({args_expression}) THEN {args_expression} ELSE '{{}}' END)")
+}
+
+/// `json_extract(<args>,'$.run_key')` selects a fresh run (`"new"` or
+/// `"new:<agent>"`), mirroring PR A's `is_read_issuance` selector check.
+/// Two-valued by construction on top of parseable args: a missing or
+/// non-text selector is `NULL`, which would otherwise poison the enclosing
+/// `NOT` and spare every row, so each comparison is `COALESCE`d to false.
+fn read_log_run_key_is_new_sql(args_expression: &str) -> String {
+    let selector = format!("json_extract({args_expression},'$.run_key')");
+    format!(
+        "(COALESCE(({selector} = 'new'), 0) OR COALESCE((substr({selector}, 1, 4) = 'new:'), 0))"
+    )
+}
+
+/// A mixed tool's read-action match for these exact arguments, two-valued
+/// on top of parseable args: a missing, non-string, or unknown `action` is
+/// `NULL` and must fail closed (kept), never match as disposable.
+fn read_log_action_is_read_sql(args_expression: &str, actions: &[&str]) -> String {
+    let reads: Vec<String> = actions
+        .iter()
+        .map(|action| read_log_name_literal(action))
+        .collect();
+    format!(
+        "COALESCE((json_extract({args_expression},'$.action') IN ({})), 0)",
+        reads.join(", ")
+    )
+}
+
+/// Calls retained as run issuance: `bootstrap` rows plus read/mixed-read
+/// calls carrying a fresh-run selector. `calls_ref` qualifies the
+/// `read_log_calls` columns (table name or outer-query alias).
+fn read_log_issuance_sql(calls_ref: &str) -> String {
+    let args = read_log_parseable_args_sql(&format!("{calls_ref}.arguments"));
+    let is_new = read_log_run_key_is_new_sql(&args);
+    let pure: Vec<String> = read_log_disposable_pure_reads()
+        .iter()
+        .map(|tool| read_log_name_literal(tool))
+        .collect();
+    let mut alternatives = vec![format!("{calls_ref}.tool = 'bootstrap'")];
+    alternatives.push(format!(
+        "{calls_ref}.tool IN ({}) AND {is_new}",
+        pure.join(", ")
+    ));
+    for (tool, actions) in read_log_mixed_reads() {
+        alternatives.push(format!(
+            "{calls_ref}.tool = {} AND {} AND {is_new}",
+            read_log_name_literal(tool),
+            read_log_action_is_read_sql(&args, &actions)
+        ));
+    }
+    format!("({})", alternatives.join(" OR "))
+}
+
+/// Disposable calls: no annotation, no `mutated` touch, not issuance, and a
+/// known-observational shape (pure read, or a mixed tool's read action for
+/// these exact arguments). Everything else — `set_intent`, mutations, mixed
+/// writes, unknown/malformed actions, unknown tool names — is kept.
+/// Malformed `arguments` text fails closed as well: the disposable
+/// predicate requires `json_valid`, so a non-parsing row is retained
+/// byte-identical whatever its tool. All extracts additionally read through
+/// the parseable-args substitution (without it the bundled SQLite build
+/// aborts the statement on malformed text instead of returning `NULL`), and
+/// the explicit `json_valid` gates on the rewriting statements guarantee
+/// malformed bytes are never normalized.
+fn read_log_disposable_sql(calls_ref: &str) -> String {
+    let issuance = read_log_issuance_sql(calls_ref);
+    let args = read_log_parseable_args_sql(&format!("{calls_ref}.arguments"));
+    let pure: Vec<String> = read_log_disposable_pure_reads()
+        .iter()
+        .map(|tool| read_log_name_literal(tool))
+        .collect();
+    let mut observational = vec![format!("{calls_ref}.tool IN ({})", pure.join(", "))];
+    for (tool, actions) in read_log_mixed_reads() {
+        observational.push(format!(
+            "{calls_ref}.tool = {} AND {}",
+            read_log_name_literal(tool),
+            read_log_action_is_read_sql(&args, &actions)
+        ));
+    }
+    format!(
+        "({calls_ref}.result_annotation IS NULL \
+         AND NOT EXISTS (SELECT 1 FROM read_log_touches t \
+                         WHERE t.call_seq = {calls_ref}.seq AND t.interaction = 'mutated') \
+         AND NOT {issuance} \
+         AND json_valid({calls_ref}.arguments) \
+         AND ({}))",
+        observational.join(" OR ")
+    )
+}
+
+/// Aggregate-only 62→63 dry-run result. Categories overlap by design: for
+/// example a malformed known read is both retained and invalid. A mixed
+/// unmatched text action may be a valid write or an unknown future action;
+/// the frozen read-action policy cannot distinguish those without guessing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ReadLog62To63AttentionReport {
+    pub total_calls: i64,
+    pub disposable_calls: i64,
+    pub retained_calls: i64,
+    pub issuance_calls: i64,
+    pub unknown_tool_calls: i64,
+    pub mixed_missing_or_nontext_action_calls: i64,
+    pub mixed_unmatched_text_action_calls: i64,
+    pub null_arguments_calls: i64,
+    pub malformed_arguments_calls: i64,
+    pub total_touches: i64,
+    pub removable_touches: i64,
+    pub total_dictionary_entries: i64,
+    pub projected_orphan_dictionary_entries: i64,
+}
+
+/// Read-only count query for a frozen engine-62 preimage. It uses the exact
+/// DELETE and issuance predicates below, returns no tools, arguments, ids, or
+/// per-call rows, and makes fail-closed attention visible before migration.
+/// Run it on a disposable fixture/copy through a read-only connection; it is
+/// not a production preflight and does not authorize migration or compaction.
+pub async fn read_log_62_to_63_attention_report(
+    connection: &mut SqliteConnection,
+) -> Result<ReadLog62To63AttentionReport> {
+    let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+        .fetch_one(&mut *connection)
+        .await?;
+    if version != 62 {
+        return Err(Error::engine(
+            "read-log attention report requires engine 62",
+        ));
+    }
+    let calls = "c";
+    let disposable = read_log_disposable_sql(calls);
+    let issuance = read_log_issuance_sql(calls);
+    let known: Vec<String> = ENGINE_62_TO_63_PURE_READ_TOOLS
+        .iter()
+        .chain(ENGINE_62_TO_63_MUTATION_TOOLS.iter())
+        .chain(ENGINE_62_TO_63_POST_FREEZE_TOOLS.iter())
+        .chain(std::iter::once(&"bootstrap"))
+        .map(|name| read_log_name_literal(name))
+        .chain(
+            ENGINE_62_TO_63_MIXED_READS
+                .iter()
+                .map(|(name, _)| read_log_name_literal(name)),
+        )
+        .collect();
+    let mixed: Vec<String> = ENGINE_62_TO_63_MIXED_READS
+        .iter()
+        .map(|(name, _)| read_log_name_literal(name))
+        .collect();
+    let args = read_log_parseable_args_sql("c.arguments");
+    let action_type = format!("json_type({args},'$.action')");
+    let matched_read_actions = ENGINE_62_TO_63_MIXED_READS
+        .iter()
+        .map(|(tool, actions)| {
+            format!(
+                "(c.tool = {} AND {})",
+                read_log_name_literal(tool),
+                read_log_action_is_read_sql(&args, actions)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    let row = sqlx::query(&format!(
+        "SELECT COUNT(*) AS total_calls, \
+          COALESCE(SUM(CASE WHEN {disposable} THEN 1 ELSE 0 END),0) AS disposable_calls, \
+          COALESCE(SUM(CASE WHEN {issuance} THEN 1 ELSE 0 END),0) AS issuance_calls, \
+          COALESCE(SUM(CASE WHEN c.tool IS NULL OR c.tool NOT IN ({}) THEN 1 ELSE 0 END),0) AS unknown_tool_calls, \
+          COALESCE(SUM(CASE WHEN c.tool IN ({}) AND json_valid(c.arguments) AND COALESCE({action_type} != 'text',1) THEN 1 ELSE 0 END),0) AS mixed_missing_action_calls, \
+          COALESCE(SUM(CASE WHEN c.tool IN ({}) AND json_valid(c.arguments) AND {action_type} = 'text' AND NOT ({matched_read_actions}) THEN 1 ELSE 0 END),0) AS mixed_unmatched_action_calls, \
+          COALESCE(SUM(CASE WHEN c.arguments IS NULL THEN 1 ELSE 0 END),0) AS null_arguments_calls, \
+          COALESCE(SUM(CASE WHEN c.arguments IS NOT NULL AND NOT json_valid(c.arguments) THEN 1 ELSE 0 END),0) AS malformed_arguments_calls \
+         FROM read_log_calls c",
+        known.join(", "), mixed.join(", "), mixed.join(", ")
+    ))
+    .fetch_one(&mut *connection)
+    .await?;
+    let total_calls: i64 = row.try_get("total_calls")?;
+    let disposable_calls: i64 = row.try_get("disposable_calls")?;
+    let total_touches: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM read_log_touches")
+        .fetch_one(&mut *connection)
+        .await?;
+    let removable_touches: i64 = sqlx::query_scalar(&format!(
+        "SELECT COUNT(*) FROM read_log_touches t JOIN read_log_calls c ON c.seq = t.call_seq \
+         WHERE {disposable} OR ({issuance} AND (c.tool = 'bootstrap' OR json_valid(c.arguments)))"
+    ))
+    .fetch_one(&mut *connection)
+    .await?;
+    let total_dictionary_entries: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM read_log_record_ids")
+            .fetch_one(&mut *connection)
+            .await?;
+    let projected_orphan_dictionary_entries: i64 = sqlx::query_scalar(&format!(
+        "SELECT COUNT(*) FROM read_log_record_ids d WHERE NOT EXISTS \
+         (SELECT 1 FROM read_log_touches t JOIN read_log_calls c ON c.seq = t.call_seq \
+          WHERE t.record_ref = d.record_ref AND NOT ({disposable}) \
+            AND NOT ({issuance} AND (c.tool = 'bootstrap' OR json_valid(c.arguments))))"
+    ))
+    .fetch_one(&mut *connection)
+    .await?;
+    Ok(ReadLog62To63AttentionReport {
+        total_calls,
+        disposable_calls,
+        retained_calls: total_calls - disposable_calls,
+        issuance_calls: row.try_get("issuance_calls")?,
+        unknown_tool_calls: row.try_get("unknown_tool_calls")?,
+        mixed_missing_or_nontext_action_calls: row.try_get("mixed_missing_action_calls")?,
+        mixed_unmatched_text_action_calls: row.try_get("mixed_unmatched_action_calls")?,
+        null_arguments_calls: row.try_get("null_arguments_calls")?,
+        malformed_arguments_calls: row.try_get("malformed_arguments_calls")?,
+        total_touches,
+        removable_touches,
+        total_dictionary_entries,
+        projected_orphan_dictionary_entries,
+    })
+}
+
+/// Run the four selective-cleanup statements in dependency order: issuance
+/// touches, issuance argument minimization, disposable calls (whose touches
+/// cascade under the runner's enforced foreign keys), then the orphan
+/// dictionary purge. Idempotent: re-running over an already-cleaned file
+/// deletes nothing and still succeeds.
+async fn apply_read_log_selective_cleanup(connection: &mut SqliteConnection) -> Result<()> {
+    let issuance = read_log_issuance_sql("read_log_calls");
+    let disposable = read_log_disposable_sql("read_log_calls");
+    // Attention-touch strip: `bootstrap` issuance needs no JSON and strips
+    // regardless; every other issuance row matched through JSON extracts and
+    // must still parse, otherwise its touches stay as fail-closed evidence
+    // alongside the retained row.
+    sqlx::query(&format!(
+        "DELETE FROM read_log_touches WHERE call_seq IN \
+         (SELECT seq FROM read_log_calls WHERE {issuance} \
+          AND (read_log_calls.tool = 'bootstrap' \
+               OR json_valid(read_log_calls.arguments)))"
+    ))
+    .execute(&mut *connection)
+    .await?;
+    // Issuance retains only the caller-supplied run-key selector, exactly as
+    // PR A capture stores it: a text selector keeps `{"run_key": ...}`, while
+    // a missing or non-text selector (e.g. historical `bootstrap` rows, which
+    // carry run identity in the `run_key`/`parent_key` columns) keeps `{}`.
+    // The `json_valid` gate keeps malformed historical bytes byte-identical
+    // instead of normalizing them; the `CASE` reads through the parseable
+    // substitution so the extract itself is total too.
+    let update_args = read_log_parseable_args_sql("arguments");
+    sqlx::query(&format!(
+        "UPDATE read_log_calls \
+         SET arguments = CASE \
+           WHEN json_type({update_args},'$.run_key') = 'text' \
+           THEN json_object('run_key', json_extract({update_args},'$.run_key')) \
+           ELSE '{{}}' END \
+         WHERE {issuance} AND json_valid(read_log_calls.arguments)"
+    ))
+    .execute(&mut *connection)
+    .await?;
+    sqlx::query(&format!("DELETE FROM read_log_calls WHERE {disposable}"))
+        .execute(&mut *connection)
+        .await?;
+    sqlx::query(
+        "DELETE FROM read_log_record_ids WHERE NOT EXISTS \
+         (SELECT 1 FROM read_log_touches \
+          WHERE read_log_touches.record_ref = read_log_record_ids.record_ref)",
+    )
+    .execute(&mut *connection)
+    .await?;
+    Ok(())
+}
+
 async fn planned_dogfood_message_origin_repair(
     connection: &mut SqliteConnection,
     repair: DogfoodMessageOriginRepair,
@@ -1805,6 +2981,7 @@ async fn append_dogfood_message_origin_declaration(
             intent: Some("Apply the reviewed Native HQ legacy Message-origin manifest.".into()),
             created_at,
             causal_envelope,
+            act: None,
         },
     )
     .await
@@ -1969,8 +3146,24 @@ fn single_connection_options(path: &Path) -> Result<SqliteConnectOptions> {
 async fn compact_database_in_place(
     connection: &mut SqliteConnection,
     migration: &dyn EngineMigrationStep,
+    db_id: &str,
 ) -> Result<()> {
+    eprintln!(
+        "migration-phase db_id={db_id:?} step={} phase=vacuum start",
+        migration.name()
+    );
+    let vacuum_started = std::time::Instant::now();
     sqlx::query("VACUUM").execute(&mut *connection).await?;
+    eprintln!(
+        "migration-phase db_id={db_id:?} step={} phase=vacuum completed elapsed_ms={}",
+        migration.name(),
+        vacuum_started.elapsed().as_millis()
+    );
+    eprintln!(
+        "migration-phase db_id={db_id:?} step={} phase=post-vacuum-checks start",
+        migration.name()
+    );
+    let checks_started = std::time::Instant::now();
     let integrity: String = sqlx::query("PRAGMA integrity_check")
         .fetch_one(&mut *connection)
         .await?
@@ -1981,6 +3174,16 @@ async fn compact_database_in_place(
             migration.name()
         )));
     }
+    let foreign_key_violations: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM pragma_foreign_key_check")
+            .fetch_one(&mut *connection)
+            .await?;
+    if foreign_key_violations != 0 {
+        return Err(Error::engine(format!(
+            "{} left {foreign_key_violations} foreign-key violation(s)",
+            migration.name()
+        )));
+    }
     if !crate::db::validate_engine_shape_on(connection, migration.to()).await? {
         return Err(Error::engine(format!(
             "{} left a shape that does not match schema {}",
@@ -1988,6 +3191,11 @@ async fn compact_database_in_place(
             migration.to()
         )));
     }
+    eprintln!(
+        "migration-phase db_id={db_id:?} step={} phase=post-vacuum-checks completed elapsed_ms={}",
+        migration.name(),
+        checks_started.elapsed().as_millis()
+    );
     Ok(())
 }
 
@@ -2003,10 +3211,18 @@ async fn capture_preimage(
         .prefix("native-ce-migration-preimage-")
         .tempdir_in(parent)?;
     let snapshot = dir.path().join("preimage.db");
+    eprintln!("migration-phase db_id={db_id:?} phase=backup-vacuum-into start");
+    let snapshot_started = std::time::Instant::now();
     sqlx::query("VACUUM INTO ?")
         .bind(snapshot.to_string_lossy().into_owned())
         .execute(&mut *connection)
         .await?;
+    eprintln!(
+        "migration-phase db_id={db_id:?} phase=backup-vacuum-into completed elapsed_ms={}",
+        snapshot_started.elapsed().as_millis()
+    );
+    eprintln!("migration-phase db_id={db_id:?} phase=backup-integrity start");
+    let integrity_started = std::time::Instant::now();
     let snapshot_options =
         SqliteConnectOptions::from_str(&format!("sqlite:{}", snapshot.display()))?
             .create_if_missing(false)
@@ -2024,9 +3240,20 @@ async fn capture_preimage(
         )));
     }
     snapshot_connection.close().await?;
-    backup
+    eprintln!(
+        "migration-phase db_id={db_id:?} phase=backup-integrity completed elapsed_ms={}",
+        integrity_started.elapsed().as_millis()
+    );
+    eprintln!("migration-phase db_id={db_id:?} phase=backup-store-verify start");
+    let store_started = std::time::Instant::now();
+    let stored = backup
         .store_verified_preimage(run_id, db_id, &snapshot)
-        .await
+        .await?;
+    eprintln!(
+        "migration-phase db_id={db_id:?} phase=backup-store-verify completed elapsed_ms={}",
+        store_started.elapsed().as_millis()
+    );
+    Ok(stored)
 }
 
 pub async fn migrate_database(
@@ -2178,7 +3405,9 @@ async fn migrate_database_with_reservation(
             // then fall through to the ordinary transactional apply so a
             // lost fence can ROLLBACK the stamp. A second connection holding
             // a write-preventing lock fails this hop closed (stay on from()).
-            if let Err(err) = compact_database_in_place(&mut connection, migration.as_ref()).await {
+            if let Err(err) =
+                compact_database_in_place(&mut connection, migration.as_ref(), db_id).await
+            {
                 let _ = connection.close().await;
                 return failed_with_backup(
                     path,
@@ -2194,6 +3423,11 @@ async fn migrate_database_with_reservation(
                 return failed_with_backup(path, from, target, "fence", err.to_string(), backup);
             }
         }
+        eprintln!(
+            "migration-phase db_id={db_id:?} step={} phase=apply start",
+            migration.name()
+        );
+        let apply_started = std::time::Instant::now();
         let foreign_keys_disabled = migration.requires_foreign_keys_disabled();
         if foreign_keys_disabled {
             if let Err(err) = sqlx::query("PRAGMA foreign_keys=OFF")
@@ -2339,7 +3573,14 @@ async fn migrate_database_with_reservation(
                 );
             }
         }
+        eprintln!(
+            "migration-phase db_id={db_id:?} step={} phase=apply completed elapsed_ms={}",
+            migration.name(),
+            apply_started.elapsed().as_millis()
+        );
     }
+    eprintln!("migration-phase db_id={db_id:?} phase=final-integrity start");
+    let final_integrity_started = std::time::Instant::now();
     let integrity = sqlx::query("PRAGMA integrity_check")
         .fetch_one(&mut connection)
         .await
@@ -2352,11 +3593,15 @@ async fn migrate_database_with_reservation(
         let _ = connection.close().await;
         return failed_with_backup(path, from, target, "integrity", message, backup);
     }
+    eprintln!(
+        "migration-phase db_id={db_id:?} phase=final-integrity completed elapsed_ms={}",
+        final_integrity_started.elapsed().as_millis()
+    );
     let _ = connection.close().await;
     if target == CURRENT_ENGINE_SCHEMA_VERSION {
         let verification = match verifier.clone() {
             Some(verifier) => verifier(path.to_path_buf()).await,
-            None => verify_migrated_database(path.to_path_buf()).await,
+            None => verify_migrated_database(path.to_path_buf(), db_id).await,
         };
         match verification {
             PostMigrationVerification::Passed => {}
@@ -2415,17 +3660,38 @@ pub async fn migrate_database_with_attempt_reservation(
     .await
 }
 
-async fn verify_migrated_database(path: PathBuf) -> PostMigrationVerification {
+async fn verify_migrated_database(path: PathBuf, db_id: &str) -> PostMigrationVerification {
+    eprintln!("migration-verification db_id={db_id:?} check=shape phase=start");
+    let shape_started = std::time::Instant::now();
     if let Err(err) = crate::db::validate_current_engine_shape_read_only(&path).await {
         return PostMigrationVerification::StructuralFailed(err.to_string());
     }
+    eprintln!(
+        "migration-verification db_id={db_id:?} check=shape phase=passed elapsed_ms={}",
+        shape_started.elapsed().as_millis()
+    );
+    eprintln!("migration-verification db_id={db_id:?} check=open phase=start");
+    let open_started = std::time::Instant::now();
     let db = match crate::db::open_existing_database_at(&path).await {
         Ok(db) => db,
         Err(err) => {
             return PostMigrationVerification::VerifyOpenFailed(err.to_string());
         }
     };
-    let conformance = crate::conformance::run_conformance(&db).await;
+    eprintln!(
+        "migration-verification db_id={db_id:?} check=open phase=passed elapsed_ms={}",
+        open_started.elapsed().as_millis()
+    );
+    let conformance = crate::conformance::run_conformance_with_progress(&db, |name, elapsed| {
+        if let Some(elapsed_ms) = elapsed {
+            eprintln!(
+                "migration-verification db_id={db_id:?} check={name} phase=completed elapsed_ms={elapsed_ms}"
+            );
+        } else {
+            eprintln!("migration-verification db_id={db_id:?} check={name} phase=start");
+        }
+    })
+    .await;
     db.close().await;
     if conformance.ok {
         PostMigrationVerification::Passed
@@ -2559,7 +3825,7 @@ mod tests {
         {
             assert_eq!(step.from(), version);
             if step.requires_pre_apply_compaction() {
-                compact_database_in_place(connection, step.as_ref())
+                compact_database_in_place(connection, step.as_ref(), "fixture")
                     .await
                     .unwrap();
             }
@@ -2592,7 +3858,7 @@ mod tests {
         let passing = dir.path().join("passing.db");
         create_current_schema(&passing).await;
         assert!(matches!(
-            verify_migrated_database(passing).await,
+            verify_migrated_database(passing, "passing-fixture").await,
             PostMigrationVerification::Passed
         ));
 
@@ -2606,7 +3872,7 @@ mod tests {
             .unwrap();
         db.close().await;
         assert!(matches!(
-            verify_migrated_database(nonconformant).await,
+            verify_migrated_database(nonconformant, "nonconformant-fixture").await,
             PostMigrationVerification::StructuralFailed(_)
         ));
     }
@@ -2771,9 +4037,190 @@ mod tests {
         }
     }
 
+    /// Undo engine-56 act stamping, leaving the released engine-55 shape.
+    /// `DROP COLUMN` rewrites the stored table text, so the reverted tables
+    /// compare equal to fresh engine-55 DDL under the shape contract.
+    async fn revert_to_engine_55(connection: &mut SqliteConnection) {
+        // The engine-58 `agent_runs` columns land after this shape, so the
+        // engine-55 preimage drops them first alongside the triggers below.
+        revert_to_engine_57(connection).await;
+        // The content-event append-only triggers land in engine 57, so the
+        // engine-55 preimage drops them alongside the act columns below.
+        sqlx::query("DROP TRIGGER content_events_no_update")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        sqlx::query("DROP TRIGGER content_events_no_delete")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        for table in [
+            "content_events",
+            "policy_events",
+            "awareness_events",
+            "notification_candidate_events",
+            "binding_audit",
+            "database_identity_audit",
+            "meta_events",
+            "control_events",
+            "derivation_events",
+            "relationship_events",
+        ] {
+            sqlx::query(&format!("ALTER TABLE {table} DROP COLUMN act"))
+                .execute(&mut *connection)
+                .await
+                .unwrap();
+        }
+        sqlx::query("DROP TABLE act_cutover")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        sqlx::query("DROP TABLE act_state")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        sqlx::query("PRAGMA user_version=55")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+    }
+
+    /// Reconstruct the released engine-56 shape: current DDL minus exactly
+    /// the two content-event append-only triggers and the three engine-58
+    /// `agent_runs` columns. Test fixtures retain their absence; this is not
+    /// a rollback API.
+    async fn revert_to_engine_56(connection: &mut SqliteConnection) {
+        revert_to_engine_57(connection).await;
+        sqlx::query("DROP TRIGGER content_events_no_update")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        sqlx::query("DROP TRIGGER content_events_no_delete")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        sqlx::query("PRAGMA user_version=56")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+    }
+
+    /// Reconstruct main's released engine-59 shape by reversing the three
+    /// act-delta edges. Test fixtures only; this is not a rollback API.
+    async fn revert_to_engine_59(connection: &mut SqliteConnection) {
+        revert_to_engine_64(connection).await;
+        for statement in [
+            "DROP INDEX idx_external_observations_act",
+            "ALTER TABLE external_observations DROP COLUMN act",
+            "DROP INDEX idx_awareness_command_intents_act",
+            "ALTER TABLE awareness_command_intents DROP COLUMN act",
+            "DROP INDEX idx_content_events_act",
+            "DROP INDEX idx_policy_events_act",
+            "DROP INDEX idx_awareness_events_act",
+            "DROP INDEX idx_notification_candidate_events_act",
+            "DROP INDEX idx_binding_audit_act",
+            "DROP INDEX idx_database_identity_audit_act",
+            "DROP INDEX idx_meta_events_act",
+            "DROP INDEX idx_control_events_act",
+            "DROP INDEX idx_derivation_events_act",
+            "DROP INDEX idx_relationship_events_act",
+            "DROP TRIGGER binding_systems_no_insert",
+            "DROP TRIGGER binding_systems_no_update",
+            "DROP TRIGGER binding_systems_no_delete",
+            "DROP INDEX idx_provenance_validity_act",
+            "ALTER TABLE provenance_attestation_validity_events DROP COLUMN act",
+        ] {
+            sqlx::query(statement)
+                .execute(&mut *connection)
+                .await
+                .unwrap();
+        }
+        sqlx::query("PRAGMA user_version=59")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+    }
+
+    /// Remove main's record-mentions edge from the engine-59 preimage.
+    async fn revert_to_engine_58(connection: &mut SqliteConnection) {
+        revert_to_engine_59(connection).await;
+        sqlx::query("DROP TABLE record_mentions")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        sqlx::query("PRAGMA user_version=58")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+    }
+
+    /// Advance a focused historical-edge fixture to the current schema
+    /// before ordinary reopen, starting at its verified source version.
+    async fn advance_engine_58_to_current(connection: &mut SqliteConnection, start: i64) {
+        for (from, to, name) in [
+            (58, 59, "engine-58-to-59-record-mentions-projection"),
+            (59, 60, "engine-59-to-60-provenance-validity-act-stamping"),
+            (60, 61, "engine-60-to-61-canonical-act-range-indexes"),
+            (61, 62, "engine-61-to-62-observation-intent-act-stamping"),
+            (62, 63, "engine-62-to-63-read-log-selective-cleanup"),
+            (63, 64, "engine-63-to-64-read-log-freelist-compaction"),
+            (64, 65, "engine-64-to-65-alpha-tab-installs-projection"),
+        ] {
+            if from < start {
+                continue;
+            }
+            let step = EngineMigrationRegistry::production()
+                .pending(from, to)
+                .unwrap()
+                .pop()
+                .unwrap();
+            assert_eq!(step.name(), name);
+            step.preflight(&mut *connection).await.unwrap();
+            if step.requires_pre_apply_compaction() {
+                compact_database_in_place(connection, step.as_ref(), "fixture")
+                    .await
+                    .unwrap();
+            }
+            step.apply(&mut *connection).await.unwrap();
+            sqlx::query(&format!("PRAGMA user_version={to}"))
+                .execute(&mut *connection)
+                .await
+                .unwrap();
+            assert!(
+                crate::db::validate_engine_shape_on_for_test(&mut *connection, to)
+                    .await
+                    .unwrap()
+            );
+        }
+    }
+
+    /// Reconstruct the released engine-57 shape: engine 58 minus exactly the
+    /// three `agent_runs` reported-identity columns. `DROP COLUMN`
+    /// rewrites the stored table text, so the reverted table compares equal
+    /// to fresh engine-57 DDL under the shape contract. Test fixtures retain
+    /// the columns' absence; this is not a rollback API.
+    async fn revert_to_engine_57(connection: &mut SqliteConnection) {
+        revert_to_engine_58(connection).await;
+        for column in [
+            "reported_mcp_client_name",
+            "reported_mcp_client_version",
+            "reported_model",
+        ] {
+            sqlx::query(&format!("ALTER TABLE agent_runs DROP COLUMN {column}"))
+                .execute(&mut *connection)
+                .await
+                .unwrap();
+        }
+        sqlx::query("PRAGMA user_version=57")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+    }
+
     /// Reconstruct the released TEXT-key shape before dictionary interning.
     /// Test fixtures retain every decoded touch; this is not a rollback API.
     async fn revert_to_engine_53(connection: &mut SqliteConnection) {
+        revert_to_engine_55(connection).await;
         let enforcing: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
             .fetch_one(&mut *connection)
             .await
@@ -3871,6 +5318,7 @@ mod tests {
                     run_key: Some("engine-47-to-48-test-fixture"),
                     parent_key: None,
                     intent: Some("exercise the reviewed dogfood message-origin repair"),
+                    is_member: true,
                     internal: true,
                     source_read_authorized: false,
                 },
@@ -4949,7 +6397,24 @@ mod tests {
         let current_digest = crate::db::schema_shape_contract_sha256_for_test(&mut at_53)
             .await
             .unwrap();
-        assert_eq!(current_digest, crate::db::ENGINE_54_SHAPE_CONTRACT_SHA256);
+        // The runner must land the exact current shape, whatever the current
+        // schema is: compare against a fresh database built from this build's
+        // DDL rather than a frozen historical pin.
+        let reference_dir = tempfile::tempdir().unwrap();
+        let reference_path = reference_dir.path().join("current-reference.db");
+        create_current_schema(&reference_path).await;
+        let reference_options =
+            SqliteConnectOptions::from_str(&format!("sqlite:{}", reference_path.display()))
+                .unwrap()
+                .foreign_keys(true);
+        let mut reference_conn = SqliteConnection::connect_with(&reference_options)
+            .await
+            .unwrap();
+        let reference_digest =
+            crate::db::schema_shape_contract_sha256_for_test(&mut reference_conn)
+                .await
+                .unwrap();
+        assert_eq!(current_digest, reference_digest);
         let sql: String = sqlx::query_scalar(
             "SELECT sql FROM sqlite_master WHERE type='table' AND name='read_log_touches'",
         )
@@ -5584,5 +7049,2009 @@ mod tests {
         let mtime_after = std::fs::metadata(&path).unwrap().modified().unwrap();
         assert_eq!(size_after, size_before);
         assert_eq!(mtime_after, mtime_before);
+    }
+
+    /// Acceptance criterion 4: migration from engine 55 leaves every
+    /// existing row unstamped and grouping-unknown, records the cutover,
+    /// and fabricates no grouping. The first post-cutover write allocates
+    /// act 1 on a counter that starts at zero.
+    #[tokio::test]
+    async fn engine_55_to_56_leaves_legacy_rows_unstamped_and_records_cutover() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("act-cutover.db");
+        create_current_schema(&path).await;
+        let db = crate::open_existing_database_at(&path).await.unwrap();
+        crate::store::create_record(
+            &db,
+            serde_json::json!({
+                "id": "1a7e4000-0000-4000-8000-000000000055",
+                "type": "Document",
+                "kind": "note",
+                "name": "pre-cutover record"
+            }),
+        )
+        .await
+        .unwrap();
+        let legacy_content_seq: i64 = sqlx::query_scalar("SELECT MAX(seq) FROM content_events")
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap();
+        assert!(legacy_content_seq > 0);
+        db.close().await;
+
+        // Reconstruct the engine-55 preimage, then run the real 55->56 edge.
+        let options = SqliteConnectOptions::from_str(&format!("sqlite:{}", path.display()))
+            .unwrap()
+            .foreign_keys(true);
+        let mut conn = SqliteConnection::connect_with(&options).await.unwrap();
+        revert_to_engine_55(&mut conn).await;
+        sqlx::query("PRAGMA user_version=55")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        let digest = crate::db::schema_shape_contract_sha256_for_test(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(digest, crate::db::ENGINE_55_SHAPE_CONTRACT_SHA256);
+        let step = EngineMigrationRegistry::production()
+            .pending(55, 56)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(step.name(), "engine-55-to-56-act-number-stamping");
+        step.preflight(&mut conn).await.unwrap();
+        step.apply(&mut conn).await.unwrap();
+        sqlx::query("PRAGMA user_version=56")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        assert!(crate::db::validate_engine_shape_on_for_test(&mut conn, 56)
+            .await
+            .unwrap());
+        // The 56→57 edge only installs the content-event append-only
+        // triggers, so the migrated database under test continues to current.
+        let step = EngineMigrationRegistry::production()
+            .pending(56, 57)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(step.name(), "engine-56-to-57-content-events-append-only");
+        step.preflight(&mut conn).await.unwrap();
+        step.apply(&mut conn).await.unwrap();
+        sqlx::query("PRAGMA user_version=57")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        assert!(crate::db::validate_engine_shape_on_for_test(&mut conn, 57)
+            .await
+            .unwrap());
+        // Run the remaining edges before
+        // reopening: this keeps the test's subject the 55→56 edge while
+        // leaving a file ordinary serving accepts.
+        let step = EngineMigrationRegistry::production()
+            .pending(57, 58)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(step.name(), "engine-57-to-58-agent-run-client-identity");
+        step.preflight(&mut conn).await.unwrap();
+        step.apply(&mut conn).await.unwrap();
+        sqlx::query("PRAGMA user_version=58")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        advance_engine_58_to_current(&mut conn, 58).await;
+        conn.close().await.unwrap();
+
+        // Every pre-cutover row is unstamped: grouping unknown, fabricated
+        // for none of them.
+        let migrated = crate::open_existing_database_at(&path).await.unwrap();
+        for table in crate::act::CANONICAL_EVENT_TABLES {
+            let nulls: i64 =
+                sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table} WHERE act IS NULL"))
+                    .fetch_one(migrated.write_pool())
+                    .await
+                    .unwrap();
+            let total: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+                .fetch_one(migrated.write_pool())
+                .await
+                .unwrap();
+            assert_eq!(
+                nulls, total,
+                "{table}: migration must not fabricate grouping for legacy rows"
+            );
+        }
+        // The cutover records the per-domain legacy frontier from engine 55.
+        let content_cutover = migrated.act_cutover_for("content_events").await.unwrap();
+        assert_eq!(content_cutover, Some(legacy_content_seq));
+        for table in crate::act::CANONICAL_EVENT_TABLES {
+            let cutover = migrated.act_cutover_for(table).await.unwrap();
+            assert!(
+                cutover.is_some(),
+                "{table}: migration must record a cutover"
+            );
+        }
+        // The counter starts at zero: no act is consumed by the migration.
+        assert_eq!(migrated.current_act().await.unwrap(), 0);
+
+        // The first post-cutover write allocates act 1.
+        let event = crate::store::append(
+            &migrated,
+            crate::store::AppendSpec {
+                record_id: "1a7e4000-0000-4000-8000-000000000056".into(),
+                event_type: "record.created".into(),
+                payload: serde_json::json!({
+                    "type": "Document",
+                    "kind": "note",
+                    "name": "post-cutover record"
+                }),
+                actor: None,
+            },
+        )
+        .await
+        .unwrap();
+        let act: Option<i64> = sqlx::query_scalar("SELECT act FROM content_events WHERE seq = ?")
+            .bind(event.local_seq)
+            .fetch_one(migrated.write_pool())
+            .await
+            .unwrap();
+        assert_eq!(act, Some(1));
+        assert_eq!(migrated.current_act().await.unwrap(), 1);
+        migrated.close().await;
+    }
+
+    /// Acceptance criterion 7: `PRAGMA integrity_check` and existing
+    /// conformance (authoritative-log rebuild plus projection diff) pass on
+    /// a migrated database.
+    #[tokio::test]
+    async fn migrated_database_passes_integrity_and_conformance() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("act-conformance.db");
+        create_current_schema(&path).await;
+        let db = crate::open_existing_database_at(&path).await.unwrap();
+        crate::store::create_record(
+            &db,
+            serde_json::json!({
+                "id": "1a7e4000-0000-4000-8000-000000000057",
+                "type": "Document",
+                "kind": "note",
+                "name": "conformance witness",
+                "body": "migrated databases must still rebuild cleanly"
+            }),
+        )
+        .await
+        .unwrap();
+        db.close().await;
+
+        let options = SqliteConnectOptions::from_str(&format!("sqlite:{}", path.display()))
+            .unwrap()
+            .foreign_keys(true);
+        let mut conn = SqliteConnection::connect_with(&options).await.unwrap();
+        revert_to_engine_55(&mut conn).await;
+        sqlx::query("PRAGMA user_version=55")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        let step = EngineMigrationRegistry::production()
+            .pending(55, 56)
+            .unwrap()
+            .pop()
+            .unwrap();
+        step.preflight(&mut conn).await.unwrap();
+        step.apply(&mut conn).await.unwrap();
+        sqlx::query("PRAGMA user_version=56")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        // Continue through the remaining edges to the current schema.
+        let step = EngineMigrationRegistry::production()
+            .pending(56, 57)
+            .unwrap()
+            .pop()
+            .unwrap();
+        step.preflight(&mut conn).await.unwrap();
+        step.apply(&mut conn).await.unwrap();
+        sqlx::query("PRAGMA user_version=57")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        let step = EngineMigrationRegistry::production()
+            .pending(57, 58)
+            .unwrap()
+            .pop()
+            .unwrap();
+        step.preflight(&mut conn).await.unwrap();
+        step.apply(&mut conn).await.unwrap();
+        sqlx::query("PRAGMA user_version=58")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        advance_engine_58_to_current(&mut conn, 58).await;
+        let integrity: String = sqlx::query_scalar("PRAGMA integrity_check")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(integrity, "ok");
+        conn.close().await.unwrap();
+
+        let migrated = crate::open_existing_database_at(&path).await.unwrap();
+        let report = crate::conformance::run_conformance(&migrated).await;
+        assert!(report.ok, "conformance must pass on a migrated database");
+        migrated.close().await;
+    }
+
+    /// Fresh current databases reject content-event rewrites while ordinary
+    /// appends keep working.
+    #[tokio::test]
+    async fn fresh_database_rejects_content_event_update_and_delete() {
+        let db = crate::db::create_database(":memory:").await.unwrap();
+        crate::store::create_record(
+            &db,
+            serde_json::json!({
+                "id": "1a7e4000-0000-4000-8000-000000000071",
+                "type": "Document",
+                "kind": "note",
+                "name": "append-only witness"
+            }),
+        )
+        .await
+        .unwrap();
+        for statement in [
+            "UPDATE content_events SET payload='{}' WHERE seq=1",
+            "DELETE FROM content_events WHERE seq=1",
+        ] {
+            let error = sqlx::query(statement)
+                .execute(db.write_pool())
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("content_events is append-only"),
+                "{statement}: {error}"
+            );
+        }
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM content_events")
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap();
+        assert!(rows > 0, "rejected rewrites must remove nothing");
+        // Ordinary appends still land.
+        crate::store::create_record(
+            &db,
+            serde_json::json!({
+                "id": "1a7e4000-0000-4000-8000-000000000072",
+                "type": "Document",
+                "kind": "note",
+                "name": "post-guard record"
+            }),
+        )
+        .await
+        .unwrap();
+        let after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM content_events")
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap();
+        assert_eq!(after, rows + 1);
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn merged_engine_58_through_63_shape_pins_are_reproducible() {
+        let db = crate::db::create_database(":memory:").await.unwrap();
+        let mut conn = db.write_pool().acquire().await.unwrap();
+        revert_to_engine_64(&mut conn).await;
+        let engine_62 = crate::db::schema_shape_contract_sha256_for_test(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(engine_62, crate::db::ENGINE_62_SHAPE_CONTRACT_SHA256);
+        assert_eq!(engine_62, crate::db::ENGINE_63_SHAPE_CONTRACT_SHA256);
+        let drop_statements = [
+            "DROP INDEX idx_external_observations_act",
+            "ALTER TABLE external_observations DROP COLUMN act",
+            "DROP INDEX idx_awareness_command_intents_act",
+            "ALTER TABLE awareness_command_intents DROP COLUMN act",
+        ];
+        for statement in drop_statements {
+            sqlx::query(statement).execute(&mut *conn).await.unwrap();
+        }
+        let engine_61 = crate::db::schema_shape_contract_sha256_for_test(&mut conn)
+            .await
+            .unwrap();
+        for statement in [
+            "DROP INDEX idx_content_events_act",
+            "DROP INDEX idx_policy_events_act",
+            "DROP INDEX idx_awareness_events_act",
+            "DROP INDEX idx_notification_candidate_events_act",
+            "DROP INDEX idx_binding_audit_act",
+            "DROP INDEX idx_database_identity_audit_act",
+            "DROP INDEX idx_meta_events_act",
+            "DROP INDEX idx_control_events_act",
+            "DROP INDEX idx_derivation_events_act",
+            "DROP INDEX idx_relationship_events_act",
+            "DROP TRIGGER binding_systems_no_insert",
+            "DROP TRIGGER binding_systems_no_update",
+            "DROP TRIGGER binding_systems_no_delete",
+        ] {
+            sqlx::query(statement).execute(&mut *conn).await.unwrap();
+        }
+        let engine_60 = crate::db::schema_shape_contract_sha256_for_test(&mut conn)
+            .await
+            .unwrap();
+        sqlx::query("DROP INDEX idx_provenance_validity_act")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        sqlx::query("ALTER TABLE provenance_attestation_validity_events DROP COLUMN act")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        let engine_59 = crate::db::schema_shape_contract_sha256_for_test(&mut conn)
+            .await
+            .unwrap();
+        sqlx::query("DROP TABLE record_mentions")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        let engine_58 = crate::db::schema_shape_contract_sha256_for_test(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(engine_58, crate::db::ENGINE_58_SHAPE_CONTRACT_SHA256);
+        assert_eq!(engine_59, crate::db::ENGINE_59_SHAPE_CONTRACT_SHA256);
+        assert_eq!(engine_60, crate::db::ENGINE_60_SHAPE_CONTRACT_SHA256);
+        assert_eq!(engine_61, crate::db::ENGINE_61_SHAPE_CONTRACT_SHA256);
+
+        sqlx::query("PRAGMA user_version=58")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        advance_engine_58_to_current(&mut conn, 58).await;
+    }
+
+    /// The 56→57 edge installs the content-event append-only triggers on an
+    /// already-existing database without touching its rows, and the migrated
+    /// database reopens with the same rejection behavior as a fresh one.
+    #[tokio::test]
+    async fn engine_56_to_57_installs_content_event_triggers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("content-append-only.db");
+        create_current_schema(&path).await;
+        let db = crate::open_existing_database_at(&path).await.unwrap();
+        crate::store::create_record(
+            &db,
+            serde_json::json!({
+                "id": "1a7e4000-0000-4000-8000-000000000073",
+                "type": "Document",
+                "kind": "note",
+                "name": "pre-migration record"
+            }),
+        )
+        .await
+        .unwrap();
+        let legacy_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM content_events")
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap();
+        assert!(legacy_rows > 0);
+        db.close().await;
+
+        // Reconstruct the engine-56 preimage, then run the real 56→57 edge.
+        let options = SqliteConnectOptions::from_str(&format!("sqlite:{}", path.display()))
+            .unwrap()
+            .foreign_keys(true);
+        let mut conn = SqliteConnection::connect_with(&options).await.unwrap();
+        revert_to_engine_56(&mut conn).await;
+        let digest = crate::db::schema_shape_contract_sha256_for_test(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(digest, crate::db::ENGINE_56_SHAPE_CONTRACT_SHA256);
+        let step = EngineMigrationRegistry::production()
+            .pending(56, 57)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(step.name(), "engine-56-to-57-content-events-append-only");
+        step.preflight(&mut conn).await.unwrap();
+        step.apply(&mut conn).await.unwrap();
+        sqlx::query("PRAGMA user_version=57")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        assert!(crate::db::validate_engine_shape_on_for_test(&mut conn, 57)
+            .await
+            .unwrap());
+        // Run the remaining edges before
+        // reopening: this keeps the test's subject the 56→57 edge while
+        // leaving a file ordinary serving accepts.
+        let step = EngineMigrationRegistry::production()
+            .pending(57, 58)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(step.name(), "engine-57-to-58-agent-run-client-identity");
+        step.preflight(&mut conn).await.unwrap();
+        step.apply(&mut conn).await.unwrap();
+        sqlx::query("PRAGMA user_version=58")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        advance_engine_58_to_current(&mut conn, 58).await;
+        conn.close().await.unwrap();
+
+        let migrated = crate::open_existing_database_at(&path).await.unwrap();
+        // No row is touched by the migration.
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM content_events")
+            .fetch_one(migrated.write_pool())
+            .await
+            .unwrap();
+        assert_eq!(rows, legacy_rows);
+        for statement in [
+            "UPDATE content_events SET payload='{}' WHERE seq=1",
+            "DELETE FROM content_events WHERE seq=1",
+        ] {
+            let error = sqlx::query(statement)
+                .execute(migrated.write_pool())
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("content_events is append-only"),
+                "{statement}: {error}"
+            );
+        }
+        // Ordinary appends and reopen keep working on the migrated database.
+        crate::store::create_record(
+            &migrated,
+            serde_json::json!({
+                "id": "1a7e4000-0000-4000-8000-000000000074",
+                "type": "Document",
+                "kind": "note",
+                "name": "post-migration record"
+            }),
+        )
+        .await
+        .unwrap();
+        migrated.close().await;
+        let reopened = crate::open_existing_database_at(&path).await.unwrap();
+        let after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM content_events")
+            .fetch_one(reopened.write_pool())
+            .await
+            .unwrap();
+        assert_eq!(after, legacy_rows + 1);
+        reopened.close().await;
+    }
+
+    /// The 57→58 edge adds three nullable `agent_runs` columns without
+    /// touching any row, and the migrated database reopens with the same
+    /// shape as a fresh one.
+    #[tokio::test]
+    async fn engine_57_to_58_adds_agent_run_client_identity_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent-run-client-identity.db");
+        create_current_schema(&path).await;
+        let db = crate::open_existing_database_at(&path).await.unwrap();
+        crate::control::ensure_agent_run(
+            &db,
+            "scout-chair-a748b2",
+            "acct_alice",
+            crate::control::ReportedRunIdentity::default(),
+        )
+        .await
+        .unwrap();
+        let legacy_runs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_runs")
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap();
+        assert_eq!(legacy_runs, 1);
+        db.close().await;
+
+        // Reconstruct the engine-57 preimage, then run the real 57→58 edge.
+        let options = SqliteConnectOptions::from_str(&format!("sqlite:{}", path.display()))
+            .unwrap()
+            .foreign_keys(true);
+        let mut conn = SqliteConnection::connect_with(&options).await.unwrap();
+        revert_to_engine_57(&mut conn).await;
+        let digest = crate::db::schema_shape_contract_sha256_for_test(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(digest, crate::db::ENGINE_57_SHAPE_CONTRACT_SHA256);
+        let step = EngineMigrationRegistry::production()
+            .pending(57, 58)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(step.name(), "engine-57-to-58-agent-run-client-identity");
+        step.preflight(&mut conn).await.unwrap();
+        step.apply(&mut conn).await.unwrap();
+        sqlx::query("PRAGMA user_version=58")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        assert!(crate::db::validate_engine_shape_on_for_test(&mut conn, 58)
+            .await
+            .unwrap());
+        advance_engine_58_to_current(&mut conn, 58).await;
+        conn.close().await.unwrap();
+
+        let migrated = crate::open_existing_database_at(&path).await.unwrap();
+        // No row is touched by the migration; the pre-existing run keeps
+        // NULL reported identity.
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_runs")
+            .fetch_one(migrated.write_pool())
+            .await
+            .unwrap();
+        assert_eq!(rows, legacy_runs);
+        let identity =
+            crate::control::read_agent_run_reported_identity(&migrated, "scout-chair-a748b2")
+                .await
+                .unwrap()
+                .expect("migrated run reads back");
+        assert_eq!(identity, crate::control::ReportedRunIdentity::default());
+        // Ordinary admission keeps working on the migrated database.
+        crate::control::ensure_agent_run(
+            &migrated,
+            "scout-chair-b748b2",
+            "acct_alice",
+            crate::control::ReportedRunIdentity {
+                client_name: Some("hazel".into()),
+                client_version: Some("2.1.0".into()),
+                model: None,
+            },
+        )
+        .await
+        .unwrap();
+        let stored =
+            crate::control::read_agent_run_reported_identity(&migrated, "scout-chair-b748b2")
+                .await
+                .unwrap()
+                .expect("post-migration run reads back");
+        assert_eq!(stored.client_name.as_deref(), Some("hazel"));
+        migrated.close().await;
+    }
+
+    /// The 58→59 DDL is transition text, but the objects it creates must stay
+    /// byte-identical to the fresh-schema DDL: migrated databases are
+    /// byte-identical to fresh ones under the shape contract only while both
+    /// spellings agree.
+    #[test]
+    fn engine_58_to_59_statements_match_fresh_ddl() {
+        for statement in ENGINE_58_TO_59_STATEMENTS {
+            let prefix = if statement.starts_with("CREATE TABLE record_mentions (") {
+                "CREATE TABLE record_mentions ("
+            } else if statement.starts_with("CREATE INDEX idx_record_mentions_lookup") {
+                "CREATE INDEX idx_record_mentions_lookup"
+            } else if statement.starts_with("CREATE INDEX idx_record_mentions_source") {
+                "CREATE INDEX idx_record_mentions_source"
+            } else {
+                panic!("unexpected 58→59 statement: {statement}");
+            };
+            let fresh = crate::schema::DDL_STATEMENTS
+                .iter()
+                .find(|candidate| candidate.starts_with(prefix))
+                .unwrap_or_else(|| panic!("58→59 statement has no fresh-DDL twin: {prefix}"));
+            assert_eq!(*fresh, statement, "58→59 statement drifted from fresh DDL");
+        }
+    }
+
+    /// Dump the whole `record_mentions` projection as comparable text, with
+    /// integer columns decoded as integers so value drift (not just row
+    /// presence drift) fails the comparison.
+    async fn dump_record_mentions(connection: &mut SqliteConnection) -> Vec<String> {
+        sqlx::query(
+            "SELECT source_id, occurrence_ix, source_event_seq, span_start, span_end,
+                    authored_reference, lookup_key, form, parser_version
+               FROM record_mentions ORDER BY source_id, occurrence_ix",
+        )
+        .fetch_all(&mut *connection)
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| {
+            format!(
+                "{}|{}|{}|{}|{}|{}|{}|{}|{}",
+                row.try_get::<String, _>("source_id").unwrap(),
+                row.try_get::<i64, _>("occurrence_ix").unwrap(),
+                row.try_get::<i64, _>("source_event_seq").unwrap(),
+                row.try_get::<i64, _>("span_start").unwrap(),
+                row.try_get::<i64, _>("span_end").unwrap(),
+                row.try_get::<String, _>("authored_reference").unwrap(),
+                row.try_get::<String, _>("lookup_key").unwrap(),
+                row.try_get::<String, _>("form").unwrap(),
+                row.try_get::<i64, _>("parser_version").unwrap(),
+            )
+        })
+        .collect()
+    }
+
+    /// The 58→59 edge creates the projection and backfills it from live
+    /// current bodies with latest-text-body provenance — and the backfilled
+    /// database matches the pre-migration live fold row for row, including
+    /// removal, tombstone and post-body metadata-update histories.
+    #[tokio::test]
+    async fn engine_58_to_59_backfills_live_bodies_with_text_provenance() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("record-mentions-backfill.db");
+        create_current_schema(&path).await;
+        let db = crate::open_existing_database_at(&path).await.unwrap();
+        let body_a = "See abc1234 and [[My Note]] end.";
+        let body_b = "Now https://n8v.to/def5678 only.";
+        let kept = crate::store::create_record(
+            &db,
+            serde_json::json!({"type": "Document", "kind": "note", "name": "kept", "body": body_a}),
+        )
+        .await
+        .unwrap();
+        let replaced = crate::store::create_record(
+            &db,
+            serde_json::json!({"type": "Document", "kind": "note", "name": "replaced", "body": body_a}),
+        )
+        .await
+        .unwrap();
+        crate::store::update_record(&db, &replaced, serde_json::json!({"body": body_b}))
+            .await
+            .unwrap();
+        // A non-body update after the body replacement carries a higher
+        // sequence but no body: the backfill must stamp the body event, not
+        // MAX(seq), exactly as the live fold kept it.
+        crate::store::update_record(&db, &replaced, serde_json::json!({"summary": "touched"}))
+            .await
+            .unwrap();
+        let renamed = crate::store::create_record(
+            &db,
+            serde_json::json!({"type": "Document", "kind": "note", "name": "renamed", "body": body_b}),
+        )
+        .await
+        .unwrap();
+        crate::store::update_record(&db, &renamed, serde_json::json!({"name": "renamed-again"}))
+            .await
+            .unwrap();
+        let emptied = crate::store::create_record(
+            &db,
+            serde_json::json!({"type": "Document", "kind": "note", "name": "emptied", "body": body_a}),
+        )
+        .await
+        .unwrap();
+        crate::store::update_record(&db, &emptied, serde_json::json!({"body": null}))
+            .await
+            .unwrap();
+        let tombstoned = crate::store::create_record(
+            &db,
+            serde_json::json!({"type": "Document", "kind": "note", "name": "tombstoned", "body": body_a}),
+        )
+        .await
+        .unwrap();
+        crate::store::delete_record(&db, &tombstoned).await.unwrap();
+        let plain = crate::store::create_record(
+            &db,
+            serde_json::json!({"type": "Document", "kind": "note", "name": "plain"}),
+        )
+        .await
+        .unwrap();
+        // The live fold's answer, captured before the revert destroys it.
+        let mut live_conn = db.write_pool().acquire().await.unwrap();
+        let expected = dump_record_mentions(&mut live_conn).await;
+        assert!(!expected.is_empty(), "fixture must fold some mentions live");
+        drop(live_conn);
+        for id in [&emptied, &tombstoned, &plain] {
+            let rows: Vec<String> =
+                sqlx::query_scalar("SELECT source_id FROM record_mentions WHERE source_id = ?")
+                    .bind(id)
+                    .fetch_all(db.write_pool())
+                    .await
+                    .unwrap();
+            assert!(rows.is_empty(), "live fold leaves no rows for {id}");
+        }
+        // The replaced source keeps its body event's sequence, not the
+        // later metadata update's.
+        let body_seq: i64 = sqlx::query_scalar(
+            "SELECT seq FROM content_events WHERE record_id = ? AND json_type(payload, '$.body') = 'text'
+              ORDER BY seq DESC LIMIT 1",
+        )
+        .bind(&replaced)
+        .fetch_one(db.write_pool())
+        .await
+        .unwrap();
+        let max_seq: i64 =
+            sqlx::query_scalar("SELECT MAX(seq) FROM content_events WHERE record_id = ?")
+                .bind(&replaced)
+                .fetch_one(db.write_pool())
+                .await
+                .unwrap();
+        assert!(
+            max_seq > body_seq,
+            "fixture needs a post-body non-body event"
+        );
+        let live_stamp: i64 = sqlx::query_scalar(
+            "SELECT DISTINCT source_event_seq FROM record_mentions WHERE source_id = ?",
+        )
+        .bind(&replaced)
+        .fetch_one(db.write_pool())
+        .await
+        .unwrap();
+        assert_eq!(live_stamp, body_seq);
+        let _ = (kept, renamed);
+        db.close().await;
+
+        // Reconstruct the engine-58 preimage, then run the real 58→59 edge.
+        let options = SqliteConnectOptions::from_str(&format!("sqlite:{}", path.display()))
+            .unwrap()
+            .foreign_keys(true);
+        let mut conn = SqliteConnection::connect_with(&options).await.unwrap();
+        revert_to_engine_58(&mut conn).await;
+        let digest = crate::db::schema_shape_contract_sha256_for_test(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(digest, crate::db::ENGINE_58_SHAPE_CONTRACT_SHA256);
+        let step = EngineMigrationRegistry::production()
+            .pending(58, 59)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(step.name(), "engine-58-to-59-record-mentions-projection");
+        step.preflight(&mut conn).await.unwrap();
+        step.apply(&mut conn).await.unwrap();
+        sqlx::query("PRAGMA user_version=59")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        assert!(crate::db::validate_engine_shape_on_for_test(&mut conn, 59)
+            .await
+            .unwrap());
+        // Backfill ran inside the edge: the migrated table already matches
+        // the live fold before reopening.
+        assert_eq!(dump_record_mentions(&mut conn).await, expected);
+        advance_engine_58_to_current(&mut conn, 59).await;
+        conn.close().await.unwrap();
+
+        let migrated = crate::open_existing_database_at(&path).await.unwrap();
+        let mut migrated_conn = migrated.write_pool().acquire().await.unwrap();
+        assert_eq!(dump_record_mentions(&mut migrated_conn).await, expected);
+        drop(migrated_conn);
+        // Replay from the log converges with the backfilled live state.
+        let result = crate::conformance::rebuild_and_diff(&migrated)
+            .await
+            .unwrap();
+        assert!(
+            result.equal,
+            "rebuild drift after 58→59: {}",
+            serde_json::to_string_pretty(&result.tables).unwrap()
+        );
+        // Ordinary writes keep folding on the migrated database.
+        let fresh = crate::store::create_record(
+            &migrated,
+            serde_json::json!({"type": "Document", "kind": "note", "name": "post", "body": body_a}),
+        )
+        .await
+        .unwrap();
+        let rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM record_mentions WHERE source_id = ?")
+                .bind(&fresh)
+                .fetch_one(migrated.write_pool())
+                .await
+                .unwrap();
+        assert_eq!(rows, 2);
+        migrated.close().await;
+    }
+
+    /// The 62→63 and 63→64 edges move no schema objects. A current-shape
+    /// fixture stamped to 62 is their exact source; this is not a rollback API.
+    async fn revert_to_engine_62(connection: &mut SqliteConnection) {
+        revert_to_engine_64(connection).await;
+        sqlx::query("PRAGMA user_version=62")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+    }
+
+    async fn compact_63_to_64_and_stamp(connection: &mut SqliteConnection) {
+        let compact = EngineMigrationRegistry::production()
+            .pending(63, 64)
+            .unwrap()
+            .pop()
+            .unwrap();
+        compact.preflight(&mut *connection).await.unwrap();
+        compact_database_in_place(connection, compact.as_ref(), "fixture")
+            .await
+            .unwrap();
+        compact.apply(connection).await.unwrap();
+        sqlx::query("PRAGMA user_version=64")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+    }
+
+    /// The 62→63 edge moves no schema objects: a file stamped back to 62
+    /// admits the frozen engine-62 shape, and the edge leaves that shape —
+    /// and current-shape validation — intact.
+    #[tokio::test]
+    async fn engine_62_shape_is_the_data_only_source_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("read-log-cleanup-shape.db");
+        create_current_schema(&path).await;
+        let options = SqliteConnectOptions::from_str(&format!("sqlite:{}", path.display()))
+            .unwrap()
+            .foreign_keys(true);
+        let mut conn = SqliteConnection::connect_with(&options).await.unwrap();
+        revert_to_engine_62(&mut conn).await;
+        let digest = crate::db::schema_shape_contract_sha256_for_test(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(digest, crate::db::ENGINE_62_SHAPE_CONTRACT_SHA256);
+        let step = EngineMigrationRegistry::production()
+            .pending(62, 63)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(step.name(), "engine-62-to-63-read-log-selective-cleanup");
+        step.preflight(&mut conn).await.unwrap();
+        step.apply(&mut conn).await.unwrap();
+        sqlx::query("PRAGMA user_version=63")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        assert!(crate::db::validate_engine_shape_on_for_test(&mut conn, 63)
+            .await
+            .unwrap());
+        assert_eq!(
+            crate::db::schema_shape_contract_sha256_for_test(&mut conn)
+                .await
+                .unwrap(),
+            crate::db::ENGINE_63_SHAPE_CONTRACT_SHA256
+        );
+        let compact = EngineMigrationRegistry::production()
+            .pending(63, 64)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(
+            compact.name(),
+            "engine-63-to-64-read-log-freelist-compaction"
+        );
+        compact.preflight(&mut conn).await.unwrap();
+        compact_database_in_place(&mut conn, compact.as_ref(), "fixture")
+            .await
+            .unwrap();
+        compact.apply(&mut conn).await.unwrap();
+        sqlx::query("PRAGMA user_version=64")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        assert!(crate::db::validate_engine_shape_on_for_test(&mut conn, 64)
+            .await
+            .unwrap());
+        conn.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn engine_63_to_64_compaction_shrinks_and_retries_after_lost_fence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("engine-63-freelist.db");
+        create_current_schema(&path).await;
+        let options = SqliteConnectOptions::from_str(&format!("sqlite:{}", path.display()))
+            .unwrap()
+            .foreign_keys(true);
+        let mut conn = SqliteConnection::connect_with(&options).await.unwrap();
+        revert_to_engine_64(&mut conn).await;
+        sqlx::query("PRAGMA user_version=63")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        let arguments = "x".repeat(4096);
+        for seq in 1..=600 {
+            sqlx::query("INSERT INTO read_log_calls(id,tool,arguments,outcome,started_at,ended_at) VALUES(?,?,?,?,?,?)")
+                .bind(format!("compaction-{seq}"))
+                .bind("unknown-retained-tool")
+                .bind(&arguments)
+                .bind("ok")
+                .bind("2026-09-23T00:00:00Z")
+                .bind("2026-09-23T00:00:01Z")
+                .execute(&mut conn)
+                .await
+                .unwrap();
+        }
+        sqlx::query("COMMIT").execute(&mut conn).await.unwrap();
+        sqlx::query("DELETE FROM read_log_calls WHERE seq > 1")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        let before_size = checkpoint_file_bytes(&mut conn, &path).await;
+        let before_free: i64 = sqlx::query_scalar("PRAGMA freelist_count")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert!(before_free > 0);
+        let retained: String =
+            sqlx::query_scalar("SELECT arguments FROM read_log_calls WHERE seq=1")
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+        let high_water: i64 =
+            sqlx::query_scalar("SELECT seq FROM sqlite_sequence WHERE name='read_log_calls'")
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+        assert_eq!(high_water, 600);
+        conn.close().await.unwrap();
+
+        let offbox = tempfile::tempdir().unwrap();
+        let backup = test_preimage_store(offbox.path(), dir.path());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let fence: FenceFn = Arc::new({
+            let calls = calls.clone();
+            move || {
+                let call = calls.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if call == 2 {
+                        Err(Error::engine("lost fence after VACUUM"))
+                    } else {
+                        Ok(())
+                    }
+                }
+                .boxed()
+            }
+        });
+        let failed = migrate_database_with_reservation(
+            &path,
+            "compaction-user",
+            "compaction-lost-fence",
+            64,
+            &EngineMigrationRegistry::production(),
+            &backup,
+            fence,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(failed.outcome, "failed", "{failed:?}");
+        assert_eq!(failed.error_kind.as_deref(), Some("fence"));
+        assert!(failed.backup.is_some());
+        assert_eq!(header_version(&path), 63);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        let compacted_size = std::fs::metadata(&path).unwrap().len();
+        assert!(
+            compacted_size < before_size,
+            "{before_size} -> {compacted_size}"
+        );
+
+        // The retry covers the same source and stamps only after VACUUM,
+        // integrity, FK, shape, and fence checks. The test verifier keeps this
+        // recovery test focused; production always runs full conformance.
+        let verifier: PostMigrationVerifier =
+            Arc::new(|_| async { PostMigrationVerification::Passed }.boxed());
+        let retry = migrate_database_with_reservation(
+            &path,
+            "compaction-user",
+            "compaction-retry",
+            64,
+            &EngineMigrationRegistry::production(),
+            &backup,
+            always_fenced(),
+            None,
+            Some(verifier),
+            None,
+        )
+        .await;
+        assert_eq!(retry.outcome, "migrated", "{retry:?}");
+        assert_eq!(header_version(&path), 64);
+        let mut after = SqliteConnection::connect_with(&options).await.unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT arguments FROM read_log_calls WHERE seq=1")
+                .fetch_one(&mut after)
+                .await
+                .unwrap(),
+            retained
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT seq FROM sqlite_sequence WHERE name='read_log_calls'"
+            )
+            .fetch_one(&mut after)
+            .await
+            .unwrap(),
+            high_water
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("PRAGMA freelist_count")
+                .fetch_one(&mut after)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("PRAGMA integrity_check")
+                .fetch_one(&mut after)
+                .await
+                .unwrap(),
+            "ok"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM pragma_foreign_key_check")
+                .fetch_one(&mut after)
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(crate::db::validate_engine_shape_on_for_test(&mut after, 64)
+            .await
+            .unwrap());
+        after.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn engine_63_to_64_refuses_nonfrozen_source_before_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("engine-63-unknown-shape.db");
+        create_current_schema(&path).await;
+        let options = SqliteConnectOptions::from_str(&format!("sqlite:{}", path.display()))
+            .unwrap()
+            .foreign_keys(true);
+        let mut conn = SqliteConnection::connect_with(&options).await.unwrap();
+        revert_to_engine_64(&mut conn).await;
+        sqlx::query("PRAGMA user_version=63")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE unreviewed_schema_object (id INTEGER PRIMARY KEY)")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        conn.close().await.unwrap();
+        let offbox = tempfile::tempdir().unwrap();
+        let backup = test_preimage_store(offbox.path(), dir.path());
+        let failed = migrate_database_with_reservation(
+            &path,
+            "compaction-user",
+            "unknown-source",
+            64,
+            &EngineMigrationRegistry::production(),
+            &backup,
+            always_fenced(),
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(failed.outcome, "failed", "{failed:?}");
+        assert_eq!(failed.error_kind.as_deref(), Some("preflight"));
+        assert!(failed.backup.is_none());
+        assert_eq!(header_version(&path), 63);
+    }
+
+    #[tokio::test]
+    async fn engine_62_to_65_runner_cleans_compacts_and_fully_verifies() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("engine-62-to-65.db");
+        create_current_schema(&path).await;
+        let options = SqliteConnectOptions::from_str(&format!("sqlite:{}", path.display()))
+            .unwrap()
+            .foreign_keys(true);
+        let mut conn = SqliteConnection::connect_with(&options).await.unwrap();
+        revert_to_engine_62(&mut conn).await;
+        sqlx::query("INSERT INTO read_log_calls(id,tool,arguments,outcome,started_at,ended_at) VALUES('disposable-read','get_record','{}','ok','2026-09-23','2026-09-23')")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        conn.close().await.unwrap();
+        let offbox = tempfile::tempdir().unwrap();
+        let backup = test_preimage_store(offbox.path(), dir.path());
+        let result = migrate_database_with_reservation(
+            &path,
+            "multi-hop-user",
+            "multi-hop-run",
+            65,
+            &EngineMigrationRegistry::production(),
+            &backup,
+            always_fenced(),
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(result.outcome, "migrated", "{result:?}");
+        assert!(result.backup.is_some());
+        assert_eq!(header_version(&path), 65);
+        let mut after = SqliteConnection::connect_with(&options).await.unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM read_log_calls")
+                .fetch_one(&mut after)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("PRAGMA freelist_count")
+                .fetch_one(&mut after)
+                .await
+                .unwrap(),
+            0
+        );
+        after.close().await.unwrap();
+    }
+
+    /// The cleanup's frozen tool sets match the reviewed PR A disposition.
+    /// Every tool from that snapshot
+    /// lands in exactly one bucket, `bootstrap` stays issuance-side,
+    /// `set_intent` stays mutation-side, and no action-evidence surface is
+    /// ever classified disposable-pure-read. A future tool addition or
+    /// disposition change fails here and forces a migration review instead
+    /// of silently changing what historical cleanup deletes.
+    #[test]
+    fn read_log_cleanup_predicate_covers_every_shipped_tool() {
+        use std::collections::BTreeSet;
+
+        use crate::mcp::action_evidence;
+        let pure: BTreeSet<&str> = read_log_disposable_pure_reads().into_iter().collect();
+        let mixed: BTreeSet<&str> = read_log_mixed_reads()
+            .iter()
+            .map(|(tool, actions)| {
+                assert!(
+                    !actions.is_empty(),
+                    "{tool} must list at least one read action"
+                );
+                *tool
+            })
+            .collect();
+        let mutation: BTreeSet<&str> = ENGINE_62_TO_63_MUTATION_TOOLS.iter().copied().collect();
+        assert!(
+            pure.is_disjoint(&mixed) && pure.is_disjoint(&mutation) && mixed.is_disjoint(&mutation),
+            "cleanup buckets must partition the shipped tools"
+        );
+        let covered: BTreeSet<&str> = pure.union(&mixed).chain(mutation.iter()).copied().collect();
+        let all: BTreeSet<&str> = ToolKind::ALL.iter().map(|kind| kind.name()).collect();
+        // Bootstrap is issuance. The explicitly listed post-freeze tool is
+        // retained as unknown historical evidence by this edge.
+        let mut expected_outside = vec![ToolKind::Bootstrap.name()];
+        expected_outside.extend_from_slice(ENGINE_62_TO_63_POST_FREEZE_TOOLS);
+        expected_outside.sort_unstable();
+        let mut actual_outside: Vec<&str> = all.difference(&covered).copied().collect();
+        actual_outside.sort_unstable();
+        assert_eq!(
+            actual_outside, expected_outside,
+            "only issuance and explicitly reviewed post-freeze tools may be outside the cleanup buckets"
+        );
+        assert!(
+            !pure.contains(ToolKind::Bootstrap.name()),
+            "bootstrap is issuance, never disposable exhaust"
+        );
+        assert!(
+            mutation.contains(ToolKind::SetIntent.name()),
+            "set_intent declarations must survive historical cleanup"
+        );
+        for surface in action_evidence::action_evidence_surfaces() {
+            assert!(
+                !pure.contains(surface),
+                "{surface} is action evidence and must never be disposable-pure-read"
+            );
+        }
+        for kind in action_evidence::ANNOTATION_SURFACES {
+            assert!(
+                !pure.contains(kind.name()),
+                "{:?} can carry a retained annotation and must never be disposable-pure-read",
+                kind.name()
+            );
+        }
+    }
+
+    /// The frozen 62→63 policy equals the reviewed PR A disposition after
+    /// subtracting only explicitly named post-freeze additions. Historical
+    /// deletion replays this frozen classification, so another tool addition
+    /// or reclassification fails here until deliberately reviewed.
+    #[test]
+    fn engine_62_to_63_frozen_policy_matches_current_disposition() {
+        let mut derived_pure: Vec<&str> = ToolKind::ALL
+            .iter()
+            .filter(|kind| {
+                matches!(
+                    kind.authoritative_disposition(),
+                    AuthoritativeDisposition::Read
+                ) && **kind != ToolKind::Bootstrap
+            })
+            .map(|kind| kind.name())
+            .collect();
+        derived_pure.retain(|name| !ENGINE_62_TO_63_POST_FREEZE_TOOLS.contains(name));
+        derived_pure.sort_unstable();
+        let mut frozen_pure = ENGINE_62_TO_63_PURE_READ_TOOLS.to_vec();
+        frozen_pure.sort_unstable();
+        assert_eq!(
+            frozen_pure, derived_pure,
+            "frozen pure-read list drifted from current disposition"
+        );
+        let mut derived_mixed: Vec<(&str, Vec<&str>)> = ToolKind::ALL
+            .iter()
+            .filter_map(|kind| match kind.authoritative_disposition() {
+                AuthoritativeDisposition::Actions(actions) => {
+                    let mut reads = actions.to_vec();
+                    reads.sort_unstable();
+                    Some((kind.name(), reads))
+                }
+                AuthoritativeDisposition::Read | AuthoritativeDisposition::Mutation => None,
+            })
+            .collect();
+        derived_mixed.retain(|(name, _)| !ENGINE_62_TO_63_POST_FREEZE_TOOLS.contains(name));
+        derived_mixed.sort_unstable_by(|a, b| a.0.cmp(b.0));
+        let mut frozen_mixed: Vec<(&str, Vec<&str>)> = ENGINE_62_TO_63_MIXED_READS
+            .iter()
+            .map(|(tool, actions)| {
+                let mut reads = actions.to_vec();
+                reads.sort_unstable();
+                (*tool, reads)
+            })
+            .collect();
+        frozen_mixed.sort_unstable_by(|a, b| a.0.cmp(b.0));
+        assert_eq!(
+            frozen_mixed, derived_mixed,
+            "frozen mixed-read list drifted from current disposition"
+        );
+        let mut derived_mutation: Vec<&str> = ToolKind::ALL
+            .iter()
+            .filter(|kind| {
+                matches!(
+                    kind.authoritative_disposition(),
+                    AuthoritativeDisposition::Mutation
+                )
+            })
+            .map(|kind| kind.name())
+            .collect();
+        derived_mutation.sort_unstable();
+        let mut frozen_mutation = ENGINE_62_TO_63_MUTATION_TOOLS.to_vec();
+        frozen_mutation.sort_unstable();
+        assert_eq!(
+            frozen_mutation, derived_mutation,
+            "frozen mutation list drifted from current disposition"
+        );
+    }
+
+    #[tokio::test]
+    async fn engine_62_to_63_retains_post_freeze_authority_act_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("authority-act-read-retention.db");
+        create_current_schema(&path).await;
+        let options = SqliteConnectOptions::from_str(&format!("sqlite:{}", path.display()))
+            .unwrap()
+            .foreign_keys(true);
+        let mut connection = SqliteConnection::connect_with(&options).await.unwrap();
+        revert_to_engine_62(&mut connection).await;
+        for (seq, tool) in [(1, "authority_act_head"), (2, "authority_act_delta")] {
+            insert_read_log_call(
+                &mut connection,
+                seq,
+                tool,
+                Some("run:act"),
+                None,
+                None,
+                r#"{"cursor":"historical"}"#,
+                "ok",
+                None,
+            )
+            .await;
+        }
+        let report = read_log_62_to_63_attention_report(&mut connection)
+            .await
+            .unwrap();
+        assert_eq!(report.total_calls, 2);
+        assert_eq!(report.disposable_calls, 0);
+        assert_eq!(report.unknown_tool_calls, 0);
+        let step = EngineMigrationRegistry::production()
+            .pending(62, 63)
+            .unwrap()
+            .pop()
+            .unwrap();
+        step.preflight(&mut connection).await.unwrap();
+        step.apply(&mut connection).await.unwrap();
+        let retained: Vec<(String, String)> =
+            sqlx::query_as("SELECT tool, arguments FROM read_log_calls ORDER BY seq")
+                .fetch_all(&mut connection)
+                .await
+                .unwrap();
+        assert_eq!(
+            retained,
+            vec![
+                (
+                    "authority_act_head".into(),
+                    r#"{"cursor":"historical"}"#.into()
+                ),
+                (
+                    "authority_act_delta".into(),
+                    r#"{"cursor":"historical"}"#.into()
+                ),
+            ]
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn insert_read_log_call(
+        connection: &mut SqliteConnection,
+        seq: i64,
+        tool: &str,
+        run_key: Option<&str>,
+        parent_key: Option<&str>,
+        intent: Option<&str>,
+        arguments: &str,
+        outcome: &str,
+        annotation: Option<&str>,
+    ) {
+        sqlx::query(
+            "INSERT INTO read_log_calls
+             (seq, id, tool, run_key, parent_key, intent, actor, arguments,
+              outcome, error_kind, result_count, result_bytes,
+              started_at, ended_at, result_annotation)
+             VALUES (?, ?, ?, ?, ?, ?, 'test-actor', ?, ?, \
+                     CASE WHEN ? = 'error' THEN 'test_error' ELSE NULL END, \
+                     NULL, NULL, '2026-09-01T00:00:00.000Z', \
+                     '2026-09-01T00:00:' || printf('%02d', ?) || '.000Z', ?)",
+        )
+        .bind(seq)
+        .bind(format!("call-{seq:04}"))
+        .bind(tool)
+        .bind(run_key)
+        .bind(parent_key)
+        .bind(intent)
+        .bind(arguments)
+        .bind(outcome)
+        .bind(outcome)
+        .bind(seq)
+        .bind(annotation)
+        .execute(&mut *connection)
+        .await
+        .unwrap();
+    }
+
+    async fn insert_read_log_touch(
+        connection: &mut SqliteConnection,
+        call_seq: i64,
+        record_ref: i64,
+        interaction: &str,
+        result_rank: Option<i64>,
+    ) {
+        sqlx::query(
+            "INSERT INTO read_log_touches (call_seq, record_ref, interaction, result_rank)
+             VALUES (?, ?, ?, ?)",
+        )
+        .bind(call_seq)
+        .bind(record_ref)
+        .bind(interaction)
+        .bind(result_rank)
+        .execute(&mut *connection)
+        .await
+        .unwrap();
+    }
+
+    /// The 62→63 edge keeps exactly PR A's retention classes with verbatim
+    /// evidence, deletes disposable exhaust (cascading its touches), strips
+    /// issuance touches and non-selector arguments, purges newly orphaned
+    /// dictionary entries, and preserves `seq`, ordering, parentage, and the
+    /// `AUTOINCREMENT` high-water mark. Re-applying the edge is a no-op.
+    #[tokio::test]
+    async fn engine_62_to_63_selective_cleanup_retains_action_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("read-log-cleanup-fixture.db");
+        create_current_schema(&path).await;
+        let options = SqliteConnectOptions::from_str(&format!("sqlite:{}", path.display()))
+            .unwrap()
+            .foreign_keys(true);
+        let mut conn = SqliteConnection::connect_with(&options).await.unwrap();
+        revert_to_engine_62(&mut conn).await;
+        for (record_ref, record_id) in [
+            (1, "fixture-record-a"),
+            (2, "fixture-record-b"),
+            (3, "fixture-record-c"),
+            (4, "fixture-record-d"),
+            (5, "fixture-record-e"),
+            (6, "fixture-record-f"),
+            (7, "fixture-preexisting-orphan"),
+        ] {
+            sqlx::query("INSERT INTO read_log_record_ids (record_ref, record_id) VALUES (?, ?)")
+                .bind(record_ref)
+                .bind(record_id)
+                .execute(&mut conn)
+                .await
+                .unwrap();
+        }
+        // Disposable pure reads.
+        insert_read_log_call(
+            &mut conn,
+            1,
+            "get_record",
+            Some("r1"),
+            None,
+            None,
+            r#"{"id":"fixture-record-a"}"#,
+            "ok",
+            None,
+        )
+        .await;
+        insert_read_log_touch(&mut conn, 1, 1, "surfaced", Some(1)).await;
+        insert_read_log_call(
+            &mut conn,
+            2,
+            "search",
+            Some("r1"),
+            None,
+            None,
+            r#"{"query":"width"}"#,
+            "ok",
+            None,
+        )
+        .await;
+        // Run issuance: kept as identity, stripped of attention.
+        insert_read_log_call(
+            &mut conn,
+            3,
+            "bootstrap",
+            Some("run:r1"),
+            None,
+            None,
+            r#"{"orientation":"deep"}"#,
+            "ok",
+            None,
+        )
+        .await;
+        insert_read_log_touch(&mut conn, 3, 2, "surfaced", Some(1)).await;
+        insert_read_log_touch(&mut conn, 3, 2, "opened", None).await;
+        insert_read_log_call(
+            &mut conn,
+            4,
+            "get_record",
+            None,
+            Some("r0"),
+            None,
+            r#"{"id":"fixture-record-c","run_key":"new:scout"}"#,
+            "ok",
+            None,
+        )
+        .await;
+        insert_read_log_touch(&mut conn, 4, 3, "surfaced", Some(2)).await;
+        // Declarations: success and failed attempt.
+        insert_read_log_call(
+            &mut conn,
+            5,
+            "set_intent",
+            Some("r1"),
+            None,
+            Some("hunt"),
+            r#"{"intent":"hunt","run_key":"r1"}"#,
+            "ok",
+            None,
+        )
+        .await;
+        insert_read_log_call(
+            &mut conn,
+            6,
+            "set_intent",
+            Some("r1"),
+            None,
+            None,
+            r#"{"intent":"hunt"}"#,
+            "error",
+            None,
+        )
+        .await;
+        // Annotation-bearing read: kept with its touches.
+        insert_read_log_call(
+            &mut conn,
+            7,
+            "get_record",
+            Some("r1"),
+            None,
+            None,
+            r#"{"id":"fixture-record-d"}"#,
+            "ok",
+            Some(r#"{"overlap":"o1"}"#),
+        )
+        .await;
+        insert_read_log_touch(&mut conn, 7, 4, "opened", Some(2)).await;
+        // Mutations and mixed writes: kept.
+        insert_read_log_call(
+            &mut conn,
+            8,
+            "update_record",
+            Some("r1"),
+            Some("r1"),
+            None,
+            r#"{"id":"fixture-record-b","body":"b"}"#,
+            "ok",
+            None,
+        )
+        .await;
+        insert_read_log_touch(&mut conn, 8, 2, "mutated", None).await;
+        insert_read_log_call(
+            &mut conn,
+            9,
+            "manage_links",
+            Some("r1"),
+            None,
+            None,
+            r#"{"action":"add","target_id":"fixture-record-b"}"#,
+            "ok",
+            None,
+        )
+        .await;
+        insert_read_log_touch(&mut conn, 9, 2, "mutated", None).await;
+        // Mixed read action: disposable.
+        insert_read_log_call(
+            &mut conn,
+            10,
+            "manage_links",
+            Some("r1"),
+            None,
+            None,
+            r#"{"action":"list"}"#,
+            "ok",
+            None,
+        )
+        .await;
+        insert_read_log_touch(&mut conn, 10, 2, "surfaced", Some(3)).await;
+        // Mixed unknown/malformed actions: fail closed (kept).
+        insert_read_log_call(
+            &mut conn,
+            11,
+            "manage_links",
+            Some("r1"),
+            None,
+            None,
+            r#"{"action":"bogus-future"}"#,
+            "ok",
+            None,
+        )
+        .await;
+        insert_read_log_call(
+            &mut conn,
+            12,
+            "manage_links",
+            Some("r1"),
+            None,
+            None,
+            r#"{}"#,
+            "ok",
+            None,
+        )
+        .await;
+        // Mutation surface without a mutated touch: kept by disposition.
+        insert_read_log_call(
+            &mut conn,
+            13,
+            "create_record",
+            Some("r1"),
+            None,
+            None,
+            r#"{"type":"Document","kind":"note"}"#,
+            "ok",
+            None,
+        )
+        .await;
+        insert_read_log_touch(&mut conn, 13, 5, "surfaced", Some(1)).await;
+        // Failed mutation attempt: kept. Failed pure read: dropped.
+        insert_read_log_call(
+            &mut conn,
+            14,
+            "delete_record",
+            Some("r1"),
+            None,
+            None,
+            r#"{"id":"fixture-record-b"}"#,
+            "error",
+            None,
+        )
+        .await;
+        insert_read_log_call(
+            &mut conn,
+            15,
+            "get_record",
+            Some("r1"),
+            None,
+            None,
+            r#"{"id":"fixture-record-b"}"#,
+            "error",
+            None,
+        )
+        .await;
+        // Unknown tool: fail closed (kept with touches).
+        insert_read_log_call(
+            &mut conn,
+            16,
+            "nonexistent_tool_fixture",
+            Some("r1"),
+            None,
+            None,
+            r#"{}"#,
+            "ok",
+            None,
+        )
+        .await;
+        insert_read_log_touch(&mut conn, 16, 6, "surfaced", None).await;
+        // Mixed read vs write on a coordination surface.
+        insert_read_log_call(
+            &mut conn,
+            17,
+            "start_work",
+            Some("r1"),
+            None,
+            None,
+            r#"{"action":"preview"}"#,
+            "ok",
+            None,
+        )
+        .await;
+        insert_read_log_touch(&mut conn, 17, 2, "surfaced", None).await;
+        insert_read_log_call(
+            &mut conn,
+            18,
+            "start_work",
+            Some("r1"),
+            None,
+            None,
+            r#"{"action":"release","run_key":"r1"}"#,
+            "ok",
+            None,
+        )
+        .await;
+        insert_read_log_touch(&mut conn, 18, 2, "mutated", None).await;
+        // Malformed historical arguments: retained byte-identical with their
+        // touches, whatever the tool. A known pure read and a mixed tool
+        // cannot match through JSON extracts; a `bootstrap` issuance row
+        // still strips attention touches (no JSON needed) but keeps its
+        // exact argument bytes.
+        insert_read_log_call(
+            &mut conn,
+            19,
+            "get_record",
+            Some("r1"),
+            None,
+            None,
+            "{invalid-json",
+            "ok",
+            None,
+        )
+        .await;
+        insert_read_log_touch(&mut conn, 19, 2, "surfaced", None).await;
+        insert_read_log_call(
+            &mut conn,
+            20,
+            "manage_links",
+            Some("r1"),
+            None,
+            None,
+            "[1,2",
+            "ok",
+            None,
+        )
+        .await;
+        insert_read_log_call(
+            &mut conn,
+            21,
+            "bootstrap",
+            Some("run:r2"),
+            None,
+            None,
+            "garbage",
+            "ok",
+            None,
+        )
+        .await;
+        insert_read_log_touch(&mut conn, 21, 2, "surfaced", None).await;
+        // SQL NULL is distinct from malformed text and must also fail closed.
+        for (seq, tool) in [(22, "get_record"), (23, "manage_links")] {
+            insert_read_log_call(
+                &mut conn,
+                seq,
+                tool,
+                Some("r1"),
+                None,
+                None,
+                "{}",
+                "ok",
+                None,
+            )
+            .await;
+            sqlx::query("UPDATE read_log_calls SET arguments = NULL WHERE seq = ?")
+                .bind(seq)
+                .execute(&mut conn)
+                .await
+                .unwrap();
+            insert_read_log_touch(&mut conn, seq, 2, "surfaced", None).await;
+        }
+
+        let high_water: i64 =
+            sqlx::query_scalar("SELECT seq FROM sqlite_sequence WHERE name = 'read_log_calls'")
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+        assert_eq!(high_water, 23);
+
+        let report = read_log_62_to_63_attention_report(&mut conn).await.unwrap();
+        assert_eq!(report.total_calls, 23);
+        assert_eq!(report.disposable_calls, 5);
+        assert_eq!(report.retained_calls, 18);
+        assert_eq!(report.issuance_calls, 3);
+        assert_eq!(report.unknown_tool_calls, 1);
+        assert_eq!(report.null_arguments_calls, 2);
+        assert_eq!(report.malformed_arguments_calls, 3);
+        assert_eq!(report.mixed_missing_or_nontext_action_calls, 1);
+        assert_eq!(report.mixed_unmatched_text_action_calls, 3);
+        assert_eq!(report.total_touches, 16);
+        assert_eq!(report.removable_touches, 7);
+        assert_eq!(report.total_dictionary_entries, 7);
+        assert_eq!(report.projected_orphan_dictionary_entries, 3);
+
+        let step = EngineMigrationRegistry::production()
+            .pending(62, 63)
+            .unwrap()
+            .pop()
+            .unwrap();
+        step.preflight(&mut conn).await.unwrap();
+        step.apply(&mut conn).await.unwrap();
+
+        let remaining: Vec<i64> = sqlx::query_scalar("SELECT seq FROM read_log_calls ORDER BY seq")
+            .fetch_all(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(
+            remaining,
+            vec![3, 4, 5, 6, 7, 8, 9, 11, 12, 13, 14, 16, 18, 19, 20, 21, 22, 23]
+        );
+        // Issuance rows keep identity columns but lose attention touches and
+        // non-selector arguments. The malformed `bootstrap` row (21) strips
+        // touches without JSON, while the malformed non-issuance rows (19,
+        // 20) keep theirs.
+        let issuance_touches: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM read_log_touches WHERE call_seq IN (3, 4, 21)",
+        )
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+        assert_eq!(issuance_touches, 0);
+        for (seq, arguments) in [(19, "{invalid-json"), (20, "[1,2"), (21, "garbage")] {
+            let stored: String =
+                sqlx::query_scalar("SELECT arguments FROM read_log_calls WHERE seq = ?")
+                    .bind(seq)
+                    .fetch_one(&mut conn)
+                    .await
+                    .unwrap();
+            assert_eq!(stored, arguments, "seq {seq} must keep exact bytes");
+        }
+        for seq in [22, 23] {
+            let stored: Option<String> =
+                sqlx::query_scalar("SELECT arguments FROM read_log_calls WHERE seq = ?")
+                    .bind(seq)
+                    .fetch_one(&mut conn)
+                    .await
+                    .unwrap();
+            assert_eq!(stored, None, "seq {seq} must keep SQL NULL arguments");
+        }
+        let bootstrap2_run_key: Option<String> =
+            sqlx::query_scalar("SELECT run_key FROM read_log_calls WHERE seq = 21")
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+        assert_eq!(bootstrap2_run_key.as_deref(), Some("run:r2"));
+        let bootstrap_args: String =
+            sqlx::query_scalar("SELECT arguments FROM read_log_calls WHERE seq = 3")
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+        assert_eq!(bootstrap_args, "{}");
+        let bootstrap_run_key: Option<String> =
+            sqlx::query_scalar("SELECT run_key FROM read_log_calls WHERE seq = 3")
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+        assert_eq!(bootstrap_run_key.as_deref(), Some("run:r1"));
+        let scout_args: String =
+            sqlx::query_scalar("SELECT arguments FROM read_log_calls WHERE seq = 4")
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+        assert_eq!(scout_args, r#"{"run_key":"new:scout"}"#);
+        // Retained evidence stays verbatim: arguments, annotation, touches
+        // (with rank), ordering, and parentage.
+        let intent_args: String =
+            sqlx::query_scalar("SELECT arguments FROM read_log_calls WHERE seq = 5")
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+        assert_eq!(intent_args, r#"{"intent":"hunt","run_key":"r1"}"#);
+        let annotation: Option<String> =
+            sqlx::query_scalar("SELECT result_annotation FROM read_log_calls WHERE seq = 7")
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+        assert_eq!(annotation.as_deref(), Some(r#"{"overlap":"o1"}"#));
+        let touches: Vec<(i64, i64, String, Option<i64>)> = sqlx::query_as(
+            "SELECT call_seq, record_ref, interaction, result_rank
+             FROM read_log_touches ORDER BY call_seq, record_ref, interaction",
+        )
+        .fetch_all(&mut conn)
+        .await
+        .unwrap();
+        assert_eq!(
+            touches,
+            vec![
+                (7, 4, "opened".to_owned(), Some(2)),
+                (8, 2, "mutated".to_owned(), None),
+                (9, 2, "mutated".to_owned(), None),
+                (13, 5, "surfaced".to_owned(), Some(1)),
+                (16, 6, "surfaced".to_owned(), None),
+                (18, 2, "mutated".to_owned(), None),
+                (19, 2, "surfaced".to_owned(), None),
+                (22, 2, "surfaced".to_owned(), None),
+                (23, 2, "surfaced".to_owned(), None),
+            ]
+        );
+        let parentage: Option<String> =
+            sqlx::query_scalar("SELECT parent_key FROM read_log_calls WHERE seq = 8")
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+        assert_eq!(parentage.as_deref(), Some("r1"));
+        // Dictionary entries survive only while referenced: refs 1 and 3
+        // were orphaned by the cleanup and 7 was already orphaned.
+        let dictionary: Vec<i64> =
+            sqlx::query_scalar("SELECT record_ref FROM read_log_record_ids ORDER BY record_ref")
+                .fetch_all(&mut conn)
+                .await
+                .unwrap();
+        assert_eq!(dictionary, vec![2, 4, 5, 6]);
+        // The AUTOINCREMENT high-water mark survives: new rows continue above
+        // the pre-cleanup maximum rather than reusing deleted sequence values.
+        let high_water_after: i64 =
+            sqlx::query_scalar("SELECT seq FROM sqlite_sequence WHERE name = 'read_log_calls'")
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+        assert_eq!(high_water_after, 23);
+        let violations: Vec<(String, Option<i64>, String, i64)> =
+            sqlx::query_as("SELECT \"table\", rowid, parent, fkid FROM pragma_foreign_key_check")
+                .fetch_all(&mut conn)
+                .await
+                .unwrap();
+        assert!(violations.is_empty(), "FK violations: {violations:?}");
+        // Re-applying the edge over the cleaned file is a no-op retry.
+        step.apply(&mut conn).await.unwrap();
+        let remaining_retry: Vec<i64> =
+            sqlx::query_scalar("SELECT seq FROM read_log_calls ORDER BY seq")
+                .fetch_all(&mut conn)
+                .await
+                .unwrap();
+        assert_eq!(remaining_retry, remaining);
+        let post_report = read_log_62_to_63_attention_report(&mut conn).await.unwrap();
+        assert_eq!(post_report.disposable_calls, 0);
+        assert_eq!(post_report.removable_touches, 0);
+        assert_eq!(post_report.projected_orphan_dictionary_entries, 0);
+        sqlx::query("PRAGMA user_version=63")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        assert!(crate::db::validate_engine_shape_on_for_test(&mut conn, 63)
+            .await
+            .unwrap());
+        compact_63_to_64_and_stamp(&mut conn).await;
+        let alpha_step = EngineMigrationRegistry::production()
+            .pending(64, 65)
+            .unwrap()
+            .pop()
+            .unwrap();
+        alpha_step.preflight(&mut conn).await.unwrap();
+        alpha_step.apply(&mut conn).await.unwrap();
+        sqlx::query("PRAGMA user_version=65")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        conn.close().await.unwrap();
+
+        // The migrated file opens and passes post-migration verification:
+        // current shape, open behavior, and the full conformance suite.
+        assert!(matches!(
+            verify_migrated_database(path.clone(), "fixture").await,
+            PostMigrationVerification::Passed
+        ));
+        // New captures continue above the retained high-water mark.
+        let migrated = crate::open_existing_database_at(&path).await.unwrap();
+        sqlx::query(
+            "INSERT INTO read_log_calls
+             (id, tool, outcome, started_at, ended_at)
+             VALUES ('post-cleanup-probe', 'get_record', 'ok',
+                     '2026-09-01T00:00:00.000Z', '2026-09-01T00:01:00.000Z')",
+        )
+        .execute(migrated.write_pool())
+        .await
+        .unwrap();
+        let probe_seq: i64 =
+            sqlx::query_scalar("SELECT seq FROM read_log_calls WHERE id = 'post-cleanup-probe'")
+                .fetch_one(migrated.write_pool())
+                .await
+                .unwrap();
+        assert_eq!(probe_seq, 24);
+        migrated.close().await;
+    }
+
+    /// Reconstruct the released engine-64 (main64) shape: current DDL minus
+    /// exactly the `alpha_tab_installs` projection table and its artifact
+    /// index. Dropping the table removes its index with it; the reverted
+    /// schema compares equal to fresh main64 DDL under the shape contract.
+    /// Test fixtures only; this is not a rollback API.
+    async fn revert_to_engine_64(connection: &mut SqliteConnection) {
+        sqlx::query("DROP TABLE alpha_tab_installs")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        sqlx::query("PRAGMA user_version=64")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+    }
+
+    /// The 64→65 DDL is transition text, but the objects it creates must stay
+    /// byte-identical to the fresh-schema DDL: migrated databases are
+    /// byte-identical to fresh ones under the shape contract only while both
+    /// spellings agree.
+    #[test]
+    fn engine_64_to_65_statements_match_fresh_ddl() {
+        for statement in ENGINE_64_TO_65_STATEMENTS {
+            let prefix = if statement.starts_with("CREATE TABLE alpha_tab_installs (") {
+                "CREATE TABLE alpha_tab_installs ("
+            } else if statement.starts_with("CREATE INDEX idx_alpha_tab_installs_artifact") {
+                "CREATE INDEX idx_alpha_tab_installs_artifact"
+            } else {
+                panic!("unexpected 64→65 statement: {statement}");
+            };
+            let fresh = crate::schema::DDL_STATEMENTS
+                .iter()
+                .find(|candidate| candidate.starts_with(prefix))
+                .unwrap_or_else(|| panic!("64→65 statement has no fresh-DDL twin: {prefix}"));
+            assert_eq!(*fresh, statement, "64→65 statement drifted from fresh DDL");
+        }
+    }
+
+    /// The 64→65 edge adds the empty `alpha_tab_installs` projection: the
+    /// migrated database validates at schema 65, the table starts empty, and
+    /// ordinary control writes keep folding on the migrated database.
+    #[tokio::test]
+    async fn engine_64_to_65_adds_empty_alpha_tab_installs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("alpha-tab-installs-edge.db");
+        create_current_schema(&path).await;
+        let options = SqliteConnectOptions::from_str(&format!("sqlite:{}", path.display()))
+            .unwrap()
+            .foreign_keys(true);
+        let mut conn = SqliteConnection::connect_with(&options).await.unwrap();
+        revert_to_engine_64(&mut conn).await;
+        let digest = crate::db::schema_shape_contract_sha256_for_test(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(digest, crate::db::ENGINE_64_SHAPE_CONTRACT_SHA256);
+        let step = EngineMigrationRegistry::production()
+            .pending(64, 65)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(step.name(), "engine-64-to-65-alpha-tab-installs-projection");
+        step.preflight(&mut conn).await.unwrap();
+        step.apply(&mut conn).await.unwrap();
+        sqlx::query("PRAGMA user_version=65")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        assert!(crate::db::validate_engine_shape_on_for_test(&mut conn, 65)
+            .await
+            .unwrap());
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM alpha_tab_installs")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(rows, 0);
+        conn.close().await.unwrap();
+
+        let migrated = crate::open_existing_database_at(&path).await.unwrap();
+        let result = crate::conformance::rebuild_and_diff_control(&migrated)
+            .await
+            .unwrap();
+        assert!(
+            result.equal,
+            "rebuild drift after 64→65: {}",
+            serde_json::to_string_pretty(&result.tables).unwrap()
+        );
+        migrated.close().await;
     }
 }

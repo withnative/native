@@ -255,13 +255,15 @@ pub(crate) const OWNER_GUIDANCE_ID: &str = "native:onboarding-owner-guidance";
 pub(crate) const OWNER_CRITERIA_ID: &str = "native:onboarding-owner-completion";
 pub(crate) const MEMBER_GUIDANCE_ID: &str = "native:onboarding-member-guidance";
 pub(crate) const MEMBER_CRITERIA_ID: &str = "native:onboarding-member-completion";
-pub(crate) const ENGINE_PROVISIONED_RECORD_IDS: [&str; 6] = [
+pub(crate) const GUEST_GUIDANCE_ID: &str = "native:onboarding-guest-guidance";
+pub(crate) const ENGINE_PROVISIONED_RECORD_IDS: [&str; 7] = [
     INSTRUCTIONS_FOLDER_ID,
     WORKSPACE_INSTRUCTIONS_ID,
     OWNER_GUIDANCE_ID,
     OWNER_CRITERIA_ID,
     MEMBER_GUIDANCE_ID,
     MEMBER_CRITERIA_ID,
+    GUEST_GUIDANCE_ID,
 ];
 
 /// The 4 spine facet keys (2e5ed3e Am.2 §3 + Am.3), promoted to columns on
@@ -302,7 +304,7 @@ pub const ARCHIVED_FACET_KEY: &str = "archived";
 /// (new hard-shaped data lands as a new substrate primitive, not a new top-level
 /// type) and still conform; conformance requires presence, never absence, of
 /// tables.
-pub const REQUIRED_TABLES: [&str; 123] = [
+pub const REQUIRED_TABLES: [&str; 125] = [
     // Substrate primitives
     "content_events",
     "content_event_causal_frontier",
@@ -371,6 +373,7 @@ pub const REQUIRED_TABLES: [&str; 123] = [
     "message_preferences",
     "member_destinations",
     "message_mentions",
+    "record_mentions",
     "notification_candidate_events",
     "notification_candidates",
     "module_releases",
@@ -414,6 +417,7 @@ pub const REQUIRED_TABLES: [&str; 123] = [
     "member_obligations",
     "member_obligation_progress",
     "seeded_instruction_sources",
+    "alpha_tab_installs",
     "control_event_applications",
     "storage_portability_policy",
     // The meta tier's own authoritative log (ba9f97e). It sits with the logs
@@ -698,7 +702,7 @@ pub fn ddl_sha256() -> String {
 /// support baseline must deliberately add its own fixture and fingerprint as
 /// part of the activation checklist in `docs/schema-migrations.md`.
 pub const FROZEN_DDL_SHA256: &str =
-    "eb10e6879ffa1bdbac22289bd0d85d68ea75892d98c5bcc77a5594aeeefa9d7f";
+    "3284d80259000f4c8ab4c88ad7ec06175561b6d526462aaf893235a8f3201111";
 
 #[cfg(test)]
 mod tests {
@@ -707,5 +711,95 @@ mod tests {
     #[test]
     fn frozen_ddl_fingerprint_matches_current_statements() {
         assert_eq!(ddl_sha256(), FROZEN_DDL_SHA256);
+    }
+
+    #[test]
+    fn merged_historical_ddl_fingerprints_are_reproducible() {
+        fn historical(version: i64) -> String {
+            let mut statements = Vec::new();
+            for statement in DDL_STATEMENTS {
+                if version < 59
+                    && (statement.starts_with("CREATE TABLE record_mentions")
+                        || statement.starts_with("CREATE INDEX idx_record_mentions_"))
+                {
+                    continue;
+                }
+                if version < 62
+                    && (statement.contains("idx_external_observations_act")
+                        || statement.contains("idx_awareness_command_intents_act"))
+                {
+                    continue;
+                }
+                if version < 61
+                    && (statement.contains("idx_content_events_act")
+                        || statement.contains("idx_policy_events_act")
+                        || statement.contains("idx_awareness_events_act")
+                        || statement.contains("idx_notification_candidate_events_act")
+                        || statement.contains("idx_binding_audit_act")
+                        || statement.contains("idx_database_identity_audit_act")
+                        || statement.contains("idx_meta_events_act")
+                        || statement.contains("idx_control_events_act")
+                        || statement.contains("idx_derivation_events_act")
+                        || statement.contains("idx_relationship_events_act")
+                        || statement.contains("binding_systems_no_insert")
+                        || statement.contains("binding_systems_no_update")
+                        || statement.contains("binding_systems_no_delete"))
+                {
+                    continue;
+                }
+                if version < 60 && statement.contains("idx_provenance_validity_act") {
+                    continue;
+                }
+                if version < 65
+                    && (statement.starts_with("CREATE TABLE alpha_tab_installs")
+                        || statement.starts_with("CREATE INDEX idx_alpha_tab_installs_"))
+                {
+                    continue;
+                }
+                let mut statement = statement.to_owned();
+                if version < 62
+                    && (statement.starts_with("CREATE TABLE external_observations")
+                        || statement.starts_with("CREATE TABLE awareness_command_intents"))
+                {
+                    statement = statement.replace("     act            INTEGER,\n", "");
+                }
+                if version < 60
+                    && statement.starts_with("CREATE TABLE provenance_attestation_validity_events")
+                {
+                    statement = statement.replace("     act            INTEGER,\n", "");
+                }
+                if statement.starts_with("PRAGMA user_version") {
+                    statement = format!("PRAGMA user_version = {version}");
+                }
+                statements.push(statement);
+            }
+            hex::encode(Sha256::digest(statements.join("\n;\n").as_bytes()))
+        }
+
+        assert_eq!(
+            [
+                historical(58),
+                historical(59),
+                historical(60),
+                historical(61),
+                historical(62),
+                historical(63),
+                historical(64),
+                historical(65),
+            ],
+            [
+                "b418f5ea746c5e791df9ec07041dbb4fdd3a5098b828de3dc3e983a456a9c755",
+                "11ce556033de8ef9d11628cf27bf619632fe0448d357d8c6c2dc8b5e8542760b",
+                "b0d60b656df93c2f5a722db72efa3e82b6951360e03c8000bd5a3f3e5cf7417c",
+                "d6e6c4aaf797c7f4ddbf6b39b888de03774e923cc5b2f5cd2f14a25c25bd6e5a",
+                "cda661e14f9631a96fce4d00d1ee057912a91056ed9f403e58359b8e8474110a",
+                "0dfa34070e4d338834b837e792108daaf80d29ddb788eed4280c97953f47b2e8",
+                // Engine 64 is main64's released DDL: historical(64) strips
+                // the 64→65 alpha projection, reproducing main64's frozen
+                // fingerprint exactly.
+                "77f1fef8c81f424154e65afd978d39ebd69e5c7ab04ce97bd2aaf11f1ab896df",
+                FROZEN_DDL_SHA256,
+            ]
+        );
     }
 }

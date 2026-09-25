@@ -36,6 +36,10 @@ const MEMBERSHIP_CREATE_INVITATION_OPERATION: &str = "manage_memberships.invitat
 const MEMBERSHIP_COPY_INVITATION_LINK_OPERATION: &str = "manage_memberships.invitations_copy_link";
 const MEMBERSHIP_SEND_INVITATION_OPERATION: &str = "manage_memberships.invitations_send";
 const MEMBERSHIP_REVOKE_INVITATION_OPERATION: &str = "manage_memberships.invitations_revoke";
+const MEMBERSHIP_CREATE_GUEST_LINK_OPERATION: &str = "manage_memberships.create_guest_link";
+const MEMBERSHIP_REVOKE_GUEST_LINK_OPERATION: &str = "manage_memberships.revoke_guest_link";
+const WORKSPACE_EXECUTOR: &str = "workspace_read";
+const WORKSPACE_LIST_OPERATION: &str = "workspace_read.list";
 const IDENTITY_EXECUTOR: &str = "identity_admin";
 const IDENTITY_ADD_OPERATION: &str = "manage_bindings.add";
 const IDENTITY_CANONICALIZE_OPERATION: &str = "manage_bindings.canonicalize";
@@ -61,6 +65,23 @@ const VOCABULARY_SET_GLOSS_OPERATION: &str = "manage_vocabularies.set_gloss";
 const VOCABULARY_METADATA_OPERATION: &str = "manage_vocabularies.set_metadata";
 const SCHEMA_CONFIG_WRITE_OPERATION: &str = "manage_schema_config.write";
 const DEFAULT_TTL_MS: i64 = 120_000;
+const SQL_WRITE_TTL_MS: i64 = 600_000;
+/// Preview-only SQL write pair. Its plan-required source and executor are
+/// advertised only when the deployment allowlists `sql_write`.
+const SQL_WRITE_EXECUTOR: &str = "sql_write";
+const SQL_WRITE_OPERATION: &str = "sql_write";
+
+/// Operation-specific plan TTL selection.
+///
+/// `sql_write` preview plans get ten minutes; every other operation keeps
+/// the two-minute default. Classification and admission are handled separately.
+pub(super) fn plan_ttl_ms(executor: &str, operation: &str) -> i64 {
+    if executor == SQL_WRITE_EXECUTOR && operation == SQL_WRITE_OPERATION {
+        SQL_WRITE_TTL_MS
+    } else {
+        DEFAULT_TTL_MS
+    }
+}
 use super::plan_store::{ClaimOutcome, PlanStore, StoredPlan, StoredState};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -241,6 +262,16 @@ pub(super) const PLAN_POLICY_TABLE: &[(&str, &str, PlanPolicy)] = &[
         MEMBERSHIP_REVOKE_INVITATION_OPERATION,
         PlanPolicy::RequiredSupported,
     ),
+    (
+        MEMBERSHIP_EXECUTOR,
+        MEMBERSHIP_CREATE_GUEST_LINK_OPERATION,
+        PlanPolicy::RequiredSupported,
+    ),
+    (
+        MEMBERSHIP_EXECUTOR,
+        MEMBERSHIP_REVOKE_GUEST_LINK_OPERATION,
+        PlanPolicy::RequiredSupported,
+    ),
     // Classified, but withheld: the hosted atomic membership writes have no
     // truthful non-mutating preparer in this facade.
     (
@@ -260,6 +291,16 @@ pub(super) const PLAN_POLICY_TABLE: &[(&str, &str, PlanPolicy)] = &[
     (
         CANVAS_WRITE_EXECUTOR,
         CANVAS_PROMOTE_OPERATION,
+        PlanPolicy::RequiredSupported,
+    ),
+    // Preview-only SQL-selected edits (E4 M1). The preparer runs the caller
+    // SELECT through the governed read path and checks versions and Edit
+    // authorization in the same transaction before rolling back; preparation
+    // provably does not mutate. Admitted only under the experimental
+    // allowlist; there is no commit route in this milestone.
+    (
+        SQL_WRITE_EXECUTOR,
+        SQL_WRITE_OPERATION,
         PlanPolicy::RequiredSupported,
     ),
 ];
@@ -299,6 +340,8 @@ pub(super) fn is_membership_operation(executor: &str, operation: &str) -> bool {
             )
             | (MEMBERSHIP_EXECUTOR, MEMBERSHIP_SEND_INVITATION_OPERATION)
             | (MEMBERSHIP_EXECUTOR, MEMBERSHIP_REVOKE_INVITATION_OPERATION)
+            | (MEMBERSHIP_EXECUTOR, MEMBERSHIP_CREATE_GUEST_LINK_OPERATION)
+            | (MEMBERSHIP_EXECUTOR, MEMBERSHIP_REVOKE_GUEST_LINK_OPERATION)
     )
 }
 
@@ -307,6 +350,17 @@ fn is_hosted_atomic_membership_operation(executor: &str, operation: &str) -> boo
         (executor, operation),
         (MEMBERSHIP_EXECUTOR, MEMBERSHIP_SET_ROLE_OPERATION)
             | (MEMBERSHIP_REMOVE_EXECUTOR, MEMBERSHIP_REMOVE_OPERATION)
+    )
+}
+
+/// The hosted workspace directory. It is `Direct` — a read needs no plan —
+/// yet it must never be advertised without hosted authority: the source tool
+/// is absent from every non-hosted registry, and this gate keeps that true
+/// even for a registry that registered it.
+pub(super) fn is_workspace_operation(executor: &str, operation: &str) -> bool {
+    matches!(
+        (executor, operation),
+        (WORKSPACE_EXECUTOR, WORKSPACE_LIST_OPERATION)
     )
 }
 
@@ -359,6 +413,10 @@ pub(super) fn validate(
         // Promotion's shape is validated by the handler's own argument
         // parsing during preparation, which is the dry run.
         (CANVAS_WRITE_EXECUTOR, CANVAS_PROMOTE_OPERATION) => Ok(()),
+        // Preview-only SQL writes: the shape is validated by the preview
+        // preparer's own argument parsing during preparation, which is the
+        // dry run. The preparer stays authoritative for bounds and parity.
+        (SQL_WRITE_EXECUTOR, SQL_WRITE_OPERATION) => Ok(()),
         (executor, operation) if is_membership_operation(executor, operation) => hosted_authority
             .ok_or_else(|| {
                 Error::engine("hosted membership plans require an authoritative catalogue context")
@@ -465,6 +523,14 @@ impl WriteRuntime {
             ttl_ms,
             dispatch_gate: None,
             revalidation_gate: None,
+        }
+    }
+
+    fn ttl_for(&self, executor: &str, operation: &str) -> i64 {
+        if executor == SQL_WRITE_EXECUTOR && operation == SQL_WRITE_OPERATION {
+            plan_ttl_ms(executor, operation)
+        } else {
+            self.ttl_ms
         }
     }
 
@@ -614,13 +680,28 @@ fn canonical_source_arguments(executor: &str, operation: &str, arguments: Value)
         }
         (MEMBERSHIP_EXECUTOR, MEMBERSHIP_SEND_INVITATION_OPERATION) => Some("invitations_send"),
         (MEMBERSHIP_EXECUTOR, MEMBERSHIP_REVOKE_INVITATION_OPERATION) => Some("invitations_revoke"),
+        (MEMBERSHIP_EXECUTOR, MEMBERSHIP_CREATE_GUEST_LINK_OPERATION) => Some("create_guest_link"),
+        (MEMBERSHIP_EXECUTOR, MEMBERSHIP_REVOKE_GUEST_LINK_OPERATION) => Some("revoke_guest_link"),
         (CANVAS_WRITE_EXECUTOR, CANVAS_PROMOTE_OPERATION) => Some("promote"),
+        // Preview-only SQL writes carry no source action selector: the single
+        // `sql_write` source tool is the whole contract.
+        (SQL_WRITE_EXECUTOR, SQL_WRITE_OPERATION) => None,
         _ => {
             return Err(Error::engine(format!(
                 "{executor}.{operation} has no exact source-argument route"
             )))
         }
     };
+    if (executor, operation) == (SQL_WRITE_EXECUTOR, SQL_WRITE_OPERATION) {
+        for field in object.keys() {
+            if !["statement", "parameters", "reason", "expected_version"].contains(&field.as_str())
+            {
+                return Err(Error::engine(format!(
+                    "sql_write.sql_write has no field '{field}'; known fields are statement, parameters, reason, expected_version"
+                )));
+            }
+        }
+    }
     if (executor, operation) == (CANVAS_WRITE_EXECUTOR, CANVAS_PROMOTE_OPERATION)
         && (object.contains_key("plan_digest") || object.contains_key("dry_run"))
     {
@@ -808,6 +889,264 @@ fn artifact_grant_effect_summary(
     )
 }
 
+/// Request shape for the preview-only `sql_write` preparer (E4 M1).
+///
+/// One portable read SELECT yielding typed operation rows over the
+/// caller-visible logical catalog, plus the caller-visible `reason` and
+/// an optional expected content sequence. Unknown fields are rejected;
+/// submitted SQL is never authority for physical writes.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SqlWritePreviewArgs {
+    statement: String,
+    #[serde(default)]
+    parameters: Vec<crate::query::sql_contract::QuerySqlParameter>,
+    reason: String,
+    #[serde(default)]
+    expected_version: Option<i64>,
+}
+
+#[derive(Debug)]
+struct SqlWritePreparation {
+    canonical_source_arguments: Value,
+    target_id: String,
+    target: String,
+    state_revision: String,
+    target_state_digest: String,
+    effect: Value,
+    effect_summary: String,
+    operation_evidence: Value,
+}
+
+/// Caller-controlled proposal bounds, refused rather than clipped: the
+/// signed effect must stay predictably small, and silent clipping would
+/// corrupt the proposal a future commit path must execute exactly. No
+/// singular-tool per-field cap exists for `name`/`summary`/`reason`, so
+/// these are preview policy, not reused limits; the statement and
+/// parameters are already capped by the governed request validator.
+const SQL_WRITE_MAX_VALUE_CHARS: usize = 1024;
+const SQL_WRITE_MAX_REASON_CHARS: usize = 1024;
+/// Display bound for target/effect text built from engine-resident record
+/// text (unbounded physical TEXT). Clipping is explicit (`...`) and
+/// char-boundary safe; semantic `effect` values are never clipped.
+const SQL_WRITE_MAX_DISPLAY_CHARS: usize = 120;
+
+fn sql_write_display(text: &str) -> String {
+    if text.chars().count() > SQL_WRITE_MAX_DISPLAY_CHARS {
+        format!(
+            "{}...",
+            text.chars()
+                .take(SQL_WRITE_MAX_DISPLAY_CHARS)
+                .collect::<String>()
+        )
+    } else {
+        text.to_string()
+    }
+}
+
+/// Truthful non-mutating preparation for one `set_field` op row.
+///
+/// Runs the caller's SELECT through the governed in-transaction read path
+/// (portable validator plus caller-relative catalog relations), then
+/// checks target version and Edit authorization in that same transaction
+/// before rolling it back. Appends no event and calls no mutation
+/// handler; the first compiler admits only `set_field` on `name` or
+/// `summary`, exactly one visible row, and no extra columns.
+async fn prepare_sql_write_preview(
+    db: &crate::Db,
+    caller: &Caller,
+    arguments: Value,
+) -> Result<SqlWritePreparation> {
+    const TOOL: &str = "sql_write";
+    let args: SqlWritePreviewArgs = super::super::tools::parse_args(TOOL, arguments)?;
+    super::super::tools::require_nonblank_reason(TOOL, &args.reason)?;
+    if args.reason.chars().count() > SQL_WRITE_MAX_REASON_CHARS {
+        return Err(Error::engine(format!(
+            "{TOOL}: 'reason' exceeds {SQL_WRITE_MAX_REASON_CHARS} characters"
+        )));
+    }
+    if args.statement.trim().is_empty() {
+        return Err(Error::engine(format!(
+            "{TOOL}: 'statement' must be a portable read SELECT"
+        )));
+    }
+    let mut tx = db.write_pool().begin().await?;
+    let request = crate::query::sql_contract::QuerySqlRequest {
+        sql: args.statement.clone(),
+        parameters: args.parameters.clone(),
+    };
+    let principal: crate::query::QueryPrincipal = caller.into();
+    let (result, _) =
+        crate::query::sql::query_sql_request_in_with_row_limit(&mut tx, principal, request, 1)
+            .await
+            .map_err(|error| Error::engine(format!("{TOOL}: selection rejected: {error}")))?;
+    if result.truncated || result.rows.len() > 1 {
+        return Err(Error::conflict(format!(
+            "{TOOL}: selection exceeds the one-operation preview bound; narrow the statement"
+        )));
+    }
+    let row = result.rows.first().ok_or_else(|| {
+        Error::conflict(format!(
+            "{TOOL}: selection returned no visible operation row"
+        ))
+    })?;
+    let object = row
+        .as_object()
+        .ok_or_else(|| Error::conflict(format!("{TOOL}: operation row must be an object")))?;
+    for key in object.keys() {
+        if !matches!(key.as_str(), "record_id" | "op" | "key" | "value") {
+            return Err(Error::conflict(format!(
+                "{TOOL}: unknown operation field '{key}'"
+            )));
+        }
+    }
+    let missing =
+        |field: &str| Error::conflict(format!("{TOOL}: operation row is missing '{field}'"));
+    let record_id = object
+        .get("record_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| missing("record_id"))?;
+    let op = object
+        .get("op")
+        .and_then(Value::as_str)
+        .ok_or_else(|| missing("op"))?;
+    let key = object
+        .get("key")
+        .and_then(Value::as_str)
+        .ok_or_else(|| missing("key"))?;
+    let value = object
+        .get("value")
+        .and_then(Value::as_str)
+        .ok_or_else(|| missing("value"))?;
+    if op != "set_field" {
+        return Err(Error::conflict(format!(
+            "{TOOL}: unsupported operation '{op}'; the first compiler admits only set_field"
+        )));
+    }
+    if !matches!(key, "name" | "summary") {
+        return Err(Error::conflict(format!(
+            "{TOOL}: unsupported set_field key '{key}'; the first compiler admits only name and summary"
+        )));
+    }
+    if key == "name" && value.trim().is_empty() {
+        return Err(Error::conflict(format!(
+            "{TOOL}: set_field name must be non-blank"
+        )));
+    }
+    if value.chars().count() > SQL_WRITE_MAX_VALUE_CHARS {
+        return Err(Error::conflict(format!(
+            "{TOOL}: set_field value exceeds {SQL_WRITE_MAX_VALUE_CHARS} characters"
+        )));
+    }
+    super::super::tools::require_record_in(
+        &mut tx,
+        caller,
+        TOOL,
+        record_id,
+        crate::authorization::Capability::Edit,
+    )
+    .await
+    .map_err(|error| match error {
+        // Infrastructure failures stay non-stale; lost visibility or Edit is
+        // selection drift. The message is preserved verbatim, so hidden and
+        // missing targets keep refusing identically.
+        Error::Sqlx(_) => error,
+        other => Error::conflict(other.to_string()),
+    })?;
+    let archived: i64 = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM facet_values WHERE record_id = ? AND key = ?)",
+    )
+    .bind(record_id)
+    .bind(crate::schema::ARCHIVED_FACET_KEY)
+    .fetch_one(&mut *tx)
+    .await?;
+    if archived != 0 {
+        return Err(Error::conflict(format!(
+            "{TOOL}: selected record is archived; restore it before preparing an edit"
+        )));
+    }
+    let previous_seq = super::super::tools::previous_record_seq_in(&mut tx, record_id)
+        .await?
+        .ok_or_else(|| Error::conflict(format!("{TOOL}: record {record_id} does not exist")))?;
+    if args
+        .expected_version
+        .is_some_and(|expected| expected != previous_seq)
+    {
+        return Err(Error::conflict(format!(
+            "{TOOL}: content revision conflict; get the record and prepare again"
+        )));
+    }
+    let current: (String, Option<String>) = sqlx::query_as::<_, (String, Option<String>)>(
+        "SELECT name, summary FROM records WHERE id = ? AND deleted_at IS NULL",
+    )
+    .bind(record_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| Error::conflict(format!("{TOOL}: record {record_id} does not exist")))?;
+    let (current_name, current_summary) = current;
+    // The signed `before` carries the exact stored value, so an oversized
+    // stored field is refused like an oversized proposal: no clipping of
+    // semantic fields, ever.
+    let existing_len = if key == "name" {
+        current_name.chars().count()
+    } else {
+        current_summary.as_deref().unwrap_or("").chars().count()
+    };
+    if existing_len > SQL_WRITE_MAX_VALUE_CHARS {
+        return Err(Error::conflict(format!(
+            "{TOOL}: existing {key} exceeds {SQL_WRITE_MAX_VALUE_CHARS} characters; the preview bound covers the replaced value too"
+        )));
+    }
+    let target = if current_name.trim().is_empty() {
+        format!("record {record_id}")
+    } else {
+        format!("{} ({record_id})", sql_write_display(&current_name))
+    };
+    let (before, after) = if key == "name" {
+        (json!(current_name), json!(value))
+    } else {
+        (json!(current_summary), json!(value))
+    };
+    let operation_evidence = json!({
+        "kind": "sql_write_preview",
+        "record_id": record_id,
+        "op": op,
+        "key": key,
+        "previous_seq": previous_seq,
+    });
+    let target_state_digest = digest(&operation_evidence)?;
+    let mut before_map = serde_json::Map::new();
+    before_map.insert(key.to_string(), before);
+    let mut after_map = serde_json::Map::new();
+    after_map.insert(key.to_string(), after.clone());
+    let changed = before_map != after_map;
+    let effect = json!({
+        "target": { "record_id": record_id },
+        "op": { "op": op, "key": key, "value": value },
+        "before": Value::Object(before_map),
+        "after": Value::Object(after_map),
+        "changed": changed,
+        "reason": args.reason,
+    });
+    let preparation = SqlWritePreparation {
+        canonical_source_arguments: json!({
+            "statement": args.statement,
+            "parameters": args.parameters,
+            "reason": args.reason,
+            "expected_version": previous_seq,
+        }),
+        target_id: record_id.to_string(),
+        target: target.clone(),
+        state_revision: format!("content-seq:{previous_seq}"),
+        target_state_digest,
+        effect,
+        effect_summary: format!("set {key} of {target} to {value:?}"),
+        operation_evidence,
+    };
+    tx.rollback().await?;
+    Ok(preparation)
+}
+
 async fn prepare_operation(
     engine: &EngineHandle,
     caller: &Caller,
@@ -816,6 +1155,25 @@ async fn prepare_operation(
     operation: &str,
     operation_arguments: Value,
 ) -> Result<PreparedWrite> {
+    // Preview-only `sql_write` (E4 M1): classified `RequiredSupported`, so the
+    // facade admits it once the executor is allowlisted. This arm serves
+    // preparation calls and the future revalidation path only; it never
+    // dispatches a mutation.
+    if (executor, operation) == (SQL_WRITE_EXECUTOR, SQL_WRITE_OPERATION) {
+        let db = sqlite_engine(engine, "sql write preview")?;
+        let prepared = prepare_sql_write_preview(db, caller, operation_arguments).await?;
+        return Ok(PreparedWrite {
+            revalidation_arguments: prepared.canonical_source_arguments.clone(),
+            canonical_source_arguments: prepared.canonical_source_arguments,
+            target_id: prepared.target_id,
+            target: prepared.target,
+            state_revision: prepared.state_revision,
+            target_state_digest: prepared.target_state_digest,
+            effect: prepared.effect,
+            effect_summary: prepared.effect_summary,
+            operation_evidence: prepared.operation_evidence,
+        });
+    }
     if (executor, operation) == (SCHEMA_ADMIN_EXECUTOR, SCHEMA_CONFIG_WRITE_OPERATION) {
         let db = sqlite_engine(engine, "schema configuration mutation")?;
         let prepared = super::super::tools::meta::prepare_schema_config_mutation(
@@ -873,7 +1231,9 @@ async fn prepare_operation(
             // preparation. Revalidate the resolved canonical request, not
             // the caller's `expires_at: null`, which would drift on every
             // execution attempt as the clock advances.
-            let revalidation_arguments = if operation == MEMBERSHIP_CREATE_INVITATION_OPERATION {
+            let revalidation_arguments = if operation == MEMBERSHIP_CREATE_INVITATION_OPERATION
+                || operation == MEMBERSHIP_CREATE_GUEST_LINK_OPERATION
+            {
                 prepared.canonical_source_arguments.clone()
             } else {
                 revalidation_arguments
@@ -895,6 +1255,8 @@ async fn prepare_operation(
                         MEMBERSHIP_COPY_INVITATION_LINK_OPERATION => "membership_invitation_copy_link",
                         MEMBERSHIP_SEND_INVITATION_OPERATION => "membership_invitation_send",
                         MEMBERSHIP_REVOKE_INVITATION_OPERATION => "membership_invitation_revoke",
+                        MEMBERSHIP_CREATE_GUEST_LINK_OPERATION => "membership_guest_link_create",
+                        MEMBERSHIP_REVOKE_GUEST_LINK_OPERATION => "membership_guest_link_revoke",
                         _ => unreachable!("membership operation classification is exact"),
                     },
                     "catalogue_snapshot":prepared.catalogue_snapshot,
@@ -1523,7 +1885,10 @@ impl ExecutorPrototypeStdioServer {
             contract_digest: contract.digest.clone(),
             catalogue_digest: self.manifest_digest.clone(),
             server_version: server_version(),
-            expires_at_ms: created_at_ms.saturating_add(self.write_runtime.ttl_ms),
+            expires_at_ms: created_at_ms.saturating_add(
+                self.write_runtime
+                    .ttl_for(&contract.executor, &contract.operation),
+            ),
             nonce: Uuid::new_v4().to_string(),
             signing_key_id: String::new(),
             integrity: String::new(),
@@ -1750,6 +2115,199 @@ impl ExecutorPrototypeStdioServer {
             "executor":contract.executor,
             "operation":contract.operation,
             "plan_id":plan_id,
+            "contract_digest":contract.digest,
+            "manifest_sha256":self.manifest_digest,
+            "server_version":server_version(),
+            "preparation_mutated":false,
+            "source_dispatch_count":0,
+            "completed":true,
+            "elapsed_ms":elapsed_ms(started),
+        }));
+        body
+    }
+
+    /// Revalidate-only confirmation for a preview-only `sql_write` plan.
+    ///
+    /// Runs after every signed comparison succeeds and before any claim or
+    /// dispatch exists. It reloads the signed row, fails closed on any race
+    /// (missing row, payload drift, expiry, or non-Prepared state), then
+    /// returns an explicit preview-current success. No `store.claim`, no
+    /// source dispatch, no content event: repeated confirmations leave the
+    /// plan Prepared.
+    #[allow(clippy::too_many_arguments)]
+    async fn confirm_sql_write_preview_current(
+        &self,
+        id: Value,
+        modern: bool,
+        contract: &OperationContract,
+        envelope: &Value,
+        plan_id: &str,
+        initially_loaded: &StoredPlan,
+        plan: &WritePlan,
+        telemetry_request: Option<&super::telemetry::TelemetryRequest>,
+        started: Instant,
+    ) -> Value {
+        let reloaded = match self.write_runtime.store.load(plan_id, now_ms()).await {
+            Ok(Some(reloaded)) => reloaded,
+            Ok(None) => {
+                return self
+                    .write_plan_error(
+                        id,
+                        modern,
+                        contract,
+                        envelope,
+                        telemetry_request,
+                        PlanError::new(
+                            "plan_not_found",
+                            "write plan disappeared before preview confirmation",
+                            false,
+                        ),
+                    )
+                    .await;
+            }
+            Err(error) => {
+                return self
+                    .write_plan_error(
+                        id,
+                        modern,
+                        contract,
+                        envelope,
+                        telemetry_request,
+                        PlanError::new("plan_store_unavailable", &error.to_string(), false),
+                    )
+                    .await;
+            }
+        };
+        if reloaded.payload != initially_loaded.payload
+            || reloaded.key_id != initially_loaded.key_id
+            || reloaded.expires_at_ms != initially_loaded.expires_at_ms
+        {
+            return self
+                .write_plan_error(
+                    id,
+                    modern,
+                    contract,
+                    envelope,
+                    telemetry_request,
+                    PlanError::new(
+                        "plan_integrity_failed",
+                        "durable plan row changed before preview confirmation",
+                        false,
+                    ),
+                )
+                .await;
+        }
+        if reloaded.expires_at_ms <= now_ms() {
+            return self
+                .write_plan_error(
+                    id,
+                    modern,
+                    contract,
+                    envelope,
+                    telemetry_request,
+                    PlanError::new(
+                        "plan_expired",
+                        "write plan expired before preview confirmation; prepare the current effect again",
+                        false,
+                    ),
+                )
+                .await;
+        }
+        match reloaded.state {
+            StoredState::Prepared => {}
+            StoredState::Expired => {
+                return self
+                    .write_plan_error(
+                        id,
+                        modern,
+                        contract,
+                        envelope,
+                        telemetry_request,
+                        PlanError::new(
+                            "plan_expired",
+                            "write plan expired before preview confirmation; prepare the current effect again",
+                            false,
+                        ),
+                    )
+                    .await;
+            }
+            _ => {
+                return self
+                    .write_plan_error(
+                        id,
+                        modern,
+                        contract,
+                        envelope,
+                        telemetry_request,
+                        PlanError::new(
+                            "plan_store_conflict",
+                            "write plan left Prepared before preview confirmation; prepare again",
+                            false,
+                        ),
+                    )
+                    .await;
+            }
+        }
+        if let (Some(telemetry), Some(request)) = (&self.telemetry, telemetry_request) {
+            let request = telemetry.with_plan_correlation(request.clone(), plan_id);
+            telemetry.emit(super::telemetry::EventSpec {
+                request: Some(request),
+                phase: super::telemetry::TelemetryPhase::PlanRevalidated,
+                outcome: super::telemetry::TelemetryOutcome::Succeeded,
+                counts: super::telemetry::TelemetryCounts {
+                    attempt_bucket: super::telemetry::attempt_bucket(1),
+                    ..super::telemetry::TelemetryCounts::default()
+                },
+                latency_bucket: super::telemetry::latency_bucket(elapsed_ms(started)),
+                ..super::telemetry::EventSpec::default()
+            });
+        }
+        let response = json!({
+            "plan_id":plan.id,
+            "executor":plan.executor,
+            "operation":plan.operation,
+            "preview_current":true,
+            "target":plan.target,
+            "effect_summary":plan.effect_summary,
+            "effect":plan.effect,
+            "expires_at":rfc3339_millis(plan.expires_at_ms),
+            "state_revision":plan.state_revision,
+            "target_state_digest":plan.target_state_digest,
+            "operation_evidence":plan.operation_evidence,
+            "contract_digest":plan.contract_digest,
+            "catalogue_digest":plan.catalogue_digest,
+            "server_version":plan.server_version,
+            "committed":false,
+            "preparation_mutated":false,
+            "source_dispatch_count":0,
+        });
+        let run_context = run_context_for_engine(
+            &self.engine,
+            self.caller.clone(),
+            envelope,
+            self.registry.public_origin(),
+        )
+        .await;
+        let structured = attach_run_context(response, run_context);
+        let mut result = protocol::call_result_content(
+            &contract.executor,
+            render::Format::Json,
+            ToolResult::from(structured),
+            None,
+        );
+        if modern {
+            protocol::add_modern_result_fields(&mut result);
+        }
+        result["_meta"]["nativeExecutor"] = self.executor_meta();
+        let body = json!({"jsonrpc":"2.0","id":id,"result":result});
+        self.trace.record(json!({
+            "schema":TRACE_SCHEMA,
+            "request_id":self.trace.next_request_id(),
+            "kind":"write_plan_preview_current",
+            "mode":"execute",
+            "executor":contract.executor,
+            "operation":contract.operation,
+            "plan_id":plan.id,
             "contract_digest":contract.digest,
             "manifest_sha256":self.manifest_digest,
             "server_version":server_version(),
@@ -2072,14 +2630,30 @@ impl ExecutorPrototypeStdioServer {
         let current = match current {
             Ok(current) => current,
             Err(error) => {
-                let diagnostic = error.to_string();
-                let identity_state_drift = plan.executor == IDENTITY_EXECUTOR
-                    && (diagnostic.contains("stale expected owner")
-                        || diagnostic.contains("collision"));
-                let code = if diagnostic.contains("revision conflict") || identity_state_drift {
-                    "plan_stale"
+                // Preview-only SQL writes classify drift by error type, never
+                // by message: the preparer raises `Conflict` for selection,
+                // shape, visibility, authorization, version, and bound drift,
+                // while governed validator, engine, Sqlx, and digest failures
+                // stay non-stale. Every other pair keeps its existing
+                // diagnostic-substring classification untouched.
+                let code = if (plan.executor.as_str(), plan.operation.as_str())
+                    == (SQL_WRITE_EXECUTOR, SQL_WRITE_OPERATION)
+                {
+                    if matches!(error, Error::Conflict(_)) {
+                        "plan_stale"
+                    } else {
+                        "plan_revalidation_failed"
+                    }
                 } else {
-                    "plan_revalidation_failed"
+                    let diagnostic = error.to_string();
+                    let identity_state_drift = plan.executor == IDENTITY_EXECUTOR
+                        && (diagnostic.contains("stale expected owner")
+                            || diagnostic.contains("collision"));
+                    if diagnostic.contains("revision conflict") || identity_state_drift {
+                        "plan_stale"
+                    } else {
+                        "plan_revalidation_failed"
+                    }
                 };
                 return self
                     .write_revalidation_error_or_advanced(
@@ -2094,7 +2668,7 @@ impl ExecutorPrototypeStdioServer {
                             telemetry_request: telemetry_request.as_ref(),
                             started,
                         },
-                        PlanError::new(code, &diagnostic, false),
+                        PlanError::new(code, &error.to_string(), false),
                     )
                     .await;
             }
@@ -2192,6 +2766,27 @@ impl ExecutorPrototypeStdioServer {
                         "source arguments, state revision, target, or prepared effect changed; prepare again",
                         false,
                     ),
+                )
+                .await;
+        }
+        // Preview-only `sql_write` (E4 M1): an execute-shaped call is a
+        // revalidate-only confirmation. It returns after every signed
+        // comparison succeeds and before any claim or dispatch exists, so no
+        // commit path is reachable from this pair.
+        if (plan.executor.as_str(), plan.operation.as_str())
+            == (SQL_WRITE_EXECUTOR, SQL_WRITE_OPERATION)
+        {
+            return self
+                .confirm_sql_write_preview_current(
+                    id,
+                    modern,
+                    &contract,
+                    &envelope,
+                    &plan_id,
+                    &stored,
+                    &plan,
+                    telemetry_request.as_ref(),
+                    started,
                 )
                 .await;
         }
@@ -3386,6 +3981,68 @@ mod tests {
         assert!(artifact.contains("source-owned"), "{artifact}");
     }
 
+    /// Preview-only SQL writes route through the facade with strict known
+    /// fields; unknown fields refuse in canonicalization, and validation
+    /// defers shape checks to the authoritative preparer.
+    #[test]
+    fn sql_write_canonical_arguments_enforce_strict_known_fields() {
+        let canonical = canonical_source_arguments(
+            SQL_WRITE_EXECUTOR,
+            SQL_WRITE_OPERATION,
+            json!({"statement": "SELECT 1", "reason": "probe"}),
+        )
+        .expect("known fields must canonicalize");
+        assert_eq!(canonical["statement"], json!("SELECT 1"));
+        assert!(
+            canonical.get("action").is_none(),
+            "sql_write carries no source action selector"
+        );
+        let unknown = canonical_source_arguments(
+            SQL_WRITE_EXECUTOR,
+            SQL_WRITE_OPERATION,
+            json!({"statement": "SELECT 1", "reason": "probe", "plan_id": "p"}),
+        )
+        .expect_err("unknown fields must refuse");
+        assert!(
+            unknown.to_string().contains("known fields are"),
+            "{unknown}"
+        );
+        validate(
+            SQL_WRITE_EXECUTOR,
+            SQL_WRITE_OPERATION,
+            json!({"statement": "SELECT 1", "reason": "probe"}),
+            None,
+        )
+        .expect("validate defers shape checks to the preparer");
+        validate(
+            SQL_WRITE_EXECUTOR,
+            SQL_WRITE_OPERATION,
+            json!({"statement": "SELECT 1", "reason": "probe", "bogus": true}),
+            None,
+        )
+        .expect_err("validate must surface the strict-field refusal");
+    }
+
+    /// Governed validator rejections are infrastructure failures, not drift:
+    /// they stay non-stale so the execute path reports
+    /// `plan_revalidation_failed` rather than `plan_stale`.
+    #[tokio::test]
+    async fn sql_write_validator_failure_stays_non_stale() {
+        let db = create_database(":memory:").await.unwrap();
+        let caller = Caller::authenticated("plan-author");
+        let error = prepare_sql_write_preview(
+            &db,
+            &caller,
+            json!({"statement": "DELETE FROM records", "reason": "probe"}),
+        )
+        .await
+        .expect_err("write statements must be rejected");
+        assert!(
+            !matches!(error, Error::Conflict(_)),
+            "validator failure must stay non-stale: {error}"
+        );
+    }
+
     /// The complete classification table, written out independently of the
     /// constants it is built from. A future edit to `PLAN_POLICY_TABLE` has to
     /// update this list, in the same order, with the literal executor and
@@ -3589,6 +4246,16 @@ mod tests {
             ),
             (
                 "membership_admin",
+                "manage_memberships.create_guest_link",
+                PlanPolicy::RequiredSupported,
+            ),
+            (
+                "membership_admin",
+                "manage_memberships.revoke_guest_link",
+                PlanPolicy::RequiredSupported,
+            ),
+            (
+                "membership_admin",
                 "manage_memberships.set_role",
                 PlanPolicy::RequiredUnavailable,
             ),
@@ -3602,15 +4269,16 @@ mod tests {
                 "manage_canvas.promote",
                 PlanPolicy::RequiredSupported,
             ),
+            ("sql_write", "sql_write", PlanPolicy::RequiredSupported),
         ];
         assert_eq!(PLAN_POLICY_TABLE, expected);
-        assert_eq!(PLAN_POLICY_TABLE.len(), 34);
+        assert_eq!(PLAN_POLICY_TABLE.len(), 37);
         assert_eq!(
             PLAN_POLICY_TABLE
                 .iter()
                 .filter(|(_, _, policy)| *policy == PlanPolicy::RequiredSupported)
                 .count(),
-            32
+            35
         );
         assert_eq!(
             PLAN_POLICY_TABLE
@@ -3696,6 +4364,331 @@ mod tests {
         }
     }
 
+    /// E4 M1 slices: the `sql_write` plan reserves ten minutes while every
+    /// other classified plan-required pair keeps exactly two minutes.
+    /// `sql_write` is classified `RequiredSupported` and admitted only under
+    /// the experimental allowlist; the TTL reservation never advertises it.
+    #[tokio::test]
+    async fn sql_write_ttl_is_ten_minutes_while_existing_plans_keep_two() {
+        assert_eq!(
+            plan_ttl_ms(SQL_WRITE_EXECUTOR, SQL_WRITE_OPERATION),
+            SQL_WRITE_TTL_MS
+        );
+        assert_eq!(SQL_WRITE_TTL_MS, 600_000);
+        for (executor, operation, _) in PLAN_POLICY_TABLE {
+            if (*executor, *operation) == (SQL_WRITE_EXECUTOR, SQL_WRITE_OPERATION) {
+                continue;
+            }
+            assert_eq!(
+                plan_ttl_ms(executor, operation),
+                DEFAULT_TTL_MS,
+                "{executor}.{operation}"
+            );
+            assert_eq!(plan_ttl_ms(executor, operation), 120_000);
+        }
+        assert!(PLAN_POLICY_TABLE
+            .iter()
+            .any(|(executor, operation, policy)| {
+                *executor == SQL_WRITE_EXECUTOR
+                    && *operation == SQL_WRITE_OPERATION
+                    && *policy == PlanPolicy::RequiredSupported
+            }));
+        assert_eq!(
+            plan_policy(SQL_WRITE_EXECUTOR, SQL_WRITE_OPERATION),
+            PlanPolicy::RequiredSupported
+        );
+        assert!(requires_plan(SQL_WRITE_EXECUTOR, SQL_WRITE_OPERATION));
+        assert!(supports(SQL_WRITE_EXECUTOR, SQL_WRITE_OPERATION));
+
+        let db = create_database(":memory:").await.unwrap();
+        let store = PlanStore::open_for_database(db.path()).await.unwrap();
+        let runtime = WriteRuntime::new(store);
+        assert_eq!(
+            runtime.ttl_for(SQL_WRITE_EXECUTOR, SQL_WRITE_OPERATION),
+            600_000
+        );
+        for (executor, operation, _) in PLAN_POLICY_TABLE {
+            if (*executor, *operation) == (SQL_WRITE_EXECUTOR, SQL_WRITE_OPERATION) {
+                continue;
+            }
+            assert_eq!(
+                runtime.ttl_for(executor, operation),
+                120_000,
+                "{executor}.{operation}"
+            );
+        }
+    }
+
+    /// E4 M1 first preparer slice: one portable SELECT producing one
+    /// `set_field` op for a caller-visible record, with target version and
+    /// Edit authorization checked in the same governed snapshot. Hidden and
+    /// missing targets refuse identically, overflow and unknown ops refuse,
+    /// and no content event is appended by any preparation.
+    #[tokio::test]
+    async fn sql_write_preview_prepares_one_visible_set_field_without_mutation() {
+        let db = create_database(":memory:").await.unwrap();
+        let target = create_record(
+            &db,
+            json!({"id":"ec00b000-0000-4000-8000-000000000031","type":"Document","kind":"note","name":"Perturb me"}),
+        )
+        .await
+        .unwrap();
+        let hidden = create_record(
+            &db,
+            json!({"id":"ec00b000-0000-4000-8000-000000000032","type":"Document","kind":"note","name":"Hidden"}),
+        )
+        .await
+        .unwrap();
+        replace_explicit_policy(
+            &db,
+            "test:sql-write-preview",
+            &target,
+            vec![AllowEntry::account("plan-author", Capability::Manage)],
+        )
+        .await
+        .unwrap();
+        replace_explicit_policy(&db, "test:sql-write-preview-hide", &hidden, vec![])
+            .await
+            .unwrap();
+        let viewonly = create_record(
+            &db,
+            json!({"id":"ec00b000-0000-4000-8000-000000000033","type":"Document","kind":"note","name":"Look only"}),
+        )
+        .await
+        .unwrap();
+        replace_explicit_policy(
+            &db,
+            "test:sql-write-preview-view",
+            &viewonly,
+            vec![AllowEntry::account("plan-author", Capability::View)],
+        )
+        .await
+        .unwrap();
+        let big_summary: String = std::iter::repeat_n('s', 1025).collect();
+        let big_record = create_record(
+            &db,
+            json!({"id":"ec00b000-0000-4000-8000-000000000035","type":"Document","kind":"note","name":"Big summary","summary":big_summary}),
+        )
+        .await
+        .unwrap();
+        replace_explicit_policy(
+            &db,
+            "test:sql-write-preview-big",
+            &big_record,
+            vec![AllowEntry::account("plan-author", Capability::Manage)],
+        )
+        .await
+        .unwrap();
+        let archived = create_record(
+            &db,
+            json!({"id":"ec00b000-0000-4000-8000-000000000037","type":"Document","kind":"note","name":"Archived"}),
+        )
+        .await
+        .unwrap();
+        replace_explicit_policy(
+            &db,
+            "test:sql-write-preview-archived",
+            &archived,
+            vec![AllowEntry::account("plan-author", Capability::Manage)],
+        )
+        .await
+        .unwrap();
+        crate::store::archive_record(&db, &archived).await.unwrap();
+        let caller = Caller::authenticated("plan-author");
+        let events_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM content_events")
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap();
+        let args_for = |id: &str| {
+            json!({
+                "statement": format!("SELECT id AS record_id, 'set_field' AS op, 'name' AS key, 'Renamed' AS value FROM records WHERE id = '{id}'"),
+                "reason": "Preview a rename through the sql_write preparer",
+            })
+        };
+        // Predicate probe: matches the target and would also match a
+        // same-prefixed hidden record, which the governed layer filters.
+        let like_args = || {
+            json!({
+                "statement": "SELECT id AS record_id, 'set_field' AS op, 'name' AS key, 'Renamed' AS value FROM records WHERE name LIKE 'Perturb%'",
+                "reason": "Preview a rename through the sql_write preparer",
+            })
+        };
+        let prepared = prepare_sql_write_preview(&db, &caller, like_args())
+            .await
+            .unwrap();
+        assert_eq!(prepared.target_id, target);
+        assert_eq!(prepared.effect["after"]["name"], json!("Renamed"));
+        assert_eq!(prepared.effect["before"]["name"], json!("Perturb me"));
+        assert!(prepared.state_revision.starts_with("content-seq:"));
+        assert!(prepared.effect_summary.contains("Renamed"));
+        assert!(prepared.canonical_source_arguments["expected_version"]
+            .as_i64()
+            .is_some());
+        // Hidden and missing targets refuse identically: neither yields a
+        // visible operation row, so neither refusal names a difference.
+        let hidden_error = prepare_sql_write_preview(&db, &caller, args_for(&hidden))
+            .await
+            .unwrap_err()
+            .to_string();
+        let missing_error = prepare_sql_write_preview(
+            &db,
+            &caller,
+            args_for("ec00b000-0000-4000-8000-00000000ffff"),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert_eq!(hidden_error, missing_error);
+        // Visible but View-only: the row is selected, then Edit
+        // authorization refuses without preparing.
+        let view_error = prepare_sql_write_preview(&db, &caller, args_for(&viewonly))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(view_error.contains("capability"), "{view_error}");
+        assert_ne!(view_error, missing_error);
+        // Stale expected version: the pinned sequence moved on.
+        let stale_version = prepared.canonical_source_arguments["expected_version"]
+            .as_i64()
+            .unwrap()
+            + 1;
+        let mut stale_args = args_for(&target);
+        stale_args["expected_version"] = json!(stale_version);
+        let stale_error = prepare_sql_write_preview(&db, &caller, stale_args)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(stale_error.contains("revision conflict"), "{stale_error}");
+        // An oversized stored value is refused like an oversized proposal:
+        // the signed `before` stays exact, never clipped.
+        let big_existing_error = prepare_sql_write_preview(
+            &db,
+            &caller,
+            json!({
+                "statement": format!("SELECT id AS record_id, 'set_field' AS op, 'summary' AS key, 'Small' AS value FROM records WHERE id = '{big_record}'"),
+                "reason": "Oversized-existing probe",
+            }),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            big_existing_error.contains("existing summary exceeds 1024"),
+            "{big_existing_error}"
+        );
+        // A readable archived record is explicitly refused by the compiler;
+        // the governed `records` view still contains it.
+        let archived_error = prepare_sql_write_preview(&db, &caller, args_for(&archived))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            archived_error.contains("selected record is archived"),
+            "{archived_error}"
+        );
+        // Hidden rows do not perturb a successful preview: insert a record
+        // the predicate would also match, hide it, and re-prepare. The
+        // governed layer filters it, so the visible result is identical.
+        // Every preparation and refusal above appended nothing.
+        let events_pre_insert: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM content_events")
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap();
+        assert_eq!(events_pre_insert, events_before);
+        let perturbative = create_record(
+            &db,
+            json!({"id":"ec00b000-0000-4000-8000-000000000036","type":"Document","kind":"note","name":"Perturb me too"}),
+        )
+        .await
+        .unwrap();
+        replace_explicit_policy(
+            &db,
+            "test:sql-write-preview-hide-perturbative",
+            &perturbative,
+            vec![],
+        )
+        .await
+        .unwrap();
+        let events_mid: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM content_events")
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap();
+        assert!(
+            events_mid > events_before,
+            "the mid-test fixture write must append, so the baselines bracket it"
+        );
+        let reprepared = prepare_sql_write_preview(&db, &caller, like_args())
+            .await
+            .unwrap();
+        assert_eq!(reprepared.effect, prepared.effect);
+        assert_eq!(reprepared.effect_summary, prepared.effect_summary);
+        assert_eq!(reprepared.target, prepared.target);
+        assert_eq!(reprepared.state_revision, prepared.state_revision);
+        assert_eq!(reprepared.target_state_digest, prepared.target_state_digest);
+        // Overflow: an unfiltered selection exceeds the one-operation bound.
+        let overflow_error = prepare_sql_write_preview(
+            &db,
+            &Caller::local(),
+            json!({
+                "statement": "SELECT id AS record_id, 'set_field' AS op, 'name' AS key, 'X' AS value FROM records",
+                "reason": "Overflow probe",
+            }),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            overflow_error.contains("one-operation preview bound"),
+            "{overflow_error}"
+        );
+        // Unknown op rows are refused, never interpreted.
+        let op_error = prepare_sql_write_preview(
+            &db,
+            &caller,
+            json!({
+                "statement": format!("SELECT id AS record_id, 'set_facet' AS op, 'triage' AS key, 'done' AS value FROM records WHERE id = '{target}'"),
+                "reason": "Unknown-op probe",
+            }),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(op_error.contains("only set_field"), "{op_error}");
+        // Oversized caller text is refused with a precise bound, never
+        // signed into a plan.
+        let big_value: String = std::iter::repeat_n('v', 1025).collect();
+        let big_error = prepare_sql_write_preview(
+            &db,
+            &caller,
+            json!({
+                "statement": format!("SELECT id AS record_id, 'set_field' AS op, 'name' AS key, '{big_value}' AS value FROM records WHERE id = '{target}'"),
+                "reason": "Oversized-value probe",
+            }),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(big_error.contains("exceeds 1024"), "{big_error}");
+        let big_reason: String = std::iter::repeat_n('r', 1025).collect();
+        let reason_error = prepare_sql_write_preview(
+            &db,
+            &caller,
+            json!({ "statement": format!("SELECT id AS record_id, 'set_field' AS op, 'name' AS key, 'Ok' AS value FROM records WHERE id = '{target}'"),
+                "reason": big_reason }),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(reason_error.contains("exceeds 1024"), "{reason_error}");
+        // No preparation appended anything: fixture writes sit strictly
+        // between the baselines, preparations add nothing after them.
+        let events_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM content_events")
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap();
+        assert_eq!(events_mid, events_after);
+    }
+
     #[test]
     fn initial_high_risk_classification_is_exact_and_fail_closed() {
         let audit: Audit = serde_json::from_str(AUDIT).unwrap();
@@ -3713,13 +4706,13 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        assert_eq!(classified.len(), 34);
+        assert_eq!(classified.len(), 36);
         assert_eq!(
             classified
                 .iter()
                 .filter(|(executor, operation)| supports(executor, operation))
                 .count(),
-            32
+            34
         );
         assert!(supports(EXECUTOR, OPERATION));
         for operation in [
@@ -3772,6 +4765,8 @@ mod tests {
             MEMBERSHIP_COPY_INVITATION_LINK_OPERATION,
             MEMBERSHIP_SEND_INVITATION_OPERATION,
             MEMBERSHIP_REVOKE_INVITATION_OPERATION,
+            MEMBERSHIP_CREATE_GUEST_LINK_OPERATION,
+            MEMBERSHIP_REVOKE_GUEST_LINK_OPERATION,
         ] {
             assert_eq!(
                 plan_policy(MEMBERSHIP_EXECUTOR, operation),

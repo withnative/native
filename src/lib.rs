@@ -58,7 +58,9 @@ pub fn engine_version_string() -> String {
 // paths byte-for-byte for every consumer.
 pub use native_artifact_html::html as artifact_html;
 pub use native_artifact_html::verify as artifact_verify;
+pub mod act;
 pub mod attribution;
+pub mod authoring;
 pub mod authorization;
 mod authorization_revision;
 pub mod awareness;
@@ -84,6 +86,7 @@ pub mod export;
 pub use native_federation as federation;
 pub mod freshness;
 pub mod generated;
+pub mod holding;
 pub mod identity;
 pub(crate) mod instruction_templates;
 pub(crate) mod instructions;
@@ -92,6 +95,7 @@ pub mod interchange;
 pub mod interpretation;
 pub mod interventions;
 pub mod mcp;
+pub mod mentions;
 pub mod message_expectation;
 pub mod meta;
 pub mod migrations;
@@ -111,6 +115,7 @@ pub mod recipe;
 pub mod record_body;
 #[doc(hidden)]
 pub mod request_work;
+pub(crate) mod write_contention;
 pub(crate) use native_record_type_correction_kernel as record_type_correction;
 pub mod record_images;
 pub mod relationship;
@@ -126,12 +131,17 @@ pub mod storage_migration;
 pub mod storage_profile;
 pub mod store;
 pub(crate) mod suggestion_lifecycle;
+/// The general K3 surface-binding resolver (design `6e2acbd` §3).
+pub mod surface_binding;
 #[cfg(feature = "turso-local")]
 pub mod turso_local;
+pub(crate) mod visible_set_cache;
 /// The run-key wordlists (task `cb6c9da`) and the distance function that makes a
 /// mistyped key repairable rather than merely invalid. Static data plus one
 /// metric; `crate::runkey` is the consumer.
 pub mod wordlist;
+pub mod workspace_index;
+pub mod workspace_snapshot;
 
 pub use db::{
     apply_schema, create_database, create_database_named, open_database, open_database_at,

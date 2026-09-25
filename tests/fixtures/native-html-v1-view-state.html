@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="native-artifact-profile" content="document">
+  <title>Workspace tabs</title>
+  <style>
+    :root { color-scheme: light; }
+    * { box-sizing: border-box; }
+    body { margin: 0; color: #172033; background: #f6f3ec; font: 16px/1.6 system-ui, -apple-system, sans-serif; }
+    main { width: min(48rem, 100%); margin: auto; padding: clamp(1.25rem, 4vw, 3rem); }
+    h1 { margin: 0 0 1rem; }
+    [role="tab"][aria-selected="true"] { font-weight: 700; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Workspace tabs</h1>
+  <p data-body-revision="1"></p>
+  <div role="tablist" aria-label="Workspace">
+    <button type="button" id="tab-usage" role="tab" aria-selected="true" data-tab="usage">Usage</button>
+    <button type="button" id="tab-billing" role="tab" aria-selected="false" data-tab="billing">Billing</button>
+  </div>
+  <div id="panel-usage" role="tabpanel" aria-labelledby="tab-usage"><p>Usage charges nothing yet.</p></div>
+  <div id="panel-billing" role="tabpanel" aria-labelledby="tab-billing" hidden><p>Billing is empty.</p></div>
+</main>
+<script>
+  // Every tab switch publishes the open tab for the successor frame, and
+  // every boot restores the handed tab before first paint. Restoration reads
+  // the schema as well as the value and never republishes what it restored.
+  var tabs = Array.prototype.slice.call(document.querySelectorAll('[role="tab"]'));
+  function show(name, publish) {
+    tabs.forEach(function (tab) {
+      var active = tab.getAttribute("data-tab") === name;
+      tab.setAttribute("aria-selected", active ? "true" : "false");
+      var panel = document.getElementById("panel-" + tab.getAttribute("data-tab"));
+      if (panel) {
+        if (active) panel.removeAttribute("hidden");
+        else panel.setAttribute("hidden", "");
+      }
+    });
+    if (publish !== false) window.nativeArtifact.setViewState({ tab: name }, { schema: "tabs.v1" });
+  }
+  tabs.forEach(function (tab) {
+    tab.addEventListener("click", function () { show(tab.getAttribute("data-tab")); });
+  });
+  window.nativeArtifact.ready.then(function (delivery) {
+    var handed = delivery.viewState || window.nativeArtifact.viewState;
+    var name = handed && handed.schema === "tabs.v1" && handed.value && handed.value.tab;
+    show(name === "billing" || name === "usage" ? name : "usage", false);
+  });
+</script>
+</body>
+</html>

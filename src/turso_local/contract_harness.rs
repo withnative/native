@@ -29,6 +29,7 @@ struct CandidateReplayEvent {
     source_event_id: String,
     payload: String,
     created_at: String,
+    act: Option<i64>,
 }
 
 #[derive(Clone, Debug)]
@@ -48,6 +49,7 @@ struct BindingAuditEvent {
     parent_key: Option<String>,
     intent: Option<String>,
     created_at: String,
+    act: Option<i64>,
 }
 
 impl TursoLocalDb {
@@ -527,6 +529,7 @@ impl TursoLocalDb {
                     intent: None,
                     created_at: crate::store::now_iso(),
                     causal_envelope: CausalEnvelopeV1::complete(CausalFrontierV1::empty()),
+                    act: None,
                 };
                 let control = transaction.control.clone();
                 let intent = ProjectorIntent::from_event(&event)?;
@@ -1320,6 +1323,48 @@ impl TursoLocalDb {
             .map_err(|error| Error::engine(format!("invalid Turso event-type count: {error}")))
     }
 
+    /// Append and project one raw `record.updated` event carrying an arbitrary
+    /// field payload.
+    ///
+    /// The product `update_record` handler refuses a non-string body, so this
+    /// is the only seam that reaches the projector's `record_body::coerce_body`
+    /// path on this adapter. It appends through the ordinary
+    /// `append_and_project` kernel, so the event is durable and replay covers
+    /// it exactly as it covers a product write.
+    pub async fn contract_append_record_updated_for_test(
+        &self,
+        record_id: &str,
+        fields: Value,
+    ) -> Result<()> {
+        let record_id = record_id.to_string();
+        run_db_write(self, &ExecutionControl::default(), move |transaction| {
+            Box::pin(async move {
+                let mut event = EventRow {
+                    local_seq: 0,
+                    act: None,
+                    id: uuid::Uuid::new_v4().to_string(),
+                    record_id,
+                    event_type: "record.updated".into(),
+                    payload: Some(fields.to_string()),
+                    actor: Some("contract:record-mentions".into()),
+                    run_key: None,
+                    parent_key: None,
+                    intent: None,
+                    created_at: crate::store::now_iso(),
+                    causal_envelope: CausalEnvelopeV1::complete(CausalFrontierV1::empty()),
+                };
+                crate::domain_transaction::append_and_project(
+                    transaction,
+                    &mut event,
+                    &ExecutionControl::default(),
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+    }
+
     /// Every authoritative content event, flattened to text.
     ///
     /// Non-authoritative material must be provably absent from the durable log
@@ -1467,6 +1512,11 @@ async fn read_content_events(connection: &turso::Connection) -> Result<Vec<Event
                     _ => return Err(Error::engine("invalid stored causal envelope")),
                 }
             },
+            // The Turso content replay below re-inserts without `act` (same
+            // omission as the SQLite projector rebuild had; unsupported
+            // backend, reported not fixed). None keeps this compiling with
+            // today's behaviour.
+            act: None,
         });
     }
     Ok(events)
@@ -1507,7 +1557,7 @@ async fn read_candidate_events(
 ) -> Result<Vec<CandidateReplayEvent>> {
     let mut rows = connection
         .query(
-            "SELECT seq,id,candidate_key,action,recipient_account_id,message_id,reason,priority,not_before,redaction_class,evaluator_kind,policy_version,source_event_type,source_event_id,payload,created_at FROM notification_candidate_events ORDER BY seq",
+            "SELECT seq,id,candidate_key,action,recipient_account_id,message_id,reason,priority,not_before,redaction_class,evaluator_kind,policy_version,source_event_type,source_event_id,payload,created_at,act FROM notification_candidate_events ORDER BY seq",
             (),
         )
         .await
@@ -1537,6 +1587,7 @@ async fn read_candidate_events(
             source_event_id: row.get(13).map_err(replay_column("candidate source id"))?,
             payload: row.get(14).map_err(replay_column("candidate payload"))?,
             created_at: row.get(15).map_err(replay_column("candidate created_at"))?,
+            act: row.get(16).map_err(replay_column("candidate act"))?,
         });
     }
     Ok(events)
@@ -1545,7 +1596,7 @@ async fn read_candidate_events(
 async fn read_binding_audit(connection: &turso::Connection) -> Result<Vec<BindingAuditEvent>> {
     let mut rows = connection
         .query(
-            "SELECT seq,id,action,system,identifier,old_record_id,new_record_id,old_canonical,new_canonical,actor,reason,run_key,parent_key,intent,created_at FROM binding_audit ORDER BY seq",
+            "SELECT seq,id,action,system,identifier,old_record_id,new_record_id,old_canonical,new_canonical,actor,reason,run_key,parent_key,intent,created_at,act FROM binding_audit ORDER BY seq",
             (),
         )
         .await
@@ -1588,6 +1639,7 @@ async fn read_binding_audit(connection: &turso::Connection) -> Result<Vec<Bindin
             created_at: row
                 .get(14)
                 .map_err(replay_column("binding audit created_at"))?,
+            act: row.get(15).map_err(replay_column("binding audit act"))?,
         });
     }
     Ok(events)
@@ -1864,7 +1916,7 @@ async fn replay_bindings(db: &TursoLocalDb, events: Vec<BindingAuditEvent>) -> R
             };
             connection
                 .execute(
-                    "INSERT INTO binding_audit(seq,id,action,system,identifier,old_record_id,new_record_id,old_canonical,new_canonical,actor,reason,run_key,parent_key,intent,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+                    "INSERT INTO binding_audit(seq,id,action,system,identifier,old_record_id,new_record_id,old_canonical,new_canonical,actor,reason,run_key,parent_key,intent,created_at,act) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
                     vec![
                         turso::Value::Integer(event.seq),
                         turso::Value::Text(event.id),
@@ -1881,6 +1933,7 @@ async fn replay_bindings(db: &TursoLocalDb, events: Vec<BindingAuditEvent>) -> R
                         optional_text(event.parent_key),
                         optional_text(event.intent),
                         turso::Value::Text(event.created_at),
+                        event.act.map_or(turso::Value::Null, turso::Value::Integer),
                     ],
                 )
                 .await
@@ -1931,8 +1984,8 @@ async fn replay_candidate_events(db: &TursoLocalDb, events: &[CandidateReplayEve
         for event in events {
             connection
                 .execute(
-                    "INSERT INTO notification_candidate_events(seq,id,candidate_key,action,recipient_account_id,message_id,reason,priority,not_before,redaction_class,evaluator_kind,policy_version,source_event_type,source_event_id,payload,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
-                    turso::params![event.seq,event.id.clone(),event.candidate_key.clone(),event.action.clone(),event.recipient_account_id.clone(),event.message_id.clone(),event.reason.clone(),event.priority.clone(),event.not_before.clone(),event.redaction_class.clone(),event.evaluator_kind.clone(),event.policy_version.clone(),event.source_event_type.clone(),event.source_event_id.clone(),event.payload.clone(),event.created_at.clone()],
+                    "INSERT INTO notification_candidate_events(seq,id,candidate_key,action,recipient_account_id,message_id,reason,priority,not_before,redaction_class,evaluator_kind,policy_version,source_event_type,source_event_id,payload,created_at,act) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
+                    turso::params![event.seq,event.id.clone(),event.candidate_key.clone(),event.action.clone(),event.recipient_account_id.clone(),event.message_id.clone(),event.reason.clone(),event.priority.clone(),event.not_before.clone(),event.redaction_class.clone(),event.evaluator_kind.clone(),event.policy_version.clone(),event.source_event_type.clone(),event.source_event_id.clone(),event.payload.clone(),event.created_at.clone(),event.act],
                 )
                 .await
                 .map_err(|error| Error::engine(format!("cannot replay Turso candidate event: {error}")))?;
@@ -1970,7 +2023,13 @@ async fn projection_snapshot(connection: &turso::Connection) -> Result<Value> {
         .chain(["notification_candidate_events", "notification_candidates"])
     {
         let mut rows = connection
-            .query(&format!("SELECT * FROM {table} ORDER BY rowid"), ())
+            .query(
+                &format!(
+                    "SELECT * FROM {table} ORDER BY {}",
+                    projection_snapshot_order(table)
+                ),
+                (),
+            )
             .await
             .map_err(|error| {
                 Error::engine(format!("cannot snapshot Turso projection {table}: {error}"))
@@ -1990,6 +2049,23 @@ async fn projection_snapshot(connection: &turso::Connection) -> Result<Value> {
         tables.insert(table.into(), Value::Array(values));
     }
     Ok(Value::Object(tables))
+}
+
+/// Snapshot ordering for one projection table.
+///
+/// Every table is compared in physical insertion order (`rowid`) except
+/// `record_mentions`, whose 58→59 migration backfill inserts rows in
+/// `source_id` order while replay folds them in content-event order. Its
+/// natural primary key is order-independent, matches the SQLite conformance
+/// comparison, and still compares the row values exactly, so two record sets
+/// with the same members compare equal whichever path built them. Other tables
+/// keep `rowid` ordering because their live fold and replay both follow the
+/// content log.
+fn projection_snapshot_order(table: &str) -> &'static str {
+    match table {
+        "record_mentions" => "source_id, occurrence_ix",
+        _ => "rowid",
+    }
 }
 
 fn turso_value(value: turso::Value) -> Value {

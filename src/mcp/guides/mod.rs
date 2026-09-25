@@ -353,4 +353,127 @@ mod tests {
         }
         db.close().await;
     }
+
+    /// E2 I-6: every SQL statement an agent can read in the shipped guides
+    /// must pass the SQLite validator, so worked examples can never teach a
+    /// statement the engine rejects. Extracts fenced ```sql blocks and
+    /// `"sql"` JSON fields whose value is a SELECT/WITH statement from the
+    /// exact rendered bodies agents receive. The `sql-schema` topic is
+    /// physical DDL documentation, not queryable SQL, and is skipped by
+    /// source class.
+    #[test]
+    fn every_guide_sql_example_passes_the_sqlite_validator() {
+        let mut checked = 0;
+        for guide in GUIDE_SPECS {
+            if guide.source == GuideSource::FrozenSqliteDdl {
+                continue;
+            }
+            for (origin, statement) in guide_sql_examples(guide.topic, guide.markdown) {
+                crate::query::sql::validate(&statement).unwrap_or_else(|error| {
+                    panic!("guide {origin} teaches a rejected statement: {error}\n{statement}")
+                });
+                checked += 1;
+            }
+        }
+        assert!(
+            checked >= 4,
+            "guide SQL guard found only {checked} examples; the extractor is stale"
+        );
+    }
+
+    /// `(topic:location, statement)` pairs an agent could copy into
+    /// `query_sql`: fenced sql blocks plus `"sql"` JSON string values that
+    /// parse as a SELECT/WITH statement.
+    fn guide_sql_examples(topic: &str, markdown: &str) -> Vec<(String, String)> {
+        let mut examples = Vec::new();
+        let mut rest = markdown;
+        while let Some(open) = rest.find("```sql") {
+            let after_open = &rest[open + "```sql".len()..];
+            let Some(close) = after_open.find("```") else {
+                break;
+            };
+            let statement = after_open[..close].trim().to_string();
+            if !statement.is_empty() {
+                examples.push((format!("{topic} fenced block"), statement));
+            }
+            rest = &after_open[close + "```".len()..];
+        }
+        let bytes = markdown.as_bytes();
+        let mut index = 0;
+        while let Some(key) = markdown[index..].find("\"sql\"") {
+            let mut cursor = index + key + "\"sql\"".len();
+            while bytes
+                .get(cursor)
+                .is_some_and(|byte| byte.is_ascii_whitespace())
+            {
+                cursor += 1;
+            }
+            if bytes.get(cursor) != Some(&b':') {
+                index = cursor;
+                continue;
+            }
+            cursor += 1;
+            while bytes
+                .get(cursor)
+                .is_some_and(|byte| byte.is_ascii_whitespace())
+            {
+                cursor += 1;
+            }
+            if bytes.get(cursor) != Some(&b'"') {
+                index = cursor;
+                continue;
+            }
+            cursor += 1;
+            let mut value = String::new();
+            let mut closed = false;
+            while let Some(byte) = bytes.get(cursor) {
+                match byte {
+                    b'"' => {
+                        closed = true;
+                        cursor += 1;
+                        break;
+                    }
+                    b'\\' => {
+                        cursor += 1;
+                        match bytes.get(cursor) {
+                            Some(b'n') => value.push('\n'),
+                            Some(b't') => value.push('\t'),
+                            Some(b'r') => value.push('\r'),
+                            Some(b'u') => {
+                                let hex = markdown
+                                    .get(cursor + 1..cursor + 5)
+                                    .filter(|hex| {
+                                        hex.len() == 4
+                                            && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+                                    })
+                                    .and_then(|hex| u32::from_str_radix(hex, 16).ok())
+                                    .and_then(char::from_u32)
+                                    .unwrap_or_else(|| {
+                                        panic!("guide {topic} has an invalid \\u escape")
+                                    });
+                                value.push(hex);
+                                cursor += 4;
+                            }
+                            Some(other) => value.push(*other as char),
+                            None => break,
+                        }
+                        cursor += 1;
+                    }
+                    _ => {
+                        value.push(*byte as char);
+                        cursor += 1;
+                    }
+                }
+            }
+            index = cursor;
+            if !closed {
+                continue;
+            }
+            let head = value.trim_start().to_ascii_uppercase();
+            if head.starts_with("SELECT") || head.starts_with("WITH") {
+                examples.push((format!("{topic} \"sql\" field"), value));
+            }
+        }
+        examples
+    }
 }

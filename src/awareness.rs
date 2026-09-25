@@ -12,7 +12,7 @@ use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use sqlx::{Row, Sqlite};
+use sqlx::{Row, Sqlite, SqliteConnection};
 use uuid::Uuid;
 
 use crate::error::{Error, Result};
@@ -148,10 +148,15 @@ pub struct HostNotificationRevalidation {
 
 /// Read a bounded notification-candidate suffix under portable authorization.
 /// Authorization errors are denials, matching ordinary record reads.
+/// `is_member` is the recipient's live catalog footing: guests evaluate the
+/// candidate message with their own account grants only. It is a required
+/// parameter so a future delivery pipeline must resolve and supply the
+/// footing rather than inheriting member resolution silently.
 #[doc(hidden)]
 pub async fn harvest_host_notification_candidates(
     db: &crate::Db,
     recipient_account_id: &str,
+    recipient_is_member: bool,
     after_candidate_seq: i64,
     limit: i64,
 ) -> Result<HostNotificationHarvest> {
@@ -176,7 +181,7 @@ pub async fn harvest_host_notification_candidates(
         let message_id: String = row.try_get("message_id")?;
         let access = crate::authorization::effective_capability_in_pool(
             db.write_pool(),
-            crate::authorization::Principal::bound(recipient_account_id, true),
+            crate::authorization::Principal::bound(recipient_account_id, recipient_is_member),
             &message_id,
         )
         .await;
@@ -208,11 +213,14 @@ pub async fn harvest_host_notification_candidates(
 }
 
 /// Revalidate one portable candidate for a hosted delivery attempt.
+/// `recipient_is_member` is the recipient's live catalog footing; see
+/// [`harvest_host_notification_candidates`].
 #[doc(hidden)]
 pub async fn revalidate_host_notification_candidate(
     db: &crate::Db,
     candidate_id: &str,
     recipient_account_id: &str,
+    recipient_is_member: bool,
 ) -> Result<Option<HostNotificationRevalidation>> {
     let candidate = sqlx::query(
         "SELECT message_id,not_before,status,priority,evaluator_kind,policy_version FROM notification_candidates WHERE candidate_id=? AND recipient_account_id=?",
@@ -227,7 +235,7 @@ pub async fn revalidate_host_notification_candidate(
     let message_id: String = candidate.try_get("message_id")?;
     let access = crate::authorization::effective_capability_in_pool(
         db.write_pool(),
-        crate::authorization::Principal::bound(recipient_account_id, true),
+        crate::authorization::Principal::bound(recipient_account_id, recipient_is_member),
         &message_id,
     )
     .await;
@@ -547,6 +555,8 @@ struct ExistingEvent {
     intent_sha256: String,
     expected_version: i64,
     payload: Value,
+    created_at: String,
+    act: Option<i64>,
 }
 
 fn sha256_json(value: &Value) -> Result<String> {
@@ -560,7 +570,7 @@ async fn existing_idempotency(
     key: &str,
 ) -> Result<Option<ExistingEvent>> {
     let row = sqlx::query(
-        "SELECT id,seq,intent_sha256,expected_version,payload FROM awareness_events
+        "SELECT id,seq,intent_sha256,expected_version,payload,created_at,act FROM awareness_events
           WHERE subject_account_id=? AND idempotency_key=?",
     )
     .bind(account)
@@ -574,6 +584,8 @@ async fn existing_idempotency(
             intent_sha256: row.try_get("intent_sha256")?,
             expected_version: row.try_get("expected_version")?,
             payload: serde_json::from_str(&row.try_get::<String, _>("payload")?)?,
+            created_at: row.try_get("created_at")?,
+            act: row.try_get("act")?,
         })
     })
     .transpose()
@@ -603,6 +615,97 @@ async fn exact_retry(
     Ok(None)
 }
 
+/// One decoded `awareness_events` row. This is the typed seam shared by the
+/// live lane writers and `rebuild_projections`: the live path builds one from
+/// the values it is about to insert, the repair path decodes one from the log,
+/// and both hand it to [`project_awareness_event`]. `seq`/`act` are carried
+/// verbatim but never re-derived by the fold; `payload` is decoded once here so
+/// the fold never parses text.
+#[derive(Clone, Debug)]
+pub(crate) struct AwarenessEventRow {
+    pub seq: i64,
+    pub id: String,
+    pub subject_account_id: String,
+    pub message_id: Option<String>,
+    pub destination_id: Option<String>,
+    pub lane: String,
+    /// Carried verbatim from the canonical envelope. The fold is lane- and
+    /// payload-driven, so the action is not read here; the row is the one
+    /// decoder the act-range seam will reuse.
+    #[allow(dead_code)]
+    pub action: String,
+    pub reason_code: String,
+    pub executor_ref: Option<String>,
+    pub delegation_ref: Option<String>,
+    pub payload: Value,
+    pub created_at: String,
+    /// The act-range coordinate. Retained so the bounded fold can select and
+    /// carry stamped rows; the repair fold never re-derives it.
+    #[allow(dead_code)]
+    pub act: Option<i64>,
+}
+
+fn awareness_row_from_sql(row: sqlx::sqlite::SqliteRow) -> Result<AwarenessEventRow> {
+    let payload: String = row.try_get("payload")?;
+    Ok(AwarenessEventRow {
+        seq: row.try_get("seq")?,
+        id: row.try_get("id")?,
+        subject_account_id: row.try_get("subject_account_id")?,
+        message_id: row.try_get("message_id")?,
+        destination_id: row.try_get("destination_id")?,
+        lane: row.try_get("lane")?,
+        action: row.try_get("action")?,
+        reason_code: row.try_get("reason_code")?,
+        executor_ref: row.try_get("executor_ref")?,
+        delegation_ref: row.try_get("delegation_ref")?,
+        payload: serde_json::from_str(&payload)?,
+        created_at: row.try_get("created_at")?,
+        act: row.try_get("act")?,
+    })
+}
+
+/// The whole awareness log in `seq` order — the input to the awareness half of
+/// the projection rebuild.
+pub(crate) async fn read_all_awareness_events(
+    conn: &mut SqliteConnection,
+) -> Result<Vec<AwarenessEventRow>> {
+    sqlx::query(
+        "SELECT seq,id,subject_account_id,message_id,destination_id,lane,action,reason_code,
+                executor_ref,delegation_ref,payload,created_at,act
+           FROM awareness_events ORDER BY seq",
+    )
+    .fetch_all(&mut *conn)
+    .await?
+    .into_iter()
+    .map(awareness_row_from_sql)
+    .collect()
+}
+
+/// The awareness-only act-range reader: exactly the rows whose `act` falls in
+/// the half-open interval `(from_exclusive, to_inclusive]`, in `seq` order,
+/// decoded by the same [`awareness_row_from_sql`] the full reader uses. Legacy
+/// rows whose act is `NULL` never satisfy the strict `act > ?` predicate and
+/// are excluded.
+#[allow(dead_code)] // R3 wires the bounded fold; the reader lands ahead of its caller.
+pub(crate) async fn awareness_events_in_act_range(
+    conn: &mut SqliteConnection,
+    from_exclusive_act: i64,
+    to_inclusive_act: i64,
+) -> Result<Vec<AwarenessEventRow>> {
+    sqlx::query(
+        "SELECT seq,id,subject_account_id,message_id,destination_id,lane,action,reason_code,
+                executor_ref,delegation_ref,payload,created_at,act
+           FROM awareness_events WHERE act > ? AND act <= ? ORDER BY seq",
+    )
+    .bind(from_exclusive_act)
+    .bind(to_inclusive_act)
+    .fetch_all(&mut *conn)
+    .await?
+    .into_iter()
+    .map(awareness_row_from_sql)
+    .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn append_event(
     tx: &mut sqlx::Transaction<'static, Sqlite>,
@@ -615,7 +718,8 @@ async fn append_event(
     interaction_nonce: Option<&str>,
     intent_payload: Option<&Value>,
     payload: &Value,
-) -> Result<(String, i64, bool)> {
+    act_alloc: &mut crate::act::ActAllocation,
+) -> Result<(AwarenessEventRow, bool)> {
     let intent = json!({
         subject.intent_field(): subject.id(),
         "lane": lane,
@@ -632,15 +736,37 @@ async fn append_event(
                 "awareness idempotency key was already used for different intent",
             ));
         }
-        return Ok((existing.id, existing.seq, false));
+        // An exact retry never projects: the existing event and its projection
+        // already agree, so the reconstructed row exists only to keep the seam
+        // total for readers.
+        return Ok((
+            AwarenessEventRow {
+                seq: existing.seq,
+                id: existing.id,
+                subject_account_id: context.subject_account_id.to_string(),
+                message_id: subject.message_id().map(str::to_owned),
+                destination_id: subject.destination_id().map(str::to_owned),
+                lane: lane.to_string(),
+                action: action.to_string(),
+                reason_code: context.reason_code.to_string(),
+                executor_ref: context.executor_ref.map(str::to_owned),
+                delegation_ref: context.delegation_ref.map(str::to_owned),
+                payload: existing.payload,
+                created_at: existing.created_at,
+                act: existing.act,
+            },
+            false,
+        ));
     }
     let id = Uuid::new_v4().to_string();
+    let created_at = now_iso();
+    let act = act_alloc.get_or_allocate(&mut *tx).await?;
     let seq: i64 = sqlx::query_scalar(
         "INSERT INTO awareness_events
            (id,idempotency_key,intent_sha256,schema_version,subject_account_id,message_id,
             destination_id,lane,action,authenticated_actor,executor_kind,executor_ref,
-            delegation_ref,expected_version,reason_code,interaction_nonce,payload,created_at)
-         VALUES (?,?,?,1,?,?,?,?,?,?,?,?,?,?,?,?,?,?) RETURNING seq",
+            delegation_ref,expected_version,reason_code,interaction_nonce,payload,created_at,act)
+         VALUES (?,?,?,1,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) RETURNING seq",
     )
     .bind(&id)
     .bind(idempotency_key)
@@ -658,10 +784,224 @@ async fn append_event(
     .bind(context.reason_code)
     .bind(interaction_nonce)
     .bind(serde_json::to_string(payload)?)
-    .bind(now_iso())
+    .bind(&created_at)
+    .bind(act)
     .fetch_one(&mut **tx)
     .await?;
-    Ok((id, seq, true))
+    Ok((
+        AwarenessEventRow {
+            seq,
+            id,
+            subject_account_id: context.subject_account_id.to_string(),
+            message_id: subject.message_id().map(str::to_owned),
+            destination_id: subject.destination_id().map(str::to_owned),
+            lane: lane.to_string(),
+            action: action.to_string(),
+            reason_code: context.reason_code.to_string(),
+            executor_ref: context.executor_ref.map(str::to_owned),
+            delegation_ref: context.delegation_ref.map(str::to_owned),
+            payload: payload.clone(),
+            created_at,
+            act: Some(act),
+        },
+        true,
+    ))
+}
+
+/// The `message_id` of one of the four Message lanes. The DDL's paired CHECKs
+/// mean exactly one subject column is present, so the destination lane never
+/// reaches here and a Message lane's subject is never borrowed from a
+/// destination. The default matches the historical replay reader byte for byte.
+fn message_subject(event: &AwarenessEventRow) -> String {
+    event.message_id.clone().unwrap_or_default()
+}
+
+/// Fold one awareness event into its single lane projection. This is the only
+/// writer of the awareness projection tables: each live lane writer calls it
+/// once after a newly inserted event, and `rebuild_projections` calls it in
+/// `seq` order over the whole retained log. It allocates no act and performs no
+/// cross-lane fanout — the caller owns both, so a rebuild cannot re-emit the
+/// candidate events the candidate log already carries.
+pub(crate) async fn project_awareness_event(
+    conn: &mut SqliteConnection,
+    event: &AwarenessEventRow,
+) -> Result<()> {
+    let account = event.subject_account_id.as_str();
+    let seq = event.seq;
+    let payload = &event.payload;
+    match event.lane.as_str() {
+        "human" => {
+            let message = message_subject(event);
+            let stage = payload["stage"]
+                .as_str()
+                .ok_or_else(|| Error::engine("invalid human replay payload"))?;
+            let now = payload["attained_at"]
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| event.created_at.clone());
+            let current: Option<(String, i64, Option<String>, Option<String>)> = sqlx::query_as(
+                "SELECT stage,version,opened_at,acknowledged_at FROM human_message_awareness
+                  WHERE subject_account_id=? AND message_id=?",
+            )
+            .bind(account)
+            .bind(&message)
+            .fetch_optional(&mut *conn)
+            .await?;
+            let current_stage = HumanStage::parse(current.as_ref().map(|v| v.0.as_str()))?;
+            let requested = HumanStage::parse(Some(stage))?;
+            let next = if requested.rank() > current_stage.rank() {
+                requested
+            } else {
+                current_stage
+            };
+            let version = current.as_ref().map_or(1, |v| v.1 + 1);
+            let opened_at = current
+                .as_ref()
+                .and_then(|value| value.2.clone())
+                .or_else(|| (requested.rank() >= HumanStage::Opened.rank()).then(|| now.clone()));
+            let acknowledged_at =
+                current
+                    .as_ref()
+                    .and_then(|value| value.3.clone())
+                    .or_else(|| {
+                        (requested.rank() >= HumanStage::Acknowledged.rank()).then(|| now.clone())
+                    });
+            sqlx::query("INSERT INTO human_message_awareness(subject_account_id,message_id,stage,first_presented_at,last_presented_at,opened_at,acknowledged_at,last_event_seq,version) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(subject_account_id,message_id) DO UPDATE SET stage=excluded.stage,last_presented_at=excluded.last_presented_at,opened_at=excluded.opened_at,acknowledged_at=excluded.acknowledged_at,last_event_seq=excluded.last_event_seq,version=excluded.version")
+                .bind(account)
+                .bind(&message)
+                .bind(next.stored())
+                .bind(&now)
+                .bind(&now)
+                .bind(opened_at)
+                .bind(acknowledged_at)
+                .bind(seq)
+                .bind(version)
+                .execute(&mut *conn)
+                .await?;
+        }
+        "agent" => {
+            let message = message_subject(event);
+            let state = payload["state"]
+                .as_str()
+                .ok_or_else(|| Error::engine("invalid agent replay payload"))?;
+            let version: i64 = sqlx::query_scalar(
+                "SELECT version FROM agent_message_dispositions
+                  WHERE subject_account_id=? AND message_id=?",
+            )
+            .bind(account)
+            .bind(&message)
+            .fetch_optional(&mut *conn)
+            .await?
+            .unwrap_or(0)
+                + 1;
+            sqlx::query("INSERT INTO agent_message_dispositions(subject_account_id,message_id,state,reason_code,last_executor_ref,delegation_ref,last_event_seq,version) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(subject_account_id,message_id) DO UPDATE SET state=excluded.state,reason_code=excluded.reason_code,last_executor_ref=excluded.last_executor_ref,delegation_ref=excluded.delegation_ref,last_event_seq=excluded.last_event_seq,version=excluded.version")
+                .bind(account)
+                .bind(&message)
+                .bind(state)
+                .bind(&event.reason_code)
+                .bind(event.executor_ref.as_deref())
+                .bind(event.delegation_ref.as_deref())
+                .bind(seq)
+                .bind(version)
+                .execute(&mut *conn)
+                .await?;
+            for evidence in payload["evidence"].as_array().into_iter().flatten() {
+                sqlx::query("INSERT INTO awareness_event_evidence(event_id,evidence_record_id,evidence_role) VALUES(?,?,?)")
+                    .bind(&event.id)
+                    .bind(evidence["record_id"].as_str())
+                    .bind(evidence["role"].as_str())
+                    .execute(&mut *conn)
+                    .await?;
+            }
+        }
+        "preference" => {
+            let message = message_subject(event);
+            let version: i64 = sqlx::query_scalar(
+                "SELECT version FROM message_preferences
+                  WHERE subject_account_id=? AND message_id=?",
+            )
+            .bind(account)
+            .bind(&message)
+            .fetch_optional(&mut *conn)
+            .await?
+            .unwrap_or(0)
+                + 1;
+            sqlx::query("INSERT INTO message_preferences(subject_account_id,message_id,attention_flag,muted,snoozed_until,archived,last_event_seq,version) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(subject_account_id,message_id) DO UPDATE SET attention_flag=excluded.attention_flag,muted=excluded.muted,snoozed_until=excluded.snoozed_until,archived=excluded.archived,last_event_seq=excluded.last_event_seq,version=excluded.version")
+                .bind(account)
+                .bind(&message)
+                .bind(payload["attention_flag"].as_bool())
+                .bind(payload["muted"].as_bool())
+                .bind(payload["snoozed_until"].as_str())
+                .bind(payload["archived"].as_bool())
+                .bind(seq)
+                .bind(version)
+                .execute(&mut *conn)
+                .await?;
+        }
+        "routing" => {
+            let message = message_subject(event);
+            let version: i64 = sqlx::query_scalar(
+                "SELECT version FROM message_inbox_routing
+                  WHERE subject_account_id=? AND message_id=?",
+            )
+            .bind(account)
+            .bind(&message)
+            .fetch_optional(&mut *conn)
+            .await?
+            .unwrap_or(0)
+                + 1;
+            sqlx::query("INSERT INTO message_inbox_routing(subject_account_id,message_id,obligation_state,executor_route,reason_code,policy_version,last_event_seq,version) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(subject_account_id,message_id) DO UPDATE SET obligation_state=excluded.obligation_state,executor_route=excluded.executor_route,reason_code=excluded.reason_code,policy_version=excluded.policy_version,last_event_seq=excluded.last_event_seq,version=excluded.version")
+                .bind(account)
+                .bind(&message)
+                .bind(payload["obligation_state"].as_str())
+                .bind(payload["executor_route"].as_str())
+                .bind(&event.reason_code)
+                .bind(payload["policy_version"].as_str())
+                .bind(seq)
+                .bind(version)
+                .execute(&mut *conn)
+                .await?;
+        }
+        "destination" => {
+            let collection = event
+                .destination_id
+                .clone()
+                .ok_or_else(|| Error::engine("destination event without a destination_id"))?;
+            let version: i64 = sqlx::query_scalar(
+                "SELECT version FROM member_destinations
+                  WHERE subject_account_id=? AND collection_id=?",
+            )
+            .bind(account)
+            .bind(&collection)
+            .fetch_optional(&mut *conn)
+            .await?
+            .unwrap_or(0)
+                + 1;
+            sqlx::query("INSERT INTO member_destinations(subject_account_id,collection_id,present,joined_at,joined_by,last_event_seq,version) VALUES(?,?,?,?,?,?,?) ON CONFLICT(subject_account_id,collection_id) DO UPDATE SET present=excluded.present,joined_at=excluded.joined_at,joined_by=excluded.joined_by,last_event_seq=excluded.last_event_seq,version=excluded.version")
+                .bind(account)
+                .bind(&collection)
+                .bind(payload["present"].as_bool())
+                .bind(payload["joined_at"].as_str())
+                .bind(payload["joined_by"].as_str())
+                .bind(seq)
+                .bind(version)
+                .execute(&mut *conn)
+                .await?;
+        }
+        _ => return Err(Error::engine("unknown awareness replay lane")),
+    }
+    Ok(())
+}
+
+/// Fold every awareness event in order through [`project_awareness_event`].
+pub(crate) async fn replay_awareness(
+    conn: &mut SqliteConnection,
+    events: &[AwarenessEventRow],
+) -> Result<()> {
+    for event in events {
+        project_awareness_event(conn, event).await?;
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -674,6 +1014,7 @@ pub async fn advance_human(
     idempotency_key: &str,
     attestation: &VerifiedHumanInteraction,
     reason_code: &str,
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<Value> {
     if stage == HumanStage::Unsurfaced {
         return Err(Error::engine(
@@ -742,7 +1083,7 @@ pub async fn advance_human(
         "interaction_attested": true,
         "attained_at": attained_at.clone(),
     });
-    let (event_id, seq, inserted) = append_event(
+    let (event, inserted) = append_event(
         tx,
         &context,
         Subject::Message(message_id),
@@ -753,6 +1094,7 @@ pub async fn advance_human(
         Some(&attestation.nonce),
         Some(&intent_payload),
         &payload,
+        act_alloc,
     )
     .await?;
     if !inserted {
@@ -760,48 +1102,8 @@ pub async fn advance_human(
             json!({"message_id":message_id,"stage":current_stage,"version":current_version,"changed":false,"idempotent":true}),
         );
     }
-    let now = attained_at;
-    let first_presented_at = row
-        .as_ref()
-        .and_then(|row| row.get::<Option<String>, _>("first_presented_at"))
-        .or_else(|| Some(now.clone()));
-    let last_presented_at = if stage.rank() >= HumanStage::Presented.rank() {
-        Some(now.clone())
-    } else {
-        row.as_ref()
-            .and_then(|row| row.get::<Option<String>, _>("last_presented_at"))
-    };
-    let opened_at = row
-        .as_ref()
-        .and_then(|row| row.get::<Option<String>, _>("opened_at"))
-        .or_else(|| (stage.rank() >= HumanStage::Opened.rank()).then(|| now.clone()));
-    let acknowledged_at = row
-        .as_ref()
-        .and_then(|row| row.get::<Option<String>, _>("acknowledged_at"))
-        .or_else(|| (stage.rank() >= HumanStage::Acknowledged.rank()).then_some(now));
+    project_awareness_event(&mut *tx, &event).await?;
     let next_version = current_version + 1;
-    sqlx::query(
-        "INSERT INTO human_message_awareness
-           (subject_account_id,message_id,stage,first_presented_at,last_presented_at,
-            opened_at,acknowledged_at,last_event_seq,version)
-         VALUES (?,?,?,?,?,?,?,?,?)
-         ON CONFLICT(subject_account_id,message_id) DO UPDATE SET
-           stage=excluded.stage,first_presented_at=excluded.first_presented_at,
-           last_presented_at=excluded.last_presented_at,opened_at=excluded.opened_at,
-           acknowledged_at=excluded.acknowledged_at,last_event_seq=excluded.last_event_seq,
-           version=excluded.version",
-    )
-    .bind(account)
-    .bind(message_id)
-    .bind(next.stored())
-    .bind(first_presented_at)
-    .bind(last_presented_at)
-    .bind(opened_at)
-    .bind(acknowledged_at)
-    .bind(seq)
-    .bind(next_version)
-    .execute(&mut **tx)
-    .await?;
     if next.rank() >= HumanStage::Opened.rank() {
         withdraw_notification_candidates_in(
             tx,
@@ -809,7 +1111,8 @@ pub async fn advance_human(
             message_id,
             None,
             "awareness.human.opened",
-            &event_id,
+            &event.id,
+            act_alloc,
         )
         .await?;
     }
@@ -829,6 +1132,7 @@ pub async fn register_human_batch_command(
     snapshot: Option<&str>,
     _attestation: &VerifiedHumanInteraction,
     _reason_code: &str,
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<bool> {
     let payload = json!({
         "stage": stage,
@@ -854,20 +1158,28 @@ pub async fn register_human_batch_command(
         }
         return Ok(false);
     }
+    // Allocate only for a genuinely new intent, immediately before INSERT.
+    // Exact retries return above without allocating; a first-time batch —
+    // even an empty one — allocates a visible act of its own when the
+    // transaction has not yet stamped one, and otherwise shares the
+    // transaction's act with the awareness events that follow.
+    let act = act_alloc.get_or_allocate(&mut *tx).await?;
     sqlx::query(
         "INSERT INTO awareness_command_intents
-           (subject_account_id,idempotency_key,intent_sha256,created_at)
-         VALUES (?,?,?,?)",
+           (subject_account_id,idempotency_key,intent_sha256,created_at,act)
+         VALUES (?,?,?,?,?)",
     )
     .bind(account)
     .bind(idempotency_key)
     .bind(digest)
     .bind(now_iso())
+    .bind(act)
     .execute(&mut **tx)
     .await?;
     Ok(true)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn set_agent_disposition(
     tx: &mut sqlx::Transaction<'static, Sqlite>,
     context: &MutationContext<'_>,
@@ -876,6 +1188,7 @@ pub async fn set_agent_disposition(
     expected_version: i64,
     idempotency_key: &str,
     evidence: &[EvidenceInput],
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<Value> {
     if !matches!(
         state,
@@ -924,7 +1237,7 @@ pub async fn set_agent_disposition(
             "agent disposition version conflict: expected {expected_version}, current {current_version}"
         )));
     }
-    let (event_id, seq, inserted) = append_event(
+    let (event, inserted) = append_event(
         tx,
         context,
         Subject::Message(message_id),
@@ -935,6 +1248,7 @@ pub async fn set_agent_disposition(
         None,
         None,
         &payload,
+        act_alloc,
     )
     .await?;
     if !inserted {
@@ -942,6 +1256,8 @@ pub async fn set_agent_disposition(
             json!({"message_id":message_id,"state":state,"version":current_version,"changed":false,"idempotent":true}),
         );
     }
+    // The fold inserts the evidence rows from the payload; validating here keeps
+    // the named refusal ahead of the schema CHECK.
     for item in evidence {
         if !matches!(
             item.role.as_str(),
@@ -949,36 +1265,9 @@ pub async fn set_agent_disposition(
         ) {
             return Err(Error::engine("invalid awareness evidence role"));
         }
-        sqlx::query(
-            "INSERT INTO awareness_event_evidence(event_id,evidence_record_id,evidence_role)
-             VALUES (?,?,?)",
-        )
-        .bind(&event_id)
-        .bind(&item.record_id)
-        .bind(&item.role)
-        .execute(&mut **tx)
-        .await?;
     }
+    project_awareness_event(&mut *tx, &event).await?;
     let next_version = current_version + 1;
-    sqlx::query(
-        "INSERT INTO agent_message_dispositions
-           (subject_account_id,message_id,state,reason_code,last_executor_ref,delegation_ref,last_event_seq,version)
-         VALUES (?,?,?,?,?,?,?,?)
-         ON CONFLICT(subject_account_id,message_id) DO UPDATE SET
-           state=excluded.state,reason_code=excluded.reason_code,
-           last_executor_ref=excluded.last_executor_ref,delegation_ref=excluded.delegation_ref,
-           last_event_seq=excluded.last_event_seq,version=excluded.version",
-    )
-    .bind(context.subject_account_id)
-    .bind(message_id)
-    .bind(state)
-    .bind(context.reason_code)
-    .bind(context.executor_ref)
-    .bind(context.delegation_ref)
-    .bind(seq)
-    .bind(next_version)
-    .execute(&mut **tx)
-    .await?;
     Ok(
         json!({"message_id":message_id,"state":state,"version":next_version,"changed":true,"idempotent":false}),
     )
@@ -1022,6 +1311,7 @@ pub async fn set_preference(
     expected_version: i64,
     idempotency_key: &str,
     reason_code: &str,
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<Value> {
     if matches!(action, PreferenceAction::Snooze) {
         let value = snoozed_until.ok_or_else(|| Error::engine("snooze requires snoozed_until"))?;
@@ -1111,7 +1401,7 @@ pub async fn set_preference(
         delegation_ref: None,
         reason_code,
     };
-    let (event_id, seq, inserted) = append_event(
+    let (event, inserted) = append_event(
         tx,
         &context,
         Subject::Message(message_id),
@@ -1122,6 +1412,7 @@ pub async fn set_preference(
         None,
         Some(&command_payload),
         &payload,
+        act_alloc,
     )
     .await?;
     if !inserted {
@@ -1129,26 +1420,8 @@ pub async fn set_preference(
             json!({"message_id":message_id,"version":current_version,"changed":false,"idempotent":true}),
         );
     }
+    project_awareness_event(&mut *tx, &event).await?;
     let next_version = current_version + 1;
-    sqlx::query(
-        "INSERT INTO message_preferences
-           (subject_account_id,message_id,attention_flag,muted,snoozed_until,archived,last_event_seq,version)
-         VALUES (?,?,?,?,?,?,?,?)
-         ON CONFLICT(subject_account_id,message_id) DO UPDATE SET
-           attention_flag=excluded.attention_flag,muted=excluded.muted,
-           snoozed_until=excluded.snoozed_until,archived=excluded.archived,
-           last_event_seq=excluded.last_event_seq,version=excluded.version",
-    )
-    .bind(account)
-    .bind(message_id)
-    .bind(attention)
-    .bind(muted)
-    .bind(&snooze)
-    .bind(archived)
-    .bind(seq)
-    .bind(next_version)
-    .execute(&mut **tx)
-    .await?;
     if matches!(
         action,
         PreferenceAction::Snooze | PreferenceAction::ClearSnooze
@@ -1161,7 +1434,8 @@ pub async fn set_preference(
             message_id,
             withdrawn_reason,
             "awareness.preference.changed",
-            &event_id,
+            &event.id,
+            act_alloc,
         )
         .await?;
         if matches!(action, PreferenceAction::Snooze) {
@@ -1176,7 +1450,8 @@ pub async fn set_preference(
                 "recipient_policy",
                 "explicit-snooze-v1",
                 "awareness.snooze.set",
-                &event_id,
+                &event.id,
+                act_alloc,
             )
             .await?;
         }
@@ -1196,6 +1471,7 @@ pub async fn set_routing(
     policy_version: Option<&str>,
     expected_version: i64,
     idempotency_key: &str,
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<Value> {
     if context.executor_kind != "human_attested" && context.executor_kind != "system" {
         return Err(Error::engine(
@@ -1244,7 +1520,7 @@ pub async fn set_routing(
     if current_version != expected_version {
         return Err(Error::engine("routing version conflict"));
     }
-    let (event_id, seq, inserted) = append_event(
+    let (event, inserted) = append_event(
         tx,
         context,
         Subject::Message(message_id),
@@ -1255,6 +1531,7 @@ pub async fn set_routing(
         None,
         None,
         &payload,
+        act_alloc,
     )
     .await?;
     if !inserted {
@@ -1262,26 +1539,8 @@ pub async fn set_routing(
             json!({"message_id":message_id,"version":current_version,"changed":false,"idempotent":true}),
         );
     }
+    project_awareness_event(&mut *tx, &event).await?;
     let next_version = current_version + 1;
-    sqlx::query(
-        "INSERT INTO message_inbox_routing
-           (subject_account_id,message_id,obligation_state,executor_route,reason_code,policy_version,last_event_seq,version)
-         VALUES (?,?,?,?,?,?,?,?)
-         ON CONFLICT(subject_account_id,message_id) DO UPDATE SET
-           obligation_state=excluded.obligation_state,executor_route=excluded.executor_route,
-           reason_code=excluded.reason_code,policy_version=excluded.policy_version,
-           last_event_seq=excluded.last_event_seq,version=excluded.version",
-    )
-    .bind(context.subject_account_id)
-    .bind(message_id)
-    .bind(obligation_state)
-    .bind(executor_route)
-    .bind(context.reason_code)
-    .bind(policy_version)
-    .bind(seq)
-    .bind(next_version)
-    .execute(&mut **tx)
-    .await?;
     let open_human = obligation_state == "open" && executor_route == "human";
     let was_open_human = current
         .as_ref()
@@ -1315,7 +1574,8 @@ pub async fn set_routing(
             "recipient_policy",
             policy_version.unwrap_or("explicit-human-route-v1"),
             "awareness.routing.set",
-            &event_id,
+            &event.id,
+            act_alloc,
         )
         .await?;
     } else if !open_human {
@@ -1325,7 +1585,8 @@ pub async fn set_routing(
             message_id,
             Some("human_obligation"),
             "awareness.routing.set",
-            &event_id,
+            &event.id,
+            act_alloc,
         )
         .await?;
     }
@@ -1424,6 +1685,7 @@ async fn apply_destination(
     joined_by: &str,
     expected_version: i64,
     idempotency_key: &str,
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<Value> {
     if collection_id.trim().is_empty() {
         return Err(Error::engine("destination requires a collection_id"));
@@ -1477,7 +1739,7 @@ async fn apply_destination(
             current.version
         )));
     }
-    let (_event_id, seq, inserted) = append_event(
+    let (event, inserted) = append_event(
         tx,
         context,
         Subject::Destination(collection_id),
@@ -1488,6 +1750,7 @@ async fn apply_destination(
         None,
         Some(&command_payload),
         &payload,
+        act_alloc,
     )
     .await?;
     if !inserted {
@@ -1498,24 +1761,8 @@ async fn apply_destination(
             "idempotent": true,
         }));
     }
+    project_awareness_event(&mut *tx, &event).await?;
     let next_version = current.version + 1;
-    sqlx::query(
-        "INSERT INTO member_destinations
-           (subject_account_id,collection_id,present,joined_at,joined_by,last_event_seq,version)
-         VALUES (?,?,?,?,?,?,?)
-         ON CONFLICT(subject_account_id,collection_id) DO UPDATE SET
-           present=excluded.present,joined_at=excluded.joined_at,joined_by=excluded.joined_by,
-           last_event_seq=excluded.last_event_seq,version=excluded.version",
-    )
-    .bind(account)
-    .bind(collection_id)
-    .bind(present)
-    .bind(&joined_at)
-    .bind(&joined_by)
-    .bind(seq)
-    .bind(next_version)
-    .execute(&mut **tx)
-    .await?;
     Ok(json!({
         "collection_id": collection_id,
         "version": next_version,
@@ -1536,6 +1783,7 @@ pub async fn set_destination(
     action: DestinationAction,
     expected_version: i64,
     idempotency_key: &str,
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<Value> {
     apply_destination(
         tx,
@@ -1545,6 +1793,7 @@ pub async fn set_destination(
         "explicit",
         expected_version,
         idempotency_key,
+        act_alloc,
     )
     .await
 }
@@ -1566,6 +1815,7 @@ pub async fn auto_join_destination_on_send_in(
     actor: &str,
     collection_id: &str,
     source_event_id: &str,
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<Option<Value>> {
     if account.trim().is_empty() || collection_id.trim().is_empty() {
         return Ok(None);
@@ -1590,6 +1840,7 @@ pub async fn auto_join_destination_on_send_in(
         "send",
         current.version,
         &format!("destination.auto-join:{source_event_id}:{collection_id}"),
+        act_alloc,
     )
     .await?;
     Ok(Some(result))
@@ -1690,6 +1941,224 @@ pub async fn project_mentions_in(
     Ok(())
 }
 
+/// One decoded `notification_candidate_events` row. The typed seam shared by
+/// the live proposal/withdrawal writers and the candidate half of
+/// `rebuild_projections`. The projection columns are the authority; the
+/// portable `payload` envelope is carried for fidelity and never re-derived.
+#[derive(Clone, Debug)]
+pub(crate) struct NotificationCandidateEventRow {
+    pub seq: i64,
+    pub id: String,
+    pub candidate_key: String,
+    pub action: String,
+    pub recipient_account_id: String,
+    pub message_id: String,
+    pub reason: String,
+    pub priority: String,
+    pub not_before: Option<String>,
+    pub redaction_class: String,
+    pub evaluator_kind: String,
+    pub policy_version: String,
+    pub source_event_type: String,
+    pub source_event_id: String,
+    /// The portable candidate envelope, carried verbatim for fidelity. The
+    /// projection columns are the authority, so the fold reads none of it.
+    #[allow(dead_code)]
+    pub payload: Value,
+    pub created_at: String,
+    /// The act-range coordinate. Retained so the bounded fold can select and
+    /// carry stamped rows; the repair fold never re-derives it.
+    #[allow(dead_code)]
+    pub act: Option<i64>,
+}
+
+fn notification_candidate_row_from_sql(
+    row: sqlx::sqlite::SqliteRow,
+) -> Result<NotificationCandidateEventRow> {
+    let payload: String = row.try_get("payload")?;
+    Ok(NotificationCandidateEventRow {
+        seq: row.try_get("seq")?,
+        id: row.try_get("id")?,
+        candidate_key: row.try_get("candidate_key")?,
+        action: row.try_get("action")?,
+        recipient_account_id: row.try_get("recipient_account_id")?,
+        message_id: row.try_get("message_id")?,
+        reason: row.try_get("reason")?,
+        priority: row.try_get("priority")?,
+        not_before: row.try_get("not_before")?,
+        redaction_class: row.try_get("redaction_class")?,
+        evaluator_kind: row.try_get("evaluator_kind")?,
+        policy_version: row.try_get("policy_version")?,
+        source_event_type: row.try_get("source_event_type")?,
+        source_event_id: row.try_get("source_event_id")?,
+        payload: serde_json::from_str(&payload)?,
+        created_at: row.try_get("created_at")?,
+        act: row.try_get("act")?,
+    })
+}
+
+/// The whole candidate log in `seq` order — the input to the candidate half of
+/// the projection rebuild.
+pub(crate) async fn read_all_notification_candidate_events(
+    conn: &mut SqliteConnection,
+) -> Result<Vec<NotificationCandidateEventRow>> {
+    sqlx::query(
+        "SELECT seq,id,candidate_key,action,recipient_account_id,message_id,reason,priority,
+                not_before,redaction_class,evaluator_kind,policy_version,source_event_type,
+                source_event_id,payload,created_at,act
+           FROM notification_candidate_events ORDER BY seq",
+    )
+    .fetch_all(&mut *conn)
+    .await?
+    .into_iter()
+    .map(notification_candidate_row_from_sql)
+    .collect()
+}
+
+/// The candidate-only act-range reader: exactly the rows whose `act` falls in
+/// the half-open interval `(from_exclusive, to_inclusive]`, in `seq` order,
+/// decoded by the same [`notification_candidate_row_from_sql`] the full reader
+/// uses. Legacy rows whose act is `NULL` never satisfy the strict `act > ?`
+/// predicate and are excluded.
+#[allow(dead_code)] // R3 wires the bounded fold; the reader lands ahead of its caller.
+pub(crate) async fn notification_candidate_events_in_act_range(
+    conn: &mut SqliteConnection,
+    from_exclusive_act: i64,
+    to_inclusive_act: i64,
+) -> Result<Vec<NotificationCandidateEventRow>> {
+    sqlx::query(
+        "SELECT seq,id,candidate_key,action,recipient_account_id,message_id,reason,priority,
+                not_before,redaction_class,evaluator_kind,policy_version,source_event_type,
+                source_event_id,payload,created_at,act
+           FROM notification_candidate_events WHERE act > ? AND act <= ? ORDER BY seq",
+    )
+    .bind(from_exclusive_act)
+    .bind(to_inclusive_act)
+    .fetch_all(&mut *conn)
+    .await?
+    .into_iter()
+    .map(notification_candidate_row_from_sql)
+    .collect()
+}
+
+/// Read one candidate event by its `seq`, the way the SQLite withdrawal port
+/// recovers the row it just appended so it can fold it through the same
+/// projector the rebuild uses.
+async fn notification_candidate_event_by_seq(
+    conn: &mut SqliteConnection,
+    seq: i64,
+) -> Result<Option<NotificationCandidateEventRow>> {
+    sqlx::query(
+        "SELECT seq,id,candidate_key,action,recipient_account_id,message_id,reason,priority,
+                not_before,redaction_class,evaluator_kind,policy_version,source_event_type,
+                source_event_id,payload,created_at,act
+           FROM notification_candidate_events WHERE seq = ?",
+    )
+    .bind(seq)
+    .fetch_optional(&mut *conn)
+    .await?
+    .map(notification_candidate_row_from_sql)
+    .transpose()
+}
+
+/// Fold one candidate event into `notification_candidates`. This is the only
+/// writer of that projection: the live proposal path calls it after the
+/// `proposed` insert, the withdrawal paths call it for the appended
+/// `withdrawn` event, and `rebuild_projections` calls it in `seq` order.
+///
+/// The transition semantics are explicit. `proposed` inserts a candidate in
+/// the `effective` state and is refused by the unique key if a proposal already
+/// exists. `withdrawn` and `suppressed` transition exactly one existing
+/// proposal projection and fail closed (`affected != 1`) when no proposal
+/// exists, so a replayed or materialised log cannot silently drop a transition
+/// whose proposal is missing; a repeated transition against the existing row
+/// remains a valid single-row update. Any other action fails closed rather
+/// than being silently reinterpreted.
+pub(crate) async fn project_notification_candidate_event(
+    conn: &mut SqliteConnection,
+    event: &NotificationCandidateEventRow,
+) -> Result<()> {
+    match event.action.as_str() {
+        "proposed" => {
+            sqlx::query("INSERT INTO notification_candidates(candidate_id,candidate_key,recipient_account_id,message_id,reason,priority,not_before,redaction_class,evaluator_kind,policy_version,source_event_type,source_event_id,candidate_event_seq,status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,'effective',?)")
+                .bind(&event.id)
+                .bind(&event.candidate_key)
+                .bind(&event.recipient_account_id)
+                .bind(&event.message_id)
+                .bind(&event.reason)
+                .bind(&event.priority)
+                .bind(event.not_before.as_deref())
+                .bind(&event.redaction_class)
+                .bind(&event.evaluator_kind)
+                .bind(&event.policy_version)
+                .bind(&event.source_event_type)
+                .bind(&event.source_event_id)
+                .bind(event.seq)
+                .bind(&event.created_at)
+                .execute(&mut *conn)
+                .await?;
+        }
+        "withdrawn" => {
+            let affected = sqlx::query(
+                "UPDATE notification_candidates SET status='withdrawn',candidate_event_seq=? WHERE candidate_key=?",
+            )
+            .bind(event.seq)
+            .bind(&event.candidate_key)
+            .execute(&mut *conn)
+            .await?
+            .rows_affected();
+            require_single_candidate_transition(affected, "withdrawal", &event.candidate_key)?;
+        }
+        "suppressed" => {
+            let affected = sqlx::query(
+                "UPDATE notification_candidates SET status='suppressed',candidate_event_seq=? WHERE candidate_key=?",
+            )
+            .bind(event.seq)
+            .bind(&event.candidate_key)
+            .execute(&mut *conn)
+            .await?
+            .rows_affected();
+            require_single_candidate_transition(affected, "suppression", &event.candidate_key)?;
+        }
+        other => {
+            return Err(Error::engine(format!(
+                "unknown notification candidate action '{other}'"
+            )))
+        }
+    }
+    Ok(())
+}
+
+/// Refuse a candidate transition that does not touch exactly one existing
+/// proposal projection. The proposal insert is the only writer of a candidate
+/// row, so a `withdrawn`/`suppressed` event without its `proposed` predecessor
+/// is a malformed log: the shared projector must fail closed rather than let a
+/// replay or a materialised delta silently drop the transition.
+fn require_single_candidate_transition(
+    affected: u64,
+    transition: &str,
+    candidate_key: &str,
+) -> Result<()> {
+    if affected != 1 {
+        return Err(Error::engine(format!(
+            "notification candidate {transition} for '{candidate_key}' must affect exactly one existing proposal, affected {affected}"
+        )));
+    }
+    Ok(())
+}
+
+/// Fold every candidate event in order through
+/// [`project_notification_candidate_event`].
+pub(crate) async fn replay_notification_candidate_events(
+    conn: &mut SqliteConnection,
+    events: &[NotificationCandidateEventRow],
+) -> Result<()> {
+    for event in events {
+        project_notification_candidate_event(conn, event).await?;
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn append_notification_candidate_in(
     tx: &mut sqlx::Transaction<'static, Sqlite>,
@@ -1703,6 +2172,7 @@ pub async fn append_notification_candidate_in(
     policy_version: &str,
     source_event_type: &str,
     source_event_id: &str,
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<Option<String>> {
     if !matches!(
         reason,
@@ -1739,12 +2209,14 @@ pub async fn append_notification_candidate_in(
     // Portable candidates intentionally contain no Message body, endpoint, or
     // provider payload. Rendering happens after host-side reauthorization.
     let payload = json!({"schema":"native.notification-candidate.v1"});
+    let created_at = now_iso();
+    let act = act_alloc.get_or_allocate(&mut *tx).await?;
     let seq: i64 = sqlx::query_scalar(
         "INSERT INTO notification_candidate_events
            (id,candidate_key,action,recipient_account_id,message_id,reason,priority,not_before,
             redaction_class,evaluator_kind,policy_version,source_event_type,
-            source_event_id,payload,created_at)
-         VALUES (?,?,'proposed',?,?,?,?,?,?,?,?,?,?,?,?) RETURNING seq",
+            source_event_id,payload,created_at,act)
+         VALUES (?,?,'proposed',?,?,?,?,?,?,?,?,?,?,?,?,?) RETURNING seq",
     )
     .bind(&id)
     .bind(&candidate_key)
@@ -1759,22 +2231,30 @@ pub async fn append_notification_candidate_in(
     .bind(source_event_type)
     .bind(source_event_id)
     .bind(serde_json::to_string(&payload)?)
-    .bind(now_iso())
+    .bind(&created_at)
+    .bind(act)
     .fetch_one(&mut **tx)
     .await?;
-    sqlx::query(
-        "INSERT INTO notification_candidates
-           (candidate_id,candidate_key,recipient_account_id,message_id,reason,priority,not_before,
-            redaction_class,evaluator_kind,policy_version,source_event_type,
-            source_event_id,candidate_event_seq,status,created_at)
-         SELECT id,candidate_key,recipient_account_id,message_id,reason,priority,not_before,
-                redaction_class,evaluator_kind,policy_version,source_event_type,
-                source_event_id,seq,'effective',created_at
-           FROM notification_candidate_events WHERE seq=?",
-    )
-    .bind(seq)
-    .execute(&mut **tx)
-    .await?;
+    let event = NotificationCandidateEventRow {
+        seq,
+        id: id.clone(),
+        candidate_key,
+        action: "proposed".into(),
+        recipient_account_id: recipient_account.to_string(),
+        message_id: message_id.to_string(),
+        reason: reason.to_string(),
+        priority: priority.to_string(),
+        not_before: not_before.map(str::to_owned),
+        redaction_class: redaction_class.to_string(),
+        evaluator_kind: evaluator_kind.to_string(),
+        policy_version: policy_version.to_string(),
+        source_event_type: source_event_type.to_string(),
+        source_event_id: source_event_id.to_string(),
+        payload,
+        created_at,
+        act: Some(act),
+    };
+    project_notification_candidate_event(&mut *tx, &event).await?;
     Ok(Some(id))
 }
 
@@ -1905,6 +2385,7 @@ where
 
 struct SqliteCandidateWithdrawalPort<'a> {
     tx: &'a mut sqlx::Transaction<'static, Sqlite>,
+    act_alloc: &'a mut crate::act::ActAllocation,
 }
 
 impl DomainStatementExecutor for SqliteCandidateWithdrawalPort<'_> {
@@ -1932,7 +2413,8 @@ impl CandidateWithdrawalPhysicalPort for SqliteCandidateWithdrawalPort<'_> {
         created_at: &'a str,
     ) -> BoxFuture<'a, Result<i64>> {
         Box::pin(async move {
-            Ok(sqlx::query_scalar("INSERT INTO notification_candidate_events(id,candidate_key,action,recipient_account_id,message_id,reason,priority,not_before,redaction_class,evaluator_kind,policy_version,source_event_type,source_event_id,payload,created_at) VALUES(?,?,'withdrawn',?,?,?,?,?,?,?,?,?,?,?,?) RETURNING seq")
+            let act = self.act_alloc.get_or_allocate(self.tx).await?;
+            Ok(sqlx::query_scalar("INSERT INTO notification_candidate_events(id,candidate_key,action,recipient_account_id,message_id,reason,priority,not_before,redaction_class,evaluator_kind,policy_version,source_event_type,source_event_id,payload,created_at,act) VALUES(?,?,'withdrawn',?,?,?,?,?,?,?,?,?,?,?,?,?) RETURNING seq")
                 .bind(withdrawal_event_id)
                 .bind(&candidate.candidate_key)
                 .bind(&candidate.recipient_account_id)
@@ -1947,6 +2429,7 @@ impl CandidateWithdrawalPhysicalPort for SqliteCandidateWithdrawalPort<'_> {
                 .bind(source_event_id)
                 .bind("{\"schema\":\"native.notification-candidate.v1\"}")
                 .bind(created_at)
+                .bind(act)
                 .fetch_one(&mut **self.tx)
                 .await?)
         })
@@ -1958,12 +2441,31 @@ impl CandidateWithdrawalPhysicalPort for SqliteCandidateWithdrawalPort<'_> {
         event_seq: i64,
     ) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
-            sqlx::query("UPDATE notification_candidates SET status='withdrawn',candidate_event_seq=? WHERE candidate_id=?")
-                .bind(event_seq)
-                .bind(candidate_id)
-                .execute(&mut **self.tx)
-                .await?;
-            Ok(())
+            // Recover the row just appended, verify it names the proposal it
+            // claims to withdraw (the `candidate_id`/`candidate_key` identity is
+            // 1:1 and both unique), then fold it through the one shared
+            // key-based projector. Portable adapters keep their own physical
+            // update; this only unifies the SQLite live and rebuild paths.
+            let event = notification_candidate_event_by_seq(self.tx, event_seq)
+                .await?
+                .ok_or_else(|| {
+                    Error::engine("notification candidate withdrawal event was not found")
+                })?;
+            let proposed_key: Option<String> = sqlx::query_scalar(
+                "SELECT candidate_key FROM notification_candidates WHERE candidate_id=?",
+            )
+            .bind(candidate_id)
+            .fetch_optional(&mut **self.tx)
+            .await?;
+            match proposed_key {
+                Some(key) if key == event.candidate_key => {}
+                _ => {
+                    return Err(Error::engine(
+                        "notification candidate withdrawal does not match its proposal",
+                    ))
+                }
+            }
+            project_notification_candidate_event(self.tx, &event).await
         })
     }
 }
@@ -1973,8 +2475,9 @@ pub async fn withdraw_message_candidates_in(
     message_id: &str,
     source_event_type: &str,
     source_event_id: &str,
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<usize> {
-    let mut port = SqliteCandidateWithdrawalPort { tx };
+    let mut port = SqliteCandidateWithdrawalPort { tx, act_alloc };
     withdraw_message_candidates_with(&mut port, message_id, source_event_type, source_event_id)
         .await
 }
@@ -1989,6 +2492,7 @@ pub(crate) async fn apply_delivered_message_awareness_in(
     recipient_accounts: &[String],
     source_event_type: &str,
     source_event_id: &str,
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<()> {
     let has_obligation: bool = sqlx::query_scalar(
         "SELECT EXISTS(
@@ -2013,6 +2517,7 @@ pub(crate) async fn apply_delivered_message_awareness_in(
                 "messaging-awareness-v1",
                 source_event_type,
                 source_event_id,
+                act_alloc,
             )
             .await?;
         }
@@ -2066,6 +2571,7 @@ pub(crate) async fn apply_delivered_message_awareness_in(
                 &source_id,
                 "correction.conflicted",
                 source_event_id,
+                act_alloc,
             )
             .await?;
         }
@@ -2096,6 +2602,7 @@ pub(crate) async fn apply_delivered_message_awareness_in(
                 "messaging-awareness-v1",
                 source_event_type,
                 source_event_id,
+                act_alloc,
             )
             .await?;
         }
@@ -2110,7 +2617,14 @@ pub(crate) async fn apply_delivered_message_awareness_in(
     .fetch_all(&mut **tx)
     .await?;
     for target_id in superseded {
-        withdraw_message_candidates_in(tx, &target_id, source_event_type, source_event_id).await?;
+        withdraw_message_candidates_in(
+            tx,
+            &target_id,
+            source_event_type,
+            source_event_id,
+            act_alloc,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -2122,19 +2636,40 @@ pub async fn withdraw_notification_candidates_in(
     reason: Option<&str>,
     source_event_type: &str,
     source_event_id: &str,
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<usize> {
-    let rows=sqlx::query("SELECT candidate_id,candidate_key,recipient_account_id,reason,priority,not_before,redaction_class,evaluator_kind,policy_version FROM notification_candidates WHERE message_id=? AND status='effective' AND (?='%' OR recipient_account_id=?) AND (? IS NULL OR reason=?)")
+    let rows=sqlx::query("SELECT candidate_key,recipient_account_id,reason,priority,not_before,redaction_class,evaluator_kind,policy_version FROM notification_candidates WHERE message_id=? AND status='effective' AND (?='%' OR recipient_account_id=?) AND (? IS NULL OR reason=?)")
         .bind(message_id).bind(recipient_account).bind(recipient_account).bind(reason).bind(reason)
         .fetch_all(&mut **tx).await?;
     for row in &rows {
         let id = Uuid::new_v4().to_string();
-        let seq:i64=sqlx::query_scalar("INSERT INTO notification_candidate_events(id,candidate_key,action,recipient_account_id,message_id,reason,priority,not_before,redaction_class,evaluator_kind,policy_version,source_event_type,source_event_id,payload,created_at) VALUES(?,?,'withdrawn',?,?,?,?,?,?,?,?,?,?,?,?) RETURNING seq")
-            .bind(id).bind(row.try_get::<String,_>("candidate_key")?).bind(row.try_get::<String,_>("recipient_account_id")?).bind(message_id)
+        let created_at = now_iso();
+        let act = act_alloc.get_or_allocate(&mut *tx).await?;
+        let seq:i64=sqlx::query_scalar("INSERT INTO notification_candidate_events(id,candidate_key,action,recipient_account_id,message_id,reason,priority,not_before,redaction_class,evaluator_kind,policy_version,source_event_type,source_event_id,payload,created_at,act) VALUES(?,?,'withdrawn',?,?,?,?,?,?,?,?,?,?,?,?,?) RETURNING seq")
+            .bind(&id).bind(row.try_get::<String,_>("candidate_key")?).bind(row.try_get::<String,_>("recipient_account_id")?).bind(message_id)
             .bind(row.try_get::<String,_>("reason")?).bind(row.try_get::<String,_>("priority")?).bind(row.try_get::<Option<String>,_>("not_before")?)
             .bind(row.try_get::<String,_>("redaction_class")?).bind(row.try_get::<String,_>("evaluator_kind")?).bind(row.try_get::<String,_>("policy_version")?)
-            .bind(source_event_type).bind(source_event_id).bind("{\"schema\":\"native.notification-candidate.v1\"}").bind(now_iso()).fetch_one(&mut **tx).await?;
-        sqlx::query("UPDATE notification_candidates SET status='withdrawn',candidate_event_seq=? WHERE candidate_id=?")
-            .bind(seq).bind(row.try_get::<String,_>("candidate_id")?).execute(&mut **tx).await?;
+            .bind(source_event_type).bind(source_event_id).bind("{\"schema\":\"native.notification-candidate.v1\"}").bind(&created_at).bind(act).fetch_one(&mut **tx).await?;
+        let event = NotificationCandidateEventRow {
+            seq,
+            id,
+            candidate_key: row.try_get("candidate_key")?,
+            action: "withdrawn".into(),
+            recipient_account_id: row.try_get("recipient_account_id")?,
+            message_id: message_id.to_string(),
+            reason: row.try_get("reason")?,
+            priority: row.try_get("priority")?,
+            not_before: row.try_get("not_before")?,
+            redaction_class: row.try_get("redaction_class")?,
+            evaluator_kind: row.try_get("evaluator_kind")?,
+            policy_version: row.try_get("policy_version")?,
+            source_event_type: source_event_type.to_string(),
+            source_event_id: source_event_id.to_string(),
+            payload: json!({"schema":"native.notification-candidate.v1"}),
+            created_at,
+            act: Some(act),
+        };
+        project_notification_candidate_event(&mut *tx, &event).await?;
     }
     Ok(rows.len())
 }
@@ -2173,92 +2708,10 @@ pub async fn rebuild_projections(db: &crate::Db) -> Result<()> {
             .execute(&mut *tx)
             .await?;
     }
-    let events=sqlx::query("SELECT id,seq,subject_account_id,message_id,destination_id,lane,action,reason_code,executor_ref,delegation_ref,payload,created_at FROM awareness_events ORDER BY seq").fetch_all(&mut *tx).await?;
-    for event in events {
-        let lane: String = event.try_get("lane")?;
-        let account: String = event.try_get("subject_account_id")?;
-        // Lane-determined subject: the four Message lanes read `message_id`,
-        // the destination lane reads `destination_id`. The DDL's paired CHECKs
-        // mean exactly one is present, so a wrong read is a fold failure rather
-        // than a silently mis-keyed projection row.
-        let message: String = event
-            .try_get::<Option<String>, _>("message_id")?
-            .unwrap_or_default();
-        let seq: i64 = event.try_get("seq")?;
-        let payload: Value = serde_json::from_str(&event.try_get::<String, _>("payload")?)?;
-        match lane.as_str() {
-            "human" => {
-                let stage = payload["stage"]
-                    .as_str()
-                    .ok_or_else(|| Error::engine("invalid human replay payload"))?;
-                let now = payload["attained_at"]
-                    .as_str()
-                    .map(str::to_owned)
-                    .unwrap_or(event.try_get("created_at")?);
-                let current:Option<(String,i64,Option<String>,Option<String>)>=sqlx::query_as("SELECT stage,version,opened_at,acknowledged_at FROM human_message_awareness WHERE subject_account_id=? AND message_id=?").bind(&account).bind(&message).fetch_optional(&mut *tx).await?;
-                let current_stage = HumanStage::parse(current.as_ref().map(|v| v.0.as_str()))?;
-                let requested = HumanStage::parse(Some(stage))?;
-                let next = if requested.rank() > current_stage.rank() {
-                    requested
-                } else {
-                    current_stage
-                };
-                let version = current.as_ref().map_or(1, |v| v.1 + 1);
-                let opened_at = current
-                    .as_ref()
-                    .and_then(|value| value.2.clone())
-                    .or_else(|| {
-                        (requested.rank() >= HumanStage::Opened.rank()).then(|| now.clone())
-                    });
-                let acknowledged_at =
-                    current
-                        .as_ref()
-                        .and_then(|value| value.3.clone())
-                        .or_else(|| {
-                            (requested.rank() >= HumanStage::Acknowledged.rank())
-                                .then(|| now.clone())
-                        });
-                sqlx::query("INSERT INTO human_message_awareness(subject_account_id,message_id,stage,first_presented_at,last_presented_at,opened_at,acknowledged_at,last_event_seq,version) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(subject_account_id,message_id) DO UPDATE SET stage=excluded.stage,last_presented_at=excluded.last_presented_at,opened_at=excluded.opened_at,acknowledged_at=excluded.acknowledged_at,last_event_seq=excluded.last_event_seq,version=excluded.version").bind(&account).bind(&message).bind(next.stored()).bind(&now).bind(&now).bind(opened_at).bind(acknowledged_at).bind(seq).bind(version).execute(&mut *tx).await?;
-            }
-            "agent" => {
-                let state = payload["state"]
-                    .as_str()
-                    .ok_or_else(|| Error::engine("invalid agent replay payload"))?;
-                let version: i64=sqlx::query_scalar("SELECT version FROM agent_message_dispositions WHERE subject_account_id=? AND message_id=?").bind(&account).bind(&message).fetch_optional(&mut *tx).await?.unwrap_or(0)+1;
-                sqlx::query("INSERT INTO agent_message_dispositions(subject_account_id,message_id,state,reason_code,last_executor_ref,delegation_ref,last_event_seq,version) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(subject_account_id,message_id) DO UPDATE SET state=excluded.state,reason_code=excluded.reason_code,last_executor_ref=excluded.last_executor_ref,delegation_ref=excluded.delegation_ref,last_event_seq=excluded.last_event_seq,version=excluded.version").bind(&account).bind(&message).bind(state).bind(event.try_get::<String,_>("reason_code")?).bind(event.try_get::<Option<String>,_>("executor_ref")?).bind(event.try_get::<Option<String>,_>("delegation_ref")?).bind(seq).bind(version).execute(&mut *tx).await?;
-                for evidence in payload["evidence"].as_array().into_iter().flatten() {
-                    sqlx::query("INSERT INTO awareness_event_evidence(event_id,evidence_record_id,evidence_role) VALUES(?,?,?)").bind(event.try_get::<String,_>("id")?).bind(evidence["record_id"].as_str()).bind(evidence["role"].as_str()).execute(&mut *tx).await?;
-                }
-            }
-            "preference" => {
-                let version:i64=sqlx::query_scalar("SELECT version FROM message_preferences WHERE subject_account_id=? AND message_id=?").bind(&account).bind(&message).fetch_optional(&mut *tx).await?.unwrap_or(0)+1;
-                sqlx::query("INSERT INTO message_preferences(subject_account_id,message_id,attention_flag,muted,snoozed_until,archived,last_event_seq,version) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(subject_account_id,message_id) DO UPDATE SET attention_flag=excluded.attention_flag,muted=excluded.muted,snoozed_until=excluded.snoozed_until,archived=excluded.archived,last_event_seq=excluded.last_event_seq,version=excluded.version").bind(&account).bind(&message).bind(payload["attention_flag"].as_bool()).bind(payload["muted"].as_bool()).bind(payload["snoozed_until"].as_str()).bind(payload["archived"].as_bool()).bind(seq).bind(version).execute(&mut *tx).await?;
-            }
-            "routing" => {
-                let version:i64=sqlx::query_scalar("SELECT version FROM message_inbox_routing WHERE subject_account_id=? AND message_id=?").bind(&account).bind(&message).fetch_optional(&mut *tx).await?.unwrap_or(0)+1;
-                sqlx::query("INSERT INTO message_inbox_routing(subject_account_id,message_id,obligation_state,executor_route,reason_code,policy_version,last_event_seq,version) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(subject_account_id,message_id) DO UPDATE SET obligation_state=excluded.obligation_state,executor_route=excluded.executor_route,reason_code=excluded.reason_code,policy_version=excluded.policy_version,last_event_seq=excluded.last_event_seq,version=excluded.version").bind(&account).bind(&message).bind(payload["obligation_state"].as_str()).bind(payload["executor_route"].as_str()).bind(event.try_get::<String,_>("reason_code")?).bind(payload["policy_version"].as_str()).bind(seq).bind(version).execute(&mut *tx).await?;
-            }
-            "destination" => {
-                let collection: String = event
-                    .try_get::<Option<String>, _>("destination_id")?
-                    .ok_or_else(|| Error::engine("destination event without a destination_id"))?;
-                let version: i64 = sqlx::query_scalar("SELECT version FROM member_destinations WHERE subject_account_id=? AND collection_id=?").bind(&account).bind(&collection).fetch_optional(&mut *tx).await?.unwrap_or(0)+1;
-                sqlx::query("INSERT INTO member_destinations(subject_account_id,collection_id,present,joined_at,joined_by,last_event_seq,version) VALUES(?,?,?,?,?,?,?) ON CONFLICT(subject_account_id,collection_id) DO UPDATE SET present=excluded.present,joined_at=excluded.joined_at,joined_by=excluded.joined_by,last_event_seq=excluded.last_event_seq,version=excluded.version").bind(&account).bind(&collection).bind(payload["present"].as_bool()).bind(payload["joined_at"].as_str()).bind(payload["joined_by"].as_str()).bind(seq).bind(version).execute(&mut *tx).await?;
-            }
-            _ => return Err(Error::engine("unknown awareness replay lane")),
-        }
-    }
-    let candidates = sqlx::query("SELECT * FROM notification_candidate_events ORDER BY seq")
-        .fetch_all(&mut *tx)
-        .await?;
-    for event in candidates {
-        let action: String = event.try_get("action")?;
-        if action == "proposed" {
-            sqlx::query("INSERT INTO notification_candidates(candidate_id,candidate_key,recipient_account_id,message_id,reason,priority,not_before,redaction_class,evaluator_kind,policy_version,source_event_type,source_event_id,candidate_event_seq,status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,'effective',?)").bind(event.try_get::<String,_>("id")?).bind(event.try_get::<String,_>("candidate_key")?).bind(event.try_get::<String,_>("recipient_account_id")?).bind(event.try_get::<String,_>("message_id")?).bind(event.try_get::<String,_>("reason")?).bind(event.try_get::<String,_>("priority")?).bind(event.try_get::<Option<String>,_>("not_before")?).bind(event.try_get::<String,_>("redaction_class")?).bind(event.try_get::<String,_>("evaluator_kind")?).bind(event.try_get::<String,_>("policy_version")?).bind(event.try_get::<String,_>("source_event_type")?).bind(event.try_get::<String,_>("source_event_id")?).bind(event.try_get::<i64,_>("seq")?).bind(event.try_get::<String,_>("created_at")?).execute(&mut *tx).await?;
-        } else {
-            sqlx::query("UPDATE notification_candidates SET status=?,candidate_event_seq=? WHERE candidate_key=?").bind(if action=="withdrawn"{"withdrawn"}else{"suppressed"}).bind(event.try_get::<i64,_>("seq")?).bind(event.try_get::<String,_>("candidate_key")?).execute(&mut *tx).await?;
-        }
-    }
+    let events = read_all_awareness_events(&mut tx).await?;
+    replay_awareness(&mut tx, &events).await?;
+    let candidates = read_all_notification_candidate_events(&mut tx).await?;
+    replay_notification_candidate_events(&mut tx, &candidates).await?;
     tx.commit().await?;
     Ok(())
 }
@@ -2275,6 +2728,7 @@ mod tests {
             executor_ref: "trusted-ui".into(),
         };
         let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+        let mut act_alloc = crate::act::ActAllocation::new();
         let first = advance_human(
             &mut tx,
             "acct:a",
@@ -2284,12 +2738,14 @@ mod tests {
             "same-key",
             &attestation,
             "explicit review",
+            &mut act_alloc,
         )
         .await
         .unwrap();
         assert_eq!(first["changed"], true);
         tx.commit().await.unwrap();
         let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+        let mut act_alloc = crate::act::ActAllocation::new();
         advance_human(
             &mut tx,
             "acct:a",
@@ -2302,11 +2758,13 @@ mod tests {
                 executor_ref: "trusted-ui".into(),
             },
             "later presentation",
+            &mut act_alloc,
         )
         .await
         .unwrap();
         tx.commit().await.unwrap();
         let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+        let mut act_alloc = crate::act::ActAllocation::new();
         let retry = advance_human(
             &mut tx,
             "acct:a",
@@ -2316,6 +2774,7 @@ mod tests {
             "same-key",
             &attestation,
             "explicit review",
+            &mut act_alloc,
         )
         .await
         .unwrap();
@@ -2331,6 +2790,7 @@ mod tests {
         );
         tx.commit().await.unwrap();
         let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+        let mut act_alloc = crate::act::ActAllocation::new();
         let error = advance_human(
             &mut tx,
             "acct:a",
@@ -2340,10 +2800,216 @@ mod tests {
             "same-key",
             &attestation,
             "different",
+            &mut act_alloc,
         )
         .await
         .unwrap_err();
         assert!(error.to_string().contains("different intent"));
+    }
+
+    /// Prerequisite 781a566a: a genuinely new batch intent allocates a
+    /// visible act immediately before INSERT; an exact retry allocates
+    /// nothing and leaves the counter untouched; a first-time empty batch
+    /// still allocates a visible act.
+    #[tokio::test]
+    async fn batch_command_intent_allocates_act_once_and_retries_allocate_nothing() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let attestation = VerifiedHumanInteraction {
+            nonce: "batch-nonce".into(),
+            executor_ref: "trusted-ui".into(),
+        };
+        let counter = || async {
+            sqlx::query_scalar::<_, i64>("SELECT next_act FROM act_state WHERE singleton = 1")
+                .fetch_one(db.write_pool())
+                .await
+                .unwrap()
+        };
+        let before = counter().await;
+
+        // First-time batch allocates a visible act.
+        let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+        let mut act_alloc = crate::act::ActAllocation::new();
+        let first = register_human_batch_command(
+            &mut tx,
+            "acct:batch",
+            HumanStage::Acknowledged,
+            &["m1".to_string()],
+            &std::collections::BTreeMap::from([("m1".to_string(), 0)]),
+            "batch-key-1",
+            None,
+            &attestation,
+            "reviewed",
+            &mut act_alloc,
+        )
+        .await
+        .unwrap();
+        assert!(first);
+        let intent_act: Option<i64> = sqlx::query_scalar(
+            "SELECT act FROM awareness_command_intents WHERE subject_account_id = 'acct:batch' AND idempotency_key = 'batch-key-1'",
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+        let allocated = intent_act.expect("new intent carries an act");
+        assert!(allocated > before);
+        tx.commit().await.unwrap();
+        assert_eq!(counter().await, allocated);
+
+        // Exact retry allocates nothing: no new row, counter untouched.
+        let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+        let mut act_alloc = crate::act::ActAllocation::new();
+        let retry = register_human_batch_command(
+            &mut tx,
+            "acct:batch",
+            HumanStage::Acknowledged,
+            &["m1".to_string()],
+            &std::collections::BTreeMap::from([("m1".to_string(), 0)]),
+            "batch-key-1",
+            None,
+            &attestation,
+            "reviewed",
+            &mut act_alloc,
+        )
+        .await
+        .unwrap();
+        assert!(!retry);
+        assert!(act_alloc.get().is_none());
+        tx.commit().await.unwrap();
+        assert_eq!(counter().await, allocated);
+
+        // First-time empty batch remains visible: it still allocates.
+        let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+        let mut act_alloc = crate::act::ActAllocation::new();
+        let empty_first = register_human_batch_command(
+            &mut tx,
+            "acct:batch",
+            HumanStage::Acknowledged,
+            &[],
+            &std::collections::BTreeMap::new(),
+            "batch-key-empty",
+            None,
+            &attestation,
+            "reviewed",
+            &mut act_alloc,
+        )
+        .await
+        .unwrap();
+        assert!(empty_first);
+        let empty_act: Option<i64> = sqlx::query_scalar(
+            "SELECT act FROM awareness_command_intents WHERE subject_account_id = 'acct:batch' AND idempotency_key = 'batch-key-empty'",
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+        assert!(empty_act.expect("empty batch carries an act") > allocated);
+        tx.commit().await.unwrap();
+        db.close().await;
+    }
+
+    /// Prerequisite 781a566a: the batch intent and every awareness event the
+    /// same command causes share one act. The intent allocates first, and the
+    /// per-message `advance_human` appends reuse the shared allocation.
+    #[tokio::test]
+    async fn batch_intent_and_awareness_events_share_one_act() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let attestation = VerifiedHumanInteraction {
+            nonce: "batch-share".into(),
+            executor_ref: "trusted-ui".into(),
+        };
+        let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+        let mut act_alloc = crate::act::ActAllocation::new();
+        let first = register_human_batch_command(
+            &mut tx,
+            "acct:share",
+            HumanStage::Acknowledged,
+            &["m-share".to_string()],
+            &std::collections::BTreeMap::from([("m-share".to_string(), 0)]),
+            "batch-share-key",
+            None,
+            &attestation,
+            "reviewed",
+            &mut act_alloc,
+        )
+        .await
+        .unwrap();
+        assert!(first);
+        advance_human(
+            &mut tx,
+            "acct:share",
+            "m-share",
+            HumanStage::Acknowledged,
+            0,
+            "batch-share-key:m-share",
+            &attestation,
+            "reviewed",
+            &mut act_alloc,
+        )
+        .await
+        .unwrap();
+        let intent_act: Option<i64> = sqlx::query_scalar(
+            "SELECT act FROM awareness_command_intents
+              WHERE subject_account_id = 'acct:share' AND idempotency_key = 'batch-share-key'",
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+        let event_acts: Vec<Option<i64>> = sqlx::query_scalar(
+            "SELECT act FROM awareness_events WHERE message_id = 'm-share' ORDER BY seq",
+        )
+        .fetch_all(&mut *tx)
+        .await
+        .unwrap();
+        let shared = intent_act.expect("the batch intent carries an act");
+        assert!(!event_acts.is_empty(), "the batch appends awareness events");
+        assert!(
+            event_acts.iter().all(|act| *act == Some(shared)),
+            "intent and awareness events must share one act, got intent {shared} vs events {event_acts:?}"
+        );
+        tx.commit().await.unwrap();
+        db.close().await;
+    }
+
+    /// Prerequisite 781a566a: a batch intent whose transaction rolls back
+    /// consumes no act, so the next committed writer reuses it.
+    #[tokio::test]
+    async fn batch_intent_rollback_consumes_no_act() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let attestation = VerifiedHumanInteraction {
+            nonce: "batch-rollback".into(),
+            executor_ref: "trusted-ui".into(),
+        };
+        let before: i64 = sqlx::query_scalar("SELECT next_act FROM act_state WHERE singleton = 1")
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap();
+        let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+        let mut act_alloc = crate::act::ActAllocation::new();
+        let first = register_human_batch_command(
+            &mut tx,
+            "acct:rollback",
+            HumanStage::Acknowledged,
+            &["m-rollback".to_string()],
+            &std::collections::BTreeMap::from([("m-rollback".to_string(), 0)]),
+            "batch-rollback-key",
+            None,
+            &attestation,
+            "reviewed",
+            &mut act_alloc,
+        )
+        .await
+        .unwrap();
+        assert!(first);
+        assert!(
+            act_alloc.get().is_some(),
+            "the rolled-back intent did allocate before the rollback"
+        );
+        tx.rollback().await.unwrap();
+        let after: i64 = sqlx::query_scalar("SELECT next_act FROM act_state WHERE singleton = 1")
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap();
+        assert_eq!(after, before, "a rolled-back intent consumes no act");
+        db.close().await;
     }
 
     #[tokio::test]
@@ -2354,6 +3020,7 @@ mod tests {
             executor_ref: "ui".into(),
         };
         let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+        let mut act_alloc = crate::act::ActAllocation::new();
         advance_human(
             &mut tx,
             "acct:a",
@@ -2363,6 +3030,7 @@ mod tests {
             "human",
             &attestation,
             "read",
+            &mut act_alloc,
         )
         .await
         .unwrap();
@@ -2385,6 +3053,7 @@ mod tests {
                 record_id: "reply:a".into(),
                 role: "reply".into(),
             }],
+            &mut act_alloc,
         )
         .await
         .unwrap();
@@ -2397,6 +3066,7 @@ mod tests {
             0,
             "flag",
             "show again",
+            &mut act_alloc,
         )
         .await
         .unwrap();
@@ -2412,6 +3082,7 @@ mod tests {
             "v1",
             "record.created",
             "event:a",
+            &mut act_alloc,
         )
         .await
         .unwrap();
@@ -2466,6 +3137,7 @@ mod tests {
         let db = crate::create_database(":memory:").await.unwrap();
         let due = (chrono::Utc::now() + chrono::Duration::hours(2)).to_rfc3339();
         let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+        let mut act_alloc = crate::act::ActAllocation::new();
         append_notification_candidate_in(
             &mut tx,
             "acct:a",
@@ -2478,6 +3150,7 @@ mod tests {
             "v1",
             "record.created",
             "source:a",
+            &mut act_alloc,
         )
         .await
         .unwrap();
@@ -2490,6 +3163,7 @@ mod tests {
             0,
             "snooze",
             "review later",
+            &mut act_alloc,
         )
         .await
         .unwrap();
@@ -2520,6 +3194,7 @@ mod tests {
         );
 
         let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+        let mut act_alloc = crate::act::ActAllocation::new();
         set_preference(
             &mut tx,
             "acct:a",
@@ -2529,6 +3204,7 @@ mod tests {
             1,
             "clear-snooze",
             "review now",
+            &mut act_alloc,
         )
         .await
         .unwrap();
@@ -2558,6 +3234,7 @@ mod tests {
                 executor_ref: "ui".into(),
             };
             let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+            let mut act_alloc = crate::act::ActAllocation::new();
             advance_human(
                 &mut tx,
                 "acct:a",
@@ -2567,6 +3244,7 @@ mod tests {
                 key,
                 &attestation,
                 "explicit gesture",
+                &mut act_alloc,
             )
             .await
             .unwrap();
@@ -2598,6 +3276,7 @@ mod tests {
     async fn lower_rank_human_event_still_withdraws_candidates_after_message_was_opened() {
         let db = crate::create_database(":memory:").await.unwrap();
         let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+        let mut act_alloc = crate::act::ActAllocation::new();
         advance_human(
             &mut tx,
             "acct:a",
@@ -2610,12 +3289,14 @@ mod tests {
                 executor_ref: "ui".into(),
             },
             "explicit gesture",
+            &mut act_alloc,
         )
         .await
         .unwrap();
         tx.commit().await.unwrap();
 
         let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+        let mut act_alloc = crate::act::ActAllocation::new();
         append_notification_candidate_in(
             &mut tx,
             "acct:a",
@@ -2628,12 +3309,14 @@ mod tests {
             "v1",
             "record.updated",
             "source:a",
+            &mut act_alloc,
         )
         .await
         .unwrap();
         tx.commit().await.unwrap();
 
         let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+        let mut act_alloc = crate::act::ActAllocation::new();
         advance_human(
             &mut tx,
             "acct:a",
@@ -2646,6 +3329,7 @@ mod tests {
                 executor_ref: "ui".into(),
             },
             "explicit gesture",
+            &mut act_alloc,
         )
         .await
         .unwrap();
@@ -2677,6 +3361,7 @@ mod tests {
     async fn preference_retry_uses_command_intent_not_later_combined_state() {
         let db = crate::create_database(":memory:").await.unwrap();
         let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+        let mut act_alloc = crate::act::ActAllocation::new();
         set_preference(
             &mut tx,
             "acct:a",
@@ -2686,11 +3371,13 @@ mod tests {
             0,
             "mute",
             "quiet",
+            &mut act_alloc,
         )
         .await
         .unwrap();
         tx.commit().await.unwrap();
         let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+        let mut act_alloc = crate::act::ActAllocation::new();
         set_preference(
             &mut tx,
             "acct:a",
@@ -2700,11 +3387,13 @@ mod tests {
             1,
             "flag",
             "important",
+            &mut act_alloc,
         )
         .await
         .unwrap();
         tx.commit().await.unwrap();
         let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+        let mut act_alloc = crate::act::ActAllocation::new();
         let retry = set_preference(
             &mut tx,
             "acct:a",
@@ -2714,6 +3403,7 @@ mod tests {
             0,
             "mute",
             "quiet",
+            &mut act_alloc,
         )
         .await
         .unwrap();
@@ -2749,6 +3439,7 @@ mod tests {
             reason_code: "agent transition",
         };
         let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+        let mut act_alloc = crate::act::ActAllocation::new();
         set_agent_disposition(
             &mut tx,
             &agent,
@@ -2757,6 +3448,7 @@ mod tests {
             0,
             "agent-first",
             &[],
+            &mut act_alloc,
         )
         .await
         .unwrap();
@@ -2768,6 +3460,7 @@ mod tests {
             1,
             "agent-later",
             &[],
+            &mut act_alloc,
         )
         .await
         .unwrap();
@@ -2779,6 +3472,7 @@ mod tests {
             0,
             "agent-first",
             &[],
+            &mut act_alloc,
         )
         .await
         .unwrap();
@@ -2796,6 +3490,7 @@ mod tests {
             reason_code: "routing transition",
         };
         let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+        let mut act_alloc = crate::act::ActAllocation::new();
         set_routing(
             &mut tx,
             &routing,
@@ -2805,6 +3500,7 @@ mod tests {
             Some("policy-v1"),
             0,
             "routing-first",
+            &mut act_alloc,
         )
         .await
         .unwrap();
@@ -2817,6 +3513,7 @@ mod tests {
             Some("policy-v2"),
             1,
             "routing-later",
+            &mut act_alloc,
         )
         .await
         .unwrap();
@@ -2829,6 +3526,7 @@ mod tests {
             Some("policy-v1"),
             0,
             "routing-first",
+            &mut act_alloc,
         )
         .await
         .unwrap();
@@ -2851,6 +3549,7 @@ mod tests {
             reason_code: "route",
         };
         let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+        let mut act_alloc = crate::act::ActAllocation::new();
         append_notification_candidate_in(
             &mut tx,
             "acct:a",
@@ -2863,6 +3562,7 @@ mod tests {
             "v1",
             "record.created",
             "source:a",
+            &mut act_alloc,
         )
         .await
         .unwrap();
@@ -2875,6 +3575,7 @@ mod tests {
             Some("policy-v1"),
             0,
             "to-human",
+            &mut act_alloc,
         )
         .await
         .unwrap();
@@ -2889,6 +3590,7 @@ mod tests {
             1
         );
         let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+        let mut act_alloc = crate::act::ActAllocation::new();
         set_routing(
             &mut tx,
             &context,
@@ -2898,6 +3600,7 @@ mod tests {
             Some("policy-v2"),
             1,
             "to-agent",
+            &mut act_alloc,
         )
         .await
         .unwrap();
@@ -2913,6 +3616,7 @@ mod tests {
         );
 
         let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+        let mut act_alloc = crate::act::ActAllocation::new();
         advance_human(
             &mut tx,
             "acct:a",
@@ -2925,6 +3629,7 @@ mod tests {
                 executor_ref: "ui".into(),
             },
             "explicit gesture",
+            &mut act_alloc,
         )
         .await
         .unwrap();
@@ -2937,6 +3642,7 @@ mod tests {
             Some("policy-v1"),
             0,
             "to-human-after-open",
+            &mut act_alloc,
         )
         .await
         .unwrap();
@@ -2964,6 +3670,7 @@ mod tests {
             reason_code: "claim",
         };
         let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+        let mut act_alloc = crate::act::ActAllocation::new();
         let error = set_agent_disposition(
             &mut tx,
             &context,
@@ -2972,6 +3679,7 @@ mod tests {
             0,
             "invalid",
             &[],
+            &mut act_alloc,
         )
         .await
         .unwrap_err();
@@ -3066,6 +3774,7 @@ mod tests {
     async fn a_member_adds_removes_and_lists_their_destination_rail() {
         let db = crate::create_database(":memory:").await.unwrap();
         let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+        let mut act_alloc = crate::act::ActAllocation::new();
 
         // Absence is the meaningful default: nothing on the rail, version 0.
         assert!(list_destinations_on(&mut *tx, "acct:a", false)
@@ -3080,6 +3789,7 @@ mod tests {
             DestinationAction::Add,
             0,
             "add-launch",
+            &mut act_alloc,
         )
         .await
         .unwrap();
@@ -3095,6 +3805,7 @@ mod tests {
             DestinationAction::Add,
             0,
             "add-design",
+            &mut act_alloc,
         )
         .await
         .unwrap();
@@ -3107,6 +3818,7 @@ mod tests {
             DestinationAction::Add,
             0,
             "add-launch-b",
+            &mut act_alloc,
         )
         .await
         .unwrap();
@@ -3130,6 +3842,7 @@ mod tests {
             DestinationAction::Remove,
             1,
             "remove-design",
+            &mut act_alloc,
         )
         .await
         .unwrap();
@@ -3183,6 +3896,7 @@ mod tests {
     async fn destination_idempotency_and_cas_match_the_message_lanes() {
         let db = crate::create_database(":memory:").await.unwrap();
         let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+        let mut act_alloc = crate::act::ActAllocation::new();
         set_destination(
             &mut tx,
             &destination_context("acct:a", "join"),
@@ -3190,6 +3904,7 @@ mod tests {
             DestinationAction::Add,
             0,
             "same-key",
+            &mut act_alloc,
         )
         .await
         .unwrap();
@@ -3202,6 +3917,7 @@ mod tests {
             DestinationAction::Add,
             0,
             "same-key",
+            &mut act_alloc,
         )
         .await
         .unwrap();
@@ -3226,6 +3942,7 @@ mod tests {
             DestinationAction::Remove,
             1,
             "same-key",
+            &mut act_alloc,
         )
         .await
         .unwrap_err();
@@ -3239,6 +3956,7 @@ mod tests {
             DestinationAction::Remove,
             0,
             "stale-remove",
+            &mut act_alloc,
         )
         .await
         .unwrap_err();
@@ -3250,6 +3968,7 @@ mod tests {
     async fn the_destination_lane_rebuilds_exactly_from_its_events() {
         let db = crate::create_database(":memory:").await.unwrap();
         let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+        let mut act_alloc = crate::act::ActAllocation::new();
         for (collection, action, expected, key) in [
             ("collection:launch", DestinationAction::Add, 0, "a1"),
             ("collection:design", DestinationAction::Add, 0, "a2"),
@@ -3263,6 +3982,7 @@ mod tests {
                 action,
                 expected,
                 key,
+                &mut act_alloc,
             )
             .await
             .unwrap();
@@ -3292,12 +4012,14 @@ mod tests {
     async fn sending_joins_once_and_a_retried_send_does_not_join_twice() {
         let db = crate::create_database(":memory:").await.unwrap();
         let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+        let mut act_alloc = crate::act::ActAllocation::new();
         let first = auto_join_destination_on_send_in(
             &mut tx,
             "acct:a",
             "actor:a",
             "collection:launch",
             "event-1",
+            &mut act_alloc,
         )
         .await
         .unwrap()
@@ -3312,6 +4034,7 @@ mod tests {
             "actor:a",
             "collection:launch",
             "event-1",
+            &mut act_alloc,
         )
         .await
         .unwrap();
@@ -3324,6 +4047,7 @@ mod tests {
             "actor:a",
             "collection:launch",
             "event-2",
+            &mut act_alloc,
         )
         .await
         .unwrap()
@@ -3347,6 +4071,7 @@ mod tests {
             DestinationAction::Remove,
             1,
             "leave-1",
+            &mut act_alloc,
         )
         .await
         .unwrap();
@@ -3356,6 +4081,7 @@ mod tests {
             "actor:a",
             "collection:launch",
             "event-3",
+            &mut act_alloc,
         )
         .await
         .unwrap()
@@ -3403,5 +4129,817 @@ mod tests {
         let mut stale = response;
         stale["schema"] = json!(MESSAGE_INBOX_SCHEMA_V1);
         assert!(validate_messaging_surface_response(&stale).is_err());
+    }
+}
+
+#[cfg(test)]
+mod guest_footing_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn harvest_resolves_candidates_without_the_members_baseline_for_guests() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        // A plain workspace document inherits the genesis members baseline:
+        // members can view it, guests cannot.
+        let record_id = "b4210000-0000-4000-8000-000000000001";
+        crate::store::create_record(
+            &db,
+            serde_json::json!({
+                "id": record_id,
+                "type": "Document",
+                "kind": "note",
+                "name": "members-only",
+                "home_id": "native:root",
+            }),
+        )
+        .await
+        .unwrap();
+        let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+        let mut act_alloc = crate::act::ActAllocation::new();
+        append_notification_candidate_in(
+            &mut tx,
+            "acct:a",
+            record_id,
+            "human_obligation",
+            "routine",
+            None,
+            "metadata_only",
+            "portable_default",
+            "v1",
+            "record.created",
+            "source:a",
+            &mut act_alloc,
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+
+        let member = harvest_host_notification_candidates(&db, "acct:a", true, 0, 10)
+            .await
+            .unwrap();
+        assert_eq!(member.candidates.len(), 1);
+        let guest = harvest_host_notification_candidates(&db, "acct:a", false, 0, 10)
+            .await
+            .unwrap();
+        assert!(
+            guest.candidates.is_empty(),
+            "guest footing must not match the members baseline"
+        );
+
+        let revalidated_member = revalidate_host_notification_candidate(
+            &db,
+            &member.candidates[0].candidate_id,
+            "acct:a",
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(revalidated_member.is_some());
+        let revalidated_guest = revalidate_host_notification_candidate(
+            &db,
+            &member.candidates[0].candidate_id,
+            "acct:a",
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(
+            revalidated_guest
+                .as_ref()
+                .is_none_or(|candidate| !candidate.effective_viewable_unmuted),
+            "guest revalidation must not report a members-only message viewable"
+        );
+    }
+}
+
+#[cfg(test)]
+mod fold_extraction_tests {
+    use super::*;
+
+    /// R3.0b: create the seven projection tables' expected copies, rebuild
+    /// through the shared projectors, and require both directions of `EXCEPT`
+    /// to be empty for every table. This is the same whole-table exactness the
+    /// standby snapshot verifier uses, applied in-process.
+    async fn assert_rebuild_matches_live(db: &crate::Db) {
+        for table in REBUILD_PROJECTION_TABLES {
+            sqlx::query(&format!(
+                "CREATE TABLE _expected_{table} AS SELECT * FROM {table}"
+            ))
+            .execute(db.write_pool())
+            .await
+            .unwrap();
+        }
+        rebuild_projections(db).await.unwrap();
+        for table in REBUILD_PROJECTION_TABLES {
+            for (left, right) in [
+                (table.to_string(), format!("_expected_{table}")),
+                (format!("_expected_{table}"), table.to_string()),
+            ] {
+                let drifted: i64 = sqlx::query_scalar(&format!(
+                    "SELECT EXISTS(SELECT * FROM {left} EXCEPT SELECT * FROM {right})"
+                ))
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+                assert_eq!(drifted, 0, "rebuild drifted projection table '{table}'");
+            }
+        }
+    }
+
+    /// R3.0b: the typed readers decode every live row, and the act-range readers
+    /// select exactly the half-open `(from, to]` interval in `seq` order while
+    /// excluding legacy NULL-act rows. Every stamped row comes from a real
+    /// writer seam; the NULL rows are inserted narrow and schema-valid, exactly
+    /// as a pre-cutover row would be.
+    #[tokio::test]
+    async fn act_range_readers_are_bounded_ordered_and_exclude_legacy_null_acts() {
+        let db = crate::create_database(":memory:").await.unwrap();
+
+        // Two awareness acts.
+        for (version, stage, key) in [
+            (0, HumanStage::Presented, "p"),
+            (1, HumanStage::Opened, "o"),
+        ] {
+            let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+            let mut act_alloc = crate::act::ActAllocation::new();
+            advance_human(
+                &mut tx,
+                "acct:range",
+                "message:range",
+                stage,
+                version,
+                key,
+                &VerifiedHumanInteraction {
+                    nonce: format!("nonce-{key}"),
+                    executor_ref: "ui".into(),
+                },
+                "range",
+                &mut act_alloc,
+            )
+            .await
+            .unwrap();
+            tx.commit().await.unwrap();
+        }
+
+        // A candidate proposal and its withdrawal through the SQLite port:
+        // two more acts.
+        let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+        let mut act_alloc = crate::act::ActAllocation::new();
+        append_notification_candidate_in(
+            &mut tx,
+            "acct:range",
+            "message:range",
+            "principal_mention",
+            "routine",
+            None,
+            "metadata_only",
+            "portable_default",
+            "v1",
+            "record.updated",
+            "src:range",
+            &mut act_alloc,
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+        let mut act_alloc = crate::act::ActAllocation::new();
+        withdraw_message_candidates_in(
+            &mut tx,
+            "message:range",
+            "record.updated",
+            "src:withdraw",
+            &mut act_alloc,
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+
+        // Legacy grouping-unknown rows in both logs.
+        sqlx::query(
+            "INSERT INTO awareness_events
+               (id,idempotency_key,intent_sha256,schema_version,subject_account_id,message_id,
+                destination_id,lane,action,authenticated_actor,executor_kind,expected_version,
+                reason_code,payload,created_at,act)
+             VALUES ('legacy-awareness','legacy-aware',?,1,'acct:range','message:legacy',
+                     NULL,'preference','attention.flagged','acct:range','system',0,
+                     'legacy',?,'2026-01-01T00:00:00.000Z',NULL)",
+        )
+        .bind("0".repeat(64))
+        .bind(
+            json!({"attention_flag":true,"muted":false,"snoozed_until":null,"archived":false})
+                .to_string(),
+        )
+        .execute(db.write_pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO notification_candidate_events
+               (id,candidate_key,action,recipient_account_id,message_id,reason,priority,not_before,
+                redaction_class,evaluator_kind,policy_version,source_event_type,source_event_id,
+                payload,created_at,act)
+             VALUES ('legacy-candidate','acct:legacy:message:legacy:principal_mention:src:legacy',
+                     'withdrawn','acct:legacy','message:legacy','principal_mention','routine',NULL,
+                     'metadata_only','portable_default','v1','record.updated','src:legacy',?,
+                     '2026-01-01T00:00:00.000Z',NULL)",
+        )
+        .bind(json!({"schema":"native.notification-candidate.v1"}).to_string())
+        .execute(db.write_pool())
+        .await
+        .unwrap();
+
+        let mut conn = db.pool().acquire().await.unwrap();
+        let awareness_full = read_all_awareness_events(&mut conn).await.unwrap();
+        assert_eq!(
+            awareness_full.len(),
+            3,
+            "two live events plus one legacy row"
+        );
+        assert!(awareness_full.iter().any(|event| event.act.is_none()));
+        assert!(awareness_full.iter().any(|event| event.action == "opened"));
+
+        let awareness_acts: Vec<(i64, Option<i64>)> =
+            sqlx::query_as("SELECT seq, act FROM awareness_events ORDER BY seq")
+                .fetch_all(&mut *conn)
+                .await
+                .unwrap();
+        let (first_seq, first_act) = awareness_acts[0];
+        let (last_seq, last_act) = awareness_acts[1];
+        assert!(first_seq < last_seq);
+        let first_act = first_act.expect("stamped first awareness event");
+        let last_act = last_act.expect("stamped second awareness event");
+
+        let bounded = awareness_events_in_act_range(&mut conn, first_act, last_act)
+            .await
+            .unwrap();
+        assert_eq!(bounded.len(), 1, "the lower bound is exclusive");
+        assert_eq!(bounded[0].seq, last_seq);
+        assert_eq!(bounded[0].act, Some(last_act));
+        let all_stamped = awareness_events_in_act_range(&mut conn, 0, i64::MAX)
+            .await
+            .unwrap();
+        assert_eq!(all_stamped.len(), 2, "the NULL-act legacy row is excluded");
+        assert!(all_stamped.windows(2).all(|pair| pair[0].seq < pair[1].seq));
+
+        let candidates_full = read_all_notification_candidate_events(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(
+            candidates_full.len(),
+            3,
+            "proposal, withdrawal, and one legacy row"
+        );
+        let candidate_acts: Vec<(i64, Option<i64>)> =
+            sqlx::query_as("SELECT seq, act FROM notification_candidate_events ORDER BY seq")
+                .fetch_all(&mut *conn)
+                .await
+                .unwrap();
+        let proposal_act = candidate_acts[0].1.expect("stamped proposal");
+        let withdrawal_act = candidate_acts[1].1.expect("stamped withdrawal");
+        let bounded =
+            notification_candidate_events_in_act_range(&mut conn, proposal_act, withdrawal_act)
+                .await
+                .unwrap();
+        assert_eq!(bounded.len(), 1, "the lower bound is exclusive");
+        assert_eq!(bounded[0].action, "withdrawn");
+        assert_eq!(bounded[0].act, Some(withdrawal_act));
+        let all_stamped = notification_candidate_events_in_act_range(&mut conn, 0, i64::MAX)
+            .await
+            .unwrap();
+        assert_eq!(all_stamped.len(), 2, "the NULL-act legacy row is excluded");
+    }
+
+    /// R3.0b: every live lane and both candidate transitions fold through the
+    /// same projector the repair path uses, so a whole-log rebuild reproduces
+    /// all seven projection tables exactly, including evidence rows, version
+    /// counters, and the `last_event_seq` pointers.
+    #[tokio::test]
+    async fn live_projection_and_whole_log_rebuild_are_exact() {
+        let db = crate::create_database(":memory:").await.unwrap();
+
+        // A principal-mention candidate that the human-opened stage withdraws.
+        let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+        let mut act_alloc = crate::act::ActAllocation::new();
+        append_notification_candidate_in(
+            &mut tx,
+            "acct:x",
+            "message:x",
+            "principal_mention",
+            "routine",
+            None,
+            "metadata_only",
+            "portable_default",
+            "v1",
+            "record.created",
+            "src:x",
+            &mut act_alloc,
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+
+        // Routing creates a human-obligation candidate before the human opens.
+        let policy_context = MutationContext {
+            subject_account_id: "acct:x",
+            authenticated_actor: "acct:x",
+            executor_kind: "system",
+            executor_ref: None,
+            delegation_ref: None,
+            reason_code: "route",
+        };
+        let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+        let mut act_alloc = crate::act::ActAllocation::new();
+        set_routing(
+            &mut tx,
+            &policy_context,
+            "message:x",
+            "open",
+            "human",
+            Some("policy-v1"),
+            0,
+            "route-open",
+            &mut act_alloc,
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+
+        for (version, stage, key) in [
+            (0, HumanStage::Presented, "human-presented"),
+            (1, HumanStage::Opened, "human-opened"),
+        ] {
+            let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+            let mut act_alloc = crate::act::ActAllocation::new();
+            advance_human(
+                &mut tx,
+                "acct:x",
+                "message:x",
+                stage,
+                version,
+                key,
+                &VerifiedHumanInteraction {
+                    nonce: format!("nonce-{key}"),
+                    executor_ref: "ui".into(),
+                },
+                "exact",
+                &mut act_alloc,
+            )
+            .await
+            .unwrap();
+            tx.commit().await.unwrap();
+        }
+
+        // A flag, a snooze (which schedules a due candidate), and a clear (which
+        // withdraws it).
+        let due = (chrono::Utc::now() + chrono::Duration::hours(2)).to_rfc3339();
+        for (action, snooze, version, key) in [
+            (PreferenceAction::FlagAttention, None, 0, "pref-flag"),
+            (
+                PreferenceAction::Snooze,
+                Some(due.as_str()),
+                1,
+                "pref-snooze",
+            ),
+            (PreferenceAction::ClearSnooze, None, 2, "pref-clear"),
+        ] {
+            let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+            let mut act_alloc = crate::act::ActAllocation::new();
+            set_preference(
+                &mut tx,
+                "acct:x",
+                "message:x",
+                action,
+                snooze,
+                version,
+                key,
+                "exact",
+                &mut act_alloc,
+            )
+            .await
+            .unwrap();
+            tx.commit().await.unwrap();
+        }
+
+        // An agent disposition with exact evidence.
+        let agent_context = MutationContext {
+            subject_account_id: "acct:x",
+            authenticated_actor: "acct:x",
+            executor_kind: "agent",
+            executor_ref: Some("run"),
+            delegation_ref: Some("delegation"),
+            reason_code: "handled",
+        };
+        let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+        let mut act_alloc = crate::act::ActAllocation::new();
+        set_agent_disposition(
+            &mut tx,
+            &agent_context,
+            "message:x",
+            "resolved",
+            0,
+            "agent-resolve",
+            &[EvidenceInput {
+                record_id: "reply:x".into(),
+                role: "reply".into(),
+            }],
+            &mut act_alloc,
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+
+        // The destination lane: add then remove.
+        let destination = MutationContext {
+            subject_account_id: "acct:x",
+            authenticated_actor: "acct:x",
+            executor_kind: "system",
+            executor_ref: None,
+            delegation_ref: None,
+            reason_code: "rail",
+        };
+        for (action, version, key) in [
+            (DestinationAction::Add, 0, "dest-add"),
+            (DestinationAction::Remove, 1, "dest-remove"),
+        ] {
+            let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+            let mut act_alloc = crate::act::ActAllocation::new();
+            set_destination(
+                &mut tx,
+                &destination,
+                "collection:exact",
+                action,
+                version,
+                key,
+                &mut act_alloc,
+            )
+            .await
+            .unwrap();
+            tx.commit().await.unwrap();
+        }
+
+        // A suppressed transition: no live writer emits it, so append the event
+        // and fold it through the same projector the log would carry.
+        let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+        let mut act_alloc = crate::act::ActAllocation::new();
+        append_notification_candidate_in(
+            &mut tx,
+            "acct:y",
+            "message:y",
+            "human_obligation",
+            "routine",
+            None,
+            "metadata_only",
+            "portable_default",
+            "v1",
+            "record.created",
+            "src:y",
+            &mut act_alloc,
+        )
+        .await
+        .unwrap();
+        let act = act_alloc.get_or_allocate(&mut tx).await.unwrap();
+        let created_at = crate::store::now_iso();
+        let seq: i64 = sqlx::query_scalar(
+            "INSERT INTO notification_candidate_events
+               (id,candidate_key,action,recipient_account_id,message_id,reason,priority,not_before,
+                redaction_class,evaluator_kind,policy_version,source_event_type,source_event_id,
+                payload,created_at,act)
+             VALUES (?,?,'suppressed',?,?,?,?,?,?,?,?,?,?,?,?,?) RETURNING seq",
+        )
+        .bind("candidate-suppressed-exact")
+        .bind("acct:y:message:y:human_obligation:src:y")
+        .bind("acct:y")
+        .bind("message:y")
+        .bind("human_obligation")
+        .bind("routine")
+        .bind(Option::<String>::None)
+        .bind("metadata_only")
+        .bind("portable_default")
+        .bind("v1")
+        .bind("record.updated")
+        .bind("src:suppressed")
+        .bind(json!({"schema":"native.notification-candidate.v1"}).to_string())
+        .bind(&created_at)
+        .bind(act)
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+        let suppressed = read_all_notification_candidate_events(&mut tx)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|event| event.seq == seq)
+            .expect("the suppressed event is readable");
+        assert_eq!(suppressed.action, "suppressed");
+        project_notification_candidate_event(&mut tx, &suppressed)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        assert_rebuild_matches_live(&db).await;
+    }
+
+    /// R3.0b: an exact retry short-circuits before the projector, so it appends
+    /// no second event and advances no version counter.
+    #[tokio::test]
+    async fn idempotent_retry_does_not_double_project() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let attestation = VerifiedHumanInteraction {
+            nonce: "retry-nonce".into(),
+            executor_ref: "ui".into(),
+        };
+
+        let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+        let mut act_alloc = crate::act::ActAllocation::new();
+        advance_human(
+            &mut tx,
+            "acct:i",
+            "message:i",
+            HumanStage::Acknowledged,
+            0,
+            "human-retry",
+            &attestation,
+            "retry",
+            &mut act_alloc,
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        let before: (String, i64, i64) = sqlx::query_as(
+            "SELECT stage,version,last_event_seq FROM human_message_awareness
+              WHERE subject_account_id='acct:i' AND message_id='message:i'",
+        )
+        .fetch_one(db.write_pool())
+        .await
+        .unwrap();
+
+        let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+        let mut act_alloc = crate::act::ActAllocation::new();
+        let retry = advance_human(
+            &mut tx,
+            "acct:i",
+            "message:i",
+            HumanStage::Acknowledged,
+            0,
+            "human-retry",
+            &attestation,
+            "retry",
+            &mut act_alloc,
+        )
+        .await
+        .unwrap();
+        assert_eq!(retry["idempotent"], true);
+        tx.commit().await.unwrap();
+        let after: (String, i64, i64) = sqlx::query_as(
+            "SELECT stage,version,last_event_seq FROM human_message_awareness
+              WHERE subject_account_id='acct:i' AND message_id='message:i'",
+        )
+        .fetch_one(db.write_pool())
+        .await
+        .unwrap();
+        assert_eq!(before, after, "a retry must not re-fold the projection");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM awareness_events")
+                .fetch_one(db.write_pool())
+                .await
+                .unwrap(),
+            1
+        );
+
+        // The candidate proposal is idempotent by `candidate_key`: the retry
+        // returns the original id and writes nothing new.
+        let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+        let mut act_alloc = crate::act::ActAllocation::new();
+        let first = append_notification_candidate_in(
+            &mut tx,
+            "acct:i",
+            "message:i",
+            "principal_mention",
+            "routine",
+            None,
+            "metadata_only",
+            "portable_default",
+            "v1",
+            "record.updated",
+            "src:i",
+            &mut act_alloc,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        tx.commit().await.unwrap();
+        let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+        let mut act_alloc = crate::act::ActAllocation::new();
+        let retried = append_notification_candidate_in(
+            &mut tx,
+            "acct:i",
+            "message:i",
+            "principal_mention",
+            "routine",
+            None,
+            "metadata_only",
+            "portable_default",
+            "v1",
+            "record.updated",
+            "src:i",
+            &mut act_alloc,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(first, retried);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM notification_candidate_events")
+                .fetch_one(db.write_pool())
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM notification_candidates")
+                .fetch_one(db.write_pool())
+                .await
+                .unwrap(),
+            1
+        );
+    }
+
+    /// R3.0b: the candidate fold names `suppressed` explicitly and fails closed
+    /// on any other action rather than silently reinterpreting it.
+    #[tokio::test]
+    async fn candidate_suppressed_transition_is_explicit_and_unknown_action_fails_closed() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+        let mut act_alloc = crate::act::ActAllocation::new();
+        append_notification_candidate_in(
+            &mut tx,
+            "acct:s",
+            "message:s",
+            "human_obligation",
+            "routine",
+            None,
+            "metadata_only",
+            "portable_default",
+            "v1",
+            "record.created",
+            "src:s",
+            &mut act_alloc,
+        )
+        .await
+        .unwrap();
+        let act = act_alloc.get_or_allocate(&mut tx).await.unwrap();
+        sqlx::query(
+            "INSERT INTO notification_candidate_events
+               (id,candidate_key,action,recipient_account_id,message_id,reason,priority,not_before,
+                redaction_class,evaluator_kind,policy_version,source_event_type,source_event_id,
+                payload,created_at,act)
+             VALUES (?,?,'suppressed',?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        )
+        .bind("candidate-suppressed")
+        .bind("acct:s:message:s:human_obligation:src:s")
+        .bind("acct:s")
+        .bind("message:s")
+        .bind("human_obligation")
+        .bind("routine")
+        .bind(Option::<String>::None)
+        .bind("metadata_only")
+        .bind("portable_default")
+        .bind("v1")
+        .bind("record.updated")
+        .bind("src:suppressed")
+        .bind(json!({"schema":"native.notification-candidate.v1"}).to_string())
+        .bind(crate::store::now_iso())
+        .bind(act)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        let suppressed = read_all_notification_candidate_events(&mut tx)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|event| event.action == "suppressed")
+            .expect("the suppressed event is readable");
+        project_notification_candidate_event(&mut tx, &suppressed)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT status FROM notification_candidates WHERE candidate_key=?",
+            )
+            .bind("acct:s:message:s:human_obligation:src:s")
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap(),
+            "suppressed"
+        );
+
+        // The repair fold reaches the same suppressed state.
+        rebuild_projections(&db).await.unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT status FROM notification_candidates WHERE candidate_key=?",
+            )
+            .bind("acct:s:message:s:human_obligation:src:s")
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap(),
+            "suppressed"
+        );
+
+        let mut bogus = suppressed;
+        bogus.action = "bogus".into();
+        let mut conn = db.pool().acquire().await.unwrap();
+        let error = project_notification_candidate_event(&mut conn, &bogus)
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("unknown notification candidate action"));
+    }
+
+    /// R3.1 follow-up: the shared candidate projector fails closed when a
+    /// withdrawal or suppression has no matching proposal projection, and a
+    /// transition against an existing proposal stays a valid one-row update,
+    /// including an exact retry.
+    #[tokio::test]
+    async fn candidate_transition_without_proposal_fails_closed() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let row = |action: &str, key: &str, seq: i64| NotificationCandidateEventRow {
+            seq,
+            id: format!("event-{seq}"),
+            candidate_key: key.into(),
+            action: action.into(),
+            recipient_account_id: "acct:f".into(),
+            message_id: "message:f".into(),
+            reason: "human_obligation".into(),
+            priority: "routine".into(),
+            not_before: None,
+            redaction_class: "metadata_only".into(),
+            evaluator_kind: "portable_default".into(),
+            policy_version: "v1".into(),
+            source_event_type: "record.updated".into(),
+            source_event_id: "src:f".into(),
+            payload: json!({"schema": "native.notification-candidate.v1"}),
+            created_at: crate::store::now_iso(),
+            act: Some(1),
+        };
+
+        let mut conn = crate::db::begin_write(db.write_pool()).await.unwrap();
+        for action in ["withdrawn", "suppressed"] {
+            let error = project_notification_candidate_event(
+                &mut conn,
+                &row(action, "acct:f:message:f:human_obligation:absent", 2),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("exactly one existing proposal"),
+                "{action} without a proposal must fail closed: {error}"
+            );
+        }
+        conn.rollback().await.unwrap();
+
+        let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+        let mut act_alloc = crate::act::ActAllocation::new();
+        append_notification_candidate_in(
+            &mut tx,
+            "acct:f",
+            "message:f",
+            "human_obligation",
+            "routine",
+            None,
+            "metadata_only",
+            "portable_default",
+            "v1",
+            "record.updated",
+            "src:f",
+            &mut act_alloc,
+        )
+        .await
+        .unwrap();
+        let key: String = sqlx::query_scalar(
+            "SELECT candidate_key FROM notification_candidates WHERE recipient_account_id='acct:f'",
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+        project_notification_candidate_event(&mut tx, &row("withdrawn", &key, 99))
+            .await
+            .unwrap();
+        // An exact retry of the same transition remains a valid one-row update.
+        project_notification_candidate_event(&mut tx, &row("withdrawn", &key, 100))
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM notification_candidates WHERE candidate_key=?")
+                .bind(&key)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(status, "withdrawn");
     }
 }

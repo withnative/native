@@ -19,7 +19,7 @@ use super::lifecycle::{
 };
 use super::{
     parse_args, previous_record_seq_in, require_nonblank_reason, require_record, require_record_in,
-    PREVIOUS_SEQ_DESCRIPTION, REASON_DESCRIPTION,
+    ACT_DESCRIPTION, PREVIOUS_SEQ_DESCRIPTION, REASON_DESCRIPTION,
 };
 
 const DEFAULT_LIMIT: i64 = 200;
@@ -108,6 +108,7 @@ async fn write_observation(
     };
 
     let mut tx = crate::db::begin_write(db.write_pool()).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
     require_record_in(&mut tx, &caller, TOOL, &record_id, Capability::Edit).await?;
     let previous_seq = previous_record_seq_in(&mut tx, &record_id).await?;
     let (record_type, kind) = record_shape_context_in(&mut tx, &record_id).await?;
@@ -158,6 +159,7 @@ async fn write_observation(
             payload,
             actor: Some(caller.actor().into()),
         },
+        &mut act_alloc,
     )
     .await?;
     db.commit_content(tx).await?;
@@ -168,6 +170,7 @@ async fn write_observation(
         &as_of,
         event.local_seq,
         previous_seq,
+        act_alloc.get(),
     ))
 }
 
@@ -373,7 +376,7 @@ pub fn register_observation_tools(registry: &mut ToolRegistry) -> Result<()> {
     registry.register(
         ToolKind::ManageFacetObservations,
         &format!(
-            "Set or unset one valid-time open-facet observation without changing the record's current facet value, or list one bounded series oldest-first. Writes require RFC3339 as_of and normalize it to UTC milliseconds. List bounds are inclusive; after_as_of is an exclusive keyset cursor; limit defaults to {DEFAULT_LIMIT} and is capped at {MAX_LIMIT}. Numeric values are returned as stored strings. {PREVIOUS_SEQ_DESCRIPTION}"
+            "Set or unset one valid-time open-facet observation without changing the record's current facet value, or list one bounded series oldest-first. Writes require RFC3339 as_of and normalize it to UTC milliseconds. List bounds are inclusive; after_as_of is an exclusive keyset cursor; limit defaults to {DEFAULT_LIMIT} and is capped at {MAX_LIMIT}. Numeric values are returned as stored strings. {PREVIOUS_SEQ_DESCRIPTION} {ACT_DESCRIPTION}"
         ),
         action_schema,
         manage_facet_observations,

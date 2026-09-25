@@ -784,6 +784,39 @@ pub(crate) fn reserve_action_attestation() -> Result<ActionAttestationDraft> {
         .map_err(|_| Error::engine("trusted provenance context is unavailable"))
 }
 
+/// Reserve an action identity that carries no idempotency-key digest.
+///
+/// Composite batch handlers issue one attestation per changed item plus one
+/// output-less batch anchor carrying the key digest (see
+/// [`issue_empty_command_attestation_in`]): sharing the dispatch's key digest
+/// across per-item rows would collide on the UNIQUE
+/// `(principal, operation, command_identity_digest)` authority index. The
+/// operation and every other fact stay the dispatch's own.
+pub(crate) fn reserve_unkeyed_action_attestation() -> Result<ActionAttestationDraft> {
+    reserve_detached_action_attestation(None)
+}
+
+/// Reserve an action identity with an explicit command-identity digest.
+///
+/// `batch_write` binds each changed item's attestation to its own digest so
+/// an identical retry can locate every item's outputs; the batch anchor
+/// (plain key digest, no outputs) is what the key lookup finds first. Both
+/// live under the UNIQUE authority index, so same-key concurrent commits
+/// fail on the anchor rather than doubling the effect.
+pub(crate) fn reserve_detached_action_attestation(
+    command_identity_digest: Option<String>,
+) -> Result<ActionAttestationDraft> {
+    TRUSTED_PROVENANCE
+        .try_with(|dispatch| ActionAttestationDraft {
+            id: Uuid::new_v4().to_string(),
+            facts: Arc::new(DispatchFacts {
+                command_identity_digest,
+                ..(*dispatch.facts).clone()
+            }),
+        })
+        .map_err(|_| Error::engine("trusted provenance context is unavailable"))
+}
+
 /// The executor identity that will be written into the accepted action's
 /// attestation. Aggregate handlers use this instead of event.actor or the
 /// authenticated routing principal when executor identity is semantic state.
@@ -826,6 +859,121 @@ pub(crate) async fn issue_action_attestation_in(
         .map(|event| ActionOutput::content(event.id.clone()))
         .collect::<Vec<_>>();
     issue_action_attestation_outputs_in(tx, draft, &outputs).await
+}
+
+/// Persist an output-less command attestation for an idempotency key.
+///
+/// Composite batch handlers issue one attestation per changed item, but
+/// unchanged items leave no row: a later call with the same key and fewer
+/// (or zero) changed items would then miss every per-item lookup and commit
+/// a second effect under one key. The anchor row — same dispatch facts
+/// (operation, whole-request digests, key digest), empty output set — closes
+/// that hole: every keyed batch leaves exactly one row the key lookup finds,
+/// including all-unchanged batches. Replays rebuild per-item results from
+/// the per-item rows, where absent rows read as unchanged.
+pub(crate) async fn issue_empty_command_attestation_in(
+    tx: &mut Transaction<'static, Sqlite>,
+) -> Result<String> {
+    let draft = reserve_action_attestation()?;
+    upsert_interaction_receipt_in(tx, &draft).await?;
+    let issued_at = crate::store::now_iso();
+    let issuer_origin_database_id: String =
+        sqlx::query_scalar("SELECT origin_db_id FROM database_identity WHERE singleton=1")
+            .fetch_one(&mut **tx)
+            .await?;
+    sqlx::query(
+        "INSERT INTO provenance_action_attestations
+            (id,schema_version,principal,executor_kind,channel,executor_ref,delegation_ref,
+             interaction_receipt_id,operation,action_commitment,action_digest,output_event_set_digest,
+             issuer,issuer_origin_database_id,issued_at,command_identity_digest,intent_digest)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+    )
+    .bind(&draft.id)
+    .bind(ACTION_ATTESTATION_SCHEMA_VERSION)
+    .bind(&draft.facts.principal)
+    .bind(&draft.facts.executor_kind)
+    .bind(draft.facts.channel.as_str())
+    .bind(&draft.facts.executor_ref)
+    .bind(&draft.facts.delegation_ref)
+    .bind(
+        draft
+            .facts
+            .interaction
+            .as_ref()
+            .map(|receipt| &receipt.receipt_id),
+    )
+    .bind(&draft.facts.operation)
+    .bind(&draft.facts.action_commitment)
+    .bind(&draft.facts.action_digest)
+    .bind(ordered_output_set_digest(&[]))
+    .bind(ISSUER)
+    .bind(&issuer_origin_database_id)
+    .bind(&issued_at)
+    .bind(&draft.facts.command_identity_digest)
+    .bind(&draft.facts.intent_digest)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        "INSERT INTO provenance_local_attestation_authority
+            (attestation_id,issuer_origin_database_id,principal,operation,
+             command_identity_digest,anchored_at) VALUES (?,?,?,?,?,?)",
+    )
+    .bind(&draft.id)
+    .bind(&issuer_origin_database_id)
+    .bind(&draft.facts.principal)
+    .bind(&draft.facts.operation)
+    .bind(&draft.facts.command_identity_digest)
+    .bind(&issued_at)
+    .execute(&mut **tx)
+    .await?;
+    note_pending_attestation(draft.id.clone());
+    Ok(draft.id)
+}
+
+async fn upsert_interaction_receipt_in(
+    tx: &mut Transaction<'static, Sqlite>,
+    draft: &ActionAttestationDraft,
+) -> Result<()> {
+    let Some(receipt) = &draft.facts.interaction else {
+        return Ok(());
+    };
+    sqlx::query(
+        "INSERT INTO provenance_interaction_receipts
+            (id,schema_version,principal,scope_digest,nonce,verifier,verified_at,
+             evidence_digest,sealed_evidence_ref,retention_class)
+         VALUES (?,?,?,?,?,?,?,?,?,?)
+         ON CONFLICT(id) DO NOTHING",
+    )
+    .bind(&receipt.receipt_id)
+    .bind(INTERACTION_RECEIPT_SCHEMA_VERSION)
+    .bind(&receipt.principal)
+    .bind(&receipt.scope_digest)
+    .bind(&receipt.nonce)
+    .bind(&receipt.verifier)
+    .bind(&receipt.verified_at)
+    .bind(&receipt.evidence_digest)
+    .bind(&receipt.sealed_evidence_ref)
+    .bind(&receipt.retention_class)
+    .execute(&mut **tx)
+    .await?;
+    let stored = sqlx::query(
+        "SELECT principal,scope_digest,nonce,verifier,evidence_digest
+           FROM provenance_interaction_receipts WHERE id=?",
+    )
+    .bind(&receipt.receipt_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    let exact = stored.try_get::<String, _>("principal")? == receipt.principal
+        && stored.try_get::<String, _>("scope_digest")? == receipt.scope_digest
+        && stored.try_get::<String, _>("nonce")? == receipt.nonce
+        && stored.try_get::<String, _>("verifier")? == receipt.verifier
+        && stored.try_get::<String, _>("evidence_digest")? == receipt.evidence_digest;
+    if !exact {
+        return Err(Error::engine(
+            "verified interaction receipt identity was reused with conflicting facts",
+        ));
+    }
+    Ok(())
 }
 
 /// Persist a schema-v2 action attestation over one exact ordered, domain-qualified
@@ -902,43 +1050,8 @@ pub(crate) async fn issue_action_attestation_outputs_in(
         }
     }
 
-    if let Some(receipt) = &draft.facts.interaction {
-        sqlx::query(
-            "INSERT INTO provenance_interaction_receipts
-                (id,schema_version,principal,scope_digest,nonce,verifier,verified_at,
-                 evidence_digest,sealed_evidence_ref,retention_class)
-             VALUES (?,?,?,?,?,?,?,?,?,?)
-             ON CONFLICT(id) DO NOTHING",
-        )
-        .bind(&receipt.receipt_id)
-        .bind(INTERACTION_RECEIPT_SCHEMA_VERSION)
-        .bind(&receipt.principal)
-        .bind(&receipt.scope_digest)
-        .bind(&receipt.nonce)
-        .bind(&receipt.verifier)
-        .bind(&receipt.verified_at)
-        .bind(&receipt.evidence_digest)
-        .bind(&receipt.sealed_evidence_ref)
-        .bind(&receipt.retention_class)
-        .execute(&mut **tx)
-        .await?;
-        let stored = sqlx::query(
-            "SELECT principal,scope_digest,nonce,verifier,evidence_digest
-               FROM provenance_interaction_receipts WHERE id=?",
-        )
-        .bind(&receipt.receipt_id)
-        .fetch_one(&mut **tx)
-        .await?;
-        let exact = stored.try_get::<String, _>("principal")? == receipt.principal
-            && stored.try_get::<String, _>("scope_digest")? == receipt.scope_digest
-            && stored.try_get::<String, _>("nonce")? == receipt.nonce
-            && stored.try_get::<String, _>("verifier")? == receipt.verifier
-            && stored.try_get::<String, _>("evidence_digest")? == receipt.evidence_digest;
-        if !exact {
-            return Err(Error::engine(
-                "verified interaction receipt identity was reused with conflicting facts",
-            ));
-        }
+    if draft.facts.interaction.is_some() {
+        upsert_interaction_receipt_in(tx, &draft).await?;
     }
 
     let issued_at = crate::store::now_iso();
@@ -1297,6 +1410,7 @@ impl ValidityChange {
 #[allow(dead_code)]
 pub(crate) async fn append_validity_event_in(
     tx: &mut Transaction<'static, Sqlite>,
+    act_alloc: &mut crate::act::ActAllocation,
     attestation_id: &str,
     change: ValidityChange,
     reason: &str,
@@ -1307,6 +1421,7 @@ pub(crate) async fn append_validity_event_in(
             "provenance validity change requires reason and issuer",
         ));
     }
+    let act = act_alloc.get_or_allocate(tx).await?;
     let id = Uuid::new_v4().to_string();
     let ordinal: i64 = sqlx::query_scalar(
         "SELECT COALESCE(MAX(ordinal), -1) + 1
@@ -1317,7 +1432,8 @@ pub(crate) async fn append_validity_event_in(
     .await?;
     sqlx::query(
         "INSERT INTO provenance_attestation_validity_events
-            (id,attestation_id,ordinal,status,reason,issuer,issued_at) VALUES (?,?,?,?,?,?,?)",
+            (id,attestation_id,ordinal,status,reason,issuer,issued_at,act)
+         VALUES (?,?,?,?,?,?,?,?)",
     )
     .bind(&id)
     .bind(attestation_id)
@@ -1326,6 +1442,7 @@ pub(crate) async fn append_validity_event_in(
     .bind(reason)
     .bind(issuer)
     .bind(crate::store::now_iso())
+    .bind(act)
     .execute(&mut **tx)
     .await?;
     crate::relationship::refresh_receiver_local_admissions_for_attestation_in(tx, attestation_id)
@@ -2078,6 +2195,7 @@ mod tests {
                 causal_envelope: crate::events::CausalEnvelopeV1::complete(
                     crate::events::CausalFrontierV1::empty(),
                 ),
+                act: None,
             }
         }
         assert_ne!(
@@ -2325,6 +2443,7 @@ mod tests {
         dispatch
             .scope(async {
                 let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+                let mut act_alloc = crate::act::ActAllocation::new();
                 let content_output = crate::store::append_in(
                     &db,
                     &mut tx,
@@ -2332,6 +2451,7 @@ mod tests {
                         "b40ce000-0000-4000-8000-000000000007",
                         "relationship action",
                     ),
+                    &mut act_alloc,
                 )
                 .await
                 .unwrap();
@@ -2380,9 +2500,13 @@ mod tests {
                     assertion,
                 )
                 .unwrap();
-                crate::relationship::create_relationship_with_assertion_in(&mut tx, &command)
-                    .await
-                    .unwrap();
+                crate::relationship::create_relationship_with_assertion_in(
+                    &mut tx,
+                    &command,
+                    &mut act_alloc,
+                )
+                .await
+                .unwrap();
                 let outputs = [
                     ActionOutput::content(content_output.id),
                     ActionOutput::relationship(command.relationship_event.event_id.clone()),
@@ -2451,6 +2575,7 @@ mod tests {
                 .unwrap());
                 append_validity_event_in(
                     &mut tx,
+                    &mut act_alloc,
                     origin_admission.authoring_action_attestation_id(),
                     ValidityChange::Invalidated,
                     "test invalidation",
@@ -2620,10 +2745,12 @@ mod tests {
         dispatch
             .scope(async {
                 let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+                let mut act_alloc = crate::act::ActAllocation::new();
                 let event = crate::store::append_in(
                     &db,
                     &mut tx,
                     create_spec("b40ce000-0000-4000-8000-000000000021", "rollback"),
+                    &mut act_alloc,
                 )
                 .await
                 .unwrap();
@@ -2664,10 +2791,12 @@ mod tests {
         dispatch
             .scope(async {
                 let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+                let mut act_alloc = crate::act::ActAllocation::new();
                 let event = crate::store::append_in(
                     &db,
                     &mut tx,
                     create_spec("b40ce000-0000-4000-8000-000000000017", "invalid outputs"),
+                    &mut act_alloc,
                 )
                 .await
                 .unwrap();
@@ -2980,9 +3109,12 @@ mod tests {
             .await
             .unwrap();
         let attestation_id = dispatch.receipt_ids().pop().unwrap();
-        let mut validity_tx = db.write_pool().begin().await.unwrap();
+        let mut validity_tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+        let before_act = crate::act::current_act(&mut validity_tx).await.unwrap();
+        let mut act_alloc = crate::act::ActAllocation::new();
         append_validity_event_in(
             &mut validity_tx,
+            &mut act_alloc,
             &attestation_id,
             ValidityChange::Invalidated,
             "test invalidation",
@@ -2992,6 +3124,7 @@ mod tests {
         .unwrap();
         append_validity_event_in(
             &mut validity_tx,
+            &mut act_alloc,
             &attestation_id,
             ValidityChange::Restored,
             "test restoration",
@@ -3000,6 +3133,15 @@ mod tests {
         .await
         .unwrap();
         validity_tx.commit().await.unwrap();
+        let acts: Vec<i64> = sqlx::query_scalar(
+            "SELECT act FROM provenance_attestation_validity_events
+             WHERE attestation_id=? ORDER BY ordinal",
+        )
+        .bind(&attestation_id)
+        .fetch_all(db.write_pool())
+        .await
+        .unwrap();
+        assert_eq!(acts, vec![before_act + 1, before_act + 1]);
 
         let foreign_event = crate::store::append(
             &db,

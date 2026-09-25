@@ -35,6 +35,22 @@ pub enum Error {
     /// stale write (HTTP 409) without parsing the human-readable message.
     #[error("{0}")]
     Conflict(String),
+    /// A read could not be served because this replica does not hold what was
+    /// asked for — "not held here", which is a different fact from "absent"
+    /// (`docs/honest-absence-contract.md`).
+    ///
+    /// Its own variant for the same reason `Conflict` is: a caller must be
+    /// able to classify it without parsing a human-readable message. That is
+    /// the whole contract. An agent that cannot tell this from "does not
+    /// exist" writes the duplicate record, and a client that normalises the
+    /// two before the agent sees them reintroduces the failure on the
+    /// agent's behalf.
+    ///
+    /// Unlike every other error here, it is **not** retryable where it was
+    /// raised: the answer exists at the authority, and this replica will
+    /// return the same thing forever.
+    #[error("{0}")]
+    NotHeld(String),
     /// Authentication failure (OTP / session) — the TS `AuthError`.
     #[error("{0}")]
     Auth(String),
@@ -59,6 +75,10 @@ pub enum Error {
 impl Error {
     pub fn engine(message: impl Into<String>) -> Self {
         Error::Engine(message.into())
+    }
+
+    pub fn not_held(message: impl Into<String>) -> Self {
+        Error::NotHeld(message.into())
     }
 
     pub fn auth(message: impl Into<String>) -> Self {

@@ -45,11 +45,29 @@ const TRUSTED_SNIPPET_CHARS: usize = 2_048;
 const TRUSTED_CANDIDATE_BYTES: usize = 4 * 1024 * 1024;
 
 /// The Layer-1 near-miss bound (stage-5 call, `8e9f9d3`): tool 17 runs the
-/// near-miss mechanisms only when strict FTS returns fewer hits than this.
-/// Five is the seam between "results to work with" and "reformulation
-/// territory" — below it the payload prompts reformulation and pays for the
-/// extra scans; at or above it strict results stand alone.
+/// near-miss mechanisms only when strict FTS returns fewer hits than this
+/// *and the caller did not cap the page itself*. Five is the seam between
+/// "results to work with" and "reformulation territory" — below it the
+/// payload prompts reformulation and pays for the extra scans; at or above
+/// it strict results stand alone.
+///
+/// The cap exclusion matters because a caller asking for three and getting
+/// three has truncated a set of unknown size, not discovered a small one.
+/// Both call sites read it that way; see `thin` in `mcp::tools::querying`
+/// and `domain_transaction::search`.
 pub const THIN_RESULTS_THRESHOLD: usize = 5;
+
+/// What a limit-capped `search` says instead of nothing (`3c4b03a`). The thin
+/// branch has always named `query_record`; the capped branch — the one where
+/// the caller is at real risk of a false negative, because a full page hides
+/// what was cut — said nothing at all, so the pointer fired exactly when it
+/// was not needed.
+///
+/// It does not restate the cap. The renderer already prints "effective limit
+/// N reached; more matches may exist" above this line, and the payload carries
+/// `limit` and `limit_reached` for a caller reading JSON, so repeating it here
+/// would spend tokens on the surface this change exists to make cheaper.
+pub const CAPPED_RESULTS_GUIDANCE: &str = "This list may be incomplete. Use query_record with a filter step (types, kinds, ancestor_id, lifecycle) for a narrow, exhaustive answer.";
 
 /// Row cap per near-miss mechanism (the other half of the bound). Near-misses
 /// are prompts for reformulation, not results — a page of them buries the
@@ -148,6 +166,10 @@ fn set_filter(column: &str, values: &[String]) -> Result<(String, String)> {
 struct SearchPrincipal<'a> {
     credential: &'a str,
     trusted_local_bypass: bool,
+    /// Live catalog membership footing. Guests resolve without the
+    /// `native:members` baseline. Required (rather than defaulted) so a
+    /// construction that forgets the footing fails to compile.
+    is_member: bool,
 }
 
 async fn run_match(
@@ -204,6 +226,7 @@ async fn run_match(
         .bind(match_expr)
         .bind(principal.trusted_local_bypass)
         .bind(principal.credential)
+        .bind(principal.is_member)
         .bind(principal.credential);
     if let Some(bind) = &scope_bind {
         query = query.bind(bind);
@@ -254,6 +277,7 @@ async fn run_match(
         db,
         principal.credential,
         principal.trusted_local_bypass,
+        principal.is_member,
         &mut hits,
     )
     .await?;
@@ -271,9 +295,15 @@ async fn run_match(
 /// their own owner/policy anchor. Every Annotation and Document:attachment
 /// instead walks exactly-one live `part_of` edges to its first ordinary bearer;
 /// malformed, bearerless, multi-bearer, tombstoned, cyclic, and over-depth
-/// chains fail closed. The first placeholder selects the unforgeable trusted
-/// local policy bypass; the remaining two bind the same transport-authenticated
-/// portable credential against that resolved authorization subject.
+/// chains fail closed. The predicate takes **four** binds, in order: the
+/// unforgeable trusted-local policy bypass (`1` bypasses the policy check
+/// entirely), the transport-authenticated portable credential matched against
+/// the resolved authorization subject's owner account binding, the folded
+/// member-footing flag (owners/members resolve the `native:members` baseline;
+/// guests pass `0` and match only their own account entry), and the same
+/// portable credential again for that account-entry branch. Every caller must
+/// supply all four, so a new `view_predicate` caller that binds only the
+/// credential resolves member-footed rather than guest-footed.
 pub(crate) fn view_predicate(alias: &str) -> String {
     let max_depth = crate::authorization::MAX_DERIVED_BEARER_DEPTH;
     format!(
@@ -325,13 +355,14 @@ pub(crate) fn view_predicate(alias: &str) -> String {
                      AND owner_account.identifier = ?
                      AND owner_account.is_canonical = 1
                  )
-                OR EXISTS (
+                 OR EXISTS (
                    SELECT 1 FROM policy_entries entry
                    WHERE entry.policy_anchor_id = authorization_subject.policy_anchor_id
                      AND entry.effect = 'allow'
                      AND entry.capability IN ('view','edit','manage')
                      AND ((entry.subject_kind = 'members'
-                           AND entry.subject_id = 'native:members')
+                           AND entry.subject_id = 'native:members'
+                           AND ? <> 0)
                           OR (entry.subject_kind = 'account'
                               AND entry.subject_id = ?))
                  )))
@@ -346,6 +377,7 @@ pub(crate) async fn independently_visible_ids(
     db: &Db,
     credential: &str,
     trusted_local_bypass: bool,
+    is_member: bool,
     ids: &[String],
 ) -> Result<HashSet<String>> {
     let unique: HashSet<&str> = ids.iter().map(String::as_str).collect();
@@ -368,6 +400,7 @@ pub(crate) async fn independently_visible_ids(
         query = query
             .bind(trusted_local_bypass)
             .bind(credential)
+            .bind(is_member)
             .bind(credential);
         visible.extend(query.fetch_all(db.write_pool()).await?);
     }
@@ -378,6 +411,7 @@ async fn redact_parent_ids(
     db: &Db,
     credential: &str,
     trusted_local_bypass: bool,
+    is_member: bool,
     hits: &mut [SearchHit],
 ) -> Result<()> {
     let parent_ids: Vec<String> = hits
@@ -385,7 +419,8 @@ async fn redact_parent_ids(
         .filter_map(|hit| hit.raw_home_id.clone())
         .collect();
     let visible =
-        independently_visible_ids(db, credential, trusted_local_bypass, &parent_ids).await?;
+        independently_visible_ids(db, credential, trusted_local_bypass, is_member, &parent_ids)
+            .await?;
     for hit in hits {
         hit.home_id = hit
             .raw_home_id
@@ -419,10 +454,11 @@ pub(crate) fn visibility_safe_score(name: &str, body: Option<&str>, terms: &[Str
 pub async fn search(
     db: &Db,
     credential: &str,
+    is_member: bool,
     input: &str,
     opts: &FtsOptions,
 ) -> Result<Vec<SearchHit>> {
-    search_with_policy_bypass(db, credential, false, input, opts).await
+    search_with_policy_bypass(db, credential, false, is_member, input, opts).await
 }
 
 /// Tool-facing search variant. Trusted local callers bypass policy grants but
@@ -431,6 +467,7 @@ pub(crate) async fn search_with_policy_bypass(
     db: &Db,
     credential: &str,
     trusted_local_bypass: bool,
+    is_member: bool,
     input: &str,
     opts: &FtsOptions,
 ) -> Result<Vec<SearchHit>> {
@@ -453,6 +490,7 @@ pub(crate) async fn search_with_policy_bypass(
         SearchPrincipal {
             credential,
             trusted_local_bypass,
+            is_member,
         },
         &index_sql,
         &match_expr,
@@ -469,16 +507,18 @@ pub(crate) async fn search_with_policy_bypass(
 pub async fn search_pool_count(
     db: &Db,
     credential: &str,
+    is_member: bool,
     input: &str,
     opts: &FtsOptions,
 ) -> Result<i64> {
-    search_pool_count_with_policy_bypass(db, credential, false, input, opts).await
+    search_pool_count_with_policy_bypass(db, credential, false, is_member, input, opts).await
 }
 
 pub(crate) async fn search_pool_count_with_policy_bypass(
     db: &Db,
     credential: &str,
     trusted_local_bypass: bool,
+    is_member: bool,
     input: &str,
     opts: &FtsOptions,
 ) -> Result<i64> {
@@ -530,6 +570,7 @@ pub(crate) async fn search_pool_count_with_policy_bypass(
         .bind(&match_expr)
         .bind(trusted_local_bypass)
         .bind(credential)
+        .bind(is_member)
         .bind(credential);
     if let Some(bind) = &scope_bind {
         query = query.bind(bind);
@@ -546,16 +587,18 @@ pub(crate) async fn search_pool_count_with_policy_bypass(
 pub async fn name_prefix(
     db: &Db,
     credential: &str,
+    is_member: bool,
     input: &str,
     opts: &FtsOptions,
 ) -> Result<Vec<SearchHit>> {
-    name_prefix_with_policy_bypass(db, credential, false, input, opts).await
+    name_prefix_with_policy_bypass(db, credential, false, is_member, input, opts).await
 }
 
 pub(crate) async fn name_prefix_with_policy_bypass(
     db: &Db,
     credential: &str,
     trusted_local_bypass: bool,
+    is_member: bool,
     input: &str,
     opts: &FtsOptions,
 ) -> Result<Vec<SearchHit>> {
@@ -577,6 +620,7 @@ pub(crate) async fn name_prefix_with_policy_bypass(
         SearchPrincipal {
             credential,
             trusted_local_bypass,
+            is_member,
         },
         &index_sql,
         &match_expr,
@@ -605,16 +649,18 @@ pub(crate) async fn name_prefix_with_policy_bypass(
 pub async fn name_infix(
     db: &Db,
     credential: &str,
+    is_member: bool,
     input: &str,
     opts: &FtsOptions,
 ) -> Result<Vec<SearchHit>> {
-    name_infix_with_policy_bypass(db, credential, false, input, opts).await
+    name_infix_with_policy_bypass(db, credential, false, is_member, input, opts).await
 }
 
 pub(crate) async fn name_infix_with_policy_bypass(
     db: &Db,
     credential: &str,
     trusted_local_bypass: bool,
+    is_member: bool,
     input: &str,
     opts: &FtsOptions,
 ) -> Result<Vec<SearchHit>> {
@@ -634,21 +680,21 @@ pub(crate) async fn name_infix_with_policy_bypass(
     } else {
         format!("AND {NOT_ARCHIVED}")
     };
-    let scope_filter = match &scope_ids {
+    let (scope_filter, scope_bind) = match &scope_ids {
         Some(ids) => {
             if ids.is_empty() {
                 return Ok(Vec::new());
             }
-            let placeholders = vec!["?"; ids.len()].join(", ");
-            format!("AND r.id IN ({placeholders})")
+            let (filter, bind) = set_filter("r.id", ids)?;
+            (filter, Some(bind))
         }
-        None => String::new(),
+        None => (String::new(), None),
     };
-    let type_filter = if opts.types.is_empty() {
-        String::new()
+    let (type_filter, type_bind) = if opts.types.is_empty() {
+        (String::new(), None)
     } else {
-        let placeholders = vec!["?"; opts.types.len()].join(", ");
-        format!("AND r.type IN ({placeholders})")
+        let (filter, bind) = set_filter("r.type", &opts.types)?;
+        (filter, Some(bind))
     };
     let predicates = vec!["r.name LIKE ? ESCAPE '\\'"; tokens.len()].join(" AND ");
     let not_hidden = super::not_hidden_predicate("r");
@@ -680,14 +726,13 @@ pub(crate) async fn name_infix_with_policy_bypass(
     query = query
         .bind(trusted_local_bypass)
         .bind(credential)
+        .bind(is_member)
         .bind(credential);
-    if let Some(ids) = &scope_ids {
-        for id in ids {
-            query = query.bind(id);
-        }
+    if let Some(bind) = scope_bind {
+        query = query.bind(bind);
     }
-    for t in &opts.types {
-        query = query.bind(t);
+    if let Some(bind) = type_bind {
+        query = query.bind(bind);
     }
     let rows = query.bind(limit).fetch_all(db.write_pool()).await?;
     let mut hits = rows
@@ -706,6 +751,6 @@ pub(crate) async fn name_infix_with_policy_bypass(
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    redact_parent_ids(db, credential, trusted_local_bypass, &mut hits).await?;
+    redact_parent_ids(db, credential, trusted_local_bypass, is_member, &mut hits).await?;
     Ok(hits)
 }

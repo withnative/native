@@ -16,6 +16,13 @@ use crate::mcp::registry::Caller;
 use crate::store::EventAnnotations;
 use crate::{Error, Result};
 
+/// The caveat that explains a relative follow link. It is rendered with the
+/// link or not at all: a deployment note about a link nobody was shown is
+/// noise, and a reader cannot act on it. Shared as a constant so the
+/// renderer's suppression and this producer cannot drift apart by a typo.
+pub const RELATIVE_FOLLOW_LINK_NOTE: &str =
+    "No public origin is configured; the follow link is relative to this Native CE deployment.";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GovernedRequestOperation {
     Authorization,
@@ -166,11 +173,15 @@ pub(crate) trait RequestLifecyclePort: Sync {
     /// Persist a successful intent declaration for one already-validated full
     /// run key. This is separate from the optional interaction tap: adapters
     /// may qualify run context without claiming interaction capture.
+    /// `reported` is the admitting call's self-asserted client identity,
+    /// stamped once at run admission; adapters without an `agent_runs`
+    /// projection ignore it.
     fn persist_intent<'a>(
         &'a self,
         run_key: &'a str,
         intent: &'a str,
         authenticated_account: &'a str,
+        reported: crate::control::ReportedRunIdentity,
     ) -> BoxFuture<'a, Result<()>>;
 
     fn displaced_key_note<'a>(&'a self, caller: &'a Caller) -> BoxFuture<'a, Option<String>>;
@@ -434,6 +445,14 @@ fn run_context_echo(
     if let Some(parent) = caller.parent_key() {
         context.insert(PARENT_KEY_ARG.into(), Value::String(parent.into()));
     }
+    // The `"new"` sentinel mints a key on whatever ordinary tool the caller
+    // happened to reach for — that is the point of it, per `crate::runkey`.
+    // Such a call establishes run context as surely as bootstrap does, so it
+    // is recorded here as a fact about this call rather than inferred later
+    // from the tool name.
+    if matches!(run_key, crate::runkey::KeyOutcome::Minted(_)) {
+        context.insert("established".into(), Value::Bool(true));
+    }
     let mut notes: Vec<String> = Vec::new();
     if let Some(key) = caller.run_key() {
         let path = format!("/workbench/runs/{key}");
@@ -443,10 +462,7 @@ fn run_context_echo(
         context.insert("follow_path".into(), Value::String(path));
         context.insert("follow_url".into(), Value::String(follow_url));
         if public_origin.is_none() {
-            notes.push(
-                "No public origin is configured; the follow link is relative to this Native CE deployment."
-                    .into(),
-            );
+            notes.push(RELATIVE_FOLLOW_LINK_NOTE.into());
         }
     }
     if caller.run_key().is_none() {
@@ -653,8 +669,19 @@ where
     if kind == Some(ToolKind::SetIntent) && outcome.is_ok() {
         if let Some(intent) = original_arguments.get("intent").and_then(Value::as_str) {
             if let Some(run_key) = declaration_run_key.as_deref() {
+                // The self-declared model rides the same declaration: the
+                // handler already type-checked it (any string stands as given;
+                // only the type is enforced), so `as_str` here only maps an
+                // explicit null or a non-string that could never have passed
+                // the handler to absence.
+                let reported = capture_caller.reported_run_identity().with_model(
+                    original_arguments
+                        .get("model")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                );
                 if let Err(error) = port
-                    .persist_intent(run_key, intent, capture_caller.credential())
+                    .persist_intent(run_key, intent, capture_caller.credential(), reported)
                     .await
                 {
                     outcome = Err(error);
@@ -920,6 +947,7 @@ mod tests {
                         let release = Arc::clone(&release);
                         async move {
                             let mut transaction = crate::db::begin_write(db.write_pool()).await?;
+                            let mut act_alloc = crate::act::ActAllocation::new();
                             crate::store::append_in(
                                 &db,
                                 &mut transaction,
@@ -933,6 +961,7 @@ mod tests {
                                     }),
                                     actor: Some("test".into()),
                                 },
+                                &mut act_alloc,
                             )
                             .await?;
                             db.commit_content(transaction).await?;
@@ -953,6 +982,7 @@ mod tests {
                 json!({"type":"object","properties":{}}),
                 |db, _caller, _arguments| async move {
                     let mut transaction = crate::db::begin_write(db.write_pool()).await?;
+                    let mut act_alloc = crate::act::ActAllocation::new();
                     crate::store::append_in(
                         &db,
                         &mut transaction,
@@ -966,6 +996,7 @@ mod tests {
                             }),
                             actor: Some("test".into()),
                         },
+                        &mut act_alloc,
                     )
                     .await?;
                     transaction.rollback().await?;

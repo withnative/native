@@ -70,7 +70,7 @@ pub(crate) struct RenderOutcome {
 /// resolution, the advertised schema and the dispatch cannot disagree — a
 /// renderer that exists but is never reached is exactly the drift this file is
 /// most likely to grow.
-const RENDERED_TOOLS: [&str; 70] = [
+const RENDERED_TOOLS: [&str; 77] = [
     "bootstrap",
     "quickstart",
     "get_structure",
@@ -79,6 +79,7 @@ const RENDERED_TOOLS: [&str; 70] = [
     "read_guide",
     "create_record",
     "create_many",
+    "batch_write",
     "get_record",
     "resolve_many",
     "update_record",
@@ -103,7 +104,10 @@ const RENDERED_TOOLS: [&str; 70] = [
     "manage_renderer_binding",
     "manage_mdx_modules",
     "manage_artifact_inputs",
+    "advance_artifact_port_pin",
     "manage_artifact_module_grants",
+    "manage_surface_bindings",
+    "manage_alpha_tabs",
     "render_artifact",
     "verify_artifact",
     "invoke_artifact_interaction",
@@ -116,6 +120,7 @@ const RENDERED_TOOLS: [&str; 70] = [
     "search",
     "query_sql",
     "scan",
+    "get_workspace_snapshot",
     "manage_vocabularies",
     "manage_schema_config",
     "attach_text",
@@ -141,6 +146,8 @@ const RENDERED_TOOLS: [&str; 70] = [
     "preview_record_shape",
     "read_canvas",
     "manage_canvas",
+    "save_account",
+    "get_reuse_context",
 ];
 
 /// The public response-control schema shared by every caller-selectable MCP
@@ -301,8 +308,11 @@ pub(crate) fn render_outcome(tool: &str, value: &Value) -> Option<RenderOutcome>
         "preview_record_shape" => Some(render_record_shape_preview(value)),
         "read_canvas" => Some(render_read_canvas(value)),
         "manage_canvas" => Some(render_manage_canvas(value)),
+        "save_account" => Some(render_management_result("Saved account", value)),
+        "get_reuse_context" => Some(render_management_result("Reuse context", value)),
         "create_record" => Some(render_enriched_write("Created", value)),
         "create_many" => Some(render_create_many(value)),
+        "batch_write" => Some(render_batch_write(value)),
         "get_record" => Some(render_get_record(value, true)),
         "resolve_many" => Some(render_resolve_many(value)),
         "update_record" => Some(render_update_record(value)),
@@ -329,8 +339,19 @@ pub(crate) fn render_outcome(tool: &str, value: &Value) -> Option<RenderOutcome>
         "manage_artifact_inputs" => {
             Some(render_management_result("Artifact input management", value))
         }
+        "advance_artifact_port_pin" => {
+            Some(render_management_result("Artifact port pin advance", value))
+        }
         "manage_artifact_module_grants" => Some(render_management_result(
             "Artifact capability grant management",
+            value,
+        )),
+        "manage_surface_bindings" => Some(render_management_result(
+            "Surface binding management",
+            value,
+        )),
+        "manage_alpha_tabs" => Some(render_management_result(
+            "Alpha tab install management",
             value,
         )),
         "render_artifact" => Some(artifacts::render_artifact(value)),
@@ -345,6 +366,7 @@ pub(crate) fn render_outcome(tool: &str, value: &Value) -> Option<RenderOutcome>
         "search" => Some(render_search(value)),
         "query_sql" => Some(render_query_sql(value)),
         "scan" => Some(render_scan(value)),
+        "get_workspace_snapshot" => Some(render_workspace_snapshot(value)),
         "manage_vocabularies" => Some(render_manage_vocabularies(value)),
         "manage_schema_config" => Some(render_manage_schema_config(value)),
         "attach_text" | "attach_from_url" => Some(render_attachment_created(value)),
@@ -374,7 +396,7 @@ pub(crate) fn render_outcome(tool: &str, value: &Value) -> Option<RenderOutcome>
         }
     }
     if let Some(context) = value.get("run_context") {
-        rendered.push_str(&render_run_context(context));
+        rendered.push_str(&render_run_context_for(tool, context));
     }
     let requires_structured_fallback = renderer_family_requires_structured_fallback(tool);
     Some(RenderOutcome {
@@ -499,6 +521,7 @@ fn renderer_family_requires_structured_fallback(tool: &str) -> bool {
             | "query_change_summaries"
             | "preview_record_shape"
             | "read_canvas"
+            | "get_reuse_context"
             | "create_record"
             | "update_record"
             | "instantiate_artifact"
@@ -507,6 +530,7 @@ fn renderer_family_requires_structured_fallback(tool: &str) -> bool {
             | "create_exploration"
             | "manage_mdx_modules"
             | "manage_artifact_inputs"
+            | "advance_artifact_port_pin"
             | "manage_artifact_module_grants"
             | "attach_text"
             | "attach_from_url"
@@ -695,6 +719,7 @@ fn render_manage_change_summaries(value: &Value) -> String {
     if let Some(seq) = value.get("event_seq").and_then(Value::as_i64) {
         let _ = writeln!(out, "Event seq: {seq}");
     }
+    render_act(&mut out, value);
 
     if action == "derive" {
         match (
@@ -754,6 +779,7 @@ fn render_manage_change_summaries(value: &Value) -> String {
                 | "executed"
                 | "event_id"
                 | "event_seq"
+                | "act"
                 | "run_context"
         )
     });
@@ -2788,6 +2814,39 @@ fn render_set_intent(value: &Value) -> String {
     if let Some(attestations) = value.get("action_attestation_ids") {
         let _ = writeln!(out, "Action attestations: {}", inline_json(attestations));
     }
+    // Shapes predating the declared-model confirmation carry no entry;
+    // say nothing rather than inventing a claim about the run.
+    if let Some(entry) = value.get("declared_model") {
+        let recorded = entry.get("recorded").and_then(Value::as_str);
+        match recorded {
+            Some(model) => {
+                let _ = writeln!(
+                    out,
+                    "Declared model recorded for this run: {}",
+                    display_inline(model)
+                );
+            }
+            None => {
+                out.push_str("Declared model: none recorded for this run.\n");
+            }
+        }
+        if entry.get("refused").and_then(Value::as_bool) == Some(true) {
+            match entry.get("declared").and_then(Value::as_str) {
+                Some(diverging) => {
+                    let _ = writeln!(
+                        out,
+                        "The declaration of {} was refused; the recorded model is unchanged, and the intent above was still accepted.",
+                        display_inline(diverging)
+                    );
+                }
+                None => {
+                    out.push_str(
+                        "A model declaration was refused; the recorded model is unchanged, and the intent above was still accepted.\n",
+                    );
+                }
+            }
+        }
+    }
     let unknown = unknown_object_keys(value, |key| {
         matches!(
             key,
@@ -2795,6 +2854,7 @@ fn render_set_intent(value: &Value) -> String {
                 | "briefing_version"
                 | "briefing"
                 | "run_context"
+                | "declared_model"
                 | "action_attestation_ids"
         )
     });
@@ -2833,7 +2893,11 @@ fn render_set_intent(value: &Value) -> String {
             inline_json(&json!(unknown)),
         );
     }
-    if version != 1 {
+    // v1 and v2 share the response shape; v2 only changed the meaning and
+    // item shape of a declaration's `touched_records`, which this renderer
+    // treats as an opaque bounded window either way. A future version is
+    // still refused rather than misread.
+    if version != 1 && version != 2 {
         out.push_str("This briefing version is unsupported by the text renderer; exact current values remain in structuredContent and a new set_intent call is not an exact replay.\n");
         return out;
     }
@@ -2946,6 +3010,7 @@ fn render_set_intent(value: &Value) -> String {
                     | "duration_ms"
                     | "declarations"
                     | "touched_records"
+                    | "touched_records_completeness"
                     | "left_non_terminal"
                     | "unclassified_lifecycle"
             )
@@ -2977,6 +3042,15 @@ fn render_set_intent(value: &Value) -> String {
             IntentWindowKind::Record,
             None,
         );
+        if resume
+            .get("touched_records_completeness")
+            .and_then(Value::as_str)
+            == Some("retained_rows_only")
+        {
+            out.push_str(
+                "Resume touches cover retained rows only; omitted reads may have occurred.\n",
+            );
+        }
         render_intent_window(
             &mut out,
             "Resume touched records",
@@ -3031,12 +3105,24 @@ fn render_management_result(label: &str, value: &Value) -> String {
 
 fn render_create_many(value: &Value) -> String {
     let ids = array(value, "ids");
+    // One act per succeeded item in the default summary mode; verbose mode
+    // carries the same coordinate on each `results[].record.act` instead, so
+    // this array is absent there and the item lines render without it.
+    let acts = array(value, "acts");
+    let act_at = |index: usize| -> Option<i64> {
+        acts.iter()
+            .find(|entry| integer(entry, "index") == Some(index as i64))
+            .and_then(|entry| entry.get("act").and_then(Value::as_i64))
+    };
     let created = ids.iter().filter(|id| id.is_string()).count();
     let mut out = format!("Created {created}/{} records\n", ids.len());
     for (index, id) in ids.iter().enumerate() {
         match id.as_str() {
             Some(id) => {
-                let _ = writeln!(out, "- [{index}] {id}");
+                let _ = match act_at(index) {
+                    Some(act) => writeln!(out, "- [{index}] {id} (act: {act})"),
+                    None => writeln!(out, "- [{index}] {id}"),
+                };
             }
             None => {
                 let _ = writeln!(out, "- [{index}] not created");
@@ -3861,6 +3947,38 @@ fn render_suggestion_review(value: &Value) -> String {
 /// part of the standalone default-text result. Only explicit JSON/App framing
 /// or a defensive renderer fallback duplicates it in `structuredContent`.
 pub fn render_run_context(context: &Value) -> String {
+    render_run_context_with_follow(context, true)
+}
+
+/// The footer exactly as `tool` renders it. Exported so a transport-level
+/// test can assert against what the tool actually produces rather than
+/// rebuilding the expectation from a different function and hoping the two
+/// agree.
+pub fn render_run_context_for(tool: &str, context: &Value) -> String {
+    render_run_context_with_follow(context, establishes_run_context(tool, context))
+}
+
+/// Whether this response is the one that hands the caller their follow link.
+///
+/// Two ways to qualify. A tool whose whole job is to establish run context —
+/// in ordinary use called about once per run. Or a call that minted the key
+/// itself: the `"new"` sentinel mints on whatever ordinary tool the caller
+/// reached for (`crate::runkey`), and that caller has never seen the link, so
+/// the tool name is the wrong thing to ask. `established` records that as a
+/// fact about the call.
+///
+/// Every other response still echoes the run key, which is what the omission
+/// and confabulation mitigation depends on; what it stops repeating is a URL
+/// derivable from that key. There is deliberately no check for whether a key
+/// has been seen before: run keys have no registry, and making newness a
+/// decision rather than a remark is how a sessions table gets built by
+/// accident.
+fn establishes_run_context(tool: &str, context: &Value) -> bool {
+    matches!(tool, "bootstrap" | "set_intent" | "close_run")
+        || context.get("established").and_then(Value::as_bool) == Some(true)
+}
+
+fn render_run_context_with_follow(context: &Value, include_follow_url: bool) -> String {
     let run_key = display_inline(
         context
             .get("run_key")
@@ -3881,10 +3999,19 @@ pub fn render_run_context(context: &Value) -> String {
     if intent_shortened {
         out.push_str("Run context intent shortened in text.\n");
     }
-    if let Some(follow_url) = context.get("follow_url").and_then(Value::as_str) {
-        let _ = writeln!(out, "Follow this run: {}", display_inline(follow_url));
+    if include_follow_url {
+        if let Some(follow_url) = context.get("follow_url").and_then(Value::as_str) {
+            let _ = writeln!(out, "Follow this run: {}", display_inline(follow_url));
+        }
     }
     for note in array(context, "notes").iter().filter_map(Value::as_str) {
+        // The relative-link caveat explains the link. Without the link above
+        // it, it describes nothing the reader can see or act on.
+        if !include_follow_url
+            && note == crate::domain_transaction::request::RELATIVE_FOLLOW_LINK_NOTE
+        {
+            continue;
+        }
         let (note, shortened) = one_line_preview(note, 500);
         let _ = writeln!(out, "Run note: {}", display_inline(&note));
         if shortened {
@@ -4186,7 +4313,7 @@ fn render_first_use_onboarding(out: &mut String, obligation: &Value) {
     let phase = obligation.get("progress_phase").and_then(Value::as_str);
     match phase {
         None => out.push_str(
-            "## First-use onboarding\n\nOffer three useful ways to begin:\n\n1. **Set up a practical workflow** — use one small piece of real work and get something useful working in this conversation.\n2. **Compare Native with another tool** — relate Native to something the person already uses, such as Notion, Linear, or plain files.\n3. **Explain Native conceptually** — give the person the mental model: what Native keeps, how agents use it, and what remains under their control.\n\nRecommend the practical workflow. It gives the person something concrete to evaluate, demonstrates the core loop of recording and recovering useful work, and makes later comparison or explanation more grounded.\n\nAdapt the wording to the conversation. If the person has already expressed a clear preference, follow it without asking them to choose again. Ask questions one at a time and only when the answer materially changes the next useful action.\n\nA practical workflow should normally produce or improve a useful workspace record. Explain that expectation when presenting the route. Comparison and conceptual explanation do not require an artifact to be useful or complete. Existing artifact-preview and consent gates remain authoritative.\n\nDo not treat opening a session, showing a preview, interruption, silence, or declining one proposed write as completion or decline. Record route selection using only its stable route ID; record value delivered only after the person confirms it was useful; resolve completion or decline only when the person establishes that terminal state.\n",
+            "## First-use onboarding\n\nOffer three useful ways to begin:\n\n1. **Set up a practical workflow** — bring one real piece of work the person cares about now, such as a project, event, or decision, and turn it into a small set of connected records they can open, change, and pick up again from any session.\n2. **Compare Native with another tool** — relate Native to something the person already uses, such as Notion, Linear, or plain files.\n3. **Explain Native conceptually** — give the person the mental model: what Native keeps, how agents use it, and what remains under their control.\n\nRecommend the practical workflow. It gives the person something concrete to evaluate and shows the core loop in this conversation rather than promising it for later.\n\nAdapt the wording to the conversation. If the person has already expressed a clear preference, follow it without asking them to choose again. Ask questions one at a time and only when the answer materially changes the next useful action.\n\nOn the practical route, aim for this shape:\n\n- **Several connected records, not one document.** Native's value shows when distinct things that belong together can be opened, changed, linked, and seen together; a single note reads like any chat answer. Split the work into its distinct parts, such as the goal, decisions, open questions, and tasks, as separate records in one collection, and link the ones that depend on or inform each other. Keep it small, about three to eight records. Preview the whole set, with names, contents, placement, and links, and obtain explicit consent before writing.\n- **Hand over a direct web link.** After writing, read the collection back and give its `share_url`, or its `record_url` when there is no `share_url`. Never construct a URL yourself and never offer the run link as the result.\n- **Invite one change from the person.** Ask them to open the link, edit one of the records, and then tell you. Read the changed record back and respond to what actually changed. That shows the person and the agent working on the same thing.\n- **Offer a view over the set, without forcing it.** Once that loop has landed, offer one way to see the records together, such as a board or an HTML artifact bound to the collection.\n- **Close with a completion message instead of asking whether it was useful.** Say in one sentence what Native now keeps for them, say what was saved and where with the link, and give two or three concrete next uses. One of them should be to start a new chat and ask where they left off.\n\nComparison and conceptual explanation do not require an artifact to be useful or complete. Existing artifact-preview and consent gates remain authoritative.\n\nDo not treat opening a session, showing a preview, interruption, silence, or declining one proposed write as completion or decline. Record route selection using only its stable route ID. After the completion message, the person's acceptance confirms value: thanks, a positive reply, or their own follow-on request. Then record value delivered and resolve the obligation as completed. Do not ask a separate \"was this useful?\" question. Resolve decline only when the person establishes it.\n",
         ),
         Some("deferred") => out.push_str(
             "## First-use onboarding\n\nThis journey is explicitly deferred. A resume-after time is reminder eligibility only; it does not resume the journey or authorize prompting or writing. Wait for explicit confirmation before resuming, and do not replay the three-route menu.\n",
@@ -4202,7 +4329,7 @@ fn render_first_use_onboarding(out: &mut String, obligation: &Value) {
                         == Some("current_run") => out.push_str("\nThe exact artifact preview has consent in this run. Preserve the existing preview/write gate: write exactly that draft, then record `artifact_written`.\n"),
                 "artifact_previewed" => out.push_str("\nThe earlier artifact preview belongs to another or unknown run. Re-show the exact draft and obtain fresh explicit consent before writing.\n"),
                 "artifact_written" => out.push_str("\nThe consented artifact has already been recorded. Do not preview or write it again; continue toward confirmed value or an explicit terminal outcome.\n"),
-                "value_delivered" => out.push_str("\nValue has been recorded as user-confirmed. Do not silently mark onboarding complete or declined; wait for the person to establish that terminal outcome.\n"),
+                "value_delivered" => out.push_str("\nValue has been recorded as user-confirmed. If the person accepted the completion message, resolve the obligation as completed; otherwise do not silently mark it complete or declined.\n"),
                 _ => {}
             }
         }
@@ -4322,7 +4449,7 @@ fn render_internal_continuation(
         }
         let _ = writeln!(out, "  record_value_delivered:\n    tool: manage_onboarding\n    arguments:\n      action: record_progress\n      programme_id: {}\n      generation: {generation}\n      phase: value_delivered\n      evidence.basis: user_confirmed\n      idempotency_key: <stable key>\n      reason: <confirmed value without copying learned context>\n      run_key: *run_key\n  complete_or_decline:\n    tool: manage_onboarding\n    arguments:\n      action: resolve_obligation\n      programme_id: {}\n      generation: {generation}\n      resolution: <completed | declined>\n      evidence: <non-null evidence>\n      idempotency_key: <stable key>\n      reason: <why the terminal state is established>\n      run_key: *run_key", yaml_scalar(programme), yaml_scalar(programme));
     }
-    out.push_str("```\n\nReuse the exact anchored run key on every subsequent Native call, reads included. It groups activity for continuity, inspection, and recovery; it is not a rollback command. If this bootstrap response is lost to a transient transport/pool failure or HTTP 502/503/504, retry bootstrap itself at most twice: a retry that carries the anchored key gets that same key echoed back, and bootstrap does not allocate a durable run.\n");
+    out.push_str("```\n\nAfter this successful bootstrap, keep its continuation state. Reuse the exact anchored run key on every subsequent Native call, reads included. It groups activity for continuity, inspection, and recovery; it is not a rollback command. It is the one key for this fresh host conversation: later user turns, task/intent/artifact changes, or renewed Native use are not new bootstrap boundaries. Use `set_intent` when the underlying aim materially changes. Only the host can determine a fresh conversation; Native has no trustworthy host-conversation identity and does not deduplicate by conversation/account. If this bootstrap response is lost to a transient transport/pool failure or HTTP 502/503/504, retry bootstrap itself at most twice: a retry that carries the anchored key gets that same key echoed back, and bootstrap does not allocate a durable run.\n");
 }
 
 fn render_bootstrap_world_items(
@@ -4619,7 +4746,7 @@ fn render_bootstrap(value: &Value) -> String {
         )
     });
 
-    out.push_str("\n## Intentful sessions\n\nInfer a clear intent from the person's request instead of asking them to repeat it. Declare it separately with `set_intent`, and update it when the underlying aim materially changes. Intent connects work into an inspectable run and enables a purpose-relative briefing; it is not a claim or permission.\n");
+    out.push_str("\n## Intentful sessions\n\nInfer a clear intent from the person's request instead of asking them to repeat it. Declare it separately with `set_intent`, and update it when the underlying aim materially changes; that update is not a new bootstrap boundary. Intent connects work into an inspectable run and enables a purpose-relative briefing; it is not a claim or permission. On the run's first set_intent, the agent may also self-declare its model once with the `model` argument so later attribution has the claim on record; the first declaration wins, it is unverified and per-run, and it grants nothing.\n");
     render_internal_continuation(&mut out, value, onboarding, footing, next_steps_stated);
     out
 }
@@ -4707,7 +4834,7 @@ fn preferred_record_url(record: &Value) -> Option<String> {
     string(record, "share_url").or_else(|| string(record, "record_url"))
 }
 
-fn linked_record_name(record: &Value) -> String {
+fn escaped_record_name(record: &Value) -> String {
     let name = string(record, "name").unwrap_or_default();
     let mut escaped = String::with_capacity(name.len());
     for character in name.chars() {
@@ -4721,10 +4848,53 @@ fn linked_record_name(record: &Value) -> String {
             character => escaped.push(character),
         }
     }
+    escaped
+}
+
+fn linked_record_name(record: &Value) -> String {
+    let escaped = escaped_record_name(record);
     let Some(url) = preferred_record_url(record) else {
         return escaped;
     };
     format!("[{escaped}]({url})")
+}
+
+/// One ancestor on the path line, which is now the only place text mode
+/// states placement. A configured origin makes the link carry the reference;
+/// without one — the stdio and local shape — a bare name would leave no way
+/// to address the ancestor at all, so the short reference is spelled out
+/// instead. Falls back to the full id where no short reference exists, and to
+/// the bare name where neither does.
+fn path_segment_name(record: &Value) -> String {
+    if let Some(url) = preferred_record_url(record) {
+        let escaped = escaped_record_name(record);
+        let text = if escaped.is_empty() {
+            string(record, "display_reference")
+                .or_else(|| string(record, "id"))
+                .map(|reference| display_inline(&reference))
+                .filter(|reference| !reference.is_empty())
+                .unwrap_or_else(|| "(unnamed)".into())
+        } else {
+            escaped
+        };
+        return format!("[{text}]({url})");
+    }
+    let escaped = escaped_record_name(record);
+    let reference = string(record, "display_reference")
+        .or_else(|| string(record, "id"))
+        .map(|reference| display_inline(&reference))
+        .filter(|reference| !reference.is_empty());
+    match (escaped.is_empty(), reference) {
+        // A nameless ancestor has nothing to show but its reference. Left as
+        // the bare name it would be an empty segment — and, once linked, an
+        // invisible one.
+        (true, Some(reference)) => reference,
+        (true, None) => "(unnamed)".into(),
+        (false, Some(reference)) if reference != escaped => {
+            format!("{escaped} ({reference})")
+        }
+        (false, _) => escaped,
+    }
 }
 
 fn record_line(record: &Value, id_width: usize, type_width: usize) -> String {
@@ -5895,10 +6065,6 @@ fn render_get_record(value: &Value, include_response_disclosures: bool) -> Strin
             );
         }
     }
-    // Ancestor blocks are response-wide: identical text is emitted once and
-    // referenced by the id of the record that carried it.
-    let mut rendered_ancestors: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
     for (index, item) in records.iter().enumerate() {
         if index > 0 {
             out.push('\n');
@@ -5972,37 +6138,57 @@ fn render_get_record(value: &Value, include_response_disclosures: bool) -> Strin
         if !state.is_empty() {
             let _ = writeln!(out, "  {}", state.join(" · "));
         }
-        if let Some(details) = exact_known_object_remainder(
-            item,
-            &[
-                "status",
-                "id",
-                "type",
-                "kind",
-                "name",
-                "body",
-                "owner_id",
-                "persistence",
-                "maturity",
-                "summary",
-                "last_activity_at",
-                "deleted_at",
-                "facets",
-                "links_out",
-                "links_in",
-                "superseded_by",
-                "freshness",
-                "children",
-                "suggestions",
-                "citations",
-                "comments",
-                "target",
-                "ancestors",
-                "interpretation",
-                "query_resolution",
-            ],
-            is_get_record_text_field,
-        ) {
+        // Five encodings of one reference ship per record: `id`,
+        // `record_path_full`, `record_path`, `display_reference`,
+        // `record_url` and `share_url`. The header line above already
+        // rendered the id and, where an origin is configured, one link — so
+        // the paths are derivations of what the reader has already been
+        // given. Suppress the derivable ones here and keep
+        // `display_reference`, which is the short form the orientation asks
+        // agents to quote. `format:"json"` still carries every field.
+        let mut rendered_keys = vec![
+            "status",
+            "id",
+            "type",
+            "kind",
+            "name",
+            "body",
+            "owner_id",
+            "persistence",
+            "maturity",
+            "summary",
+            "last_activity_at",
+            "deleted_at",
+            "facets",
+            "links_out",
+            "links_in",
+            "mentions_out",
+            "mentions_in",
+            "superseded_by",
+            "freshness",
+            "children",
+            "suggestions",
+            "citations",
+            "comments",
+            "target",
+            "ancestors",
+            "interpretation",
+            "query_resolution",
+            // "/" + id, where id heads this record's own line.
+            "record_path_full",
+            // "/" + display_reference, which is retained below.
+            "record_path",
+        ];
+        // Drop only the URL the header actually linked. When no origin is
+        // configured neither is emitted, and both stay in the blob.
+        if string(item, "share_url").is_some() {
+            rendered_keys.push("share_url");
+        } else if string(item, "record_url").is_some() {
+            rendered_keys.push("record_url");
+        }
+        if let Some(details) =
+            exact_known_object_remainder(item, &rendered_keys, is_get_record_text_field)
+        {
             let label = if value.get("as_of").is_some() {
                 "Record details (historical projection with live-at-read-time enrichments)"
             } else {
@@ -6062,7 +6248,7 @@ fn render_get_record(value: &Value, include_response_disclosures: bool) -> Strin
         if !ancestors.is_empty() {
             let path = ancestors
                 .iter()
-                .map(linked_record_name)
+                .map(path_segment_name)
                 .collect::<Vec<_>>()
                 .join(" > ");
             let heading = match item
@@ -6228,44 +6414,39 @@ fn render_get_record(value: &Value, include_response_disclosures: bool) -> Strin
                 let _ = writeln!(out, "    {}", inline_json(link));
             }
         }
-        let ancestors = array(item, "ancestors");
-        if !ancestors.is_empty() {
-            let heading = match item
-                .get("containment_path_visible")
-                .and_then(Value::as_bool)
-            {
-                Some(true) => "Ancestor details (root first, complete)",
-                Some(false) => {
-                    "Visible ancestor details (root first; containment path incomplete or withheld)"
-                }
-                None => "Visible ancestor details (root first; completeness not reported)",
-            };
-            // Siblings share a folder, so the same ancestor block would
-            // otherwise be repeated verbatim for every record in the batch.
-            // Emit it once and point later records at the record that carries
-            // it — a reference resolvable inside this same response, not a
-            // second call, and not a silent omission.
-            let mut block = String::new();
-            let _ = writeln!(block, "  {heading}:");
-            for ancestor in ancestors {
-                let _ = writeln!(block, "    {}", inline_json(ancestor));
+        // Body mentions. Distinct from links on purpose: a mention is parser
+        // evidence that prose referred to something, never an asserted edge.
+        // Resolution state is shown honestly and names only visible records.
+        for (heading, list_key, count_key) in [
+            ("Mentions", "mentions_out", "mentions_out_count"),
+            ("Mentioned by", "mentions_in", "mentions_in_count"),
+        ] {
+            let entries = array(item, list_key);
+            let total = integer(item, count_key).unwrap_or(0);
+            if total == 0 {
+                continue;
             }
-            let record_id = display_inline(&string(item, "id").unwrap_or_default());
-            match rendered_ancestors.get(&block) {
-                Some(first_id) => {
-                    let _ = writeln!(
-                        out,
-                        "  {heading}: identical to the block shown for record {first_id} above in this response.",
-                    );
-                }
-                None => {
-                    out.push_str(&block);
-                    if !record_id.is_empty() {
-                        rendered_ancestors.insert(block, record_id);
-                    }
-                }
+            // Mentions share the link window: both are unbounded for the same
+            // reason and paged through the same caller-sized window.
+            render_window_heading(
+                &mut out,
+                heading,
+                total,
+                entries.len() as i64,
+                links_offset,
+                links_limit,
+                "links_offset",
+                "links_limit",
+            );
+            for entry in entries {
+                let _ = writeln!(out, "    {}", render_mention_line(entry, list_key));
             }
         }
+        // No ancestor details block. The path line above already names and
+        // links every ancestor under the same completeness qualifier, so the
+        // block restated each one as JSON carrying five encodings of a
+        // reference the reader had just been handed. `format:"json"` still
+        // carries the full `ancestors` projection, type and kind included.
         // Authored bytes come last so they cannot impersonate metadata that
         // follows them. A single-record body remains uncapped, but every line
         // is visibly quoted as untrusted record content; explicit JSON is the
@@ -6342,6 +6523,50 @@ fn render_window_heading(
         );
     }
     out.push_str(")\n");
+}
+
+/// One body-mention line. Outgoing entries carry a resolution state and name
+/// only visible records; incoming entries name a visible source.
+///
+/// Absence is rendered as absence, never as a fabricated count or category: an
+/// entry without an occurrence count does not claim `×1`, and an entry without
+/// a resolution state does not claim `unresolved` (see `claimed_integer`).
+fn render_mention_line(entry: &Value, list_key: &str) -> String {
+    let count = claimed_integer(entry.get("occurrence_count"), "occurrences");
+    if list_key == "mentions_in" {
+        let name = display_inline(&string(entry, "source_name").unwrap_or_default());
+        let id = display_inline(&string(entry, "source_id").unwrap_or_default());
+        return format!("← {name} ({id}) ×{count}");
+    }
+    let reference = display_inline(&string(entry, "authored_reference").unwrap_or_default());
+    let form = display_inline(&string(entry, "form").unwrap_or_default());
+    let resolution = entry.get("resolution");
+    let state = resolution.and_then(|value| value.get("state"));
+    let tail = match state.and_then(Value::as_str) {
+        Some("resolved") => {
+            let name = display_inline(
+                &resolution
+                    .and_then(|value| string(value, "name"))
+                    .unwrap_or_default(),
+            );
+            let id = display_inline(
+                &resolution
+                    .and_then(|value| string(value, "id"))
+                    .unwrap_or_default(),
+            );
+            format!("resolved to {name} ({id})")
+        }
+        Some("ambiguous") => {
+            let candidates = claimed_integer(
+                resolution.and_then(|value| value.get("visible_candidate_count")),
+                "visible matches",
+            );
+            format!("ambiguous ({candidates} visible matches)")
+        }
+        Some(other) => display_inline(other),
+        None => "(resolution not reported)".to_string(),
+    };
+    format!("→ {reference} ({form}, ×{count}) — {tail}")
 }
 
 // ---------------------------------------------------------------------------
@@ -7187,6 +7412,7 @@ fn render_enriched_write(verb: &str, value: &Value) -> String {
         }
     }
     render_previous_seq(&mut out, value);
+    render_act(&mut out, value);
     render_write_receipt(&mut out, value);
     render_body_receipt(&mut out, value);
     // The create-time overlap advisory is prose, never a raw receipt key: only
@@ -7195,7 +7421,55 @@ fn render_enriched_write(verb: &str, value: &Value) -> String {
     if let Some(overlap) = value.get("work_overlap") {
         render_overlap_window(&mut out, "Work overlap", overlap);
     }
+    // The similarity advisory is prose, never a raw receipt key: only a fresh
+    // `create_record` or a `create_many` item can carry it. Like the overlap
+    // window, it is omitted entirely when there was nothing to report.
+    if let Some(similar) = value.get("similar_existing") {
+        render_similar_existing(&mut out, similar);
+    }
     out.push_str("Call get_record for post-write state.\n");
+    out
+}
+
+fn render_batch_write(value: &Value) -> String {
+    let Some(results) = value.get("results").and_then(Value::as_array) else {
+        return format!(
+            "Batch write {} requested · {} changed · {} unchanged\n",
+            claimed_integer(value.get("requested"), "requested"),
+            claimed_integer(value.get("changed"), "changed"),
+            claimed_integer(value.get("unchanged"), "unchanged"),
+        );
+    };
+    let mut out = format!(
+        "Batch write {} requested · {} changed · {} unchanged\n",
+        claimed_integer(value.get("requested"), "requested"),
+        claimed_integer(value.get("changed"), "changed"),
+        claimed_integer(value.get("unchanged"), "unchanged"),
+    );
+    for result in results {
+        let _ = match claimed_string(result.get("op"), "op").as_str() {
+            "add_link" => writeln!(
+                out,
+                "  [{}] add_link {} -> {}  {}",
+                claimed_integer(result.get("index"), "index"),
+                claimed_string(result.get("id"), "id"),
+                claimed_string(result.get("target_id"), "target_id"),
+                claimed_string(result.get("status"), "status"),
+            ),
+            op => writeln!(
+                out,
+                "  [{}] {} {}  {}",
+                claimed_integer(result.get("index"), "index"),
+                op,
+                claimed_string(result.get("id"), "id"),
+                claimed_string(result.get("status"), "status"),
+            ),
+        };
+    }
+    let warnings = array(value, "warnings");
+    if !warnings.is_empty() {
+        let _ = writeln!(out, "Warnings: {} (see structured receipt)", warnings.len());
+    }
     out
 }
 
@@ -7239,7 +7513,7 @@ fn render_write_receipt(out: &mut String, value: &Value) {
         .filter(|(key, _)| {
             !matches!(
                 key.as_str(),
-                "previous_seq" | "run_context" | "work_overlap"
+                "previous_seq" | "act" | "run_context" | "work_overlap" | "similar_existing"
             )
         })
         .collect::<Vec<_>>();
@@ -7328,6 +7602,10 @@ fn is_enriched_record_field(key: &str) -> bool {
             | "links_out_count"
             | "links_in"
             | "links_in_count"
+            | "mentions_out"
+            | "mentions_out_count"
+            | "mentions_in"
+            | "mentions_in_count"
             | "superseded_by"
             | "children"
             | "child_count"
@@ -7408,6 +7686,18 @@ fn render_previous_seq(out: &mut String, value: &Value) {
     }
 }
 
+/// Keep the produced act in the default text response next to the pre-write
+/// handle. Absent when the write appended nothing canonical, in which case no
+/// line is rendered and the text is byte-identical to before.
+fn render_act(out: &mut String, value: &Value) {
+    if let Some(act) = value.get("act").and_then(Value::as_i64) {
+        let _ = writeln!(
+            out,
+            "act: {act} (the per-workspace act number this write allocated)",
+        );
+    }
+}
+
 fn render_delete_record(value: &Value) -> String {
     let id = string(value, "id").unwrap_or_default();
     let deleted = boolean(value, "deleted").unwrap_or(false);
@@ -7420,6 +7710,7 @@ fn render_delete_record(value: &Value) -> String {
         let _ = writeln!(out, "deleted_at: {at}");
     }
     render_previous_seq(&mut out, value);
+    render_act(&mut out, value);
     out
 }
 
@@ -7452,6 +7743,7 @@ fn render_ownership_claim(value: &Value) -> String {
         display_inline(event_id),
     );
     render_previous_seq(&mut out, value);
+    render_act(&mut out, value);
     out
 }
 
@@ -7504,6 +7796,7 @@ fn render_record_type_correction(value: &Value) -> String {
         let _ = writeln!(out, "body_digest unchanged: {digest}");
     }
     render_previous_seq(&mut out, value);
+    render_act(&mut out, value);
     out
 }
 
@@ -7522,6 +7815,7 @@ fn render_archive_record(value: &Value) -> String {
         if changed { "" } else { " (no write)" },
     );
     render_previous_seq(&mut out, value);
+    render_act(&mut out, value);
     out
 }
 
@@ -7684,6 +7978,16 @@ fn render_whats_changed(value: &Value) -> String {
                 let _ = write!(out, "\n  {label}: {found}");
             }
         }
+        if let Some(channel) = change.get("channel") {
+            if let Some(kind) = string(channel, "kind") {
+                let _ = write!(out, "\n  channel: {kind}");
+            }
+        }
+        if let Some(executor) = change.get("executor") {
+            if let Some(kind) = string(executor, "kind") {
+                let _ = write!(out, "\n  executor: {kind}");
+            }
+        }
         for (label, key) in [
             ("types", "event_types"),
             ("families", "event_families"),
@@ -7828,6 +8132,7 @@ fn render_exploration(value: &Value) -> String {
 fn render_event_context(value: &Value) -> String {
     const CONTROL_BUDGET: usize = 4_000;
     const CONSULTED_BUDGET: usize = 4_000;
+    const BASIS_BUDGET: usize = 4_000;
     const LIMITS_BUDGET: usize = 2_000;
     const EVENT_PAYLOAD_BUDGET: usize = 3_000;
     const BEFORE_BODY_BUDGET: usize = 4_000;
@@ -7843,6 +8148,7 @@ fn render_event_context(value: &Value) -> String {
     let mut out = "Event context.\n".to_string();
     let mut control_remaining = CONTROL_BUDGET;
     let mut consulted_remaining = CONSULTED_BUDGET;
+    let mut basis_remaining = BASIS_BUDGET;
     let mut limits_remaining = LIMITS_BUDGET;
 
     let event = value.get("event");
@@ -8105,6 +8411,82 @@ fn render_event_context(value: &Value) -> String {
         }
     }
 
+    // The declared basis is the run's own account of what the write rested
+    // on: a claim of use, not an observation of exposure. It is rendered
+    // beside — never merged into — the opened evidence above, and the
+    // opened-does-not-establish-comprehension hedge is not repeated for it.
+    match value.get("basis") {
+        Some(basis) if basis.is_object() => {
+            let status = basis.get("status").and_then(Value::as_str);
+            let sources = basis.get("sources").and_then(Value::as_array);
+            let completeness = basis.get("completeness").and_then(Value::as_str);
+            match (status, sources) {
+                (Some("not_declared"), Some(_)) => out.push_str(
+                    "Declared sources: not declared. The write named no source basis, which is itself neither a claim of none nor evidence of nothing read.\n",
+                ),
+                (Some("declared_none"), Some(_)) => out.push_str(
+                    "Declared sources: declared as none. The run said this write rested on no Native record.\n",
+                ),
+                (Some("declared"), Some(sources)) => {
+                    match completeness {
+                        Some(completeness @ ("complete" | "partial")) => {
+                            let _ = writeln!(out, "Declared sources: declared; {} visible source(s) returned ({completeness}).", sources.len());
+                        }
+                        _ => out.push_str("Declared sources: declared; completeness is missing or malformed, so the visible returned page is not treated as exhaustive.\n"),
+                    }
+                    let mut rendered = 0usize;
+                    let mut malformed = 0usize;
+                    for record in sources {
+                        if !record.is_object() {
+                            malformed += 1;
+                            continue;
+                        }
+                        let (projection, malformed_fields) = typed_context_projection(record, |key| {
+                            matches!(key, "record_id" | "name" | "type" | "kind" | "revision_event_id" | "revision_supplied_by" | "role" | "reason" | "is_event_target")
+                        }, |key, field| match key {
+                            "is_event_target" => field.is_boolean(),
+                            _ => string_or_null(field),
+                        });
+                        if render_bounded_context_component(
+                            &mut out,
+                            "  - ",
+                            &projection,
+                            &mut basis_remaining,
+                            750,
+                        ) {
+                            rendered += 1;
+                        }
+                        render_context_malformed_fields(&mut out, "declared source", malformed_fields, &mut basis_remaining);
+                        if basis_remaining > 0 {
+                            render_context_unknowns(&mut out, "declared source", record, |key| {
+                                matches!(key, "record_id" | "name" | "type" | "kind" | "revision_event_id" | "revision_supplied_by" | "role" | "reason" | "is_event_target")
+                            }, &mut basis_remaining);
+                        }
+                    }
+                    if rendered + malformed < sources.len() || malformed > 0 {
+                        let _ = writeln!(out, "Declared-source detail: {rendered} rendered, {malformed} malformed, {} omitted by the text budget; {READ_JSON_RECOVERY}", sources.len().saturating_sub(rendered + malformed));
+                    }
+                    out.push_str("A declaration is an authored claim of use, not verified use.\n");
+                }
+                _ => out.push_str(
+                    "Declared sources: status or sources are missing/malformed; no absence is inferred. Re-call this read with the same arguments and format:\"json\" for a fresh exact JSON projection.\n",
+                ),
+            }
+            render_context_unknowns(
+                &mut out,
+                "declared basis",
+                basis,
+                |key| matches!(key, "label" | "status" | "completeness" | "sources"),
+                &mut basis_remaining,
+            );
+        }
+        _ => {
+            out.push_str("Declared sources: evidence envelope missing or malformed; no absence is inferred. ");
+            out.push_str(READ_JSON_RECOVERY);
+            out.push('\n');
+        }
+    }
+
     match value.get("interpretation_limits") {
         Some(Value::Array(limits)) => {
             let mut valid = Vec::new();
@@ -8276,6 +8658,7 @@ fn render_event_context(value: &Value) -> String {
                     | "delta"
                     | "neighbouring_events"
                     | "consulted"
+                    | "basis"
                     | "interpretation_limits"
                     | "run_context"
             )
@@ -8284,6 +8667,7 @@ fn render_event_context(value: &Value) -> String {
     );
     if control_remaining == 0
         || consulted_remaining == 0
+        || basis_remaining == 0
         || limits_remaining == 0
         || payload_remaining == 0
         || neighbour_remaining == 0
@@ -8293,6 +8677,7 @@ fn render_event_context(value: &Value) -> String {
         out.push('\n');
     }
     out.push_str("Opening a record establishes no comprehension, reliance or agreement.\n");
+    out.push_str("Declared sources are authored claims, not verified use.\n");
     out
 }
 
@@ -8333,11 +8718,17 @@ fn render_run_activity(value: &Value) -> String {
         .map(|item| {
             typed_context_projection(
                 item,
-                |key| matches!(key, "status" | "reason" | "visibility_filtered"),
+                |key| {
+                    matches!(
+                        key,
+                        "status" | "reason" | "visibility_filtered" | "completeness"
+                    )
+                },
                 |key, field| match key {
                     "status" => field.is_string(),
                     "reason" => string_or_null(field),
                     "visibility_filtered" => field.is_boolean() || field.is_null(),
+                    "completeness" => field.is_string(),
                     _ => false,
                 },
             )
@@ -8373,6 +8764,13 @@ fn render_run_activity(value: &Value) -> String {
         Some("available") => match value.get("read_activity") {
             Some(Value::Array(rows)) => {
                 if validated_availability
+                    .get("completeness")
+                    .and_then(Value::as_str)
+                    == Some("retained_rows_only")
+                {
+                    out.push_str("Activity counts cover retained rows only; omitted reads may have occurred.\n");
+                }
+                if validated_availability
                     .get("reason")
                     .is_some_and(|reason| !reason.is_null())
                 {
@@ -8382,7 +8780,7 @@ fn render_run_activity(value: &Value) -> String {
                 if rows.is_empty() && scope_valid {
                     match visibility_filtered {
                         Some(true) => out.push_str("No visible aggregate read-activity rows were returned; hidden activity may exist.\n"),
-                        Some(false) => out.push_str("No visible aggregate read-activity rows were returned in this available scope.\n"),
+                        Some(false) => out.push_str("No visible aggregate activity rows were retained in this scope; omitted reads may have occurred.\n"),
                         None => out.push_str("No visible aggregate read-activity rows were returned, but visibility coverage is missing or malformed; no exhaustive absence is inferred.\n"),
                     }
                 }
@@ -8472,7 +8870,12 @@ fn render_run_activity(value: &Value) -> String {
             &mut out,
             "availability",
             availability,
-            |key| matches!(key, "status" | "reason" | "visibility_filtered"),
+            |key| {
+                matches!(
+                    key,
+                    "status" | "reason" | "visibility_filtered" | "completeness"
+                )
+            },
             &mut remaining,
         );
     }
@@ -8942,6 +9345,7 @@ fn render_manage_links_write(value: &Value, action: &str) -> String {
         _ => unreachable!("receipt kind was validated"),
     }
     render_previous_seq(&mut out, value);
+    render_act(&mut out, value);
     link_write_unknowns(
         &mut out,
         "link write-receipt",
@@ -8974,6 +9378,7 @@ fn render_manage_links_write(value: &Value, action: &str) -> String {
                     | "target_id"
                     | "relationship"
                     | "previous_seq"
+                    | "act"
                     | "write_receipt"
                     | "relationship_origin_db_id"
                     | "relationship_id"
@@ -9208,6 +9613,7 @@ fn render_manage_facet_observations(value: &Value) -> String {
             );
         }
         render_previous_seq(&mut out, value);
+        render_act(&mut out, value);
         return out;
     }
 
@@ -9392,9 +9798,25 @@ fn render_query_sql(value: &Value) -> String {
     let truncated = boolean(value, "truncated").unwrap_or(false);
     let mut out = format!("{reported} row(s) returned");
     if truncated {
-        out.push_str(" — TRUNCATED at the tool ceiling; more rows may exist. Page the SQL with LIMIT/OFFSET.");
+        // E2 I-5: the keyset repair travels in `truncation_hint`; the
+        // fallback (payloads predating the field) gives the same remedy
+        // rather than the LIMIT/OFFSET advice it replaced.
+        match value.get("truncation_hint").and_then(Value::as_str) {
+            Some(hint) => {
+                out.push_str(" — TRUNCATED. ");
+                out.push_str(hint);
+                out.push('.');
+            }
+            None => out.push_str(
+                " — TRUNCATED at the tool ceiling; more rows may exist. \
+                 Add ORDER BY over a unique key and page with a keyset predicate.",
+            ),
+        }
     }
     out.push('\n');
+    if let Some(seq) = value.get("as_of_seq").and_then(Value::as_i64) {
+        let _ = writeln!(out, "As of content sequence: {seq}");
+    }
     if columns.is_empty() {
         out.push_str("Columns: none\n");
         return out;
@@ -9441,6 +9863,103 @@ fn render_count_shape(out: &mut String, label: &str, value: &Value) {
             integer(bucket, "count").unwrap_or_default()
         );
     }
+}
+
+/// Bounded text summary of a workspace snapshot answer.
+///
+/// Deliberately lossy: stamps, row counts, and a bounded sample of row names
+/// and ids — never the whole pin, and never the token. Callers that need
+/// exact rows or the token use the JSON projection (the MCP transport keeps
+/// its structured fallback for this tool), which is why this renderer stays
+/// out of the lossless read allowlist. Total over drifted payloads: missing
+/// or mistyped fields are skipped, never panicked on.
+fn render_workspace_snapshot(value: &Value) -> String {
+    if value.get("unavailable").and_then(Value::as_bool) == Some(true) {
+        return "workspace snapshot unavailable (index_unavailable): retry fresh or use the governed read path".to_string();
+    }
+    if value.get("restart_required").and_then(Value::as_bool) == Some(true) {
+        let mut out = "workspace snapshot restart required".to_string();
+        if let Some(reason) = string(value, "reason") {
+            out.push_str(&format!(" ({reason})"));
+        }
+        out.push_str(": discard the model and re-open");
+        return out;
+    }
+    let mut out = String::from("workspace snapshot");
+    for (key, label) in [
+        ("content_seq", "content"),
+        ("authorization_epoch", "epoch"),
+        ("relationship_seq", "relationships"),
+    ] {
+        if let Some(seq) = integer(value, key) {
+            let _ = write!(out, " · {label} {seq}");
+        }
+    }
+    out.push('\n');
+    // Up to 20 sample rows across whatever row arrays the payload carries.
+    // Sections and deltas share the same shape vocabulary; unknown arrays
+    // are ignored rather than rendered as a claim.
+    const SAMPLE_BUDGET: usize = 20;
+    let mut shown = 0;
+    for key in [
+        "rows",
+        "upsert_records",
+        "upsert_facets",
+        "upsert_links",
+        "content_events",
+    ] {
+        for row in array(value, key) {
+            if shown >= SAMPLE_BUDGET {
+                break;
+            }
+            let id = string(row, "id").unwrap_or_default();
+            let name = string(row, "name")
+                .or_else(|| string(row, "key"))
+                .or_else(|| string(row, "relationship"))
+                .or_else(|| string(row, "event_type"))
+                .unwrap_or_default();
+            if id.is_empty() && name.is_empty() {
+                continue;
+            }
+            let _ = write!(
+                out,
+                "\n- {key}: {id}{}",
+                if name.is_empty() {
+                    String::new()
+                } else {
+                    format!(" · {name}")
+                }
+            );
+            shown += 1;
+        }
+        if shown >= SAMPLE_BUDGET {
+            break;
+        }
+    }
+    let total: usize = [
+        "rows",
+        "upsert_records",
+        "upsert_facets",
+        "upsert_links",
+        "content_events",
+    ]
+    .iter()
+    .map(|key| array(value, key).len())
+    .sum();
+    if total > shown {
+        let _ = write!(
+            out,
+            "\n({} more row(s); re-call with format:\"json\" for the exact projection)",
+            total - shown
+        );
+    }
+    for key in ["delete_record_ids", "delete_facet_ids", "delete_link_ids"] {
+        let ids = array(value, key);
+        if !ids.is_empty() {
+            let _ = write!(out, "\n{key}: {} deleted", ids.len());
+        }
+    }
+    out
 }
 
 fn render_scan(value: &Value) -> String {
@@ -9798,6 +10317,56 @@ fn render_overlap_window(out: &mut String, label: &str, overlap: &Value) {
     for item in array(overlap, "items") {
         out.push_str(&render_overlap_item_line(item));
         out.push('\n');
+    }
+}
+
+/// One `similar_existing` item as a prose line: the match reasons are the
+/// useful part, so they are named rather than buried in the structured
+/// receipt.
+fn render_similar_existing(out: &mut String, similar: &Value) {
+    let items = array(similar, "items");
+    let _ = writeln!(out, "Similar existing records ({}):", items.len());
+    for item in items {
+        let id = claimed_string(item.get("id"), "id");
+        let name = claimed_string(item.get("name"), "name");
+        let why = item.get("why").cloned().unwrap_or(Value::Null);
+        let mut reasons = Vec::new();
+        if why
+            .get("exact_name")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            reasons.push("same name".to_string());
+        }
+        let shared_terms = why
+            .get("shared_name_terms")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|term| term.as_str())
+            .collect::<Vec<_>>();
+        if !shared_terms.is_empty() {
+            reasons.push(format!("shared name terms: {}", shared_terms.join(", ")));
+        }
+        let shared_facets = why
+            .get("shared_facet_keys")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|key| key.as_str())
+            .collect::<Vec<_>>();
+        if !shared_facets.is_empty() {
+            reasons.push(format!("shared facet keys: {}", shared_facets.join(", ")));
+        }
+        let _ = writeln!(
+            out,
+            "  {id}  {name}{}",
+            if reasons.is_empty() {
+                String::new()
+            } else {
+                format!(" — {}", reasons.join("; "))
+            }
+        );
     }
 }
 
@@ -10279,6 +10848,26 @@ mod record_url_render_tests {
         );
         assert!(updated.contains("[0] 0189d4c6"), "{updated}");
         assert!(updated.contains("[1] 0189d4c6"), "{updated}");
+
+        let batched = render(
+            "batch_write",
+            &json!({
+                "requested":2,
+                "changed":2,
+                "unchanged":0,
+                "results":[
+                    {"index":0,"op":"update","id":"rec:a","status":"changed"},
+                    {"index":1,"op":"add_link","id":"rec:a","target_id":"rec:b","status":"changed"}
+                ]
+            }),
+        )
+        .unwrap();
+        assert!(
+            batched.contains("2 requested · 2 changed · 0 unchanged"),
+            "{batched}"
+        );
+        assert!(batched.contains("[0] update rec:a"), "{batched}");
+        assert!(batched.contains("[1] add_link rec:a -> rec:b"), "{batched}");
     }
 }
 

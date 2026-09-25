@@ -34,6 +34,11 @@ fn without_query_sql_test_fixture_writes(relative: &Path, source: &str) -> Strin
     // ids inline: the record-id rule admits only canonical UUIDs, and the
     // fixture must reference the same records it creates. The expected text is
     // therefore the format template, which keeps this guard exact.
+    // The conformance corpus seeds (`CONFORMANCE_TURSO_POLICY_SEED`) name
+    // their `conf:` ids inline: Turso has no test-accessible policy write
+    // path, so the SQLite runner's `replace_explicit_policy` grants are
+    // mirrored here literally. `sql_conformance.rs` itself holds no policy
+    // write, which keeps the projector as the only SQLite-side producer.
     // Split at the test module first so moving any exception into runtime code
     // makes this guard fail rather than silently enlarging Turso's write funnel.
     let test_module = normalized("#[cfg(all(test, feature = \"turso-tests\"))] mod tests {");
@@ -45,6 +50,14 @@ fn without_query_sql_test_fixture_writes(relative: &Path, source: &str) -> Strin
         (
             "QUERY_SQL_PARITY_FIXTURE record policy seed",
             "INSERT INTO record_policies(record_id,created_at) SELECT id,'2026-01-01T00:00:00.000Z' FROM records WHERE id LIKE 'parity:%'",
+        ),
+        (
+            "conformance corpus record policy seed",
+            "INSERT INTO record_policies(record_id,created_at) SELECT id,'2026-01-01T00:00:00.000Z' FROM records WHERE id LIKE 'conf:%'",
+        ),
+        (
+            "conformance corpus policy entry seed",
+            "INSERT INTO policy_entries(policy_anchor_id,subject_kind,subject_id,effect,capability) VALUES ('conf:common','account','alice','allow','view'),('conf:common','account','bea','allow','view'),('conf:alice','account','alice','allow','view'),('conf:bea','account','bea','allow','view'),('conf:sort-a','account','alice','allow','view'),('conf:sort-b','account','alice','allow','view'),('conf:sort-c','account','alice','allow','view')",
         ),
         (
             "query_sql two-principal record policy seed",

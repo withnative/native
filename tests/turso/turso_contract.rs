@@ -5,7 +5,8 @@
 use crate::contract::{
     scenarios, ContractHarness, DeliveredMessageFixture, TestCaller, TursoHarness,
 };
-use serde_json::json;
+use native_ce::mentions::{scan_body, MENTION_PARSER_VERSION};
+use serde_json::{json, Value};
 use sha2::Digest;
 
 #[tokio::test]
@@ -62,10 +63,10 @@ async fn turso_local_describe_schema_is_normalized_allowlisted_and_owner_gated()
     assert_eq!(owner["engine"]["storage_profile"], "turso-local");
     assert_eq!(
         owner["engine"]["ddl_fingerprint"],
-        "3b147534372585937388cc3868bce30d3b2bacf837d3378b5cc4792198a37dc9"
+        "cb602bcd40071ca3e66a1b3ca41f4f3fafa0024d2fd448204b72d697f4bcb9c9"
     );
-    assert_eq!(owner["tables"].as_array().unwrap().len(), 33);
-    assert_eq!(owner["ddl_statements"].as_array().unwrap().len(), 87);
+    assert_eq!(owner["tables"].as_array().unwrap().len(), 34);
+    assert_eq!(owner["ddl_statements"].as_array().unwrap().len(), 90);
     let ddl = owner["ddl_statements"]
         .as_array()
         .unwrap()
@@ -698,4 +699,458 @@ async fn turso_record_lifecycle_and_references(
         "the Turso prefix range must use the record primary-key path: {plan}"
     );
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// record_mentions current-state projection (plan a9392df slice 4).
+//
+// The Turso adapter serves no product read for `record_mentions`, so these
+// tests read the folded rows through a raw local connection. Every test also
+// asserts replay equivalence, which snapshots the same table and folds the
+// captured event log back through the Turso projector.
+// ---------------------------------------------------------------------------
+
+const MENTION_BODY_A: &str = "See abc1234 and [[My Note]] end.";
+const MENTION_BODY_B: &str = "Now https://n8v.to/def5678 only.";
+
+async fn raw_local_connection(
+    database: &<TursoHarness as ContractHarness>::Database,
+) -> (turso::Database, turso::Connection) {
+    let path = database.runtime_for_test().unwrap().path().to_path_buf();
+    let raw = turso::Builder::new_local(path.to_str().unwrap())
+        .experimental_index_method(true)
+        .build()
+        .await
+        .unwrap();
+    let connection = raw.connect().unwrap();
+    (raw, connection)
+}
+
+async fn mention_rows(
+    database: &<TursoHarness as ContractHarness>::Database,
+    source_id: &str,
+) -> Vec<Value> {
+    let (raw, connection) = raw_local_connection(database).await;
+    let mut rows = connection
+        .query(
+            "SELECT occurrence_ix, source_event_seq, span_start, span_end, \
+             authored_reference, lookup_key, form, parser_version \
+             FROM record_mentions WHERE source_id=?1 ORDER BY occurrence_ix",
+            [source_id.to_string()],
+        )
+        .await
+        .unwrap();
+    let mut values = Vec::new();
+    while let Some(row) = rows.next().await.unwrap() {
+        values.push(json!({
+            "occurrence_ix": row.get::<i64>(0).unwrap(),
+            "source_event_seq": row.get::<i64>(1).unwrap(),
+            "span_start": row.get::<i64>(2).unwrap(),
+            "span_end": row.get::<i64>(3).unwrap(),
+            "authored_reference": row.get::<String>(4).unwrap(),
+            "lookup_key": row.get::<String>(5).unwrap(),
+            "form": row.get::<String>(6).unwrap(),
+            "parser_version": row.get::<i64>(7).unwrap(),
+        }));
+    }
+    drop(rows);
+    drop(connection);
+    drop(raw);
+    values
+}
+
+async fn stored_body(
+    database: &<TursoHarness as ContractHarness>::Database,
+    record_id: &str,
+) -> Option<String> {
+    let (raw, connection) = raw_local_connection(database).await;
+    let mut rows = connection
+        .query(
+            "SELECT body FROM records WHERE id=?1",
+            [record_id.to_string()],
+        )
+        .await
+        .unwrap();
+    let value = rows
+        .next()
+        .await
+        .unwrap()
+        .and_then(|row| row.get::<Option<String>>(0).unwrap());
+    drop(rows);
+    drop(connection);
+    drop(raw);
+    value
+}
+
+async fn latest_content_seq(
+    database: &<TursoHarness as ContractHarness>::Database,
+    record_id: &str,
+) -> i64 {
+    let (raw, connection) = raw_local_connection(database).await;
+    let mut rows = connection
+        .query(
+            "SELECT MAX(seq) FROM content_events WHERE record_id=?1",
+            [record_id.to_string()],
+        )
+        .await
+        .unwrap();
+    let value = rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap();
+    drop(rows);
+    drop(connection);
+    drop(raw);
+    value
+}
+
+fn expected_mention_rows(source_event_seq: i64, body: &str) -> Vec<Value> {
+    scan_body(body)
+        .iter()
+        .enumerate()
+        .map(|(occurrence_ix, occurrence)| {
+            json!({
+                "occurrence_ix": occurrence_ix as i64,
+                "source_event_seq": source_event_seq,
+                "span_start": occurrence.span_start as i64,
+                "span_end": occurrence.span_end as i64,
+                "authored_reference": occurrence.authored_reference.clone(),
+                "lookup_key": occurrence.lookup_key.clone(),
+                "form": occurrence.form.as_str(),
+                "parser_version": MENTION_PARSER_VERSION,
+            })
+        })
+        .collect()
+}
+
+async fn create_mention_record(
+    harness: &TursoHarness,
+    database: &<TursoHarness as ContractHarness>::Database,
+    id: &str,
+    body: Value,
+) {
+    harness
+        .call(
+            database,
+            TestCaller::Local,
+            "create_record",
+            json!({
+                "id": id,
+                "type": "Document",
+                "kind": "note",
+                "name": "mention fold",
+                "body": body,
+                "reason": "Fold current-body record mentions."
+            }),
+        )
+        .await
+        .unwrap();
+}
+
+async fn update_mention_record(
+    harness: &TursoHarness,
+    database: &<TursoHarness as ContractHarness>::Database,
+    id: &str,
+    fields: Value,
+) {
+    let mut arguments = fields.as_object().unwrap().clone();
+    if arguments.contains_key("body") {
+        // A whole-body replacement of an already-non-empty body is guarded.
+        let current = stored_body(database, id).await;
+        let digest = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(
+            current.as_deref().unwrap_or("").as_bytes(),
+        ));
+        arguments.insert("if_body_digest".into(), json!(digest));
+    }
+    arguments.insert("id".into(), json!(id));
+    arguments.insert("reason".into(), json!("Update the mention fixture."));
+    harness
+        .call(
+            database,
+            TestCaller::Local,
+            "update_record",
+            Value::Object(arguments),
+        )
+        .await
+        .unwrap();
+}
+
+async fn delete_mention_record(
+    harness: &TursoHarness,
+    database: &<TursoHarness as ContractHarness>::Database,
+    id: &str,
+) {
+    harness
+        .call(
+            database,
+            TestCaller::Local,
+            "delete_record",
+            json!({"id": id, "reason": "Remove the mention fixture."}),
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn turso_local_create_folds_current_body_mentions() {
+    let harness = TursoHarness::new();
+    let database = harness.fresh_logical_database().await.unwrap();
+    let id = "9f000000-0000-4000-8000-000000000001";
+    create_mention_record(&harness, &database, id, json!(MENTION_BODY_A)).await;
+    let seq = latest_content_seq(&database, id).await;
+    let rows = mention_rows(&database, id).await;
+    assert_eq!(rows, expected_mention_rows(seq, MENTION_BODY_A));
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert!(rows.iter().all(|row| row["parser_version"] == 1));
+    harness.assert_replay_equivalent(&database).await.unwrap();
+    harness.close(&database).await;
+}
+
+#[tokio::test]
+async fn turso_local_create_without_mentions_leaves_no_rows() {
+    let harness = TursoHarness::new();
+    let database = harness.fresh_logical_database().await.unwrap();
+    for (id, body) in [
+        ("9f000000-0000-4000-8000-000000000002", json!(null)),
+        ("9f000000-0000-4000-8000-000000000003", json!("")),
+        (
+            "9f000000-0000-4000-8000-000000000004",
+            json!("plain prose without references"),
+        ),
+    ] {
+        create_mention_record(&harness, &database, id, body).await;
+        assert!(mention_rows(&database, id).await.is_empty());
+    }
+    harness.assert_replay_equivalent(&database).await.unwrap();
+    harness.close(&database).await;
+}
+
+#[tokio::test]
+async fn turso_local_body_update_replaces_mentions_with_new_provenance() {
+    let harness = TursoHarness::new();
+    let database = harness.fresh_logical_database().await.unwrap();
+    let id = "9f000000-0000-4000-8000-000000000005";
+    create_mention_record(&harness, &database, id, json!(MENTION_BODY_A)).await;
+    update_mention_record(&harness, &database, id, json!({"body": MENTION_BODY_B})).await;
+    let seq = latest_content_seq(&database, id).await;
+    let rows = mention_rows(&database, id).await;
+    assert_eq!(rows, expected_mention_rows(seq, MENTION_BODY_B));
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    // Old occurrences are absent: replacement, never accumulation.
+    assert!(!rows
+        .iter()
+        .any(|row| row["authored_reference"] == "abc1234"));
+    assert!(!rows
+        .iter()
+        .any(|row| row["authored_reference"] == "My Note"));
+    harness.assert_replay_equivalent(&database).await.unwrap();
+    harness.close(&database).await;
+}
+
+#[tokio::test]
+async fn turso_local_metadata_only_update_preserves_mention_provenance() {
+    let harness = TursoHarness::new();
+    let database = harness.fresh_logical_database().await.unwrap();
+    let id = "9f000000-0000-4000-8000-000000000006";
+    create_mention_record(&harness, &database, id, json!(MENTION_BODY_A)).await;
+    let before_seq = latest_content_seq(&database, id).await;
+    let before = mention_rows(&database, id).await;
+    assert_eq!(before.len(), 2);
+    update_mention_record(
+        &harness,
+        &database,
+        id,
+        json!({"name": "renamed", "summary": "touched"}),
+    )
+    .await;
+    // A new event exists, but the body it carries is unchanged.
+    assert!(latest_content_seq(&database, id).await > before_seq);
+    assert_eq!(mention_rows(&database, id).await, before);
+    assert_eq!(
+        mention_rows(&database, id).await,
+        expected_mention_rows(before_seq, MENTION_BODY_A)
+    );
+    harness.assert_replay_equivalent(&database).await.unwrap();
+    harness.close(&database).await;
+}
+
+#[tokio::test]
+async fn turso_local_null_or_empty_body_update_leaves_no_mentions() {
+    let harness = TursoHarness::new();
+    let database = harness.fresh_logical_database().await.unwrap();
+    let id = "9f000000-0000-4000-8000-000000000007";
+    create_mention_record(&harness, &database, id, json!(MENTION_BODY_A)).await;
+    assert_eq!(mention_rows(&database, id).await.len(), 2);
+    update_mention_record(&harness, &database, id, json!({"body": null})).await;
+    assert!(mention_rows(&database, id).await.is_empty());
+    // Re-adding a body folds it again under the re-add event's sequence.
+    update_mention_record(&harness, &database, id, json!({"body": MENTION_BODY_B})).await;
+    let seq = latest_content_seq(&database, id).await;
+    assert_eq!(
+        mention_rows(&database, id).await,
+        expected_mention_rows(seq, MENTION_BODY_B)
+    );
+    update_mention_record(&harness, &database, id, json!({"body": ""})).await;
+    assert!(mention_rows(&database, id).await.is_empty());
+    harness.assert_replay_equivalent(&database).await.unwrap();
+    harness.close(&database).await;
+}
+
+#[tokio::test]
+async fn turso_local_delete_removes_mentions() {
+    let harness = TursoHarness::new();
+    let database = harness.fresh_logical_database().await.unwrap();
+    let id = "9f000000-0000-4000-8000-000000000008";
+    create_mention_record(&harness, &database, id, json!(MENTION_BODY_A)).await;
+    assert_eq!(mention_rows(&database, id).await.len(), 2);
+    delete_mention_record(&harness, &database, id).await;
+    assert!(mention_rows(&database, id).await.is_empty());
+    harness.assert_replay_equivalent(&database).await.unwrap();
+    harness.close(&database).await;
+}
+
+/// The product `update_record` handler refuses a non-string body, so this
+/// reaches the projector through the raw append seam. `records.body` is TEXT,
+/// so the fold must scan the value's JSON rendering rather than skip the
+/// update, or a string->non-string transition would drift between live
+/// folding, the migration backfill (which reads the stored column) and replay.
+#[tokio::test]
+async fn turso_local_non_string_body_update_scans_stored_json_text() {
+    let harness = TursoHarness::new();
+    let database = harness.fresh_logical_database().await.unwrap();
+    let id = "9f000000-0000-4000-8000-000000000009";
+    create_mention_record(&harness, &database, id, json!(MENTION_BODY_A)).await;
+    assert_eq!(mention_rows(&database, id).await.len(), 2);
+    for (value, stored) in [
+        (
+            json!({"note": "keep abc1234 in mind"}),
+            r#"{"note":"keep abc1234 in mind"}"#,
+        ),
+        (
+            json!(["deadbee and [[Wiki Name]]"]),
+            r#"["deadbee and [[Wiki Name]]"]"#,
+        ),
+    ] {
+        harness
+            .append_record_updated_for_test(&database, id, json!({"body": value}))
+            .await
+            .unwrap();
+        assert_eq!(stored_body(&database, id).await.as_deref(), Some(stored));
+        let seq = latest_content_seq(&database, id).await;
+        assert_eq!(
+            mention_rows(&database, id).await,
+            expected_mention_rows(seq, stored)
+        );
+    }
+    harness.assert_replay_equivalent(&database).await.unwrap();
+    harness.close(&database).await;
+}
+
+/// `coerce_body` renders booleans and numbers as the `TEXT` affinity would, so
+/// a boolean or numeric replacement must fold that stored text (no references,
+/// no rows) rather than leaving the previous body's rows in place.
+#[tokio::test]
+async fn turso_local_boolean_and_numeric_bodies_replace_mentions() {
+    let harness = TursoHarness::new();
+    let database = harness.fresh_logical_database().await.unwrap();
+    let id = "9f000000-0000-4000-8000-000000000017";
+    create_mention_record(&harness, &database, id, json!(MENTION_BODY_A)).await;
+    assert_eq!(mention_rows(&database, id).await.len(), 2);
+    for (value, stored) in [(json!(true), "1"), (json!(0), "0"), (json!(42), "42")] {
+        harness
+            .append_record_updated_for_test(&database, id, json!({"body": value}))
+            .await
+            .unwrap();
+        assert_eq!(stored_body(&database, id).await.as_deref(), Some(stored));
+        assert!(mention_rows(&database, id).await.is_empty());
+    }
+    harness.assert_replay_equivalent(&database).await.unwrap();
+    harness.close(&database).await;
+}
+
+/// A body write that fails after its handler but before commit must roll back
+/// its mention replacement with the rest of the transaction, leaving the
+/// previous body's rows and provenance intact.
+#[tokio::test]
+async fn turso_local_failed_body_write_rolls_back_mention_rows() {
+    let harness = TursoHarness::new();
+    let database = harness.fresh_logical_database().await.unwrap();
+    let id = "9f000000-0000-4000-8000-000000000018";
+    create_mention_record(&harness, &database, id, json!(MENTION_BODY_A)).await;
+    let seq = latest_content_seq(&database, id).await;
+    let before = mention_rows(&database, id).await;
+    assert_eq!(before, expected_mention_rows(seq, MENTION_BODY_A));
+
+    database
+        .runtime_for_test()
+        .unwrap()
+        .contract_arm_post_handler_write_failure("update_record");
+    let digest = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(
+        MENTION_BODY_A.as_bytes(),
+    ));
+    let error = harness
+        .call(
+            &database,
+            TestCaller::Local,
+            "update_record",
+            json!({
+                "id": id,
+                "body": MENTION_BODY_B,
+                "if_body_digest": digest,
+                "reason": "Force post-handler mention rollback."
+            }),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("forced update_record failure"), "{error}");
+    assert_eq!(mention_rows(&database, id).await, before);
+    assert_eq!(
+        mention_rows(&database, id).await,
+        expected_mention_rows(seq, MENTION_BODY_A)
+    );
+    harness.assert_replay_equivalent(&database).await.unwrap();
+    harness.close(&database).await;
+}
+
+#[tokio::test]
+async fn turso_local_mentions_replay_equivalent_after_mixed_history() {
+    let harness = TursoHarness::new();
+    let database = harness.fresh_logical_database().await.unwrap();
+    let kept = "9f000000-0000-4000-8000-000000000011";
+    let replaced = "9f000000-0000-4000-8000-000000000012";
+    let renamed = "9f000000-0000-4000-8000-000000000013";
+    let emptied = "9f000000-0000-4000-8000-000000000014";
+    let tombstoned = "9f000000-0000-4000-8000-000000000015";
+    let plain = "9f000000-0000-4000-8000-000000000016";
+
+    create_mention_record(&harness, &database, kept, json!(MENTION_BODY_A)).await;
+    create_mention_record(&harness, &database, replaced, json!(MENTION_BODY_A)).await;
+    update_mention_record(
+        &harness,
+        &database,
+        replaced,
+        json!({"body": MENTION_BODY_B}),
+    )
+    .await;
+    create_mention_record(&harness, &database, renamed, json!(MENTION_BODY_B)).await;
+    update_mention_record(
+        &harness,
+        &database,
+        renamed,
+        json!({"summary": "metadata only"}),
+    )
+    .await;
+    create_mention_record(&harness, &database, emptied, json!(MENTION_BODY_A)).await;
+    update_mention_record(&harness, &database, emptied, json!({"body": null})).await;
+    create_mention_record(&harness, &database, tombstoned, json!(MENTION_BODY_A)).await;
+    delete_mention_record(&harness, &database, tombstoned).await;
+    create_mention_record(&harness, &database, plain, json!("no references here")).await;
+
+    assert_eq!(mention_rows(&database, kept).await.len(), 2);
+    assert_eq!(mention_rows(&database, replaced).await.len(), 1);
+    assert_eq!(mention_rows(&database, renamed).await.len(), 1);
+    assert!(mention_rows(&database, emptied).await.is_empty());
+    assert!(mention_rows(&database, tombstoned).await.is_empty());
+    assert!(mention_rows(&database, plain).await.is_empty());
+
+    harness.assert_replay_equivalent(&database).await.unwrap();
+    harness.close(&database).await;
 }

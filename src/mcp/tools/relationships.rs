@@ -22,7 +22,7 @@ use crate::relationship::{
 };
 use crate::{Db, Error, Result};
 
-use super::{can_record_in, parse_args, require_record_in};
+use super::{can_record_in, echo_act, parse_args, require_record_in};
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -139,6 +139,7 @@ async fn manage_relationships(db: Db, caller: Caller, arguments: Value) -> Resul
         } => {
             require_idempotency_key(&idempotency_key)?;
             let mut tx = crate::db::begin_write(db.write_pool()).await?;
+            let mut act_alloc = crate::act::ActAllocation::new();
             let result = async {
                 let definition = definition(&relationship_type)?;
                 let created = resolve_new_relationship_in(
@@ -198,7 +199,12 @@ async fn manage_relationships(db: Db, caller: Caller, arguments: Value) -> Resul
                     let assertion_id = spec.stream_id.clone();
                     let relationship_id = existing.coordinate.relationship_id.clone();
                     let event_id = spec.event_id.clone();
-                    crate::relationship::append_relationship_event_in(&mut tx, &spec).await?;
+                    crate::relationship::append_relationship_event_in(
+                        &mut tx,
+                        &spec,
+                        &mut act_alloc,
+                    )
+                    .await?;
                     (
                         relationship_id,
                         assertion_id,
@@ -219,8 +225,12 @@ async fn manage_relationships(db: Db, caller: Caller, arguments: Value) -> Resul
                         ActionOutput::relationship(command.relationship_event.event_id.clone()),
                         ActionOutput::relationship(command.assertion_event.event_id.clone()),
                     ];
-                    crate::relationship::create_relationship_with_assertion_in(&mut tx, &command)
-                        .await?;
+                    crate::relationship::create_relationship_with_assertion_in(
+                        &mut tx,
+                        &command,
+                        &mut act_alloc,
+                    )
+                    .await?;
                     (relationship_id, assertion_id, outputs)
                 };
                 let output_events = outputs
@@ -242,7 +252,8 @@ async fn manage_relationships(db: Db, caller: Caller, arguments: Value) -> Resul
                 ))
             }
             .await;
-            finish_write(&db, tx, result).await
+            let act = act_alloc.get();
+            finish_write(&db, tx, result, act).await
         }
         ManageRelationshipsArgs::Contest {
             relationship_origin_db_id,
@@ -254,6 +265,7 @@ async fn manage_relationships(db: Db, caller: Caller, arguments: Value) -> Resul
         } => {
             require_idempotency_key(&idempotency_key)?;
             let mut tx = crate::db::begin_write(db.write_pool()).await?;
+            let mut act_alloc = crate::act::ActAllocation::new();
             let result = async {
                 let relationship = load_relationship_in(
                     &mut tx,
@@ -319,7 +331,8 @@ async fn manage_relationships(db: Db, caller: Caller, arguments: Value) -> Resul
                 let assertion_id = spec.stream_id.clone();
                 let event_id = spec.event_id.clone();
                 let assertion_stream_version = spec.stream_version()?;
-                crate::relationship::append_relationship_event_in(&mut tx, &spec).await?;
+                crate::relationship::append_relationship_event_in(&mut tx, &spec, &mut act_alloc)
+                    .await?;
                 crate::provenance::issue_action_attestation_outputs_in(
                     &mut tx,
                     draft,
@@ -339,7 +352,8 @@ async fn manage_relationships(db: Db, caller: Caller, arguments: Value) -> Resul
                 ))
             }
             .await;
-            finish_write(&db, tx, result).await
+            let act = act_alloc.get();
+            finish_write(&db, tx, result, act).await
         }
         ManageRelationshipsArgs::AddEvidence {
             assertion_issuer_origin_db_id,
@@ -351,6 +365,7 @@ async fn manage_relationships(db: Db, caller: Caller, arguments: Value) -> Resul
             require_idempotency_key(&idempotency_key)?;
             require_nonblank("reason", &reason)?;
             let mut tx = crate::db::begin_write(db.write_pool()).await?;
+            let mut act_alloc = crate::act::ActAllocation::new();
             let result = async {
                 let assertion = authorize_assertion_mutation_in(
                     &mut tx,
@@ -400,7 +415,8 @@ async fn manage_relationships(db: Db, caller: Caller, arguments: Value) -> Resul
                 )?;
                 let event_id = spec.event_id.clone();
                 let assertion_stream_version = spec.stream_version()?;
-                crate::relationship::append_relationship_event_in(&mut tx, &spec).await?;
+                crate::relationship::append_relationship_event_in(&mut tx, &spec, &mut act_alloc)
+                    .await?;
                 crate::provenance::issue_action_attestation_outputs_in(
                     &mut tx,
                     draft,
@@ -419,7 +435,8 @@ async fn manage_relationships(db: Db, caller: Caller, arguments: Value) -> Resul
                 Ok((receipt, true))
             }
             .await;
-            finish_write(&db, tx, result).await
+            let act = act_alloc.get();
+            finish_write(&db, tx, result, act).await
         }
         ManageRelationshipsArgs::Retract {
             assertion_issuer_origin_db_id,
@@ -430,6 +447,7 @@ async fn manage_relationships(db: Db, caller: Caller, arguments: Value) -> Resul
             require_idempotency_key(&idempotency_key)?;
             require_nonblank("reason", &reason)?;
             let mut tx = crate::db::begin_write(db.write_pool()).await?;
+            let mut act_alloc = crate::act::ActAllocation::new();
             let result = async {
                 let assertion = authorize_assertion_mutation_in(
                     &mut tx,
@@ -469,7 +487,8 @@ async fn manage_relationships(db: Db, caller: Caller, arguments: Value) -> Resul
                 )?;
                 let event_id = spec.event_id.clone();
                 let assertion_stream_version = spec.stream_version()?;
-                crate::relationship::append_relationship_event_in(&mut tx, &spec).await?;
+                crate::relationship::append_relationship_event_in(&mut tx, &spec, &mut act_alloc)
+                    .await?;
                 crate::provenance::issue_action_attestation_outputs_in(
                     &mut tx,
                     draft,
@@ -489,7 +508,8 @@ async fn manage_relationships(db: Db, caller: Caller, arguments: Value) -> Resul
                 ))
             }
             .await;
-            finish_write(&db, tx, result).await
+            let act = act_alloc.get();
+            finish_write(&db, tx, result, act).await
         }
         ManageRelationshipsArgs::Read {
             relationship_origin_db_id,
@@ -552,11 +572,12 @@ async fn finish_write(
     db: &Db,
     tx: Transaction<'static, Sqlite>,
     result: Result<(Value, bool)>,
+    act: Option<i64>,
 ) -> Result<Value> {
     match result {
         Ok((value, true)) => {
             db.commit_content(tx).await?;
-            Ok(value)
+            echo_act(value, act)
         }
         Ok((value, false)) => {
             tx.rollback().await?;
@@ -1158,7 +1179,9 @@ async fn reconstruct_retry_in(
         let (_, evidence_id) = crate::identity::decode_native_record(evidence_ref)?;
         response["evidence_id"] = json!(evidence_id);
     }
-    Ok(response)
+    // A keyed replay returns the original write's act, so the replay receipt
+    // is indistinguishable from the call that did the work.
+    echo_act(response, super::attested_act_in(tx, attestation_id).await?)
 }
 
 async fn read_relationship(

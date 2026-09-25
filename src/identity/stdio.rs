@@ -28,6 +28,7 @@ pub async fn resolve_stdio_account_identity(
     selected_account: Option<&str>,
 ) -> Result<String> {
     let mut tx = crate::db::begin_write(db.write_pool()).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
     let rows = sqlx::query(
         "SELECT record_id, identifier, is_canonical FROM bindings
          WHERE system = 'account'
@@ -61,6 +62,7 @@ pub async fn resolve_stdio_account_identity(
                 }),
                 actor: Some(account_token.clone()),
             },
+            &mut act_alloc,
         )
         .await?;
         crate::identity::add_binding_internal_in(
@@ -71,6 +73,7 @@ pub async fn resolve_stdio_account_identity(
             "account",
             &account_token,
             true,
+            &mut act_alloc,
         )
         .await?;
         crate::instruction_templates::provision_member_in(
@@ -79,6 +82,7 @@ pub async fn resolve_stdio_account_identity(
             &account_token,
             &record_id,
             crate::instruction_templates::MemberProvisioningAuthority::Standalone,
+            &mut act_alloc,
         )
         .await?;
         db.commit_content(tx).await?;
@@ -146,6 +150,7 @@ pub async fn resolve_stdio_account_identity(
         &selected.0,
         &selected.1,
         crate::instruction_templates::MemberProvisioningAuthority::Standalone,
+        &mut act_alloc,
     )
     .await?;
     if changed {
@@ -229,7 +234,9 @@ mod tests {
         let db = db().await;
         let token = resolve_stdio_account_identity(&db, None).await.unwrap();
         assert!(is_account_token(&token), "{token}");
-        assert_eq!(counts(&db).await, (11, 11, 1));
+        // Twelve records/events: the historical eleven plus the seeded guest
+        // onboarding guidance template, which ships on every database.
+        assert_eq!(counts(&db).await, (12, 12, 1));
 
         let row = sqlx::query(
             "SELECT r.type, r.kind, r.name, e.actor, b.system, b.identifier, b.is_canonical
@@ -304,7 +311,8 @@ mod tests {
         let second = resolve_stdio_account_identity(&db, None);
         let (first, second) = tokio::join!(first, second);
         assert_eq!(first.unwrap(), second.unwrap());
-        assert_eq!(counts(&db).await, (11, 11, 1));
+        // Twelve records/events: see above — the guest guidance seed.
+        assert_eq!(counts(&db).await, (12, 12, 1));
         db.close().await;
     }
 

@@ -49,6 +49,36 @@ use crate::error::{Error, Result};
 const BODY_WRITING_TYPES: &str =
     "'record.created','record.updated','receipt.committed.v1','unit.revision.recorded.v1'";
 
+/// SQL twin of [`payload_carries_body`]: the predicate selecting events whose
+/// projection writes `records.body` with a payload value. The two must move
+/// together — a new body-writing event type belongs in both, alongside
+/// [`BODY_WRITING_TYPES`]. `json_type(...) IS NOT NULL` distinguishes an
+/// absent key from an explicit JSON `null`, so a `record.updated` that clears
+/// the body still counts as a writer here.
+pub(crate) const BODY_CARRYING_EVENT_SQL: &str = "(type IN ('record.created','record.updated','receipt.committed.v1') AND json_type(payload,'$.body') IS NOT NULL) OR (type = 'unit.revision.recorded.v1' AND json_type(payload,'$.content.content') IS NOT NULL)";
+
+/// Whether a body-writing event's payload actually carries a body value, so
+/// its projection overwrites `records.body`.
+///
+/// This is the Rust twin of [`BODY_CARRYING_EVENT_SQL`], used by the
+/// revision-3 interchange upgrade to reconstruct the provenance of an
+/// imported current body. Both mirror the projector: a `record.updated` or
+/// `receipt.committed.v1` writes the body only when the payload object has a
+/// `body` key (any JSON type, including `null`), and a
+/// `unit.revision.recorded.v1` writes `content.content`.
+pub(crate) fn payload_carries_body(event_type: &str, payload: &Value) -> bool {
+    match event_type {
+        "record.created" | "record.updated" | "receipt.committed.v1" => {
+            payload.get("body").is_some()
+        }
+        "unit.revision.recorded.v1" => payload
+            .get("content")
+            .and_then(|content| content.get("content"))
+            .is_some(),
+        _ => false,
+    }
+}
+
 /// Coerce an event-payload `body` value the way the projector stores it.
 ///
 /// The projector binds payload values through `push_json_arg` into a `TEXT`
@@ -56,7 +86,12 @@ const BODY_WRITING_TYPES: &str =
 /// and other numbers bind by affinity, both of which `TEXT` affinity renders
 /// as decimal text; arrays and objects are serialized to JSON text in Rust
 /// before binding. `None` is SQL `NULL`.
-fn coerce_body(value: &Value) -> Option<String> {
+///
+/// The live body-mention fold must scan this same text, not just string
+/// bodies: an array or object body is stored as its JSON rendering, and the
+/// migration backfill scans the stored column, so scanning anything else
+/// would make live folding and replay disagree.
+pub(crate) fn coerce_body(value: &Value) -> Option<String> {
     match value {
         Value::Null => None,
         Value::String(body) => Some(body.clone()),

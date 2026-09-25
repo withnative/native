@@ -23,8 +23,11 @@ or change anything it can name:
   reusable exact-pinned modules. The host validates source and inputs, renders
   a safe tree, and reauthorizes mediated interactions when they are invoked.
 - `native.html.v1` renders a self-contained HTML document over exact named,
-  read-only inputs. It has no ambient network access, module import, or
-  mutation surface.
+  read-only inputs. It has no ambient network access or module import. The
+  runtime is `native.html.v1` either way; what changes is the declaration:
+  `native.html.artifact.v1` admits no mutation surface, while
+  `native.html.artifact.v2` declares the same typed `interactions` entries
+  as MDX v2, settled through the commit-on-gesture surface described below.
 
 In both runtimes, “all your data” can only mean records the caller is
 authorized to read and has deliberately bound into that artifact. Input
@@ -143,8 +146,9 @@ exact-source grants. Reusable MDX modules apply the same idea to shared
 presentation code through exact publication pins and explicit port mappings,
 as described below. Adding editing controls requires a declared, supported MDX
 interaction that the host validates and reauthorizes on invocation. An HTML
-version can present the named read-only input but cannot acquire that mutation
-surface.
+version declaring `native.html.artifact.v2` acquires that mutation surface
+through typed interactions; one on v1, or with no interaction declaration,
+stays read-only.
 
 The [artifact row of the capability map](capability-map.md) links the selected
 runtime policy and executable evidence for named inputs, exact-source grants,
@@ -189,9 +193,10 @@ port list in launch headers. Because JavaScript numbers and structured-clone
 delivery cannot preserve arbitrary JSON integers, named HTML resolution fails
 closed before hashing or delivery when any integer is outside
 `[-9007199254740991, 9007199254740991]`; this applies to collection facets and
-governed-SQL rows alike. HTML has no module imports, mutation surface, or
-network authority. Historical governed-SQL relation execution is explicitly
-unsupported and fails closed until a portable replay contract exists. The host
+governed-SQL rows alike. `native.html.artifact.v1` documents have no module
+imports, mutation surface, or network authority. Historical governed-SQL
+relation execution is explicitly unsupported and fails closed until a
+portable replay contract exists. The host
 performs no wall-clock liveness polling of the frame: it arms a
 bootstrap-handshake timeout and one bounded acknowledgement wait per in-place
 input delivery, and nothing else. The frame announces a non-persisted `pagehide`
@@ -215,8 +220,120 @@ version, arrival before initialisation, a non-string digest, or a non-number
 sequence) is dropped silently, and the host's bounded wait then relaunches.
 Any answer other than `input-applied` within that one bounded wait, or a
 changed body digest, replaces the frame with a fresh one-use launch exactly
-as before. The message set is additive under `native.html.bridge.v1`; a
-document that never subscribes sees no change in behaviour.
+as before.
+
+A document may also hand its own view state to the frame that replaces it.
+`nativeArtifact.setViewState(value, { schema })` publishes eagerly: the value
+must survive a pristine JSON round-trip inside the same 65536-byte bound as an
+intent, the optional `schema` is an advisory intent id, and a violation is a
+synchronous `TypeError` at the call site rather than a silent loss. Publishes
+are coalesced to at most one posted message per animation frame, latest wins,
+and before the port opens a waiting view state occupies one reserved slot in
+the 32-slot queue rather than accumulating. There is deliberately **no
+acknowledgement and no bounded wait**: no host decision rides on this message,
+so unlike input delivery it adds no wall-clock liveness surface, and a lost
+publish simply means the successor cold-boots. The host holds one opaque blob
+per artifact identity, in memory, never inspecting `value` — it influences no
+digest, no authorisation decision and no render decision — and stamps it with
+the body digest that published it rather than trusting the frame for that. The
+blob survives a body-digest relaunch and the reload-recovery path, and is
+cleared with the hold on a settled refusal or denial, on an artifact identity
+change, and on unmount. The successor receives it as an optional `view_state`
+field in `native-html-init`, deep-frozen and exposed as
+`nativeArtifact.viewState` and in the `ready` resolution, carrying `value`, the
+advisory `schema`, and `from_body_digest`. **`schema` is the evidence a
+successor can act on** when deciding whether it understands what it was handed.
+`from_body_digest` names the body that published the blob, but the init message
+does not tell a document its own body digest, so a successor has nothing to
+compare it against: treat it as provenance for the host and for debugging,
+not as something authored code can branch on. Restoration is the author's
+responsibility and best-effort by construction. Because the successor body can
+read whatever the predecessor published, **view state is for view state**:
+authors must not put secrets or unsaved user content in it. The verifier
+harness never sends one, so `nativeArtifact.viewState` is always `undefined`
+under verification, which is always a cold boot.
+
+The message set is additive under `native.html.bridge.v1`; a document that
+never subscribes and never publishes sees no change in behaviour. The
+host-mediated navigation message carries the gesture disposition the same
+additive way: `newTab: true` when the trusted in-frame click held
+Ctrl/Cmd or was a middle-click, absent for a same-tab click. The host
+refuses any other disposition shape, keeps the existing user-activation and
+destination checks, and still resolves the named record under the viewer's
+own authenticated read — naming a record never preauthorizes it.
+
+### HTML write settlement (`native.html.artifact.v2`)
+
+A v2 document declares typed `interactions` — the same shape as MDX v2 — in
+the existing inert manifest element, requests `input.read` per exposed port
+(there is no separate write-proposal grant), and proposes declared writes
+from authored JavaScript with `nativeArtifact.propose()`. A newer proposal
+supersedes an older one still awaiting review; only a write already being
+applied cannot be torn down. The host
+supplies artifact and source identity, observed compare-and-set versions, and
+idempotency; none of those belong in the proposal.
+
+Settlement is commit-on-gesture with the Apply tray as the fallback. Two
+layers gate the ungated path. The frame runtime marks a proposal
+gesture-backed only when it is made during dispatch of a terminal trusted
+gesture event (`click`, `drop`); the host additionally requires its own
+`navigator.userActivation`. The mark is necessary and never sufficient. A
+declared, in-scope, reversible write then commits on the gesture,
+optimistically, with no Apply step. Everything else keeps the Apply step: a
+proposal made outside a completed gesture still reaches the host and routes
+to the tray — it does not throw and is not silently dropped — as does any
+proposal where `userActivation` is unsupported, which degrades to the tray
+rather than failing. A proposal outside the declaration is rejected with a
+brief reason, never escalated to a dialog.
+
+A write committed on the gesture leaves a host-owned settled-change trace
+rendered outside the artifact's layout, carrying a real reversal: the
+reversal goes through an ordinary declared entry with the commit's
+compare-and-set token and reports a conflict rather than overwriting. A
+write committed through the Apply tray leaves no trace; the host shows a
+transient notice instead. Effects with no derivable inverse keep their
+Apply step — record creation has no inverse the artifact can assert, so it
+stays gated — and therefore never become traces at all. A trace can still
+carry a disabled reversal: when the commit returned no post-write version
+to check against, or when a later declaration change removed every entry
+able to assert the prior value, the reversal is disabled with a plain
+reason.
+
+Reversibility is resolved against the value the write replaced, which has a
+consequence worth knowing before authoring: **a `facet.set` on a facet that
+can be absent needs a `facet.unset` declared on the same facet, or a write
+replacing an absent value is not reversible.** Only a `facet.unset` entry can
+assert an absent prior value, so without one the inverse of "absent becomes
+set" does not exist, the write is not `immediate`, and it routes to the Apply
+tray even though the artifact and the gesture are both valid. The prior value
+is read per record, so this is the first write to a *given* record's facet,
+not one first write overall.
+
+The same resolution decides every later write. One replacing a present value
+commits on the gesture when a declared `facet.set` can assert that value — so
+for a toggle-shaped facet, whose declaration covers everything the facet can
+hold, the symptom is a tray that appears only the first time. A facet holding
+a value that came from outside the declaration — a direct edit, another
+artifact, a creation default — keeps routing to the tray until it holds a
+covered value, however many writes in.
+
+Two adjacent constraints show up in the same place. A declared facet value
+must be a string, number or object: booleans are refused, because the stored
+form has no representation for one, so a boolean-ish facet carries `"true"`
+and `"false"` as strings. And a `facet.unset` entry declares no value at all,
+since it has none to write, nor any value slot — anything but its one
+`bound_input` record slot is refused as declared but unused.
+
+Two boundaries are not obvious. Relation-envelope rows never enter a write
+interaction's `bound_input` domain, so a governed-SQL-fed view cannot be
+written through; writable slots require Collection-envelope inputs.
+Engine-dispatched facet keys (`archived`, `runtime`) and `owner` are not
+writable through an interaction at all: declaring them is refused outright
+rather than gated through the tray. `Annotation`/`comment` creation is
+refused as a specialized governed workflow. Known limits: a pointer-event
+drag producing neither `click` nor `drop` cannot arm a proposal, and a
+widget proposing only from `keydown` never earns the gesture mark, so both
+settle through the tray at best.
 
 ## `native.mdx.v1`
 
@@ -667,10 +784,13 @@ manifest's `port` into a grant is refused, and the refusal says so. Effective au
 current opener authority, and runtime support. Grants do not transfer to a
 later source or publication event, so an edit or upgrade with new or broadened
 authority cannot activate silently. The one exception carries authority forward
-without broadening it: when a body edit leaves the declaration surface digest
-unchanged, each existing grant is re-issued against the new exact source only if
-that source still requests the identical capability and scope, and is dropped
-and reported otherwise. A publication upgrade never carries. Record consumption
+without broadening it: when a body edit leaves a port's declaration unchanged,
+each binding and grant on that port is re-issued against the new exact source
+only if that source still requests the identical capability and scope, and is
+dropped and reported otherwise. A grant naming no port (user-gesture
+navigation) carries whenever its request is still declared, regardless of input
+changes; a changed port drops only its own binding and grants, and adding a
+port drops nothing. A publication upgrade never carries. Record consumption
 authorization remains independent from runtime grants.
 
 V2 compilation is a forward-command concern, never a projector concern.

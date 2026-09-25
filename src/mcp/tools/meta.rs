@@ -284,6 +284,7 @@ use crate::schema::{ENGINE_RESERVED_FACET_KEYS, SPINE_FACET_KEYS};
 
 use super::super::registry::{Caller, ToolRegistry};
 use super::super::ToolKind;
+use super::echo_act;
 use super::parse_args;
 
 // ---------------------------------------------------------------------------
@@ -456,10 +457,12 @@ async fn manage_vocabularies(db: Db, caller: Caller, arguments: Value) -> Result
         mutation => {
             let expected_revision = mutation.schema_state_revision().map(ToString::to_string);
             let mut tx = crate::db::begin_write(db.write_pool()).await?;
+            let mut act_alloc = crate::act::ActAllocation::new();
             assert_schema_state_revision_in(&mut tx, expected_revision.as_deref()).await?;
-            let result = apply_vocabulary_mutation_in(&mut tx, &caller, mutation).await?;
+            let result =
+                apply_vocabulary_mutation_in(&mut tx, &caller, mutation, &mut act_alloc).await?;
             tx.commit().await?;
-            Ok(result)
+            Ok(echo_act(result, act_alloc.get())?)
         }
     }
 }
@@ -548,13 +551,16 @@ async fn apply_vocabulary_mutation_in(
     tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
     caller: &Caller,
     args: ManageVocabulariesArgs,
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<Value> {
     match args {
         ManageVocabulariesArgs::ListValues { .. } => Err(Error::engine(
             "manage_vocabularies list_values is not a mutation",
         )),
         ManageVocabulariesArgs::CreateVocabulary { name, id, .. } => {
-            let id = create_vocabulary_in(tx, &name, id.as_deref(), Some(caller.actor())).await?;
+            let id =
+                create_vocabulary_in(tx, &name, id.as_deref(), Some(caller.actor()), act_alloc)
+                    .await?;
             Ok(json!({
                 "vocabulary_id": id,
                 "name": name,
@@ -579,6 +585,7 @@ async fn apply_vocabulary_mutation_in(
                 terminality,
                 metadata.clone(),
                 Some(caller.actor()),
+                act_alloc,
             )
             .await?;
             let status = get_value_on(tx, &value_id).await?.status;
@@ -595,29 +602,47 @@ async fn apply_vocabulary_mutation_in(
         ManageVocabulariesArgs::SetMetadata {
             value_id, metadata, ..
         } => {
-            set_value_metadata_in(tx, &value_id, metadata.clone(), Some(caller.actor())).await?;
+            set_value_metadata_in(
+                tx,
+                &value_id,
+                metadata.clone(),
+                Some(caller.actor()),
+                act_alloc,
+            )
+            .await?;
             Ok(json!({ "value_id": value_id, "metadata": metadata }))
         }
         ManageVocabulariesArgs::ReorderValue {
             value_id, ordinal, ..
         } => {
-            reorder_value_in(tx, &value_id, ordinal, Some(caller.actor())).await?;
+            reorder_value_in(tx, &value_id, ordinal, Some(caller.actor()), act_alloc).await?;
             Ok(json!({ "value_id": value_id, "ordinal": ordinal, "reordered": true }))
         }
         ManageVocabulariesArgs::SetGloss {
             value_id, gloss, ..
         } => {
-            set_gloss_in(tx, &value_id, gloss.as_deref(), Some(caller.actor())).await?;
+            set_gloss_in(
+                tx,
+                &value_id,
+                gloss.as_deref(),
+                Some(caller.actor()),
+                act_alloc,
+            )
+            .await?;
             Ok(json!({ "value_id": value_id, "gloss": gloss, "gloss_set": true }))
         }
         ManageVocabulariesArgs::PromoteValue { value_id, .. } => {
-            promote_value_in(tx, &value_id, Some(caller.actor())).await?;
+            promote_value_in(tx, &value_id, Some(caller.actor()), act_alloc).await?;
             Ok(json!({ "value_id": value_id, "status": "active" }))
         }
         ManageVocabulariesArgs::DeprecateValue { value_id, .. } => {
-            let quarantined_records =
-                deprecate_value_with_quarantine_count_in(tx, &value_id, Some(caller.actor()))
-                    .await?;
+            let quarantined_records = deprecate_value_with_quarantine_count_in(
+                tx,
+                &value_id,
+                Some(caller.actor()),
+                act_alloc,
+            )
+            .await?;
             Ok(json!({
                 "value_id": value_id,
                 "status": "deprecated",
@@ -629,7 +654,14 @@ async fn apply_vocabulary_mutation_in(
             canonical_id,
             ..
         } => {
-            alias_value_in(tx, &value_id, &canonical_id, Some(caller.actor())).await?;
+            alias_value_in(
+                tx,
+                &value_id,
+                &canonical_id,
+                Some(caller.actor()),
+                act_alloc,
+            )
+            .await?;
             Ok(json!({
                 "value_id": value_id,
                 "alias_of": canonical_id,
@@ -637,11 +669,11 @@ async fn apply_vocabulary_mutation_in(
             }))
         }
         ManageVocabulariesArgs::DeleteValue { value_id, .. } => {
-            delete_value_in(tx, &value_id, Some(caller.actor())).await?;
+            delete_value_in(tx, &value_id, Some(caller.actor()), act_alloc).await?;
             Ok(json!({ "value_id": value_id, "deleted": true }))
         }
         ManageVocabulariesArgs::DeleteVocabulary { vocabulary, .. } => {
-            delete_vocabulary_in(tx, &vocabulary, Some(caller.actor())).await?;
+            delete_vocabulary_in(tx, &vocabulary, Some(caller.actor()), act_alloc).await?;
             Ok(json!({ "vocabulary": vocabulary, "deleted": true }))
         }
     }
@@ -847,11 +879,12 @@ pub(crate) async fn prepare_vocabulary_mutation(
     }
 
     let mut tx = crate::db::begin_write(db.write_pool()).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
     let state_revision = schema_state_revision_in(&mut tx).await?;
     let (scope, target_id, target) = vocabulary_mutation_scope_in(&mut tx, &parsed).await?;
     let before = vocabulary_scope_snapshot_in(&mut tx, &scope).await?;
     let (meta_before, _) = schema_state_high_waters_in(&mut tx).await?;
-    let result = apply_vocabulary_mutation_in(&mut tx, caller, parsed).await?;
+    let result = apply_vocabulary_mutation_in(&mut tx, caller, parsed, &mut act_alloc).await?;
     let (meta_after, _) = schema_state_high_waters_in(&mut tx).await?;
     let after = vocabulary_scope_snapshot_in(&mut tx, &scope).await?;
     tx.rollback().await?;
@@ -1619,6 +1652,7 @@ async fn manage_schema_config(db: Db, caller: Caller, arguments: Value) -> Resul
             if_schema_state_revision,
         } => {
             let mut tx = crate::db::begin_write(db.write_pool()).await?;
+            let mut act_alloc = crate::act::ActAllocation::new();
             let result = apply_schema_config_write_in(
                 &mut tx,
                 &caller,
@@ -1627,10 +1661,11 @@ async fn manage_schema_config(db: Db, caller: Caller, arguments: Value) -> Resul
                 version_lineage,
                 applies_to_collection_id,
                 if_schema_state_revision.as_deref(),
+                &mut act_alloc,
             )
             .await?;
             tx.commit().await?;
-            Ok(result)
+            Ok(echo_act(result, act_alloc.get())?)
         }
     }
 }
@@ -1644,6 +1679,7 @@ async fn apply_schema_config_write_in(
     version_lineage: Option<String>,
     applies_to_collection_id: Option<String>,
     expected_revision: Option<&str>,
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<Value> {
     if !data.is_object() {
         return Err(Error::engine(
@@ -1717,7 +1753,8 @@ async fn apply_schema_config_write_in(
     }
     let nonconforming_stored_values =
         count_nonconforming_declared_values(tx, &prospective_rows).await?;
-    let id = append_prepared_user_schema_config_in(tx, prepared, Some(caller.actor())).await?;
+    let id = append_prepared_user_schema_config_in(tx, prepared, Some(caller.actor()), act_alloc)
+        .await?;
     Ok(json!({
         "id": id,
         "layer": "user",
@@ -1814,6 +1851,7 @@ pub(crate) async fn prepare_schema_config_mutation(
     };
 
     let mut tx = crate::db::begin_write(db.write_pool()).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
     let state_revision = schema_state_revision_in(&mut tx).await?;
     let before = schema_config_snapshot_in(&mut tx, &id).await?;
     let (meta_before, _) = schema_state_high_waters_in(&mut tx).await?;
@@ -1825,6 +1863,7 @@ pub(crate) async fn prepare_schema_config_mutation(
         version_lineage,
         applies_to_collection_id,
         None,
+        &mut act_alloc,
     )
     .await?;
     let (meta_after, _) = schema_state_high_waters_in(&mut tx).await?;

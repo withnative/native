@@ -14,11 +14,21 @@ use crate::error::{Error, Result};
 use crate::events::EventRow;
 use crate::events::OccurrenceBoundPayload;
 use crate::query::lens::{self, AsOfSelector, ContentSeqSelector, ReadLens};
+// The coordination surfaces this evaluator reads *by shape* — it inspects
+// their verbatim arguments, not just the fact that they ran — come from the
+// action-evidence carve-out, which is the single authority for what capture
+// must keep raw. `START_WORK`, `MANAGE_LINKS` and `CREATE_RECORD` are used
+// as match patterns below and must stay `const`: a `let` of the same name
+// would be an irrefutable binding that matches every tool, and
+// `is_explicit_coordination` would return true for all of them with no
+// compile error.
+use crate::mcp::action_evidence::{self, CREATE_RECORD, MANAGE_LINKS, START_WORK};
+use crate::provenance::Channel;
 use crate::query::{events, read};
 
 use super::super::registry::{Caller, ToolRegistry};
 use super::super::ToolKind;
-use super::{can_record, parse_args, require_record};
+use super::{can_record, can_record_in, can_record_in_pool, parse_args, require_record};
 
 /// Default page size for `get_history` (the reader caps at its own MAX_PAGE).
 const DEFAULT_PAGE: i64 = 100;
@@ -118,6 +128,8 @@ struct ChangeGroupKey {
     record_id: String,
     actor: Option<String>,
     run_key: Option<String>,
+    channel: String,
+    executor_kind: Option<String>,
 }
 
 #[derive(Debug)]
@@ -131,6 +143,153 @@ struct ChangeGroup {
     event_types: BTreeSet<String>,
     event_families: BTreeSet<String>,
     changed_fields: BTreeSet<String>,
+    channel_assurance: &'static str,
+    executor_assurance: &'static str,
+}
+
+/// Server-observed provenance for one `whats_changed` event.
+///
+/// `(channel_kind, channel_assurance, executor_kind, executor_assurance)`.
+/// Missing or invalidated attestations collapse to
+/// `("unknown", "unknown_or_withheld", None, "unknown_or_withheld")`.
+/// The executor class is never derived from the channel or the run key.
+type ChangeProvenance = (String, &'static str, Option<String>, &'static str);
+
+fn provenance_for_change(
+    channel: Channel,
+    attested: bool,
+    executor_kind: Option<String>,
+) -> ChangeProvenance {
+    let kind = channel.as_str().to_string();
+    let channel_assurance = if attested && channel.is_observed() {
+        "server_observed"
+    } else {
+        "unknown_or_withheld"
+    };
+    let executor_assurance = if attested {
+        "engine_attested"
+    } else {
+        "unknown_or_withheld"
+    };
+    let (kind, executor_kind) = if attested {
+        (kind, executor_kind)
+    } else {
+        ("unknown".to_string(), None)
+    };
+    (kind, channel_assurance, executor_kind, executor_assurance)
+}
+
+/// Batch the existing valid-attestation join over `matched` event ids.
+///
+/// Runs after authorization and actor-disclosure gates; callers only learn
+/// about events they may already see. Chunked to stay under SQLite's
+/// bind-variable ceiling on large pages.
+async fn change_provenance_map(
+    db: &Db,
+    event_ids: &[String],
+) -> Result<HashMap<String, ChangeProvenance>> {
+    use std::collections::{HashMap as Map, HashSet};
+    // event_id -> (raw channel, executor_kind, attestation_id). First row
+    // wins, and the query's ORDER BY puts the outputs arm first, so that
+    // priority is deterministic even for a dual-linked event.
+    let mut attested: Map<String, (Option<String>, Option<String>, String)> = Map::new();
+    for chunk in event_ids.chunks(200) {
+        if chunk.is_empty() {
+            continue;
+        }
+        let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+        // A dual-linked event (rows in both arms) is unreachable in
+        // production but constructible in tests. The Rust fold below takes
+        // the first row per event, so source priority is explicit here in
+        // SQL — current outputs arm before the legacy events arm — rather
+        // than relying on the arms' return order.
+        let sql = format!(
+            "SELECT o.output_event_id AS event_id, a.channel AS channel,
+                    a.executor_kind AS executor_kind, a.id AS attestation_id,
+                    0 AS src
+               FROM provenance_action_outputs o
+               JOIN provenance_action_attestations a
+                 ON a.id = o.action_attestation_id
+              WHERE o.output_domain = 'content' AND o.output_event_id IN ({placeholders})
+              UNION ALL
+             SELECT e.output_event_id AS event_id, a.channel AS channel,
+                    a.executor_kind AS executor_kind, a.id AS attestation_id,
+                    1 AS src
+               FROM provenance_action_events e
+               JOIN provenance_action_attestations a
+                 ON a.id = e.action_attestation_id
+              WHERE e.output_event_id IN ({placeholders})
+              ORDER BY event_id, src"
+        );
+        let mut query = sqlx::query(&sql);
+        for id in chunk {
+            query = query.bind(id);
+        }
+        for id in chunk {
+            query = query.bind(id);
+        }
+        for row in query.fetch_all(db.write_pool()).await? {
+            let event_id: String = row.try_get("event_id")?;
+            if attested.contains_key(&event_id) {
+                continue;
+            }
+            let channel: Option<String> = row.try_get("channel").ok().flatten();
+            let executor_kind: Option<String> = row.try_get("executor_kind").ok().flatten();
+            let attestation_id: String = row.try_get("attestation_id")?;
+            attested.insert(event_id, (channel, executor_kind, attestation_id));
+        }
+    }
+    // Latest validity per attestation; invalidated collapses to unknown.
+    let mut invalidated: HashSet<String> = HashSet::new();
+    let attestation_ids: Vec<String> = attested
+        .values()
+        .map(|(_, _, id)| id.clone())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    for chunk in attestation_ids.chunks(200) {
+        if chunk.is_empty() {
+            continue;
+        }
+        let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+        let sql = format!(
+            "SELECT attestation_id, status FROM provenance_attestation_validity_events
+              WHERE attestation_id IN ({placeholders})
+              ORDER BY attestation_id, ordinal DESC"
+        );
+        let mut query = sqlx::query(&sql);
+        for id in chunk {
+            query = query.bind(id);
+        }
+        let mut seen: HashSet<String> = HashSet::new();
+        for row in query.fetch_all(db.write_pool()).await? {
+            let id: String = row.try_get("attestation_id")?;
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+            let status: String = row.try_get("status")?;
+            if status == "invalidated" {
+                invalidated.insert(id);
+            }
+        }
+    }
+    let mut map = HashMap::new();
+    for event_id in event_ids {
+        let provenance = match attested.get(event_id) {
+            Some((channel, executor_kind, attestation_id))
+                if !invalidated.contains(attestation_id) =>
+            {
+                provenance_for_change(
+                    Channel::from_stored(channel.as_deref()),
+                    true,
+                    executor_kind.clone(),
+                )
+            }
+            _ => provenance_for_change(Channel::Unknown, false, None),
+        };
+        map.insert(event_id.clone(), provenance);
+    }
+    Ok(map)
 }
 
 #[derive(Deserialize)]
@@ -249,36 +408,6 @@ struct OverlapOutcomeCounts {
 }
 
 const OVERLAP_OBSERVATION_MINUTES: i64 = 30;
-
-/// Successful calls whose extracted `mutated` touch represents material work
-/// on an existing record. The list is intentionally explicit: adding a new
-/// mutation surface does not silently change this evaluation instrument.
-const OVERLAP_MATERIAL_MUTATION_TOOLS: &[&str] = &[
-    "archive_record",
-    "attach_from_url",
-    "attach_text",
-    "claim_unowned_record",
-    "correct_record_type",
-    "create_attribution",
-    "delete_record",
-    "invoke_artifact_interaction",
-    "manage_artifact_inputs",
-    "manage_attachments",
-    "manage_attributions",
-    "manage_canvas",
-    "manage_citations",
-    "manage_change_summaries",
-    "manage_facet_observations",
-    "manage_interventions",
-    "manage_links",
-    "manage_mdx_modules",
-    "manage_messages",
-    "manage_relationships",
-    "resolve_external",
-    "resolve_suggestions",
-    "start_work",
-    "update_record",
-];
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -1455,13 +1584,24 @@ async fn whats_changed_inner(
         .map(|(event, _)| event.clone())
         .collect::<Vec<_>>();
     let actor_names = resolve_actor_names(&db, &matched_events).await;
+    let event_ids = matched_events
+        .iter()
+        .map(|event| event.id.clone())
+        .collect::<Vec<_>>();
+    let provenance = change_provenance_map(&db, &event_ids).await?;
     let mut groups: Vec<ChangeGroup> = Vec::new();
     let mut group_indexes: HashMap<ChangeGroupKey, usize> = HashMap::new();
     for (event, families) in matched {
+        let (channel, _, executor_kind, _) = provenance
+            .get(&event.id)
+            .cloned()
+            .unwrap_or_else(|| provenance_for_change(Channel::Unknown, false, None));
         let key = ChangeGroupKey {
             record_id: event.record_id.clone(),
             actor: event.actor.clone(),
             run_key: event.run_key.clone(),
+            channel,
+            executor_kind,
         };
         if let Some(index) = group_indexes.get(&key).copied() {
             let group = &mut groups[index];
@@ -1481,6 +1621,16 @@ async fn whats_changed_inner(
             group.changed_fields.extend(changed_fields(&event)?);
         } else {
             let index = groups.len();
+            let channel_assurance = if key.channel == "unknown" {
+                "unknown_or_withheld"
+            } else {
+                "server_observed"
+            };
+            let executor_assurance = if key.executor_kind.is_some() {
+                "engine_attested"
+            } else {
+                "unknown_or_withheld"
+            };
             group_indexes.insert(key.clone(), index);
             groups.push(ChangeGroup {
                 key,
@@ -1492,6 +1642,8 @@ async fn whats_changed_inner(
                 event_types: BTreeSet::from([event.event_type.clone()]),
                 event_families: families,
                 changed_fields: changed_fields(&event)?,
+                channel_assurance,
+                executor_assurance,
             });
         }
     }
@@ -1523,6 +1675,8 @@ async fn whats_changed_inner(
                 "actor": group.key.actor,
                 "actor_name": actor_name,
                 "run_key": group.key.run_key,
+                "channel": {"kind": group.key.channel, "assurance": group.channel_assurance},
+                "executor": {"kind": group.key.executor_kind, "assurance": group.executor_assurance},
                 "first_local_seq": group.first_seq,
                 "last_local_seq": group.last_seq,
                 "first_event_at": group.first_event_at,
@@ -1589,6 +1743,32 @@ async fn require_public_history_record(
     Ok(())
 }
 
+/// Read-tier form of [`require_public_history_record`]. Byte-identical logic
+/// on the physically read-only pool, so `get_history`'s admission prologue
+/// does not queue on the serialised writer. The shared `Db`-taking form stays
+/// on the write pool for `whats_changed` until that handler migrates.
+async fn require_public_history_record_in_pool(
+    pool: &sqlx::SqlitePool,
+    caller: &Caller,
+    tool: &str,
+    record_id: &str,
+) -> Result<()> {
+    super::require_record_in_pool(pool, caller, tool, record_id, Capability::View).await?;
+    let acknowledgement = crate::query::acknowledgement_predicate("r");
+    let hidden_acknowledgement: bool = sqlx::query_scalar(&format!(
+        "SELECT EXISTS(SELECT 1 FROM records r WHERE r.id=? AND {acknowledgement})"
+    ))
+    .bind(record_id)
+    .fetch_one(pool)
+    .await?;
+    if hidden_acknowledgement {
+        return Err(Error::engine(format!(
+            "{tool}: record {record_id} does not exist"
+        )));
+    }
+    Ok(())
+}
+
 async fn get_history(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
     let args: GetHistoryArgs = parse_args("get_history", arguments)?;
     if args.include_child_runs && args.for_run.is_none() {
@@ -1603,7 +1783,7 @@ async fn get_history(db: Db, caller: Caller, arguments: Value) -> Result<Value> 
         ));
     }
     if let Some(record_id) = args.record_id.as_deref() {
-        require_public_history_record(&db, &caller, "get_history", record_id).await?;
+        require_public_history_record_in_pool(db.pool(), &caller, "get_history", record_id).await?;
     }
     if args.for_run.is_none() {
         if let Some(record_id) = args.record_id.as_deref() {
@@ -1619,81 +1799,103 @@ async fn get_history(db: Db, caller: Caller, arguments: Value) -> Result<Value> 
             .await;
         }
     }
+    // Resolve the database identity before taking the read snapshot below.
+    // `database_id` itself acquires a read-pool connection on a cold memo, so
+    // calling it while this snapshot is held would nest two checkouts of the
+    // same 5-connection pool and can deadlock five concurrent callers.
+    let local_database_id = crate::identity::database_id(&db).await?;
     let mut cursor = args.after_seq;
     let mut selected = Vec::new();
     let mut exhausted = false;
     let mut actor_disclosure = ActorDisclosure::default();
-    while selected.len() < limit as usize && !exhausted {
-        let page = match &args.for_run {
-            Some(run_key) => {
-                match crate::runkey::validate_full(Some(run_key)) {
-                    crate::runkey::KeyOutcome::Valid(_) => {}
-                    crate::runkey::KeyOutcome::Malformed { complaint, .. } => {
-                        return Err(Error::engine(format!(
-                            "invalid for_run '{run_key}': {complaint}"
-                        )))
+    // One physically read-only snapshot for the whole page walk. Every page
+    // fetch and per-event visibility/redaction check here observes committed
+    // state only, so none depends on the write pool's read-your-writes
+    // snapshot within this call.
+    let mut snapshot = db.pool().begin().await?;
+    let result = async {
+        while selected.len() < limit as usize && !exhausted {
+            let page = match &args.for_run {
+                Some(run_key) => {
+                    match crate::runkey::validate_full(Some(run_key)) {
+                        crate::runkey::KeyOutcome::Valid(_) => {}
+                        crate::runkey::KeyOutcome::Malformed { complaint, .. } => {
+                            return Err(Error::engine(format!(
+                                "invalid for_run '{run_key}': {complaint}"
+                            )))
+                        }
+                        _ => unreachable!("for_run is present and validate_full never mints keys"),
                     }
-                    _ => unreachable!("for_run is present and validate_full never mints keys"),
-                }
-                events::events_for_run_ordered(
-                    &db,
-                    run_key,
-                    args.include_child_runs,
-                    args.record_id.as_deref(),
-                    cursor,
-                    1000,
-                    args.order.event_order(),
-                )
-                .await?
-            }
-            None => match &args.record_id {
-                Some(record_id) => {
-                    events::events_for_record_ordered(
-                        &db,
-                        record_id,
+                    events::events_for_run_ordered_in(
+                        &mut snapshot,
+                        run_key,
+                        args.include_child_runs,
+                        args.record_id.as_deref(),
                         cursor,
                         1000,
                         args.order.event_order(),
                     )
                     .await?
                 }
-                None => {
-                    events::all_events_ordered(&db, cursor, 1000, args.order.event_order()).await?
+                None => match &args.record_id {
+                    Some(record_id) => {
+                        events::events_for_record_ordered_in(
+                            &mut snapshot,
+                            record_id,
+                            cursor,
+                            1000,
+                            args.order.event_order(),
+                        )
+                        .await?
+                    }
+                    None => {
+                        events::all_events_ordered_in(
+                            &mut snapshot,
+                            cursor,
+                            1000,
+                            args.order.event_order(),
+                        )
+                        .await?
+                    }
+                },
+            };
+            let raw_exhausted = page.next_after_seq.is_none();
+            let raw_len = page.events.len();
+            let mut processed = 0usize;
+            for mut event in page.events {
+                cursor = Some(event.local_seq);
+                processed += 1;
+                if args.record_id.is_none()
+                    && !can_record_in(&mut snapshot, &caller, &event.record_id, Capability::View)
+                        .await?
+                {
+                    continue;
                 }
-            },
-        };
-        let raw_exhausted = page.next_after_seq.is_none();
-        let raw_len = page.events.len();
-        let mut processed = 0usize;
-        for mut event in page.events {
-            cursor = Some(event.local_seq);
-            processed += 1;
-            if args.record_id.is_none()
-                && !can_record(&db, &caller, &event.record_id, Capability::View).await?
-            {
-                continue;
+                if !event_is_visible_in(&mut snapshot, &caller, &event).await? {
+                    continue;
+                }
+                redact_event_in(&mut snapshot, &caller, &mut actor_disclosure, &mut event).await?;
+                selected.push(event);
+                if selected.len() == limit as usize {
+                    break;
+                }
             }
-            if !event_is_visible(&db, &caller, &event).await? {
-                continue;
-            }
-            redact_event(&db, &caller, &mut actor_disclosure, &mut event).await?;
-            selected.push(event);
-            if selected.len() == limit as usize {
-                break;
-            }
+            exhausted = raw_exhausted && processed == raw_len;
         }
-        exhausted = raw_exhausted && processed == raw_len;
+        let actor_names = resolve_actor_names_in(&mut snapshot, &selected).await;
+        Ok::<_, Error>(json!({
+            "local_database_id": local_database_id,
+            "events": selected.iter().map(|event| {
+                shape_history_event(event_to_value(event, &actor_names), args.detail)
+            }).collect::<Vec<_>>(),
+            "next_after_local_seq": if exhausted { None } else { cursor },
+            "order": args.order,
+            "representation": history_representation(args.detail),
+        }))
     }
-    let actor_names = resolve_actor_names(&db, &selected).await;
-    Ok(json!({
-        "local_database_id": crate::identity::database_id(&db).await?,
-        "events": selected.iter().map(|event| {
-            shape_history_event(event_to_value(event, &actor_names), args.detail)
-        }).collect::<Vec<_>>(),
-        "next_after_local_seq": if exhausted { None } else { cursor },
-        "order": args.order,
-        "representation": history_representation(args.detail),
-    }))
+    .await;
+    snapshot.rollback().await?;
+    result
 }
 
 async fn get_record_history_in(
@@ -1706,7 +1908,9 @@ async fn get_record_history_in(
     detail: HistoryDetail,
 ) -> Result<Value> {
     let local_database_id = crate::identity::database_id(db).await?;
-    let mut snapshot = db.write_pool().begin().await?;
+    // The record-history walk is non-mutating; run it on the physically
+    // read-only pool's snapshot so it never waits on the serialised writer.
+    let mut snapshot = db.pool().begin().await?;
     let result = async {
         super::require_record_in(
             &mut snapshot,
@@ -1875,6 +2079,7 @@ fn run_activity_result(
             "status": if unavailable_reason.is_some() { "unavailable" } else { "available" },
             "reason": unavailable_reason,
             "visibility_filtered": visibility_filtered,
+            "completeness": if unavailable_reason.is_some() { "unavailable" } else { "retained_rows_only" },
         },
         "read_activity": read_activity,
     })
@@ -1921,13 +2126,27 @@ async fn get_run_activity(db: Db, caller: Caller, arguments: Value) -> Result<Va
 
     let legacy_local = super::is_legacy_local(&caller);
     if !legacy_local {
+        // Ownership must not depend on retained read-log rows alone: capture
+        // filtering (task 8a6377f PR A) drops disposable pure-read calls, so
+        // a run with no retained read calls still owns its durable
+        // `agent_runs` row and any declared `content_events`. Without the
+        // durable route this check would report "run does not exist" for a
+        // live read-only run — the DELETE-rows fork of audit increment 3.
         let owns_root = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM read_log_calls
-              WHERE run_key = ? AND actor = ?)",
+               WHERE run_key = ? AND actor = ?)
+                OR EXISTS(SELECT 1 FROM agent_runs
+               WHERE run_key = ? AND account_id = ?)
+                OR EXISTS(SELECT 1 FROM content_events
+               WHERE run_key = ? AND actor = ?)",
         )
         .bind(run_key)
         .bind(caller.credential())
-        .fetch_one(db.write_pool())
+        .bind(run_key)
+        .bind(caller.credential())
+        .bind(run_key)
+        .bind(caller.credential())
+        .fetch_one(db.pool())
         .await;
         match owns_root {
             Ok(false) => return Err(Error::engine("get_run_activity: run does not exist")),
@@ -1977,7 +2196,7 @@ async fn get_run_activity(db: Db, caller: Caller, arguments: Value) -> Result<Va
     .bind(include_child_runs)
     .bind(legacy_local)
     .bind(caller.credential())
-    .fetch_all(db.write_pool())
+    .fetch_all(db.pool())
     .await;
 
     let rows = match rows {
@@ -1993,6 +2212,23 @@ async fn get_run_activity(db: Db, caller: Caller, arguments: Value) -> Result<Va
         }
     };
     let read_activity = async {
+        // A run may touch the same record thousands of times. Authorize the
+        // distinct records once on a current snapshot, then retain every
+        // historical interaction in the aggregate below. This is request-local:
+        // the next poll still observes current revocations and admission rules.
+        let mut touched_ids = HashSet::new();
+        for row in &rows {
+            if let Some(id) = row.try_get::<Option<String>, _>("touch_record_id")? {
+                touched_ids.insert(id);
+            }
+        }
+        let visible = if touched_ids.is_empty() {
+            HashSet::new()
+        } else {
+            super::visible_ids_in_pool(db.pool(), &caller, touched_ids.into_iter().collect())
+                .await?
+        };
+
         #[derive(Default)]
         struct Activity {
             parent_key: Option<String>,
@@ -2022,7 +2258,7 @@ async fn get_run_activity(db: Db, caller: Caller, arguments: Value) -> Result<Va
             let Some(record_id) = row.try_get::<Option<String>, _>("touch_record_id")? else {
                 continue;
             };
-            if !can_record(&db, &caller, &record_id, Capability::View).await? {
+            if !visible.contains(&record_id) {
                 visibility_filtered = true;
                 continue;
             }
@@ -2108,13 +2344,13 @@ fn is_explicit_coordination(action: &ObservedOverlapAction, eligible: &HashSet<S
     match action.tool.as_str() {
         // A durable link written on either side of disclosed work is the v1
         // generic coordination primitive. Removal is material work instead.
-        "manage_links" => {
+        MANAGE_LINKS => {
             action.arguments.get("action").and_then(Value::as_str) == Some("add")
                 && touches_eligible
         }
         // Handoff is a governed core kind. It qualifies only when the create
         // explicitly links the handoff to an anchor or disclosed overlap.
-        "create_record" => {
+        CREATE_RECORD => {
             action.arguments.get("type").and_then(Value::as_str) == Some("Document")
                 && action.arguments.get("kind").and_then(Value::as_str) == Some("handoff")
                 && action
@@ -2245,7 +2481,7 @@ async fn classify_overlap_claim(
             sqlx::query_scalar("SELECT ended_at FROM agent_runs WHERE run_key=? AND account_id=?")
                 .bind(run_key)
                 .bind(&notice.actor)
-                .fetch_optional(db.write_pool())
+                .fetch_optional(db.pool())
                 .await?
                 .flatten()
         }
@@ -2294,7 +2530,7 @@ async fn classify_overlap_claim(
     .bind(notice.seq)
     .bind(&notice.ended_at)
     .bind(boundary.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
-    .fetch_all(db.write_pool())
+    .fetch_all(db.pool())
     .await?;
 
     let mut eligible = HashSet::new();
@@ -2332,7 +2568,7 @@ async fn classify_overlap_claim(
 
     for seq in order {
         let action = &actions[&seq];
-        if action.tool == "start_work"
+        if action.tool == START_WORK
             && action.arguments.get("action").and_then(Value::as_str) == Some("release")
             && action.mutated.iter().any(|id| anchor_ids.contains(id))
         {
@@ -2341,7 +2577,7 @@ async fn classify_overlap_claim(
         if is_explicit_coordination(action, &eligible) {
             return Ok((true, Some("coordinated")));
         }
-        if OVERLAP_MATERIAL_MUTATION_TOOLS.contains(&action.tool.as_str())
+        if action_evidence::is_material_mutation_surface(&action.tool)
             && action.mutated.iter().any(|id| eligible.contains(id))
         {
             return Ok((true, Some("proceeded")));
@@ -2360,7 +2596,7 @@ async fn work_overlap_evaluation(
         let admitted: bool =
             sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM member_contexts WHERE account_id=?)")
                 .bind(caller.credential())
-                .fetch_one(db.write_pool())
+                .fetch_one(db.pool())
                 .await?;
         if !admitted {
             return Err(Error::engine(
@@ -2376,7 +2612,7 @@ async fn work_overlap_evaluation(
           ORDER BY seq",
     )
     .bind(&as_of)
-    .fetch_all(db.write_pool())
+    .fetch_all(db.pool())
     .await
     {
         Ok(rows) => rows,
@@ -2490,13 +2726,15 @@ async fn work_overlap_evaluation(
             let mut visible_overlaps = Vec::new();
             let mut identifiers_withheld = false;
             for anchor in &notice.emission.anchors {
-                if can_record(db, caller, &anchor.record_id, Capability::View).await? {
+                if can_record_in_pool(db.pool(), caller, &anchor.record_id, Capability::View)
+                    .await?
+                {
                     visible_anchors.push(anchor.record_id.clone());
                 } else {
                     identifiers_withheld = true;
                 }
                 for record_id in &anchor.overlap_record_ids {
-                    if can_record(db, caller, record_id, Capability::View).await? {
+                    if can_record_in_pool(db.pool(), caller, record_id, Capability::View).await? {
                         visible_overlaps.push(record_id.clone());
                     } else {
                         identifiers_withheld = true;
@@ -2642,7 +2880,7 @@ async fn discover_own_runs(
     .bind(cursor_sort)
     .bind(cursor_id)
     .bind(limit + 1)
-    .fetch_all(db.write_pool())
+    .fetch_all(db.pool())
     .await?;
     let has_more = rows.len() as i64 > limit;
     let page = rows.iter().take(limit as usize);
@@ -2716,7 +2954,7 @@ async fn latest_discovery_intent(
     .bind(run_key)
     .bind(caller.credential())
     .bind(observed_at)
-    .fetch_optional(db.write_pool())
+    .fetch_optional(db.pool())
     .await;
     match row {
         Ok(Some(row)) => match (
@@ -2753,7 +2991,7 @@ async fn discovery_activity_freshness(
     .bind(run_key)
     .bind(caller.credential())
     .bind(observed_at)
-    .fetch_one(db.write_pool())
+    .fetch_one(db.pool())
     .await?;
     let transient = sqlx::query_scalar::<_, Option<String>>(
         "SELECT MAX(ended_at) FROM read_log_calls
@@ -2762,7 +3000,7 @@ async fn discovery_activity_freshness(
     .bind(run_key)
     .bind(caller.credential())
     .bind(observed_at)
-    .fetch_one(db.write_pool())
+    .fetch_one(db.pool())
     .await;
     let (transient, status, reason) = match transient {
         Ok(value) => (value, "available", Value::Null),
@@ -2793,54 +3031,77 @@ async fn discovery_activity_freshness(
     }))
 }
 
-pub(crate) async fn record_version_at(
+pub(crate) async fn record_versions_at(
     db: &Db,
     caller: &Caller,
     record_id: &str,
-    seq: i64,
-) -> Result<Value> {
-    if seq < 1 {
+    before_seq: i64,
+    after_seq: i64,
+) -> Result<(Value, Value)> {
+    if before_seq < 1 || after_seq < before_seq {
         return Err(Error::engine("get_record_version seq must be positive"));
     }
-    let resolved = lens::resolve_as_of(
+    let before_resolved = lens::resolve_as_of(
         db,
-        AsOfSelector::ContentSeq(ContentSeqSelector { content_seq: seq }),
+        AsOfSelector::ContentSeq(ContentSeqSelector {
+            content_seq: before_seq,
+        }),
     )
     .await?;
+    let after_resolved = lens::resolve_as_of(
+        db,
+        AsOfSelector::ContentSeq(ContentSeqSelector {
+            content_seq: after_seq,
+        }),
+    )
+    .await?;
+    let events = events::log_prefix(db, after_resolved.resolved_content_seq).await?;
+    let split = events.partition_point(|event| event.local_seq <= before_seq);
 
     let scratch = open_database(":memory:").await?;
-    let result: Result<Option<read::EnrichedRecord>> = async {
+    let result: Result<(Value, Value)> = async {
         apply_schema(&scratch).await?;
-        lens::replay_projection(db, &scratch, resolved.resolved_content_seq).await?;
-        let read_lens = ReadLens::historical(&scratch, db, &resolved);
-        let record = read::get_record_with_lens_as(
-            &read_lens,
-            record_id,
-            read::EnrichOptions::default(),
-            super::principal(caller),
-        )
-        .await?;
-        let Some(mut record) = record else {
-            return Ok(None);
-        };
-        super::lifecycle::filter_enriched_record_with_auth(
-            &scratch,
-            db,
-            caller,
-            &mut record,
-            read::EnrichOptions::default(),
-        )
-        .await?;
-        Ok(Some(record))
+        lens::replay_projection_events(&scratch, &events[..split]).await?;
+        let before = read_record_version(db, &scratch, caller, record_id, &before_resolved).await?;
+        lens::replay_projection_events(&scratch, &events[split..]).await?;
+        let after = read_record_version(db, &scratch, caller, record_id, &after_resolved).await?;
+        Ok((before, after))
     }
     .await;
     scratch.close().await;
+    result
+}
 
-    match result? {
-        Some(record) => Ok(json!({ "as_of_seq": seq, "record": record })),
+async fn read_record_version(
+    live: &Db,
+    scratch: &Db,
+    caller: &Caller,
+    record_id: &str,
+    resolved: &lens::ResolvedAsOf,
+) -> Result<Value> {
+    let read_lens = ReadLens::historical(scratch, live, resolved);
+    let record = read::get_record_with_lens_as(
+        &read_lens,
+        record_id,
+        read::EnrichOptions::default(),
+        super::principal(caller),
+    )
+    .await?;
+    match record {
+        Some(mut record) => {
+            super::lifecycle::filter_enriched_record_with_auth(
+                scratch,
+                live,
+                caller,
+                &mut record,
+                read::EnrichOptions::default(),
+            )
+            .await?;
+            Ok(json!({ "as_of_seq": resolved.resolved_content_seq, "record": record }))
+        }
         None => Err(Error::engine(format!(
             "record {} has no state as of seq {}",
-            record_id, seq
+            record_id, resolved.resolved_content_seq
         ))),
     }
 }
@@ -2893,7 +3154,8 @@ pub fn register_history_tools(registry: &mut ToolRegistry) -> Result<()> {
     )?;
     registry.register(
         ToolKind::WhatsChanged,
-        "Return a stable, authorization-filtered window over the authoritative content event log. The first page pins a public synchronization high-water sequence, visible events fill the requested page after every caller filter, and the server stores no progress state. Pass next_request back verbatim until it becomes null.",
+        "Authorization-filtered window over the content event log; first page pins high water, next_request round-trips verbatim. Groups split on (record, actor, run, channel, executor) with channel {kind, assurance} and executor {kind, assurance}; unknown when unattested or invalidated.",
+
         json!({
             "type": "object",
             "properties": {
@@ -3013,6 +3275,212 @@ pub fn register_history_tools(registry: &mut ToolRegistry) -> Result<()> {
         get_run_activity,
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod run_activity_batch_tests {
+    use super::*;
+    use crate::authorization::{replace_explicit_policy, AllowEntry};
+    use crate::db::{
+        create_database, with_read_pool_acquisition_counter, with_write_pool_acquisition_counter,
+    };
+
+    const RUN: &str = "heron-river-c748b2";
+    const CHILD: &str = "scout-chair-a748b2";
+
+    async fn calls(db: &Db, run: &str, parent: Option<&str>, actor: &str, count: usize) {
+        let mut tx = db.write_pool().begin().await.unwrap();
+        let head: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(seq),0) FROM read_log_calls")
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::query(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<?)
+             INSERT INTO read_log_calls(id,tool,run_key,parent_key,actor,outcome,started_at,ended_at)
+             SELECT printf('fixture-%d',i+?), 'search', ?, ?, ?, 'ok',
+                    '2026-09-17T00:00:00Z','2026-09-17T00:00:00Z' FROM n",
+        ).bind(count as i64).bind(head).bind(run).bind(parent).bind(actor)
+            .execute(&mut *tx).await.unwrap();
+        // Each call both surfaces and opens every dictionary record. The
+        // aggregate counts interactions, not unique records, after visibility.
+        sqlx::query(
+            "INSERT INTO read_log_touches(call_seq,record_ref,interaction)
+             SELECT c.seq,d.record_ref,k.interaction FROM read_log_calls c
+             CROSS JOIN read_log_record_ids d
+             CROSS JOIN (SELECT 'surfaced' AS interaction UNION ALL SELECT 'opened') k
+             WHERE c.seq>?",
+        )
+        .bind(head)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    /// Handler-body read-pool acquisitions for one `get_run_activity` call.
+    /// The endpoint is non-mutating and now reads exclusively through the
+    /// physically read-only pool, so its write-pool count is measured
+    /// separately by [`measure_write`].
+    async fn measure(db: &Db, children: bool) -> (Value, u64) {
+        let (result, acquisitions) = with_read_pool_acquisition_counter(get_run_activity(
+            db.clone(),
+            Caller::authenticated("acct:viewer"),
+            json!({"for_run":RUN,"include_child_runs":children}),
+        ))
+        .await;
+        (result.unwrap(), acquisitions)
+    }
+
+    async fn measure_write(db: &Db, children: bool) -> u64 {
+        let (result, acquisitions) = with_write_pool_acquisition_counter(get_run_activity(
+            db.clone(),
+            Caller::authenticated("acct:viewer"),
+            json!({"for_run":RUN,"include_child_runs":children}),
+        ))
+        .await;
+        result.unwrap();
+        acquisitions
+    }
+
+    #[tokio::test]
+    async fn run_activity_visibility_cost_is_independent_of_repeated_touches() {
+        let db = create_database(":memory:").await.unwrap();
+        let visible = crate::store::create_record(
+            &db,
+            json!({"type":"Document","kind":"note","name":"Visible target"}),
+        )
+        .await
+        .unwrap();
+        let hidden = crate::store::create_record(
+            &db,
+            json!({"type":"Document","kind":"note","name":"Hidden target"}),
+        )
+        .await
+        .unwrap();
+        replace_explicit_policy(
+            &db,
+            "test:policy",
+            &visible,
+            vec![AllowEntry::account("acct:viewer", Capability::View)],
+        )
+        .await
+        .unwrap();
+        replace_explicit_policy(&db, "test:policy", &hidden, vec![])
+            .await
+            .unwrap();
+        for id in [visible.as_str(), hidden.as_str(), "missing-record"] {
+            sqlx::query("INSERT INTO read_log_record_ids(record_id) VALUES(?)")
+                .bind(id)
+                .execute(db.write_pool())
+                .await
+                .unwrap();
+        }
+        calls(&db, RUN, None, "acct:viewer", 10).await;
+        // Measure the former per-touch visibility loop independently of the
+        // endpoint's fixed ownership/log reads. This is a positive control
+        // for the acquisition counter and a conservative before reference.
+        let (_, scalar_cost) = with_write_pool_acquisition_counter(async {
+            let caller = Caller::authenticated("acct:viewer");
+            for _ in 0..20 {
+                for (id, expected) in [
+                    (visible.as_str(), true),
+                    (hidden.as_str(), false),
+                    ("missing-record", false),
+                ] {
+                    assert_eq!(
+                        can_record(&db, &caller, id, Capability::View)
+                            .await
+                            .unwrap(),
+                        expected
+                    );
+                }
+            }
+        })
+        .await;
+        assert!(
+            scalar_cost >= 60,
+            "scalar control observed only {scalar_cost} acquisitions"
+        );
+        let (small, small_cost) = measure(&db, false).await;
+        assert_eq!(small["read_activity"][0]["searches"], 10);
+        assert_eq!(small["read_activity"][0]["surfaced"], 10);
+        assert_eq!(small["read_activity"][0]["opened"], 10);
+        assert_eq!(small["availability"]["visibility_filtered"], true);
+        // The endpoint is non-mutating and now runs entirely on the physically
+        // read-only pool: no handler-body read may take a writer slot.
+        assert_eq!(
+            measure_write(&db, false).await,
+            0,
+            "get_run_activity took a write-pool connection"
+        );
+
+        calls(&db, RUN, None, "acct:viewer", 200).await;
+        calls(&db, CHILD, Some(RUN), "acct:viewer", 3).await;
+        // Matching run keys are correlation, not authority to read another
+        // principal's calls. These must not contribute to any count.
+        calls(&db, RUN, None, "acct:other", 7).await;
+        let (large, large_cost) = measure(&db, false).await;
+        assert_eq!(large["read_activity"].as_array().unwrap().len(), 1);
+        assert_eq!(large["read_activity"][0]["searches"], 210);
+        assert_eq!(large["read_activity"][0]["surfaced"], 210);
+        assert_eq!(large["read_activity"][0]["opened"], 210);
+        assert_eq!(
+            small_cost, large_cost,
+            "repeated touches added pool acquisitions"
+        );
+        assert!(
+            large_cost >= 1,
+            "get_run_activity took no read-pool connections: {large_cost}"
+        );
+        eprintln!("run activity: scalar visibility for 60 touches {scalar_cost} write-pool acquisitions; full endpoint at 60 -> 1260 touches {small_cost} -> {large_cost} read-pool acquisitions");
+
+        let (tree, tree_cost) = measure(&db, true).await;
+        assert_eq!(tree["read_activity"].as_array().unwrap().len(), 2);
+        assert_eq!(tree["read_activity"][1]["run_key"], CHILD);
+        assert_eq!(tree["read_activity"][1]["parent_key"], RUN);
+        assert_eq!(tree["read_activity"][1]["opened"], 3);
+        assert_eq!(tree_cost, large_cost);
+
+        // No cache survives a request: revocation removes touch counts on the
+        // next poll, while the caller's own historical search count remains.
+        replace_explicit_policy(&db, "test:policy", &visible, vec![])
+            .await
+            .unwrap();
+        let (revoked, _) = measure(&db, false).await;
+        assert_eq!(revoked["read_activity"][0]["searches"], 210);
+        assert_eq!(revoked["read_activity"][0]["surfaced"], 0);
+        assert_eq!(revoked["read_activity"][0]["opened"], 0);
+        assert_eq!(revoked["availability"]["visibility_filtered"], true);
+        db.close().await;
+    }
+
+    /// `get_history` must never hold two read-pool connections at once.
+    ///
+    /// The handler opens one read snapshot for the whole page walk, and the
+    /// database-identity read also acquires a read-pool connection. If that
+    /// identity read ran while the snapshot was held, a pool with only one
+    /// free slot would stall: hold all but one of the read pool's five
+    /// connections and a nested checkout has nothing to take. The identity
+    /// memo is cold here (`create_database` seeds the row but not the memo),
+    /// so this is a genuine detector, not a warm-cache no-op.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn get_history_never_holds_two_read_pool_connections() {
+        let db = create_database(":memory:").await.unwrap();
+        let mut held = Vec::new();
+        for _ in 0..4 {
+            held.push(db.pool().acquire().await.unwrap());
+        }
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            get_history(db.clone(), Caller::authenticated("acct:viewer"), json!({})),
+        )
+        .await
+        .expect("get_history nested a second read-pool connection")
+        .unwrap();
+        assert!(output.get("events").is_some());
+        drop(held);
+        db.close().await;
+    }
 }
 
 #[cfg(test)]

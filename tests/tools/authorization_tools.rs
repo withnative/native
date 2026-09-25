@@ -3186,7 +3186,7 @@ async fn diagnostics_scan_facets_and_work_context_use_only_visible_related_rows(
 
 #[test]
 fn every_registered_tool_kind_has_an_authorization_disposition() {
-    assert_eq!(ToolKind::ALL.len(), 77);
+    assert_eq!(ToolKind::ALL.len(), 87);
     let mut registry = ToolRegistry::new();
     register_builtin_tools(&mut registry).unwrap();
     register_surface_tools(&mut registry).unwrap();
@@ -3204,8 +3204,11 @@ fn every_registered_tool_kind_has_an_authorization_disposition() {
             ToolKind::StandbyStatus,
             ToolKind::ExportSnapshot,
             ToolKind::ManageMemberships,
+            ToolKind::WorkspaceRead,
             ToolKind::ReachRead,
             ToolKind::ReachConnect,
+            ToolKind::AuthorityActHead,
+            ToolKind::AuthorityActDelta,
         ]
     );
     assert_eq!(
@@ -3233,6 +3236,10 @@ fn every_registered_tool_kind_has_an_authorization_disposition() {
         AuthorizationDisposition::CallerFilteredRead
     );
     assert_eq!(
+        ToolKind::GetWorkspaceSnapshot.authorization(),
+        AuthorizationDisposition::CallerFilteredRead
+    );
+    assert_eq!(
         ToolKind::ManageInterventions.authorization(),
         AuthorizationDisposition::Specialized
     );
@@ -3242,6 +3249,10 @@ fn every_registered_tool_kind_has_an_authorization_disposition() {
     );
     assert_eq!(
         ToolKind::ReachConnect.authorization(),
+        AuthorizationDisposition::Specialized
+    );
+    assert_eq!(
+        ToolKind::WorkspaceRead.authorization(),
         AuthorizationDisposition::Specialized
     );
     for kind in [
@@ -3746,5 +3757,134 @@ async fn related_multi_target_moves_refresh_final_policy_anchors_independently_o
         assert_eq!(boundary_anchor, explicit_boundary);
         assert_eq!(boundary_leaf_anchor, explicit_boundary);
     }
+    db.close().await;
+}
+
+#[tokio::test]
+async fn workspace_snapshot_serves_only_visible_rows_and_restarts_on_revoke() {
+    let (db, registry, alice, _bea) = fixture().await;
+    let common = create_local(
+        &registry,
+        &db,
+        json!({ "type": "Document", "kind": "note", "name": "Common" }),
+    )
+    .await;
+    let alice_only = create_local(
+        &registry,
+        &db,
+        json!({ "type": "Document", "kind": "note", "name": "Alice only", "owner_id": alice }),
+    )
+    .await;
+    replace_explicit_policy(
+        &db,
+        "test:policy",
+        &common,
+        vec![
+            AllowEntry::account("acct:alice", Capability::View),
+            AllowEntry::account("acct:bea", Capability::View),
+        ],
+    )
+    .await
+    .unwrap();
+    replace_explicit_policy(
+        &db,
+        "test:policy",
+        &alice_only,
+        vec![AllowEntry::account("acct:alice", Capability::View)],
+    )
+    .await
+    .unwrap();
+    let alice_caller = || {
+        Caller::authenticated("acct:alice")
+            .with_hosting_context("host:alice", "db:test")
+            .with_hosting_owner(false)
+    };
+    let bea_caller = || {
+        Caller::authenticated("acct:bea")
+            .with_hosting_context("host:bea", "db:test")
+            .with_hosting_owner(false)
+    };
+    let opened = call_as(
+        &registry,
+        &db,
+        alice_caller(),
+        "get_workspace_snapshot",
+        json!({ "action": "open" }),
+    )
+    .await
+    .unwrap();
+    let token = opened["snapshot_token"].as_str().unwrap().to_string();
+    let page = call_as(
+        &registry,
+        &db,
+        alice_caller(),
+        "get_workspace_snapshot",
+        json!({ "action": "page", "snapshot_token": token, "section": "records" }),
+    )
+    .await
+    .unwrap();
+    let ids: Vec<&str> = page["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["id"].as_str().unwrap())
+        .collect();
+    assert!(ids.contains(&common.as_str()) && ids.contains(&alice_only.as_str()));
+    let bea_open = call_as(
+        &registry,
+        &db,
+        bea_caller(),
+        "get_workspace_snapshot",
+        json!({ "action": "open" }),
+    )
+    .await
+    .unwrap();
+    let bea_token = bea_open["snapshot_token"].as_str().unwrap().to_string();
+    let bea_page = call_as(
+        &registry,
+        &db,
+        bea_caller(),
+        "get_workspace_snapshot",
+        json!({ "action": "page", "snapshot_token": bea_token, "section": "records" }),
+    )
+    .await
+    .unwrap();
+    let bea_ids: Vec<&str> = bea_page["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["id"].as_str().unwrap())
+        .collect();
+    assert!(bea_ids.contains(&common.as_str()) && !bea_ids.contains(&alice_only.as_str()));
+    replace_explicit_policy(
+        &db,
+        "test:narrow",
+        &common,
+        vec![AllowEntry::account("acct:alice", Capability::View)],
+    )
+    .await
+    .unwrap();
+    let caught = call_as(
+        &registry,
+        &db,
+        bea_caller(),
+        "get_workspace_snapshot",
+        json!({ "action": "catch_up", "snapshot_token": bea_token }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(caught["restart_required"], true);
+    assert!(caught.get("upsert_records").is_none());
+    let paged = call_as(
+        &registry,
+        &db,
+        bea_caller(),
+        "get_workspace_snapshot",
+        json!({ "action": "page", "snapshot_token": bea_open["snapshot_token"].as_str().unwrap(), "section": "records" }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(paged["restart_required"], true);
+    assert!(paged.get("rows").is_none());
     db.close().await;
 }

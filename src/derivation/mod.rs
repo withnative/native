@@ -40,9 +40,13 @@ pub use events::{
     NewDerivationEvent, RecipeRevisionRef, DERIVATION_EVENT_SCHEMA_VERSION, DERIVATION_EVENT_TYPES,
 };
 pub use integrity::state_violations;
+#[allow(unused_imports)] // R3 consumes the bounded fold; the reader lands ahead of its caller.
+pub(crate) use persistence::derivation_events_in_act_range;
 #[allow(unused_imports)]
-pub(crate) use persistence::append_derivation_event_in;
+pub(crate) use persistence::{append_derivation_event_in, replay_derivations_in};
 pub use persistence::{read_all_derivation_events, replay_derivations};
+#[allow(unused_imports)] // R3 consumes the per-event fold through this crate-wide path.
+pub(crate) use projector::project_event;
 #[allow(unused_imports)]
 pub(crate) use requests::acquire_or_steal_request_in;
 pub use requests::{

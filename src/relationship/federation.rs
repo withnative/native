@@ -528,6 +528,7 @@ pub(crate) async fn ingest_verified_native_relationships(
     RelationshipFederationBackend::Sqlite.require_qualified()?;
     let prepared = preflight(&context, decrypted_content)?;
     let mut tx = crate::db::begin_write(db.write_pool()).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
     let mut classes = classify_all_in(&mut tx, &prepared.events).await?;
     persist_foreign_attestations_in(&mut tx, &prepared.wire.attestations).await?;
 
@@ -561,6 +562,7 @@ pub(crate) async fn ingest_verified_native_relationships(
                             event,
                             prepared.direct_origin,
                             evidence,
+                            &mut act_alloc,
                         )
                         .await?;
                         applied += 1;
@@ -583,7 +585,7 @@ pub(crate) async fn ingest_verified_native_relationships(
             }
         }
     }
-    let drained = drain_quarantine_in(&mut tx).await?;
+    let drained = drain_quarantine_in(&mut tx, &mut act_alloc).await?;
     db.commit_content(tx).await?;
     Ok(RelationshipFederationIngestResult {
         applied,
@@ -1208,8 +1210,9 @@ async fn append_imported_event_in(
     event: &PreparedEvent,
     direct_origin: bool,
     evidence_state: &str,
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<()> {
-    super::persistence::append_federated_relationship_event_in(tx, &event.spec).await?;
+    super::persistence::append_federated_relationship_event_in(tx, &event.spec, act_alloc).await?;
     sqlx::query(
         "INSERT INTO relationship_federation_events
          (issuer_origin_db_id,event_id,fingerprint,source_batch_origin_db_id,envelope_id,
@@ -1323,7 +1326,10 @@ async fn quarantine_event_in(
     Ok(())
 }
 
-async fn drain_quarantine_in(tx: &mut Transaction<'static, Sqlite>) -> Result<usize> {
+async fn drain_quarantine_in(
+    tx: &mut Transaction<'static, Sqlite>,
+    act_alloc: &mut crate::act::ActAllocation,
+) -> Result<usize> {
     let mut drained = 0usize;
     loop {
         let rows = sqlx::query(
@@ -1404,6 +1410,7 @@ async fn drain_quarantine_in(tx: &mut Transaction<'static, Sqlite>) -> Result<us
                 &event,
                 direct_origin,
                 evidence_state,
+                act_alloc,
             )
             .await?;
             drained += 1;
@@ -2025,9 +2032,14 @@ mod tests {
         let source_origin = spec.issuer_origin_db_id.clone();
         let expected_fingerprint = spec.fingerprint().unwrap();
         let mut source_tx = crate::db::begin_write(source.write_pool()).await.unwrap();
-        super::super::persistence::append_relationship_event_in(&mut source_tx, &spec)
-            .await
-            .unwrap();
+        let mut act_alloc = crate::act::ActAllocation::new();
+        super::super::persistence::append_relationship_event_in(
+            &mut source_tx,
+            &spec,
+            &mut act_alloc,
+        )
+        .await
+        .unwrap();
         source.commit_content(source_tx).await.unwrap();
 
         let bytes = export_native_relationships(

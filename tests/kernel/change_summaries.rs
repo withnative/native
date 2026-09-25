@@ -120,6 +120,7 @@ async fn install_packaged_recipe_record(db: &Db, body: &str) -> String {
         intent: Some("historical packaged recipe test fixture".into()),
         created_at: "2026-08-01T00:00:00.000Z".into(),
         causal_envelope: native_ce::events::CausalEnvelopeV1::legacy_unknown(),
+        act: None,
     };
     let pool = crate::common::fixture_write_pool(db).await;
     let mut tx = pool.begin().await.unwrap();

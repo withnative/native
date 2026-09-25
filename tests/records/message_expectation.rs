@@ -222,6 +222,7 @@ async fn set_open_human_routing(db: &Db, message_id: &str, idempotency_key: &str
     db.drain_captures_for_tests().await;
     let pool = crate::common::fixture_write_pool(db).await;
     let mut tx = pool.begin().await.unwrap();
+    let mut act_alloc = native_ce::act::ActAllocation::new();
     native_ce::awareness::set_routing(
         &mut tx,
         &native_ce::awareness::MutationContext {
@@ -238,6 +239,7 @@ async fn set_open_human_routing(db: &Db, message_id: &str, idempotency_key: &str
         None,
         0,
         idempotency_key,
+        &mut act_alloc,
     )
     .await
     .unwrap();

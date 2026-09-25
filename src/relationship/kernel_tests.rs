@@ -14,24 +14,57 @@ const NOW: &str = "2026-08-12T12:34:56.123Z";
 const RECORD_A_ID: &str = "4e1a0000-0000-4000-8000-000000000001";
 const RECORD_B_ID: &str = "4e1a0000-0000-4000-8000-000000000002";
 
+/// A foreign issuer/relationship origin for federation-preserving fixtures.
+const FOREIGN_ORIGIN: &str = "ndb_77777777777777777777777777777777";
+
+/// Read the act counter through an open transaction. The read pool cannot
+/// observe the transaction's own uncommitted bump, so in-transaction
+/// counter assertions must use this.
+async fn counter_in_tx(tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>) -> i64 {
+    sqlx::query_scalar::<_, i64>("SELECT next_act FROM act_state WHERE singleton = 1")
+        .fetch_one(&mut **tx)
+        .await
+        .unwrap()
+}
+
 async fn command(db: &crate::Db) -> CreateRelationshipWithAssertion {
     let origin = crate::identity::database_id(db).await.unwrap();
-    let a_ref = crate::identity::encode_native_record(&origin, RECORD_A_ID).unwrap();
-    let b_ref = crate::identity::encode_native_record(&origin, RECORD_B_ID).unwrap();
+    // Local writers emit unresolved endpoints: only the receiving projection
+    // may name a record id.
+    command_for_origin(&origin, false)
+}
+
+/// Build the same atomic genesis under an arbitrary issuer origin. A foreign
+/// origin lets the federation-preserving append seam construct a genuinely
+/// receiver-side federated fixture without an unexportable ingest envelope.
+///
+/// `origin_local_record_ids` plants the issuer's own resolved record ids on the
+/// endpoints. A real federated event legitimately carries them, because the
+/// origin resolved them against its own records; a receiver that adopted them
+/// would be trusting the origin's local identity space. The federated
+/// projection must discard them, while the local projection keeps them — which
+/// is why the local fixture passes `false`.
+fn command_for_origin(
+    origin: &str,
+    origin_local_record_ids: bool,
+) -> CreateRelationshipWithAssertion {
+    let a_ref = crate::identity::encode_native_record(origin, RECORD_A_ID).unwrap();
+    let b_ref = crate::identity::encode_native_record(origin, RECORD_B_ID).unwrap();
+    let resolved = |record_id: &str| origin_local_record_ids.then(|| record_id.to_string());
     let endpoints = vec![
         RelationshipEndpoint {
             role: "participant".into(),
             portable_ref: a_ref.clone(),
             record_type: Some("Document".into()),
             record_kind: Some("note".into()),
-            record_id: None,
+            record_id: resolved(RECORD_A_ID),
         },
         RelationshipEndpoint {
             role: "participant".into(),
             portable_ref: b_ref,
             record_type: Some("Document".into()),
             record_kind: Some("note".into()),
-            record_id: None,
+            record_id: resolved(RECORD_B_ID),
         },
     ];
     let definition = core_relationship_type_manifest()
@@ -65,12 +98,12 @@ async fn command(db: &crate::Db) -> CreateRelationshipWithAssertion {
     let assertion_created = AssertionCreatedV1 {
         schema_version: 1,
         relationship: RelationshipCoordinate {
-            relationship_origin_db_id: origin.clone(),
+            relationship_origin_db_id: origin.into(),
             relationship_id: Uuid::new_v4().to_string(),
             relationship_revision: 1,
         },
         relationship_created_event: RelationshipEventCoordinate {
-            issuer_origin_db_id: origin.clone(),
+            issuer_origin_db_id: origin.into(),
             event_id: Uuid::new_v4().to_string(),
         },
         stance: "support".into(),
@@ -92,7 +125,7 @@ async fn command(db: &crate::Db) -> CreateRelationshipWithAssertion {
         authoring_action_attestation_id: "action-attestation-test".into(),
     };
     prepare_relationship_with_assertion(
-        &origin,
+        origin,
         "native-principal:local",
         NOW,
         NOW,
@@ -181,7 +214,8 @@ async fn stream_cas_and_forced_second_write_failure_leave_no_partial_state() {
         }),
     );
     let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
-    let error = append_relationship_event_in(&mut tx, &stale)
+    let mut act_alloc = crate::act::ActAllocation::new();
+    let error = append_relationship_event_in(&mut tx, &stale, &mut act_alloc)
         .await
         .unwrap_err();
     assert!(matches!(error, crate::Error::Conflict(_)));
@@ -191,6 +225,498 @@ async fn stream_cas_and_forced_second_write_failure_leave_no_partial_state() {
         .await
         .unwrap();
     assert_eq!(count, 2, "failed append savepoint leaked an event");
+}
+
+/// A savepoint rollback revokes the act_state bump made inside it, so the
+/// memo must forget exactly what was allocated inside — and nothing else.
+/// Without the reset, a later append in the same transaction would stamp a
+/// fresh act while the revoked one silently vanished (a gap), or — worse,
+/// once an error-tolerant caller retries inside the same memo — two
+/// transactions could stamp the same act.
+#[tokio::test]
+async fn savepoint_rollback_releases_only_the_act_allocated_inside_it() {
+    let db = crate::create_database(":memory:").await.unwrap();
+    let counter = || async {
+        sqlx::query_scalar::<_, i64>("SELECT next_act FROM act_state WHERE singleton = 1")
+            .fetch_one(db.pool())
+            .await
+            .unwrap()
+    };
+    let before: i64 = counter().await;
+
+    let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+    let mut act_alloc = crate::act::ActAllocation::new();
+
+    // Case 1: the memo is empty, the atomic create allocates inside the
+    // savepoint, then the forced failure rolls it back. The memo must be
+    // empty again and the counter untouched.
+    let first = command(&db).await;
+    super::persistence::with_forced_atomic_assertion_write_failure(
+        super::persistence::create_relationship_with_assertion_in(&mut tx, &first, &mut act_alloc),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        act_alloc.get(),
+        None,
+        "savepoint rollback must release the memoized act"
+    );
+    assert_eq!(
+        counter_in_tx(&mut tx).await,
+        before,
+        "rollback must not consume an act"
+    );
+
+    // The revoked act is reusable: the next append in this transaction
+    // allocates exactly the following act, with no gap.
+    let second = command(&db).await;
+    let created =
+        super::persistence::create_relationship_with_assertion_in(&mut tx, &second, &mut act_alloc)
+            .await
+            .unwrap();
+    assert!(!created.relationship.exact_retry);
+    let first_act = act_alloc.get().expect("successful append holds an act");
+    assert_eq!(first_act, before + 1);
+    assert_eq!(counter_in_tx(&mut tx).await, before + 1);
+
+    // Case 2: the memo already holds an act from earlier in this
+    // transaction. A savepoint rollback inside must not discard it — no
+    // bump could have happened inside, since allocation reuses a held
+    // value.
+    let third = command(&db).await;
+    super::persistence::with_forced_atomic_assertion_write_failure(
+        super::persistence::create_relationship_with_assertion_in(&mut tx, &third, &mut act_alloc),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        act_alloc.get(),
+        Some(first_act),
+        "rollback must not discard an act allocated outside the savepoint"
+    );
+    assert_eq!(counter_in_tx(&mut tx).await, before + 1);
+    tx.commit().await.unwrap();
+
+    let acts: Vec<Option<i64>> =
+        sqlx::query_scalar("SELECT DISTINCT act FROM relationship_events ORDER BY act")
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        acts,
+        vec![Some(first_act)],
+        "one transaction stamps one act"
+    );
+    db.close().await;
+}
+
+#[tokio::test]
+async fn authoritative_replay_preserves_acts_without_allocating() {
+    let source = crate::create_database(":memory:").await.unwrap();
+    let command = command(&source).await;
+    create_relationship_with_assertion(&source, &command)
+        .await
+        .unwrap();
+
+    // Model a pre-act legacy row. Production append-only guards make this
+    // impossible after cutover; an upgraded database can legitimately
+    // contain the same NULL in its historical prefix.
+    sqlx::query("DROP TRIGGER relationship_events_no_update")
+        .execute(source.write_pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE relationship_events SET act=NULL WHERE seq=1")
+        .execute(source.write_pool())
+        .await
+        .unwrap();
+
+    let expected: Vec<(i64, Option<i64>)> =
+        sqlx::query_as("SELECT seq,act FROM relationship_events ORDER BY seq")
+            .fetch_all(source.pool())
+            .await
+            .unwrap();
+    assert_eq!(expected.len(), 2);
+    assert_eq!(expected[0].1, None);
+    assert!(expected[1].1.is_some());
+    let mut source_conn = source.write_pool().acquire().await.unwrap();
+    let events = read_all_relationship_events(&mut source_conn)
+        .await
+        .unwrap();
+    drop(source_conn);
+
+    let rebuilt = crate::create_database(":memory:").await.unwrap();
+    let counter_before: i64 =
+        sqlx::query_scalar("SELECT next_act FROM act_state WHERE singleton=1")
+            .fetch_one(rebuilt.pool())
+            .await
+            .unwrap();
+    let mut tx = crate::db::begin_write(rebuilt.write_pool()).await.unwrap();
+    replay_relationship_events(&mut tx, &events, &std::collections::BTreeSet::new())
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    let actual: Vec<(i64, Option<i64>)> =
+        sqlx::query_as("SELECT seq,act FROM relationship_events ORDER BY seq")
+            .fetch_all(rebuilt.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        actual, expected,
+        "replay must preserve each exact (seq, act)"
+    );
+    let counter_after: i64 = sqlx::query_scalar("SELECT next_act FROM act_state WHERE singleton=1")
+        .fetch_one(rebuilt.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        counter_after, counter_before,
+        "replay must not allocate an act"
+    );
+
+    // An exact replay is a no-op, while the same event identity with a
+    // different grouping is canonical divergence rather than a fresh act.
+    let mut tx = crate::db::begin_write(rebuilt.write_pool()).await.unwrap();
+    replay_relationship_events(&mut tx, &events, &std::collections::BTreeSet::new())
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    let mut divergent = events.clone();
+    divergent[1].act = Some(expected[1].1.unwrap() + 100);
+    let mut tx = crate::db::begin_write(rebuilt.write_pool()).await.unwrap();
+    let error = replay_relationship_events(&mut tx, &divergent, &std::collections::BTreeSet::new())
+        .await
+        .unwrap_err();
+    assert!(matches!(error, crate::Error::Conflict(_)));
+    tx.rollback().await.unwrap();
+    let counter_final: i64 = sqlx::query_scalar("SELECT next_act FROM act_state WHERE singleton=1")
+        .fetch_one(rebuilt.pool())
+        .await
+        .unwrap();
+    assert_eq!(counter_final, counter_before);
+
+    source.close().await;
+    rebuilt.close().await;
+}
+
+/// Append a complete genesis whose issuer and relationship origin are foreign
+/// through the same sealed federation-preserving seam the ingest path uses, so
+/// the bounded replay sees a genuine federated event rather than a local row
+/// relabelled. The caller owns the transaction so the pair shares one act.
+async fn append_foreign_genesis(
+    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    alloc: &mut crate::act::ActAllocation,
+) -> (String, String) {
+    let foreign = command_for_origin(FOREIGN_ORIGIN, true);
+    super::persistence::append_federated_relationship_event_in(
+        tx,
+        &foreign.relationship_event,
+        alloc,
+    )
+    .await
+    .unwrap();
+    super::persistence::append_federated_relationship_event_in(tx, &foreign.assertion_event, alloc)
+        .await
+        .unwrap();
+    (
+        foreign.relationship_event.event_id,
+        foreign.assertion_event.event_id,
+    )
+}
+
+fn evidence_event(
+    command: &CreateRelationshipWithAssertion,
+    expected_stream_version: i64,
+    suffix: &str,
+) -> RelationshipEventSpec {
+    assertion_event(
+        command,
+        expected_stream_version,
+        RelationshipEventPayload::AssertionEvidenceAdded(AssertionEvidenceAddedV1 {
+            schema_version: 1,
+            evidence_ref: format!("native-evidence:{suffix}"),
+            reason: format!("range evidence {suffix}"),
+        }),
+    )
+}
+
+/// The bounded relationship reader selects exactly the half-open
+/// `(from, to]` interval in `seq` order, excludes a legacy `NULL` act, agrees
+/// with the full reader filtered to the same stamped acts, and treats a range
+/// ending at the maximum stamped act as inclusive.
+#[tokio::test]
+async fn relationship_events_in_act_range_is_bounded_ordered_and_excludes_null_acts() {
+    use std::collections::BTreeMap;
+
+    let source = crate::create_database(":memory:").await.unwrap();
+    let genesis = command(&source).await;
+    create_relationship_with_assertion(&source, &genesis)
+        .await
+        .unwrap();
+    // Three more acts, each its own commit, so the log spans several acts.
+    for (index, suffix) in ["a", "b", "c"].into_iter().enumerate() {
+        let expected_stream_version = 1 + index as i64;
+        append_one(
+            &source,
+            &evidence_event(&genesis, expected_stream_version, suffix),
+        )
+        .await;
+    }
+    // Null out the middle of the five rows so the unmapped legacy act sits
+    // between stamped rows on both sides, not merely at the trailing edge.
+    let legacy_id: String =
+        sqlx::query_scalar("SELECT id FROM relationship_events ORDER BY seq LIMIT 1 OFFSET 2")
+            .fetch_one(source.pool())
+            .await
+            .unwrap();
+    sqlx::query("DROP TRIGGER relationship_events_no_update")
+        .execute(source.write_pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE relationship_events SET act=NULL WHERE id=?1")
+        .bind(&legacy_id)
+        .execute(source.write_pool())
+        .await
+        .unwrap();
+
+    let mut conn = source.write_pool().acquire().await.unwrap();
+    let full = read_all_relationship_events(&mut conn).await.unwrap();
+    let rows: Vec<(i64, String, Option<i64>)> =
+        sqlx::query_as("SELECT seq, id, act FROM relationship_events ORDER BY seq")
+            .fetch_all(&mut *conn)
+            .await
+            .unwrap();
+    let seq_of: BTreeMap<String, i64> =
+        rows.iter().map(|(seq, id, _)| (id.clone(), *seq)).collect();
+    let act_of: BTreeMap<i64, Option<i64>> =
+        rows.iter().map(|(seq, _, act)| (*seq, *act)).collect();
+    let mut acts: Vec<i64> = act_of.values().flatten().copied().collect();
+    acts.sort_unstable();
+    acts.dedup();
+    assert_eq!(acts.len(), 3, "the fixture expects three stamped acts");
+    let max_act = *acts.last().unwrap();
+
+    for (from_exclusive, to_inclusive) in [
+        (acts[0], acts[2]),
+        (acts[1], acts[2]),
+        (acts[0], acts[1]),
+        (0, max_act),
+    ] {
+        let bounded = relationship_events_in_act_range(&mut conn, from_exclusive, to_inclusive)
+            .await
+            .unwrap();
+        let seqs: Vec<i64> = bounded
+            .iter()
+            .map(|event| seq_of[&event.event_id])
+            .collect();
+        assert!(seqs.windows(2).all(|pair| pair[0] < pair[1]), "seq order");
+        assert!(bounded.iter().all(|event| event.event_id != legacy_id));
+        let expected: Vec<_> = full
+            .iter()
+            .filter(|event| {
+                act_of[&seq_of[&event.event_id]]
+                    .is_some_and(|act| act > from_exclusive && act <= to_inclusive)
+            })
+            .cloned()
+            .collect();
+        assert_eq!(
+            bounded, expected,
+            "range ({from_exclusive}, {to_inclusive}]"
+        );
+    }
+    // The empty interval is empty even at the maximum act.
+    assert!(
+        relationship_events_in_act_range(&mut conn, max_act, max_act)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    // A range ending at the maximum act still includes every stamped row.
+    assert_eq!(
+        relationship_events_in_act_range(&mut conn, 0, max_act)
+            .await
+            .unwrap()
+            .len(),
+        full.len() - 1
+    );
+    drop(conn);
+    source.close().await;
+}
+
+/// A bounded replay preserves local and federated acts exactly, allocates no
+/// act (leaving `act_state` at its destination value), routes federated
+/// identities through the receiver-resolved path, and retains exact-retry
+/// no-op and divergent-act conflict semantics.
+#[tokio::test]
+async fn bounded_replay_preserves_local_and_federated_acts_and_retains_retry_semantics() {
+    let source = crate::create_database(":memory:").await.unwrap();
+    let local = command(&source).await;
+    create_relationship_with_assertion(&source, &local)
+        .await
+        .unwrap();
+    let mut tx = crate::db::begin_write(source.write_pool()).await.unwrap();
+    let mut alloc = crate::act::ActAllocation::new();
+    let (foreign_relationship_event, foreign_assertion_event) =
+        append_foreign_genesis(&mut tx, &mut alloc).await;
+    tx.commit().await.unwrap();
+
+    let expected: Vec<(i64, String, Option<i64>)> =
+        sqlx::query_as("SELECT seq, id, act FROM relationship_events ORDER BY seq")
+            .fetch_all(source.pool())
+            .await
+            .unwrap();
+    let max_act: i64 = sqlx::query_scalar("SELECT MAX(act) FROM relationship_events")
+        .fetch_one(source.pool())
+        .await
+        .unwrap();
+    let federated = std::collections::BTreeSet::from([
+        (
+            FOREIGN_ORIGIN.to_string(),
+            foreign_relationship_event.clone(),
+        ),
+        (FOREIGN_ORIGIN.to_string(), foreign_assertion_event.clone()),
+    ]);
+
+    // The materialiser's shape: read exactly the carried act-range rows once,
+    // then fold those same rows through `replay_relationship_events` (the sole
+    // Preserve-mode inserter/projector). No second read and no act allocation.
+    let mut source_conn = source.write_pool().acquire().await.unwrap();
+    let carried = relationship_events_in_act_range(&mut source_conn, 0, max_act)
+        .await
+        .unwrap();
+    drop(source_conn);
+    assert_eq!(carried.len(), expected.len());
+
+    // The carried foreign rows must still name the origin's own resolved record
+    // ids, or the federated-resolution assertion below would prove nothing. The
+    // target also seeds local records with those exact ids, so a projection that
+    // trusted the carried ids would keep them and fail the `[None, None]` check;
+    // only receiver resolution discards them.
+    let foreign_created = carried
+        .iter()
+        .find(|event| {
+            event.issuer_origin_db_id == FOREIGN_ORIGIN
+                && matches!(
+                    event.payload,
+                    RelationshipEventPayload::RelationshipCreated(_)
+                )
+        })
+        .expect("carried foreign relationship.created");
+    let RelationshipEventPayload::RelationshipCreated(created) = &foreign_created.payload else {
+        unreachable!("matched above")
+    };
+    assert_eq!(
+        created
+            .endpoints
+            .iter()
+            .map(|endpoint| endpoint.record_id.as_deref())
+            .collect::<Vec<_>>(),
+        vec![Some(RECORD_A_ID), Some(RECORD_B_ID)],
+        "the foreign fixture must carry origin-resolved ids to discriminate"
+    );
+
+    let target = crate::create_database(":memory:").await.unwrap();
+    // Local records collide with the ids the foreign event carries, so the
+    // local projection could preserve them; only federated resolution discards.
+    for record_id in [RECORD_A_ID, RECORD_B_ID] {
+        sqlx::query(
+            "INSERT INTO records(id,type,kind,policy_anchor_id)
+             VALUES(?1,'Document','note','native:root')",
+        )
+        .bind(record_id)
+        .execute(target.write_pool())
+        .await
+        .unwrap();
+    }
+    let counter_before: i64 =
+        sqlx::query_scalar("SELECT next_act FROM act_state WHERE singleton=1")
+            .fetch_one(target.pool())
+            .await
+            .unwrap();
+    let mut tx = crate::db::begin_write(target.write_pool()).await.unwrap();
+    replay_relationship_events(&mut tx, &carried, &federated)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    let actual: Vec<(i64, String, Option<i64>)> =
+        sqlx::query_as("SELECT seq, id, act FROM relationship_events ORDER BY seq")
+            .fetch_all(target.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        actual, expected,
+        "bounded replay must preserve every exact (seq, id, act)"
+    );
+    let counter_after: i64 = sqlx::query_scalar("SELECT next_act FROM act_state WHERE singleton=1")
+        .fetch_one(target.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        counter_after, counter_before,
+        "bounded replay must not allocate an act"
+    );
+
+    // The federated event projected through the receiver-resolved path: its
+    // foreign portable refs resolve to no local record rather than trusting the
+    // origin's record ids.
+    let foreign_endpoint_ids: Vec<Option<String>> = sqlx::query_scalar(
+        "SELECT record_id FROM relationship_endpoints
+          WHERE relationship_origin_db_id=?1 ORDER BY ordinal",
+    )
+    .bind(FOREIGN_ORIGIN)
+    .fetch_all(target.pool())
+    .await
+    .unwrap();
+    assert_eq!(foreign_endpoint_ids, vec![None, None]);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM relationships WHERE relationship_origin_db_id=?1"
+        )
+        .bind(FOREIGN_ORIGIN)
+        .fetch_one(target.pool())
+        .await
+        .unwrap(),
+        1
+    );
+
+    // Exact retry of the same carried rows is a no-op.
+    let mut tx = crate::db::begin_write(target.write_pool()).await.unwrap();
+    replay_relationship_events(&mut tx, &carried, &federated)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    let retried: Vec<(i64, String, Option<i64>)> =
+        sqlx::query_as("SELECT seq, id, act FROM relationship_events ORDER BY seq")
+            .fetch_all(target.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        retried, expected,
+        "exact bounded retry must not duplicate rows"
+    );
+
+    // The destination already holds this identity, so a carried row under a
+    // divergent act is canonical conflict rather than a silent restamp.
+    let mut divergent = carried.clone();
+    divergent[0].act = Some(divergent[0].act.expect("stamped act") + 100);
+    let mut tx = crate::db::begin_write(target.write_pool()).await.unwrap();
+    let error = replay_relationship_events(&mut tx, &divergent, &federated)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, crate::Error::Conflict(_)));
+    tx.rollback().await.unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT next_act FROM act_state WHERE singleton=1")
+            .fetch_one(target.pool())
+            .await
+            .unwrap(),
+        counter_before,
+        "a divergent bounded replay must not allocate an act"
+    );
+
+    source.close().await;
+    target.close().await;
 }
 
 #[tokio::test]
@@ -209,7 +735,8 @@ async fn assertion_state_machine_never_mutates_another_assertion() {
         }),
     );
     let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
-    append_relationship_event_in(&mut tx, &retracted)
+    let mut act_alloc = crate::act::ActAllocation::new();
+    append_relationship_event_in(&mut tx, &retracted, &mut act_alloc)
         .await
         .unwrap();
     tx.commit().await.unwrap();
@@ -222,7 +749,8 @@ async fn assertion_state_machine_never_mutates_another_assertion() {
         }),
     );
     let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
-    let error = append_relationship_event_in(&mut tx, &illegal_restore)
+    let mut act_alloc = crate::act::ActAllocation::new();
+    let error = append_relationship_event_in(&mut tx, &illegal_restore, &mut act_alloc)
         .await
         .unwrap_err();
     assert!(matches!(error, crate::Error::Conflict(_)));
@@ -263,7 +791,8 @@ async fn concurrent_writers_to_one_assertion_have_one_cas_winner() {
         tasks.push(tokio::spawn(async move {
             barrier.wait().await;
             let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
-            let result = append_relationship_event_in(&mut tx, &spec).await;
+            let mut act_alloc = crate::act::ActAllocation::new();
+            let result = append_relationship_event_in(&mut tx, &spec, &mut act_alloc).await;
             match &result {
                 Ok(_) => tx.commit().await.unwrap(),
                 Err(_) => tx.rollback().await.unwrap(),
@@ -462,7 +991,10 @@ async fn synchronous_projection_records_endpoint_activity_and_defers_legacy_link
 
 async fn append_one(db: &crate::Db, spec: &RelationshipEventSpec) {
     let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
-    append_relationship_event_in(&mut tx, spec).await.unwrap();
+    let mut act_alloc = crate::act::ActAllocation::new();
+    append_relationship_event_in(&mut tx, spec, &mut act_alloc)
+        .await
+        .unwrap();
     tx.commit().await.unwrap();
 }
 

@@ -23,6 +23,9 @@ fn context<'a>(caller: &'a Caller, reason: &'a str) -> MutationContext<'a> {
         run_key: caller.run_key(),
         parent_key: caller.parent_key(),
         intent: caller.intent(),
+        // Every identity-tool visibility gate resolves through this
+        // footing: guests see only their own account grants.
+        is_member: caller.is_host_member(),
         internal: false,
         source_read_authorized: false,
     }
@@ -47,12 +50,16 @@ async fn resolve_external(db: Db, caller: Caller, arguments: Value) -> Result<Va
         &args.hints,
     )
     .await?;
-    Ok(json!({
+    let mut response = json!({
         "status": if result.created { "created" } else { "resolved" },
         "record_id": result.record_id,
         "created": result.created,
         "bindings_added": result.bindings_added,
-    }))
+    });
+    if let Some(act) = result.act {
+        response["act"] = act.into();
+    }
+    Ok(response)
 }
 
 #[derive(Deserialize)]
@@ -110,12 +117,12 @@ async fn manage_bindings(db: Db, caller: Caller, arguments: Value) -> Result<Val
         ManageBindingsArgs::List { record_id } => Ok(json!({
             "status": "listed",
             "record_id": record_id,
-            "bindings": identity::list_bindings(&db, caller.actor(), &record_id).await?,
+            "bindings": identity::list_bindings(&db, caller.actor(), caller.is_host_member(), &record_id).await?,
         })),
         ManageBindingsArgs::Observations { record_id, limit } => Ok(json!({
             "status": "listed",
             "record_id": record_id,
-            "observations": identity::list_observations(&db, caller.actor(), &record_id, limit).await?,
+            "observations": identity::list_observations(&db, caller.actor(), caller.is_host_member(), &record_id, limit).await?,
         })),
         ManageBindingsArgs::Add {
             record_id,
@@ -125,7 +132,7 @@ async fn manage_bindings(db: Db, caller: Caller, arguments: Value) -> Result<Val
             if_binding_state_revision,
         } => {
             require_nonblank_reason("manage_bindings", &reason)?;
-            let changed = identity::add_binding_if_revision(
+            let (changed, act) = identity::add_binding_if_revision(
                 &db,
                 &context(&caller, &reason),
                 &record_id,
@@ -134,9 +141,12 @@ async fn manage_bindings(db: Db, caller: Caller, arguments: Value) -> Result<Val
                 if_binding_state_revision.as_deref(),
             )
             .await?;
-            Ok(
-                json!({"status": if changed {"added"} else {"unchanged"}, "record_id": record_id, "changed": changed}),
-            )
+            let mut response = json!({"status": if changed {"added"} else {"unchanged"}, "record_id": record_id, "changed": changed});
+            // Omission-safe: a no-op that appended nothing carries no act.
+            if let Some(act) = act {
+                response["act"] = act.into();
+            }
+            Ok(response)
         }
         ManageBindingsArgs::Remove {
             record_id,
@@ -145,7 +155,7 @@ async fn manage_bindings(db: Db, caller: Caller, arguments: Value) -> Result<Val
             if_binding_state_revision,
         } => {
             require_nonblank_reason("manage_bindings", &reason)?;
-            let changed = identity::remove_binding_if_revision(
+            let (changed, act) = identity::remove_binding_if_revision(
                 &db,
                 &context(&caller, &reason),
                 &record_id,
@@ -153,9 +163,12 @@ async fn manage_bindings(db: Db, caller: Caller, arguments: Value) -> Result<Val
                 if_binding_state_revision.as_deref(),
             )
             .await?;
-            Ok(
-                json!({"status": if changed {"removed"} else {"unchanged"}, "record_id": record_id, "changed": changed}),
-            )
+            let mut response = json!({"status": if changed {"removed"} else {"unchanged"}, "record_id": record_id, "changed": changed});
+            // Omission-safe: a no-op that appended nothing carries no act.
+            if let Some(act) = act {
+                response["act"] = act.into();
+            }
+            Ok(response)
         }
         ManageBindingsArgs::Canonicalize {
             record_id,
@@ -164,7 +177,7 @@ async fn manage_bindings(db: Db, caller: Caller, arguments: Value) -> Result<Val
             if_binding_state_revision,
         } => {
             require_nonblank_reason("manage_bindings", &reason)?;
-            let changed = identity::canonicalize_binding_if_revision(
+            let (changed, act) = identity::canonicalize_binding_if_revision(
                 &db,
                 &context(&caller, &reason),
                 &record_id,
@@ -172,11 +185,16 @@ async fn manage_bindings(db: Db, caller: Caller, arguments: Value) -> Result<Val
                 if_binding_state_revision.as_deref(),
             )
             .await?;
-            Ok(json!({
+            let mut response = json!({
                 "status": if changed { "canonicalized" } else { "unchanged" },
                 "record_id": record_id,
                 "changed": changed
-            }))
+            });
+            // Omission-safe: a no-op that appended nothing carries no act.
+            if let Some(act) = act {
+                response["act"] = act.into();
+            }
+            Ok(response)
         }
         ManageBindingsArgs::Reconcile {
             target_record_id,
@@ -190,7 +208,7 @@ async fn manage_bindings(db: Db, caller: Caller, arguments: Value) -> Result<Val
             if apply {
                 require_nonblank_reason("manage_bindings", &reason)?;
             }
-            let selected = identity::reconcile_bindings_if_revision(
+            let (selected, act) = identity::reconcile_bindings_if_revision(
                 &db,
                 &context(&caller, &reason),
                 &target_record_id,
@@ -200,14 +218,19 @@ async fn manage_bindings(db: Db, caller: Caller, arguments: Value) -> Result<Val
                 if_binding_state_revision.as_deref(),
             )
             .await?;
-            Ok(json!({
+            let mut response = json!({
                 "status": if apply {"reconciled"} else {"preview"},
                 "record_id": target_record_id,
                 "from_record_id": expected_source_record_id,
                 "to_record_id": target_record_id,
                 "bindings": selected,
                 "changed": apply,
-            }))
+            });
+            // Omission-safe: `preview` and an unchanged apply append nothing.
+            if let Some(act) = act {
+                response["act"] = act.into();
+            }
+            Ok(response)
         }
     }
 }
@@ -404,7 +427,7 @@ async fn observe_external(db: Db, caller: Caller, arguments: Value) -> Result<Va
         args.snapshot_filename.as_deref(),
     )
     .await?;
-    Ok(json!({
+    let mut response = json!({
         "status": "observed",
         "record_id": result.record_id,
         "observation_id": result.observation_id,
@@ -413,7 +436,11 @@ async fn observe_external(db: Db, caller: Caller, arguments: Value) -> Result<Va
         "quality": args.quality,
         "provenance": result.provenance,
         "attachment_id": result.provenance_attachment_id,
-    }))
+    });
+    if let Some(act) = result.act {
+        response["act"] = act.into();
+    }
+    Ok(response)
 }
 
 pub fn register_identity_tools(registry: &mut ToolRegistry) -> Result<()> {

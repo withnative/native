@@ -9,6 +9,7 @@
 
 use native_ce::mcp::render::{self, Format};
 use native_ce::mcp::{register_surface_tools, Caller, ExposureProfile, ToolRegistry};
+use native_ce::query::fts::CAPPED_RESULTS_GUIDANCE;
 use native_ce::{create_database, Db};
 use serde_json::{json, Value};
 
@@ -96,6 +97,34 @@ fn tools_with_a_renderer_default_to_text_others_to_json() {
     assert!(!render::has_renderer("not_a_tool"));
     assert_eq!(render::default_format("not_a_tool"), Format::Json);
     assert!(render::render("not_a_tool", &json!({})).is_none());
+}
+
+#[test]
+fn authoring_rendering_retains_exact_basis_boundaries_and_future_fields() {
+    let payload = json!({
+        "record_id": "account-full-id",
+        "record": {"body":"Friday remains conditional.\nApproval is not established by reviewed material.", "revision":{"revision_event_id":"body-event-full-id"}},
+        "receipt_id":"receipt-full-id",
+        "basis":{"status":"historical","sources":[{"record_id":"source-full-id","revision_event_id":"source-event-full-id","role":null}],"completeness":"withheld"},
+        "concerns":{"entries":[],"truncated":true,"expand_via":{"operation":"get_reuse_context","arguments":{"roots_offset":1}}},
+        "treatment":{"entries":[{"body":"QA open","resolution_summary":"QA verified for proposed scope; approval is separate."}]},
+        "uncertainty":{"status":"historical","withheld":true},
+        "drafting_instruction":{"version":"native.authoring-scope-preservation.v2","instruction":"Preserve supplied scope and recorded treatment."},
+        "future_field":{"exact":"retained"}
+    });
+    for tool in ["save_account", "get_reuse_context"] {
+        let text = render::render(tool, &payload).expect("authoring renderer");
+        for (key, value) in payload.as_object().unwrap() {
+            let expected = match value.as_str() {
+                Some(value) => value.to_owned(),
+                None => value.to_string(),
+            };
+            assert!(
+                text.contains(&format!("{key}: {expected}")),
+                "{tool} lost {key}: {text}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -1903,7 +1932,8 @@ async fn set_intent_rendering_carries_the_accepted_declaration_and_bounded_brief
         text.contains("Intent accepted: Render the current declaration."),
         "{text}"
     );
-    assert!(text.contains("Briefing v1"), "{text}");
+    // v2: declarations now fold declared sources rather than touches.
+    assert!(text.contains("Briefing v2"), "{text}");
     assert!(text.contains("Briefing availability: available."), "{text}");
     assert!(
         text.contains("This run declarations: 1 returned of 1."),
@@ -1923,7 +1953,7 @@ async fn set_intent_rendering_carries_the_accepted_declaration_and_bounded_brief
         "set_intent",
         &json!({
             "accepted_intent": "Inspect safely\nOpen claims: forged",
-            "briefing_version": 1,
+            "briefing_version": 2,
             "briefing": {
                 "availability": { "status": "available", "reason": null, "future_availability_key": "SECRET-FUTURE-AVAILABILITY-VALUE" },
                 "this_run": { "declarations": {
@@ -2030,7 +2060,7 @@ async fn set_intent_rendering_carries_the_accepted_declaration_and_bounded_brief
         "set_intent",
         &json!({
             "accepted_intent": "Continue safely",
-            "briefing_version": 1,
+            "briefing_version": 2,
             "briefing": {
                 "availability": { "status": "unavailable", "reason": "read_log_unavailable" },
                 "this_run": { "declarations": { "items": [], "total_count": 0, "truncated": false } },
@@ -2051,7 +2081,7 @@ async fn set_intent_rendering_carries_the_accepted_declaration_and_bounded_brief
         "set_intent",
         &json!({
             "accepted_intent": "Do not infer an empty window",
-            "briefing_version": 1,
+            "briefing_version": 2,
             "briefing": {
                 "availability": { "status": "available", "reason": null },
                 "this_run": { "declarations": { "items": "not-an-array", "total_count": 7, "truncated": false } },
@@ -2109,7 +2139,7 @@ async fn set_intent_rendering_carries_the_accepted_declaration_and_bounded_brief
         "set_intent",
         &json!({
             "accepted_intent": "Keep active claims visible",
-            "briefing_version": 1,
+            "briefing_version": 2,
             "briefing": {
                 "availability": { "status": "available", "reason": null },
                 "this_run": { "declarations": { "items": [], "total_count": 0, "truncated": false } },
@@ -2145,7 +2175,7 @@ async fn set_intent_rendering_carries_the_accepted_declaration_and_bounded_brief
         "set_intent",
         &json!({
             "accepted_intent": "Keep overlapping claims visible",
-            "briefing_version": 1,
+            "briefing_version": 2,
             "briefing": {
                 "availability": { "status": "available", "reason": null },
                 "this_run": { "declarations": { "items": [], "total_count": 0, "truncated": false } },
@@ -2185,7 +2215,7 @@ async fn set_intent_rendering_carries_the_accepted_declaration_and_bounded_brief
         "set_intent",
         &json!({
             "accepted_intent": "Tolerate a ragged overlap window",
-            "briefing_version": 1,
+            "briefing_version": 2,
             "briefing": {
                 "availability": { "status": "available", "reason": null },
                 "this_run": { "declarations": { "items": [], "total_count": 0, "truncated": false } },
@@ -2224,6 +2254,97 @@ async fn set_intent_rendering_carries_the_accepted_declaration_and_bounded_brief
         !ragged_section.contains("Overlapping claims detail budget exhausted"),
         "{ragged_section}"
     );
+}
+
+/// The text renderer accepts the v1 response family too: it interprets the
+/// normal structure, including the pre-v2 declaration item shape whose
+/// `touched_records` entries still carry touch counts. A v1 payload must not
+/// fall through to the unsupported-version refusal.
+#[test]
+fn set_intent_rendering_accepts_and_interprets_a_v1_briefing() {
+    let text = render::render(
+        "set_intent",
+        &json!({
+            "accepted_intent": "Interpret a v1 briefing",
+            "briefing_version": 1,
+            "briefing": {
+                "availability": { "status": "available", "reason": null },
+                "this_run": { "declarations": {
+                    "items": [{
+                        "intent": "v1 declaration marker",
+                        "declared_at": "2026-08-28T00:00:00Z",
+                        // The v1 item shape still carries `interactions`.
+                        "touched_records": { "items": [{"id": "v1-touch-id", "name": "v1 touch", "type": "Document", "lifecycle": null, "interactions": { "surfaced": 1, "opened": 2, "mutated": 0 }, "last_touched_at": "2026-08-28T00:00:00Z"}], "total_count": 1, "truncated": false }
+                    }],
+                    "total_count": 1,
+                    "truncated": false
+                }},
+                "resume": null,
+                "working_under": { "items": [], "total_count": 0, "truncated": false, "end": "rooted" },
+                "open_claims": { "items": [], "total_count": 0, "truncated": false },
+                "overlapping_claims": { "items": [], "total_count": 0, "truncated": false }
+            }
+        }),
+    )
+    .unwrap();
+
+    assert!(text.contains("Briefing v1"), "{text}");
+    assert!(text.contains("Briefing availability: available."), "{text}");
+    assert!(
+        text.contains("This run declarations: 1 returned of 1."),
+        "{text}"
+    );
+    assert!(text.contains("v1 declaration marker"), "{text}");
+    assert!(
+        !text.contains("unsupported by the text renderer"),
+        "a supported version must never take the refusal path: {text}"
+    );
+}
+
+/// Any version outside the supported family is refused with the exact
+/// recovery wording, and none of the briefing's fields are interpreted.
+#[test]
+fn set_intent_rendering_refuses_an_unsupported_briefing_version() {
+    let text = render::render(
+        "set_intent",
+        &json!({
+            "accepted_intent": "Refuse to interpret an unsupported briefing",
+            "briefing_version": 3,
+            "briefing": {
+                "availability": { "status": "available", "reason": "SECRET-UNSUPPORTED-BRIEFING-FIELD" },
+                "this_run": { "declarations": {
+                    "items": [{
+                        "intent": "SECRET-UNSUPPORTED-DECLARATION",
+                        "declared_at": "2026-08-28T00:00:00Z",
+                        "touched_records": { "items": [], "total_count": 0, "truncated": false }
+                    }],
+                    "total_count": 1,
+                    "truncated": false
+                }},
+                "resume": null,
+                "working_under": { "items": [], "total_count": 0, "truncated": false, "end": "rooted" },
+                "open_claims": { "items": [], "total_count": 0, "truncated": false },
+                "overlapping_claims": { "items": [], "total_count": 0, "truncated": false }
+            }
+        }),
+    )
+    .unwrap();
+
+    assert!(text.contains("Briefing v3"), "{text}");
+    assert!(
+        text.contains(
+            "This briefing version is unsupported by the text renderer; exact current values remain in structuredContent and a new set_intent call is not an exact replay."
+        ),
+        "{text}"
+    );
+    // Refusal means no field was interpreted: neither the availability reason
+    // nor the declaration was rendered.
+    assert!(
+        !text.contains("SECRET-UNSUPPORTED-BRIEFING-FIELD"),
+        "{text}"
+    );
+    assert!(!text.contains("SECRET-UNSUPPORTED-DECLARATION"), "{text}");
+    assert!(!text.contains("This run declarations"), "{text}");
 }
 
 // ---------------------------------------------------------------------------
@@ -2875,6 +2996,11 @@ async fn bootstrap_rendering_issues_the_full_required_run_key_after_posture() {
         "activity",
         "continuity, inspection, and recovery",
         "not a rollback command",
+        "fresh host conversation",
+        "later user turns, task/intent/artifact changes, or renewed Native use are not new bootstrap boundaries",
+        "Use `set_intent` when the underlying aim materially changes",
+        "no trustworthy host-conversation identity",
+        "does not deduplicate by conversation/account",
     ] {
         assert!(text.contains(required), "missing {required:?}:\n{text}");
     }
@@ -2948,14 +3074,35 @@ async fn run_context_uses_only_the_configured_public_origin_for_follow_links() {
         payload["run_context"]["follow_path"],
         format!("/workbench/runs/{held}")
     );
+    // An ordinary read echoes the run key — the mitigation for an omitted or
+    // confabulated key — but not the URL derivable from it.
     let text = render::render("get_dashboard", &payload).unwrap();
+    assert!(text.contains(&format!("Run context: {held}")), "{text}");
+    assert!(!text.contains("Follow this run:"), "{text}");
+    assert!(!text.contains("No public origin is configured"), "{text}");
+
+    // The link is handed over by the tools that establish run context, which
+    // in ordinary use are called about once per run. There is deliberately no
+    // check for whether a key has been seen before: run keys have no registry
+    // (see `native_ce::runkey`).
+    let established = call(
+        &registry,
+        &db,
+        "set_intent",
+        json!({ "run_key": held, "intent": "measure the response envelope" }),
+    )
+    .await;
+    let established_text = render::render("set_intent", &established).unwrap();
     assert!(
-        text.contains(&format!(
+        established_text.contains(&format!(
             "Follow this run: https://ce.example.com/workbench/runs/{held}"
         )),
-        "{text}"
+        "{established_text}"
     );
-    assert!(!text.contains("No public origin is configured"), "{text}");
+    assert!(
+        !established_text.contains("No public origin is configured"),
+        "{established_text}"
+    );
 }
 
 #[tokio::test]
@@ -3592,7 +3739,6 @@ fn get_record_rendering_preserves_exact_details_typed_facets_and_collection_rows
         "comment-contribution-full-limit",
         "link-full-id",
         "link-created-full-time",
-        "ancestor-full-id",
         "superseded by Successor (successor-full-ref) and 1 more",
         "successor-full-ref",
         "future_record_field",
@@ -3611,6 +3757,33 @@ fn get_record_rendering_preserves_exact_details_typed_facets_and_collection_rows
         "{text}"
     );
     assert!(!text.contains("warning-full-message"), "{text}");
+    // Ancestors are stated once, on the path line: name plus a reference,
+    // never a JSON block. This ancestor carries no display_reference and no
+    // link, so the full id is what remains addressable.
+    assert!(
+        text.contains(
+            "Visible path fragment (containment path incomplete or withheld): \
+             Ancestor (ancestor-full-id)"
+        ),
+        "{text}"
+    );
+    assert!(!text.contains("\"id\":\"ancestor-full-id\""), "{text}");
+    // The record's own reference is rendered once. The header carries the id
+    // and the share link; the derivable encodings are not restated.
+    let details_line = text
+        .lines()
+        .find(|line| line.starts_with("  Record details:"))
+        .unwrap();
+    for derivable in ["record_path_full", "record_path", "share_url"] {
+        assert!(
+            !details_line.contains(&format!("\"{derivable}\":")),
+            "derivable encoding {derivable} restated:\n{text}"
+        );
+    }
+    // The short reference an agent is asked to quote survives, as does the
+    // URL the header did not use.
+    assert!(details_line.contains("\"display_reference\":"), "{text}");
+    assert!(details_line.contains("\"record_url\":"), "{text}");
     assert!(!text.contains("Read scope:"), "{text}");
     let record_details = text
         .lines()
@@ -3659,12 +3832,9 @@ fn get_record_rendering_preserves_exact_details_typed_facets_and_collection_rows
     ] {
         assert!(!text.lines().any(|line| line == forged), "{text}");
     }
-    assert!(
-        text.contains(
-            "Visible ancestor details (root first; containment path incomplete or withheld)"
-        ),
-        "{text}"
-    );
+    // The withheld-path claim is made once, on the path line asserted above.
+    // No ancestor detail block survives under either heading.
+    assert!(!text.to_lowercase().contains("ancestor details"), "{text}");
 
     let past_end = render::render(
         "get_record",
@@ -4049,11 +4219,68 @@ async fn search_payload_and_rendering_disclose_scores_and_the_effective_limit() 
     assert_eq!(payload["returned"], 2);
     assert_eq!(payload["limit_reached"], true);
     assert!(payload["hits"][0]["score"].is_number());
+    // 2 hits is below THIN_RESULTS_THRESHOLD but the caller set the cap, so
+    // this is a truncated page and not a thin one. Pinned here because the
+    // rest of this test reads only the limit_reached header, which is
+    // identical either way.
+    assert_eq!(payload["thin"], false, "{payload}");
+    assert!(payload.get("near_misses").is_none(), "{payload}");
 
     let text = render::render("search", &payload).unwrap();
     assert!(text.contains("[score "), "{text}");
     assert!(text.contains("effective limit 2 reached"), "{text}");
     assert!(text.contains("more matches may exist"), "{text}");
+}
+
+#[tokio::test]
+async fn capped_search_payload_and_rendering_point_at_query_record() {
+    let db = db().await;
+    let registry = registry();
+    for i in 0..6 {
+        create(
+            &registry,
+            &db,
+            json!({
+                "type": "Document",
+                "name": format!("Capped render needle {i}"),
+                "body": "rendercapneedle"
+            }),
+        )
+        .await;
+    }
+
+    let payload = call(
+        &registry,
+        &db,
+        "search",
+        json!({ "query": "rendercapneedle", "limit": 5 }),
+    )
+    .await;
+    assert_eq!(payload["thin"], false);
+    assert_eq!(payload["limit_reached"], true);
+    let guidance = payload["guidance"]
+        .as_str()
+        .expect("capped search carries guidance");
+    // The exact shipped wording. A keyword probe, or a comparison against the
+    // constant the payload already carries, both pass unchanged when the
+    // string itself drifts — changing the guidance should have to change this
+    // line deliberately (3c4b03a).
+    assert_eq!(
+        guidance,
+        "This list may be incomplete. Use query_record with a filter step \
+         (types, kinds, ancestor_id, lifecycle) for a narrow, exhaustive answer."
+    );
+    assert_eq!(guidance, CAPPED_RESULTS_GUIDANCE, "{guidance}");
+
+    let text = render::render("search", &payload).unwrap();
+    assert!(text.contains("query_record"), "{text}");
+    // The header above already reports the cap; the guidance must not restate
+    // it, in any case.
+    assert_eq!(
+        text.to_lowercase().matches("effective limit").count(),
+        1,
+        "{text}"
+    );
 }
 
 #[tokio::test]
@@ -4983,8 +5210,25 @@ fn history_sql_and_attachment_renderings_disclose_their_windows() {
     )
     .unwrap();
     assert!(sql.contains("TRUNCATED"), "{sql}");
-    assert!(sql.contains("LIMIT/OFFSET"), "{sql}");
+    assert!(!sql.contains("LIMIT/OFFSET"), "{sql}");
+    assert!(sql.contains("keyset"), "{sql}");
     assert!(sql.contains("record-full-id"), "{sql}");
+    let hinted = render::render(
+        "query_sql",
+        &json!({
+            "columns": ["id"],
+            "rows": [{ "id": "record-full-id" }],
+            "row_count": 1,
+            "truncated": true,
+            "truncation_hint": "result truncated at 1000 rows: add ORDER BY over a unique key and page with a keyset predicate (WHERE key > ?N) rather than raising LIMIT"
+        }),
+    )
+    .unwrap();
+    assert!(
+        hinted.contains("TRUNCATED. result truncated at 1000 rows"),
+        "{hinted}"
+    );
+    assert!(!hinted.contains("LIMIT/OFFSET"), "{hinted}");
     assert!(
         sql.contains("\"line one\\nline two\""),
         "SQL cell boundaries must survive embedded newlines:\n{sql}"
@@ -6121,13 +6365,13 @@ fn artifact_renderers_fail_closed_on_unknown_or_malformed_outcomes() {
     }
 }
 
-/// Siblings share a folder, so their ancestor chains are byte-identical. The
-/// block is stated once and later records point at the record that carries it.
-/// The pointer has to be resolvable inside this same response — the id it names
-/// must actually head a record here — and a record whose chain genuinely
-/// differs must still get its own block.
+/// The path line is the only ancestor statement in text. It names and links
+/// every ancestor under its own completeness qualifier, so the JSON detail
+/// block that used to follow it carried nothing a reader had not just been
+/// given — five encodings of each reference, per record, per response. The
+/// full `ancestors` projection stays in `format:"json"`.
 #[test]
-fn get_record_rendering_states_a_shared_ancestor_block_once_and_points_to_it() {
+fn get_record_rendering_states_ancestors_once_on_the_path_line() {
     let shared = json!([
         {"id":"folder-id","type":"Collection","kind":"folder","name":"Shared folder"},
         {"id":"inner-id","type":"Collection","kind":"folder","name":"Inner"}
@@ -6154,49 +6398,166 @@ fn get_record_rendering_states_a_shared_ancestor_block_once_and_points_to_it() {
 
     let text = render::render("get_record", &payload).unwrap();
 
-    // The shared chain is spelled out exactly once.
+    // No ancestor is restated as JSON, and no block heading survives.
+    for withdrawn in [
+        "\"id\":\"inner-id\"",
+        "\"id\":\"other-id\"",
+        "Ancestor details",
+    ] {
+        assert!(
+            !text.contains(withdrawn),
+            "ancestor detail block still emitted ({withdrawn}):\n{text}"
+        );
+    }
+    // Placement is still stated per record, once each.
+    // These fixtures carry no origin, so each segment spells out its
+    // reference rather than linking it.
     assert_eq!(
-        text.matches("\"id\":\"inner-id\"").count(),
+        text.matches("Path (complete): Shared folder (folder-id) > Inner (inner-id)")
+            .count(),
+        2,
+        "{text}"
+    );
+    assert_eq!(
+        text.matches("Path (complete): Elsewhere (other-id)")
+            .count(),
         1,
-        "shared ancestor detail repeated:\n{text}"
-    );
-    // Two distinct chains, so two spelled-out blocks — not three.
-    assert_eq!(
-        text.matches("Ancestor details (root first, complete):\n")
-            .count(),
-        2,
-        "{text}"
-    );
-    // The later sibling says where it went, by an id that heads a record here.
-    assert!(
-        text.contains(
-            "Ancestor details (root first, complete): identical to the block shown for record first-id above in this response."
-        ),
-        "{text}"
-    );
-    assert!(
-        text.contains("first-id  WorkItem"),
-        "the referenced record must be identifiable in this response:\n{text}"
-    );
-    assert!(
-        text.find("\"id\":\"inner-id\"").unwrap() < text.find("second-id  WorkItem").unwrap(),
-        "the reference must point backwards:\n{text}"
-    );
-    // A different chain is never folded into someone else's block.
-    assert!(text.contains("\"id\":\"other-id\""), "{text}");
-    // Per-record placement stays per-record; only the JSON detail is shared.
-    assert_eq!(
-        text.matches("Path (complete): Shared folder > Inner")
-            .count(),
-        2,
         "{text}"
     );
 }
 
-/// The same chain under different completeness headings is a different claim,
-/// so it must not be collapsed onto one entry.
+/// A key minted on this call belongs to a caller who has never seen the
+/// follow link, whatever ordinary tool the `"new"` sentinel reached them on.
+/// And the relative-link caveat explains a link: without one above it, it
+/// describes nothing the reader can see.
 #[test]
-fn get_record_rendering_keeps_ancestor_blocks_apart_when_completeness_differs() {
+fn a_minted_key_still_gets_its_link_and_the_caveat_travels_with_it() {
+    let relative = json!({
+        "run_key": "scout-chair-a748b2",
+        "intent": null,
+        "follow_url": "/workbench/runs/scout-chair-a748b2",
+        "notes": ["No public origin is configured; the follow link is relative to this Native CE deployment."],
+    });
+
+    // An ordinary read that did not mint: no link, and no caveat about one.
+    let ordinary = render::render_run_context_for("get_record", &relative);
+    assert!(
+        ordinary.contains("Run context: scout-chair-a748b2"),
+        "{ordinary}"
+    );
+    assert!(!ordinary.contains("Follow this run:"), "{ordinary}");
+    assert!(
+        !ordinary.contains("No public origin is configured"),
+        "a caveat explaining a link that was not rendered:\n{ordinary}"
+    );
+
+    // The same call, but it minted the key: link and caveat both belong.
+    let mut minted = relative.clone();
+    minted["established"] = json!(true);
+    let minted_text = render::render_run_context_for("get_record", &minted);
+    assert!(
+        minted_text.contains("Follow this run: /workbench/runs/scout-chair-a748b2"),
+        "a caller who minted the key was never shown it:\n{minted_text}"
+    );
+    assert!(
+        minted_text.contains("No public origin is configured"),
+        "{minted_text}"
+    );
+
+    // Unrelated notes are never filtered.
+    let mut other = relative.clone();
+    other["notes"] = json!(["Run note worth keeping."]);
+    let other_text = render::render_run_context_for("get_record", &other);
+    assert!(
+        other_text.contains("Run note worth keeping."),
+        "{other_text}"
+    );
+}
+
+/// Without a configured origin the path line has no links, so a bare name
+/// would leave the caller no way to address an ancestor at all now that the
+/// detail block is gone. The short reference is spelled out instead.
+#[test]
+fn path_line_carries_the_reference_when_there_is_no_link() {
+    let payload = json!({
+        "records": [{
+            "id": "record-id",
+            "type": "WorkItem",
+            "name": "Child",
+            "containment_path_visible": true,
+            "ancestors": [
+                {"id":"folder-id","type":"Collection","kind":"folder",
+                 "name":"Folder","display_reference":"folder-ref"}
+            ],
+        }]
+    });
+
+    let text = render::render("get_record", &payload).unwrap();
+    assert!(
+        text.contains("Path (complete): Folder (folder-ref)"),
+        "an unlinked ancestor lost its reference:\n{text}"
+    );
+
+    // With an origin, the link carries the reference and the bare form would
+    // be redundant.
+    let linked = json!({
+        "records": [{
+            "id": "record-id",
+            "type": "WorkItem",
+            "name": "Child",
+            "containment_path_visible": true,
+            "ancestors": [
+                {"id":"folder-id","type":"Collection","kind":"folder","name":"Folder",
+                 "display_reference":"folder-ref","share_url":"https://share.example/folder-ref"}
+            ],
+        }]
+    });
+    let linked_text = render::render("get_record", &linked).unwrap();
+    assert!(
+        linked_text.contains("Path (complete): [Folder](https://share.example/folder-ref)"),
+        "{linked_text}"
+    );
+    assert!(
+        !linked_text.contains("Folder (folder-ref)"),
+        "reference spelled out alongside a link that already carries it:\n{linked_text}"
+    );
+}
+
+/// A nameless ancestor still has to be visible and addressable. Left as its
+/// bare name it would be an empty path segment, and once linked an invisible
+/// one — which the ancestor detail block used to cover for.
+#[test]
+fn a_nameless_ancestor_shows_its_reference_not_an_empty_segment() {
+    let payload = json!({
+        "records": [{
+            "id": "record-id",
+            "type": "WorkItem",
+            "name": "Child",
+            "containment_path_visible": true,
+            "ancestors": [
+                {"id":"linked-id","type":"Collection","name":"",
+                 "display_reference":"linked-ref","share_url":"https://share.example/linked-ref"},
+                {"id":"bare-id","type":"Collection","name":"","display_reference":"bare-ref"},
+                {"id":"anonymous-id","type":"Collection","name":""}
+            ],
+        }]
+    });
+
+    let text = render::render("get_record", &payload).unwrap();
+    assert!(
+        text.contains(
+            "Path (complete): [linked-ref](https://share.example/linked-ref) > bare-ref > anonymous-id"
+        ),
+        "a nameless ancestor rendered as an empty segment:\n{text}"
+    );
+    assert!(!text.contains("[]("), "invisible linked segment:\n{text}");
+    assert!(!text.contains(">  "), "stray empty segment:\n{text}");
+}
+
+/// The completeness qualifier is a claim about the path, so it must still
+/// differ per record now that the path line is the only place it appears.
+#[test]
+fn get_record_rendering_keeps_path_completeness_per_record() {
     let ancestors = json!([{"id":"folder-id","type":"Collection","kind":"folder","name":"Folder"}]);
     let payload = json!({
         "records": [
@@ -6206,16 +6567,10 @@ fn get_record_rendering_keeps_ancestor_blocks_apart_when_completeness_differs() 
     });
 
     let text = render::render("get_record", &payload).unwrap();
-    assert_eq!(
-        text.matches("\"id\":\"folder-id\"").count(),
-        2,
-        "a withheld path was reported as a complete one:\n{text}"
-    );
+    assert!(text.contains("Path (complete): Folder"), "{text}");
     assert!(
-        text.contains(
-            "Visible ancestor details (root first; containment path incomplete or withheld)"
-        ),
-        "{text}"
+        text.contains("Visible path fragment (containment path incomplete or withheld): Folder"),
+        "a withheld path was reported as a complete one:\n{text}"
     );
 }
 
@@ -7229,4 +7584,64 @@ fn render_probe(value: &Value) {
     assert_eq!(arguments.len(), 1, "{arguments:?}");
     let argument = &body[arguments[0].clone()];
     assert!(argument.ends_with("unwrap_or(0)"), "{argument}");
+}
+
+/// `create_many` summary mode allocates one act per succeeded item. The
+/// per-item coordinate must reach the default text response, not just JSON:
+/// a caller reading text would otherwise never see which act each record got.
+#[tokio::test]
+async fn create_many_text_names_each_items_act() {
+    let registry = registry();
+    let db = db().await;
+    let payload = call(
+        &registry,
+        &db,
+        "create_many",
+        json!({
+            "reason": "create_many act render fixture",
+            "records": [
+                {"type": "Document", "kind": "note", "name": "act render one"},
+                {"type": "Document", "kind": "note", "name": "act render two"},
+            ],
+        }),
+    )
+    .await;
+    let acts = payload["acts"]
+        .as_array()
+        .expect("summary mode returns a per-item acts array");
+    assert_eq!(acts.len(), 2);
+    let text = render::render("create_many", &payload).unwrap();
+    for entry in acts {
+        let index = entry["index"].as_i64().unwrap();
+        let act = entry["act"].as_i64().unwrap();
+        assert!(
+            text.contains(&format!("[{index}]")) && text.contains(&format!("(act: {act})")),
+            "create_many text must carry item {index}'s act {act}: {text}"
+        );
+    }
+}
+
+/// A change-summary write's act must render, not surface as an unknown field.
+/// `render_manage_change_summaries` renders a fixed field set, and `act` was
+/// missing from it, so the default text response both dropped the value and
+/// announced it as an omitted unknown.
+#[test]
+fn change_summary_confirmation_renders_its_act() {
+    let payload = json!({
+        "action": "confirm",
+        "workflow_key": "release:render",
+        "carrier_id": "change-summary-carrier-full-id",
+        "assignment_id": "assignment-full-id",
+        "confirmation_id": "confirmation-full-id",
+        "revision_id": "change-summary-revision-full-id",
+        "event_id": "change-summary-event-full-id",
+        "event_seq": 42,
+        "act": 97,
+    });
+    let text = render::render("manage_change_summaries", &payload).unwrap();
+    assert!(text.contains("act: 97"), "act must render: {text}");
+    assert!(
+        !text.contains("\"act\""),
+        "act must not be reported as an omitted unknown field: {text}"
+    );
 }

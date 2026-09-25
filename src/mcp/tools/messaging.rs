@@ -20,7 +20,7 @@ use crate::store::{append_in, AppendSpec};
 use super::super::registry::{Caller, ToolRegistry};
 use super::super::ToolKind;
 use super::{
-    can_record, can_record_in, parse_args, require_nonblank_reason, require_record_in,
+    can_record, can_record_in, echo_act, parse_args, require_nonblank_reason, require_record_in,
     REASON_DESCRIPTION,
 };
 
@@ -244,6 +244,7 @@ async fn append_classification(
     message_id: &str,
     conversation_id: &str,
     add: bool,
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<()> {
     let spec = if add {
         AppendSpec {
@@ -270,7 +271,7 @@ async fn append_classification(
             actor: Some(caller.actor().into()),
         }
     };
-    append_in(db, tx, spec).await?;
+    append_in(db, tx, spec, act_alloc).await?;
     Ok(())
 }
 
@@ -430,6 +431,7 @@ async fn share_history(
 ) -> Result<Value> {
     require_nonblank_reason("manage_messages.share_history", &reason)?;
     let mut tx = crate::db::begin_write(db.write_pool()).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
     let (message_ids, snapshot_seq, conversation_id) =
         resolved_share_set(&mut tx, message_ids, conversation_id, snapshot_seq).await?;
     if message_ids.is_empty() {
@@ -545,6 +547,7 @@ async fn share_history(
                 })?,
                 actor: Some(caller.actor().into()),
             },
+            &mut act_alloc,
         )
         .await?;
         if let Some(attestation) = attestation {
@@ -561,12 +564,14 @@ async fn share_history(
             caller.actor(),
             message_id,
             policy,
+            &mut act_alloc,
         )
         .await?;
         shared.push(message_id.clone());
     }
     db.commit_content(tx).await?;
-    Ok(json!({
+    echo_act(
+        json!({
         "status": if shared.is_empty() { "unchanged" } else { "shared" },
         "selection_id": selection_id,
         "snapshot_seq": snapshot_seq,
@@ -576,7 +581,9 @@ async fn share_history(
         "message_ids": message_ids,
         "shared": shared,
         "unchanged": unchanged,
-    }))
+        }),
+        act_alloc.get(),
+    )
 }
 
 fn reaction_executor(caller: &Caller) -> (&'static str, Option<String>) {
@@ -892,6 +899,7 @@ async fn append_reaction_command_in(
     tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
     caller: &Caller,
     spec: ReactionCommandSpec<'_>,
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<()> {
     let (executor_kind, executor_ref) = reaction_executor(caller);
     let payload = crate::events::MessageReactionPayload {
@@ -920,6 +928,7 @@ async fn append_reaction_command_in(
             payload: serde_json::to_value(payload)?,
             actor: Some(caller.actor().into()),
         },
+        act_alloc,
     )
     .await?;
     Ok(())
@@ -979,9 +988,10 @@ async fn mutate_reaction(
         "message.reaction.removed.v1"
     };
     let mut tx = crate::db::begin_write(db.write_pool()).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
     require_local_message_in(&mut tx, caller, &message_id).await?;
-    if let Some((existing_record_id, event_type_found, payload)) = sqlx::query(
-        "SELECT record_id,type,payload FROM content_events
+    if let Some((existing_record_id, event_type_found, payload, replayed_act)) = sqlx::query(
+        "SELECT record_id,type,payload,act FROM content_events
           WHERE actor=?
             AND type IN ('message.reaction.added.v1','message.reaction.removed.v1')
             AND json_extract(payload,'$.idempotency_key')=?
@@ -998,6 +1008,7 @@ async fn mutate_reaction(
             serde_json::from_str::<crate::events::MessageReactionPayload>(
                 &row.try_get::<String, _>("payload")?,
             )?,
+            row.try_get::<Option<i64>, _>("act")?,
         ))
     })
     .transpose()?
@@ -1013,11 +1024,16 @@ async fn mutate_reaction(
             &existing_record_id,
         )?;
         tx.rollback().await?;
-        return Ok(json!({
+        // A keyed replay returns the original reaction write's act, so the
+        // replay receipt is indistinguishable from the first.
+        return echo_act(
+            json!({
             "status":if original_changed {if adding {"added"} else {"removed"}} else {"unchanged"},
             "message_id":message_id,"emoji":emoji,
             "changed":original_changed,"reactions":reaction_groups(db,caller.credential(),&message_id).await?,
-        }));
+            }),
+            replayed_act,
+        );
     }
     let present = reaction_present_in(&mut tx, &message_id, caller.actor(), &emoji).await?;
     let changed = present != adding;
@@ -1034,14 +1050,18 @@ async fn mutate_reaction(
             adding,
             changed,
         },
+        &mut act_alloc,
     )
     .await?;
     db.commit_content(tx).await?;
-    Ok(json!({
+    echo_act(
+        json!({
         "status":if changed {if adding {"added"} else {"removed"}} else {"unchanged"},
         "message_id":message_id,"emoji":emoji,"changed":changed,
         "reactions":reaction_groups(db,caller.credential(),&message_id).await?,
-    }))
+        }),
+        act_alloc.get(),
+    )
 }
 
 async fn append_link_if_missing_in(
@@ -1051,6 +1071,7 @@ async fn append_link_if_missing_in(
     source_id: &str,
     target_id: &str,
     relationship: &str,
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<bool> {
     let exists: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM links WHERE source_id=? AND target_id=? AND relationship=?)",
@@ -1078,6 +1099,7 @@ async fn append_link_if_missing_in(
             })?,
             actor: Some(caller.actor().into()),
         },
+        act_alloc,
     )
     .await?;
     Ok(true)
@@ -1088,6 +1110,7 @@ async fn clone_message_visibility_to_evidence_in(
     caller: &Caller,
     message_id: &str,
     evidence_id: &str,
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<()> {
     let message_anchor: String =
         sqlx::query_scalar("SELECT policy_anchor_id FROM records WHERE id=?")
@@ -1120,7 +1143,14 @@ async fn clone_message_visibility_to_evidence_in(
             AllowEntry::account(id, capability)
         });
     }
-    crate::authorization::replace_explicit_policy_on(tx, caller.actor(), evidence_id, entries).await
+    crate::authorization::replace_explicit_policy_on(
+        tx,
+        caller.actor(),
+        evidence_id,
+        entries,
+        act_alloc,
+    )
+    .await
 }
 
 async fn satisfy_acknowledgement_expectation_with_reaction(
@@ -1142,9 +1172,10 @@ async fn satisfy_acknowledgement_expectation_with_reaction(
         ));
     }
     let mut tx = crate::db::begin_write(db.write_pool()).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
     require_local_message_in(&mut tx, caller, &message_id).await?;
     if let Some(row) = sqlx::query(
-        "SELECT record_id,type,payload FROM content_events
+        "SELECT record_id,type,payload,act FROM content_events
           WHERE actor=?
             AND type IN ('message.reaction.added.v1','message.reaction.removed.v1')
             AND json_extract(payload,'$.idempotency_key')=?
@@ -1157,6 +1188,7 @@ async fn satisfy_acknowledgement_expectation_with_reaction(
     {
         let existing_record_id: String = row.try_get("record_id")?;
         let event_type: String = row.try_get("type")?;
+        let replayed_act: Option<i64> = row.try_get("act")?;
         let payload: crate::events::MessageReactionPayload =
             serde_json::from_str(&row.try_get::<String, _>("payload")?)?;
         payload.validate(Some(caller.actor()))?;
@@ -1185,11 +1217,15 @@ async fn satisfy_acknowledgement_expectation_with_reaction(
             .ok_or_else(|| Error::engine("acknowledgement retry has no valid durable evidence"))?;
         tx.rollback().await?;
         let state = message_state(db, caller, &message_id).await?;
-        return Ok(json!({
+        // A keyed replay returns the original write's act.
+        return echo_act(
+            json!({
             "status":"acknowledged","message_id":message_id,"emoji":EMOJI,"changed":original_changed,
             "reactions":state["reactions"],
             "acknowledgement":{"state":"satisfied","evidence_record_id":evidence_record_id},
-        }));
+            }),
+            replayed_act,
+        );
     }
     let actor_record_id = caller_record_id_in(&mut tx, caller).await?.ok_or_else(|| {
         Error::engine(
@@ -1246,14 +1282,29 @@ async fn satisfy_acknowledgement_expectation_with_reaction(
                 payload: Value::Object(fields),
                 actor: Some(caller.actor().into()),
             },
+            &mut act_alloc,
         )
         .await?;
-        clone_message_visibility_to_evidence_in(&mut tx, caller, &message_id, &evidence_id).await?;
+        clone_message_visibility_to_evidence_in(
+            &mut tx,
+            caller,
+            &message_id,
+            &evidence_id,
+            &mut act_alloc,
+        )
+        .await?;
         evidence_changed = true;
     }
-    evidence_changed |=
-        append_link_if_missing_in(db, &mut tx, caller, &evidence_id, &message_id, "part_of")
-            .await?;
+    evidence_changed |= append_link_if_missing_in(
+        db,
+        &mut tx,
+        caller,
+        &evidence_id,
+        &message_id,
+        "part_of",
+        &mut act_alloc,
+    )
+    .await?;
     evidence_changed |= append_link_if_missing_in(
         db,
         &mut tx,
@@ -1261,6 +1312,7 @@ async fn satisfy_acknowledgement_expectation_with_reaction(
         &evidence_id,
         &message_id,
         "acknowledges",
+        &mut act_alloc,
     )
     .await?;
     let routing: Option<(String, String, i64)> = sqlx::query_as(
@@ -1288,6 +1340,7 @@ async fn satisfy_acknowledgement_expectation_with_reaction(
             adding: true,
             changed,
         },
+        &mut act_alloc,
     )
     .await?;
     if routing_changed {
@@ -1308,15 +1361,19 @@ async fn satisfy_acknowledgement_expectation_with_reaction(
             None,
             routing.as_ref().map_or(0, |(_, _, version)| *version),
             &format!("{idempotency_key}:routing"),
+            &mut act_alloc,
         )
         .await?;
     }
     db.commit_content(tx).await?;
-    Ok(json!({
+    echo_act(
+        json!({
         "status":"acknowledged","message_id":message_id,"emoji":EMOJI,"changed":changed,
         "reactions":reaction_groups(db,caller.credential(),&message_id).await?,
         "acknowledgement":{"state":"satisfied","evidence_record_id":evidence_id},
-    }))
+        }),
+        act_alloc.get(),
+    )
 }
 
 async fn visible_message_rows(
@@ -1538,6 +1595,7 @@ async fn list_context(
     let mut candidates = query
         .bind(super::is_legacy_local(caller))
         .bind(caller.credential())
+        .bind(caller.is_host_member())
         .bind(caller.credential())
         .bind((limit + 1) as i64)
         .fetch_all(&mut *snapshot)
@@ -1736,20 +1794,25 @@ async fn build_inbox_snapshot_attempt(
             "Inbox snapshot exceeds the bounded 10000 Message selection",
         ));
     }
-    let mut message_ids = Vec::new();
-    for id in candidates {
-        if visible_in_snapshot(&mut tx, caller, &id).await? {
-            message_ids.push(id);
-        }
-    }
+    // Batched visibility through the canonical set-wise admission helper
+    // (`visible_ids_in`: one admission set query plus the constant-statement
+    // preloaded authorization fold). Scalar `visible_in_snapshot` remains for
+    // the single conversation-id gate above; the per-candidate loop it used
+    // to serve here issued one full authorization walk per Message.
+    let message_ids = filter_visible_in_snapshot(&mut tx, caller, candidates).await?;
+    // Batched hydration inside the same snapshot transaction. The batch
+    // hydration overhead is constant (one joined row query, two grouped
+    // count queries, one ranked reaction query plus two batched
+    // actor-resolution queries, and the three-statement expectation base
+    // preload); per-Message evidence walks inside the shared evaluator remain
+    // linear and are the explicitly measured residual cost.
+    let mut hydrated = hydrate_inbox_items_in(&mut tx, caller, &message_ids).await?;
     tx.commit().await?;
     let mut items = Vec::new();
-    for id in message_ids {
-        if let Some(mut item) = inbox_item(db, caller, &id).await? {
-            if item_in_view(&item, view) {
-                item.as_object_mut().unwrap().remove("_predicates");
-                items.push(item);
-            }
+    for mut item in hydrated.drain(..) {
+        if item_in_view(&item, view) {
+            item.as_object_mut().unwrap().remove("_predicates");
+            items.push(item);
         }
     }
     let current_content: i64 =
@@ -1808,11 +1871,57 @@ async fn build_inbox_snapshot_attempt(
     })
 }
 
-async fn inbox_item(db: &Db, caller: &Caller, message_id: &str) -> Result<Option<Value>> {
-    if !can_record(db, caller, message_id, Capability::View).await? {
-        return Ok(None);
+/// Batched visibility for the inbox candidate set, preserving the scalar
+/// admission order and semantics for every caller.
+///
+/// This is the canonical set-wise form of the old per-candidate
+/// `visible_in_snapshot` + per-item `can_record` gates:
+/// [`super::visible_ids_in`] combines ordinary record-family admission with
+/// the preloaded authorization fold (the same grant/owner/derived/Unit rules
+/// the scalar `effective_capability_on` evaluates, including the
+/// trusted-local shape-validation semantics for legacy callers) in one extra
+/// set query plus the constant-statement preload. The result is a set, so
+/// membership filters the candidate list below and the original
+/// newest-first ordering is retained.
+async fn filter_visible_in_snapshot(
+    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    caller: &Caller,
+    candidates: Vec<String>,
+) -> Result<Vec<String>> {
+    let visible = super::visible_ids_in(tx, caller, candidates.clone()).await?;
+    Ok(candidates
+        .into_iter()
+        .filter(|id| visible.contains(id))
+        .collect())
+}
+
+/// Batched inbox hydration inside the caller's snapshot transaction.
+///
+/// The batch hydration overhead is a constant number of statements
+/// regardless of item count: one joined row query, one grouped
+/// mention-count query, one grouped delivery-candidate query, one ranked
+/// reaction query plus two batched actor-resolution queries, and the
+/// three-statement expectation base preload (recipient binding, record
+/// types, expectation facets). That constant covers the hydration overhead
+/// only — the per-Message evidence walks inside the shared expectation
+/// evaluator deliberately stay scalar on this same transaction (see the
+/// call site), so their semantics are unchanged and their statements remain
+/// linear in the visible count; they are the measured residual.
+///
+/// Ordering follows the input `message_ids` order (candidate newest-first).
+/// Rows missing from the snapshot are skipped, matching the scalar
+/// `inbox_item` `Ok(None)` behaviour. All other fields, defaults, and the
+/// `_predicates.snoozed` computation are byte-for-byte the scalar logic.
+async fn hydrate_inbox_items_in(
+    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    caller: &Caller,
+    message_ids: &[String],
+) -> Result<Vec<Value>> {
+    if message_ids.is_empty() {
+        return Ok(Vec::new());
     }
-    let row = sqlx::query(
+    let ids_json = serde_json::to_string(message_ids)?;
+    let rows = sqlx::query(
         "SELECT r.id,r.name,r.body,r.created_at,r.home_id,
                 COALESCE(h.stage,'unsurfaced') human_stage,COALESCE(h.version,0) human_version,
                 COALESCE(a.state,'unhandled') agent_state,COALESCE(a.version,0) agent_version,
@@ -1824,62 +1933,256 @@ async fn inbox_item(db: &Db, caller: &Caller, message_id: &str) -> Result<Option
            LEFT JOIN agent_message_dispositions a ON a.message_id=r.id AND a.subject_account_id=?
            LEFT JOIN message_preferences p ON p.message_id=r.id AND p.subject_account_id=?
            LEFT JOIN message_inbox_routing ir ON ir.message_id=r.id AND ir.subject_account_id=?
-          WHERE r.id=? AND r.type='Message' AND r.deleted_at IS NULL",
+          WHERE r.id IN (SELECT value FROM json_each(?)) AND r.type='Message' AND r.deleted_at IS NULL",
     )
     .bind(caller.credential()).bind(caller.credential()).bind(caller.credential()).bind(caller.credential())
-    .bind(message_id).fetch_optional(db.write_pool()).await?;
-    let Some(row) = row else {
-        return Ok(None);
-    };
-    let expectation = crate::message_expectation::derive_message_expectation_state(
-        db,
-        message_id,
-        caller.credential(),
+    .bind(&ids_json).fetch_all(&mut **tx).await?;
+    let mut rows_by_id = std::collections::HashMap::with_capacity(rows.len());
+    for row in rows {
+        let id: String = row.try_get("id")?;
+        rows_by_id.insert(id, row);
+    }
+    let mut mention_by_id = std::collections::HashMap::new();
+    for row in sqlx::query(
+        "SELECT mm.message_id AS message_id,COUNT(*) AS n FROM message_mentions mm
+           JOIN bindings b ON b.record_id=mm.target_record_id AND b.system='account'
+            AND b.identifier=? AND b.is_canonical=1
+          WHERE mm.message_id IN (SELECT value FROM json_each(?))
+            AND mm.target_kind='principal' AND mm.effective=1
+          GROUP BY mm.message_id",
     )
-    .await?;
-    let default_obligation = match expectation.state {
-        crate::message_expectation::MessageExpectationState::Open
-        | crate::message_expectation::MessageExpectationState::Unknown => "open",
-        crate::message_expectation::MessageExpectationState::Satisfied => "satisfied",
-        crate::message_expectation::MessageExpectationState::NotRequired => "none",
+    .bind(caller.credential())
+    .bind(&ids_json)
+    .fetch_all(&mut **tx)
+    .await?
+    {
+        let id: String = row.try_get("message_id")?;
+        let n: i64 = row.try_get("n")?;
+        mention_by_id.insert(id, n);
+    }
+    let mut candidate_by_id = std::collections::HashMap::new();
+    for row in sqlx::query(
+        "SELECT message_id,COUNT(*) AS n FROM notification_candidates
+          WHERE recipient_account_id=? AND message_id IN (SELECT value FROM json_each(?))
+            AND status='effective' GROUP BY message_id",
+    )
+    .bind(caller.credential())
+    .bind(&ids_json)
+    .fetch_all(&mut **tx)
+    .await?
+    {
+        let id: String = row.try_get("message_id")?;
+        let n: i64 = row.try_get("n")?;
+        candidate_by_id.insert(id, n);
+    }
+    let reactions_by_id = batched_reaction_groups_in(tx, caller.credential(), message_ids).await?;
+    // Batched expectation base preloads (recipient binding, record types,
+    // expectation facets: three constant statements) for the hydrated rows
+    // only; evidence walks stay per-Message scalar inside the shared
+    // evaluator, so derivation semantics are unchanged.
+    let present_ids: Vec<String> = message_ids
+        .iter()
+        .filter(|id| rows_by_id.contains_key(*id))
+        .cloned()
+        .collect();
+    let batch = if present_ids.is_empty() {
+        Vec::new()
+    } else {
+        crate::message_expectation::derive_message_expectation_states_in(
+            tx,
+            &present_ids,
+            caller.credential(),
+        )
+        .await?
     };
-    let obligation_state = row
-        .try_get::<Option<String>, _>("obligation_state")?
-        .unwrap_or_else(|| default_obligation.into());
-    let executor_route = row
-        .try_get::<Option<String>, _>("executor_route")?
-        .unwrap_or_else(|| {
-            if obligation_state == "open" {
-                "human".into()
-            } else {
-                "unassigned".into()
-            }
+    let mut expectation_by_id = std::collections::HashMap::with_capacity(present_ids.len());
+    for derived in batch {
+        expectation_by_id.insert(derived.message_id.clone(), derived);
+    }
+    let mut items = Vec::new();
+    for message_id in message_ids {
+        let Some(row) = rows_by_id.remove(message_id) else {
+            continue;
+        };
+        let expectation = expectation_by_id
+            .remove(message_id)
+            .expect("batched expectation derivations cover every hydrated row");
+        let default_obligation = match expectation.state {
+            crate::message_expectation::MessageExpectationState::Open
+            | crate::message_expectation::MessageExpectationState::Unknown => "open",
+            crate::message_expectation::MessageExpectationState::Satisfied => "satisfied",
+            crate::message_expectation::MessageExpectationState::NotRequired => "none",
+        };
+        let obligation_state = row
+            .try_get::<Option<String>, _>("obligation_state")?
+            .unwrap_or_else(|| default_obligation.into());
+        let executor_route = row
+            .try_get::<Option<String>, _>("executor_route")?
+            .unwrap_or_else(|| {
+                if obligation_state == "open" {
+                    "human".into()
+                } else {
+                    "unassigned".into()
+                }
+            });
+        let human_stage: String = row.try_get("human_stage")?;
+        let agent_state: String = row.try_get("agent_state")?;
+        let snoozed_until: Option<String> = row.try_get("snoozed_until")?;
+        let snoozed = snoozed_until
+            .as_deref()
+            .and_then(|v| chrono::DateTime::parse_from_rfc3339(v).ok())
+            .is_some_and(|v| v > chrono::Utc::now());
+        let mention_count: i64 = mention_by_id.remove(message_id).unwrap_or(0);
+        let candidate_count: i64 = candidate_by_id.remove(message_id).unwrap_or(0);
+        let reactions = reactions_by_id.get(message_id).cloned().unwrap_or_default();
+        items.push(json!({
+            // The destination this Message was filed in, carried on every item so a
+            // per-destination rollup is a grouping rather than a second query.
+            // A Message sent without a home is filed under `native:unfiled` rather
+            // than left homeless, so the grouping is total; `null` stays reserved
+            // for a record that genuinely has no home.
+            "message_id":message_id,"home_id":row.try_get::<Option<String>,_>("home_id")?,"name":row.try_get::<String,_>("name")?,"body":row.try_get::<Option<String>,_>("body")?,"created_at":row.try_get::<String,_>("created_at")?,
+            "human":{"stage":human_stage,"version":row.try_get::<i64,_>("human_version")?},
+            "agent":{"state":agent_state,"version":row.try_get::<i64,_>("agent_version")?},
+            "obligation":{"state":obligation_state,"expectation_state":expectation.state},
+            "route":{"executor":executor_route,"version":row.try_get::<i64,_>("routing_version")?},
+            "mention":{"principal":mention_count>0},
+            "attention":{"flagged":row.try_get::<i64,_>("attention_flag")?!=0,"muted":row.try_get::<i64,_>("muted")?!=0,"snoozed_until":snoozed_until,"archived":row.try_get::<i64,_>("archived")?!=0,"version":row.try_get::<i64,_>("preference_version")?},
+            "delivery":{"candidate_count":candidate_count},
+            "reactions":reactions,
+            "_predicates":{"snoozed":snoozed}
+        }));
+    }
+    Ok(items)
+}
+
+/// Batched form of `reaction_groups_in`: one ranked reaction query across
+/// all `message_ids`, then one batched binding query and one batched name
+/// query for the distinct actors. Grouping, ordering (emoji, actor), the
+/// `viewer` flag, the `record_id`/`account_id` fallback, and payload
+/// validation are identical to the scalar path.
+async fn batched_reaction_groups_in(
+    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    viewer_account: &str,
+    message_ids: &[String],
+) -> Result<std::collections::HashMap<String, Vec<Value>>> {
+    use std::collections::{BTreeMap, HashMap};
+    let mut out: HashMap<String, Vec<Value>> = HashMap::new();
+    if message_ids.is_empty() {
+        return Ok(out);
+    }
+    let ids_json = serde_json::to_string(message_ids)?;
+    let rows = sqlx::query(
+        "WITH ranked AS (
+           SELECT record_id AS message_id,type,actor,payload,created_at,
+                  ROW_NUMBER() OVER (
+                    PARTITION BY record_id,actor,json_extract(payload,'$.emoji') ORDER BY seq DESC
+                  ) recency
+             FROM content_events
+            WHERE record_id IN (SELECT value FROM json_each(?))
+              AND type IN ('message.reaction.added.v1','message.reaction.removed.v1')
+         )
+         SELECT message_id,actor,payload,created_at FROM ranked
+          WHERE recency=1 AND type='message.reaction.added.v1'
+          ORDER BY message_id,json_extract(payload,'$.emoji'),actor",
+    )
+    .bind(&ids_json)
+    .fetch_all(&mut **tx)
+    .await?;
+    if rows.is_empty() {
+        return Ok(out);
+    }
+    let mut actors = std::collections::BTreeSet::new();
+    let mut parsed: Vec<(
+        String,
+        String,
+        crate::events::MessageReactionPayload,
+        String,
+    )> = Vec::with_capacity(rows.len());
+    for row in rows {
+        let message_id: String = row.try_get("message_id")?;
+        let account_id: String = row.try_get("actor")?;
+        let payload: crate::events::MessageReactionPayload =
+            serde_json::from_str(&row.try_get::<String, _>("payload")?)?;
+        payload.validate(Some(&account_id))?;
+        let reacted_at: String = row.try_get("created_at")?;
+        actors.insert(account_id.clone());
+        parsed.push((message_id, account_id, payload, reacted_at));
+    }
+    let actors: Vec<String> = actors.into_iter().collect();
+    let actors_json = serde_json::to_string(&actors)?;
+    let mut record_by_actor: HashMap<String, String> = HashMap::new();
+    for row in sqlx::query(
+        "SELECT identifier,record_id FROM bindings
+          WHERE system='account' AND is_canonical=1 AND identifier IN (SELECT value FROM json_each(?))",
+    )
+    .bind(&actors_json)
+    .fetch_all(&mut **tx)
+    .await?
+    {
+        let identifier: String = row.try_get("identifier")?;
+        let record_id: String = row.try_get("record_id")?;
+        record_by_actor.entry(identifier).or_insert(record_id);
+    }
+    let record_ids: Vec<String> = {
+        let mut set = std::collections::BTreeSet::new();
+        for record_id in record_by_actor.values() {
+            set.insert(record_id.clone());
+        }
+        set.into_iter().collect()
+    };
+    let mut name_by_record: HashMap<String, String> = HashMap::new();
+    if !record_ids.is_empty() {
+        let records_json = serde_json::to_string(&record_ids)?;
+        for row in sqlx::query(
+            "SELECT id,name FROM records WHERE id IN (SELECT value FROM json_each(?)) AND deleted_at IS NULL",
+        )
+        .bind(&records_json)
+        .fetch_all(&mut **tx)
+        .await?
+        {
+            let id: String = row.try_get("id")?;
+            let name: String = row.try_get("name")?;
+            name_by_record.insert(id, name);
+        }
+    }
+    let mut grouped: HashMap<String, BTreeMap<String, Vec<Value>>> = HashMap::new();
+    for (message_id, account_id, payload, reacted_at) in parsed {
+        let record_id = record_by_actor.get(&account_id).cloned();
+        let name = record_id
+            .as_deref()
+            .and_then(|record_id| name_by_record.get(record_id).cloned());
+        let mut actor = json!({
+            "record_id":record_id,
+            "name":name,
+            "executor_kind":payload.executor_kind,
+            "reacted_at":reacted_at,
+            "viewer":account_id == viewer_account,
         });
-    let human_stage: String = row.try_get("human_stage")?;
-    let agent_state: String = row.try_get("agent_state")?;
-    let snoozed_until: Option<String> = row.try_get("snoozed_until")?;
-    let snoozed = snoozed_until
-        .as_deref()
-        .and_then(|v| chrono::DateTime::parse_from_rfc3339(v).ok())
-        .is_some_and(|v| v > chrono::Utc::now());
-    let mention_count:i64=sqlx::query_scalar("SELECT COUNT(*) FROM message_mentions mm JOIN bindings b ON b.record_id=mm.target_record_id AND b.system='account' AND b.identifier=? AND b.is_canonical=1 WHERE mm.message_id=? AND mm.target_kind='principal' AND mm.effective=1").bind(caller.credential()).bind(message_id).fetch_one(db.write_pool()).await?;
-    Ok(Some(json!({
-        // The destination this Message was filed in, carried on every item so a
-        // per-destination rollup is a grouping rather than a second query.
-        // A Message sent without a home is filed under `native:unfiled` rather
-        // than left homeless, so the grouping is total; `null` stays reserved
-        // for a record that genuinely has no home.
-        "message_id":message_id,"home_id":row.try_get::<Option<String>,_>("home_id")?,"name":row.try_get::<String,_>("name")?,"body":row.try_get::<Option<String>,_>("body")?,"created_at":row.try_get::<String,_>("created_at")?,
-        "human":{"stage":human_stage,"version":row.try_get::<i64,_>("human_version")?},
-        "agent":{"state":agent_state,"version":row.try_get::<i64,_>("agent_version")?},
-        "obligation":{"state":obligation_state,"expectation_state":expectation.state},
-        "route":{"executor":executor_route,"version":row.try_get::<i64,_>("routing_version")?},
-        "mention":{"principal":mention_count>0},
-        "attention":{"flagged":row.try_get::<i64,_>("attention_flag")?!=0,"muted":row.try_get::<i64,_>("muted")?!=0,"snoozed_until":snoozed_until,"archived":row.try_get::<i64,_>("archived")?!=0,"version":row.try_get::<i64,_>("preference_version")?},
-        "delivery":{"candidate_count":sqlx::query_scalar::<_,i64>("SELECT COUNT(*) FROM notification_candidates WHERE recipient_account_id=? AND message_id=? AND status='effective'").bind(caller.credential()).bind(message_id).fetch_one(db.write_pool()).await?},
-        "reactions":reaction_groups(db,caller.credential(),message_id).await?,
-        "_predicates":{"snoozed":snoozed}
-    })))
+        if actor["record_id"].is_null() {
+            actor["account_id"] = json!(account_id);
+        }
+        grouped
+            .entry(message_id)
+            .or_default()
+            .entry(payload.emoji)
+            .or_default()
+            .push(actor);
+    }
+    for (message_id, groups) in grouped {
+        out.insert(
+            message_id,
+            groups
+                .into_iter()
+                .map(|(emoji, actors)| {
+                    let viewer_reacted =
+                        actors.iter().any(|actor| actor["viewer"] == true);
+                    json!({"emoji":emoji,"count":actors.len(),"actors":actors,"viewer_reacted":viewer_reacted})
+                })
+                .collect(),
+        );
+    }
+    Ok(out)
 }
 
 /// Transaction-scoped evidence admission for the `set_agent_disposition`
@@ -1985,7 +2288,7 @@ const ATTENTION_CANDIDATE_LIMIT: i64 = 10_001;
 /// transaction, and a principal lookup only for a direct candidate that
 /// survived everything else. The scan always fetches up to the bound; a match
 /// ends per-candidate work early but never skips that bounded fetch. There is
-/// no `inbox_item` projection, no expectation derivation, no reaction groups,
+/// no inbox item projection, no expectation derivation, no reaction groups,
 /// no Message bodies, and no inbox snapshot token stored.
 ///
 /// The predicate mirrors the workbench `adapter.newMessages` dot exactly:
@@ -2211,34 +2514,54 @@ async fn manage_messages(db: Db, caller: Caller, arguments: Value) -> Result<Val
             conversation_id,
         } => {
             let mut tx = crate::db::begin_write(db.write_pool()).await?;
+            let mut act_alloc = crate::act::ActAllocation::new();
             require_classification_authority(&mut tx, &caller, &message_id, &conversation_id)
                 .await?;
             let changed = !relation_exists(&mut tx, &message_id, &conversation_id).await?;
             if changed {
-                append_classification(&db, &mut tx, &caller, &message_id, &conversation_id, true)
-                    .await?;
+                append_classification(
+                    &db,
+                    &mut tx,
+                    &caller,
+                    &message_id,
+                    &conversation_id,
+                    true,
+                    &mut act_alloc,
+                )
+                .await?;
             }
             db.commit_content(tx).await?;
-            Ok(
+            Ok(echo_act(
                 json!({"status": if changed {"classified"} else {"unchanged"}, "message_id":message_id,"conversation_id":conversation_id,"changed":changed}),
-            )
+                act_alloc.get(),
+            )?)
         }
         ManageMessagesArgs::Unclassify {
             message_id,
             conversation_id,
         } => {
             let mut tx = crate::db::begin_write(db.write_pool()).await?;
+            let mut act_alloc = crate::act::ActAllocation::new();
             require_classification_authority(&mut tx, &caller, &message_id, &conversation_id)
                 .await?;
             let changed = relation_exists(&mut tx, &message_id, &conversation_id).await?;
             if changed {
-                append_classification(&db, &mut tx, &caller, &message_id, &conversation_id, false)
-                    .await?;
+                append_classification(
+                    &db,
+                    &mut tx,
+                    &caller,
+                    &message_id,
+                    &conversation_id,
+                    false,
+                    &mut act_alloc,
+                )
+                .await?;
             }
             db.commit_content(tx).await?;
-            Ok(
+            Ok(echo_act(
                 json!({"status": if changed {"unclassified"} else {"unchanged"}, "message_id":message_id,"conversation_id":conversation_id,"changed":changed}),
-            )
+                act_alloc.get(),
+            )?)
         }
         ManageMessagesArgs::Move {
             message_id,
@@ -2251,6 +2574,7 @@ async fn manage_messages(db: Db, caller: Caller, arguments: Value) -> Result<Val
                 ));
             }
             let mut tx = crate::db::begin_write(db.write_pool()).await?;
+            let mut act_alloc = crate::act::ActAllocation::new();
             require_classification_authority(&mut tx, &caller, &message_id, &from_conversation_id)
                 .await?;
             require_record_in(
@@ -2273,6 +2597,7 @@ async fn manage_messages(db: Db, caller: Caller, arguments: Value) -> Result<Val
                 &message_id,
                 &from_conversation_id,
                 false,
+                &mut act_alloc,
             )
             .await?;
             if !relation_exists(&mut tx, &message_id, &to_conversation_id).await? {
@@ -2283,13 +2608,15 @@ async fn manage_messages(db: Db, caller: Caller, arguments: Value) -> Result<Val
                     &message_id,
                     &to_conversation_id,
                     true,
+                    &mut act_alloc,
                 )
                 .await?;
             }
             db.commit_content(tx).await?;
-            Ok(
+            Ok(echo_act(
                 json!({"status":"moved","message_id":message_id,"from_conversation_id":from_conversation_id,"to_conversation_id":to_conversation_id,"changed":true}),
-            )
+                act_alloc.get(),
+            )?)
         }
         ManageMessagesArgs::ShareHistory {
             recipient_id,
@@ -2478,6 +2805,7 @@ async fn manage_messages(db: Db, caller: Caller, arguments: Value) -> Result<Val
                 })?
                 .clone();
             let mut tx = crate::db::begin_write(db.write_pool()).await?;
+            let mut act_alloc = crate::act::ActAllocation::new();
             let first_application = crate::awareness::register_human_batch_command(
                 &mut tx,
                 caller.credential(),
@@ -2488,6 +2816,7 @@ async fn manage_messages(db: Db, caller: Caller, arguments: Value) -> Result<Val
                 snapshot.as_deref(),
                 &attestation,
                 &reason,
+                &mut act_alloc,
             )
             .await?;
             if first_application {
@@ -2539,12 +2868,16 @@ async fn manage_messages(db: Db, caller: Caller, arguments: Value) -> Result<Val
                         &format!("{idempotency_key}:{message_id}"),
                         &attestation,
                         &reason,
+                        &mut act_alloc,
                     )
                     .await?,
                 );
             }
             db.commit_awareness(tx).await?;
-            Ok(json!({"status":"applied","results":results,"exact_message_ids":message_ids}))
+            Ok(echo_act(
+                json!({"status":"applied","results":results,"exact_message_ids":message_ids}),
+                act_alloc.get(),
+            )?)
         }
         ManageMessagesArgs::SetAgentDisposition {
             message_id,
@@ -2561,6 +2894,7 @@ async fn manage_messages(db: Db, caller: Caller, arguments: Value) -> Result<Val
                 )
             })?;
             let mut tx = crate::db::begin_write(db.write_pool()).await?;
+            let mut act_alloc = crate::act::ActAllocation::new();
             require_visible_message_in(&mut tx, &caller, &message_id).await?;
             for item in &evidence {
                 require_record_in(
@@ -2596,10 +2930,11 @@ async fn manage_messages(db: Db, caller: Caller, arguments: Value) -> Result<Val
                 expected_version,
                 &idempotency_key,
                 &evidence,
+                &mut act_alloc,
             )
             .await?;
             db.commit_awareness(tx).await?;
-            Ok(result)
+            Ok(echo_act(result, act_alloc.get())?)
         }
         ManageMessagesArgs::SetPreference {
             message_id,
@@ -2611,6 +2946,7 @@ async fn manage_messages(db: Db, caller: Caller, arguments: Value) -> Result<Val
         } => {
             require_nonblank_reason("manage_messages.set_preference", &reason)?;
             let mut tx = crate::db::begin_write(db.write_pool()).await?;
+            let mut act_alloc = crate::act::ActAllocation::new();
             require_visible_message_in(&mut tx, &caller, &message_id).await?;
             let result = crate::awareness::set_preference(
                 &mut tx,
@@ -2621,10 +2957,11 @@ async fn manage_messages(db: Db, caller: Caller, arguments: Value) -> Result<Val
                 expected_version,
                 &idempotency_key,
                 &reason,
+                &mut act_alloc,
             )
             .await?;
             db.commit_awareness(tx).await?;
-            Ok(result)
+            Ok(echo_act(result, act_alloc.get())?)
         }
         ManageMessagesArgs::SetRouting {
             message_id,
@@ -2647,6 +2984,7 @@ async fn manage_messages(db: Db, caller: Caller, arguments: Value) -> Result<Val
                     ));
                 };
             let mut tx = crate::db::begin_write(db.write_pool()).await?;
+            let mut act_alloc = crate::act::ActAllocation::new();
             require_visible_message_in(&mut tx, &caller, &message_id).await?;
             let context = crate::awareness::MutationContext {
                 subject_account_id: caller.credential(),
@@ -2665,10 +3003,11 @@ async fn manage_messages(db: Db, caller: Caller, arguments: Value) -> Result<Val
                 policy_version.as_deref(),
                 expected_version,
                 &idempotency_key,
+                &mut act_alloc,
             )
             .await?;
             db.commit_awareness(tx).await?;
-            Ok(result)
+            Ok(echo_act(result, act_alloc.get())?)
         }
         ManageMessagesArgs::ListInbox {
             view,
@@ -2763,6 +3102,7 @@ async fn manage_messages(db: Db, caller: Caller, arguments: Value) -> Result<Val
                     ("system", None)
                 };
             let mut tx = crate::db::begin_write(db.write_pool()).await?;
+            let mut act_alloc = crate::act::ActAllocation::new();
             if matches!(action, crate::awareness::DestinationAction::Add) {
                 // Authorization and destination-shape validation belong under
                 // the same serialized write lock as the awareness append. A
@@ -2798,10 +3138,11 @@ async fn manage_messages(db: Db, caller: Caller, arguments: Value) -> Result<Val
                 action,
                 expected_version,
                 &idempotency_key,
+                &mut act_alloc,
             )
             .await?;
             db.commit_awareness(tx).await?;
-            Ok(result)
+            Ok(echo_act(result, act_alloc.get())?)
         }
         ManageMessagesArgs::ListDestinations { include_removed } => {
             let rail = crate::awareness::list_destinations_on(
@@ -3136,11 +3477,13 @@ mod destination_authorization_tests {
         // behind this transaction. Once admitted it must re-evaluate policy in
         // that serialized snapshot and refuse without appending awareness.
         let mut revoke = crate::db::begin_write(db.write_pool()).await.unwrap();
+        let mut act_alloc = crate::act::ActAllocation::new();
         crate::authorization::replace_explicit_policy_on(
             &mut revoke,
             "test:revoke",
             collection_id,
             vec![],
+            &mut act_alloc,
         )
         .await
         .unwrap();
@@ -3179,5 +3522,232 @@ mod destination_authorization_tests {
         .await
         .unwrap();
         assert_eq!(writes, 0, "revocation must win without an awareness append");
+    }
+}
+
+#[cfg(test)]
+mod inbox_snapshot_batching_tests {
+    use super::*;
+    use crate::db::with_write_pool_acquisition_counter;
+    use sqlx::Row;
+
+    const BUNCH_SENDER: &str = "4e55a9e0-0000-4000-8000-000000000004";
+    const BUNCH_RECIPIENT: &str = "4e55a9e0-0000-4000-8000-000000000003";
+
+    async fn install_bunch_people(db: &Db) {
+        for (record_id, principal, account) in [
+            (BUNCH_SENDER, "native/sender", "acct_sender"),
+            (BUNCH_RECIPIENT, "native/recipient", "acct_recipient"),
+        ] {
+            crate::store::create_record(
+                db,
+                serde_json::json!({"id":record_id,"type":"Entity","kind":"person","name":record_id}),
+            )
+            .await
+            .unwrap();
+            for (system, identifier) in [("native-principal", principal), ("account", account)] {
+                sqlx::query(
+                    "INSERT INTO bindings(record_id,system,identifier,is_canonical)
+                     VALUES (?,?,?,1)",
+                )
+                .bind(record_id)
+                .bind(system)
+                .bind(identifier)
+                .execute(db.write_pool())
+                .await
+                .unwrap();
+            }
+        }
+    }
+
+    async fn seed_bunch(db: &Db, count: usize) -> Vec<String> {
+        install_bunch_people(db).await;
+        let mut ids = Vec::with_capacity(count);
+        for index in 0..count {
+            let arguments = serde_json::json!({
+                "action": "send",
+                "body": format!("bunch message {index}"),
+                "owner_id": BUNCH_SENDER,
+                "origin": {"type": "direct", "participant_ids": [BUNCH_SENDER, BUNCH_RECIPIENT]},
+                "addressed_to": [BUNCH_RECIPIENT],
+                "expectation": "none",
+                "idempotency_key": format!("bunch-send-{count}-{index}"),
+                "reason": "Seed the snapshot batching acquisition fixture.",
+            });
+            let id = manage_messages(db.clone(), Caller::local(), arguments)
+                .await
+                .unwrap()["id"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            ids.push(id);
+        }
+        ids
+    }
+
+    async fn snapshot_acquisitions(db: &Db, caller: &Caller) -> (usize, u64) {
+        let (result, acquisitions) =
+            with_write_pool_acquisition_counter(build_inbox_snapshot(db, caller, "browse", None))
+                .await;
+        let snapshot = result.unwrap();
+        (snapshot.items.len(), acquisitions)
+    }
+
+    /// Scalar control replaying the old per-Message pool path: for every id
+    /// the same sequence the pre-batch `inbox_item` loop issued against the
+    /// pool (admission, row, expectation, mention count, candidate count,
+    /// reaction groups — each at least one checkout). Read-only; seeding
+    /// stays outside the measured scope.
+    async fn scalar_control_acquisitions(db: &Db, caller: &Caller, ids: &[String]) -> u64 {
+        let (_, acquisitions) = with_write_pool_acquisition_counter(async {
+            for id in ids {
+                let _ = super::can_record(db, caller, id, Capability::View).await.unwrap();
+                let _ = sqlx::query("SELECT id FROM records WHERE id=?")
+                    .bind(id)
+                    .fetch_optional(db.write_pool())
+                    .await
+                    .unwrap();
+                let _ =
+                    crate::message_expectation::derive_message_expectation_state(db, id, caller.credential())
+                        .await
+                        .unwrap();
+                let _ = sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM message_mentions WHERE message_id=?",
+                )
+                .bind(id)
+                .fetch_one(db.write_pool())
+                .await
+                .unwrap();
+                let _ = sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM notification_candidates WHERE recipient_account_id=? AND message_id=?",
+                )
+                .bind(caller.credential())
+                .bind(id)
+                .fetch_one(db.write_pool())
+                .await
+                .unwrap();
+                let _ = reaction_groups(db, caller.credential(), id).await.unwrap();
+            }
+        })
+        .await;
+        acquisitions
+    }
+
+    /// Deterministic pool-churn before/after evidence for the batched
+    /// snapshot path: one snapshot transaction plus the constant optimistic
+    /// head re-checks, regardless of item count, so batched acquisitions
+    /// stay flat while the scalar control replaying the old per-Message
+    /// pool loop grows linearly with Message count. Statement constancy for
+    /// the visibility half is pinned separately by
+    /// `preloaded_authorization_statement_count_is_constant_for_401_records`;
+    /// the batch hydration overhead is likewise constant, and the
+    /// expectation base preload (binding, types, facets) is now constant
+    /// too — only per-Message evidence walks inside the shared evaluator
+    /// remain linear, on the single snapshot connection: statements, zero
+    /// acquisitions. No timing assertions anywhere.
+    #[tokio::test]
+    async fn inbox_snapshot_pool_acquisitions_do_not_grow_with_message_count() {
+        let small_db = crate::create_database(":memory:").await.unwrap();
+        let small_ids = seed_bunch(&small_db, 8).await;
+        let large_db = crate::create_database(":memory:").await.unwrap();
+        let large_ids = seed_bunch(&large_db, 64).await;
+        let caller = Caller::authenticated("acct_recipient");
+        let (small_items, small) = snapshot_acquisitions(&small_db, &caller).await;
+        let (large_items, large) = snapshot_acquisitions(&large_db, &caller).await;
+        assert_eq!(small_items, 8);
+        assert_eq!(large_items, 64);
+        // Legacy local parity: the same seeded Messages stay visible through
+        // the canonical set-wise admission helper, which carries the
+        // trusted-local shape-validation semantics the old per-item
+        // `can_record` gate enforced after the scalar existence check.
+        let (local_items, _) = snapshot_acquisitions(&large_db, &Caller::local()).await;
+        assert_eq!(local_items, 64);
+        let small_control = scalar_control_acquisitions(&small_db, &caller, &small_ids).await;
+        let large_control = scalar_control_acquisitions(&large_db, &caller, &large_ids).await;
+        eprintln!(
+            "inbox snapshot acquisitions: batched small(8)={small} large(64)={large}; scalar control small(8)={small_control} large(64)={large_control}"
+        );
+        assert!(
+            small <= 10,
+            "8-message snapshot took {small} write-pool acquisitions, expected <= 10"
+        );
+        assert!(
+            large <= small + 2,
+            "64-message snapshot took {large} acquisitions vs {small} for 8 messages: hydration must not add pool checkouts"
+        );
+        assert!(
+            large_control - small_control >= 100,
+            "scalar control grew only {small_control} -> {large_control}: the control must demonstrate the old linear slope"
+        );
+        assert!(
+            large + 100 <= large_control,
+            "batched 64-message snapshot took {large} acquisitions vs scalar control {large_control}: expected an order-of-magnitude gap"
+        );
+        small_db.close().await;
+        large_db.close().await;
+    }
+
+    /// A Message whose semantic-Unit bearer edge is cyclic fails the
+    /// trusted-local shape validation the scalar gate enforces. The batched
+    /// local path must agree with the scalar verdict exactly: this is the
+    /// case the naive legacy bypass (returning every candidate) missed.
+    #[tokio::test]
+    async fn batched_local_visibility_matches_scalar_shape_rejection() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        install_bunch_people(&db).await;
+        let arguments = serde_json::json!({
+            "action": "send",
+            "body": "cyclic bearer victim",
+            "owner_id": BUNCH_SENDER,
+            "origin": {"type": "direct", "participant_ids": [BUNCH_SENDER, BUNCH_RECIPIENT]},
+            "addressed_to": [BUNCH_RECIPIENT],
+            "expectation": "none",
+            "idempotency_key": "shape-victim-send",
+            "reason": "Seed the shape-rejection parity fixture.",
+        });
+        let victim = manage_messages(db.clone(), Caller::local(), arguments)
+            .await
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let creation = sqlx::query(
+            "SELECT id, seq, created_at FROM content_events WHERE record_id = ? AND type = 'record.created'",
+        )
+        .bind(&victim)
+        .fetch_one(db.write_pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO semantic_units
+                (unit_id, authority_bearer_record_id, creation_event_id, creation_event_seq, created_at)
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(&victim)
+        .bind(&victim)
+        .bind(creation.try_get::<String, _>("id").unwrap())
+        .bind(creation.try_get::<i64, _>("seq").unwrap())
+        .bind(creation.try_get::<String, _>("created_at").unwrap())
+        .execute(db.write_pool())
+        .await
+        .unwrap();
+        let local = Caller::local();
+        let mut tx = db.write_pool().begin().await.unwrap();
+        let scalar = super::can_record_in(&mut tx, &local, &victim, Capability::View)
+            .await
+            .unwrap();
+        let batched = super::super::visible_ids_in(&mut tx, &local, vec![victim.clone()])
+            .await
+            .unwrap();
+        tx.rollback().await.unwrap();
+        assert!(
+            !scalar,
+            "scalar legacy gate must reject the cyclic-bearer Message"
+        );
+        assert!(
+            !batched.contains(&victim),
+            "batched local visibility must agree with the scalar shape rejection"
+        );
+        db.close().await;
     }
 }

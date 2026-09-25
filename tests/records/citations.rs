@@ -1328,6 +1328,7 @@ async fn targeted_citation_shape_is_preserved_atomically_in_writes_and_replay() 
             intent: None,
             created_at: "2026-08-01T12:00:00.000Z".into(),
             causal_envelope: native_ce::events::CausalEnvelopeV1::default(),
+            act: None,
         });
         let scratch = replay_db().await;
         {

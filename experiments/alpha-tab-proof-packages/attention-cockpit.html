@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Attention cockpit — sample preview</title>
+<style>
+body { margin: 0; padding: 1.5rem; font: 15px/1.5 system-ui, sans-serif; color: #1a201a; background: #f6f7f2; }
+main { max-width: 52rem; margin: 0 auto; }
+.banner { padding: 0.6rem 0.9rem; border: 1px solid #b9c4ad; background: #eef3e4; }
+.summary { font-weight: 600; }
+.group { margin-top: 1.25rem; padding: 0.75rem 1rem; border: 1px solid #d5dacd; background: #ffffff; }
+.item { margin: 0.5rem 0; }
+.badge { display: inline-block; padding: 0 0.45rem; margin-left: 0.5rem; border: 1px solid #c3cabd; font-size: 0.8rem; }
+button { padding: 0.3rem 0.7rem; margin-top: 0.25rem; }
+.note { margin-top: 1.5rem; font-size: 0.85rem; color: #4a5245; }
+</style>
+<script type="application/json" id="native-artifact-manifest">{"capability_requests":[{"capability":"input.read","scope":{"port":"items"}}],"inputs":{"items":{"envelope":"native.collection-envelope.v1","expose_to_root":true,"required":true}},"schema":"native.html.artifact.v1"}</script>
+</head>
+<body>
+<main>
+<h1>Attention cockpit</h1>
+<p id="sample-banner" class="banner" role="status">Loading preview input.</p>
+<p id="summary" class="summary">Waiting for host input.</p>
+<div id="groups"></div>
+<p class="note">Read-only preview on native.html.artifact.v1: this view renders only the host-delivered input bundle and offers no actions. Record navigation is not wired in the sample preview — the alpha sample frame ignores frame navigation messages, so each item carries a disabled Open control instead of a working button. The frame itself holds no authority, credential, or network access.</p>
+</main>
+<script>
+(function () {
+  "use strict";
+  function cohortRecords(input) {
+    if (!input || typeof input !== "object") return [];
+    var port = input.inputs && input.inputs.items;
+    if (port && Array.isArray(port.records)) return port.records;
+    if (Array.isArray(input.records)) return input.records;
+    return [];
+  }
+  function isSample(input) {
+    return !!input && (input.sample_preview === true || input.mode === "sample");
+  }
+  function text(value) {
+    if (value === null || value === undefined) return "";
+    return String(value);
+  }
+  function bucketOf(record) {
+    var facets = (record && record.facets) || {};
+    return text(facets.status || facets.priority || record.lifecycle || "unsorted") || "unsorted";
+  }
+  function render(bundle) {
+    var input = (bundle && bundle.input) || bundle;
+    var records = cohortRecords(input);
+    var banner = document.getElementById("sample-banner");
+    var summary = document.getElementById("summary");
+    var groups = document.getElementById("groups");
+    while (groups.firstChild) groups.removeChild(groups.firstChild);
+    if (isSample(input)) {
+      banner.textContent = "Sample preview \u2014 host-supplied fixture data, not live records. No live read occurred to paint this view.";
+    } else {
+      banner.textContent = "Host-delivered input bundle. The frame renders only what the host resolved under viewer authority.";
+    }
+    if (!records.length) {
+      summary.textContent = "No visible items.";
+      var empty = document.createElement("p");
+      empty.textContent = "Nothing in this input needs attention right now.";
+      groups.appendChild(empty);
+      return;
+    }
+    summary.textContent = records.length + (records.length === 1 ? " visible item." : " visible items.");
+    var buckets = {};
+    var order = [];
+    records.forEach(function (record) {
+      var bucket = bucketOf(record);
+      if (!buckets[bucket]) { buckets[bucket] = []; order.push(bucket); }
+      buckets[bucket].push(record);
+    });
+    order.sort();
+    order.forEach(function (bucket) {
+      var members = buckets[bucket].slice().sort(function (a, b) {
+        return text(a.name).localeCompare(text(b.name));
+      });
+      var section = document.createElement("section");
+      section.setAttribute("class", "group");
+      var heading = document.createElement("h2");
+      heading.textContent = bucket + " (" + members.length + ")";
+      section.appendChild(heading);
+      var list = document.createElement("ul");
+      members.forEach(function (record) {
+        var item = document.createElement("li");
+        item.setAttribute("class", "item");
+        var name = document.createElement("strong");
+        name.textContent = text(record.name) || "(unnamed record)";
+        item.appendChild(name);
+        var facets = record.facets || {};
+        Object.keys(facets).slice(0, 4).forEach(function (key) {
+          var badge = document.createElement("span");
+          badge.setAttribute("class", "badge");
+          badge.textContent = key + ": " + text(facets[key]);
+          item.appendChild(badge);
+        });
+        if (text(record.summary)) {
+          var desc = document.createElement("p");
+          desc.textContent = text(record.summary);
+          item.appendChild(desc);
+        }
+        if (text(record.id)) {
+          var open = document.createElement("button");
+          open.setAttribute("type", "button");
+          open.setAttribute("disabled", "");
+          open.setAttribute("title", "Record navigation is not wired in the sample preview.");
+          open.textContent = "Open record (unavailable in preview)";
+          item.appendChild(open);
+        }
+        list.appendChild(item);
+      });
+      section.appendChild(list);
+      groups.appendChild(section);
+    });
+  }
+  function boot(delivery) { render(delivery); }
+  if (window.nativeArtifact && window.nativeArtifact.ready && typeof window.nativeArtifact.ready.then === "function") {
+    window.nativeArtifact.ready.then(boot, function () {
+      document.getElementById("summary").textContent = "Preview input unavailable.";
+    });
+    if (typeof window.nativeArtifact.onInput === "function") {
+      window.nativeArtifact.onInput(boot);
+    }
+  } else {
+    document.getElementById("summary").textContent = "Preview input unavailable outside the artifact host.";
+  }
+})();
+</script>
+</body>
+</html>

@@ -45,6 +45,7 @@ impl DerivationCoordinatorClock for TestClock {
 
 async fn create_series(db: &Db, id: &str) {
     let mut tx = begin_write(db.write_pool()).await.unwrap();
+    let mut act_alloc = crate::act::ActAllocation::new();
     append_derivation_event_in(
         &mut tx,
         NewDerivationEvent::authored(
@@ -59,6 +60,7 @@ async fn create_series(db: &Db, id: &str) {
             }),
         )
         .unwrap(),
+        &mut act_alloc,
     )
     .await
     .unwrap();
@@ -1054,6 +1056,7 @@ async fn governed_request_acquire_validates_and_atomically_publishes_success() {
         "audience_sha256": audience_sha256,
     });
     let mut series_tx = begin_write(db.write_pool()).await.unwrap();
+    let mut act_alloc = crate::act::ActAllocation::new();
     append_derivation_event_in(
         &mut series_tx,
         NewDerivationEvent::authored(
@@ -1068,6 +1071,7 @@ async fn governed_request_acquire_validates_and_atomically_publishes_success() {
             }),
         )
         .unwrap(),
+        &mut act_alloc,
     )
     .await
     .unwrap();

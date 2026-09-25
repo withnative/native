@@ -319,7 +319,7 @@ async fn bootstrap_returns_only_bounded_first_call_context() {
     assert_eq!(fixed["scope"], "engine");
     assert_eq!(fixed["kind"], "fixed");
     assert_eq!(fixed["source"]["type"], "engine");
-    assert_eq!(fixed["source"]["template_version"], 8);
+    assert_eq!(fixed["source"]["template_version"], 9);
     assert!(fixed["source"].get("record_id").is_none());
     assert!(fixed["content"]
         .as_str()

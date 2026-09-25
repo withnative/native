@@ -132,6 +132,7 @@ pub struct ImageContent {
 struct ImageTransaction<'a> {
     db: &'a Db,
     tx: &'a mut Transaction<'static, Sqlite>,
+    act_alloc: &'a mut crate::act::ActAllocation,
 }
 
 impl DomainStatementExecutor for ImageTransaction<'_> {
@@ -150,6 +151,10 @@ impl DomainStatementExecutor for ImageTransaction<'_> {
 }
 
 impl AttachmentPhysicalPort for ImageTransaction<'_> {
+    fn allocated_act(&self) -> Option<i64> {
+        self.act_alloc.get()
+    }
+
     fn lock_content_log<'a>(&'a mut self) -> BoxFuture<'a, Result<()>> {
         Box::pin(async { Ok(()) })
     }
@@ -174,7 +179,7 @@ impl AttachmentPhysicalPort for ImageTransaction<'_> {
 
     fn append_content<'a>(&'a mut self, spec: AppendSpec) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
-            crate::store::append_in(self.db, self.tx, spec)
+            crate::store::append_in(self.db, self.tx, spec, self.act_alloc)
                 .await
                 .map(|_| ())
         })
@@ -579,12 +584,17 @@ pub async fn insert_record_image(
     );
     let committed_digest = sha256_hex(committed_body.as_bytes());
     let mut tx = crate::db::begin_write(db.write_pool()).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
     {
-        let mut port = ImageTransaction { db, tx: &mut tx };
+        let mut port = ImageTransaction {
+            db,
+            tx: &mut tx,
+            act_alloc: &mut act_alloc,
+        };
         let principal = if caller.is_trusted_local() {
             Principal::trusted_local()
         } else {
-            Principal::bound(caller.credential(), true)
+            Principal::bound(caller.credential(), caller.is_host_member())
         };
         if !crate::authorization::allows_record_with(
             &mut port,
@@ -703,11 +713,16 @@ pub async fn read_record_image(
     attachment_id: &str,
 ) -> std::result::Result<ImageContent, RecordImageError> {
     let mut tx = db.write_pool().begin().await?;
-    let mut port = ImageTransaction { db, tx: &mut tx };
+    let mut act_alloc = crate::act::ActAllocation::new();
+    let mut port = ImageTransaction {
+        db,
+        tx: &mut tx,
+        act_alloc: &mut act_alloc,
+    };
     let principal = if caller.is_trusted_local() {
         Principal::trusted_local()
     } else {
-        Principal::bound(caller.credential(), true)
+        Principal::bound(caller.credential(), caller.is_host_member())
     };
     if !crate::authorization::allows_record_with(&mut port, principal, bearer_id, Capability::View)
         .await?

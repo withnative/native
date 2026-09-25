@@ -1,8 +1,12 @@
-//! Authenticated hosted-snapshot acquisition for the local standby.
+//! Authenticated hosted act-delta refresh with whole-snapshot fallback.
 //!
 //! This is a controller kernel, not an MCP tool. It talks only to the hosted
 //! MCP endpoint and the generation store; the local MCP remains physically
-//! read-only and keeps serving its already-leased immutable generation.
+//! read-only and keeps serving its already-leased immutable generation. A
+//! bounded authenticated delta is applied only to a private clone, admitted by
+//! the ordinary generation verifier, and exposed by the same durable pointer
+//! swap as a snapshot. Refused delta shapes retain the snapshot acquisition
+//! path used for bootstrap and compatibility fallback.
 
 use std::fs::{self, File, OpenOptions};
 use std::future::Future;
@@ -18,14 +22,20 @@ use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use sqlx::Connection as _;
 use tokio::sync::watch;
 
 use crate::error::{Error, Result};
 use crate::standby_snapshot::{
-    CanonicalFrontierV1, ObservedInstalledConsumerIdentity, StandbyConsumerIdentity,
-    StandbySnapshotManifest, STANDBY_CONSUMER_CONTRACT, STANDBY_SNAPSHOT_MEDIA_TYPE,
+    manifest_from_completed_export, CanonicalFrontierV1, HostedStandbyManifestContext,
+    ObservedInstalledConsumerIdentity, ProducerBuildIdentity, StandbyConsumerIdentity,
+    StandbyGenerationMaterialization, StandbySnapshotManifest, STANDBY_CONSUMER_CONTRACT,
+    STANDBY_SNAPSHOT_MEDIA_TYPE,
 };
 
+use super::act_materialise::apply_authority_act_delta_and_finalize_head;
+use super::authority_probe::read_authority_act_head;
+use super::delta_transport::AuthorityActTransport;
 use super::{GenerationStore, InstalledGeneration, StandbyRuntimeConfig};
 
 const STATE_CONTRACT: &str = "native.standby-refresh-state.v1";
@@ -124,6 +134,10 @@ pub struct StandbyRefreshState {
     pub consecutive_failure_count: u32,
     pub last_failure_class: Option<RefreshFailureClass>,
     pub last_failure: Option<String>,
+    #[serde(default)]
+    pub last_delta_fallback_class: Option<DeltaFallbackClass>,
+    #[serde(default)]
+    pub last_delta_fallback: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -172,6 +186,11 @@ fn valid_status_state(state: &StandbyRefreshState) -> bool {
     ];
     state.last_attempt_at.is_some() == state.last_attempt_cause.is_some()
         && state.last_failure_class.is_some() == state.last_failure.is_some()
+        && state.last_delta_fallback_class.is_some() == state.last_delta_fallback.is_some()
+        && state
+            .last_delta_fallback
+            .as_ref()
+            .is_none_or(|message| message.len() <= 160)
         && active_evidence
             .iter()
             .all(|present| *present == active_evidence[0])
@@ -293,6 +312,8 @@ impl Default for StandbyRefreshState {
             consecutive_failure_count: 0,
             last_failure_class: None,
             last_failure: None,
+            last_delta_fallback_class: None,
+            last_delta_fallback: None,
         }
     }
 }
@@ -305,6 +326,9 @@ pub enum StandbyRefreshOutcome {
     },
     Accepted {
         coalesced: bool,
+    },
+    Unchanged {
+        generation: Box<InstalledGeneration>,
     },
 }
 
@@ -324,6 +348,7 @@ struct AttemptError {
     class: RefreshFailureClass,
     safe_message: &'static str,
     source: Error,
+    delta_fallback: Option<DeltaFallbackDiagnostic>,
 }
 
 struct AttemptStagingFiles {
@@ -331,8 +356,43 @@ struct AttemptStagingFiles {
     manifest: PathBuf,
 }
 
+enum AttemptSuccess {
+    Installed {
+        generation: InstalledGeneration,
+        retention_warnings: Vec<String>,
+        delta_fallback: Option<DeltaFallbackDiagnostic>,
+    },
+    Unchanged(InstalledGeneration),
+}
+
+enum DeltaAttempt {
+    Installed {
+        generation: InstalledGeneration,
+        retention_warnings: Vec<String>,
+    },
+    Unchanged(InstalledGeneration),
+    FallBackToSnapshot(DeltaFallbackDiagnostic),
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeltaFallbackClass {
+    HeadCompatibility,
+    DeltaUnavailable,
+    IntegrityOrApplyRefusal,
+    RemoteHeadRegression,
+    UntrustedLocalBase,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DeltaFallbackDiagnostic {
+    class: DeltaFallbackClass,
+    message: &'static str,
+}
+
 impl Drop for AttemptStagingFiles {
     fn drop(&mut self) {
+        remove_owned_sqlite_sidecars(&self.snapshot);
         remove_owned_staging_file(&self.snapshot);
         remove_owned_staging_file(&self.manifest);
     }
@@ -344,7 +404,13 @@ impl AttemptError {
             class,
             safe_message,
             source,
+            delta_fallback: None,
         }
+    }
+
+    fn after_delta_fallback(mut self, diagnostic: DeltaFallbackDiagnostic) -> Self {
+        self.delta_fallback = Some(diagnostic);
+        self
     }
 }
 
@@ -512,6 +578,7 @@ pub struct StandbyRefreshController {
     observed: ObservedInstalledConsumerIdentity,
     refresh_dir: PathBuf,
     client: Arc<dyn SnapshotPageClient>,
+    delta_enabled: bool,
 }
 
 impl StandbyRefreshController {
@@ -532,6 +599,7 @@ impl StandbyRefreshController {
             observed,
             refresh_dir,
             client: Arc::new(HttpSnapshotPageClient::new()?),
+            delta_enabled: true,
         })
     }
 
@@ -545,6 +613,9 @@ impl StandbyRefreshController {
     ) -> Result<Self> {
         let mut controller = Self::new(runtime, config, store, observed)?;
         controller.client = client;
+        // Existing snapshot-controller fixtures intentionally exercise the
+        // legacy path in isolation. Dedicated delta tests cover the new path.
+        controller.delta_enabled = false;
         Ok(controller)
     }
 
@@ -639,6 +710,8 @@ impl StandbyRefreshController {
         state.last_attempt_cause = Some(cause);
         state.last_failure_class = None;
         state.last_failure = None;
+        state.last_delta_fallback_class = None;
+        state.last_delta_fallback = None;
         self.write_state(&state)?;
 
         let outcome = match tokio::time::timeout(ATTEMPT_TIMEOUT, self.run_attempt()).await {
@@ -659,7 +732,11 @@ impl StandbyRefreshController {
             .causes
             .contains(&RefreshCause::Manual);
         match outcome {
-            Ok((generation, retention_warnings)) => {
+            Ok(AttemptSuccess::Installed {
+                generation,
+                retention_warnings,
+                delta_fallback,
+            }) => {
                 state.last_success_at = Some(now());
                 state.installed_generation_id = Some(generation.id.clone());
                 state.snapshot_captured_at = Some(generation.manifest.captured_at.clone());
@@ -670,16 +747,34 @@ impl StandbyRefreshController {
                 state.consecutive_failure_count = 0;
                 state.last_failure_class = None;
                 state.last_failure = None;
+                set_delta_fallback(&mut state, delta_fallback);
                 self.write_state(&state)?;
                 Ok(StandbyRefreshOutcome::Installed {
                     generation: Box::new(generation),
                     retention_warnings,
                 })
             }
+            Ok(AttemptSuccess::Unchanged(generation)) => {
+                state.last_success_at = Some(now());
+                state.installed_generation_id = Some(generation.id.clone());
+                state.snapshot_captured_at = Some(generation.manifest.captured_at.clone());
+                state.snapshot_completed_at =
+                    Some(generation.manifest.snapshot_completed_at.clone());
+                state.frontier = Some(generation.manifest.frontier.clone());
+                state.consecutive_failure_count = 0;
+                state.last_failure_class = None;
+                state.last_failure = None;
+                set_delta_fallback(&mut state, None);
+                self.write_state(&state)?;
+                Ok(StandbyRefreshOutcome::Unchanged {
+                    generation: Box::new(generation),
+                })
+            }
             Err(error) => {
                 state.consecutive_failure_count = state.consecutive_failure_count.saturating_add(1);
                 state.last_failure_class = Some(error.class);
                 state.last_failure = Some(error.safe_message.into());
+                set_delta_fallback(&mut state, error.delta_fallback);
                 self.write_state(&state)?;
                 Err(error.source)
             }
@@ -764,15 +859,41 @@ impl StandbyRefreshController {
         }
     }
 
-    async fn run_attempt(
-        &self,
-    ) -> std::result::Result<(InstalledGeneration, Vec<String>), AttemptError> {
+    async fn run_attempt(&self) -> std::result::Result<AttemptSuccess, AttemptError> {
         let bearer = read_credential(&self.config.credential_file)?;
         let endpoint = format!(
             "{}/mcp/{}",
             self.config.hosted_origin,
             utf8_percent_encode(&self.runtime.hosted_route_database_id, NON_ALPHANUMERIC)
         );
+        let mut delta_fallback = None;
+        if self.delta_enabled {
+            if let Ok(Some(current)) = self.store.current_for_head_probe() {
+                match self.try_delta_attempt(&bearer, current).await? {
+                    DeltaAttempt::Installed {
+                        generation,
+                        retention_warnings,
+                    } => {
+                        return Ok(AttemptSuccess::Installed {
+                            generation,
+                            retention_warnings,
+                            delta_fallback: None,
+                        })
+                    }
+                    DeltaAttempt::Unchanged(generation) => {
+                        return Ok(AttemptSuccess::Unchanged(generation))
+                    }
+                    DeltaAttempt::FallBackToSnapshot(diagnostic) => {
+                        delta_fallback = Some(diagnostic)
+                    }
+                }
+            } else {
+                delta_fallback = Some(DeltaFallbackDiagnostic {
+                    class: DeltaFallbackClass::UntrustedLocalBase,
+                    message: "delta base was unavailable or not immutable",
+                });
+            }
+        }
         let attempt_id = uuid::Uuid::new_v4();
         let snapshot_path = self
             .store
@@ -786,8 +907,225 @@ impl StandbyRefreshController {
             snapshot: snapshot_path.clone(),
             manifest: manifest_path.clone(),
         };
-        self.download_and_install(&endpoint, bearer, &snapshot_path, &manifest_path)
+        let (generation, retention_warnings) = self
+            .download_and_install(&endpoint, bearer, &snapshot_path, &manifest_path)
             .await
+            .map_err(|error| match delta_fallback {
+                Some(diagnostic) => error.after_delta_fallback(diagnostic),
+                None => error,
+            })?;
+        Ok(AttemptSuccess::Installed {
+            generation,
+            retention_warnings,
+            delta_fallback,
+        })
+    }
+
+    async fn try_delta_attempt(
+        &self,
+        bearer: &str,
+        current: InstalledGeneration,
+    ) -> std::result::Result<DeltaAttempt, AttemptError> {
+        let captured_at = now();
+        let local = match crate::db::open_existing_database_standby_read_only(
+            current.snapshot_path.to_string_lossy().as_ref(),
+        )
+        .await
+        {
+            Ok(local) => local,
+            Err(_) => {
+                return Ok(DeltaAttempt::FallBackToSnapshot(DeltaFallbackDiagnostic {
+                    class: DeltaFallbackClass::UntrustedLocalBase,
+                    message: "local delta base could not be probed; installed a whole snapshot",
+                }))
+            }
+        };
+        let local_head_result = read_authority_act_head(&local).await;
+        local.close().await;
+        let local_head = match local_head_result {
+            Ok(head) => head,
+            Err(_) => {
+                return Ok(DeltaAttempt::FallBackToSnapshot(DeltaFallbackDiagnostic {
+                    class: DeltaFallbackClass::UntrustedLocalBase,
+                    message:
+                        "local delta base lacked exhaustive history; installed a whole snapshot",
+                }))
+            }
+        };
+
+        let transport = AuthorityActTransport::new(
+            &self.config.hosted_origin,
+            &self.runtime.hosted_route_database_id,
+            &self.runtime.origin_database_id,
+            bearer,
+        )
+        .map_err(classify_delta_transport_error)?;
+        let remote_head = match transport.head().await {
+            Ok(head) => head,
+            Err(error) => match classify_delta_transport_error(error) {
+                error
+                    if matches!(
+                        error.class,
+                        RefreshFailureClass::Authentication | RefreshFailureClass::Network
+                    ) =>
+                {
+                    return Err(error)
+                }
+                _ => {
+                    return Ok(DeltaAttempt::FallBackToSnapshot(DeltaFallbackDiagnostic {
+                        class: DeltaFallbackClass::HeadCompatibility,
+                        message: "hosted delta head was incompatible or unrepresentable",
+                    }))
+                }
+            },
+        };
+        if remote_head.head().matches_authority_head(&local_head) {
+            return Ok(DeltaAttempt::Unchanged(current));
+        }
+        if remote_head.head().head_act() < local_head.head_act {
+            return Ok(DeltaAttempt::FallBackToSnapshot(DeltaFallbackDiagnostic {
+                class: DeltaFallbackClass::RemoteHeadRegression,
+                message: "hosted delta head regressed behind the installed generation",
+            }));
+        }
+
+        // A successful authenticated head probe established connectivity and
+        // origin binding. Any exact-cut refusal from here is a typed request
+        // to retain the independently verified whole-snapshot path (oversize,
+        // incompatible pins, identity movement, or an unrepresentable gap).
+        let delta = match transport.delta(local_head.head_act).await {
+            Ok(delta) => delta,
+            Err(Error::Auth(message)) => {
+                return Err(AttemptError::new(
+                    RefreshFailureClass::Authentication,
+                    "hosted delta authentication was refused",
+                    Error::Auth(message),
+                ))
+            }
+            Err(error) => {
+                let classified = classify_delta_transport_error(error);
+                if matches!(
+                    classified.class,
+                    RefreshFailureClass::Authentication | RefreshFailureClass::Network
+                ) {
+                    return Err(classified);
+                }
+                let rpc_refusal = classified.source.to_string().contains("RPC error")
+                    || classified.source.to_string().contains("response too large");
+                return Ok(DeltaAttempt::FallBackToSnapshot(DeltaFallbackDiagnostic {
+                    class: if rpc_refusal {
+                        DeltaFallbackClass::DeltaUnavailable
+                    } else {
+                        DeltaFallbackClass::IntegrityOrApplyRefusal
+                    },
+                    message: if rpc_refusal {
+                        "hosted delta was unavailable; installed a whole snapshot"
+                    } else {
+                        "hosted delta failed integrity validation; installed a whole snapshot"
+                    },
+                }));
+            }
+        };
+
+        // The cheap head path never confers trust. Only after advancement is
+        // known do we hash and deeply verify the immutable base, immediately
+        // before cloning it. Re-reading the pointer also fences replacement.
+        let verified = match self.store.current_for_refresh(&self.observed).await {
+            Ok(Some(verified)) if verified.id == current.id => verified,
+            _ => {
+                return Ok(DeltaAttempt::FallBackToSnapshot(DeltaFallbackDiagnostic {
+                    class: DeltaFallbackClass::UntrustedLocalBase,
+                    message: "delta base failed deep verification; installed a whole snapshot",
+                }))
+            }
+        };
+
+        let attempt_id = uuid::Uuid::new_v4();
+        let snapshot_path = self
+            .store
+            .staging_dir()
+            .join(format!("refresh-{attempt_id}.snapshot.db"));
+        let manifest_path = self
+            .store
+            .staging_dir()
+            .join(format!("refresh-{attempt_id}.manifest.json"));
+        let _cleanup = AttemptStagingFiles {
+            snapshot: snapshot_path.clone(),
+            manifest: manifest_path.clone(),
+        };
+        copy_private_file(&verified.snapshot_path, &snapshot_path)?;
+
+        let candidate = crate::open_existing_database_at(&snapshot_path)
+            .await
+            .map_err(classify_install_error)?;
+        let applied = apply_authority_act_delta_and_finalize_head(&candidate, &delta).await;
+        match applied {
+            Ok(_) => close_delta_candidate(candidate, &snapshot_path).await?,
+            Err(error) => {
+                candidate.close().await;
+                if matches!(error, Error::Auth(_)) {
+                    return Err(classify_delta_transport_error(error));
+                }
+                return Ok(DeltaAttempt::FallBackToSnapshot(DeltaFallbackDiagnostic {
+                    class: DeltaFallbackClass::IntegrityOrApplyRefusal,
+                    message: "hosted delta was refused during apply; installed a whole snapshot",
+                }));
+            }
+        }
+
+        let size_bytes = fs::metadata(&snapshot_path)
+            .map_err(|error| local_io(error.into()))?
+            .len();
+        let sha256 = sha256_file(&snapshot_path)?;
+        let completed_at = now();
+        let context = HostedStandbyManifestContext::new_with_producer(
+            self.runtime.hosted_route_database_id.clone(),
+            verified.manifest.consumer.clone(),
+            ProducerBuildIdentity::new(
+                self.observed.source_sha.clone(),
+                self.observed.ddl_sha256.clone(),
+            )
+            .map_err(classify_install_error)?,
+        )
+        .map_err(classify_install_error)?;
+        let mut manifest = manifest_from_completed_export(
+            &snapshot_path,
+            size_bytes,
+            sha256,
+            captured_at,
+            completed_at,
+            context,
+        )
+        .await
+        .map_err(classify_install_error)?;
+        manifest.materialization = StandbyGenerationMaterialization::Delta;
+        manifest.head_act = Some(delta.to_inclusive_act());
+        let manifest_bytes = manifest.canonical_json().map_err(classify_install_error)?;
+        let mut manifest_file = create_private_file(&manifest_path)?;
+        manifest_file
+            .write_all(&manifest_bytes)
+            .map_err(|error| local_io(error.into()))?;
+        manifest_file
+            .sync_all()
+            .map_err(|error| local_io(error.into()))?;
+        File::open(self.store.staging_dir())
+            .and_then(|file| file.sync_all())
+            .map_err(|error| local_io(error.into()))?;
+
+        self.record_active_candidate(&manifest)?;
+        let generation = self
+            .store
+            .install_staged(&snapshot_path, &manifest_path, &self.observed)
+            .await
+            .map_err(classify_install_error)?;
+        let retention_warnings = match self.store.prune_retention(&self.observed).await {
+            Ok(warnings) => warnings,
+            Err(_) => vec!["post-refresh retention deferred".into()],
+        };
+        Ok(DeltaAttempt::Installed {
+            generation,
+            retention_warnings,
+        })
     }
 
     async fn download_and_install(
@@ -1138,6 +1476,9 @@ impl StandbyRefreshController {
             };
             let id = rest
                 .strip_suffix(".snapshot.db")
+                .or_else(|| rest.strip_suffix(".snapshot.db-wal"))
+                .or_else(|| rest.strip_suffix(".snapshot.db-shm"))
+                .or_else(|| rest.strip_suffix(".snapshot.db-journal"))
                 .or_else(|| rest.strip_suffix(".manifest.json"));
             if id.is_none_or(|id| uuid::Uuid::parse_str(id).is_err()) {
                 continue;
@@ -1302,7 +1643,7 @@ fn validate_page(
     Ok(())
 }
 
-fn validate_exact_origin(raw: &str) -> Result<()> {
+pub(super) fn validate_exact_origin(raw: &str) -> Result<()> {
     let url = url::Url::parse(raw)
         .map_err(|_| Error::engine("standby hosted_origin must be an exact URL origin"))?;
     let loopback = match url.host() {
@@ -1439,6 +1780,67 @@ fn create_private_file(path: &Path) -> std::result::Result<File, AttemptError> {
     Ok(file)
 }
 
+fn copy_private_file(source: &Path, destination: &Path) -> std::result::Result<(), AttemptError> {
+    require_regular_file(source).map_err(local_io)?;
+    let mut input = File::open(source).map_err(|error| local_io(error.into()))?;
+    let mut output = create_private_file(destination)?;
+    std::io::copy(&mut input, &mut output).map_err(|error| local_io(error.into()))?;
+    output.sync_all().map_err(|error| local_io(error.into()))?;
+    Ok(())
+}
+
+async fn close_delta_candidate(
+    candidate: crate::Db,
+    path: &Path,
+) -> std::result::Result<(), AttemptError> {
+    crate::db::checkpoint_and_close_hosted_adoption_database(candidate)
+        .await
+        .map_err(classify_install_error)?;
+    // The writable fold uses WAL like every ordinary workspace handle. A
+    // published generation is one immutable file, so make the main database
+    // self-contained and return it to DELETE mode before hashing or admission;
+    // otherwise a later read-only validation can materialise -wal/-shm beside
+    // the supposedly immutable generation.
+    let options = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(path)
+        .create_if_missing(false)
+        .journal_mode(sqlx::sqlite::SqliteJournalMode::Delete);
+    let mut connection = sqlx::SqliteConnection::connect_with(&options)
+        .await
+        .map_err(|error| classify_install_error(error.into()))?;
+    let mode: String = sqlx::query_scalar("PRAGMA journal_mode=DELETE")
+        .fetch_one(&mut connection)
+        .await
+        .map_err(|error| classify_install_error(error.into()))?;
+    connection
+        .close()
+        .await
+        .map_err(|error| classify_install_error(error.into()))?;
+    if !mode.eq_ignore_ascii_case("delete") {
+        return Err(classify_install_error(Error::engine(
+            "delta candidate did not leave WAL journal mode",
+        )));
+    }
+    Ok(())
+}
+
+fn sha256_file(path: &Path) -> std::result::Result<String, AttemptError> {
+    require_regular_file(path).map_err(local_io)?;
+    let mut file = File::open(path).map_err(|error| local_io(error.into()))?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| local_io(error.into()))?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(hex::encode(digest.finalize()))
+}
+
 fn open_private_lock(path: &Path) -> Result<File> {
     let mut options = OpenOptions::new();
     options.create(true).truncate(false).read(true).write(true);
@@ -1498,6 +1900,14 @@ fn remove_owned_staging_file(path: &Path) {
     }
 }
 
+fn remove_owned_sqlite_sidecars(path: &Path) {
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let mut sidecar = path.as_os_str().to_os_string();
+        sidecar.push(suffix);
+        remove_owned_staging_file(&PathBuf::from(sidecar));
+    }
+}
+
 fn set_mode(path: &Path, mode: u32) -> Result<()> {
     #[cfg(unix)]
     {
@@ -1554,6 +1964,42 @@ fn classify_install_error(source: Error) -> AttemptError {
         ),
     };
     AttemptError::new(class, message, source)
+}
+
+fn classify_delta_transport_error(source: Error) -> AttemptError {
+    let (class, message) = match &source {
+        Error::Auth(_) => (
+            RefreshFailureClass::Authentication,
+            "hosted delta authentication was refused",
+        ),
+        Error::Io(_) => (
+            RefreshFailureClass::LocalIo,
+            "local standby delta preparation failed",
+        ),
+        Error::Engine(detail)
+            if detail.contains("request failed")
+                || detail.contains("was interrupted")
+                || detail.contains("HTTP status 5")
+                || detail.contains("HTTP status 408")
+                || detail.contains("HTTP status 425")
+                || detail.contains("HTTP status 429") =>
+        {
+            (RefreshFailureClass::Network, "hosted delta request failed")
+        }
+        _ => (
+            RefreshFailureClass::Protocol,
+            "hosted delta protocol exchange failed",
+        ),
+    };
+    AttemptError::new(class, message, source)
+}
+
+fn set_delta_fallback(
+    state: &mut StandbyRefreshState,
+    diagnostic: Option<DeltaFallbackDiagnostic>,
+) {
+    state.last_delta_fallback_class = diagnostic.map(|value| value.class);
+    state.last_delta_fallback = diagnostic.map(|value| value.message.to_string());
 }
 
 fn now() -> String {
@@ -1660,7 +2106,10 @@ mod tests {
             bearer: String,
             request: SnapshotPageRequest,
         ) -> PageFuture {
-            assert_eq!(endpoint, "http://localhost/mcp/route%2D1");
+            assert!(
+                endpoint.ends_with("/mcp/route%2D1"),
+                "unexpected snapshot endpoint {endpoint}"
+            );
             assert_eq!(bearer, "secret");
             assert_eq!(request.length, MAX_PAGE_BYTES);
             self.calls.fetch_add(1, Ordering::SeqCst);
@@ -1834,6 +2283,123 @@ mod tests {
         stream.shutdown().await.unwrap();
     }
 
+    async fn serve_authority_act_calls(
+        db: crate::Db,
+        expected_calls: usize,
+    ) -> (u16, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let task = tokio::spawn(async move {
+            for _ in 0..expected_calls {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let (headers, body) = read_http_request(&mut stream).await;
+                assert!(headers
+                    .to_ascii_lowercase()
+                    .contains("authorization: bearer secret"));
+                let operation = body["params"]["arguments"]["operation"].as_str().unwrap();
+                let result = match operation {
+                    super::super::delta_transport::AUTHORITY_ACT_HEAD_OPERATION => {
+                        super::super::delta_transport::observe_authority_act_head(&db, "route-1")
+                            .await
+                            .map(|value| serde_json::to_value(value).unwrap())
+                    }
+                    super::super::delta_transport::AUTHORITY_ACT_DELTA_OPERATION => {
+                        let from = body["params"]["arguments"]["arguments"]["from_exclusive_act"]
+                            .as_i64()
+                            .unwrap();
+                        super::super::delta_transport::observe_authority_act_delta(
+                            &db, "route-1", from,
+                        )
+                        .await
+                        .map(|value| serde_json::to_value(value).unwrap())
+                    }
+                    other => panic!("unexpected authority operation {other}"),
+                };
+                let envelope = match result {
+                    Ok(structured) => json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "result": {
+                            "content": [],
+                            "structuredContent": structured,
+                            "isError": false,
+                            "resultType": "complete",
+                            "_meta": {}
+                        }
+                    }),
+                    Err(error) => json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "error": {"code": -32000, "message": error.to_string()}
+                    }),
+                };
+                write_json_response(&mut stream, "200 OK", &envelope).await;
+            }
+        });
+        (port, task)
+    }
+
+    async fn serve_one_head_refusal(
+        status: &'static str,
+        envelope: Value,
+    ) -> (u16, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let (_, body) = read_http_request(&mut stream).await;
+            assert_eq!(
+                body["params"]["arguments"]["operation"],
+                super::super::delta_transport::AUTHORITY_ACT_HEAD_OPERATION
+            );
+            write_json_response(&mut stream, status, &envelope).await;
+        });
+        (port, task)
+    }
+
+    async fn serve_valid_head_then_invalid_delta(
+        db: crate::Db,
+    ) -> (u16, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let task = tokio::spawn(async move {
+            for index in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let (_, body) = read_http_request(&mut stream).await;
+                let operation = body["params"]["arguments"]["operation"].as_str().unwrap();
+                let structured = if index == 0 {
+                    assert_eq!(
+                        operation,
+                        super::super::delta_transport::AUTHORITY_ACT_HEAD_OPERATION
+                    );
+                    serde_json::to_value(
+                        super::super::delta_transport::observe_authority_act_head(&db, "route-1")
+                            .await
+                            .unwrap(),
+                    )
+                    .unwrap()
+                } else {
+                    assert_eq!(
+                        operation,
+                        super::super::delta_transport::AUTHORITY_ACT_DELTA_OPERATION
+                    );
+                    json!({"invalid": "delta"})
+                };
+                write_json_response(
+                    &mut stream,
+                    "200 OK",
+                    &json!({
+                        "jsonrpc": "2.0", "id": 1,
+                        "result": {"content": [], "structuredContent": structured,
+                                   "isError": false, "resultType": "complete", "_meta": {}}
+                    }),
+                )
+                .await;
+            }
+        });
+        (port, task)
+    }
+
     fn controller_with_client(
         client: Arc<dyn SnapshotPageClient>,
     ) -> (tempfile::TempDir, StandbyRefreshController) {
@@ -1870,6 +2436,380 @@ mod tests {
             StandbyRefreshController::new_with_client(runtime, config, store, observed, client)
                 .unwrap();
         (directory, controller)
+    }
+
+    #[tokio::test]
+    async fn authenticated_delta_refresh_promotes_and_survives_restart_with_status_provenance() {
+        const RECORD_ID: &str = "1a7e4000-0000-4000-8000-00000000d200";
+
+        let authority = crate::db::create_database(":memory:").await.unwrap();
+        let origin = crate::identity::database_id(&authority).await.unwrap();
+        let (initial_bytes, initial_manifest) = snapshot_fixture(&authority).await;
+        let initial_client = Arc::new(ScriptedClient::new(paged_replies(
+            "delta-base",
+            &initial_bytes,
+            &initial_manifest,
+        )));
+        let directory = tempfile::tempdir().unwrap();
+        let mut controller = controller_for_origin(&directory, origin, initial_client);
+        let first = controller
+            .refresh_once(RefreshCause::Startup)
+            .await
+            .unwrap();
+        let StandbyRefreshOutcome::Installed {
+            generation: first, ..
+        } = first
+        else {
+            panic!("initial snapshot refresh must install")
+        };
+
+        crate::store::append(
+            &authority,
+            crate::store::AppendSpec {
+                record_id: RECORD_ID.into(),
+                event_type: "record.created".into(),
+                payload: json!({
+                    "type": "Document",
+                    "kind": "note",
+                    "name": "delta controller evidence",
+                }),
+                actor: None,
+            },
+        )
+        .await
+        .unwrap();
+        let expected_head = read_authority_act_head(&authority).await.unwrap().head_act;
+        let (port, server) = serve_authority_act_calls(authority.clone(), 2).await;
+        controller.config.hosted_origin = format!("http://127.0.0.1:{port}");
+        controller.delta_enabled = true;
+        let snapshot_fallback = Arc::new(AlwaysFailClient {
+            class: RefreshFailureClass::Protocol,
+            calls: AtomicUsize::new(0),
+        });
+        controller.client = snapshot_fallback.clone();
+
+        let outcome = controller
+            .refresh_once(RefreshCause::Scheduled)
+            .await
+            .unwrap();
+        server.await.unwrap();
+        let StandbyRefreshOutcome::Installed { generation, .. } = outcome else {
+            panic!("advanced authority must install a delta generation")
+        };
+        assert_ne!(generation.id, first.id);
+        assert_eq!(
+            generation.manifest.materialization,
+            StandbyGenerationMaterialization::Delta
+        );
+        assert_eq!(generation.manifest.head_act, Some(expected_head));
+        assert_eq!(snapshot_fallback.calls.load(Ordering::SeqCst), 0);
+        let accepted = crate::db::open_existing_database_standby_read_only(
+            generation.snapshot_path.to_string_lossy().as_ref(),
+        )
+        .await
+        .unwrap();
+        let name: String = sqlx::query_scalar("SELECT name FROM records WHERE id = ?")
+            .bind(RECORD_ID)
+            .fetch_one(accepted.pool())
+            .await
+            .unwrap();
+        assert_eq!(name, "delta controller evidence");
+        accepted.close().await;
+
+        let published_entries = fs::read_dir(generation.snapshot_path.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        controller
+            .store
+            .current_for_refresh(&controller.observed)
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "a just-promoted delta generation remains fully verifiable; entries={published_entries:?}: {error}"
+                )
+            })
+            .expect("the current pointer remains present");
+
+        let activated = controller
+            .store
+            .activate_for_startup(&controller.observed)
+            .await
+            .unwrap();
+        let super::super::StandbyStartupOutcome::Serving(active) = activated else {
+            panic!("delta generation must remain activatable after restart")
+        };
+        assert_eq!(
+            active.generation.id,
+            generation.id,
+            "startup selected {} ({}) instead of delta {} ({}); reason {:?}; first {}",
+            active.generation.id,
+            active.generation.manifest.captured_at,
+            generation.id,
+            generation.manifest.captured_at,
+            active.startup_reason,
+            first.id,
+        );
+        assert_eq!(
+            active.generation.manifest.materialization,
+            StandbyGenerationMaterialization::Delta
+        );
+        assert_eq!(active.generation.manifest.head_act, Some(expected_head));
+        let provider = super::super::StandbyStatusProvider::for_serving(
+            controller.runtime.clone(),
+            controller.store.clone(),
+            controller.observed.clone(),
+            &active,
+            true,
+            true,
+        );
+        let status = provider.status().await;
+        let accepted_status = status.accepted_generation.unwrap();
+        assert_eq!(
+            accepted_status.materialization,
+            StandbyGenerationMaterialization::Delta
+        );
+        assert_eq!(accepted_status.head_act, Some(expected_head));
+
+        // Make the bytes disagree with the manifest while preserving a valid,
+        // immutable SQLite file. A no-op tick must not hash/deep-verify the
+        // database; an advancing tick performs that verification before use.
+        set_mode(&generation.snapshot_path, 0o600).unwrap();
+        OpenOptions::new()
+            .append(true)
+            .open(&generation.snapshot_path)
+            .unwrap()
+            .write_all(b"no-op deep-verification discriminator")
+            .unwrap();
+        set_mode(&generation.snapshot_path, 0o400).unwrap();
+
+        let (port, no_op_server) = serve_authority_act_calls(authority.clone(), 1).await;
+        controller.config.hosted_origin = format!("http://127.0.0.1:{port}");
+        let no_op = controller
+            .refresh_once(RefreshCause::Scheduled)
+            .await
+            .unwrap();
+        no_op_server.await.unwrap();
+        let StandbyRefreshOutcome::Unchanged { generation: same } = no_op else {
+            panic!("equal replicated heads must finish after the cheap probe")
+        };
+        assert_eq!(same.id, generation.id);
+        assert_eq!(snapshot_fallback.calls.load(Ordering::SeqCst), 0);
+        authority.close().await;
+    }
+
+    #[tokio::test]
+    async fn compatible_head_refusals_use_snapshot_but_network_is_not_reclassified() {
+        for (label, status, envelope) in [
+            (
+                "head-http-refusal",
+                "400 Bad Request",
+                json!({"error": "unsupported authority head"}),
+            ),
+            (
+                "pre-59-authority",
+                "200 OK",
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "error": {"code": -32000, "message": "engine schema predates act head"}
+                }),
+            ),
+        ] {
+            let authority = crate::db::create_database(":memory:").await.unwrap();
+            let origin = crate::identity::database_id(&authority).await.unwrap();
+            let (bytes, manifest) = snapshot_fixture(&authority).await;
+            let directory = tempfile::tempdir().unwrap();
+            let mut controller = controller_for_origin(
+                &directory,
+                origin,
+                Arc::new(ScriptedClient::new(paged_replies(label, &bytes, &manifest))),
+            );
+            controller
+                .refresh_once(RefreshCause::Startup)
+                .await
+                .unwrap();
+
+            let (port, server) = serve_one_head_refusal(status, envelope).await;
+            controller.config.hosted_origin = format!("http://127.0.0.1:{port}");
+            controller.delta_enabled = true;
+            controller.client = Arc::new(ScriptedClient::new(paged_replies(
+                &format!("{label}-fallback"),
+                &bytes,
+                &manifest,
+            )));
+            assert!(matches!(
+                controller
+                    .refresh_once(RefreshCause::Scheduled)
+                    .await
+                    .unwrap(),
+                StandbyRefreshOutcome::Installed { .. }
+            ));
+            server.await.unwrap();
+            let state = controller.state().unwrap();
+            assert_eq!(
+                state.last_delta_fallback_class,
+                Some(DeltaFallbackClass::HeadCompatibility)
+            );
+            authority.close().await;
+        }
+
+        let network =
+            classify_delta_transport_error(Error::engine("hosted authority act request failed"));
+        assert_eq!(network.class, RefreshFailureClass::Network);
+    }
+
+    #[tokio::test]
+    async fn invalid_delta_falls_back_with_bounded_integrity_diagnostic() {
+        let authority = crate::db::create_database(":memory:").await.unwrap();
+        let origin = crate::identity::database_id(&authority).await.unwrap();
+        let (base_bytes, base_manifest) = snapshot_fixture(&authority).await;
+        let directory = tempfile::tempdir().unwrap();
+        let mut controller = controller_for_origin(
+            &directory,
+            origin,
+            Arc::new(ScriptedClient::new(paged_replies(
+                "invalid-delta-base",
+                &base_bytes,
+                &base_manifest,
+            ))),
+        );
+        controller
+            .refresh_once(RefreshCause::Startup)
+            .await
+            .unwrap();
+        crate::store::append(
+            &authority,
+            crate::store::AppendSpec {
+                record_id: "1a7e4000-0000-4000-8000-00000000d202".into(),
+                event_type: "record.created".into(),
+                payload: json!({"type":"Document","kind":"note","name":"fallback"}),
+                actor: None,
+            },
+        )
+        .await
+        .unwrap();
+        let (fallback_bytes, fallback_manifest) = snapshot_fixture(&authority).await;
+        controller.client = Arc::new(ScriptedClient::new(paged_replies(
+            "invalid-delta-fallback",
+            &fallback_bytes,
+            &fallback_manifest,
+        )));
+        let (port, server) = serve_valid_head_then_invalid_delta(authority.clone()).await;
+        controller.config.hosted_origin = format!("http://127.0.0.1:{port}");
+        controller.delta_enabled = true;
+
+        assert!(matches!(
+            controller
+                .refresh_once(RefreshCause::Scheduled)
+                .await
+                .unwrap(),
+            StandbyRefreshOutcome::Installed { .. }
+        ));
+        server.await.unwrap();
+        let state = controller.state().unwrap();
+        assert_eq!(
+            state.last_delta_fallback_class,
+            Some(DeltaFallbackClass::IntegrityOrApplyRefusal)
+        );
+        assert!(state
+            .last_delta_fallback
+            .as_deref()
+            .is_some_and(|message| message.len() <= 160 && !message.contains("secret")));
+        authority.close().await;
+    }
+
+    #[tokio::test]
+    async fn oversize_delta_falls_back_and_failed_fallback_preserves_current() {
+        const RECORD_ID: &str = "1a7e4000-0000-4000-8000-00000000d201";
+
+        let authority = crate::db::create_database(":memory:").await.unwrap();
+        let origin = crate::identity::database_id(&authority).await.unwrap();
+        let (initial_bytes, initial_manifest) = snapshot_fixture(&authority).await;
+        let directory = tempfile::tempdir().unwrap();
+        let mut controller = controller_for_origin(
+            &directory,
+            origin,
+            Arc::new(ScriptedClient::new(paged_replies(
+                "fallback-base",
+                &initial_bytes,
+                &initial_manifest,
+            ))),
+        );
+        let first = controller
+            .refresh_once(RefreshCause::Startup)
+            .await
+            .unwrap();
+        let StandbyRefreshOutcome::Installed {
+            generation: first, ..
+        } = first
+        else {
+            panic!("initial snapshot refresh must install")
+        };
+
+        crate::store::append(
+            &authority,
+            crate::store::AppendSpec {
+                record_id: RECORD_ID.into(),
+                event_type: "record.created".into(),
+                payload: json!({
+                    "type": "Document",
+                    "kind": "note",
+                    "name": "oversize fallback",
+                    "body": "x".repeat(800_000),
+                }),
+                actor: None,
+            },
+        )
+        .await
+        .unwrap();
+        let (fallback_bytes, fallback_manifest) = snapshot_fixture(&authority).await;
+
+        let failed_snapshot = Arc::new(AlwaysFailClient {
+            class: RefreshFailureClass::Network,
+            calls: AtomicUsize::new(0),
+        });
+        controller.client = failed_snapshot.clone();
+        controller.delta_enabled = true;
+        let (port, refused_delta) = serve_authority_act_calls(authority.clone(), 2).await;
+        controller.config.hosted_origin = format!("http://127.0.0.1:{port}");
+        assert!(controller
+            .refresh_once(RefreshCause::Scheduled)
+            .await
+            .is_err());
+        refused_delta.await.unwrap();
+        assert_eq!(failed_snapshot.calls.load(Ordering::SeqCst), 3);
+        let retained = controller
+            .store
+            .current_for_refresh(&controller.observed)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(retained.id, first.id);
+
+        let snapshot_fallback = Arc::new(ScriptedClient::new(paged_replies(
+            "oversize-fallback",
+            &fallback_bytes,
+            &fallback_manifest,
+        )));
+        controller.client = snapshot_fallback.clone();
+        let (port, refused_delta) = serve_authority_act_calls(authority.clone(), 2).await;
+        controller.config.hosted_origin = format!("http://127.0.0.1:{port}");
+        let outcome = controller
+            .refresh_once(RefreshCause::NetworkRecovery)
+            .await
+            .unwrap();
+        refused_delta.await.unwrap();
+        let StandbyRefreshOutcome::Installed { generation, .. } = outcome else {
+            panic!("oversize exact cut must install through snapshot fallback")
+        };
+        assert_ne!(generation.id, first.id);
+        assert_eq!(
+            generation.manifest.materialization,
+            StandbyGenerationMaterialization::Snapshot
+        );
+        assert!(snapshot_fallback.calls.load(Ordering::SeqCst) > 0);
+        authority.close().await;
     }
 
     #[test]

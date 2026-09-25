@@ -20,10 +20,10 @@ use native_ce::db::DatabaseOpenMode;
 use native_ce::export::{ExportCoordinator, LocalSnapshotSource};
 use native_ce::identity::resolve_stdio_account_identity;
 use native_ce::mcp::{
-    register_build_enabled_experimental_tools, register_builtin_tools, register_snapshot_tool,
-    register_standby_status_tool, register_surface_tools, Caller, ExperimentalExecutors,
-    ExposureProfile, McpSurfaceMode, StatusOnlyStdioServer, StdioServer, ToolRegistry,
-    EXPERIMENTAL_EXECUTORS_ENV,
+    register_allowlisted_experimental_tools, register_build_enabled_experimental_tools,
+    register_builtin_tools, register_snapshot_tool, register_standby_status_tool,
+    register_surface_tools, Caller, ExperimentalExecutors, ExposureProfile, McpSurfaceMode,
+    StatusOnlyStdioServer, StdioServer, ToolRegistry, EXPERIMENTAL_EXECUTORS_ENV,
 };
 #[cfg(feature = "mcp-executor-prototype")]
 use native_ce::mcp::{ExecutorPrototypeStdioServer, ExecutorTelemetryContext};
@@ -37,6 +37,33 @@ use native_ce::standby::{
 #[cfg(feature = "turso-local")]
 use native_ce::turso_local::{register_turso_local_tools, TursoLocalRuntimeConfig};
 use sqlx::Row;
+
+/// Machine-readable identity used by the release packager and installer. It
+/// deliberately comes from the compiled binary itself, rather than from a
+/// caller-supplied label or a package manifest.
+fn print_standby_identity() -> ExitCode {
+    match observe_installed_consumer_identity() {
+        Ok(observed) => {
+            let identity = serde_json::json!({
+                "contract": native_ce::standby_snapshot::STANDBY_CONSUMER_CONTRACT,
+                "version": 1,
+                "runtime": "mcp-stdio",
+                "platform": observed.platform,
+                "source_sha": observed.source_sha,
+                "artifact_sha256": observed.artifact_sha256,
+                "engine_schema_version": observed.engine_schema_version,
+                "ddl_sha256": observed.ddl_sha256,
+                "standby_required": true,
+            });
+            println!("{identity}");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("mcp-stdio: cannot observe standby identity: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
 
 const USAGE: &str =
     "usage: mcp-stdio [--account <token>] <path-to.db> | mcp-stdio --standby [--account <token>] <path-to-standby-config.json>   (or set exactly one applicable controller: NATIVE_CE_DB, NATIVE_CE_STANDBY_CONFIG, NATIVE_CE_STORAGE_TARGET_CONFIG, NATIVE_CE_POSTGRES_CONFIG, NATIVE_CE_TURSO_LOCAL_CONFIG; Postgres and Turso-local are trusted-local and reject NATIVE_CE_ACCOUNT)";
@@ -89,10 +116,12 @@ fn configured_profile_for_surface(
 fn register_stdio_tools(
     registry: &mut ToolRegistry,
     exports: &ExportCoordinator,
+    experimental: &ExperimentalExecutors,
 ) -> native_ce::Result<()> {
     register_builtin_tools(registry)?;
     register_surface_tools(registry)?;
     register_build_enabled_experimental_tools(registry)?;
+    register_allowlisted_experimental_tools(registry, experimental)?;
     register_snapshot_tool(
         registry,
         Arc::new(LocalSnapshotSource::with_coordinator(exports.clone())),
@@ -304,6 +333,16 @@ fn validate_turso_selection(
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
+    if args
+        .first()
+        .is_some_and(|argument| argument == "--standby-identity")
+    {
+        if args.len() != 1 {
+            eprintln!("mcp-stdio: --standby-identity takes no additional arguments");
+            return ExitCode::from(2);
+        }
+        return print_standby_identity();
+    }
     if args
         .first()
         .is_some_and(|argument| argument == "--standby-refresh")
@@ -623,7 +662,7 @@ async fn main() -> ExitCode {
         registry.set_standby_read_only(open_mode == DatabaseOpenMode::StandbyReadOnly);
     }
     registry.set_exposure_profile(profile);
-    if let Err(err) = register_stdio_tools(&mut registry, &exports) {
+    if let Err(err) = register_stdio_tools(&mut registry, &exports, &experimental_executors) {
         eprintln!("mcp-stdio: {err}");
         return ExitCode::FAILURE;
     }
@@ -779,6 +818,13 @@ async fn run_manual_standby_refresh(args: &[String]) -> ExitCode {
             );
             ExitCode::SUCCESS
         }
+        Ok(StandbyRefreshOutcome::Unchanged { generation }) => {
+            eprintln!(
+                "mcp-stdio: standby generation {} is already current",
+                generation.id
+            );
+            ExitCode::SUCCESS
+        }
         Ok(StandbyRefreshOutcome::Accepted { coalesced }) => {
             let disposition = if coalesced { "coalesced" } else { "accepted" };
             eprintln!("mcp-stdio: standby manual refresh {disposition}");
@@ -817,9 +863,12 @@ async fn run_turso_local(config_path: &str, profile: ExposureProfile) -> ExitCod
     let exports = ExportCoordinator::new();
     let mut registry = ToolRegistry::new();
     registry.set_exposure_profile(profile);
-    if let Err(error) = register_stdio_tools(&mut registry, &exports)
-        .and_then(|()| register_turso_local_tools(&mut registry))
-        .and_then(|()| registry.validate_profile_budgets())
+    // Turso-local has no sql_write backend: the allowlisted source stays
+    // withheld here regardless of the executor allowlist.
+    if let Err(error) =
+        register_stdio_tools(&mut registry, &exports, &ExperimentalExecutors::empty())
+            .and_then(|()| register_turso_local_tools(&mut registry))
+            .and_then(|()| registry.validate_profile_budgets())
     {
         eprintln!("mcp-stdio: {error}");
         return ExitCode::FAILURE;
@@ -873,9 +922,12 @@ async fn run_postgres(config_path: &str, profile: ExposureProfile) -> ExitCode {
     let exports = ExportCoordinator::new();
     let mut registry = ToolRegistry::new();
     registry.set_exposure_profile(profile);
-    if let Err(error) = register_stdio_tools(&mut registry, &exports)
-        .and_then(|()| register_postgres_tools(&mut registry))
-        .and_then(|()| registry.validate_profile_budgets())
+    // Postgres has no sql_write backend: the allowlisted source stays
+    // withheld here regardless of the executor allowlist.
+    if let Err(error) =
+        register_stdio_tools(&mut registry, &exports, &ExperimentalExecutors::empty())
+            .and_then(|()| register_postgres_tools(&mut registry))
+            .and_then(|()| registry.validate_profile_budgets())
     {
         eprintln!("mcp-stdio: {error}");
         db.close().await;
@@ -1137,7 +1189,12 @@ mod tests {
         register_snapshot_tool(&mut stable_registry, Arc::new(LocalSnapshotSource::new())).unwrap();
         let stable_focused_bytes = stable_registry.descriptor_array_bytes(ExposureProfile::Focused);
         let mut registry = ToolRegistry::new();
-        register_stdio_tools(&mut registry, &ExportCoordinator::new()).unwrap();
+        register_stdio_tools(
+            &mut registry,
+            &ExportCoordinator::new(),
+            &ExperimentalExecutors::empty(),
+        )
+        .unwrap();
 
         let spec = registry
             .get(TOOL)
@@ -1181,10 +1238,49 @@ mod tests {
     #[test]
     fn no_default_features_omits_agent_intent_registration() {
         let mut registry = ToolRegistry::new();
-        register_stdio_tools(&mut registry, &ExportCoordinator::new()).unwrap();
+        register_stdio_tools(
+            &mut registry,
+            &ExportCoordinator::new(),
+            &ExperimentalExecutors::empty(),
+        )
+        .unwrap();
 
         assert!(registry
             .get("experimental_freshness_agent_intent")
             .is_none());
+    }
+
+    #[test]
+    fn stdio_registers_sql_write_only_under_its_allowlist() {
+        let mut default_registry = ToolRegistry::new();
+        register_stdio_tools(
+            &mut default_registry,
+            &ExportCoordinator::new(),
+            &ExperimentalExecutors::empty(),
+        )
+        .unwrap();
+        assert!(
+            default_registry.get("sql_write").is_none(),
+            "default stdio registry must omit the sql_write source"
+        );
+        assert!(
+            !default_registry
+                .specs_for_profile(ExposureProfile::Complete)
+                .any(|candidate| candidate.name == "sql_write"),
+            "default Complete tools/list must omit sql_write"
+        );
+        let allowlisted = ExperimentalExecutors::from_env_value(Some("sql_write".into())).unwrap();
+        let mut opted_registry = ToolRegistry::new();
+        register_stdio_tools(&mut opted_registry, &ExportCoordinator::new(), &allowlisted).unwrap();
+        let spec = opted_registry
+            .get("sql_write")
+            .expect("allowlisted stdio registry must hold the sql_write source");
+        assert!(!spec.description.trim().is_empty());
+        assert!(opted_registry
+            .specs_for_profile(ExposureProfile::Complete)
+            .any(|candidate| candidate.name == "sql_write"));
+        assert!(!opted_registry
+            .specs_for_profile(ExposureProfile::Focused)
+            .any(|candidate| candidate.name == "sql_write"));
     }
 }

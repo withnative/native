@@ -128,6 +128,10 @@ import/export, and cross-backend round trips are not current capabilities.
   identity, runtime dispatch, governed inputs, and isolation boundaries. The
   [worked example](artifact-runtimes.md#one-collection-two-authored-views) follows
   one Collection through two authored views and explains compatible reuse.
+- [Agent-authored alpha tab proof](capability-map.md#agent-authored-tabs) —
+  **Experimental:** selected backend install, preview, adoption and read
+  contracts with two read-only HTML package examples. The browser tab host is
+  **Held**, and the proof does not establish a general plugin product.
 - [`web/mcp-apps`](../web/mcp-apps/) — **Experimental:** two selected optional
   MCP App views for record-version differences and suggestion review.
 

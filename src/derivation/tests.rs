@@ -7,7 +7,10 @@ use super::*;
 
 async fn append(db: &Db, input: NewDerivationEvent) -> DerivationEventRow {
     let mut tx = begin_write(db.write_pool()).await.unwrap();
-    let event = append_derivation_event_in(&mut tx, input).await.unwrap();
+    let mut act_alloc = crate::act::ActAllocation::new();
+    let event = append_derivation_event_in(&mut tx, input, &mut act_alloc)
+        .await
+        .unwrap();
     tx.commit().await.unwrap();
     event
 }
@@ -151,6 +154,7 @@ async fn idempotency_rejects_different_intent() {
     .unwrap();
     append(&db, first).await;
     let mut tx = begin_write(db.write_pool()).await.unwrap();
+    let mut act_alloc = crate::act::ActAllocation::new();
     let error = append_derivation_event_in(
         &mut tx,
         NewDerivationEvent::authored(
@@ -165,6 +169,7 @@ async fn idempotency_rejects_different_intent() {
             }),
         )
         .unwrap(),
+        &mut act_alloc,
     )
     .await
     .unwrap_err();
@@ -283,4 +288,97 @@ async fn controlled_success_identity_uses_full_coordination_key_variants() {
     .await
     .unwrap();
     assert_eq!(stored, keys);
+}
+
+#[tokio::test]
+async fn derivation_events_in_act_range_is_bounded_ordered_and_excludes_null_acts() {
+    use std::collections::BTreeMap;
+
+    const LEGACY: &str = "derivation-event-legacy-null-act";
+
+    let db = crate::db::create_database(":memory:").await.unwrap();
+    // Three real authored series, each committed by its own seam call so each
+    // carries its own act stamp.
+    for ordinal in 0..3 {
+        append(
+            &db,
+            NewDerivationEvent::authored(
+                format!("series:act-range-{ordinal}"),
+                "person:alice",
+                Some(format!("run-{ordinal}")),
+                "define a range witness series",
+                DerivationEventPayload::SeriesCreated(DerivationSeriesCreated {
+                    id: format!("series:act-range-{ordinal}"),
+                    series_key: format!("act-range:{ordinal}"),
+                    definition: json!({"output":"note","recipe":"native/range"}),
+                }),
+            )
+            .unwrap(),
+        )
+        .await;
+    }
+    // A legacy grouping-unknown row: `NULL` act, schema-valid, narrow.
+    sqlx::query(
+        "INSERT INTO derivation_events
+             (id,idempotency_key,type,schema_version,aggregate_kind,aggregate_id,
+              actor,run_key,reason,payload,created_at,act)
+         VALUES(?,'legacy-key','derivation.series.created',1,'derivation_series',
+                'series:legacy','engine:seed',NULL,'legacy act witness','{}',
+                '2026-01-01T00:00:00.000Z',NULL)",
+    )
+    .bind(LEGACY)
+    .execute(db.write_pool())
+    .await
+    .unwrap();
+
+    let mut conn = db.pool().acquire().await.unwrap();
+    let full = read_all_derivation_events(&mut conn).await.unwrap();
+
+    let act_of: BTreeMap<i64, Option<i64>> = sqlx::query("SELECT seq, act FROM derivation_events")
+        .fetch_all(&mut *conn)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| (row.get("seq"), row.get("act")))
+        .collect();
+    let mut acts: Vec<i64> = act_of.values().flatten().copied().collect();
+    acts.sort_unstable();
+    acts.dedup();
+    assert!(
+        acts.len() >= 3,
+        "the test expects at least three stamped acts"
+    );
+
+    for (from_exclusive, to_inclusive) in
+        [(acts[0], acts[2]), (acts[1], acts[2]), (acts[0], acts[1])]
+    {
+        let bounded = derivation_events_in_act_range(&mut conn, from_exclusive, to_inclusive)
+            .await
+            .unwrap();
+        assert!(bounded.windows(2).all(|pair| pair[0].seq < pair[1].seq));
+        let expected: Vec<DerivationEventRow> = full
+            .iter()
+            .filter(|event| {
+                act_of[&event.seq].is_some_and(|act| act > from_exclusive && act <= to_inclusive)
+            })
+            .cloned()
+            .collect();
+        assert_eq!(
+            bounded, expected,
+            "range ({from_exclusive}, {to_inclusive}]"
+        );
+        assert!(
+            !bounded.iter().any(|event| event.id == LEGACY),
+            "a NULL-act row never matches the range predicate"
+        );
+    }
+
+    // Equal bounds are the empty half-open interval, not a widening.
+    assert!(derivation_events_in_act_range(&mut conn, acts[2], acts[2])
+        .await
+        .unwrap()
+        .is_empty());
+    // The NULL row is still part of the full log, proving it was excluded by
+    // the predicate and not dropped by the decoder.
+    assert!(full.iter().any(|event| event.id == LEGACY));
 }

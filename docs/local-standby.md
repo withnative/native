@@ -11,6 +11,35 @@ accept/promote kernel, startup activation/recovery path, and refresh controller
 are implemented; full status disclosure, packaging, and qualification remain
 separate slices.
 
+## Release-pinned acquisition
+
+The supported laptop path is the `@withnative/standby` npm package at an
+exact version. Its platform-specific optional dependency contains a prebuilt
+`mcp-stdio`, plus a `native.standby-artifact.v1` manifest with the full
+`NATIVE_CE_GIT_SHA`, engine schema version, frozen DDL fingerprint, and binary
+SHA-256. The package verifies that manifest and checksum before copying the
+binary into an immutable versioned generation under
+`~/.local/share/native-local` (or `NATIVE_STANDBY_HOME`). A clean laptop does
+not compile the repository.
+
+```sh
+npx --package @withnative/standby@0.1.0 native-standby install
+npx --package @withnative/standby@0.1.0 native-standby configure \
+  --replica-root "$HOME/.local/share/native-local" \
+  --hosted-route ROUTE_DATABASE_ID \
+  --origin-database-id ndb_DATABASE_ID \
+  --mcp-config "$HOME/.config/mcp/config.json"
+npx --package @withnative/standby@0.1.0 native-standby verify --json
+```
+
+The generated `native-local` entry launches the stable absolute path with
+`--standby` and the strict standby configuration. It is independent of npm,
+the registry, and hosted GHCR after installation; the existing hosted `native`
+entry is preserved. `native-standby update` is idempotent and refuses to
+replace a release version with different bytes. `native-standby rollback`
+switches the stable launcher to the prior checksum-verified generation without
+removing or rewriting `accepted/`, `device/`, or `refresh/`.
+
 ## First-release choices
 
 - Agents use an explicit `native-local` MCP configuration alongside the
@@ -263,11 +292,68 @@ is deliberately not claimed as a complete promotion proof: promotion must also
 prove prefix inclusion for read-visible append-only domains without a global
 sequence, validate governed projections, and keep unfenced mutable state equal
 unless a ratified authority proves its successor relationship. Operational
-read-log, job, run, and receiver-local relationship-quarantine bookkeeping is
-disposable and is never replayed locally. The in-place storage-portability
-policy is conservatively frozen byte-for-byte across promotion until it gains
-a ratified history or successor proof; semantic validation alone cannot prove
+read-log, job, and receiver-local relationship-quarantine bookkeeping is
+disposable and is never replayed locally. Agent-run state is a deterministic
+control-log projection and is folded locally with the rest of that domain. The
+in-place storage-portability policy is conservatively frozen byte-for-byte
+across promotion until it gains a ratified history or successor proof;
+semantic validation alone cannot prove
 that a higher revision belongs to the same lineage.
+
+Canonical state is not synonymous with sequenced state. It consists of the ten
+sequenced act-stamped logs; the three non-sequenced act-stamped logs
+`provenance_attestation_validity_events`, `external_observations`, and
+`awareness_command_intents`; immutable companions selected by joins from those mutations; and
+small canonical state that requires explicit carry, comparison, or
+seed-equality rules in the delta protocol. Everything else is either an
+incremental fold of that authority or receiver-local/operational state. The
+engine-table classification beside the schema contract is exhaustive. Its DDL
+parser rejects table-creating statements it cannot understand, and the
+inventory fails closed when fresh-schema DDL adds a table without a carriage,
+pin, fold, or exclusion decision. Projection inventories are cross-checked
+against the fold classification so a known replay table cannot be labelled
+disposable.
+
+Steady-state refresh now probes the authenticated authority act head first. An
+equal replicated head is a one-probe no-op. An advance fetches one bounded,
+authenticated whole-act delta, clones the accepted immutable generation into
+private staging, and applies the canonical events through the same per-event
+projectors and DDL triggers used by the authority. The candidate is admitted
+through the ordinary deep generation verifier and becomes visible only when
+the durable current pointer is switched. The prior generation remains served
+and restart-safe until that promotion completes.
+
+The no-op path does not hash or deep-verify the snapshot bytes. It checks the
+immutable generation/pointer identity, reads the local act head, and performs
+the remote head probe; deep verification is deferred until immediately before
+an advancing generation is cloned. The head probe itself still scans the
+act-stamped validity log for its maximum act and serializes the governed
+storage-policy subtree. Those authority-side costs remain bounded correctness
+work to profile and optimise separately; they are not database-file-size work.
+
+SQLite `application_id` carries a database-local source-history provenance
+marker. Fresh native databases and revision-5 imports are marked exhaustive;
+compatibility imports retain their original revision. Unknown or pre-revision-5
+history refuses act-head/delta service and uses whole-snapshot refresh, so a
+compatibility upgrader cannot relabel omitted historical events as exhaustive.
+
+An identity change, incompatible or unrepresentable cut, or a delta above the
+transport ceiling takes the existing whole-snapshot path. A failed fallback
+leaves the current pointer unchanged. Full replay stays bootstrap, repair, and
+verification machinery rather than the steady-state refresh algorithm. There
+are no global-rebuild derived tables today; that bucket remains explicit and
+empty so a future global dependency cannot silently acquire an incremental
+claim. Generation provenance durably records the accepted act head and whether
+the file was materialised by snapshot or delta, and `standby_status` projects
+both across restart.
+
+This delta classification is narrower than canonical interchange and the
+legacy whole-file successor proof. Interchange may carry operational sections
+for a complete logical migration even when a local standby delta discards
+them. Likewise, the legacy snapshot gate may require a candidate file to
+preserve operational append-only rows (including migration drills and local
+attestation-authority evidence) without making those rows part of the new
+delta protocol.
 
 Ordinary `export_snapshot` calls remain generic and carry no manifest. On the
 first call only, a hosted owner may supply `standby_consumer` with the exact

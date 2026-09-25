@@ -41,8 +41,11 @@ fn postgres_query_sql_closed_ast_admission_contract() {
     ] {
         assert!(validate(&request(sql)).is_err(), "admitted {sql}");
     }
+    // I1/I1b: callers write `?N`; the Postgres path rewrites to `$N`
+    // after the classifier, so `?N` validates and the exact-`$n`-set check
+    // runs on the rewritten text.
     let typed = QuerySqlRequest {
-        sql: "SELECT $1::text FROM records WHERE id=$2".into(),
+        sql: "SELECT ?1::text FROM records WHERE id=?2".into(),
         parameters: vec![
             QuerySqlParameter::Text {
                 value: Some("label".into()),
@@ -52,12 +55,42 @@ fn postgres_query_sql_closed_ast_admission_contract() {
             },
         ],
     };
-    validate(&typed).unwrap();
+    let rewritten = validate(&typed).unwrap();
+    assert_eq!(
+        rewritten, "SELECT $1::text FROM records WHERE id=$2",
+        "unexpected rewrite: {rewritten}"
+    );
     let missing = QuerySqlRequest {
-        sql: "SELECT $2 FROM records".into(),
+        sql: "SELECT ?2 FROM records".into(),
         parameters: vec![QuerySqlParameter::Text {
             value: Some("x".into()),
         }],
     };
-    assert!(validate(&missing).is_err());
+    let missing_error = validate(&missing).unwrap_err().to_string();
+    assert!(
+        missing_error.contains("ordered parameters and $n placeholders must match exactly"),
+        "unexpected refusal: {missing_error}"
+    );
+    // Every non-`?N` spelling is rejected with the portable repair, while a
+    // `$1` inside a string literal is data and stays admitted. A bare `?`
+    // names the jsonb operators as out of profile instead.
+    validate(&request("SELECT id FROM records WHERE name = '$1'")).unwrap();
+    let bare = validate(&request("SELECT id FROM records WHERE id = ?"))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        bare.contains("Postgres `?`/`?|`/`?&` operators"),
+        "missing jsonb note: {bare}"
+    );
+    for sql in [
+        "SELECT $1::text FROM records WHERE id=$2",
+        "SELECT $2 FROM records",
+        "SELECT id FROM records WHERE id = :name",
+    ] {
+        let error = validate(&request(sql)).unwrap_err().to_string();
+        assert!(
+            error.contains("use positional `?N` placeholders"),
+            "{sql}: missing repair: {error}"
+        );
+    }
 }

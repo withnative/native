@@ -516,6 +516,9 @@ async fn get_run_activity_is_per_run_aggregate_only_and_degrades_to_empty() {
 
     let db = db().await;
     let registry = registry();
+    // PR A capture filtering (task 8a6377f): only action-evidence calls earn
+    // rows. `create_record` is retained with its mutated touch; `search` and
+    // failed pure reads are disposable exhaust and leave nothing behind.
     call(
         &registry,
         &db,
@@ -544,9 +547,10 @@ async fn get_run_activity_is_per_run_aggregate_only_and_degrades_to_empty() {
     call(
         &registry,
         &db,
-        "search",
+        "create_record",
         json!({
-            "query": "activity",
+            "type": "Document",
+            "name": "child activity target",
             "run_key": CHILD_RUN,
             "parent_key": ROOT_RUN,
         }),
@@ -573,13 +577,22 @@ async fn get_run_activity_is_per_run_aggregate_only_and_degrades_to_empty() {
     // Read-log touches deliberately have no record foreign key: a record may
     // disappear after a real interaction. The aggregate must suppress that
     // dangling correlation rather than fail or disclose its existence.
-    let root_search_seq: i64 = sqlx::query_scalar(
-        "SELECT MIN(seq) FROM read_log_calls WHERE run_key = ? AND tool = 'search'",
+    // Search calls are disposable exhaust under capture filtering: they earn
+    // no rows, so the dangling-record correlation is attached to the retained
+    // `create_record` row instead.
+    let root_create_seq: i64 = sqlx::query_scalar(
+        "SELECT MIN(seq) FROM read_log_calls WHERE run_key = ? AND tool = 'create_record'",
     )
     .bind(ROOT_RUN)
     .fetch_one(db.pool())
     .await
     .unwrap();
+    let search_rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM read_log_calls WHERE tool = 'search'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(search_rows, 0, "pure-read search calls must leave no rows");
     let fixture_pool = crate::common::fixture_write_pool(&db).await;
     sqlx::query("INSERT OR IGNORE INTO read_log_record_ids (record_id) VALUES (?)")
         .bind("missing-record")
@@ -590,7 +603,7 @@ async fn get_run_activity_is_per_run_aggregate_only_and_degrades_to_empty() {
         "INSERT INTO read_log_touches(call_seq,record_ref,interaction,result_rank)
          VALUES(?,(SELECT record_ref FROM read_log_record_ids WHERE record_id = ?),'opened',NULL)",
     )
-    .bind(root_search_seq)
+    .bind(root_create_seq)
     .bind("missing-record")
     .execute(&fixture_pool)
     .await
@@ -607,16 +620,28 @@ async fn get_run_activity_is_per_run_aggregate_only_and_degrades_to_empty() {
     assert_eq!(exact["for_run"], ROOT_RUN);
     assert_eq!(exact["include_child_runs"], false);
     assert_eq!(exact["availability"]["status"], "available");
+    assert_eq!(exact["availability"]["completeness"], "retained_rows_only");
     assert!(exact["availability"]["reason"].is_null());
     assert_eq!(exact["availability"]["visibility_filtered"], true);
     assert_eq!(exact_rows.len(), 1);
     assert_eq!(exact_rows[0]["run_key"], ROOT_RUN);
     assert_eq!(exact_rows[0]["parent_key"], Value::Null);
-    assert_eq!(exact_rows[0]["searches"], 2);
-    assert!(exact_rows[0]["surfaced"].as_i64().unwrap() >= 1);
+    assert_eq!(exact_rows[0]["searches"], 0);
+    // The retained create action surfaced two structural support records.
+    // The discarded search contributes no aggregate activity.
+    assert_eq!(exact_rows[0]["surfaced"], 2);
     assert_eq!(exact_rows[0]["opened"], 0);
+    assert_eq!(exact_rows[0]["mutated"], 1);
     assert!(!exact.to_string().contains(SECRET_QUERY));
     let exact_text = render::render("get_run_activity", &exact).unwrap();
+    assert!(
+        exact_text.contains("omitted reads may have occurred"),
+        "{exact_text}"
+    );
+    assert!(
+        !exact_text.contains("Additional availability fields omitted"),
+        "{exact_text}"
+    );
     assert!(exact_text.contains(ROOT_RUN), "{exact_text}");
     assert!(
         exact_text.contains(&serde_json::to_string(&exact_rows[0]).unwrap()),
@@ -644,7 +669,8 @@ async fn get_run_activity_is_per_run_aggregate_only_and_degrades_to_empty() {
     assert_eq!(tree_rows[0]["run_key"], ROOT_RUN);
     assert_eq!(tree_rows[1]["run_key"], CHILD_RUN);
     assert_eq!(tree_rows[1]["parent_key"], ROOT_RUN);
-    assert_eq!(tree_rows[1]["searches"], 1);
+    assert_eq!(tree_rows[1]["searches"], 0);
+    assert_eq!(tree_rows[1]["mutated"], 1);
     for row in tree_rows {
         assert_eq!(row.as_object().unwrap().len(), 6);
     }

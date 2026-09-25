@@ -1287,6 +1287,13 @@ pub(crate) async fn render_record<E: DomainStatementExecutor>(
         links_out_count,
         links_in,
         links_in_count,
+        // Portable adapters do not serve the body-mention projection: the four
+        // fields stay absent (never empty) outside the SQLite kernel, exactly
+        // as `superseded_by` and `freshness` do.
+        mentions_out: None,
+        mentions_out_count: None,
+        mentions_in: None,
+        mentions_in_count: None,
         // Portable adapters do not serve this projection: the field stays
         // absent (never empty) outside the SQLite kernel.
         superseded_by: None,

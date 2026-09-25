@@ -505,6 +505,56 @@ async fn an_unedited_contribution_reports_one_participant() {
 // Visibility and disclosure
 // ---------------------------------------------------------------------------
 
+/// A run admitted by a caller that asserted no `clientInfo` carries no client
+/// claim at all. The key is absent, never an empty object and never a null:
+/// there is no writer for the model claim yet either, so it must not appear.
+#[tokio::test]
+async fn an_admitted_run_without_a_client_reports_no_client_claim() {
+    let db = db().await;
+    let mut registry = registry();
+    native_ce::mcp::register_builtin_tools(&mut registry).unwrap();
+    bind_local_person(&registry, &db).await;
+    let bearer_id = bearer(&registry, &db, "c07b0000-0000-4000-8000-00000000001a").await;
+    let run_key = "plover-archery-cccccc";
+    call(
+        &registry,
+        &db,
+        "set_intent",
+        json!({ "intent": "admitted plainly", "run_key": run_key }),
+    )
+    .await;
+    let comment_id = "c07b0000-0000-4000-8000-00000000001b";
+    comment_in_run(
+        &registry,
+        &db,
+        mcp(),
+        Some(run_key),
+        comment_id,
+        &bearer_id,
+        "Written under a run that named no client.",
+    )
+    .await;
+
+    let read = call_as(
+        &registry,
+        &db,
+        Caller::local(),
+        "get_record",
+        json!({ "ids": [comment_id] }),
+    )
+    .await;
+    let run = &read["records"][0]["contribution"]["run"];
+    assert_eq!(run["run_key"], json!(run_key));
+    assert!(
+        run.get("reported_mcp_client").is_none(),
+        "nothing was asserted, so no client key appears: {run}"
+    );
+    assert!(
+        run.get("reported_model").is_none(),
+        "no writer populates the model claim, so it must be absent, not stubbed: {run}"
+    );
+}
+
 #[tokio::test]
 async fn another_principals_run_is_withheld_and_same_run_is_null_not_false() {
     let db = db().await;

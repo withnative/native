@@ -53,6 +53,15 @@ use crate::schema::{ddl_sha256, FROZEN_DDL_SHA256};
 pub struct ConformanceReport {
     pub ok: bool,
     pub checks: Vec<CheckResult>,
+    /// Static check names and durations only; never database rows.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub check_timings: Vec<ConformanceCheckTiming>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ConformanceCheckTiming {
+    pub check: String,
+    pub elapsed_ms: u128,
 }
 
 /// The freeze check: the DDL compiled into this build must hash to the pinned
@@ -189,56 +198,123 @@ fn into_check(name: &str, result: crate::error::Result<RebuildDiffResult>) -> Ch
 
 /// Run the full conformance suite against a database.
 pub async fn run_conformance(db: &Db) -> ConformanceReport {
-    let mut checks: Vec<CheckResult> = vec![check_frozen_ddl()];
-    checks.extend(run_spine_checks(db).await);
-    checks.push(check_rebuild_and_diff(db).await);
-    checks.push(check_rebuild_and_diff_meta(db).await);
-    checks.push(check_rebuild_and_diff_policy(db).await);
-    checks.push(check_rebuild_and_diff_relationship(db).await);
-    checks.push(check_rebuild_and_diff_control(db).await);
-    checks.push(check_rebuild_and_diff_derivation(db).await);
-    checks.push(check_provenance_state(db).await);
-    checks.push(check_read_log_disposability().await);
-    checks.push(check_authorization_revision_state(db).await);
-    checks.push(match crate::authorization::state_violations(db).await {
-        Ok(violations) => CheckResult {
-            check: "authorization-policy-state".into(),
-            ok: violations.is_empty(),
-            violations,
-        },
-        Err(err) => CheckResult {
-            check: "authorization-policy-state".into(),
-            ok: false,
-            violations: vec![format!("authorization state could not be validated: {err}")],
-        },
-    });
-    checks.push(match crate::control::state_violations(db).await {
-        Ok(violations) => CheckResult {
-            check: "control-event-log-state".into(),
-            ok: violations.is_empty(),
-            violations,
-        },
-        Err(err) => CheckResult {
-            check: "control-event-log-state".into(),
-            ok: false,
-            violations: vec![format!(
-                "instruction control event log state could not be validated: {err}"
-            )],
-        },
-    });
-    checks.push(match crate::policy::state_violations(db).await {
-        Ok(violations) => CheckResult {
-            check: "policy-event-log-state".into(),
-            ok: violations.is_empty(),
-            violations,
-        },
-        Err(err) => CheckResult {
-            check: "policy-event-log-state".into(),
-            ok: false,
-            violations: vec![format!("policy event log could not be validated: {err}")],
-        },
-    });
-    checks.push(
+    run_conformance_with_progress(db, |_, _| {}).await
+}
+
+/// The full suite with aggregate-only progress: `None` marks a named check's
+/// start and `Some(ms)` marks completion. A cancelled run still identifies its
+/// last active check without exposing any data from the database.
+pub(crate) async fn run_conformance_with_progress(
+    db: &Db,
+    mut on_check: impl FnMut(&str, Option<u128>),
+) -> ConformanceReport {
+    let mut check_timings = Vec::new();
+    macro_rules! timed {
+        ($name:literal, $check:expr) => {{
+            on_check($name, None);
+            let started = std::time::Instant::now();
+            let result = $check;
+            let elapsed_ms = started.elapsed().as_millis();
+            check_timings.push(ConformanceCheckTiming {
+                check: $name.into(),
+                elapsed_ms,
+            });
+            on_check($name, Some(elapsed_ms));
+            result
+        }};
+    }
+    let mut checks: Vec<CheckResult> = vec![timed!("frozen-ddl", check_frozen_ddl())];
+    checks.extend(
+        run_spine_checks_with_progress(db, &mut |name, elapsed| {
+            if let Some(elapsed_ms) = elapsed {
+                check_timings.push(ConformanceCheckTiming {
+                    check: name.into(),
+                    elapsed_ms,
+                });
+            }
+            on_check(name, elapsed);
+        })
+        .await,
+    );
+    checks.push(timed!("rebuild-and-diff", check_rebuild_and_diff(db).await));
+    checks.push(timed!(
+        "rebuild-and-diff-meta",
+        check_rebuild_and_diff_meta(db).await
+    ));
+    checks.push(timed!(
+        "rebuild-and-diff-policy",
+        check_rebuild_and_diff_policy(db).await
+    ));
+    checks.push(timed!(
+        "rebuild-and-diff-relationship",
+        check_rebuild_and_diff_relationship(db).await
+    ));
+    checks.push(timed!(
+        "rebuild-and-diff-control",
+        check_rebuild_and_diff_control(db).await
+    ));
+    checks.push(timed!(
+        "rebuild-and-diff-derivation",
+        check_rebuild_and_diff_derivation(db).await
+    ));
+    checks.push(timed!("provenance-state", check_provenance_state(db).await));
+    checks.push(timed!(
+        "read-log-disposability",
+        check_read_log_disposability().await
+    ));
+    checks.push(timed!(
+        "authorization-revision-state",
+        check_authorization_revision_state(db).await
+    ));
+    checks.push(timed!(
+        "authorization-policy-state",
+        match crate::authorization::state_violations(db).await {
+            Ok(violations) => CheckResult {
+                check: "authorization-policy-state".into(),
+                ok: violations.is_empty(),
+                violations,
+            },
+            Err(err) => CheckResult {
+                check: "authorization-policy-state".into(),
+                ok: false,
+                violations: vec![format!("authorization state could not be validated: {err}")],
+            },
+        }
+    ));
+    checks.push(timed!(
+        "control-event-log-state",
+        match crate::control::state_violations(db).await {
+            Ok(violations) => CheckResult {
+                check: "control-event-log-state".into(),
+                ok: violations.is_empty(),
+                violations,
+            },
+            Err(err) => CheckResult {
+                check: "control-event-log-state".into(),
+                ok: false,
+                violations: vec![format!(
+                    "instruction control event log state could not be validated: {err}"
+                )],
+            },
+        }
+    ));
+    checks.push(timed!(
+        "policy-event-log-state",
+        match crate::policy::state_violations(db).await {
+            Ok(violations) => CheckResult {
+                check: "policy-event-log-state".into(),
+                ok: violations.is_empty(),
+                violations,
+            },
+            Err(err) => CheckResult {
+                check: "policy-event-log-state".into(),
+                ok: false,
+                violations: vec![format!("policy event log could not be validated: {err}")],
+            },
+        }
+    ));
+    checks.push(timed!(
+        "relationship-event-log-state",
         match crate::relationship::relationship_state_violations(db).await {
             Ok(violations) => CheckResult {
                 check: "relationship-event-log-state".into(),
@@ -252,25 +328,29 @@ pub async fn run_conformance(db: &Db) -> ConformanceReport {
                     "relationship event log could not be validated: {err}"
                 )],
             },
-        },
-    );
-    checks.push(match crate::identity::state_violations(db).await {
-        Ok(violations) => CheckResult {
-            check: "portable-identity-state".into(),
-            ok: violations.is_empty(),
-            violations,
-        },
-        Err(err) => CheckResult {
-            check: "portable-identity-state".into(),
-            ok: false,
-            violations: vec![format!(
-                "portable identity state could not be validated: {err}"
-            )],
-        },
-    });
+        }
+    ));
+    checks.push(timed!(
+        "portable-identity-state",
+        match crate::identity::state_violations(db).await {
+            Ok(violations) => CheckResult {
+                check: "portable-identity-state".into(),
+                ok: violations.is_empty(),
+                violations,
+            },
+            Err(err) => CheckResult {
+                check: "portable-identity-state".into(),
+                ok: false,
+                violations: vec![format!(
+                    "portable identity state could not be validated: {err}"
+                )],
+            },
+        }
+    ));
     ConformanceReport {
         ok: checks.iter().all(|c| c.ok),
         checks,
+        check_timings,
     }
 }
 
@@ -365,6 +445,7 @@ pub(crate) async fn run_standby_admission_conformance(db: &Db) -> ConformanceRep
     ConformanceReport {
         ok: checks.iter().all(|check| check.ok),
         checks: std::mem::take(&mut checks),
+        check_timings: Vec::new(),
     }
 }
 
@@ -372,10 +453,17 @@ pub(crate) async fn run_standby_admission_conformance(db: &Db) -> ConformanceRep
 pub fn format_report(report: &ConformanceReport) -> String {
     let mut lines: Vec<String> = Vec::new();
     for c in &report.checks {
+        let timing = report
+            .check_timings
+            .iter()
+            .find(|timing| timing.check == c.check)
+            .map(|timing| format!("  elapsed_ms={}", timing.elapsed_ms))
+            .unwrap_or_default();
         lines.push(format!(
-            "{}  {}",
+            "{}  {}{}",
             if c.ok { "PASS" } else { "FAIL" },
-            c.check
+            c.check,
+            timing
         ));
         for v in &c.violations {
             lines.push(format!("      - {v}"));
@@ -390,6 +478,34 @@ pub fn format_report(report: &ConformanceReport) -> String {
         .to_string(),
     );
     lines.join("\n")
+}
+
+#[cfg(test)]
+mod timing_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn full_conformance_emits_named_start_and_completion_in_report_order() {
+        let db = crate::db::create_database(":memory:").await.unwrap();
+        let mut progress = Vec::new();
+        let report = run_conformance_with_progress(&db, |name, elapsed| {
+            progress.push((name.to_owned(), elapsed));
+        })
+        .await;
+        assert!(report.ok, "{}", format_report(&report));
+        assert_eq!(report.check_timings.len(), report.checks.len());
+        assert_eq!(progress.len(), report.checks.len() * 2);
+        for (index, (check, timing)) in report.checks.iter().zip(&report.check_timings).enumerate()
+        {
+            assert_eq!(timing.check, check.check);
+            assert_eq!(progress[index * 2], (check.check.clone(), None));
+            assert_eq!(
+                progress[index * 2 + 1],
+                (check.check.clone(), Some(timing.elapsed_ms))
+            );
+        }
+        db.close().await;
+    }
 }
 
 #[cfg(test)]

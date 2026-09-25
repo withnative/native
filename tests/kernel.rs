@@ -12,10 +12,14 @@ mod contract;
 mod corpus;
 mod freshness_contract;
 
+#[path = "kernel/act_number.rs"]
+mod act_number;
 #[path = "kernel/activity_query.rs"]
 mod activity_query;
 #[path = "kernel/as_of.rs"]
 mod as_of;
+#[path = "kernel/authoring_receipt_qualification.rs"]
+mod authoring_receipt_qualification;
 #[path = "kernel/change_summaries.rs"]
 mod change_summaries;
 #[path = "kernel/corpus_sqlite.rs"]

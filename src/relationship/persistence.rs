@@ -12,6 +12,11 @@ use super::{
 const APPEND_SAVEPOINT: &str = "native_relationship_append";
 const CREATE_SAVEPOINT: &str = "native_relationship_create";
 
+enum RelationshipActMode<'a> {
+    Allocate(&'a mut crate::act::ActAllocation),
+    Preserve(Option<i64>),
+}
+
 #[cfg(test)]
 tokio::task_local! {
     static FORCE_ATOMIC_ASSERTION_WRITE_FAILURE: ();
@@ -20,11 +25,26 @@ tokio::task_local! {
 pub(crate) async fn append_relationship_event_in(
     tx: &mut Transaction<'_, Sqlite>,
     spec: &RelationshipEventSpec,
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<AppendedRelationshipEvent> {
     sqlx::query(&format!("SAVEPOINT {APPEND_SAVEPOINT}"))
         .execute(&mut **tx)
         .await?;
-    match append_relationship_event_core_in(tx, spec, true, false).await {
+    // The savepoint rollback below undoes the act_state bump when the core
+    // allocated inside it. A bump can only have happened inside when the
+    // memo held nothing on entry (allocation reuses a held value), so reset
+    // the memo exactly then; a memo that entered holding an act from an
+    // earlier append in this transaction stays valid.
+    let prior_act = act_alloc.get();
+    match append_relationship_event_core_in(
+        tx,
+        spec,
+        true,
+        false,
+        RelationshipActMode::Allocate(act_alloc),
+    )
+    .await
+    {
         Ok(event) => {
             sqlx::query(&format!("RELEASE {APPEND_SAVEPOINT}"))
                 .execute(&mut **tx)
@@ -33,6 +53,9 @@ pub(crate) async fn append_relationship_event_in(
         }
         Err(error) => {
             rollback_savepoint(tx, APPEND_SAVEPOINT).await?;
+            if prior_act.is_none() {
+                act_alloc.reset();
+            }
             Err(error)
         }
     }
@@ -43,6 +66,7 @@ async fn append_relationship_event_core_in(
     spec: &RelationshipEventSpec,
     capture_provenance: bool,
     federated_projection: bool,
+    act_mode: RelationshipActMode<'_>,
 ) -> Result<AppendedRelationshipEvent> {
     spec.validate()?;
     if spec.payload.stream_kind() == StreamKind::Relationship
@@ -67,6 +91,13 @@ async fn append_relationship_event_core_in(
             return Err(Error::engine(
                 "exact relationship event retry found a missing or divergent projection",
             ));
+        }
+        if let RelationshipActMode::Preserve(expected_act) = &act_mode {
+            if existing.act != *expected_act {
+                return Err(Error::conflict(
+                    "relationship event replay found a divergent workspace act",
+                ));
+            }
         }
         return Ok(AppendedRelationshipEvent {
             seq: existing.seq,
@@ -96,11 +127,17 @@ async fn append_relationship_event_core_in(
     let stream_version = spec.stream_version()?;
     let payload = String::from_utf8(crate::derivation::canonical_json(&spec.payload.value()?))
         .expect("canonical JSON is UTF-8");
+    let act = match act_mode {
+        RelationshipActMode::Allocate(act_alloc) => {
+            Some(act_alloc.get_or_allocate(&mut *tx).await?)
+        }
+        RelationshipActMode::Preserve(act) => act,
+    };
     let seq: i64 = sqlx::query_scalar(
         "INSERT INTO relationship_events
          (id,stream_kind,stream_id,stream_version,relationship_origin_db_id,
-          relationship_id,type,payload,actor,issuer_origin_db_id,occurred_at,ingested_at)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
+          relationship_id,type,payload,actor,issuer_origin_db_id,occurred_at,ingested_at,act)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
          RETURNING seq",
     )
     .bind(&spec.event_id)
@@ -115,6 +152,7 @@ async fn append_relationship_event_core_in(
     .bind(&spec.issuer_origin_db_id)
     .bind(&spec.occurred_at)
     .bind(&spec.ingested_at)
+    .bind(act)
     .fetch_one(&mut **tx)
     .await?;
     if federated_projection {
@@ -139,14 +177,25 @@ async fn append_relationship_event_core_in(
 pub(crate) async fn create_relationship_with_assertion_in(
     tx: &mut Transaction<'_, Sqlite>,
     command: &CreateRelationshipWithAssertion,
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<CreatedRelationshipWithAssertion> {
     validate_atomic_command(command)?;
     sqlx::query(&format!("SAVEPOINT {CREATE_SAVEPOINT}"))
         .execute(&mut **tx)
         .await?;
+    // As in `append_relationship_event_in`: the rollback below revokes any
+    // act bump the two appends made, so the memo must forget exactly what
+    // was allocated inside — i.e. reset only when it entered empty.
+    let prior_act = act_alloc.get();
     let result = async {
-        let relationship =
-            append_relationship_event_core_in(tx, &command.relationship_event, true, false).await?;
+        let relationship = append_relationship_event_core_in(
+            tx,
+            &command.relationship_event,
+            true,
+            false,
+            RelationshipActMode::Allocate(&mut *act_alloc),
+        )
+        .await?;
         #[cfg(test)]
         if FORCE_ATOMIC_ASSERTION_WRITE_FAILURE
             .try_with(|_| ())
@@ -154,8 +203,14 @@ pub(crate) async fn create_relationship_with_assertion_in(
         {
             return Err(Error::engine("forced atomic assertion write failure"));
         }
-        let assertion =
-            append_relationship_event_core_in(tx, &command.assertion_event, true, false).await?;
+        let assertion = append_relationship_event_core_in(
+            tx,
+            &command.assertion_event,
+            true,
+            false,
+            RelationshipActMode::Allocate(&mut *act_alloc),
+        )
+        .await?;
         if relationship.exact_retry != assertion.exact_retry {
             return Err(Error::engine(
                 "atomic relationship creation found only one previously committed origin event",
@@ -176,6 +231,9 @@ pub(crate) async fn create_relationship_with_assertion_in(
         }
         Err(error) => {
             rollback_savepoint(tx, CREATE_SAVEPOINT).await?;
+            if prior_act.is_none() {
+                act_alloc.reset();
+            }
             Err(error)
         }
     }
@@ -184,8 +242,19 @@ pub(crate) async fn create_relationship_with_assertion_in(
 pub(super) async fn replay_relationship_event_in(
     tx: &mut Transaction<'_, Sqlite>,
     spec: &RelationshipEventSpec,
+    act: Option<i64>,
 ) -> Result<AppendedRelationshipEvent> {
-    append_relationship_event_core_in(tx, spec, false, false).await
+    append_relationship_event_core_in(tx, spec, false, false, RelationshipActMode::Preserve(act))
+        .await
+}
+
+pub(super) async fn replay_federated_relationship_event_in(
+    tx: &mut Transaction<'_, Sqlite>,
+    spec: &RelationshipEventSpec,
+    act: Option<i64>,
+) -> Result<AppendedRelationshipEvent> {
+    append_relationship_event_core_in(tx, spec, false, true, RelationshipActMode::Preserve(act))
+        .await
 }
 
 /// Sealed preserved-origin append. The raw event stays byte-semantically
@@ -194,8 +263,16 @@ pub(super) async fn replay_relationship_event_in(
 pub(super) async fn append_federated_relationship_event_in(
     tx: &mut Transaction<'_, Sqlite>,
     spec: &RelationshipEventSpec,
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<AppendedRelationshipEvent> {
-    append_relationship_event_core_in(tx, spec, false, true).await
+    append_relationship_event_core_in(
+        tx,
+        spec,
+        false,
+        true,
+        RelationshipActMode::Allocate(act_alloc),
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -211,7 +288,8 @@ pub(crate) async fn create_relationship_with_assertion(
     command: &CreateRelationshipWithAssertion,
 ) -> Result<CreatedRelationshipWithAssertion> {
     let mut tx = crate::db::begin_write(db.write_pool()).await?;
-    match create_relationship_with_assertion_in(&mut tx, command).await {
+    let mut act_alloc = crate::act::ActAllocation::new();
+    match create_relationship_with_assertion_in(&mut tx, command, &mut act_alloc).await {
         Ok(created) => {
             db.commit_content(tx).await?;
             Ok(created)
@@ -324,6 +402,7 @@ struct ExistingEvent {
     seq: i64,
     stream_version: i64,
     fingerprint: String,
+    act: Option<i64>,
 }
 
 async fn existing_event_in(
@@ -333,7 +412,7 @@ async fn existing_event_in(
 ) -> Result<Option<ExistingEvent>> {
     let Some(row) = sqlx::query(
         "SELECT seq,id,stream_kind,stream_id,stream_version,relationship_origin_db_id,
-                relationship_id,type,payload,actor,issuer_origin_db_id,occurred_at,ingested_at
+                relationship_id,type,payload,actor,issuer_origin_db_id,occurred_at,ingested_at,act
          FROM relationship_events WHERE issuer_origin_db_id=?1 AND id=?2",
     )
     .bind(issuer_origin_db_id)
@@ -372,5 +451,6 @@ async fn existing_event_in(
         seq: row.try_get("seq")?,
         stream_version,
         fingerprint: stored.fingerprint()?,
+        act: row.try_get("act")?,
     }))
 }

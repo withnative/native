@@ -39,6 +39,12 @@ pub(crate) use replication_v1::{
     VerifiedEnvelopeContext,
 };
 
+// The act-cut closure's production-backed replicated-message fixture. The
+// authenticated context constructor stays sealed to `replication_v1`; this
+// re-export is test-only and never part of a non-test build.
+#[cfg(test)]
+pub(crate) use replication_v1::ingest_remote_fixture_message;
+
 /// Current UTC time in the DDL's timestamp shape, e.g. `2026-07-22T10:30:00.123Z`.
 pub(crate) fn now_iso() -> String {
     chrono::Utc::now()
@@ -86,6 +92,7 @@ struct PreparedEvent {
 struct SqliteContentPorts<'transaction> {
     transaction: &'transaction mut sqlx::Transaction<'static, sqlx::Sqlite>,
     native_source: Option<NativeEventSource>,
+    act: i64,
 }
 
 impl crate::domain_transaction::EventCursorPort for SqliteContentPorts<'_> {
@@ -164,13 +171,14 @@ impl crate::domain_transaction::EventCursorPort for SqliteContentPorts<'_> {
                 }
             }
             event.causal_envelope = causal_envelope;
+            let act = self.act;
             let inserted = control
                 .run_domain(crate::portable_sql::ExecutionPhase::Statement, async {
                     Ok(sqlx::query(
                         "INSERT INTO content_events
                             (id, record_id, type, payload, actor, run_key, parent_key, intent,
-                             created_at, causal_envelope_version, causal_status)
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                             created_at, causal_envelope_version, causal_status, act)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                          RETURNING seq",
                     )
                     .bind(&event.id)
@@ -184,6 +192,7 @@ impl crate::domain_transaction::EventCursorPort for SqliteContentPorts<'_> {
                     .bind(&event.created_at)
                     .bind(event.causal_envelope.version().as_i64())
                     .bind(event.causal_envelope.status().as_str())
+                    .bind(act)
                     .fetch_one(&mut **self.transaction)
                     .await)
                 })
@@ -284,13 +293,14 @@ pub(crate) async fn append_in(
     db: &Db,
     tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
     spec: AppendSpec,
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<EventRow> {
     if spec.event_type == "record.type_corrected.v1" {
         return Err(Error::engine(
             "record.type_corrected.v1 is correction-operation-owned and cannot be appended through the generic content seam",
         ));
     }
-    append_with_event_id_in(db, tx, Uuid::new_v4().to_string(), spec).await
+    append_with_event_id_in(db, tx, Uuid::new_v4().to_string(), spec, act_alloc).await
 }
 
 /// Governed-only append capability for the prepared record-type correction
@@ -300,22 +310,24 @@ pub(crate) async fn append_record_type_correction_in(
     db: &Db,
     tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
     spec: AppendSpec,
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<EventRow> {
     if spec.event_type != "record.type_corrected.v1" {
         return Err(Error::engine(
             "append_record_type_correction_in accepts only record.type_corrected.v1",
         ));
     }
-    append_with_event_id_in(db, tx, Uuid::new_v4().to_string(), spec).await
+    append_with_event_id_in(db, tx, Uuid::new_v4().to_string(), spec, act_alloc).await
 }
 
 async fn append_engine_seed_in(
     db: &Db,
     tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
     spec: AppendSpec,
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<EventRow> {
     let prepared = prepare_sealed_local_event(Uuid::new_v4().to_string(), spec)?;
-    append_prepared_engine_seed_in(db, tx, prepared).await
+    append_prepared_engine_seed_in(db, tx, prepared, act_alloc).await
 }
 
 /// Sealed instruction-provisioning append. The shared domain kernel permits
@@ -325,9 +337,17 @@ pub(crate) async fn append_engine_provisioned_in(
     db: &Db,
     tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
     spec: AppendSpec,
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<EventRow> {
     let prepared = prepare_sealed_local_event(Uuid::new_v4().to_string(), spec)?;
-    append_prepared_admitted(db, tx, prepared, PreparedAdmission::EngineProvisioning).await
+    append_prepared_admitted(
+        db,
+        tx,
+        prepared,
+        PreparedAdmission::EngineProvisioning,
+        act_alloc,
+    )
+    .await
 }
 
 /// Append the change-summary carrier's `record.created`. This is the ONLY
@@ -340,9 +360,17 @@ pub(crate) async fn append_engine_derived_in(
     db: &Db,
     tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
     spec: AppendSpec,
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<EventRow> {
     let prepared = prepare_sealed_local_event(Uuid::new_v4().to_string(), spec)?;
-    append_prepared_admitted(db, tx, prepared, PreparedAdmission::EngineDerived).await
+    append_prepared_admitted(
+        db,
+        tx,
+        prepared,
+        PreparedAdmission::EngineDerived,
+        act_alloc,
+    )
+    .await
 }
 
 /// Narrow publication seam for protocols whose portable event UUID must exist
@@ -353,6 +381,7 @@ pub(crate) async fn append_with_event_id_in(
     tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
     event_id: String,
     spec: AppendSpec,
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<EventRow> {
     let uuid = Uuid::parse_str(&event_id)
         .map_err(|_| Error::engine("preallocated content event id must be a canonical UUIDv4"))?;
@@ -364,12 +393,13 @@ pub(crate) async fn append_with_event_id_in(
         ));
     }
     let prepared = prepare_sealed_local_event(event_id, spec)?;
-    append_prepared_in(db, tx, prepared).await
+    append_prepared_in(db, tx, prepared, act_alloc).await
 }
 
 /// Sealed body-publication seam for the derivation substrate. The ordinary
 /// content event/projector remains authoritative; this capability only proves
 /// that the caller holds the current binding generation and target version.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn append_derived_body_with_event_id_in(
     db: &Db,
     tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
@@ -378,6 +408,7 @@ pub(crate) async fn append_derived_body_with_event_id_in(
     generation: i64,
     target_version: i64,
     spec: AppendSpec,
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<EventRow> {
     if spec.event_type != "record.updated" || spec.payload.get("body").is_none() {
         return Err(Error::engine(
@@ -391,7 +422,10 @@ pub(crate) async fn append_derived_body_with_event_id_in(
         target_version,
     };
     DERIVED_BODY_AUTHORITY
-        .scope(authority, append_with_event_id_in(db, tx, event_id, spec))
+        .scope(
+            authority,
+            append_with_event_id_in(db, tx, event_id, spec, act_alloc),
+        )
         .await
 }
 
@@ -420,12 +454,16 @@ pub(crate) async fn append_migration_on(
         intent: None,
         created_at: created_at.into(),
         causal_envelope: CausalEnvelopeV1::legacy_unknown(),
+        act: None,
     };
+    let act = crate::act::ActAllocation::new()
+        .get_or_allocate(conn)
+        .await?;
     event.local_seq = sqlx::query_scalar(
         "INSERT INTO content_events
             (id,record_id,type,payload,actor,run_key,parent_key,intent,created_at,
-             causal_envelope_version,causal_status)
-         VALUES(?,?,?,?,?,NULL,NULL,NULL,?,1,'legacy_unknown') RETURNING seq",
+             causal_envelope_version,causal_status,act)
+         VALUES(?,?,?,?,?,NULL,NULL,NULL,?,1,'legacy_unknown',?) RETURNING seq",
     )
     .bind(&event.id)
     .bind(&event.record_id)
@@ -433,8 +471,10 @@ pub(crate) async fn append_migration_on(
     .bind(&event.payload)
     .bind(&event.actor)
     .bind(&event.created_at)
+    .bind(act)
     .fetch_one(&mut *conn)
     .await?;
+    event.act = Some(act);
     project(&mut *conn, &event).await?;
     Ok(event)
 }
@@ -466,6 +506,7 @@ fn prepare_sealed_local_event(event_id: String, spec: AppendSpec) -> Result<Prep
         intent: annotations.intent,
         created_at: now_iso(),
         causal_envelope: CausalEnvelopeV1::default(),
+        act: None,
     };
     Ok(PreparedEvent {
         event,
@@ -482,16 +523,18 @@ async fn append_prepared_in(
     db: &Db,
     tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
     prepared: PreparedEvent,
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<EventRow> {
-    append_prepared_admitted(db, tx, prepared, PreparedAdmission::Ordinary).await
+    append_prepared_admitted(db, tx, prepared, PreparedAdmission::Ordinary, act_alloc).await
 }
 
 async fn append_prepared_engine_seed_in(
     db: &Db,
     tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
     prepared: PreparedEvent,
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<EventRow> {
-    append_prepared_admitted(db, tx, prepared, PreparedAdmission::EngineSeed).await
+    append_prepared_admitted(db, tx, prepared, PreparedAdmission::EngineSeed, act_alloc).await
 }
 
 #[derive(Clone, Copy)]
@@ -507,6 +550,7 @@ async fn append_prepared_admitted(
     tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
     mut prepared: PreparedEvent,
     admission: PreparedAdmission,
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<EventRow> {
     if prepared.event.event_type == "record.deleted" {
         let active_binding: bool = sqlx::query_scalar(
@@ -634,9 +678,12 @@ async fn append_prepared_admitted(
     } else {
         CausalAdmission::LocalComputed
     };
+    let act = act_alloc.get_or_allocate(tx).await?;
+    prepared.event.act = Some(act);
     let mut ports = SqliteContentPorts {
         transaction: tx,
         native_source: prepared.native_source.clone(),
+        act,
     };
     let control = crate::portable_sql::ExecutionControl::default();
     match admission {
@@ -816,12 +863,14 @@ async fn assert_one_current_definition_per_term(
 }
 
 /// Append one event and project it, in a single write transaction. Returns the
-/// stored event row (including its assigned `seq`).
+/// stored event row (including its assigned `seq`). The transaction carries
+/// exactly one act.
 pub async fn append(db: &Db, spec: AppendSpec) -> Result<EventRow> {
     reject_public_runtime_event(&spec)?;
     let mut tx = crate::db::begin_write(db.write_pool()).await?;
     reject_public_governed_attribution_in(&mut tx, &spec).await?;
-    let event = append_in(db, &mut tx, spec).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
+    let event = append_in(db, &mut tx, spec, &mut act_alloc).await?;
     db.commit_content(tx).await?;
     Ok(event)
 }
@@ -831,7 +880,7 @@ pub async fn append(db: &Db, spec: AppendSpec) -> Result<EventRow> {
 /// All-or-nothing: any guard or projection failure rolls the entire batch back,
 /// so a multi-event tool call (`create_record` with facets and links) can no
 /// longer leave a visible partial write. Events get consecutive `seq` values in
-/// spec order.
+/// spec order, and the whole batch shares one act: it is one write.
 pub async fn append_batch(db: &Db, specs: Vec<AppendSpec>) -> Result<Vec<EventRow>> {
     if specs.is_empty() {
         return Err(Error::engine("append_batch requires at least one event"));
@@ -840,10 +889,11 @@ pub async fn append_batch(db: &Db, specs: Vec<AppendSpec>) -> Result<Vec<EventRo
         reject_public_runtime_event(spec)?;
     }
     let mut tx = crate::db::begin_write(db.write_pool()).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
     let mut events = Vec::with_capacity(specs.len());
     for spec in specs {
         reject_public_governed_attribution_in(&mut tx, &spec).await?;
-        events.push(append_in(db, &mut tx, spec).await?);
+        events.push(append_in(db, &mut tx, spec, &mut act_alloc).await?);
     }
     db.commit_content(tx).await?;
     Ok(events)
@@ -860,9 +910,10 @@ pub(crate) async fn append_engine_seed_batch(
         ));
     }
     let mut tx = crate::db::begin_write(db.write_pool()).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
     let mut events = Vec::with_capacity(specs.len());
     for spec in specs {
-        events.push(append_engine_seed_in(db, &mut tx, spec).await?);
+        events.push(append_engine_seed_in(db, &mut tx, spec, &mut act_alloc).await?);
     }
     db.commit_content(tx).await?;
     Ok(events)
@@ -975,6 +1026,7 @@ pub async fn update_record_when_lifecycle(
     };
     reject_public_runtime_event(&spec)?;
     let mut tx = crate::db::begin_write(db.write_pool()).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
     let row = sqlx::query("SELECT lifecycle, deleted_at FROM records WHERE id = ?")
         .bind(id)
         .fetch_optional(&mut *tx)
@@ -993,7 +1045,7 @@ pub async fn update_record_when_lifecycle(
     if current.as_deref() != expected {
         return Ok(LifecycleCas::Conflict { current });
     }
-    let event = append_in(db, &mut tx, spec).await?;
+    let event = append_in(db, &mut tx, spec, &mut act_alloc).await?;
     db.commit_content(tx).await?;
     Ok(LifecycleCas::Applied(event))
 }
@@ -1225,6 +1277,7 @@ mod causal_admission_tests {
             intent: None,
             created_at: "2026-09-01T00:00:00.000Z".into(),
             causal_envelope: CausalEnvelopeV1::default(),
+            act: None,
         }
     }
 
@@ -1272,11 +1325,14 @@ mod causal_admission_tests {
     async fn governed_import_rejects_complete_empty_frontier_after_source_genesis() {
         let db = crate::db::create_database(":memory:").await.unwrap();
         let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+        let mut act_alloc = crate::act::ActAllocation::new();
         let rejected_id = Uuid::new_v4().to_string();
         let mut event = imported_event(rejected_id.clone());
+        let act = act_alloc.get_or_allocate(&mut tx).await.unwrap();
         let mut ports = SqliteContentPorts {
             transaction: &mut tx,
             native_source: Some(source(2)),
+            act,
         };
         let error = ports
             .append_event(
@@ -1307,15 +1363,18 @@ mod causal_admission_tests {
     async fn governed_import_rejects_an_edge_that_closes_a_cycle() {
         let db = crate::db::create_database(":memory:").await.unwrap();
         let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+        let mut act_alloc = crate::act::ActAllocation::new();
         let first_id = Uuid::new_v4().to_string();
         let second_id = Uuid::new_v4().to_string();
         let control = crate::portable_sql::ExecutionControl::default();
 
         let mut first = imported_event(first_id.clone());
         {
+            let act = act_alloc.get_or_allocate(&mut tx).await.unwrap();
             let mut ports = SqliteContentPorts {
                 transaction: &mut tx,
                 native_source: Some(source(7)),
+                act,
             };
             ports
                 .append_event(
@@ -1330,9 +1389,11 @@ mod causal_admission_tests {
         }
 
         let mut second = imported_event(second_id.clone());
+        let act = act_alloc.get_or_allocate(&mut tx).await.unwrap();
         let mut ports = SqliteContentPorts {
             transaction: &mut tx,
             native_source: Some(source(8)),
+            act,
         };
         let error = ports
             .append_event(
@@ -1389,9 +1450,10 @@ mod sealed_append_seam_tests {
     async fn engine_seed_wrapper_uses_seed_admission() {
         let db = crate::db::create_database(":memory:").await.unwrap();
         let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+        let mut act_alloc = crate::act::ActAllocation::new();
         // An ordinary UUID is valid for the public seam but not for genesis.
         let ordinary_id = Uuid::new_v4().to_string();
-        let error = append_engine_seed_in(&db, &mut tx, created_spec(&ordinary_id))
+        let error = append_engine_seed_in(&db, &mut tx, created_spec(&ordinary_id), &mut act_alloc)
             .await
             .unwrap_err();
         assert_eq!(
@@ -1399,10 +1461,14 @@ mod sealed_append_seam_tests {
             "engine seed record id must be native:root or native:unfiled"
         );
         // The seed seam admits only record.created, even for its own ids.
-        let error =
-            append_engine_seed_in(&db, &mut tx, updated_spec(crate::schema::ROOT_RECORD_ID))
-                .await
-                .unwrap_err();
+        let error = append_engine_seed_in(
+            &db,
+            &mut tx,
+            updated_spec(crate::schema::ROOT_RECORD_ID),
+            &mut act_alloc,
+        )
+        .await
+        .unwrap_err();
         assert_eq!(
             error.to_string(),
             "engine seed admission accepts only record.created events"
@@ -1414,11 +1480,17 @@ mod sealed_append_seam_tests {
     async fn engine_provisioning_wrapper_uses_provisioning_admission() {
         let db = crate::db::create_database(":memory:").await.unwrap();
         let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+        let mut act_alloc = crate::act::ActAllocation::new();
         // Reserved ids outside the fixed catalog are rejected with the
         // provisioning-specific allowlist error, not the generic reservation.
-        let error = append_engine_provisioned_in(&db, &mut tx, created_spec("native:kernel-squat"))
-            .await
-            .unwrap_err();
+        let error = append_engine_provisioned_in(
+            &db,
+            &mut tx,
+            created_spec("native:kernel-squat"),
+            &mut act_alloc,
+        )
+        .await
+        .unwrap_err();
         assert_eq!(
             error.to_string(),
             "engine provisioning record id is not in the fixed allowlist"
@@ -1426,17 +1498,19 @@ mod sealed_append_seam_tests {
         // The provisioning seam admits only record.created, even for an
         // allowlisted id.
         let allowlisted = crate::schema::INSTRUCTIONS_FOLDER_ID;
-        let error = append_engine_provisioned_in(&db, &mut tx, updated_spec(allowlisted))
-            .await
-            .unwrap_err();
+        let error =
+            append_engine_provisioned_in(&db, &mut tx, updated_spec(allowlisted), &mut act_alloc)
+                .await
+                .unwrap_err();
         assert_eq!(
             error.to_string(),
             "engine provisioning admission accepts only record.created events"
         );
         // An allowlisted record.created reaches the provisioning admission.
-        let event = append_engine_provisioned_in(&db, &mut tx, created_spec(allowlisted))
-            .await
-            .unwrap();
+        let event =
+            append_engine_provisioned_in(&db, &mut tx, created_spec(allowlisted), &mut act_alloc)
+                .await
+                .unwrap();
         assert_eq!(event.record_id, allowlisted);
         assert_eq!(event.event_type, "record.created");
         tx.rollback().await.unwrap();
@@ -1446,19 +1520,24 @@ mod sealed_append_seam_tests {
     async fn engine_derived_wrapper_uses_derived_admission() {
         let db = crate::db::create_database(":memory:").await.unwrap();
         let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+        let mut act_alloc = crate::act::ActAllocation::new();
         // Engine-owned ids are not valid carrier ids: the derived seam reports
         // the UUID shape error, distinguishing it from the seed seam.
-        let error =
-            append_engine_derived_in(&db, &mut tx, created_spec(crate::schema::ROOT_RECORD_ID))
-                .await
-                .unwrap_err();
+        let error = append_engine_derived_in(
+            &db,
+            &mut tx,
+            created_spec(crate::schema::ROOT_RECORD_ID),
+            &mut act_alloc,
+        )
+        .await
+        .unwrap_err();
         assert_eq!(
             error.to_string(),
             "record id must be a canonical lowercase UUID of version 4 or 7"
         );
         // The derived seam admits only record.created, even for a carrier id.
         let carrier = format!("change-summary:carrier:{}", "a".repeat(64));
-        let error = append_engine_derived_in(&db, &mut tx, updated_spec(&carrier))
+        let error = append_engine_derived_in(&db, &mut tx, updated_spec(&carrier), &mut act_alloc)
             .await
             .unwrap_err();
         assert_eq!(
@@ -1466,7 +1545,7 @@ mod sealed_append_seam_tests {
             "engine derived admission accepts only record.created events"
         );
         // A carrier record.created reaches the derived admission.
-        let event = append_engine_derived_in(&db, &mut tx, created_spec(&carrier))
+        let event = append_engine_derived_in(&db, &mut tx, created_spec(&carrier), &mut act_alloc)
             .await
             .unwrap();
         assert_eq!(event.record_id, carrier);
@@ -1478,6 +1557,7 @@ mod sealed_append_seam_tests {
     async fn preallocated_wrapper_uses_ordinary_admission() {
         let db = crate::db::create_database(":memory:").await.unwrap();
         let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+        let mut act_alloc = crate::act::ActAllocation::new();
         // Engine-owned ids stay reserved on the ordinary preallocated seam,
         // distinguishing it from the seed seam which owns them.
         let error = append_with_event_id_in(
@@ -1485,6 +1565,7 @@ mod sealed_append_seam_tests {
             &mut tx,
             Uuid::new_v4().to_string(),
             created_spec(crate::schema::ROOT_RECORD_ID),
+            &mut act_alloc,
         )
         .await
         .unwrap_err();
@@ -1498,6 +1579,7 @@ mod sealed_append_seam_tests {
             &mut tx,
             "not-a-uuid".into(),
             created_spec(&Uuid::new_v4().to_string()),
+            &mut act_alloc,
         )
         .await
         .unwrap_err();
@@ -1509,10 +1591,15 @@ mod sealed_append_seam_tests {
         // preallocated event id.
         let record_id = Uuid::new_v4().to_string();
         let event_id = Uuid::new_v4().to_string();
-        let event =
-            append_with_event_id_in(&db, &mut tx, event_id.clone(), created_spec(&record_id))
-                .await
-                .unwrap();
+        let event = append_with_event_id_in(
+            &db,
+            &mut tx,
+            event_id.clone(),
+            created_spec(&record_id),
+            &mut act_alloc,
+        )
+        .await
+        .unwrap();
         assert_eq!(event.id, event_id);
         assert_eq!(event.record_id, record_id);
         assert_eq!(event.event_type, "record.created");

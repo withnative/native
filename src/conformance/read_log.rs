@@ -436,8 +436,14 @@ async fn run_corpus(drop_read_log: bool) -> Result<Vec<Value>> {
                         "get_run_activity did not return an availability object",
                     )
                 })?;
-            let expected_shape = availability.len() == 3
+            let expected_shape = availability.len() == 4
                 && availability.get("status").and_then(Value::as_str) == Some(expected_status)
+                && availability.get("completeness").and_then(Value::as_str)
+                    == Some(if drop_read_log {
+                        "unavailable"
+                    } else {
+                        "retained_rows_only"
+                    })
                 && if drop_read_log {
                     availability.get("reason").and_then(Value::as_str)
                         == Some("read_log_unavailable")

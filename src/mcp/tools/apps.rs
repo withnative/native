@@ -15,7 +15,7 @@ use crate::events::EventRow;
 use super::super::apps::{RECORD_VERSION_DIFF_URI, SUGGESTION_REVIEW_URI};
 use super::super::registry::{AppMetadata, Caller, ToolRegistry};
 use super::super::ToolKind;
-use super::{can_record, history::record_version_at, parse_args, require_record};
+use super::{can_record, history::record_versions_at, parse_args, require_record};
 use crate::mcp::record_ref::with_record_selector_aliases;
 
 #[derive(Deserialize)]
@@ -46,27 +46,22 @@ async fn render_record_version_diff(db: Db, caller: Caller, arguments: Value) ->
             "render_record_version_diff before_seq must be positive",
         ));
     }
-    let current_seq: Option<i64> =
-        sqlx::query_scalar("SELECT MAX(seq) FROM content_events WHERE record_id = ?")
-            .bind(&args.record_id)
-            .fetch_one(db.write_pool())
-            .await?;
-    let Some(current_seq) = current_seq else {
-        return Err(Error::engine(format!(
-            "record {} does not exist",
-            args.record_id
-        )));
-    };
+    // Enrichment includes related records. Its current boundary must be the
+    // workspace head, since those records can change after this record's last
+    // own event.
+    let current_seq: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(seq), 0) FROM content_events")
+        .fetch_one(db.write_pool())
+        .await?;
     if args.before_seq > current_seq {
         return Err(Error::engine(format!(
-            "render_record_version_diff before_seq {} is after the record's current revision {}",
+            "render_record_version_diff before_seq {} is after the current content head {}",
             args.before_seq, current_seq
         )));
     }
-    let before = record_version_at(&db, &caller, &args.record_id, args.before_seq).await?;
-    let after = record_version_at(&db, &caller, &args.record_id, current_seq).await?;
+    let (before, after) =
+        record_versions_at(&db, &caller, &args.record_id, args.before_seq, current_seq).await?;
     let rows = sqlx::query(
-        "SELECT seq, id, record_id, type, payload, actor, run_key, parent_key, intent, created_at
+        "SELECT seq, id, record_id, type, payload, actor, run_key, parent_key, intent, created_at, act
            FROM content_events
           WHERE record_id = ? AND seq > ? AND seq <= ?
           ORDER BY seq",
@@ -91,6 +86,7 @@ async fn render_record_version_diff(db: Db, caller: Caller, arguments: Value) ->
             intent: row.try_get("intent")?,
             created_at: row.try_get("created_at")?,
             causal_envelope: crate::events::CausalEnvelopeV1::default(),
+            act: row.try_get("act")?,
         };
         if !super::history::event_is_visible(&db, &caller, &event).await? {
             continue;

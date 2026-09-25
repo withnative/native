@@ -7,7 +7,7 @@
   "candidate_surfaces": {
     "stable": {
       "ordinary": {
-        "descriptor_bytes": 41663,
+        "descriptor_bytes": 43163,
         "descriptors": [
           {
             "name": "bootstrap",
@@ -68,7 +68,8 @@
                     "canvas_read",
                     "canvas_write",
                     "reach_read",
-                    "reach_connect"
+                    "reach_connect",
+                    "workspace_read"
                   ]
                 },
                 "operation": {
@@ -232,7 +233,11 @@
                     "get_dashboard",
                     "get_history",
                     "get_record",
+                    "get_reuse_context",
                     "get_structure",
+                    "get_workspace_snapshot.catch_up",
+                    "get_workspace_snapshot.open",
+                    "get_workspace_snapshot.page",
                     "manage_attachments.inspect",
                     "manage_attachments.list",
                     "manage_facet_observations.list",
@@ -290,6 +295,7 @@
                   "type": "string",
                   "enum": [
                     "attach_text",
+                    "batch_write",
                     "claim_unowned_record",
                     "correct_record_type",
                     "create_attribution",
@@ -309,6 +315,7 @@
                     "manage_relationships.retract",
                     "resolve_suggestions.accept",
                     "resolve_suggestions.reject",
+                    "save_account",
                     "update_record"
                   ]
                 },
@@ -347,6 +354,7 @@
                       "type": "string",
                       "enum": [
                         "attach_text",
+                        "batch_write",
                         "claim_unowned_record",
                         "correct_record_type",
                         "create_attribution",
@@ -366,6 +374,7 @@
                         "manage_relationships.retract",
                         "resolve_suggestions.accept",
                         "resolve_suggestions.reject",
+                        "save_account",
                         "update_record"
                       ]
                     },
@@ -1628,11 +1637,17 @@
                 "operation": {
                   "type": "string",
                   "enum": [
+                    "manage_alpha_tabs.inspect",
+                    "manage_alpha_tabs.list",
+                    "manage_alpha_tabs.live_read",
+                    "manage_alpha_tabs.preview",
                     "manage_artifact_inputs.read",
                     "manage_change_summaries.inspect",
                     "manage_mdx_modules.impact",
                     "manage_mdx_modules.inspect",
                     "manage_renderer_binding.read",
+                    "manage_surface_bindings.get",
+                    "manage_surface_bindings.list",
                     "query_change_summaries.drill",
                     "query_change_summaries.get",
                     "query_change_summaries.list",
@@ -1673,6 +1688,7 @@
                   "type": "string",
                   "enum": [
                     "invoke_artifact_interaction",
+                    "manage_alpha_tabs.launch",
                     "open_collection",
                     "render_artifact"
                   ]
@@ -1710,8 +1726,15 @@
                 "operation": {
                   "type": "string",
                   "enum": [
+                    "advance_artifact_port_pin",
                     "instantiate_artifact",
+                    "manage_alpha_tabs.adopt",
+                    "manage_alpha_tabs.disable",
+                    "manage_alpha_tabs.install",
+                    "manage_alpha_tabs.remove",
+                    "manage_alpha_tabs.restore",
                     "manage_artifact_inputs.bind",
+                    "manage_artifact_inputs.bind_many",
                     "manage_artifact_inputs.unbind",
                     "manage_change_summaries.confirm",
                     "manage_change_summaries.create_or_reuse",
@@ -1721,7 +1744,9 @@
                     "manage_mdx_modules.publish",
                     "manage_mdx_modules.withdraw",
                     "manage_renderer_binding.bind",
-                    "manage_renderer_binding.unbind"
+                    "manage_renderer_binding.unbind",
+                    "manage_surface_bindings.reset",
+                    "manage_surface_bindings.set"
                   ]
                 },
                 "arguments": {
@@ -1795,10 +1820,12 @@
                 "operation": {
                   "type": "string",
                   "enum": [
+                    "manage_memberships.create_guest_link",
                     "manage_memberships.invitations_copy_link",
                     "manage_memberships.invitations_create",
                     "manage_memberships.invitations_revoke",
                     "manage_memberships.invitations_send",
+                    "manage_memberships.revoke_guest_link",
                     "manage_memberships.set_role"
                   ]
                 },
@@ -1836,10 +1863,12 @@
                     "operation": {
                       "type": "string",
                       "enum": [
+                        "manage_memberships.create_guest_link",
                         "manage_memberships.invitations_copy_link",
                         "manage_memberships.invitations_create",
                         "manage_memberships.invitations_revoke",
                         "manage_memberships.invitations_send",
+                        "manage_memberships.revoke_guest_link",
                         "manage_memberships.set_role"
                       ]
                     },
@@ -1884,10 +1913,12 @@
                     "operation": {
                       "type": "string",
                       "enum": [
+                        "manage_memberships.create_guest_link",
                         "manage_memberships.invitations_copy_link",
                         "manage_memberships.invitations_create",
                         "manage_memberships.invitations_revoke",
                         "manage_memberships.invitations_send",
+                        "manage_memberships.revoke_guest_link",
                         "manage_memberships.set_role"
                       ]
                     },
@@ -2075,6 +2106,8 @@
                 "operation": {
                   "type": "string",
                   "enum": [
+                    "authority_act_delta",
+                    "authority_act_head",
                     "export_snapshot"
                   ]
                 },
@@ -2353,11 +2386,47 @@
               "idempotentHint": false,
               "openWorldHint": true
             }
+          },
+          {
+            "name": "workspace_read",
+            "title": "Workspace read",
+            "description": "List the caller's hosted workspaces.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "operation": {
+                  "type": "string",
+                  "enum": [
+                    "workspace_read.list"
+                  ]
+                },
+                "arguments": {
+                  "type": "object",
+                  "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                },
+                "run_key": {
+                  "type": "string"
+                },
+                "parent_key": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "operation"
+              ],
+              "additionalProperties": false
+            },
+            "annotations": {
+              "readOnlyHint": true,
+              "destructiveHint": false,
+              "idempotentHint": true,
+              "openWorldHint": false
+            }
           }
         ]
       },
       "lens": {
-        "descriptor_bytes": 47694,
+        "descriptor_bytes": 49410,
         "descriptors": [
           {
             "name": "bootstrap",
@@ -2416,7 +2485,8 @@
                     "membership_remove",
                     "export",
                     "canvas_read",
-                    "canvas_write"
+                    "canvas_write",
+                    "workspace_read"
                   ]
                 },
                 "operation": {
@@ -2608,7 +2678,11 @@
                     "get_dashboard",
                     "get_history",
                     "get_record",
+                    "get_reuse_context",
                     "get_structure",
+                    "get_workspace_snapshot.catch_up",
+                    "get_workspace_snapshot.open",
+                    "get_workspace_snapshot.page",
                     "manage_attachments.inspect",
                     "manage_attachments.list",
                     "manage_facet_observations.list",
@@ -2678,6 +2752,7 @@
                   "type": "string",
                   "enum": [
                     "attach_text",
+                    "batch_write",
                     "claim_unowned_record",
                     "correct_record_type",
                     "create_attribution",
@@ -2697,6 +2772,7 @@
                     "manage_relationships.retract",
                     "resolve_suggestions.accept",
                     "resolve_suggestions.reject",
+                    "save_account",
                     "update_record"
                   ]
                 },
@@ -2739,6 +2815,7 @@
                       "type": "string",
                       "enum": [
                         "attach_text",
+                        "batch_write",
                         "claim_unowned_record",
                         "correct_record_type",
                         "create_attribution",
@@ -2758,6 +2835,7 @@
                         "manage_relationships.retract",
                         "resolve_suggestions.accept",
                         "resolve_suggestions.reject",
+                        "save_account",
                         "update_record"
                       ]
                     },
@@ -4181,11 +4259,17 @@
                 "operation": {
                   "type": "string",
                   "enum": [
+                    "manage_alpha_tabs.inspect",
+                    "manage_alpha_tabs.list",
+                    "manage_alpha_tabs.live_read",
+                    "manage_alpha_tabs.preview",
                     "manage_artifact_inputs.read",
                     "manage_change_summaries.inspect",
                     "manage_mdx_modules.impact",
                     "manage_mdx_modules.inspect",
                     "manage_renderer_binding.read",
+                    "manage_surface_bindings.get",
+                    "manage_surface_bindings.list",
                     "query_change_summaries.drill",
                     "query_change_summaries.get",
                     "query_change_summaries.list",
@@ -4238,6 +4322,7 @@
                   "type": "string",
                   "enum": [
                     "invoke_artifact_interaction",
+                    "manage_alpha_tabs.launch",
                     "open_collection",
                     "render_artifact"
                   ]
@@ -4279,8 +4364,15 @@
                 "operation": {
                   "type": "string",
                   "enum": [
+                    "advance_artifact_port_pin",
                     "instantiate_artifact",
+                    "manage_alpha_tabs.adopt",
+                    "manage_alpha_tabs.disable",
+                    "manage_alpha_tabs.install",
+                    "manage_alpha_tabs.remove",
+                    "manage_alpha_tabs.restore",
                     "manage_artifact_inputs.bind",
+                    "manage_artifact_inputs.bind_many",
                     "manage_artifact_inputs.unbind",
                     "manage_change_summaries.confirm",
                     "manage_change_summaries.create_or_reuse",
@@ -4290,7 +4382,9 @@
                     "manage_mdx_modules.publish",
                     "manage_mdx_modules.withdraw",
                     "manage_renderer_binding.bind",
-                    "manage_renderer_binding.unbind"
+                    "manage_renderer_binding.unbind",
+                    "manage_surface_bindings.reset",
+                    "manage_surface_bindings.set"
                   ]
                 },
                 "arguments": {
@@ -4380,10 +4474,12 @@
                 "operation": {
                   "type": "string",
                   "enum": [
+                    "manage_memberships.create_guest_link",
                     "manage_memberships.invitations_copy_link",
                     "manage_memberships.invitations_create",
                     "manage_memberships.invitations_revoke",
                     "manage_memberships.invitations_send",
+                    "manage_memberships.revoke_guest_link",
                     "manage_memberships.set_role"
                   ]
                 },
@@ -4425,10 +4521,12 @@
                     "operation": {
                       "type": "string",
                       "enum": [
+                        "manage_memberships.create_guest_link",
                         "manage_memberships.invitations_copy_link",
                         "manage_memberships.invitations_create",
                         "manage_memberships.invitations_revoke",
                         "manage_memberships.invitations_send",
+                        "manage_memberships.revoke_guest_link",
                         "manage_memberships.set_role"
                       ]
                     },
@@ -4477,10 +4575,12 @@
                     "operation": {
                       "type": "string",
                       "enum": [
+                        "manage_memberships.create_guest_link",
                         "manage_memberships.invitations_copy_link",
                         "manage_memberships.invitations_create",
                         "manage_memberships.invitations_revoke",
                         "manage_memberships.invitations_send",
+                        "manage_memberships.revoke_guest_link",
                         "manage_memberships.set_role"
                       ]
                     },
@@ -4684,6 +4784,8 @@
                 "operation": {
                   "type": "string",
                   "enum": [
+                    "authority_act_delta",
+                    "authority_act_head",
                     "export_snapshot"
                   ]
                 },
@@ -4914,13 +5016,61 @@
               "idempotentHint": true,
               "openWorldHint": false
             }
+          },
+          {
+            "name": "workspace_read",
+            "title": "Workspace read",
+            "description": "List the caller's hosted workspaces.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "operation": {
+                  "type": "string",
+                  "enum": [
+                    "workspace_read.list"
+                  ]
+                },
+                "arguments": {
+                  "type": "object",
+                  "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                },
+                "run_key": {
+                  "type": "string"
+                },
+                "parent_key": {
+                  "type": "string"
+                },
+                "destination_db_id": {
+                  "type": "string",
+                  "description": "Explicit lens destination for pass-through writes or destination-scoped reads."
+                },
+                "cursor": {
+                  "type": "string"
+                },
+                "page_size": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 50
+                }
+              },
+              "required": [
+                "operation"
+              ],
+              "additionalProperties": false
+            },
+            "annotations": {
+              "readOnlyHint": true,
+              "destructiveHint": false,
+              "idempotentHint": true,
+              "openWorldHint": false
+            }
           }
         ]
       }
     },
     "build_enabled_experimental": {
       "ordinary": {
-        "descriptor_bytes": 42615,
+        "descriptor_bytes": 46253,
         "descriptors": [
           {
             "name": "bootstrap",
@@ -4981,7 +5131,9 @@
                     "canvas_read",
                     "canvas_write",
                     "reach_read",
-                    "reach_connect"
+                    "reach_connect",
+                    "workspace_read",
+                    "sql_write"
                   ]
                 },
                 "operation": {
@@ -5145,7 +5297,11 @@
                     "get_dashboard",
                     "get_history",
                     "get_record",
+                    "get_reuse_context",
                     "get_structure",
+                    "get_workspace_snapshot.catch_up",
+                    "get_workspace_snapshot.open",
+                    "get_workspace_snapshot.page",
                     "manage_attachments.inspect",
                     "manage_attachments.list",
                     "manage_facet_observations.list",
@@ -5203,6 +5359,7 @@
                   "type": "string",
                   "enum": [
                     "attach_text",
+                    "batch_write",
                     "claim_unowned_record",
                     "correct_record_type",
                     "create_attribution",
@@ -5222,6 +5379,7 @@
                     "manage_relationships.retract",
                     "resolve_suggestions.accept",
                     "resolve_suggestions.reject",
+                    "save_account",
                     "update_record"
                   ]
                 },
@@ -5260,6 +5418,7 @@
                       "type": "string",
                       "enum": [
                         "attach_text",
+                        "batch_write",
                         "claim_unowned_record",
                         "correct_record_type",
                         "create_attribution",
@@ -5279,6 +5438,7 @@
                         "manage_relationships.retract",
                         "resolve_suggestions.accept",
                         "resolve_suggestions.reject",
+                        "save_account",
                         "update_record"
                       ]
                     },
@@ -6541,11 +6701,17 @@
                 "operation": {
                   "type": "string",
                   "enum": [
+                    "manage_alpha_tabs.inspect",
+                    "manage_alpha_tabs.list",
+                    "manage_alpha_tabs.live_read",
+                    "manage_alpha_tabs.preview",
                     "manage_artifact_inputs.read",
                     "manage_change_summaries.inspect",
                     "manage_mdx_modules.impact",
                     "manage_mdx_modules.inspect",
                     "manage_renderer_binding.read",
+                    "manage_surface_bindings.get",
+                    "manage_surface_bindings.list",
                     "query_change_summaries.drill",
                     "query_change_summaries.get",
                     "query_change_summaries.list",
@@ -6586,6 +6752,7 @@
                   "type": "string",
                   "enum": [
                     "invoke_artifact_interaction",
+                    "manage_alpha_tabs.launch",
                     "open_collection",
                     "render_artifact"
                   ]
@@ -6623,8 +6790,15 @@
                 "operation": {
                   "type": "string",
                   "enum": [
+                    "advance_artifact_port_pin",
                     "instantiate_artifact",
+                    "manage_alpha_tabs.adopt",
+                    "manage_alpha_tabs.disable",
+                    "manage_alpha_tabs.install",
+                    "manage_alpha_tabs.remove",
+                    "manage_alpha_tabs.restore",
                     "manage_artifact_inputs.bind",
+                    "manage_artifact_inputs.bind_many",
                     "manage_artifact_inputs.unbind",
                     "manage_change_summaries.confirm",
                     "manage_change_summaries.create_or_reuse",
@@ -6634,7 +6808,9 @@
                     "manage_mdx_modules.publish",
                     "manage_mdx_modules.withdraw",
                     "manage_renderer_binding.bind",
-                    "manage_renderer_binding.unbind"
+                    "manage_renderer_binding.unbind",
+                    "manage_surface_bindings.reset",
+                    "manage_surface_bindings.set"
                   ]
                 },
                 "arguments": {
@@ -6708,10 +6884,12 @@
                 "operation": {
                   "type": "string",
                   "enum": [
+                    "manage_memberships.create_guest_link",
                     "manage_memberships.invitations_copy_link",
                     "manage_memberships.invitations_create",
                     "manage_memberships.invitations_revoke",
                     "manage_memberships.invitations_send",
+                    "manage_memberships.revoke_guest_link",
                     "manage_memberships.set_role"
                   ]
                 },
@@ -6749,10 +6927,12 @@
                     "operation": {
                       "type": "string",
                       "enum": [
+                        "manage_memberships.create_guest_link",
                         "manage_memberships.invitations_copy_link",
                         "manage_memberships.invitations_create",
                         "manage_memberships.invitations_revoke",
                         "manage_memberships.invitations_send",
+                        "manage_memberships.revoke_guest_link",
                         "manage_memberships.set_role"
                       ]
                     },
@@ -6797,10 +6977,12 @@
                     "operation": {
                       "type": "string",
                       "enum": [
+                        "manage_memberships.create_guest_link",
                         "manage_memberships.invitations_copy_link",
                         "manage_memberships.invitations_create",
                         "manage_memberships.invitations_revoke",
                         "manage_memberships.invitations_send",
+                        "manage_memberships.revoke_guest_link",
                         "manage_memberships.set_role"
                       ]
                     },
@@ -6988,6 +7170,8 @@
                 "operation": {
                   "type": "string",
                   "enum": [
+                    "authority_act_delta",
+                    "authority_act_head",
                     "export_snapshot"
                   ]
                 },
@@ -7265,6 +7449,176 @@
               "destructiveHint": false,
               "idempotentHint": false,
               "openWorldHint": true
+            }
+          },
+          {
+            "name": "workspace_read",
+            "title": "Workspace read",
+            "description": "List the caller's hosted workspaces.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "operation": {
+                  "type": "string",
+                  "enum": [
+                    "workspace_read.list"
+                  ]
+                },
+                "arguments": {
+                  "type": "object",
+                  "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                },
+                "run_key": {
+                  "type": "string"
+                },
+                "parent_key": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "operation"
+              ],
+              "additionalProperties": false
+            },
+            "annotations": {
+              "readOnlyHint": true,
+              "destructiveHint": false,
+              "idempotentHint": true,
+              "openWorldHint": false
+            }
+          },
+          {
+            "name": "sql_write",
+            "title": "SQL write",
+            "description": "For plan-required operations, prepare first; preparation does not mutate. Prepare with {operation, arguments}. Execute only with the returned {operation, plan_id, target, effect_summary}; never combine preparation and execution fields. Preview-only SQL-selected record edit. An execute-shaped call only revalidates the signed preview and confirms it is current; it never commits.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "operation": {
+                  "type": "string",
+                  "enum": [
+                    "sql_write"
+                  ]
+                },
+                "arguments": {
+                  "type": "object",
+                  "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                },
+                "run_key": {
+                  "type": "string"
+                },
+                "parent_key": {
+                  "type": "string"
+                },
+                "plan_id": {
+                  "type": "string",
+                  "description": "Opaque id returned by preparation."
+                },
+                "target": {
+                  "type": "string",
+                  "description": "Exact visible target returned by preparation."
+                },
+                "effect_summary": {
+                  "type": "string",
+                  "description": "Exact visible effect returned by preparation."
+                }
+              },
+              "required": [
+                "operation"
+              ],
+              "additionalProperties": false,
+              "oneOf": [
+                {
+                  "title": "Prepare or direct",
+                  "properties": {
+                    "operation": {
+                      "type": "string",
+                      "enum": [
+                        "sql_write"
+                      ]
+                    },
+                    "arguments": {
+                      "type": "object",
+                      "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                    },
+                    "run_key": {
+                      "type": "string"
+                    },
+                    "parent_key": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "operation",
+                    "arguments"
+                  ],
+                  "not": {
+                    "anyOf": [
+                      {
+                        "required": [
+                          "plan_id"
+                        ]
+                      },
+                      {
+                        "required": [
+                          "target"
+                        ]
+                      },
+                      {
+                        "required": [
+                          "effect_summary"
+                        ]
+                      }
+                    ]
+                  }
+                },
+                {
+                  "title": "Execute prepared plan",
+                  "properties": {
+                    "operation": {
+                      "type": "string",
+                      "enum": [
+                        "sql_write"
+                      ]
+                    },
+                    "run_key": {
+                      "type": "string"
+                    },
+                    "parent_key": {
+                      "type": "string"
+                    },
+                    "plan_id": {
+                      "type": "string",
+                      "description": "Opaque id returned by preparation."
+                    },
+                    "target": {
+                      "type": "string",
+                      "description": "Exact visible target returned by preparation."
+                    },
+                    "effect_summary": {
+                      "type": "string",
+                      "description": "Exact visible effect returned by preparation."
+                    }
+                  },
+                  "required": [
+                    "operation",
+                    "plan_id",
+                    "target",
+                    "effect_summary"
+                  ],
+                  "not": {
+                    "required": [
+                      "arguments"
+                    ]
+                  }
+                }
+              ]
+            },
+            "annotations": {
+              "readOnlyHint": false,
+              "destructiveHint": false,
+              "idempotentHint": false,
+              "openWorldHint": false
             }
           },
           {
@@ -7311,7 +7665,7 @@
         ]
       },
       "lens": {
-        "descriptor_bytes": 48779,
+        "descriptor_bytes": 53032,
         "descriptors": [
           {
             "name": "bootstrap",
@@ -7370,7 +7724,9 @@
                     "membership_remove",
                     "export",
                     "canvas_read",
-                    "canvas_write"
+                    "canvas_write",
+                    "workspace_read",
+                    "sql_write"
                   ]
                 },
                 "operation": {
@@ -7562,7 +7918,11 @@
                     "get_dashboard",
                     "get_history",
                     "get_record",
+                    "get_reuse_context",
                     "get_structure",
+                    "get_workspace_snapshot.catch_up",
+                    "get_workspace_snapshot.open",
+                    "get_workspace_snapshot.page",
                     "manage_attachments.inspect",
                     "manage_attachments.list",
                     "manage_facet_observations.list",
@@ -7632,6 +7992,7 @@
                   "type": "string",
                   "enum": [
                     "attach_text",
+                    "batch_write",
                     "claim_unowned_record",
                     "correct_record_type",
                     "create_attribution",
@@ -7651,6 +8012,7 @@
                     "manage_relationships.retract",
                     "resolve_suggestions.accept",
                     "resolve_suggestions.reject",
+                    "save_account",
                     "update_record"
                   ]
                 },
@@ -7693,6 +8055,7 @@
                       "type": "string",
                       "enum": [
                         "attach_text",
+                        "batch_write",
                         "claim_unowned_record",
                         "correct_record_type",
                         "create_attribution",
@@ -7712,6 +8075,7 @@
                         "manage_relationships.retract",
                         "resolve_suggestions.accept",
                         "resolve_suggestions.reject",
+                        "save_account",
                         "update_record"
                       ]
                     },
@@ -9135,11 +9499,17 @@
                 "operation": {
                   "type": "string",
                   "enum": [
+                    "manage_alpha_tabs.inspect",
+                    "manage_alpha_tabs.list",
+                    "manage_alpha_tabs.live_read",
+                    "manage_alpha_tabs.preview",
                     "manage_artifact_inputs.read",
                     "manage_change_summaries.inspect",
                     "manage_mdx_modules.impact",
                     "manage_mdx_modules.inspect",
                     "manage_renderer_binding.read",
+                    "manage_surface_bindings.get",
+                    "manage_surface_bindings.list",
                     "query_change_summaries.drill",
                     "query_change_summaries.get",
                     "query_change_summaries.list",
@@ -9192,6 +9562,7 @@
                   "type": "string",
                   "enum": [
                     "invoke_artifact_interaction",
+                    "manage_alpha_tabs.launch",
                     "open_collection",
                     "render_artifact"
                   ]
@@ -9233,8 +9604,15 @@
                 "operation": {
                   "type": "string",
                   "enum": [
+                    "advance_artifact_port_pin",
                     "instantiate_artifact",
+                    "manage_alpha_tabs.adopt",
+                    "manage_alpha_tabs.disable",
+                    "manage_alpha_tabs.install",
+                    "manage_alpha_tabs.remove",
+                    "manage_alpha_tabs.restore",
                     "manage_artifact_inputs.bind",
+                    "manage_artifact_inputs.bind_many",
                     "manage_artifact_inputs.unbind",
                     "manage_change_summaries.confirm",
                     "manage_change_summaries.create_or_reuse",
@@ -9244,7 +9622,9 @@
                     "manage_mdx_modules.publish",
                     "manage_mdx_modules.withdraw",
                     "manage_renderer_binding.bind",
-                    "manage_renderer_binding.unbind"
+                    "manage_renderer_binding.unbind",
+                    "manage_surface_bindings.reset",
+                    "manage_surface_bindings.set"
                   ]
                 },
                 "arguments": {
@@ -9334,10 +9714,12 @@
                 "operation": {
                   "type": "string",
                   "enum": [
+                    "manage_memberships.create_guest_link",
                     "manage_memberships.invitations_copy_link",
                     "manage_memberships.invitations_create",
                     "manage_memberships.invitations_revoke",
                     "manage_memberships.invitations_send",
+                    "manage_memberships.revoke_guest_link",
                     "manage_memberships.set_role"
                   ]
                 },
@@ -9379,10 +9761,12 @@
                     "operation": {
                       "type": "string",
                       "enum": [
+                        "manage_memberships.create_guest_link",
                         "manage_memberships.invitations_copy_link",
                         "manage_memberships.invitations_create",
                         "manage_memberships.invitations_revoke",
                         "manage_memberships.invitations_send",
+                        "manage_memberships.revoke_guest_link",
                         "manage_memberships.set_role"
                       ]
                     },
@@ -9431,10 +9815,12 @@
                     "operation": {
                       "type": "string",
                       "enum": [
+                        "manage_memberships.create_guest_link",
                         "manage_memberships.invitations_copy_link",
                         "manage_memberships.invitations_create",
                         "manage_memberships.invitations_revoke",
                         "manage_memberships.invitations_send",
+                        "manage_memberships.revoke_guest_link",
                         "manage_memberships.set_role"
                       ]
                     },
@@ -9638,6 +10024,8 @@
                 "operation": {
                   "type": "string",
                   "enum": [
+                    "authority_act_delta",
+                    "authority_act_head",
                     "export_snapshot"
                   ]
                 },
@@ -9866,6 +10254,200 @@
               "readOnlyHint": false,
               "destructiveHint": false,
               "idempotentHint": true,
+              "openWorldHint": false
+            }
+          },
+          {
+            "name": "workspace_read",
+            "title": "Workspace read",
+            "description": "List the caller's hosted workspaces.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "operation": {
+                  "type": "string",
+                  "enum": [
+                    "workspace_read.list"
+                  ]
+                },
+                "arguments": {
+                  "type": "object",
+                  "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                },
+                "run_key": {
+                  "type": "string"
+                },
+                "parent_key": {
+                  "type": "string"
+                },
+                "destination_db_id": {
+                  "type": "string",
+                  "description": "Explicit lens destination for pass-through writes or destination-scoped reads."
+                },
+                "cursor": {
+                  "type": "string"
+                },
+                "page_size": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 50
+                }
+              },
+              "required": [
+                "operation"
+              ],
+              "additionalProperties": false
+            },
+            "annotations": {
+              "readOnlyHint": true,
+              "destructiveHint": false,
+              "idempotentHint": true,
+              "openWorldHint": false
+            }
+          },
+          {
+            "name": "sql_write",
+            "title": "SQL write",
+            "description": "For plan-required operations, prepare first; preparation does not mutate. Prepare with {operation, arguments}. Execute only with the returned {operation, plan_id, target, effect_summary}; never combine preparation and execution fields. Preview-only SQL-selected record edit. An execute-shaped call only revalidates the signed preview and confirms it is current; it never commits.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "operation": {
+                  "type": "string",
+                  "enum": [
+                    "sql_write"
+                  ]
+                },
+                "arguments": {
+                  "type": "object",
+                  "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                },
+                "run_key": {
+                  "type": "string"
+                },
+                "parent_key": {
+                  "type": "string"
+                },
+                "destination_db_id": {
+                  "type": "string",
+                  "description": "Explicit lens destination for pass-through writes or destination-scoped reads."
+                },
+                "plan_id": {
+                  "type": "string",
+                  "description": "Opaque id returned by preparation."
+                },
+                "target": {
+                  "type": "string",
+                  "description": "Exact visible target returned by preparation."
+                },
+                "effect_summary": {
+                  "type": "string",
+                  "description": "Exact visible effect returned by preparation."
+                }
+              },
+              "required": [
+                "operation"
+              ],
+              "additionalProperties": false,
+              "oneOf": [
+                {
+                  "title": "Prepare or direct",
+                  "properties": {
+                    "operation": {
+                      "type": "string",
+                      "enum": [
+                        "sql_write"
+                      ]
+                    },
+                    "arguments": {
+                      "type": "object",
+                      "description": "Nested operation arguments only. Keep operation, run_key and parent_key in the executor envelope."
+                    },
+                    "run_key": {
+                      "type": "string"
+                    },
+                    "parent_key": {
+                      "type": "string"
+                    },
+                    "destination_db_id": {
+                      "type": "string",
+                      "description": "Explicit lens destination for pass-through writes or destination-scoped reads."
+                    }
+                  },
+                  "required": [
+                    "operation",
+                    "arguments"
+                  ],
+                  "not": {
+                    "anyOf": [
+                      {
+                        "required": [
+                          "plan_id"
+                        ]
+                      },
+                      {
+                        "required": [
+                          "target"
+                        ]
+                      },
+                      {
+                        "required": [
+                          "effect_summary"
+                        ]
+                      }
+                    ]
+                  }
+                },
+                {
+                  "title": "Execute prepared plan",
+                  "properties": {
+                    "operation": {
+                      "type": "string",
+                      "enum": [
+                        "sql_write"
+                      ]
+                    },
+                    "run_key": {
+                      "type": "string"
+                    },
+                    "parent_key": {
+                      "type": "string"
+                    },
+                    "destination_db_id": {
+                      "type": "string",
+                      "description": "Explicit lens destination for pass-through writes or destination-scoped reads."
+                    },
+                    "plan_id": {
+                      "type": "string",
+                      "description": "Opaque id returned by preparation."
+                    },
+                    "target": {
+                      "type": "string",
+                      "description": "Exact visible target returned by preparation."
+                    },
+                    "effect_summary": {
+                      "type": "string",
+                      "description": "Exact visible effect returned by preparation."
+                    }
+                  },
+                  "required": [
+                    "operation",
+                    "plan_id",
+                    "target",
+                    "effect_summary"
+                  ],
+                  "not": {
+                    "required": [
+                      "arguments"
+                    ]
+                  }
+                }
+              ]
+            },
+            "annotations": {
+              "readOnlyHint": false,
+              "destructiveHint": false,
+              "idempotentHint": false,
               "openWorldHint": false
             }
           },
@@ -10112,6 +10694,30 @@
       "candidate_plan_policy": "direct"
     },
     {
+      "legacy_tool": "save_account",
+      "legacy_action": "call",
+      "stability": "stable",
+      "availability": [
+        "ordinary",
+        "lens"
+      ],
+      "candidate_executor": "records_write",
+      "candidate_operation": "save_account",
+      "candidate_plan_policy": "direct"
+    },
+    {
+      "legacy_tool": "get_reuse_context",
+      "legacy_action": "call",
+      "stability": "stable",
+      "availability": [
+        "ordinary",
+        "lens"
+      ],
+      "candidate_executor": "records_read",
+      "candidate_operation": "get_reuse_context",
+      "candidate_plan_policy": "direct"
+    },
+    {
       "legacy_tool": "create_many",
       "legacy_action": "call",
       "stability": "stable",
@@ -10121,6 +10727,18 @@
       ],
       "candidate_executor": "records_write",
       "candidate_operation": "create_many",
+      "candidate_plan_policy": "direct"
+    },
+    {
+      "legacy_tool": "batch_write",
+      "legacy_action": "call",
+      "stability": "stable",
+      "availability": [
+        "ordinary",
+        "lens"
+      ],
+      "candidate_executor": "records_write",
+      "candidate_operation": "batch_write",
       "candidate_plan_policy": "direct"
     },
     {
@@ -11181,6 +11799,18 @@
     },
     {
       "legacy_tool": "manage_artifact_inputs",
+      "legacy_action": "bind_many",
+      "stability": "stable",
+      "availability": [
+        "ordinary",
+        "lens"
+      ],
+      "candidate_executor": "artifacts_write",
+      "candidate_operation": "manage_artifact_inputs.bind_many",
+      "candidate_plan_policy": "direct"
+    },
+    {
+      "legacy_tool": "manage_artifact_inputs",
       "legacy_action": "read",
       "stability": "stable",
       "availability": [
@@ -11240,6 +11870,18 @@
       "candidate_plan_policy": "plan_required"
     },
     {
+      "legacy_tool": "advance_artifact_port_pin",
+      "legacy_action": "call",
+      "stability": "stable",
+      "availability": [
+        "ordinary",
+        "lens"
+      ],
+      "candidate_executor": "artifacts_write",
+      "candidate_operation": "advance_artifact_port_pin",
+      "candidate_plan_policy": "direct"
+    },
+    {
       "legacy_tool": "render_artifact",
       "legacy_action": "call",
       "stability": "stable",
@@ -11273,6 +11915,174 @@
       ],
       "candidate_executor": "artifacts_execute",
       "candidate_operation": "open_collection",
+      "candidate_plan_policy": "direct"
+    },
+    {
+      "legacy_tool": "manage_surface_bindings",
+      "legacy_action": "get",
+      "stability": "stable",
+      "availability": [
+        "ordinary",
+        "lens"
+      ],
+      "candidate_executor": "artifacts_read",
+      "candidate_operation": "manage_surface_bindings.get",
+      "candidate_plan_policy": "direct"
+    },
+    {
+      "legacy_tool": "manage_surface_bindings",
+      "legacy_action": "list",
+      "stability": "stable",
+      "availability": [
+        "ordinary",
+        "lens"
+      ],
+      "candidate_executor": "artifacts_read",
+      "candidate_operation": "manage_surface_bindings.list",
+      "candidate_plan_policy": "direct"
+    },
+    {
+      "legacy_tool": "manage_surface_bindings",
+      "legacy_action": "reset",
+      "stability": "stable",
+      "availability": [
+        "ordinary",
+        "lens"
+      ],
+      "candidate_executor": "artifacts_write",
+      "candidate_operation": "manage_surface_bindings.reset",
+      "candidate_plan_policy": "direct"
+    },
+    {
+      "legacy_tool": "manage_surface_bindings",
+      "legacy_action": "set",
+      "stability": "stable",
+      "availability": [
+        "ordinary",
+        "lens"
+      ],
+      "candidate_executor": "artifacts_write",
+      "candidate_operation": "manage_surface_bindings.set",
+      "candidate_plan_policy": "direct"
+    },
+    {
+      "legacy_tool": "manage_alpha_tabs",
+      "legacy_action": "adopt",
+      "stability": "stable",
+      "availability": [
+        "ordinary",
+        "lens"
+      ],
+      "candidate_executor": "artifacts_write",
+      "candidate_operation": "manage_alpha_tabs.adopt",
+      "candidate_plan_policy": "direct"
+    },
+    {
+      "legacy_tool": "manage_alpha_tabs",
+      "legacy_action": "disable",
+      "stability": "stable",
+      "availability": [
+        "ordinary",
+        "lens"
+      ],
+      "candidate_executor": "artifacts_write",
+      "candidate_operation": "manage_alpha_tabs.disable",
+      "candidate_plan_policy": "direct"
+    },
+    {
+      "legacy_tool": "manage_alpha_tabs",
+      "legacy_action": "inspect",
+      "stability": "stable",
+      "availability": [
+        "ordinary",
+        "lens"
+      ],
+      "candidate_executor": "artifacts_read",
+      "candidate_operation": "manage_alpha_tabs.inspect",
+      "candidate_plan_policy": "direct"
+    },
+    {
+      "legacy_tool": "manage_alpha_tabs",
+      "legacy_action": "install",
+      "stability": "stable",
+      "availability": [
+        "ordinary",
+        "lens"
+      ],
+      "candidate_executor": "artifacts_write",
+      "candidate_operation": "manage_alpha_tabs.install",
+      "candidate_plan_policy": "direct"
+    },
+    {
+      "legacy_tool": "manage_alpha_tabs",
+      "legacy_action": "launch",
+      "stability": "stable",
+      "availability": [
+        "ordinary",
+        "lens"
+      ],
+      "candidate_executor": "artifacts_execute",
+      "candidate_operation": "manage_alpha_tabs.launch",
+      "candidate_plan_policy": "direct"
+    },
+    {
+      "legacy_tool": "manage_alpha_tabs",
+      "legacy_action": "list",
+      "stability": "stable",
+      "availability": [
+        "ordinary",
+        "lens"
+      ],
+      "candidate_executor": "artifacts_read",
+      "candidate_operation": "manage_alpha_tabs.list",
+      "candidate_plan_policy": "direct"
+    },
+    {
+      "legacy_tool": "manage_alpha_tabs",
+      "legacy_action": "live_read",
+      "stability": "stable",
+      "availability": [
+        "ordinary",
+        "lens"
+      ],
+      "candidate_executor": "artifacts_read",
+      "candidate_operation": "manage_alpha_tabs.live_read",
+      "candidate_plan_policy": "direct"
+    },
+    {
+      "legacy_tool": "manage_alpha_tabs",
+      "legacy_action": "preview",
+      "stability": "stable",
+      "availability": [
+        "ordinary",
+        "lens"
+      ],
+      "candidate_executor": "artifacts_read",
+      "candidate_operation": "manage_alpha_tabs.preview",
+      "candidate_plan_policy": "direct"
+    },
+    {
+      "legacy_tool": "manage_alpha_tabs",
+      "legacy_action": "remove",
+      "stability": "stable",
+      "availability": [
+        "ordinary",
+        "lens"
+      ],
+      "candidate_executor": "artifacts_write",
+      "candidate_operation": "manage_alpha_tabs.remove",
+      "candidate_plan_policy": "direct"
+    },
+    {
+      "legacy_tool": "manage_alpha_tabs",
+      "legacy_action": "restore",
+      "stability": "stable",
+      "availability": [
+        "ordinary",
+        "lens"
+      ],
+      "candidate_executor": "artifacts_write",
+      "candidate_operation": "manage_alpha_tabs.restore",
       "candidate_plan_policy": "direct"
     },
     {
@@ -11405,6 +12215,42 @@
       ],
       "candidate_executor": "records_read",
       "candidate_operation": "scan",
+      "candidate_plan_policy": "direct"
+    },
+    {
+      "legacy_tool": "get_workspace_snapshot",
+      "legacy_action": "catch_up",
+      "stability": "stable",
+      "availability": [
+        "ordinary",
+        "lens"
+      ],
+      "candidate_executor": "records_read",
+      "candidate_operation": "get_workspace_snapshot.catch_up",
+      "candidate_plan_policy": "direct"
+    },
+    {
+      "legacy_tool": "get_workspace_snapshot",
+      "legacy_action": "open",
+      "stability": "stable",
+      "availability": [
+        "ordinary",
+        "lens"
+      ],
+      "candidate_executor": "records_read",
+      "candidate_operation": "get_workspace_snapshot.open",
+      "candidate_plan_policy": "direct"
+    },
+    {
+      "legacy_tool": "get_workspace_snapshot",
+      "legacy_action": "page",
+      "stability": "stable",
+      "availability": [
+        "ordinary",
+        "lens"
+      ],
+      "candidate_executor": "records_read",
+      "candidate_operation": "get_workspace_snapshot.page",
       "candidate_plan_policy": "direct"
     },
     {
@@ -12057,6 +12903,18 @@
     },
     {
       "legacy_tool": "manage_memberships",
+      "legacy_action": "create_guest_link",
+      "stability": "stable",
+      "availability": [
+        "ordinary",
+        "lens"
+      ],
+      "candidate_executor": "membership_admin",
+      "candidate_operation": "manage_memberships.create_guest_link",
+      "candidate_plan_policy": "plan_required"
+    },
+    {
+      "legacy_tool": "manage_memberships",
       "legacy_action": "invitations_copy_link",
       "stability": "stable",
       "availability": [
@@ -12153,6 +13011,18 @@
     },
     {
       "legacy_tool": "manage_memberships",
+      "legacy_action": "revoke_guest_link",
+      "stability": "stable",
+      "availability": [
+        "ordinary",
+        "lens"
+      ],
+      "candidate_executor": "membership_admin",
+      "candidate_operation": "manage_memberships.revoke_guest_link",
+      "candidate_plan_policy": "plan_required"
+    },
+    {
+      "legacy_tool": "manage_memberships",
       "legacy_action": "set_role",
       "stability": "stable",
       "availability": [
@@ -12162,6 +13032,18 @@
       "candidate_executor": "membership_admin",
       "candidate_operation": "manage_memberships.set_role",
       "candidate_plan_policy": "plan_required"
+    },
+    {
+      "legacy_tool": "workspace_read",
+      "legacy_action": "list",
+      "stability": "stable",
+      "availability": [
+        "ordinary",
+        "lens"
+      ],
+      "candidate_executor": "workspace_read",
+      "candidate_operation": "workspace_read.list",
+      "candidate_plan_policy": "direct"
     },
     {
       "legacy_tool": "reach_read",
@@ -12227,6 +13109,30 @@
       ],
       "candidate_executor": "reach_connect",
       "candidate_operation": "connect_source",
+      "candidate_plan_policy": "direct"
+    },
+    {
+      "legacy_tool": "authority_act_head",
+      "legacy_action": "call",
+      "stability": "stable",
+      "availability": [
+        "ordinary",
+        "lens"
+      ],
+      "candidate_executor": "export",
+      "candidate_operation": "authority_act_head",
+      "candidate_plan_policy": "direct"
+    },
+    {
+      "legacy_tool": "authority_act_delta",
+      "legacy_action": "call",
+      "stability": "stable",
+      "availability": [
+        "ordinary",
+        "lens"
+      ],
+      "candidate_executor": "export",
+      "candidate_operation": "authority_act_delta",
       "candidate_plan_policy": "direct"
     },
     {
@@ -12300,6 +13206,18 @@
       "candidate_executor": "experimental_freshness",
       "candidate_operation": "experimental_freshness_agent_intent.revise_exact_expression",
       "candidate_plan_policy": "direct"
+    },
+    {
+      "legacy_tool": "sql_write",
+      "legacy_action": "call",
+      "stability": "experimental",
+      "availability": [
+        "ordinary",
+        "lens"
+      ],
+      "candidate_executor": "sql_write",
+      "candidate_operation": "sql_write",
+      "candidate_plan_policy": "plan_required"
     },
     {
       "legacy_tool": "materialize_record",

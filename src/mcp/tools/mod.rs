@@ -12,6 +12,7 @@
 //! all. The universal snapshot tool is registered separately because its
 //! runtime mechanism is captured through [`SnapshotSourceRef`].
 
+pub mod alpha_tabs;
 pub mod apps;
 pub mod artifact_input_cache;
 pub mod artifact_interactions;
@@ -19,6 +20,10 @@ pub mod artifact_revalidate;
 pub mod artifacts;
 pub mod attachments;
 pub mod attribution;
+pub mod authoring;
+pub mod authoring_context;
+pub mod authority_act;
+pub mod batch_write;
 pub mod canvas;
 pub mod change_summaries;
 pub mod citations;
@@ -47,18 +52,23 @@ pub mod quickstart;
 pub mod record_shape;
 pub mod relationships;
 pub mod resolution;
+pub mod similar;
+pub mod sql_write;
 pub mod suggestions;
+pub mod surface_bindings;
 pub mod work;
+pub mod workspace_snapshot;
 
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-use sqlx::{Row, Sqlite, Transaction};
+use sqlx::{Row, Sqlite, SqliteConnection, Transaction};
 
 use crate::authorization::{self, Capability, Principal};
 use crate::error::{Error, Result};
 
 use super::registry::{Caller, ToolRegistry};
 use super::SnapshotSourceRef;
+use super::{ExperimentalExecutors, EXPERIMENTAL_SQL_WRITE_EXECUTOR};
 
 /// Register every shipped surface tool, in surface order (registration order
 /// is the `tools/list` order). Stages extend this as they land; today: stage 3
@@ -72,7 +82,10 @@ pub fn register_surface_tools(registry: &mut ToolRegistry) -> Result<()> {
     quickstart::register_quickstart_tool(registry)?;
     super::guides::register_guide_tool(registry)?;
     lifecycle::register_lifecycle_tools(registry)?;
+    authoring::register_authoring_tools(registry)?;
+    authoring_context::register_reuse_context_tool(registry)?;
     create_many::register_create_many_tool(registry)?;
+    batch_write::register_batch_write_tool(registry)?;
     history::register_history_tools(registry)?;
     identity::register_identity_tools(registry)?;
     policy::register_policy_tools(registry)?;
@@ -83,10 +96,13 @@ pub fn register_surface_tools(registry: &mut ToolRegistry) -> Result<()> {
     messaging::register_messaging_tools(registry)?;
     interventions::register_intervention_tools(registry)?;
     artifacts::register_artifact_tools(registry)?;
+    surface_bindings::register_surface_binding_tools(registry)?;
+    alpha_tabs::register_alpha_tab_tools(registry)?;
     artifact_interactions::register_artifact_interaction_tool(registry)?;
     observations::register_observation_tools(registry)?;
     facets::register_facet_tools(registry)?;
     querying::register_query_tools(registry)?;
+    workspace_snapshot::register_workspace_snapshot_tool(registry)?;
     resolution::register_resolution_tools(registry)?;
     meta::register_meta_tools(registry)?;
     attachments::register_attachment_tools(registry)?;
@@ -113,6 +129,21 @@ pub use experimental_agent_intents::register_experimental_agent_intent_tool;
 pub fn register_build_enabled_experimental_tools(_registry: &mut ToolRegistry) -> Result<()> {
     #[cfg(feature = "experimental-agent-intents")]
     experimental_agent_intents::register_experimental_agent_intent_tool(_registry)?;
+    Ok(())
+}
+
+/// Register the experimental sources a live runtime allowlisted.
+///
+/// Live runtimes (stdio, held) register `sql_write` only when the deployment
+/// allowlisted its executor. Evidence generation registers that source
+/// explicitly; the default ordinary/legacy surface stays byte-identical.
+pub fn register_allowlisted_experimental_tools(
+    registry: &mut ToolRegistry,
+    experimental: &ExperimentalExecutors,
+) -> Result<()> {
+    if experimental.contains(EXPERIMENTAL_SQL_WRITE_EXECUTOR) {
+        sql_write::register_sql_write_tool(registry)?;
+    }
     Ok(())
 }
 
@@ -154,6 +185,31 @@ pub(crate) const PREVIOUS_SEQ_DESCRIPTION: &str =
     "Returns previous_seq, the pre-write record event seq. Use get_record with \
      as_of.content_seq to reconstruct prior state; see the lifecycle guide.";
 
+/// Shared response contract for every write that allocates an act. Keeping
+/// the wording identical tells the caller, at the moment it decides what to
+/// do next, that the value it just received is the coordinate of the write
+/// it just performed — the same reason `previous_seq` is described everywhere.
+///
+/// A write that appended nothing canonical (an idempotent or no-op write)
+/// allocates no act, and the response omits the field entirely rather than
+/// reporting null or the workspace's current act: "no act" and
+/// "act unchanged" are different facts and must not be conflated.
+///
+/// It is appended only to the descriptions that already carried the
+/// `previous_seq` sibling and sit outside the federated-lens Focused profile.
+/// That profile is compiled against a hard byte budget
+/// (`FOCUSED_PROFILE_MAX_BYTES`) and leaves essentially no slack, so every
+/// Focused-profile write omits this sentence — `delete_record`,
+/// `archive_record` and `manage_links` (which carry `PREVIOUS_SEQ_DESCRIPTION`)
+/// as well as `update_record`, `manage_messages`, `manage_vocabularies` and
+/// `manage_schema_config` (which carry neither). The runtime field is
+/// unaffected: this constant is the one place its wording lives, and the
+/// response carries `act` regardless of whether the discovery prose names it.
+pub(crate) const ACT_DESCRIPTION: &str =
+    "Returns act, the per-workspace act number this write allocated and \
+     stamped on every canonical event it appended. Omitted when the write \
+     appended nothing canonical.";
+
 /// Parse a tool's arguments into its typed shape, naming the tool in the
 /// error — the message is what the caller sees, verbatim.
 pub(crate) fn parse_args<T: DeserializeOwned>(tool: &str, arguments: Value) -> Result<T> {
@@ -192,16 +248,67 @@ pub(crate) async fn previous_record_seq_in(
     )
 }
 
+/// The act the original keyed write allocated, recovered from the canonical
+/// events its command attestation covers.
+///
+/// A keyed replay must be indistinguishable from the first call, so it returns
+/// the original write's act rather than omitting it: the field is present on
+/// both and the caller cannot tell which call did the work. Only a *true*
+/// no-op — nothing was ever appended, so no act exists — omits the field.
+///
+/// `act` is exactly-once per write transaction and stamped on every canonical
+/// event that transaction appended, so the maximum across the attested outputs
+/// is that transaction's act regardless of which domains it touched. The two
+/// domains an attestation can reference are `content` and `relationship`;
+/// `provenance_action_outputs` records which log each output lives in.
+///
+/// The two halves of the union are not symmetric. `content_events.id` is
+/// UNIQUE, so its half can join on the id alone. `relationship_events` is only
+/// UNIQUE `(issuer_origin_db_id, id)`: federated import stamps a *foreign*
+/// issuer origin onto ingested events and allocates a local act for them, so a
+/// peer event reusing a canonical UUID a local keyed write already used would
+/// otherwise match both rows and let `MAX` return the ingest act. The
+/// relationship half is therefore qualified by the attestation's own issuer
+/// origin, exactly as every other relationship-event lookup in the tree is.
+/// Do not "simplify" that qualification away.
+pub(crate) async fn attested_act_in(
+    conn: &mut SqliteConnection,
+    attestation_id: &str,
+) -> Result<Option<i64>> {
+    Ok(sqlx::query_scalar(
+        "SELECT MAX(act) FROM (
+             SELECT e.act AS act FROM provenance_action_outputs o
+               JOIN content_events e ON e.id = o.output_event_id
+              WHERE o.action_attestation_id = ? AND o.output_domain = 'content'
+             UNION ALL
+             SELECT e.act AS act FROM provenance_action_outputs o
+               JOIN relationship_events e ON e.id = o.output_event_id
+              WHERE o.action_attestation_id = ? AND o.output_domain = 'relationship'
+                AND e.issuer_origin_db_id = (
+                    SELECT issuer_origin_database_id
+                      FROM provenance_action_attestations
+                     WHERE id = ?)
+         )",
+    )
+    .bind(attestation_id)
+    .bind(attestation_id)
+    .bind(attestation_id)
+    .fetch_one(&mut *conn)
+    .await?)
+}
+
 /// Translate the transport-authenticated account token into the portable
 /// policy principal. Hosted callers have already passed the live catalog
 /// membership check before a database is selected; stdio callers are the
 /// selected in-file account and enforcement is advisory at the filesystem
-/// boundary. In both cases the dynamic `members` subject is therefore live.
+/// boundary. The dynamic `members` subject is live for owners and members;
+/// guests (folded in via `Caller::with_hosting_member`) resolve to their own
+/// account grants only.
 pub(crate) fn principal(caller: &Caller) -> Principal<'_> {
     if is_legacy_local(caller) {
         Principal::trusted_local()
     } else {
-        Principal::bound(caller.credential(), true)
+        Principal::bound(caller.credential(), caller.is_host_member())
     }
 }
 
@@ -533,6 +640,22 @@ pub(crate) fn echo_previous_seq(mut result: Value, previous_seq: Option<i64>) ->
         .as_object_mut()
         .ok_or_else(|| Error::engine("record write returned a non-object result"))?;
     object.insert("previous_seq".into(), previous_seq.into());
+    Ok(result)
+}
+
+/// Add the produced act to an existing structured write result, in the same
+/// per-tool payload position as `previous_seq`.
+///
+/// A write that allocated no act (an idempotent or no-op write that appended
+/// nothing canonical) omits the field entirely: `None` leaves the object
+/// untouched rather than inserting null, so "no act" never reads as a value.
+pub(crate) fn echo_act(mut result: Value, act: Option<i64>) -> Result<Value> {
+    if let Some(act) = act {
+        let object = result
+            .as_object_mut()
+            .ok_or_else(|| Error::engine("record write returned a non-object result"))?;
+        object.insert("act".into(), act.into());
+    }
     Ok(result)
 }
 

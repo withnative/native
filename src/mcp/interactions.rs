@@ -26,9 +26,10 @@ use tokio::sync::{mpsc, Notify};
 
 use crate::db::Db;
 use crate::error::{Error, Result};
+use crate::holding::{HoldingClassification, HoldingSensitivity};
 use crate::instructions::MAX_BOOTSTRAP_PENDING_OBLIGATIONS;
 
-use super::registry::{attach_run_context, Caller};
+use super::registry::Caller;
 
 /// Every tool shipped by native-ce: two seam builtins plus the v1 surface.
 /// Names are derived from this enum, so a registration cannot pair a
@@ -50,6 +51,9 @@ pub enum ToolKind {
     CreateRecord,
     CreateMany,
     CreateExploration,
+    BatchWrite,
+    SaveAccount,
+    GetReuseContext,
     GetEventContext,
     GetRecord,
     ResolveMany,
@@ -76,6 +80,9 @@ pub enum ToolKind {
     ManageMdxModules,
     ManageArtifactInputs,
     ManageArtifactModuleGrants,
+    AdvanceArtifactPortPin,
+    ManageSurfaceBindings,
+    ManageAlphaTabs,
     RenderArtifact,
     VerifyArtifact,
     InvokeArtifactInteraction,
@@ -88,6 +95,7 @@ pub enum ToolKind {
     Search,
     QuerySql,
     Scan,
+    GetWorkspaceSnapshot,
     ManageVocabularies,
     ManageSchemaConfig,
     AttachText,
@@ -106,12 +114,15 @@ pub enum ToolKind {
     ManageInstructions,
     ManageOnboarding,
     ManageMemberships,
+    WorkspaceRead,
     ManageChangeSummaries,
     QueryChangeSummaries,
     ReadCanvas,
     ManageCanvas,
     ReachRead,
     ReachConnect,
+    AuthorityActHead,
+    AuthorityActDelta,
 }
 
 /// Whether one registered operation is observational or mutating.
@@ -380,7 +391,7 @@ pub enum AuthorizationDisposition {
 }
 
 impl ToolKind {
-    pub const ALL: [ToolKind; 77] = [
+    pub const ALL: [ToolKind; 87] = [
         ToolKind::Ping,
         ToolKind::EngineInfo,
         ToolKind::StandbyStatus,
@@ -395,6 +406,9 @@ impl ToolKind {
         ToolKind::CreateRecord,
         ToolKind::CreateMany,
         ToolKind::CreateExploration,
+        ToolKind::BatchWrite,
+        ToolKind::SaveAccount,
+        ToolKind::GetReuseContext,
         ToolKind::GetEventContext,
         ToolKind::GetRecord,
         ToolKind::ResolveMany,
@@ -421,6 +435,9 @@ impl ToolKind {
         ToolKind::ManageMdxModules,
         ToolKind::ManageArtifactInputs,
         ToolKind::ManageArtifactModuleGrants,
+        ToolKind::AdvanceArtifactPortPin,
+        ToolKind::ManageSurfaceBindings,
+        ToolKind::ManageAlphaTabs,
         ToolKind::RenderArtifact,
         ToolKind::VerifyArtifact,
         ToolKind::InvokeArtifactInteraction,
@@ -433,6 +450,7 @@ impl ToolKind {
         ToolKind::Search,
         ToolKind::QuerySql,
         ToolKind::Scan,
+        ToolKind::GetWorkspaceSnapshot,
         ToolKind::ManageVocabularies,
         ToolKind::ManageSchemaConfig,
         ToolKind::AttachText,
@@ -451,6 +469,7 @@ impl ToolKind {
         ToolKind::ManageInstructions,
         ToolKind::ManageOnboarding,
         ToolKind::ManageMemberships,
+        ToolKind::WorkspaceRead,
         ToolKind::ManageChangeSummaries,
         ToolKind::QueryChangeSummaries,
         ToolKind::PreviewRecordShape,
@@ -458,6 +477,8 @@ impl ToolKind {
         ToolKind::ManageCanvas,
         ToolKind::ReachRead,
         ToolKind::ReachConnect,
+        ToolKind::AuthorityActHead,
+        ToolKind::AuthorityActDelta,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -477,6 +498,9 @@ impl ToolKind {
             ToolKind::CreateRecord => "create_record",
             ToolKind::CreateMany => "create_many",
             ToolKind::CreateExploration => "create_exploration",
+            ToolKind::BatchWrite => "batch_write",
+            ToolKind::SaveAccount => "save_account",
+            ToolKind::GetReuseContext => "get_reuse_context",
             ToolKind::GetEventContext => "get_event_context",
             ToolKind::GetRecord => "get_record",
             ToolKind::ResolveMany => "resolve_many",
@@ -503,6 +527,9 @@ impl ToolKind {
             ToolKind::ManageMdxModules => "manage_mdx_modules",
             ToolKind::ManageArtifactInputs => "manage_artifact_inputs",
             ToolKind::ManageArtifactModuleGrants => "manage_artifact_module_grants",
+            ToolKind::AdvanceArtifactPortPin => "advance_artifact_port_pin",
+            ToolKind::ManageSurfaceBindings => "manage_surface_bindings",
+            ToolKind::ManageAlphaTabs => "manage_alpha_tabs",
             ToolKind::RenderArtifact => "render_artifact",
             ToolKind::VerifyArtifact => "verify_artifact",
             ToolKind::InvokeArtifactInteraction => "invoke_artifact_interaction",
@@ -515,6 +542,7 @@ impl ToolKind {
             ToolKind::Search => "search",
             ToolKind::QuerySql => "query_sql",
             ToolKind::Scan => "scan",
+            ToolKind::GetWorkspaceSnapshot => "get_workspace_snapshot",
             ToolKind::ManageVocabularies => "manage_vocabularies",
             ToolKind::ManageSchemaConfig => "manage_schema_config",
             ToolKind::AttachText => "attach_text",
@@ -533,12 +561,15 @@ impl ToolKind {
             ToolKind::ManageInstructions => "manage_instructions",
             ToolKind::ManageOnboarding => "manage_onboarding",
             ToolKind::ManageMemberships => "manage_memberships",
+            ToolKind::WorkspaceRead => "workspace_read",
             ToolKind::ManageChangeSummaries => "manage_change_summaries",
             ToolKind::QueryChangeSummaries => "query_change_summaries",
             ToolKind::ReadCanvas => "read_canvas",
             ToolKind::ManageCanvas => "manage_canvas",
             ToolKind::ReachRead => "reach_read",
             ToolKind::ReachConnect => "reach_connect",
+            ToolKind::AuthorityActHead => "authority_act_head",
+            ToolKind::AuthorityActDelta => "authority_act_delta",
         }
     }
 
@@ -578,6 +609,7 @@ impl ToolKind {
             | Self::DescribeSchema
             | Self::PreviewRecordShape
             | Self::GetEventContext
+            | Self::GetReuseContext
             | Self::GetRecord
             | Self::ResolveMany
             | Self::RenderRecord
@@ -600,7 +632,11 @@ impl ToolKind {
             | Self::ResolveCitation
             | Self::ReadCanvas
             | Self::ReadAttributions
-            | Self::ReachRead => Read,
+            | Self::ReachRead
+            | Self::AuthorityActHead
+            | Self::AuthorityActDelta
+            | Self::GetWorkspaceSnapshot
+            | Self::WorkspaceRead => Read,
             Self::ManageBindings => Actions(&["list", "observations"]),
             Self::ManageRecordPolicy => Actions(&["inspect", "list"]),
             Self::ManageLinks => Actions(&["list"]),
@@ -620,6 +656,10 @@ impl ToolKind {
             Self::ManageRendererBinding
             | Self::ManageArtifactInputs
             | Self::ManageArtifactModuleGrants => Actions(&["read"]),
+            Self::ManageSurfaceBindings => Actions(&["list", "get"]),
+            Self::ManageAlphaTabs => {
+                Actions(&["list", "inspect", "preview", "launch", "live_read"])
+            }
             Self::ManageMdxModules => Actions(&["inspect", "impact"]),
             Self::ManageFacetObservations => Actions(&["list"]),
             Self::ManageVocabularies => Actions(&["list_values"]),
@@ -639,6 +679,8 @@ impl ToolKind {
             | Self::CreateRecord
             | Self::CreateMany
             | Self::CreateExploration
+            | Self::BatchWrite
+            | Self::SaveAccount
             | Self::UpdateRecord
             | Self::ClaimUnownedRecord
             | Self::CorrectRecordType
@@ -647,6 +689,7 @@ impl ToolKind {
             | Self::ResolveExternal
             | Self::ObserveExternal
             | Self::InstantiateArtifact
+            | Self::AdvanceArtifactPortPin
             | Self::InvokeArtifactInteraction
             | Self::AttachText
             | Self::AttachFromUrl
@@ -663,6 +706,150 @@ impl ToolKind {
     /// Compatibility spelling for the immutable-standby consumer.
     pub const fn standby_disposition(self) -> AuthoritativeDisposition {
         self.authoritative_disposition()
+    }
+
+    /// How this surface behaves when what it was asked for is not held
+    /// (`docs/honest-absence-contract.md` §4, task a42f6e3).
+    ///
+    /// This match is the enforcement mechanism of the honest-absence
+    /// contract, and it is the reason the contract is more than prose: a new
+    /// read tool cannot compile until somebody decides what it does over a
+    /// partial replica. It is the same discipline `authoritative_disposition`
+    /// applies to read/write classification and `crate::act` applies to
+    /// canonical-table coverage.
+    ///
+    /// Two things are worth reading carefully before changing an arm:
+    ///
+    /// * **`Unaffected` on the time axis is a claim about the projection,**
+    ///   not about the tool. A replica's base is an accumulator that already
+    ///   reflects every event below W, so a record-shaped read stays complete
+    ///   at any window. A tool is `Unaffected` only if its answer comes from
+    ///   the projection alone.
+    /// * **`Refuses` follows `as_of`.** Any surface that accepts an `as_of`
+    ///   selector can be asked for a historical state whose events are gone,
+    ///   and a partial replay is indistinguishable from a whole one — so it
+    ///   refuses rather than answering. That makes the classification a
+    ///   property of the argument surface, not of the live read.
+    pub const fn holding_classification(self) -> HoldingClassification {
+        use HoldingClassification as Class;
+        use HoldingSensitivity::{Bounded, Refuses, Unaffected};
+        match self {
+            // Answered from the projection alone, and accept no `as_of`.
+            Self::GetDashboard
+            | Self::DescribeSchema
+            | Self::PreviewRecordShape
+            | Self::GetReuseContext
+            | Self::ResolveMany
+            | Self::RenderRecord
+            | Self::OpenCollection
+            | Self::ResolveFacets
+            | Self::SuggestFacetValues
+            | Self::ResolveRollup
+            | Self::Search
+            | Self::QuerySql
+            | Self::Scan
+            | Self::ReadAttachment
+            | Self::RenderSuggestionReview
+            | Self::ResolveCitation
+            | Self::ReachRead
+            | Self::WorkspaceRead
+            | Self::ManageBindings
+            | Self::ManageRecordPolicy
+            | Self::ManageLinks
+            | Self::ManageRelationships
+            | Self::ManageInterventions
+            | Self::ManageRendererBinding
+            | Self::ManageArtifactInputs
+            | Self::ManageArtifactModuleGrants
+            | Self::ManageSurfaceBindings
+            | Self::ManageAlphaTabs
+            | Self::ManageMdxModules
+            | Self::ManageFacetObservations
+            | Self::ManageVocabularies
+            | Self::ManageSchemaConfig
+            | Self::ManageAttachments
+            | Self::StartWork
+            | Self::ManageInstructions
+            | Self::ManageOnboarding
+            | Self::ManageMemberships
+            | Self::ManageChangeSummaries
+            | Self::RenderArtifact
+            | Self::VerifyArtifact => Class::reads(Unaffected),
+
+            // Accept `as_of`, so they may be asked to replay a prefix that is
+            // no longer held.
+            Self::GetRecord | Self::GetStructure | Self::QueryRecord | Self::ReadCanvas => {
+                Class::reads(Refuses)
+            }
+
+            // `whats_changed` resumes from a caller-supplied baseline. Below
+            // the window it would report the post-W events as the whole change
+            // set since that position, which is a wrong answer rather than a
+            // short one.
+            Self::WhatsChanged | Self::AuthorityActHead | Self::AuthorityActDelta => {
+                Class::reads(Refuses)
+            }
+            // `get_workspace_snapshot` resumes from a caller-supplied token.
+            // A missing, expired, or fence-moved token yields an explicit
+            // `restart_required`, never a partial window presented as whole —
+            // the same shape as the inbox `cursor_reset_required` below.
+            Self::GetWorkspaceSnapshot => Class::reads(Refuses),
+
+            // Messaging list reads resume from an opaque inbox cursor, which
+            // below the window is the `cursor_reset_required` condition the
+            // surface already has a shape for.
+            Self::ManageMessages => Class::reads(Refuses),
+
+            // Read the log directly and can honestly return a short answer,
+            // provided they say the history is bounded rather than exhausted.
+            Self::GetHistory
+            | Self::GetEventContext
+            | Self::GetRunActivity
+            | Self::RenderRecordVersionDiff
+            | Self::ReadAttributions
+            | Self::QueryChangeSummaries => Class::reads(Bounded),
+
+            // A read by the contract's definition even though
+            // `authoritative_disposition` calls it a mutation: it writes a
+            // file, but the answer is the document, and a windowed replica
+            // exports a document whose scope it must state.
+            Self::ExportSnapshot => Class::reads(Bounded),
+
+            // Report the replica's own footing, including the holding
+            // disclosure itself. They describe the boundary rather than
+            // running into it.
+            Self::Ping | Self::EngineInfo | Self::StandbyStatus | Self::Bootstrap => {
+                Class::reads(Unaffected)
+            }
+
+            Self::ReadGuide | Self::Quickstart => Class::reads(Unaffected),
+
+            Self::SetIntent
+            | Self::CloseRun
+            | Self::CreateRecord
+            | Self::CreateMany
+            | Self::CreateExploration
+            | Self::BatchWrite
+            | Self::SaveAccount
+            | Self::UpdateRecord
+            | Self::ClaimUnownedRecord
+            | Self::CorrectRecordType
+            | Self::DeleteRecord
+            | Self::ArchiveRecord
+            | Self::ResolveExternal
+            | Self::ObserveExternal
+            | Self::InstantiateArtifact
+            | Self::AdvanceArtifactPortPin
+            | Self::InvokeArtifactInteraction
+            | Self::AttachText
+            | Self::AttachFromUrl
+            | Self::ResolveSuggestions
+            | Self::ManageCitations
+            | Self::CreateAttribution
+            | Self::ManageCanvas
+            | Self::ManageAttributions
+            | Self::ReachConnect => Class::NoRead,
+        }
     }
 
     /// Complete exposure metadata for every production capability.
@@ -695,6 +882,9 @@ impl ToolKind {
             ToolKind::CreateRecord => ToolExposure::new(Records, true, Atomicity),
             ToolKind::CreateMany => ToolExposure::new(Records, false, Atomicity),
             ToolKind::CreateExploration => ToolExposure::new(Records, false, Atomicity),
+            ToolKind::BatchWrite => ToolExposure::new(Records, false, Atomicity),
+            ToolKind::SaveAccount => ToolExposure::new(Records, false, Atomicity),
+            ToolKind::GetReuseContext => ToolExposure::new(Records, false, BoundedContextOrCalls),
             ToolKind::GetEventContext => {
                 ToolExposure::new(Coordination, false, BoundedContextOrCalls)
             }
@@ -737,6 +927,13 @@ impl ToolKind {
             ToolKind::ManageArtifactModuleGrants => {
                 ToolExposure::new(Artifacts, false, CorrectnessUnderIgnorance)
             }
+            ToolKind::AdvanceArtifactPortPin => ToolExposure::new(Artifacts, false, Atomicity),
+            ToolKind::ManageSurfaceBindings => {
+                ToolExposure::new(Artifacts, false, CorrectnessUnderIgnorance)
+            }
+            ToolKind::ManageAlphaTabs => {
+                ToolExposure::new(Artifacts, false, CorrectnessUnderIgnorance)
+            }
             ToolKind::RenderArtifact => ToolExposure::new(Artifacts, false, BoundedContextOrCalls),
             ToolKind::VerifyArtifact => {
                 ToolExposure::new(Artifacts, false, CorrectnessUnderIgnorance)
@@ -755,6 +952,9 @@ impl ToolKind {
             ToolKind::Search => ToolExposure::new(Query, true, BoundedContextOrCalls),
             ToolKind::QuerySql => ToolExposure::new(Query, false, Discoverability),
             ToolKind::Scan => ToolExposure::new(Query, true, BoundedContextOrCalls),
+            ToolKind::GetWorkspaceSnapshot => {
+                ToolExposure::new(Query, false, BoundedContextOrCalls)
+            }
             ToolKind::ManageVocabularies => {
                 ToolExposure::new(Schema, true, CorrectnessUnderIgnorance)
             }
@@ -791,6 +991,10 @@ impl ToolKind {
                 ToolExposure::new(Guidance, false, CorrectnessUnderIgnorance)
             }
             ToolKind::ManageMemberships => ToolExposure::new(Identity, false, Atomicity),
+            // Hosted-only, like membership and reach: undiscoverable under
+            // focused filtering, present in the complete default, callable by
+            // exact name.
+            ToolKind::WorkspaceRead => ToolExposure::new(Identity, false, BoundedContextOrCalls),
             ToolKind::ManageChangeSummaries => ToolExposure::new(Artifacts, false, Atomicity),
             ToolKind::QueryChangeSummaries => {
                 ToolExposure::new(Artifacts, false, CorrectnessUnderIgnorance)
@@ -805,6 +1009,14 @@ impl ToolKind {
             // membership admission reason even though it writes no records.
             ToolKind::ReachRead => ToolExposure::new(Identity, false, BoundedContextOrCalls),
             ToolKind::ReachConnect => ToolExposure::new(Identity, false, Atomicity),
+            // Hosted-only, like membership and reach: undiscoverable under
+            // focused filtering, present in the complete default, callable by
+            // exact name. Both are the authority-side half of the standby
+            // delta transport, so they share the export family's
+            // HostOwner-gated full-corpus permission shape.
+            ToolKind::AuthorityActHead | ToolKind::AuthorityActDelta => {
+                ToolExposure::new(Export, false, CorrectnessUnderIgnorance)
+            }
         }
     }
 
@@ -825,7 +1037,8 @@ impl ToolKind {
             | ToolKind::QueryRecord
             | ToolKind::ResolveMany
             | ToolKind::Search
-            | ToolKind::Scan => CallerFilteredRead,
+            | ToolKind::Scan
+            | ToolKind::GetWorkspaceSnapshot => CallerFilteredRead,
             ToolKind::GetStructure
             | ToolKind::GetRecord
             | ToolKind::RenderRecord
@@ -842,10 +1055,15 @@ impl ToolKind {
             ToolKind::DeleteRecord | ToolKind::ArchiveRecord => RecordManage,
             ToolKind::ClaimUnownedRecord
             | ToolKind::ManageVocabularies
-            | ToolKind::ExportSnapshot => HostOwner,
+            | ToolKind::ExportSnapshot
+            | ToolKind::AuthorityActHead
+            | ToolKind::AuthorityActDelta => HostOwner,
             ToolKind::CreateRecord
             | ToolKind::CreateMany
             | ToolKind::CreateExploration
+            | ToolKind::BatchWrite
+            | ToolKind::SaveAccount
+            | ToolKind::GetReuseContext
             | ToolKind::GetEventContext
             | ToolKind::UpdateRecord
             | ToolKind::GetHistory
@@ -863,6 +1081,9 @@ impl ToolKind {
             | ToolKind::ManageMdxModules
             | ToolKind::ManageArtifactInputs
             | ToolKind::ManageArtifactModuleGrants
+            | ToolKind::AdvanceArtifactPortPin
+            | ToolKind::ManageSurfaceBindings
+            | ToolKind::ManageAlphaTabs
             | ToolKind::RenderArtifact
             | ToolKind::VerifyArtifact
             | ToolKind::InvokeArtifactInteraction
@@ -882,6 +1103,7 @@ impl ToolKind {
             | ToolKind::ManageInstructions
             | ToolKind::ManageOnboarding
             | ToolKind::ManageMemberships
+            | ToolKind::WorkspaceRead
             | ToolKind::ReachRead
             | ToolKind::ReachConnect => Specialized,
             ToolKind::ManageChangeSummaries | ToolKind::QueryChangeSummaries => Specialized,
@@ -1165,6 +1387,8 @@ fn extract(kind: ToolKind, arguments: &Value, result: &Value) -> Extraction {
         | ToolKind::StandbyStatus
         | ToolKind::ReadGuide
         | ToolKind::ExportSnapshot
+        | ToolKind::AuthorityActHead
+        | ToolKind::AuthorityActDelta
         | ToolKind::SetIntent
         | ToolKind::CloseRun => {}
         ToolKind::Bootstrap => {
@@ -1277,6 +1501,40 @@ fn extract(kind: ToolKind, arguments: &Value, result: &Value) -> Extraction {
                 extraction.mutated(string_at(candidate, "id"));
             }
             extraction.count(candidates.len() + 1);
+        }
+        ToolKind::BatchWrite => {
+            let results = array_at(result, "results");
+            for outcome in results {
+                if outcome.get("status").and_then(Value::as_str) == Some("changed") {
+                    extraction.mutated(string_at(outcome, "id"));
+                    // Link items mutate both ends, mirroring extract_manage_links.
+                    if outcome.get("op").and_then(Value::as_str) == Some("add_link") {
+                        extraction.mutated(string_at(outcome, "target_id"));
+                    }
+                }
+            }
+            extraction.count(results.len());
+        }
+        ToolKind::SaveAccount => {
+            extraction.mutated(string_at(result, "record_id"));
+            extraction.count(1);
+        }
+        ToolKind::GetReuseContext => {
+            extraction.opened(string_at(result, "record_id"));
+            if let Some(basis) = result.get("basis") {
+                for source in array_at(basis, "sources") {
+                    extraction.surfaced(string_at(source, "record_id"));
+                }
+            }
+            for window in ["concerns", "treatment"] {
+                for root in array_at(result.get(window).unwrap_or(&Value::Null), "entries") {
+                    extraction.surfaced(string_at(root, "comment_id"));
+                    for reply in array_at(root, "replies") {
+                        extraction.surfaced(string_at(reply, "comment_id"));
+                    }
+                }
+            }
+            extraction.count(1);
         }
         ToolKind::GetEventContext => {
             // The event's own target is opened. Records the run merely
@@ -1550,7 +1808,10 @@ fn extract(kind: ToolKind, arguments: &Value, result: &Value) -> Extraction {
             extraction.count(array_at(result, "releases").len().max(1));
         }
         ToolKind::ManageArtifactInputs => {
-            if matches!(string_at(arguments, "action"), Some("bind" | "unbind")) {
+            if matches!(
+                string_at(arguments, "action"),
+                Some("bind" | "bind_many" | "unbind")
+            ) {
                 extraction.mutated(string_at(result, "artifact_id"));
             } else {
                 extraction.opened(string_at(result, "artifact_id"));
@@ -1567,6 +1828,100 @@ fn extract(kind: ToolKind, arguments: &Value, result: &Value) -> Extraction {
                 extraction.opened(string_at(result, "artifact_id"));
             }
             extraction.count(array_at(result, "grants").len());
+        }
+        ToolKind::AdvanceArtifactPortPin => {
+            extraction.mutated(string_at(result, "artifact_id"));
+            extraction.surfaced(string_at(result, "collection_id"));
+            extraction.count(1);
+        }
+        ToolKind::ManageSurfaceBindings => {
+            let action = string_at(arguments, "action");
+            let changed = matches!(string_at(result, "status"), Some("bound" | "reset"));
+            match action {
+                Some("set" | "reset") => {
+                    if changed {
+                        extraction.mutated(string_at(result, "source_id"));
+                        let changed_target = result
+                            .get("removed_target_id")
+                            .and_then(Value::as_str)
+                            .or_else(|| {
+                                result
+                                    .get("resolution")
+                                    .and_then(|resolution| resolution.get("target_id"))
+                                    .and_then(Value::as_str)
+                            });
+                        extraction.mutated(changed_target);
+                    } else {
+                        extraction.opened(string_at(result, "source_id"));
+                    }
+                    extraction.count(1);
+                }
+                _ => {
+                    extraction.count(array_at(result, "bindings").len());
+                }
+            }
+        }
+        // Install state is control-tier, not a record edge: every action
+        // consults the pinned artifact (surfaced, never mutated) and counts
+        // the installs it reports.
+        ToolKind::ManageAlphaTabs => {
+            let install_artifact = result
+                .get("install")
+                .and_then(|install| string_at(install, "artifact_id"));
+            match string_at(arguments, "action") {
+                Some("list") => {
+                    for item in array_at(result, "installs") {
+                        extraction.surfaced(string_at(item, "artifact_id"));
+                    }
+                    extraction.count(array_at(result, "installs").len());
+                }
+                Some("inspect") => {
+                    extraction.surfaced(install_artifact);
+                    extraction.count(usize::from(
+                        result
+                            .get("installed")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                    ));
+                }
+                Some("install" | "disable" | "restore" | "remove") => {
+                    extraction.surfaced(install_artifact);
+                    extraction.count(1);
+                }
+                Some("preview") => {
+                    extraction.surfaced(
+                        result
+                            .get("preview")
+                            .and_then(|preview| string_at(preview, "artifact_id")),
+                    );
+                    extraction.count(1);
+                }
+                Some("launch") => {
+                    extraction.surfaced(
+                        result
+                            .get("pin")
+                            .and_then(|pin| string_at(pin, "artifact_id")),
+                    );
+                    extraction.count(1);
+                }
+                // The host-executed governed read: the pinned artifact plus
+                // every live row it returned are surfaced (never mutated),
+                // and the count is the returned row count.
+                Some("live_read") => {
+                    extraction.surfaced(
+                        result
+                            .get("pin")
+                            .and_then(|pin| string_at(pin, "artifact_id")),
+                    );
+                    let rows = result
+                        .get("input")
+                        .map(|input| array_at(input, "records"))
+                        .unwrap_or(&[]);
+                    surface_id_array(&mut extraction, rows, "id");
+                    extraction.count(rows.len());
+                }
+                Some(_) | None => extraction.count(0),
+            }
         }
         ToolKind::RenderArtifact => {
             extraction.opened(string_at(result, "artifact_id"));
@@ -1671,6 +2026,42 @@ fn extract(kind: ToolKind, arguments: &Value, result: &Value) -> Extraction {
             extraction.count_value(result.get("row_count").and_then(Value::as_i64));
         }
         ToolKind::Scan => extract_scan(&mut extraction, result),
+        ToolKind::GetWorkspaceSnapshot => {
+            // Page rows are section-shaped: surface the record each row is
+            // about, not the row's own id — a facet, link, or event id names
+            // no record. Deltas surface every touched record the same way.
+            let section = string_at(result, "section").unwrap_or("");
+            let mut touched = 0;
+            for row in array_at(result, "rows") {
+                match section {
+                    "facets" | "content_events" => extraction.surfaced(string_at(row, "record_id")),
+                    "links" => {
+                        extraction.surfaced(string_at(row, "source_id"));
+                        extraction.surfaced(string_at(row, "target_id"));
+                    }
+                    _ => extraction.surfaced(string_at(row, "id")),
+                }
+                touched += 1;
+            }
+            for row in array_at(result, "upsert_records") {
+                extraction.surfaced(string_at(row, "id"));
+                touched += 1;
+            }
+            for row in array_at(result, "upsert_facets") {
+                extraction.surfaced(string_at(row, "record_id"));
+                touched += 1;
+            }
+            for row in array_at(result, "upsert_links") {
+                extraction.surfaced(string_at(row, "source_id"));
+                extraction.surfaced(string_at(row, "target_id"));
+                touched += 1;
+            }
+            for event in array_at(result, "content_events") {
+                extraction.surfaced(string_at(event, "record_id"));
+                touched += 1;
+            }
+            extraction.count(touched);
+        }
         ToolKind::ManageVocabularies => {
             if string_at(arguments, "action") == Some("list_values") {
                 extraction.count(array_at(result, "values").len());
@@ -1792,6 +2183,13 @@ fn extract(kind: ToolKind, arguments: &Value, result: &Value) -> Extraction {
             Some("set_role" | "remove") => extraction.count(1),
             Some(_) | None => extraction.count(0),
         },
+        // Workspace identifiers are database ids, never Native record ids:
+        // count only, so read-log capture can never mistake a workspace for
+        // a surfaced record.
+        ToolKind::WorkspaceRead => match string_at(arguments, "action") {
+            Some("list") => extraction.count(array_at(result, "workspaces").len()),
+            Some(_) | None => extraction.count(0),
+        },
         // Provider identifiers are external pointers, never Native record
         // ids: count only, so read-log capture can never mistake a Slack
         // timestamp or Notion page id for a surfaced record.
@@ -1839,6 +2237,7 @@ fn error_kind(error: &Error) -> &'static str {
     match error {
         Error::Engine(_) => "engine",
         Error::Conflict(_) => "conflict",
+        Error::NotHeld(_) => "not_held",
         Error::Auth(_) => "auth",
         Error::Delivery(_) => "delivery",
         Error::DeploymentReadOnly(_) => "deployment_read_only",
@@ -1848,26 +2247,17 @@ fn error_kind(error: &Error) -> &'static str {
     }
 }
 
-fn response_bytes(
-    outcome: std::result::Result<&Value, &Error>,
-    run_context: &Value,
-) -> Option<i64> {
-    let response = match outcome {
-        Ok(value) => attach_run_context(value.clone(), run_context.clone()),
-        Err(error) => serde_json::json!({
-            "error": error.to_string(),
-            "run_context": run_context,
-        }),
-    };
-    serde_json::to_vec(&response)
-        .ok()
-        .and_then(|bytes| i64::try_from(bytes.len()).ok())
-}
-
 /// Persist only bounded operational routing for Reach. Provider search text
 /// is deliberately outside Native's interaction log, and invalid direct calls
 /// must not smuggle arbitrary fields into it before schema validation fails.
-fn captured_arguments(extractor: Extractor, original: &Value) -> Value {
+///
+/// Every other tool's arguments are stored verbatim. For the action-evidence
+/// surfaces in [`crate::mcp::action_evidence`] that is load-bearing rather
+/// than incidental: `get_run_activity` reads their structure to tell
+/// `coordinated` from `proceeded`. A future slice that stops storing verbatim
+/// arguments for pure reads must leave those surfaces alone; the unit tests
+/// in that module fail if it does not.
+pub(super) fn captured_arguments(extractor: Extractor, original: &Value) -> Value {
     match extractor {
         Extractor::Shipped(ToolKind::ReachRead) => original
             .get("action")
@@ -1932,7 +2322,14 @@ const WORK_OVERLAP_EMISSION_VERSION: u8 = 1;
 /// actually disclosed.  This deliberately reads only record ids and counts
 /// from the already-shaped response: holder account/intent/run/timestamp
 /// fields never cross the read-log boundary.
-fn work_overlap_result_annotation(kind: ToolKind, result: &Value) -> Option<String> {
+pub(super) fn work_overlap_result_annotation(kind: ToolKind, result: &Value) -> Option<String> {
+    // The carve-out decides which surfaces may carry retained evidence; this
+    // function only decides the shape. A kind removed from
+    // `ANNOTATION_SURFACES` stops annotating here, rather than the two
+    // statements drifting apart unnoticed.
+    if !super::action_evidence::ANNOTATION_SURFACES.contains(&kind) {
+        return None;
+    }
     let (surface, anchors) = match kind {
         ToolKind::StartWork if string_at(result, "action") == Some("claim") => {
             let overlap = result.get("work_overlap")?;
@@ -2509,6 +2906,103 @@ pub(crate) async fn record_declaration_call(
     db.record_declaration(capture).await;
 }
 
+/// Retention predicate for PR A capture filtering (task 8a6377f).
+///
+/// Decides whether one finished call earns a `read_log_calls` row under the
+/// current schema. It keeps exactly what live consumers need and drops the
+/// disposable pure-read exhaust that made the table ~1.4 GB on Native HQ:
+///
+/// * successful `set_intent` declarations, even with zero touches, and failed
+///   declaration attempts as mutation evidence;
+/// * `bootstrap` issuance rows, including failed/malformed attempts, so a
+///   read-only run retains its identity and parentage before any declaration;
+/// * other legacy `run_key: "new"` / `"new:<agent>"` issuance calls, with
+///   their read arguments and touches removed;
+/// * annotation-bearing rows, even on otherwise read-only surfaces;
+/// * action calls on the action-evidence surfaces (`action_evidence`), ok or
+///   error, with verbatim arguments and ordering intact;
+/// * rows with `mutated` touches (material work, including surfaces outside
+///   the carve-out such as `create_many` or `observe_external`);
+/// * error attempts on mutation actions (failed pure reads carry no consumer
+///   and are dropped);
+/// * every `Mutation`-disposition tool outside the carve-out (fail-closed:
+///   a future mutation tool keeps its attempt evidence until the carve-out
+///   explicitly adopts it).
+///
+/// Drops only known-observational calls: `Read`-disposition tools, and the
+/// read actions of mixed (`Actions`) tools as classified by
+/// `authoritative_disposition` for these exact arguments. Unknown or
+/// malformed mixed actions fail closed (keep). Extension tools with
+/// `CustomInteractionPolicy::NoRecordInteractions` keep their existing
+/// minimal-row behavior; this predicate never widens logging onto a surface
+/// that previously logged nothing.
+///
+/// `result_count`, `result_bytes` and `result_rank` have no production
+/// reader (audit increment 2) and are nulled at write time for retained
+/// rows; the columns stay in the schema (no migration in PR A).
+fn should_retain_capture(
+    extractor: Extractor,
+    original_arguments: &Value,
+    outcome_is_ok: bool,
+    extraction: &Extraction,
+    has_annotation: bool,
+) -> bool {
+    // Extension-only synthetic tools keep their existing behavior: a minimal
+    // row with no record touches. Never widen logging here.
+    let kind = match extractor {
+        Extractor::Custom(_) => return true,
+        Extractor::Shipped(kind) => kind,
+    };
+    // Run-key issuance is a coordination fact even when the run has no later
+    // declaration or write. Consumers use this row to distinguish a real
+    // read-only run from an unseen key and to recover its parentage.
+    if kind == ToolKind::Bootstrap || is_read_issuance(kind, original_arguments) {
+        return true;
+    }
+    // A retained overlap notice is action evidence whatever its tool.
+    if has_annotation {
+        return true;
+    }
+    // A surface can offer both reads and writes. Its read actions are still
+    // disposable: on HQ, manage_messages read actions alone account for over
+    // 220,000 rows. The disposition below keeps its write actions and failed
+    // write attempts, with the verbatim arguments the evaluator needs.
+    // Material work keeps its evidence even where the tool is outside the
+    // carve-out (e.g. `create_many`, `observe_external`).
+    if extraction
+        .touches
+        .iter()
+        .any(|touch| touch.interaction == Interaction::Mutated)
+    {
+        return true;
+    }
+    // Successful declarations are the read-only run's only intent record.
+    if kind == ToolKind::SetIntent && outcome_is_ok {
+        return true;
+    }
+    match kind.authoritative_disposition() {
+        // Fail-closed: a future mutation tool keeps its rows until the
+        // carve-out explicitly adopts it.
+        AuthoritativeDisposition::Mutation => true,
+        // Mixed tools decide per call: read actions are disposable exhaust,
+        // mutation or unknown/malformed actions keep their attempt evidence.
+        AuthoritativeDisposition::Actions(_) => {
+            !kind.authoritative_disposition().admits(original_arguments)
+        }
+        // Pure reads (get_record, search, query_record, history reads,
+        // diagnostics with no touches, ...) are the disposable tier.
+        AuthoritativeDisposition::Read => false,
+    }
+}
+
+fn is_read_issuance(kind: ToolKind, arguments: &Value) -> bool {
+    kind.authoritative_disposition().admits(arguments)
+        && arguments
+            .get("run_key")
+            .and_then(Value::as_str)
+            .is_some_and(|key| key == "new" || key.starts_with("new:"))
+}
+
 /// Build the owned capture envelope for one finished call, snapshotting the
 /// authorization context (credential actor, validated run/parent keys,
 /// arguments JSON) on the calling task. `None` means unserializable
@@ -2520,14 +3014,14 @@ fn prepare_capture(
     tool_name: &str,
     caller: &Caller,
     original_arguments: &Value,
-    run_context: &Value,
+    _run_context: &Value,
     outcome: std::result::Result<&Value, &Error>,
     started_at: &str,
     ended_at: &str,
     interaction_capability: Option<&str>,
     deployment_persistence_lease: Option<super::DeploymentPersistenceLease>,
 ) -> Option<PendingCapture> {
-    let extraction = match (extractor, outcome) {
+    let mut extraction = match (extractor, outcome) {
         (Extractor::Shipped(kind), Ok(result)) => extract(kind, original_arguments, result),
         (Extractor::Custom(CustomInteractionPolicy::NoRecordInteractions), Ok(_)) => {
             Extraction::success()
@@ -2541,8 +3035,47 @@ fn prepare_capture(
         (Extractor::Shipped(kind), Ok(result)) => work_overlap_result_annotation(kind, result),
         _ => None,
     };
-    let arguments = match serde_json::to_string(&captured_arguments(extractor, original_arguments))
-    {
+    // PR A capture filtering: disposable pure-read exhaust earns no row.
+    // Fail-open is preserved — the tap never raises to the caller; a dropped
+    // row is simply not enqueued, exactly like an unserializable envelope.
+    if !should_retain_capture(
+        extractor,
+        original_arguments,
+        outcome.is_ok(),
+        &extraction,
+        result_annotation.is_some(),
+    ) {
+        return None;
+    }
+    // Bootstrap is retained only as run-key issuance/parentage evidence. Its
+    // orientation payload can surface many records; those touches are the
+    // disposable attention tier and must not hitch a ride on the retained
+    // envelope. The historical cleanup applies this same row/touch split.
+    let read_issuance =
+        matches!(extractor, Extractor::Shipped(kind) if is_read_issuance(kind, original_arguments));
+    let issuance = matches!(extractor, Extractor::Shipped(ToolKind::Bootstrap)) || read_issuance;
+    if issuance {
+        extraction.touches.clear();
+    }
+    // Unused exhaust columns have no production reader: stop writing
+    // `result_count`, `result_bytes` and per-touch `result_rank`. The columns
+    // stay (no migration in PR A); retained rows store NULLs.
+    extraction.result_count = None;
+    for touch in &mut extraction.touches {
+        touch.result_rank = None;
+    }
+    // Issuance retains only the caller-supplied run-key selector. Record IDs,
+    // search text and bootstrap orientation arguments are attention, not run
+    // identity. The validated run and parent keys live in separate columns.
+    let stored_arguments = if issuance {
+        match original_arguments.get("run_key") {
+            Some(run_key) => serde_json::json!({ "run_key": run_key }),
+            None => serde_json::json!({}),
+        }
+    } else {
+        captured_arguments(extractor, original_arguments)
+    };
+    let arguments = match serde_json::to_string(&stored_arguments) {
         Ok(arguments) => arguments,
         Err(_) => return None,
     };
@@ -2573,7 +3106,10 @@ fn prepare_capture(
         error,
         extraction,
         result_annotation,
-        result_bytes: response_bytes(outcome, run_context),
+        // PR A stops writing response bytes: no production reader selects
+        // `result_bytes` (audit increment 2). The column stays; rows store
+        // NULL. `run_context` is therefore unused by capture (see param).
+        result_bytes: None,
         started_at: started_at.to_string(),
         ended_at: ended_at.to_string(),
         _deployment_persistence_lease: deployment_persistence_lease,
@@ -2802,6 +3338,51 @@ mod tests {
                 &json!({"provider":"private invalid provider", "token":"private token"})
             ),
             json!({})
+        );
+    }
+
+    #[test]
+    fn workspace_snapshot_extraction_surfaces_referenced_records() {
+        fn touched(result: &Value) -> Vec<String> {
+            extract(ToolKind::GetWorkspaceSnapshot, &json!({}), result)
+                .touches
+                .into_iter()
+                .map(|touch| touch.record_id)
+                .collect()
+        }
+        // Facet rows name facets; the touched record is record_id.
+        assert_eq!(
+            touched(&json!({
+                "section": "facets",
+                "rows": [{ "id": "facet-1", "record_id": "rec-a", "key": "k" }]
+            })),
+            vec!["rec-a"]
+        );
+        // Link rows name both endpoints.
+        assert_eq!(
+            touched(&json!({
+                "section": "links",
+                "rows": [{ "id": "link-1", "source_id": "rec-a", "target_id": "rec-b" }]
+            })),
+            vec!["rec-a", "rec-b"]
+        );
+        // Event rows name their record.
+        assert_eq!(
+            touched(&json!({
+                "section": "content_events",
+                "rows": [{ "id": "evt-1", "record_id": "rec-c" }]
+            })),
+            vec!["rec-c"]
+        );
+        // Deltas cover every array; facet, link, and event ids never surface.
+        assert_eq!(
+            touched(&json!({
+                "upsert_records": [{ "id": "rec-a" }],
+                "upsert_facets": [{ "id": "facet-9", "record_id": "rec-b" }],
+                "upsert_links": [{ "id": "link-9", "source_id": "rec-c", "target_id": "rec-d" }],
+                "content_events": [{ "id": "evt-9", "record_id": "rec-e" }]
+            })),
+            vec!["rec-a", "rec-b", "rec-c", "rec-d", "rec-e"]
         );
     }
 
@@ -3035,6 +3616,22 @@ mod tests {
                 result_count: Some(0),
             },
             Case {
+                name: "authority_act_head returns replicated coordinates, not record results",
+                kind: ToolKind::AuthorityActHead,
+                arguments: json!({}),
+                result: json!({ "head": { "head_act": 7 } }),
+                touches: vec![],
+                result_count: Some(0),
+            },
+            Case {
+                name: "authority_act_delta returns canonical bytes, not record results",
+                kind: ToolKind::AuthorityActDelta,
+                arguments: json!({ "from_exclusive_act": 0 }),
+                result: json!({ "to_inclusive_act": 7, "data_base64": "AA==" }),
+                touches: vec![],
+                result_count: Some(0),
+            },
+            Case {
                 name: "reach search counts provider results without Native record touches",
                 kind: ToolKind::ReachRead,
                 arguments: json!({ "action": "search_slack", "query": "release" }),
@@ -3239,6 +3836,37 @@ mod tests {
                 }),
                 touches: vec![mutated("changed")],
                 result_count: Some(2),
+            },
+            Case {
+                name: "batch_write mutates only changed positional outcomes",
+                kind: ToolKind::BatchWrite,
+                arguments: json!({}),
+                result: json!({
+                    "requested":2,
+                    "changed":1,
+                    "unchanged":1,
+                    "results":[
+                        {"index":0,"op":"update","id":"changed","status":"changed"},
+                        {"index":1,"op":"archive","id":"same","status":"unchanged"}
+                    ]
+                }),
+                touches: vec![mutated("changed")],
+                result_count: Some(2),
+            },
+            Case {
+                name: "batch_write link items mutate source and target",
+                kind: ToolKind::BatchWrite,
+                arguments: json!({}),
+                result: json!({
+                    "requested":1,
+                    "changed":1,
+                    "unchanged":0,
+                    "results":[
+                        {"index":0,"op":"add_link","id":"source","target_id":"target","status":"changed"}
+                    ]
+                }),
+                touches: vec![mutated("source"), mutated("target")],
+                result_count: Some(1),
             },
             Case {
                 name: "claim_unowned_record mutates its claimed target",
@@ -3835,6 +4463,19 @@ mod tests {
                 result_count: Some(2),
             },
             Case {
+                name: "workspace_read lists workspace directories without fabricating record touches",
+                kind: ToolKind::WorkspaceRead,
+                arguments: json!({ "action": "list" }),
+                result: json!({
+                    "workspaces": [
+                        { "id": "workspace-a", "short_ref": "workspac" },
+                        { "id": "workspace-b", "short_ref": "workspac" },
+                    ],
+                }),
+                touches: vec![],
+                result_count: Some(2),
+            },
+            Case {
                 name: "manage_change_summaries mutates its stable carrier",
                 kind: ToolKind::ManageChangeSummaries,
                 arguments: json!({ "action": "confirm" }),
@@ -3930,6 +4571,59 @@ mod tests {
                 }),
                 touches: vec![mutated("artifact")],
                 result_count: Some(1),
+            },
+            Case {
+                name: "advance_artifact_port_pin mutates the artifact and surfaces the bound Collection",
+                kind: ToolKind::AdvanceArtifactPortPin,
+                arguments: json!({ "artifact_id": "artifact", "port_name": "rows" }),
+                result: json!({ "artifact_id": "artifact", "collection_id": "events" }),
+                touches: vec![mutated("artifact"), surfaced("events", 1)],
+                result_count: Some(1),
+            },
+            Case {
+                name: "manage_surface_bindings set mutates the source and its bound artifact",
+                kind: ToolKind::ManageSurfaceBindings,
+                arguments: json!({ "action": "set" }),
+                result: json!({
+                    "status": "bound",
+                    "scope": "personal",
+                    "source_id": "person",
+                    "resolution": { "source": "personal", "target_id": "artifact" },
+                }),
+                touches: vec![mutated("person"), mutated("artifact")],
+                result_count: Some(1),
+            },
+            Case {
+                name: "manage_alpha_tabs list surfaces each install's artifact and counts installs",
+                kind: ToolKind::ManageAlphaTabs,
+                arguments: json!({ "action": "list" }),
+                result: json!({
+                    "installs": [{ "artifact_id": "a1" }, { "artifact_id": "a2" }],
+                }),
+                touches: vec![surfaced("a1", 1), surfaced("a2", 2)],
+                result_count: Some(2),
+            },
+            Case {
+                name: "manage_alpha_tabs install surfaces the pinned artifact without mutating it",
+                kind: ToolKind::ManageAlphaTabs,
+                arguments: json!({ "action": "install" }),
+                result: json!({
+                    "changed": true,
+                    "install": { "artifact_id": "a1" },
+                }),
+                touches: vec![surfaced("a1", 1)],
+                result_count: Some(1),
+            },
+            Case {
+                name: "manage_alpha_tabs live_read surfaces the pinned artifact and every live row",
+                kind: ToolKind::ManageAlphaTabs,
+                arguments: json!({ "action": "live_read" }),
+                result: json!({
+                    "pin": { "artifact_id": "a1" },
+                    "input": { "records": [{ "id": "r1" }, { "id": "r2" }] },
+                }),
+                touches: vec![surfaced("a1", 1), surfaced("r1", 2), surfaced("r2", 3)],
+                result_count: Some(2),
             },
             Case {
                 name: "manage_renderer_binding implicit unbind mutates both endpoints and counts its removed link",
@@ -4110,6 +4804,25 @@ mod tests {
                 result_count: Some(3),
             },
             Case {
+                name: "save_account mutates the authored document",
+                kind: ToolKind::SaveAccount,
+                arguments: json!({}),
+                result: json!({"record_id": "account"}),
+                touches: vec![mutated("account")],
+                result_count: Some(1),
+            },
+            Case {
+                name: "get_reuse_context opens the addressed account",
+                kind: ToolKind::GetReuseContext,
+                arguments: json!({}),
+                result: json!({"record_id": "account",
+                    "basis":{"sources":[{"record_id":"source"}]},
+                    "concerns":{"entries":[{"comment_id":"concern","replies":[{"comment_id":"reply"}]}]},
+                    "treatment":{"entries":[{"comment_id":"resolved"}]}}),
+                touches: vec![opened("account"), surfaced("source", 1), surfaced("concern", 2), surfaced("reply", 3), surfaced("resolved", 4)],
+                result_count: Some(1),
+            },
+            Case {
                 name: "get_event_context opens the event target, not the records it reports as consulted",
                 kind: ToolKind::GetEventContext,
                 arguments: json!({ "event_id": "event" }),
@@ -4145,6 +4858,27 @@ mod tests {
                 result: json!({ "outcome": "rejected" }),
                 touches: vec![],
                 result_count: Some(1),
+            },
+            Case {
+                name: "get_workspace_snapshot surfaces delta records, never row ids",
+                kind: ToolKind::GetWorkspaceSnapshot,
+                arguments: json!({ "action": "catch_up", "snapshot_token": "tok" }),
+                result: json!({
+                    "upsert_records": [{ "id": "rec-a" }],
+                    "upsert_facets": [{ "id": "facet-9", "record_id": "rec-b" }],
+                    "upsert_links": [{
+                        "id": "link-9", "source_id": "rec-c", "target_id": "rec-d",
+                    }],
+                    "content_events": [{ "id": "evt-9", "record_id": "rec-e" }],
+                }),
+                touches: vec![
+                    surfaced("rec-a", 1),
+                    surfaced("rec-b", 2),
+                    surfaced("rec-c", 3),
+                    surfaced("rec-d", 4),
+                    surfaced("rec-e", 5),
+                ],
+                result_count: Some(4),
             },
         ]);
 

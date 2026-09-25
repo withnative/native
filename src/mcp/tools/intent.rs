@@ -12,6 +12,7 @@ use crate::query::lineage;
 
 use super::super::registry::{Caller, ToolRegistry};
 use super::super::ToolKind;
+use super::lifecycle::SOURCE_BASIS_FORMAT;
 use super::work::work_overlap_for_record;
 use super::{can_record, parse_args};
 
@@ -21,19 +22,30 @@ const NON_TERMINAL_LIMIT: usize = 20;
 const UNCLASSIFIED_LIFECYCLE_LIMIT: usize = 20;
 const CLAIM_LIMIT: usize = 20;
 const CLAIM_CANDIDATE_LIMIT: usize = 100;
-/// Anchors named in `overlapping_claims.items`: open-claim records first,
-/// then records this run touched, deduplicated, in that order.
+/// Anchors named in `overlapping_claims.items`: open claims first, then
+/// retained action touches and declared sources, deduplicated.
 const OVERLAP_ANCHOR_CAP: usize = 10;
 
 // The briefing version describes the compatible response family. New bounded
-// sections are additive within v1; bump it only when an existing field's
-// meaning or shape changes.
-const BRIEFING_VERSION: u8 = 1;
+// sections are additive within a version; bump it when an existing field's
+// meaning or shape changes. v2 changed the meaning of a declaration's
+// `touched_records`: it now folds DECLARED sources from content events rather
+// than touched records from the read log, and its item shape changed to match
+// (declaring `reason`/`role`/revision bearing, no `interactions` count). The
+// key and bounded `{items,total_count,truncated}` wrapper are unchanged, and
+// `resume.touched_records` remains a run-level list of retained touches. Its
+// observational tier is partial once capture filtering begins.
+const BRIEFING_VERSION: u8 = 2;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SetIntentArgs {
     intent: String,
+    /// Optional self-declared model name: the model's own claim about which
+    /// model is running this turn. Free prose, stored exactly as given —
+    /// never normalised against a model list — and fixed for the run.
+    #[serde(default)]
+    model: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -91,6 +103,12 @@ pub(crate) fn declare_without_activity_briefing(arguments: Value) -> Result<Valu
         "accepted_intent": args.intent,
         "briefing_version": BRIEFING_VERSION,
         "briefing": unavailable_briefing("backend_not_qualified"),
+        "declared_model": {
+            "declared": args.model,
+            "recorded": Value::Null,
+            "refused": false,
+            "note": "This backend does not stamp run identity, so a declared model is carried but nothing is recorded. Declare `model` on the first set_intent call of runs admitted by the qualified backend instead. A declaration is the model's own unverified claim, fixed per run, and grants no capability.",
+        },
     }))
 }
 
@@ -160,6 +178,157 @@ async fn touched_between(
     Ok(bounded(items, total, limit))
 }
 
+/// The declared source basis folded per intent episode, from canonical
+/// content-event envelopes — never from the disposable read log.
+///
+/// Each episode keeps the `touched_records` key and its bounded
+/// `{items, total_count, truncated}` shape, but the items are the records
+/// this run's writes in that episode DECLARED they rested on
+/// (`native.source-basis.v1` on the write event — `record.created`, the
+/// body-bearing `record.updated`, or the first facet event of an update call,
+/// exactly the placement the `reason` key follows), not the records the run
+/// merely touched. An item carries the declaring detail
+/// the old touch summary has room for — the declared `reason`, `role` and
+/// revision bearing — and `last_touched_at` is the last declaring write in
+/// the episode. There is no `interactions` count: touches were not consulted,
+/// and a zeroed count would claim a measurement that never happened.
+///
+/// Scope is temporal, mirroring `consulted_context`'s cross-tier rule:
+/// `read_log_calls.seq` and `content_events.seq` are unrelated counters, so
+/// episodes are windows over `created_at` between one declaration's
+/// `ended_at` and the next — never sequence comparisons across tiers, and
+/// never grouping by intent text, which cannot tell two episodes apart when
+/// the same aim is declared twice.
+///
+/// The window is HALF-OPEN: the lower edge (`after_ended_at`, this
+/// declaration's `ended_at`) is inclusive, the upper edge (`before_ended_at`,
+/// the next declaration's `ended_at`) is exclusive. A write stamped exactly
+/// at the next declaration's response time therefore belongs only to the new
+/// episode, never to both, so adjacent windows cannot double-count it.
+async fn declared_sources_between(
+    db: &Db,
+    caller: &Caller,
+    run_key: &str,
+    after_ended_at: &str,
+    before_ended_at: Option<&str>,
+    limit: usize,
+) -> Result<Value> {
+    let rows = sqlx::query(
+        "SELECT id, payload, created_at FROM content_events
+          WHERE run_key = ? AND created_at >= ? AND (?3 IS NULL OR created_at < ?3)
+          ORDER BY created_at DESC, id DESC",
+    )
+    .bind(run_key)
+    .bind(after_ended_at)
+    .bind(before_ended_at)
+    .bind(before_ended_at)
+    .fetch_all(db.write_pool())
+    .await?;
+    // De-duplicate per record, keeping the LATEST declaring write. A record
+    // cited three times in one episode is one declared source, not three.
+    let mut latest: std::collections::BTreeMap<String, Value> = std::collections::BTreeMap::new();
+    for row in rows.iter() {
+        let created_at: String = row.try_get("created_at")?;
+        let payload_raw: Option<String> = row.try_get("payload")?;
+        let Some(payload_raw) = payload_raw.as_deref() else {
+            continue;
+        };
+        let Ok(payload) = serde_json::from_str::<Value>(payload_raw) else {
+            continue;
+        };
+        let Some(envelope) = payload.get("basis") else {
+            continue;
+        };
+        let is_v1 = envelope.as_object().is_some_and(|object| {
+            object.get("format").and_then(Value::as_str) == Some(SOURCE_BASIS_FORMAT)
+        });
+        if !is_v1 {
+            continue;
+        }
+        let Some(declared) = envelope.get("sources").and_then(Value::as_array) else {
+            continue;
+        };
+        for entry in declared {
+            let Some(record_id) = entry.get("record_id").and_then(Value::as_str) else {
+                continue;
+            };
+            if latest.contains_key(record_id) {
+                continue;
+            }
+            let field = |key: &str| {
+                entry
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .map_or(Value::Null, |value| json!(value))
+            };
+            latest.insert(
+                record_id.to_string(),
+                json!({
+                    "record_id": record_id,
+                    "last_touched_at": created_at,
+                    "reason": field("reason"),
+                    "role": field("role"),
+                    "revision_event_id": field("revision_event_id"),
+                    "revision_supplied_by": field("revision_supplied_by"),
+                }),
+            );
+        }
+    }
+    let mut items = Vec::new();
+    for (record_id, mut item) in latest {
+        // The deep-link rule applies here too: a hidden source is omitted
+        // WITHOUT disclosing that it existed — not even in `total_count`.
+        if !can_record(db, caller, &record_id, Capability::View).await? {
+            continue;
+        }
+        let display: Option<(String, String, Option<String>)> =
+            sqlx::query_as("SELECT name, type, lifecycle FROM records WHERE id = ?")
+                .bind(&record_id)
+                .fetch_optional(db.write_pool())
+                .await?;
+        let Some((name, record_type, lifecycle)) = display else {
+            continue;
+        };
+        item.as_object_mut()
+            .expect("declared item is an object")
+            .insert("id".into(), Value::String(record_id));
+        item.as_object_mut()
+            .expect("declared item is an object")
+            .insert("name".into(), Value::String(name));
+        item.as_object_mut()
+            .expect("declared item is an object")
+            .insert("type".into(), Value::String(record_type));
+        item.as_object_mut()
+            .expect("declared item is an object")
+            .insert(
+                "lifecycle".into(),
+                lifecycle.map_or(Value::Null, Value::String),
+            );
+        // `record_id` was the fold key; `id` is the shape's key. Both name
+        // the same record, and the shape keeps exactly one.
+        item.as_object_mut()
+            .expect("declared item is an object")
+            .shift_remove("record_id");
+        items.push(item);
+    }
+    // Rows arrived most-recent-first and `BTreeMap` iteration is by record
+    // id, so restore recency order explicitly: the episode's latest declared
+    // source reads first, as touches did.
+    items.sort_by(|left, right| {
+        right
+            .get("last_touched_at")
+            .and_then(Value::as_str)
+            .cmp(&left.get("last_touched_at").and_then(Value::as_str))
+            .then_with(|| {
+                left.get("id")
+                    .and_then(Value::as_str)
+                    .cmp(&right.get("id").and_then(Value::as_str))
+            })
+    });
+    let total = items.len();
+    Ok(bounded(items, total, limit))
+}
+
 async fn declarations(
     db: &Db,
     caller: &Caller,
@@ -167,7 +336,7 @@ async fn declarations(
     pending: Option<(&str, &str)>,
 ) -> Result<Value> {
     let rows = sqlx::query(
-        "SELECT seq, intent, started_at
+        "SELECT seq, intent, started_at, ended_at
            FROM read_log_calls
           WHERE run_key = ? AND tool = 'set_intent' AND outcome = 'ok'
             AND intent IS NOT NULL
@@ -183,15 +352,26 @@ async fn declarations(
         if index < keep_from {
             continue;
         }
-        let seq: i64 = row.try_get("seq")?;
-        let before = rows
+        // The episode this declaration opens runs from its response time to
+        // the next declaration's response time. `ended_at` carries the
+        // boundary; `started_at` is only the fallback a missing stamp would
+        // need, since an unbounded lower edge would misattribute the whole
+        // run's earlier writes into this episode.
+        let started_at: String = row.try_get("started_at")?;
+        let ended_at: Option<String> = row.try_get("ended_at")?;
+        let lower = ended_at.as_deref().unwrap_or(&started_at);
+        let before: Option<String> = rows
             .get(index + 1)
-            .map(|next| next.try_get::<i64, _>("seq"))
-            .transpose()?;
+            .map(|next| {
+                next.try_get::<Option<String>, _>("ended_at")
+                    .map(|ended| ended.or_else(|| next.try_get::<String, _>("started_at").ok()))
+            })
+            .transpose()?
+            .flatten();
         items.push(json!({
             "intent": row.try_get::<String, _>("intent")?,
-            "declared_at": row.try_get::<String, _>("started_at")?,
-            "touched_records": touched_between(db, caller, run_key, seq, before, TOUCHED_LIMIT).await?,
+            "declared_at": started_at,
+            "touched_records": declared_sources_between(db, caller, run_key, lower, before.as_deref(), TOUCHED_LIMIT).await?,
         }));
     }
     if let Some((intent, declared_at)) = pending {
@@ -324,6 +504,7 @@ async fn resume(db: &Db, caller: &Caller) -> Result<Value> {
         "duration_ms": duration_ms,
         "declarations": declarations(db, caller, &prior_key, None).await?,
         "touched_records": touched_between(db, caller, &prior_key, -1, None, TOUCHED_LIMIT).await?,
+        "touched_records_completeness": "retained_rows_only",
         "left_non_terminal": left_non_terminal,
         "unclassified_lifecycle": unclassified_lifecycle,
     }))
@@ -407,8 +588,8 @@ async fn open_claims(db: &Db, caller: &Caller) -> Result<Value> {
 }
 
 /// Neighbouring claims around the records this briefing already names:
-/// the caller's open claims first, then the records this run has touched,
-/// deduplicated, in that order. Each anchor with a non-empty overlap window
+/// the caller's open claims first, then retained action touches and declared
+/// sources, deduplicated, in that order. Each anchor with a non-empty window
 /// is named with its window; unlike the claim-time notice the anchor ITSELF
 /// is folded in as a `same_record` item when another holder claims it, so a
 /// run that walked straight into someone else's claim sees it here.
@@ -430,16 +611,23 @@ async fn overlapping_claims(db: &Db, caller: &Caller, open: &Value) -> Result<Va
         })
         .unwrap_or_default();
     if let Some(run_key) = caller.run_key() {
-        let touched = touched_between(db, caller, run_key, -1, None, TOUCHED_LIMIT).await?;
-        for item in touched
-            .get("items")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-        {
-            if let Some(id) = item.get("id").and_then(Value::as_str) {
-                if !anchors.iter().any(|anchor| anchor == id) {
-                    anchors.push(id.to_string());
+        // Capture omits pure reads. Preserve anchors from retained action
+        // touches, including undeclared mutations, and add the sources this
+        // run's writes declared across its episodes.
+        let retained = touched_between(db, caller, run_key, -1, None, TOUCHED_LIMIT).await?;
+        let declared =
+            declared_sources_between(db, caller, run_key, "", None, TOUCHED_LIMIT).await?;
+        for section in [&retained, &declared] {
+            for item in section
+                .get("items")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                if let Some(id) = item.get("id").and_then(Value::as_str) {
+                    if !anchors.iter().any(|anchor| anchor == id) {
+                        anchors.push(id.to_string());
+                    }
                 }
             }
         }
@@ -494,11 +682,121 @@ async fn briefing(db: &Db, caller: &Caller, intent: &str) -> Value {
 
 async fn set_intent(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
     let args: SetIntentArgs = parse_args("set_intent", arguments)?;
+    let declared_model = declared_model(&db, &caller, args.model).await;
     Ok(json!({
         "accepted_intent": args.intent,
         "briefing_version": BRIEFING_VERSION,
         "briefing": briefing(&db, &caller, &args.intent).await,
+        "declared_model": declared_model,
     }))
+}
+
+/// Honesty paragraph shared by every declared-model response note. It names
+/// the real beneficiary, states both limits (per-run fixity and no better
+/// source coming), and claims no benefit that is not true: the value grants
+/// no capability and does not affect routing, permission, gating or rendering
+/// priority.
+const DECLARED_MODEL_ABOUT: &str = "Declare once, on the first set_intent of the run: the first declaration wins and a later differing one is refused, while repeating the recorded value is harmless. The value is the model's own unverified claim about itself, fixed per run — a mid-run model switch leaves it naming the earlier model — and no launcher-independent source will correct it. It grants no capability and does not affect routing, permission, gating or rendering priority; it exists so a future reader attributing this run's work to a model, person or agent, has the claim on record.";
+
+fn declared_model_note(sentence: String) -> String {
+    format!("{sentence} {DECLARED_MODEL_ABOUT}")
+}
+
+/// Confirmation of what this response actually records for the run's
+/// self-declared model: what this call declared, what the run has recorded,
+/// and whether this call's declaration was refused.
+///
+/// A refusal is response-level, never a failed call: the intent declaration
+/// still lands and the briefing is still returned, because an unverified
+/// value must never decide whether the declaration itself succeeds. What the
+/// refusal costs the claim is exactly what it says — the recorded model is
+/// unchanged — and the response is where the caller is told.
+///
+/// This handler runs before the governed wrapper persists the declaration, so
+/// the confirmation is computed optimistically — and it is exact on every
+/// path where the response survives: on an existing run persistence never
+/// touches the model, so the pre-read stored value is the post-call one; on
+/// a new run admission stamps exactly the clamped declaration. A read failure
+/// degrades to the same optimism: anything that breaks the read breaks
+/// persistence too, and a failed call carries no confirmation.
+async fn declared_model(db: &Db, caller: &Caller, declared: Option<String>) -> Value {
+    let Some(run_key) = caller.run_key() else {
+        return json!({
+            "declared": declared,
+            "recorded": Value::Null,
+            "refused": false,
+            "note": declared_model_note(
+                "No run context on this call, so nothing is recorded.".into(),
+            ),
+        });
+    };
+    let clamped = crate::control::ReportedRunIdentity {
+        model: declared.clone(),
+        ..Default::default()
+    }
+    .clamped()
+    .model;
+    let stored: Option<Option<String>> =
+        crate::control::read_agent_run_reported_identity(db, run_key)
+            .await
+            .ok()
+            .flatten()
+            .map(|identity| identity.model);
+    match stored {
+        Some(recorded) => {
+            let (sentence, refused) = match &recorded {
+                Some(recorded) => {
+                    let repeated = declared.as_deref() == Some(recorded.as_str());
+                    let refused = declared.is_some() && !repeated;
+                    let mut sentence = format!(
+                        "This run already records declared model '{recorded}'."
+                    );
+                    if refused {
+                        sentence.push_str(&format!(
+                            " The declaration of '{}' is refused and the recorded model is unchanged. This call's intent is still recorded and its briefing still returned.",
+                            declared.as_deref().unwrap_or_default()
+                        ));
+                    } else if declared.is_some() {
+                        sentence.push_str(
+                            " The repeated declaration matches, so this call succeeds unchanged.",
+                        );
+                    }
+                    (sentence, refused)
+                }
+                None => match declared {
+                    Some(_) => (
+                        "This run records no declared model: none was declared on the call that admitted it, and a later declaration cannot be recorded. The declaration is refused; this call's intent is still recorded normally. Declare 'model' on the first set_intent call of the run."
+                            .into(),
+                        true,
+                    ),
+                    None => (
+                        "This run records no declared model: none was declared on the call that admitted it, and a later declaration cannot be recorded."
+                            .into(),
+                        false,
+                    ),
+                },
+            };
+            json!({
+                "declared": declared,
+                "recorded": recorded,
+                "refused": refused,
+                "note": declared_model_note(sentence),
+            })
+        }
+        None => {
+            let sentence = match clamped.clone() {
+                Some(model) => format!("Recorded '{model}' as this run's declared model."),
+                None => "No model was declared on this call, so this run records none; a later call cannot add one."
+                    .into(),
+            };
+            json!({
+                "declared": declared,
+                "recorded": clamped,
+                "note": declared_model_note(sentence),
+                "refused": false,
+            })
+        }
+    }
 }
 
 async fn close_run(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
@@ -519,6 +817,10 @@ pub fn register_intent_tool(registry: &mut ToolRegistry) -> Result<()> {
     registry.register(
         ToolKind::SetIntent,
         "Declare this run's current intent and receive a bounded structural briefing. \
+         Optionally self-declare the running model with `model`: a free-form name recorded once, at run admission, \
+         so a future reader attributing this work has the claim on record. \
+         The first declaration wins — a later differing one is refused, while repeating the recorded value is harmless. \
+         A self-declaration is the model's own unverified claim, fixed per run, and grants nothing. \
          Finish the durable activity explicitly with close_run.",
         json!({
             "type": "object",
@@ -526,6 +828,10 @@ pub fn register_intent_tool(registry: &mut ToolRegistry) -> Result<()> {
                 "intent": {
                     "type": "string",
                     "description": "Free prose describing what this run is trying to accomplish."
+                },
+                "model": {
+                    "type": "string",
+                    "description": "Optional self-declared model name for this run (for example the model running this turn). Stored exactly as given up to 256 bytes — never normalised against a list — and fixed for the run: the first declaration wins and a later differing one is refused. Unverified and per-run: it says which model claimed the run at admission, grants no capability, and does not affect routing, permission, gating or rendering priority."
                 }
             },
             "required": ["intent"],

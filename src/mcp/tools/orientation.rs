@@ -66,7 +66,15 @@ const MAX_DASHBOARD_LIMIT: usize = 100;
 /// with the guaranteed orientation, and caller-visible previews cannot expand
 /// with the size of the database. The transport ceiling is derived from every
 /// valid component rather than serving as the design input for the prose.
-pub const MAX_BOOTSTRAP_ORIENTATION_BYTES: usize = 8 * 1024;
+///
+/// Raised from 8 KiB to 9 KiB on 20 Sep 2026, against that preference, because
+/// the declared source basis needs one standing sentence and the capsule stood
+/// eight bytes inside the old bound. The sentence carries the two reasons the
+/// agent acts on — that the declaration is the only account surviving its own
+/// context window, and that it is what lets the person it acts for see the
+/// basis — so the prose could not be shortened to fit. This is a required
+/// product guidance cost, not a widening; `cc34ddc` remains the question.
+pub const MAX_BOOTSTRAP_ORIENTATION_BYTES: usize = 9 * 1024;
 pub const MAX_BOOTSTRAP_FOOTING_BYTES: usize = 8 * 1024;
 pub const MAX_BOOTSTRAP_CURRENT_WORLD_BYTES: usize = 8 * 1024;
 pub const MAX_BOOTSTRAP_INTENTFUL_SESSIONS_BYTES: usize = 2 * 1024;
@@ -293,7 +301,7 @@ async fn principal_footing(db: &Db, caller: &Caller, observed_at: &str) -> Resul
         let deleted: Option<String> = row.try_get("deleted_at")?;
         let capability = authorization::effective_capability_on(
             &mut private_tx,
-            crate::authorization::Principal::bound(caller.credential(), true),
+            crate::authorization::Principal::bound(caller.credential(), caller.is_host_member()),
             &root_record_id,
         )
         .await
@@ -767,9 +775,13 @@ pub(crate) async fn resolve_session_footing(db: &Db, caller: &Caller, tool: &str
         "content": crate::instructions::ENGINE_ORIENTATION,
         "ownership": "build-owned and guaranteed independently of portable instruction resolution",
     });
-    let portable_resolution =
-        crate::instructions::resolve_for_account(db.pool(), caller.credential(), Some(&run_key))
-            .await?;
+    let portable_resolution = crate::instructions::resolve_for_account(
+        db.pool(),
+        caller.credential(),
+        caller.is_host_member(),
+        Some(&run_key),
+    )
+    .await?;
     let portable_status = portable_resolution.instructions.status.clone();
     let portable_entry_count = portable_resolution.instructions.entries.len();
     let pending_obligation_count = portable_resolution.pending_obligations.len();
@@ -851,7 +863,12 @@ pub(crate) async fn resolve_session_footing(db: &Db, caller: &Caller, tool: &str
         "declaration_tool": "set_intent",
         "briefing_location": "the separate set_intent response",
         "why": "Native uses agent-declared intent to return a purpose-relative briefing, connect work into an inspectable run, surface resumable work and open claims, and leave a more intelligible hand-off.",
-        "guidance": "Infer a clear intent from the user's request rather than asking them to repeat it. Update the declaration when the underlying aim materially changes.",
+        "guidance": "Infer a clear intent from the user's request rather than asking them to repeat it. When the underlying aim materially changes, update it with set_intent; this does not create a new bootstrap boundary.",
+        "declared_model": {
+            "how": "Name the model with `model` on the run's first set_intent.",
+            "why": "So the person or agent later reading this run — e.g. the model evaluation ledger — knows which model claimed it.",
+            "limits": "First wins; differing repeats are refused. Unverified, per-run, grants nothing, no launcher-independent source coming; terms in set_intent.",
+        },
         "boundaries": [
             {
                 "kind": "bootstrap",
@@ -874,7 +891,7 @@ pub(crate) async fn resolve_session_footing(db: &Db, caller: &Caller, tool: &str
     let session = json!({
         "run_key": run["run_key"],
         "reuse_required": true,
-        "guidance": "Reuse this exact key as run_key on subsequent calls, reads included. It groups this session's reads and writes for continuity, inspection, and recovery.",
+        "guidance": "This successful bootstrap establishes the one run key for this fresh host conversation. Reuse this exact key as run_key on subsequent calls, reads included. Later user turns, task/intent/artifact changes, or renewed Native use are not new bootstrap boundaries; use set_intent when the aim materially changes. Only the host can determine a fresh conversation: Native has no trustworthy host-conversation identity and does not deduplicate by conversation/account.",
         "whole_run_rollback": false,
     });
     let engine = json!({
@@ -1038,7 +1055,7 @@ async fn get_structure(db: Db, caller: Caller, mut arguments: Value) -> Result<V
     // See `resolve_session_footing` for the same seam choice.
     require_record_in_pool(db.pool(), &caller, TOOL, &args.root_id, Capability::View).await?;
     let Some(selector) = as_of else {
-        return get_structure_from_lens(&ReadLens::live(&db), &caller, args).await;
+        return get_structure_from_lens(&ReadLens::live(&db), Some(&db), &caller, args).await;
     };
     let resolved = lens::resolve_as_of_in_pool(db.pool(), selector).await?;
     let scratch = open_database(":memory:").await?;
@@ -1046,7 +1063,7 @@ async fn get_structure(db: Db, caller: Caller, mut arguments: Value) -> Result<V
         apply_schema(&scratch).await?;
         lens::replay_projection_in_pool(db.pool(), &scratch, resolved.resolved_content_seq).await?;
         let read_lens = ReadLens::historical(&scratch, &db, &resolved);
-        let mut output = get_structure_from_lens(&read_lens, &caller, args).await?;
+        let mut output = get_structure_from_lens(&read_lens, None, &caller, args).await?;
         lens::echo_temporal(&mut output, &resolved);
         Ok(output)
     }
@@ -1057,6 +1074,7 @@ async fn get_structure(db: Db, caller: Caller, mut arguments: Value) -> Result<V
 
 async fn get_structure_from_lens(
     lens: &ReadLens<'_>,
+    live_db: Option<&Db>,
     caller: &Caller,
     args: GetStructureArgs,
 ) -> Result<Value> {
@@ -1106,16 +1124,30 @@ async fn get_structure_from_lens(
     };
     let max_depth = opts.max_depth;
     let max_children_per_node = opts.max_children_per_node;
-    let nodes = if super::is_legacy_local(caller) {
-        tree::descendants_from(lens.projection(), &args.root_id, opts).await?
+    // Hosted activity readers have a broader query_sql visible set than this
+    // tool's bound-principal tree policy, so their walk stays governed SQL.
+    let query_principal: crate::query::QueryPrincipal = caller.into();
+    let indexed = if let Some(db) =
+        live_db.filter(|_| !super::is_legacy_local(caller) && !query_principal.activity_read())
+    {
+        db.indexed_structure_nodes(query_principal, &args.root_id, &opts)
+            .await?
     } else {
-        tree::descendants_with_lens_as(lens, &args.root_id, opts, super::principal(caller)).await?
+        None
+    };
+    let (nodes, index_stamp) = if let Some((nodes, stamp)) = indexed {
+        (nodes, Some(stamp))
+    } else {
+        (
+            governed_structure_nodes(lens, caller, &args.root_id, &opts).await?,
+            None,
+        )
     };
     // Both bounds are echoed back: a caller comparing a node's `child_count`
     // against the siblings it received needs to know which cap produced the
     // gap, and defaults it never passed are exactly the ones it does not know.
     let mut output = json!({
-        "root_id": args.root_id,
+        "root_id": args.root_id.clone(),
         "max_depth": max_depth,
         "max_children_per_node": max_children_per_node,
         "nodes": nodes,
@@ -1133,7 +1165,541 @@ async fn get_structure_from_lens(
         )
         .await?;
     }
+    let mut used_index = index_stamp.is_some();
+    if let (Some(db), Some(stamp)) = (live_db, index_stamp) {
+        #[cfg(test)]
+        {
+            let pending = {
+                let mut slot = structure_final_fence_hook().lock().unwrap();
+                if slot
+                    .as_ref()
+                    .is_some_and(|hook| hook.root_id == args.root_id)
+                {
+                    slot.take()
+                } else {
+                    None
+                }
+            };
+            if let Some(hook) = pending {
+                let _ = hook.entered.send(());
+                let _ = hook.resume.await;
+            }
+        }
+        if !db.structure_index_fences_match(stamp).await {
+            used_index = false;
+            // A commit during the successor read invalidates the indexed
+            // tree. Recompute through the existing governed path rather than
+            // return rows from two different content or policy revisions.
+            output["nodes"] =
+                json!(governed_structure_nodes(lens, caller, &args.root_id, &opts).await?);
+            if let Some(nodes) = output.get_mut("nodes").and_then(Value::as_array_mut) {
+                super::lifecycle::annotate_superseded_by_in_pools(
+                    lens.projection().shared_pool(),
+                    lens.meta().shared_pool(),
+                    caller,
+                    nodes,
+                )
+                .await?;
+            }
+        }
+    }
+    crate::mcp::request_timing::record_m4_index_decision(used_index);
     Ok(output)
+}
+
+#[cfg(test)]
+struct StructureFinalFenceHook {
+    root_id: String,
+    entered: tokio::sync::oneshot::Sender<()>,
+    resume: tokio::sync::oneshot::Receiver<()>,
+}
+
+#[cfg(test)]
+fn structure_final_fence_hook() -> &'static std::sync::Mutex<Option<StructureFinalFenceHook>> {
+    static HOOK: std::sync::OnceLock<std::sync::Mutex<Option<StructureFinalFenceHook>>> =
+        std::sync::OnceLock::new();
+    HOOK.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+#[cfg(test)]
+fn structure_final_fence_hook_test_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+async fn governed_structure_nodes(
+    lens: &ReadLens<'_>,
+    caller: &Caller,
+    root_id: &str,
+    opts: &tree::TreeOptions,
+) -> Result<Vec<tree::TreeNode>> {
+    if super::is_legacy_local(caller) {
+        tree::descendants_from(lens.projection(), root_id, opts.clone()).await
+    } else {
+        tree::descendants_with_lens_as(lens, root_id, opts.clone(), super::principal(caller)).await
+    }
+}
+
+#[cfg(test)]
+mod indexed_structure_tests {
+    use super::*;
+    use crate::authorization::{replace_explicit_policy, AllowEntry};
+    use crate::mcp::register_surface_tools;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    async fn create(registry: &ToolRegistry, db: &Db, fields: Value) -> String {
+        let mut fields = fields;
+        fields["reason"] = json!("indexed structure differential fixture");
+        registry
+            .call(db.clone(), Caller::local(), "create_record", fields)
+            .await
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    }
+
+    #[tokio::test]
+    async fn live_index_matches_independent_governed_walk_for_two_principals() {
+        let db = crate::db::create_database(":memory:").await.unwrap();
+        let mut registry = ToolRegistry::new();
+        register_surface_tools(&mut registry).unwrap();
+        let hidden_parent = create(
+            &registry,
+            &db,
+            json!({
+                "type": "Collection", "kind": "folder", "name": "hidden parent"
+            }),
+        )
+        .await;
+        let root = create(
+            &registry,
+            &db,
+            json!({
+                "type": "Collection", "kind": "folder", "name": "root", "home_id": hidden_parent
+            }),
+        )
+        .await;
+        let private = create(
+            &registry,
+            &db,
+            json!({
+                "type": "WorkItem", "kind": "task", "name": "a-private", "home_id": root
+            }),
+        )
+        .await;
+        let folder = create(
+            &registry,
+            &db,
+            json!({
+                "type": "Collection", "kind": "folder", "name": "b-folder", "home_id": root
+            }),
+        )
+        .await;
+        let _nested = create(
+            &registry,
+            &db,
+            json!({
+                "type": "Document", "kind": "note", "name": "nested", "home_id": folder
+            }),
+        )
+        .await;
+        let archived = create(
+            &registry,
+            &db,
+            json!({
+                "type": "Document", "kind": "note", "name": "c-archived", "home_id": root
+            }),
+        )
+        .await;
+        registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "archive_record",
+                json!({
+                    "id": archived, "reason": "indexed structure differential fixture"
+                }),
+            )
+            .await
+            .unwrap();
+        replace_explicit_policy(
+            &db,
+            "test:indexed-structure",
+            &hidden_parent,
+            vec![AllowEntry::account("acct:alice", Capability::View)],
+        )
+        .await
+        .unwrap();
+        replace_explicit_policy(
+            &db,
+            "test:indexed-structure",
+            &root,
+            vec![
+                AllowEntry::account("acct:alice", Capability::View),
+                AllowEntry::account("acct:bea", Capability::View),
+            ],
+        )
+        .await
+        .unwrap();
+        replace_explicit_policy(
+            &db,
+            "test:indexed-structure",
+            &private,
+            vec![AllowEntry::account("acct:alice", Capability::View)],
+        )
+        .await
+        .unwrap();
+
+        let index_options = tree::TreeOptions {
+            max_depth: 2,
+            include_archived: false,
+            max_children_per_node: 1,
+            exclude_types: vec![],
+        };
+        assert!(db
+            .indexed_structure_nodes(
+                (&Caller::authenticated("acct:alice")).into(),
+                &root,
+                &index_options
+            )
+            .await
+            .unwrap()
+            .is_some());
+        let mut unsupported = db.workspace_index_snapshot_for_tests().await.unwrap();
+        let mut annotation = unsupported.records[&private].clone();
+        annotation.id = "10000000-0000-4000-8000-000000000001".into();
+        annotation.record_type = "Annotation".into();
+        let annotation_id = annotation.id.clone();
+        unsupported
+            .records
+            .insert(annotation_id.clone(), annotation);
+        let visible = HashSet::from([root.clone(), annotation_id]);
+        assert!(
+            tree::descendants_from_index(&unsupported, &visible, &root, &index_options).is_none()
+        );
+
+        // The hosted activity credential has broader query_sql visibility
+        // than get_structure's bound-principal walk, so it must use SQL.
+        let activity = unsafe {
+            Caller::authenticated("acct:bea").with_verified_hosted_activity(
+                "host:bea",
+                "db:test",
+                vec![
+                    crate::query::principal::ActivityRosterMember::verified_unchecked(
+                        "acct:bea",
+                        "member:bea",
+                    ),
+                ],
+                true,
+            )
+        }
+        .unwrap();
+        for caller in [
+            Caller::authenticated("acct:alice"),
+            Caller::authenticated("acct:bea"),
+            Caller::local(),
+            activity,
+        ] {
+            for (archived, excluded, cap, depth) in [
+                (false, vec![], 1, 2),
+                (true, vec![], 2, 1),
+                (true, vec!["Document".to_owned()], 2, 2),
+                (false, vec!["Collection".to_owned()], 0, 3),
+            ] {
+                let args = || GetStructureArgs {
+                    root_id: root.clone(),
+                    max_depth: Some(depth),
+                    include_archived: Some(archived),
+                    max_children_per_node: Some(cap),
+                    exclude_types: excluded.clone(),
+                };
+                let lens = ReadLens::live(&db);
+                let governed = get_structure_from_lens(&lens, None, &caller, args())
+                    .await
+                    .unwrap();
+                let indexed = get_structure_from_lens(&lens, Some(&db), &caller, args())
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    indexed,
+                    governed,
+                    "principal={} cap={cap} depth={depth}",
+                    caller.credential()
+                );
+                if caller.credential() == "acct:bea" {
+                    assert_eq!(indexed["nodes"][0]["home_id"], Value::Null);
+                    assert_eq!(indexed["nodes"][0]["containment_path_visible"], false);
+                }
+            }
+        }
+        assert!(db.workspace_index_built_for_tests().await);
+
+        // A policy narrowing moves the held authorization fence. A bounded
+        // rebuild restores indexed service and preserves the governed answer.
+        replace_explicit_policy(
+            &db,
+            "test:indexed-structure",
+            &folder,
+            vec![AllowEntry::account("acct:alice", Capability::View)],
+        )
+        .await
+        .unwrap();
+        let bea = Caller::authenticated("acct:bea");
+        assert!(db
+            .indexed_structure_nodes((&bea).into(), &root, &index_options)
+            .await
+            .unwrap()
+            .is_some());
+        let args = || GetStructureArgs {
+            root_id: root.clone(),
+            max_depth: Some(2),
+            include_archived: Some(false),
+            max_children_per_node: Some(1),
+            exclude_types: vec![],
+        };
+        let lens = ReadLens::live(&db);
+        let recovered = get_structure_from_lens(&lens, Some(&db), &bea, args())
+            .await
+            .unwrap();
+        let governed = get_structure_from_lens(&lens, None, &bea, args())
+            .await
+            .unwrap();
+        assert_eq!(recovered, governed);
+        assert_eq!(recovered["nodes"].as_array().unwrap().len(), 1);
+        assert_eq!(recovered["nodes"][0]["child_count"], 0);
+
+        // Projected-state parity fixture: directly add a semantic_units row
+        // for a Document/note after attaching text. This does not exercise
+        // the supported semantic Unit creation path. In this database state,
+        // query_sql omits the derived attachment's authorization subject,
+        // while the governed tree surfaces it through the authority bearer.
+        // The index must route this shape through the tree's SQL admission.
+        let projected_subject = create(
+            &registry,
+            &db,
+            json!({
+                "type": "Document", "kind": "note", "name": "projected subject", "home_id": root
+            }),
+        )
+        .await;
+        let attachment = registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "attach_text",
+                json!({"record_id": projected_subject, "text": "derived attachment"}),
+            )
+            .await
+            .unwrap()["attachment_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let creation = sqlx::query(
+            "SELECT id, seq, created_at FROM content_events \
+             WHERE record_id = ? AND type = 'record.created'",
+        )
+        .bind(&projected_subject)
+        .fetch_one(db.write_pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO semantic_units \
+             (unit_id, authority_bearer_record_id, creation_event_id, creation_event_seq, created_at) \
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(&projected_subject)
+        .bind(&root)
+        .bind(creation.try_get::<String, _>("id").unwrap())
+        .bind(creation.try_get::<i64, _>("seq").unwrap())
+        .bind(creation.try_get::<String, _>("created_at").unwrap())
+        .execute(db.write_pool())
+        .await
+        .unwrap();
+        let alice = Caller::authenticated("acct:alice");
+        let attachment_args = || GetStructureArgs {
+            root_id: root.clone(),
+            max_depth: Some(1),
+            include_archived: Some(false),
+            max_children_per_node: Some(10),
+            exclude_types: vec![],
+        };
+        let lens = ReadLens::live(&db);
+        let governed_attachment = get_structure_from_lens(&lens, None, &alice, attachment_args())
+            .await
+            .unwrap();
+        let indexed_attachment =
+            get_structure_from_lens(&lens, Some(&db), &alice, attachment_args())
+                .await
+                .unwrap();
+        assert_eq!(indexed_attachment, governed_attachment);
+        assert!(governed_attachment["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|node| node["id"] == attachment));
+
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn indexed_structure_handler_takes_no_write_pool_connection() {
+        let _hook_lock = structure_final_fence_hook_test_lock().lock().await;
+        let db = crate::db::create_database(":memory:").await.unwrap();
+        let mut registry = ToolRegistry::new();
+        register_surface_tools(&mut registry).unwrap();
+        let root = create(
+            &registry,
+            &db,
+            json!({"type": "Collection", "kind": "folder", "name": "root"}),
+        )
+        .await;
+        let _child = create(
+            &registry,
+            &db,
+            json!({"type": "WorkItem", "kind": "task", "name": "child", "home_id": root}),
+        )
+        .await;
+        let caller = Caller::authenticated("acct:bea");
+        let opts = tree::TreeOptions {
+            max_depth: 1,
+            include_archived: false,
+            max_children_per_node: 1,
+            exclude_types: vec![],
+        };
+        assert!(db
+            .indexed_structure_nodes((&caller).into(), &root, &opts)
+            .await
+            .unwrap()
+            .is_some());
+
+        // The final-fence hook fires only after the handler selected index
+        // nodes. Its signal proves this request hit the index, so a governed
+        // fallback cannot satisfy the zero-acquisition assertion by accident.
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+        *structure_final_fence_hook().lock().unwrap() = Some(StructureFinalFenceHook {
+            root_id: root.clone(),
+            entered: entered_tx,
+            resume: resume_rx,
+        });
+        let sink = Arc::new(AtomicU64::new(u64::MAX));
+        let call = crate::db::with_write_pool_acquisition_sink(
+            Arc::clone(&sink),
+            registry.call(
+                db.clone(),
+                caller,
+                "get_structure",
+                json!({"root_id": root, "max_depth": 1, "max_children_per_node": 1}),
+            ),
+        );
+        let witness = async {
+            tokio::time::timeout(std::time::Duration::from_secs(30), entered_rx)
+                .await
+                .unwrap()
+                .unwrap();
+            resume_tx.send(()).unwrap();
+        };
+        let (output, ()) = tokio::join!(call, witness);
+        let output = output.unwrap();
+        assert_eq!(output["nodes"][0]["child_count"], 1);
+        assert_eq!(output["nodes"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            sink.load(Ordering::Relaxed),
+            0,
+            "indexed get_structure handler checked out the write pool"
+        );
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn live_index_retries_governed_walk_when_policy_moves_during_succession() {
+        let _hook_lock = structure_final_fence_hook_test_lock().lock().await;
+        let db = crate::db::create_database(":memory:").await.unwrap();
+        let mut registry = ToolRegistry::new();
+        register_surface_tools(&mut registry).unwrap();
+        let root = create(
+            &registry,
+            &db,
+            json!({"type": "Collection", "kind": "folder", "name": "root"}),
+        )
+        .await;
+        let child = create(
+            &registry,
+            &db,
+            json!({"type": "WorkItem", "kind": "task", "name": "child", "home_id": root}),
+        )
+        .await;
+        let bea = Caller::authenticated("acct:bea");
+        let opts = tree::TreeOptions {
+            max_depth: 1,
+            include_archived: false,
+            max_children_per_node: 1,
+            exclude_types: vec![],
+        };
+        assert!(db
+            .indexed_structure_nodes((&bea).into(), &root, &opts)
+            .await
+            .unwrap()
+            .is_some());
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+        *structure_final_fence_hook().lock().unwrap() = Some(StructureFinalFenceHook {
+            root_id: root.clone(),
+            entered: entered_tx,
+            resume: resume_rx,
+        });
+        let reading_db = db.clone();
+        let reading_root = root.clone();
+        let reader = tokio::spawn(async move {
+            get_structure_from_lens(
+                &ReadLens::live(&reading_db),
+                Some(&reading_db),
+                &bea,
+                GetStructureArgs {
+                    root_id: reading_root,
+                    max_depth: Some(1),
+                    include_archived: Some(false),
+                    max_children_per_node: Some(1),
+                    exclude_types: vec![],
+                },
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(30), entered_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        replace_explicit_policy(
+            &db,
+            "test:indexed-structure-race",
+            &child,
+            vec![AllowEntry::account("acct:alice", Capability::View)],
+        )
+        .await
+        .unwrap();
+        resume_tx.send(()).unwrap();
+        let raced = reader.await.unwrap().unwrap();
+        let governed = get_structure_from_lens(
+            &ReadLens::live(&db),
+            None,
+            &Caller::authenticated("acct:bea"),
+            GetStructureArgs {
+                root_id: root,
+                max_depth: Some(1),
+                include_archived: Some(false),
+                max_children_per_node: Some(1),
+                exclude_types: vec![],
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(raced, governed);
+        assert_eq!(raced["nodes"][0]["child_count"], 0);
+        assert_eq!(raced["nodes"].as_array().unwrap().len(), 1);
+        db.close().await;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1635,6 +2201,10 @@ async fn describe_schema(db: Db, caller: Caller, arguments: Value) -> Result<Val
         }));
     }
     let mut out = json!({
+        "logical_relations": "sql_read queries caller-visible logical relations (16 on sqlite-local, 12 on every profile), not the physical tables below. \
+         Start from the relation card in the sql_read descriptor, or query \
+         SELECT relation_name, column_name, column_position FROM catalog_columns \
+         ORDER BY relation_name, column_position (notes in catalog_relations).",
         "engine": {
             "name": ENGINE_NAME,
             "version": ENGINE_VERSION,
@@ -1683,10 +2253,10 @@ async fn describe_schema(db: Db, caller: Caller, arguments: Value) -> Result<Val
 pub fn register_orientation_tools(registry: &mut ToolRegistry) -> Result<()> {
     registry.register(
         ToolKind::Bootstrap,
-        "Read-only orientation, instructions and run key; declare intent via set_intent. \
-         After transient transport/pool failure or HTTP 502/503/504, retry at most twice \
+        "Read-only orientation and run key. Call once per fresh host conversation; later turns or task/artifact/aim changes are not new boundaries. Reuse the key; changed aims use set_intent. The host owns that boundary. \
+         Retry transient transport/pool/HTTP 502/503/504 failures at most twice \
          (1s, 2s; honor Retry-After up to 30s), then stop. Never retry auth, validation, \
-         or instruction-readiness failures. Retain the run key once received for every call.",
+         or instruction-readiness failures.",
         json!({
             "type": "object",
             "properties": {},
@@ -1760,9 +2330,12 @@ pub fn register_orientation_tools(registry: &mut ToolRegistry) -> Result<()> {
     )?;
     registry.register(
         ToolKind::DescribeSchema,
-        "Physical tables and columns with authority roles (authoritative log / \
-         projection / substrate / meta tier): orientation for sql_read. For \
-         record types, kinds, facets and vocabularies use \
+        "sql_read queries logical relations, not these physical \
+         tables: 16 relations on sqlite-local, 12 on every profile \
+         (4 are sqlite-local only). Start from sql_read's descriptor card, or SELECT relation_name, \
+         column_name FROM catalog_columns. What follows is the physical tier \
+         (authoritative log / projection / substrate / meta) for engine and \
+         storage work. For record types, kinds, facets and vocabularies use \
          preview_record_shape or manage_vocabularies.list_values instead. \
          Set include_ddl for the frozen statements.",
         json!({

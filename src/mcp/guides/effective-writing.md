@@ -51,6 +51,12 @@ When an external artifact will matter after this session or to another contribut
 
 ## Correct forward
 
+When reusing an ordinary account, `records_read.get_reuse_context` supplies its current body and exact revision, declared basis coverage, bounded direct concerns and recorded treatment, inherited uncertainty, and a versioned drafting instruction. Read the completeness boundaries: a complete declared set or comment window is not all relevant organisational evidence.
+
+Use `records_write.save_account` to save the authored body with the exact source revisions and declared roles supplied to the drafting step. The output and its basis are committed together. A source declaration records use, not semantic support, agreement or correctness. Ordinary body edits remain available, but do not renew an earlier revision's declaration. If selected source material or the expected output revision has changed, recover the current context and reconsider the draft; do not silently substitute newer sources.
+
+Preserve uncertainty in the reusable prose itself. “Not established by the supplied material” must not become “pending”, “outstanding”, “not approved” or an organisation-wide absence unless that operational state is explicitly recorded. A resolved comment body describes the concern; its resolution summary records the scoped outcome. Preserve that recorded treatment in later prose instead of reopening the old concern. Resolving one comment does not resolve a separate question, and recorded resolution does not rewrite earlier derivatives.
+
 When the world changes or a conclusion proves wrong, preserve the fact that it changed. Update the current record honestly, record the new reasoning that matters, and use an explicit supersession relationship when one durable position replaces another. History should let the next reader distinguish what was believed then from what governs now.
 
 Correction-forward discipline should increase willingness to contribute a reasoned draft; it should not license careless writing. Verify consequential facts, make uncertainty visible, and avoid rewriting the past to make the present look inevitable.

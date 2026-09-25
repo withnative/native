@@ -5,7 +5,7 @@ use serde::Serialize;
 
 use crate::standby_snapshot::{
     CanonicalFrontierV1, ObservedInstalledConsumerIdentity, StandbyConsumerIdentity,
-    StandbySnapshotEngineIdentity,
+    StandbyGenerationMaterialization, StandbySnapshotEngineIdentity,
 };
 
 use super::generation_store::{GenerationProvenanceStatus, GenerationStoreStatus};
@@ -51,6 +51,8 @@ pub struct StandbyGenerationStatus {
     pub snapshot_completed_at: String,
     pub promoted_at: Option<String>,
     pub frontier: CanonicalFrontierV1,
+    pub head_act: Option<i64>,
+    pub materialization: StandbyGenerationMaterialization,
     pub engine: StandbySnapshotEngineIdentity,
     pub consumer: StandbyConsumerIdentity,
 }
@@ -81,6 +83,8 @@ pub struct StandbyRefreshStatus {
     pub consecutive_failure_count: Option<u32>,
     pub last_failure_class: Option<super::RefreshFailureClass>,
     pub last_failure: Option<String>,
+    pub last_delta_fallback_class: Option<super::refresh::DeltaFallbackClass>,
+    pub last_delta_fallback: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -150,6 +154,8 @@ struct ServingGeneration {
     captured_at: String,
     snapshot_completed_at: String,
     frontier: CanonicalFrontierV1,
+    head_act: Option<i64>,
+    materialization: StandbyGenerationMaterialization,
     engine: StandbySnapshotEngineIdentity,
     consumer: StandbyConsumerIdentity,
 }
@@ -188,6 +194,8 @@ impl StandbyStatusProvider {
                 captured_at: active.generation.manifest.captured_at.clone(),
                 snapshot_completed_at: active.generation.manifest.snapshot_completed_at.clone(),
                 frontier: active.generation.manifest.frontier.clone(),
+                head_act: active.generation.manifest.head_act,
+                materialization: active.generation.manifest.materialization,
                 engine: active.generation.manifest.engine.clone(),
                 consumer: active.generation.manifest.consumer.clone(),
             }),
@@ -328,6 +336,8 @@ fn generation_status(
         snapshot_completed_at: normalized_timestamp(&manifest.snapshot_completed_at),
         promoted_at,
         frontier: manifest.frontier.clone(),
+        head_act: manifest.head_act,
+        materialization: manifest.materialization,
         engine: manifest.engine.clone(),
         consumer: manifest.consumer.clone(),
     }
@@ -364,6 +374,8 @@ fn build_status(
             snapshot_completed_at: normalized_timestamp(&serving.snapshot_completed_at),
             promoted_at,
             frontier: serving.frontier.clone(),
+            head_act: serving.head_act,
+            materialization: serving.materialization,
             engine: serving.engine.clone(),
             consumer: serving.consumer.clone(),
         }
@@ -656,6 +668,25 @@ fn refresh_status(
             .and_then(|state| state.last_failure_class)
             .map(safe_refresh_failure_message)
             .map(str::to_owned),
+        last_delta_fallback_class: state
+            .as_ref()
+            .and_then(|state| state.last_delta_fallback_class),
+        last_delta_fallback: state
+            .as_ref()
+            .and_then(|state| state.last_delta_fallback_class)
+            .map(safe_delta_fallback_message)
+            .map(str::to_owned),
+    }
+}
+
+fn safe_delta_fallback_message(class: super::refresh::DeltaFallbackClass) -> &'static str {
+    use super::refresh::DeltaFallbackClass::*;
+    match class {
+        HeadCompatibility => "delta head was incompatible; whole snapshot used",
+        DeltaUnavailable => "delta was unavailable; whole snapshot used",
+        IntegrityOrApplyRefusal => "delta integrity or apply check refused; whole snapshot used",
+        RemoteHeadRegression => "delta authority head regressed; whole snapshot used",
+        UntrustedLocalBase => "local delta base was not trusted; whole snapshot used",
     }
 }
 
@@ -730,6 +761,8 @@ mod tests {
             },
             consumer: consumer(),
             frontier: frontier(),
+            head_act: Some(0),
+            materialization: StandbyGenerationMaterialization::Snapshot,
             snapshot: StandbySnapshotBytes {
                 media_type: STANDBY_SNAPSHOT_MEDIA_TYPE.into(),
                 size_bytes: 1,
@@ -785,6 +818,8 @@ mod tests {
                 captured_at: captured_at.into(),
                 snapshot_completed_at: captured_at.into(),
                 frontier: frontier(),
+                head_act: Some(0),
+                materialization: StandbyGenerationMaterialization::Snapshot,
                 engine: manifest(captured_at, captured_at).engine,
                 consumer: consumer(),
             }),

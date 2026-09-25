@@ -17,7 +17,12 @@
   ],
   "properties": {
     "format": { "const": "native.canonical-interchange.v1" },
-    "revision": { "const": 2 },
+    "revision": { "const": 5 },
+    "source_history_revision": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 5
+    },
     "source_profile": {
       "type": "object",
       "additionalProperties": false,
@@ -35,8 +40,8 @@
     },
     "sections": {
       "type": "array",
-      "minItems": 97,
-      "maxItems": 97,
+      "minItems": 99,
+      "maxItems": 99,
       "items": { "$ref": "#/$defs/sectionDescriptor" }
     },
     "content_sha256": { "$ref": "#/$defs/sha256" }
@@ -52,7 +57,7 @@
       "required": ["name", "revision", "row_count", "sha256"],
       "properties": {
         "name": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" },
-        "revision": { "const": 2 },
+        "revision": { "const": 5 },
         "row_count": { "type": "integer", "minimum": 0 },
         "sha256": { "$ref": "#/$defs/sha256" }
       }

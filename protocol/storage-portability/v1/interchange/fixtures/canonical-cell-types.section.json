@@ -1,6 +1,6 @@
 {
   "format": "native.canonical-interchange.section.v1",
-  "revision": 2,
+  "revision": 5,
   "name": "representative_values",
   "columns": [
     { "name": "id", "declared_type": "TEXT" },

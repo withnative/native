@@ -342,6 +342,7 @@ pub async fn apply_hosted_membership_cleanup(
 ) -> Result<HostedMembershipCleanupCounts> {
     validate_operation_id(operation_id)?;
     let mut transaction = crate::db::begin_write(db.write_pool()).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
     let projection = project_in(
         &mut transaction,
         Some(operation_id),
@@ -411,6 +412,7 @@ pub async fn apply_hosted_membership_cleanup(
                     payload: json!({"owner_id": recipient_person_id}),
                     actor: Some(content_actor.clone()),
                 },
+                &mut act_alloc,
             )
             .await?;
         }
@@ -428,6 +430,7 @@ pub async fn apply_hosted_membership_cleanup(
             entries,
             &policy_actor,
             reason,
+            &mut act_alloc,
         )
         .await?;
     }

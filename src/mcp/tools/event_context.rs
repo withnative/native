@@ -5,8 +5,8 @@
 //! A comment byline deep-links to the event that produced the utterance being
 //! read. Opening that link should let a reader see the exact comment-producing
 //! event, what the run said it was trying to do at that moment, the writes
-//! around it, the exact change made, and the records the run most immediately
-//! opened beforehand.
+//! around it, the exact change made, and any retained evidence of records the
+//! run opened beforehand.
 //!
 //! `get_run_activity` cannot answer this. It returns visibility-filtered
 //! AGGREGATE counts for a whole run and deliberately omits raw arguments and
@@ -24,24 +24,39 @@
 //! panel therefore says "Opened before this event", not "Sources" and not
 //! "Used".
 //!
-//! Two failure modes are called out explicitly rather than papered over:
+//! Selective capture makes the consulted list partial whenever old opens
+//! survive. Ordinary new reads create no row, so an empty list is unavailable
+//! evidence, never proof that the run opened nothing. Two additional limits
+//! are called out explicitly:
 //!
 //! - The read log is **disposable operational evidence**, not canonical
 //!   history. If it is absent or a query fails, the answer is `unavailable` —
 //!   never an empty list, which a reader would correctly interpret as "this run
 //!   opened nothing".
-//! - Visibility filtering and the eight-record bound both TRUNCATE. That is
-//!   reported as `partial`, so an incomplete list is never mistaken for a
-//!   complete one.
+//! - Visibility filtering and the eight-record bound can further truncate a
+//!   partial list; neither grants inference about unretained opens.
 //!
 //! A deep-link grants no read authority. Every returned record passes the
 //! viewer's ordinary visibility check, and redaction behaves exactly as it does
 //! on the ordinary history surface.
+//!
+//! # What "basis" does and does not mean
+//!
+//! Beside the observed `consulted` evidence sits the run's own `basis`
+//! declaration, read from the selected event's `native.source-basis.v1`
+//! envelope: `declared` with sources, `declared_none` with an empty list, and
+//! `not_declared` with an empty list. The three never collapse into each other.
+//! A declaration is an authored claim of use, never verified use — hence the
+//! `basis_is_declared_not_verified` interpretation limit, and hence the label
+//! honestly saying "Sources" where the consulted panel must not. The
+//! opened-does-not-establish-comprehension limit describes observed opens only
+//! and is not applied to declarations.
 
 use serde_json::{json, Value};
 use sqlx::Row;
 
 use super::history::{event_is_visible, event_to_value, redact_event, ActorDisclosure};
+use super::lifecycle::SOURCE_BASIS_FORMAT;
 use super::{can_record, parse_args, require_record};
 use crate::authorization::Capability;
 use crate::db::Db;
@@ -63,6 +78,10 @@ pub const LIMIT_OPENED_NOT_COMPREHENSION: &str =
 pub const LIMIT_CONSULTED_BOUNDED: &str = "consulted_context_is_bounded";
 pub const LIMIT_CONSULTED_FILTERED: &str = "consulted_context_may_be_visibility_filtered";
 pub const LIMIT_READ_LOG_BEST_EFFORT: &str = "read_log_is_best_effort_not_canonical_history";
+/// A declared source basis is an authored claim of use, never verified use.
+/// This limit travels with the `basis` block only; the opened/comprehension
+/// limit above describes observed opens and is not applied to declarations.
+pub const LIMIT_BASIS_DECLARED_NOT_VERIFIED: &str = "basis_is_declared_not_verified";
 
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -72,11 +91,10 @@ struct GetEventContextArgs {
     event_id: String,
 }
 
-/// Consulted-evidence completeness. `Unavailable` and an empty `Available` are
-/// different answers and must never collapse into each other.
+/// Consulted-evidence completeness. Selective capture means retained opens
+/// can only establish partial evidence; none means unavailable.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum EvidenceStatus {
-    Available,
     Partial,
     Unavailable,
 }
@@ -84,7 +102,6 @@ enum EvidenceStatus {
 impl EvidenceStatus {
     fn as_str(self) -> &'static str {
         match self {
-            EvidenceStatus::Available => "available",
             EvidenceStatus::Partial => "partial",
             EvidenceStatus::Unavailable => "unavailable",
         }
@@ -94,7 +111,7 @@ impl EvidenceStatus {
 pub fn register_event_context_tool(registry: &mut ToolRegistry) -> Result<()> {
     registry.register(
         ToolKind::GetEventContext,
-        "One moment in a run, addressed by immutable event id: the selected event, the intent in force at that event rather than the run's latest intent, the exact before/after body delta that event itself produced (correct even after later edits), neighbouring events in the same run, and up to eight records the same run most recently OPENED beforehand. Opened means the run explicitly requested the record; it establishes no comprehension, reliance or agreement. Records that were only surfaced in results are reported as a separate weaker count, never as consulted. Evidence status is explicit: an empty available list means no qualifying opens were logged in the bounded scope, while an absent or failed read log reports unavailable. Raw tool arguments and query text are never returned, and the link grants no read authority beyond the viewer's ordinary visibility.",
+        "One moment in a run, addressed by immutable event id: the selected event, the intent in force at that event rather than the run's latest intent, the exact before/after body delta that event itself produced (correct even after later edits), neighbouring events in the same run, and any retained records the run opened beforehand. Read capture is now selective: consulted evidence is partial when retained opens exist and unavailable when none survive; an empty list never proves that nothing was opened. A sibling basis block reports the run's own declared source basis from the selected event's native.source-basis.v1 envelope as declared, declared_none or not_declared; a declaration is an authored claim, never verified use. Raw tool arguments and query text are never returned, and the link grants no read authority beyond the viewer's ordinary visibility.",
         json!({
             "type": "object",
             "properties": {
@@ -114,7 +131,7 @@ async fn get_event_context(db: Db, caller: Caller, arguments: Value) -> Result<V
     let args: GetEventContextArgs = parse_args(TOOL, arguments)?;
     let row = sqlx::query(
         "SELECT seq, id, record_id, type, payload, actor, run_key, parent_key, intent, created_at,
-                causal_envelope_version, causal_status,
+                causal_envelope_version, causal_status, act,
                 (SELECT json_group_array(parent_event_id)
                    FROM content_event_causal_frontier
                   WHERE event_id = content_events.id) AS causal_frontier
@@ -142,8 +159,21 @@ async fn get_event_context(db: Db, caller: Caller, arguments: Value) -> Result<V
 
     let delta = body_delta(&db, &event_record_id, &selected).await?;
 
+    // The basis is read from the CANONICAL payload, before redaction nulls
+    // `_id` keys the viewer may not see. Visibility is enforced per source
+    // below instead, so a hidden source is omitted whole — reason included —
+    // rather than leaked field by field through the redacted echo.
+    let canonical_payload = selected.payload.clone();
+
     let mut disclosure = ActorDisclosure::default();
     redact_event(&db, &caller, &mut disclosure, &mut selected).await?;
+    // The generic redaction nulls `_id` keys the viewer may not see but keeps
+    // the surrounding prose — right for bodies, wrong for a structured basis
+    // entry, where a surviving `reason`/`role` beside a nulled id still
+    // discloses that a hidden source was cited and why. Entries no viewer may
+    // show are removed whole from the echo below; the sibling `basis` block
+    // above already reports their absence as `partial`.
+    scrub_hidden_basis_entries(&db, &caller, &mut selected).await?;
     // The run block, the consulted scope and the neighbour scope must all
     // observe the REDACTED run key: for a caller outside the holder's
     // account the claim run is withheld exactly as on ordinary history,
@@ -167,21 +197,43 @@ async fn get_event_context(db: Db, caller: Caller, arguments: Value) -> Result<V
     }
     .unwrap_or_else(|_| ConsultedEvidence::unavailable());
 
+    let basis = basis_context(&db, &caller, &event_record_id, canonical_payload.as_deref()).await;
+
     let actor_names = if selected.actor.is_some() {
         crate::mcp::tools::history::resolve_actor_names(&db, std::slice::from_ref(&selected)).await
     } else {
         std::collections::HashMap::new()
     };
 
-    Ok(json!({
-        "event": event_to_value(&selected, &actor_names),
-        "run": event_run_key.as_ref().map(|run_key| json!({
+    // Run-level, read once for this request, and only for the run the redacted
+    // event still names. The client software named itself at run start; it is
+    // not an attestation, and it is not a per-event fact.
+    let reported_client = match event_run_key.as_deref() {
+        Some(run_key) => crate::control::read_agent_run_reported_identity(&db, run_key)
+            .await?
+            .and_then(crate::contribution::reported_client_facts),
+        None => None,
+    };
+
+    let run = event_run_key.as_ref().map(|run_key| {
+        let mut run = json!({
             "run_key": run_key,
             "agent_key": crate::runkey::agent_key_of(run_key),
             // The same disclaimer the contribution projection carries: a run
             // key groups calls, it does not identify a persistent agent.
             "assurance": "correlation_only",
-        })),
+        });
+        if let Some(client) = &reported_client {
+            run.as_object_mut()
+                .expect("run correlation is an object")
+                .insert("reported_mcp_client".into(), json!(client));
+        }
+        run
+    });
+
+    Ok(json!({
+        "event": event_to_value(&selected, &actor_names),
+        "run": run,
         "intent_at_event": event_intent,
         "delta": delta,
         "neighbouring_events": neighbours,
@@ -194,11 +246,18 @@ async fn get_event_context(db: Db, caller: Caller, arguments: Value) -> Result<V
             "other_records_surfaced": consulted.surfaced_only,
             "limit": MAX_CONSULTED,
         },
+        "basis": {
+            "label": "Sources",
+            "status": basis.status,
+            "completeness": basis.completeness,
+            "sources": basis.sources,
+        },
         "interpretation_limits": [
             LIMIT_OPENED_NOT_COMPREHENSION,
             LIMIT_CONSULTED_BOUNDED,
             LIMIT_CONSULTED_FILTERED,
             LIMIT_READ_LOG_BEST_EFFORT,
+            LIMIT_BASIS_DECLARED_NOT_VERIFIED,
         ],
     }))
 }
@@ -279,7 +338,7 @@ async fn neighbouring_events(
     };
     let rows = sqlx::query(
         "SELECT seq, id, record_id, type, payload, actor, run_key, parent_key, intent, created_at,
-                causal_envelope_version, causal_status,
+                causal_envelope_version, causal_status, act,
                 (SELECT json_group_array(parent_event_id)
                    FROM content_event_causal_frontier
                   WHERE event_id = content_events.id) AS causal_frontier
@@ -304,6 +363,11 @@ async fn neighbouring_events(
             continue;
         }
         redact_event(db, caller, disclosure, &mut event).await?;
+        // Neighbour payloads echo on the same response as the selected one,
+        // so the same whole-entry basis scrub applies: generic redaction
+        // alone would keep a hidden declared source's reason and role beside
+        // its nulled id.
+        scrub_hidden_basis_entries(db, caller, &mut event).await?;
         events.push(event);
     }
     let names = crate::mcp::tools::history::resolve_actor_names(db, &events).await;
@@ -429,9 +493,7 @@ async fn consulted_context(
     // also recorded about it.
     surfaced_only_ids.retain(|id| !opened.iter().any(|(opened_id, _)| opened_id == id));
 
-    let total_opened = opened.len();
     let mut records = Vec::new();
-    let mut filtered_any = false;
     for (record_id, last_at) in opened {
         if records.len() >= MAX_CONSULTED {
             break;
@@ -439,7 +501,6 @@ async fn consulted_context(
         // The deep-link grants no additional read authority. A hidden record is
         // omitted WITHOUT disclosing that it existed.
         if !can_record(db, caller, &record_id, Capability::View).await? {
-            filtered_any = true;
             continue;
         }
         let display = sqlx::query("SELECT name, type, kind FROM records WHERE id = ?")
@@ -471,21 +532,206 @@ async fn consulted_context(
     for record_id in surfaced_only_ids {
         if can_record(db, caller, &record_id, Capability::View).await? {
             surfaced_only += 1;
-        } else {
-            filtered_any = true;
         }
     }
 
-    let status = if filtered_any || total_opened > MAX_CONSULTED {
-        EvidenceStatus::Partial
+    // Capture no longer retains ordinary reads. A legacy retained open is
+    // useful evidence, but can never prove this list complete across the
+    // policy transition. With none, report unavailable rather than silently
+    // claiming that the run opened nothing.
+    let status = if records.is_empty() && surfaced_only == 0 {
+        EvidenceStatus::Unavailable
     } else {
-        EvidenceStatus::Available
+        EvidenceStatus::Partial
     };
     Ok(ConsultedEvidence {
         status,
         records,
         surfaced_only,
     })
+}
+
+/// The run's own declared source basis, read from the selected event's
+/// canonical payload envelope — never from the read log.
+///
+/// Three states, never collapsed: `declared` (a declaration exists; its
+/// enumerable visible sources may still be empty when the stored list is
+/// hidden or unreadable), `declared_none` (a stored empty array: the writer
+/// said this rested on no Native record), and `not_declared` (no recognized
+/// envelope at all). An
+/// unrecognized envelope — an unknown format, a non-object, or no `basis` key
+/// — reads as `not_declared` rather than being misread: only the v1 envelope
+/// this binary writes is interpreted, so a newer format is never parsed as
+/// v1. A recognized v1 envelope whose `sources` is missing or not an array is
+/// a declaration this server cannot enumerate; it reads as `declared` with
+/// `partial` completeness and no source lines, never as `not_declared`, which
+/// would falsely report that nothing was declared.
+struct BasisEvidence {
+    status: &'static str,
+    completeness: &'static str,
+    sources: Vec<Value>,
+}
+
+impl BasisEvidence {
+    fn not_declared() -> Self {
+        BasisEvidence {
+            status: "not_declared",
+            // Empty because nothing was declared, not because something was
+            // withheld. The status is what distinguishes those.
+            completeness: "complete",
+            sources: Vec::new(),
+        }
+    }
+}
+
+async fn basis_context(
+    db: &Db,
+    caller: &Caller,
+    event_record_id: &str,
+    canonical_payload: Option<&str>,
+) -> BasisEvidence {
+    let Some(raw) = canonical_payload else {
+        return BasisEvidence::not_declared();
+    };
+    let Ok(payload) = serde_json::from_str::<Value>(raw) else {
+        return BasisEvidence::not_declared();
+    };
+    let Some(envelope) = payload.get("basis") else {
+        return BasisEvidence::not_declared();
+    };
+    // Forward compatibility gate: the envelope is only interpreted when it
+    // names the format this binary writes. Anything else — a future version,
+    // a mistyped key, a non-object — is left unread, never coerced.
+    let is_v1 = envelope.as_object().is_some_and(|object| {
+        object.get("format").and_then(Value::as_str) == Some(SOURCE_BASIS_FORMAT)
+    });
+    if !is_v1 {
+        return BasisEvidence::not_declared();
+    }
+    // Recognized v1, so a declaration exists even if its source list cannot
+    // be enumerated: report it as declared-but-partial, never not_declared.
+    let Some(declared) = envelope.get("sources").and_then(Value::as_array) else {
+        return BasisEvidence {
+            status: "declared",
+            completeness: "partial",
+            sources: Vec::new(),
+        };
+    };
+    if declared.is_empty() {
+        return BasisEvidence {
+            status: "declared_none",
+            completeness: "complete",
+            sources: Vec::new(),
+        };
+    }
+    let mut sources = Vec::with_capacity(declared.len());
+    let mut partial = false;
+    for entry in declared {
+        // An entry without a usable record id names nothing showable. It is
+        // skipped without disclosure, exactly like a hidden source: the list
+        // reports `partial` rather than pretending to be whole.
+        let Some(record_id) = entry.get("record_id").and_then(Value::as_str) else {
+            partial = true;
+            continue;
+        };
+        // Fail closed: a visibility check that errors hides, and the list
+        // reports `partial` rather than passing something unseen.
+        if !can_record(db, caller, record_id, Capability::View)
+            .await
+            .unwrap_or(false)
+        {
+            partial = true;
+            continue;
+        }
+        let display = sqlx::query("SELECT name, type, kind FROM records WHERE id = ?")
+            .bind(record_id)
+            .fetch_optional(db.write_pool())
+            .await;
+        let Ok(display) = display else {
+            partial = true;
+            continue;
+        };
+        let (name, record_type, kind) = match display {
+            Some(row) => (
+                row.try_get::<Option<String>, _>("name").ok().flatten(),
+                row.try_get::<Option<String>, _>("type").ok().flatten(),
+                row.try_get::<Option<String>, _>("kind").ok().flatten(),
+            ),
+            None => (None, None, None),
+        };
+        let field = |key: &str| {
+            entry
+                .get(key)
+                .and_then(Value::as_str)
+                .map_or(Value::Null, |value| json!(value))
+        };
+        sources.push(json!({
+            "record_id": record_id,
+            "name": name,
+            "type": record_type,
+            "kind": kind,
+            "revision_event_id": field("revision_event_id"),
+            "revision_supplied_by": field("revision_supplied_by"),
+            "role": field("role"),
+            "reason": field("reason"),
+            // Labelled rather than silently removed: "the run read the very
+            // record it then wrote to" is itself informative.
+            "is_event_target": record_id == event_record_id,
+        }));
+    }
+    BasisEvidence {
+        status: "declared",
+        completeness: if partial { "partial" } else { "complete" },
+        sources,
+    }
+}
+
+/// Remove hidden declared-source entries whole from a redacted payload echo.
+///
+/// Generic redaction is field-shaped: it nulls `_id` keys the viewer may not
+/// see while keeping the surrounding prose. Applied to a structured basis
+/// entry that leaves the `reason`/`role` of a hidden source beside its nulled
+/// id — a disclosure the sibling `basis` block was built to prevent. Any
+/// entry whose `record_id` is not a viewer-visible string is therefore
+/// dropped entire, visible entries preserved byte-for-byte. The envelope
+/// version is deliberately not gated: this removes unshowable entries from
+/// whatever envelope carries them without interpreting version-specific
+/// fields. Applied to the selected event AND every neighbouring event, since
+/// both echo their payloads on the same response.
+async fn scrub_hidden_basis_entries(db: &Db, caller: &Caller, event: &mut EventRow) -> Result<()> {
+    let Some(raw) = event.payload.as_deref() else {
+        return Ok(());
+    };
+    let Ok(payload) = serde_json::from_str::<Value>(raw) else {
+        return Ok(());
+    };
+    let Some(entries) = payload
+        .get("basis")
+        .and_then(|envelope| envelope.get("sources"))
+        .and_then(Value::as_array)
+    else {
+        return Ok(());
+    };
+    let mut kept = Vec::with_capacity(entries.len());
+    for entry in entries {
+        // Fail closed, as in `basis_context`: a visibility check that errors
+        // hides, and the sibling block already reports `partial`.
+        let visible = match entry.get("record_id").and_then(Value::as_str) {
+            Some(record_id) => can_record(db, caller, record_id, Capability::View)
+                .await
+                .unwrap_or(false),
+            None => false,
+        };
+        if visible {
+            kept.push(entry.clone());
+        }
+    }
+    if kept.len() != entries.len() {
+        let mut redacted = payload;
+        redacted["basis"]["sources"] = Value::Array(kept);
+        event.payload = Some(serde_json::to_string(&redacted)?);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -507,6 +753,7 @@ mod tests {
             causal_envelope: crate::events::CausalEnvelopeV1::complete(
                 crate::events::CausalFrontierV1::empty(),
             ),
+            act: None,
         }
     }
 
@@ -533,12 +780,12 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_is_not_an_empty_available_list() {
+    fn unavailable_is_not_a_partial_list() {
         let evidence = ConsultedEvidence::unavailable();
         assert_eq!(evidence.status.as_str(), "unavailable");
         assert!(evidence.records.is_empty());
         assert_ne!(
-            EvidenceStatus::Available.as_str(),
+            EvidenceStatus::Partial.as_str(),
             EvidenceStatus::Unavailable.as_str(),
             "an absent read log must never render as 'no records opened'"
         );

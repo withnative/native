@@ -1,10 +1,10 @@
 # Engine-native read-only SQL
 
-`query_sql` accepts one read-only statement in the active engine's native dialect. Native does not translate SQL between engines. Call `engine_info` first and inspect its `query_sql` object: it is the admission truth for availability, immutable profile revision, dialect, parameter convention, limits, and any fail-closed reason.
+`query_sql` accepts one read-only statement in the active engine's native dialect. Native does not translate SQL between engines. The `sql_read` descriptor card names the relations, value model and worked statements; `engine_info` remains available for the active profile revision, dialect, parameter convention, limits, and any fail-closed reason, but is not required before use.
 
 ## Parameters
 
-Parameters are optional and positional. Every supplied item requires both a `type` tag and an explicit `value`; `value: null` is a typed SQL NULL, while the string `"null"` is a JSON null for the `json` tag. Use the active profile's generated placeholder and encoding metadata below.
+Parameters are optional and positional (`?N`, 1-based and contiguous, on every profile — `$N`, bare `?`, and `:name` are rejected). Every supplied item requires both a `type` tag and an explicit `value`; `value: null` is a typed SQL NULL, while the string `"null"` is a JSON null for the `json` tag. Use the active profile's encoding metadata below.
 
 ```json
 {
@@ -19,7 +19,9 @@ Queries are not portable merely because their parameter values are.
 
 Rows and relations are caller-filtered. Physical policy, principal, catalog, FTS, embedding, job, metadata, and introspection relations are not part of the logical catalog. A read-only transaction alone is not authorization.
 
-SQLite retains its established normalization: SQL NULL to JSON null, INTEGER to a JSON integer, REAL to a finite JSON number, BLOB to base64 text, and other values to text. Engines with distinct boolean, arbitrary numeric, JSON, or timestamp types must follow the generated encoding contract. Ordering, collation, null placement, and timestamp precision remain dialect-specific.
+Prefixing an admissible statement with `EXPLAIN QUERY PLAN` returns its plan instead of its rows, showing whether the query probes a caller-relative relation by key or scans it. The plan names internal helper relations such as `_query_sql_authorization_subjects` by design: that is the authorization relation the query is evaluated against, not a leak.
+
+Every engine presents the same value model: timestamps as fixed UTC-millis text with integer epoch-millis `*_ms` companions (date maths is portable integer arithmetic), booleans as 0/1, binary (`C`) text ordering, and one numeric encoding per value shape — integer-valued numerics (notably `sum` over integers) as JSON integers, non-integral ones (notably `avg`) as JSON numbers, with out-of-range integers refused rather than rounded. SQL NULL becomes JSON null, INTEGER a JSON integer, REAL a finite JSON number, BLOB base64 text, and other values text. Null placement in ordering remains dialect-specific, so state `NULLS FIRST` or `NULLS LAST` explicitly on nullable sort keys; every engine admits the explicit form.
 
 ## Saved governed SQL
 
@@ -36,7 +38,7 @@ execution validates it again and runs through the same caller-filtered
   "v":"1.1",
   "kind":"governed_sql",
   "profile":{"id":"sqlite-local","revision":2},
-  "catalog_revision":3,
+  "catalog_revision":4,
   "relations":{"records":{"identity":"native.query-sql.records","semantic_version":1}},
   "sql":"SELECT name,id FROM records WHERE type=?1",
   "parameters":[{"type":"text","value":"WorkItem"}],
@@ -84,6 +86,19 @@ that run, but it is not authentication, proof of exclusive possession, or a
 persistent identity for the actor behind the calls. `activity_id` remains the
 opaque relational key used to join activity with `agent_activity_claims`.
 
+`agent_activity.declared_intent` is the latest text the run declared with
+`set_intent`, or NULL. Intent is caller-authored disclosure, never verified
+fact, and it is disclosed only to the declaring account. The companion
+`declared_intent_state` is engine-authored and tells the NULLs apart:
+`disclosed` (text shown), `none` (own run, nothing declared), `withheld`
+(another account's run), or `unavailable` (the `read_log_calls` capture table
+was absent for this observation). Precedence is fixed: `unavailable` shadows
+`withheld`, since there is nothing to withhold when capture contributed
+nothing. Known gap: a standby export strips read-log rows but keeps the
+tables, so a stripped-but-present read log reports `none` rather than
+`unavailable`. Telling "capture ran and found nothing" from "capture was
+removed" needs a durable signal the export writes, which does not exist yet.
+
 `native.relation-envelope.v1` artifact ports may bind a governed SQL
 Collection when the port declares the exact `schema_sha256` expected from its
 output. Rendering reruns the saved query under the viewer's current authority
@@ -100,6 +115,6 @@ known total.
 
 <!-- GENERATED:QUERY_SQL_CONTRACT -->
 
-The front-door scanner rejects multiple statements and obvious writes, DDL, transaction control, mutable pragmas, attachment/extension operations, and copy/export forms. Its lexical rules follow the active profile: SQLite/Turso understand their quoted forms and `$name` parameters but never PostgreSQL dollar quoting; PostgreSQL additionally understands escape strings, nested block comments, quoted identifiers, and dollar quoting. This remains defence in depth. The qualified backend parser, authorization provider, read-only controls, and function/catalog restrictions remain authoritative.
+The front-door scanner rejects multiple statements and obvious writes, DDL, transaction control, mutable pragmas, attachment/extension operations, and copy/export forms. Its lexical rules follow the active profile: caller placeholders are positional `?N` on every profile. SQLite/Turso understand their quoted forms but never PostgreSQL dollar quoting; PostgreSQL additionally understands escape strings, nested block comments, quoted identifiers, and dollar quoting. This remains defence in depth. The qualified backend parser, authorization provider, read-only controls, and function/catalog restrictions remain authoritative.
 
 Never infer availability from dialect similarity. Use `engine_info.query_sql.available` for the active profile.

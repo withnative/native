@@ -111,7 +111,6 @@ async fn authorize_uncertainty_lineage_on(
 /// embedding returns an idempotent result from that Receipt's event payload.
 /// This preserves the runtime rule that authorization is checked before a
 /// command's prior result becomes observable.
-#[cfg(feature = "experimental-agent-intents")]
 pub(super) async fn reauthorize_receipt_payload_on(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     principal: Principal<'_>,
@@ -159,6 +158,41 @@ pub(super) async fn reauthorize_receipt_payload_on(
         ] {
             verify_revision_ref_on(tx, reference).await?;
         }
+    }
+    Ok(())
+}
+
+async fn require_ordinary_note_output_on(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    record_id: &str,
+) -> Result<()> {
+    let row = sqlx::query(
+        "SELECT r.type,r.kind,
+                EXISTS(SELECT 1 FROM facet_values f
+                         WHERE f.record_id=r.id AND f.key='runtime' AND f.value IS NOT NULL)
+                    AS has_runtime,
+                EXISTS(SELECT 1 FROM semantic_units u WHERE u.unit_id=r.id) AS is_unit
+           FROM records r WHERE r.id=? AND r.deleted_at IS NULL",
+    )
+    .bind(record_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or_else(|| Error::engine("authoring output is unavailable"))?;
+    let record_type: String = row.try_get("type")?;
+    let kind: Option<String> = row.try_get("kind")?;
+    let has_runtime: bool = row.try_get("has_runtime")?;
+    let is_unit: bool = row.try_get("is_unit")?;
+    let governed_note = match kind.as_deref() {
+        Some(kind) => {
+            let resolution = crate::meta::kind::resolve_on(tx, &record_type, kind).await?;
+            crate::generated::kinds::CoreKind::DocumentNote.matches(&resolution)
+        }
+        None => false,
+    };
+    if !governed_note || has_runtime || is_unit {
+        return Err(Error::engine(
+            "authoring output must be an ordinary Document kind:note without a runtime binding",
+        ));
     }
     Ok(())
 }
@@ -651,6 +685,14 @@ async fn load_commit_result_on(
     .into_iter()
     .map(DependencyId::new)
     .collect::<Result<Vec<_>>>()?;
+    // The receipt event is a content event and carries the act the original
+    // commit allocated; reading it here means the idempotent replay returns
+    // the same act as the first call.
+    let act: Option<i64> = sqlx::query_scalar("SELECT act FROM content_events WHERE id=?")
+        .bind(receipt_event_id)
+        .fetch_optional(&mut *conn)
+        .await?
+        .flatten();
     Ok(CommitDurableOutputResult {
         receipt_id,
         output_revision: serde_json::from_str(&row.try_get::<String, _>("output_revision")?)?,
@@ -667,7 +709,49 @@ async fn load_commit_result_on(
             _ => return Err(Error::engine("invalid projected Receipt disclosure")),
         },
         high_water: serde_json::from_str(&row.try_get::<String, _>("history_high_water")?)?,
+        act,
     })
+}
+
+/// Recover an already committed ordinary-note output by its scoped key.
+/// Authorization and the supported output shape are rechecked before the
+/// occupied key or any Receipt payload becomes observable. Exact historical
+/// references are re-authorized but deliberately need not remain current.
+pub(crate) async fn replay_ordinary_note_output(
+    db: &Db,
+    principal: Principal<'_>,
+    consumer_record_id: &str,
+    idempotency_key: &IdempotencyKey,
+) -> Result<Option<(ReceiptCommittedPayload, CommitDurableOutputResult)>> {
+    let mut tx = begin_write(db.write_pool()).await?;
+    require_capability_on(&mut tx, principal, consumer_record_id, Capability::Edit).await?;
+    require_ordinary_note_output_on(&mut tx, consumer_record_id).await?;
+    let row = sqlx::query(
+        "SELECT c.operation,c.result_event_id,e.payload
+           FROM freshness_runtime_command_results c
+           JOIN content_events e ON e.id=c.result_event_id
+          WHERE c.scope_record_id=? AND c.idempotency_key=?",
+    )
+    .bind(consumer_record_id)
+    .bind(idempotency_key.as_str())
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(row) = row else {
+        tx.rollback().await?;
+        return Ok(None);
+    };
+    if row.try_get::<String, _>("operation")? != "commit_durable_output" {
+        return Err(Error::engine(
+            "idempotency key was already used for a different authoring command",
+        ));
+    }
+    let result_event_id: String = row.try_get("result_event_id")?;
+    let payload: ReceiptCommittedPayload =
+        serde_json::from_str(&row.try_get::<String, _>("payload")?)?;
+    reauthorize_receipt_payload_on(&mut tx, principal, &payload).await?;
+    let result = load_commit_result_on(&mut tx, &result_event_id).await?;
+    tx.rollback().await?;
+    Ok(Some((payload, result)))
 }
 
 pub async fn commit_durable_output(
@@ -676,7 +760,20 @@ pub async fn commit_durable_output(
     actor: &str,
     input: CommitDurableOutputInput,
 ) -> Result<CommitDurableOutputResult> {
-    commit_durable_output_with_failure(db, principal, actor, input, None).await
+    commit_durable_output_impl(db, principal, actor, input, None, false).await
+}
+
+/// Commit a Receipt-backed authored body while enforcing the supported
+/// ordinary-note boundary in the same reserved write transaction as the
+/// append. This is the narrow product wrapper; the general freshness runtime
+/// retains its existing internal consumer support.
+pub(crate) async fn commit_ordinary_note_output(
+    db: &Db,
+    principal: Principal<'_>,
+    actor: &str,
+    input: CommitDurableOutputInput,
+) -> Result<CommitDurableOutputResult> {
+    commit_durable_output_impl(db, principal, actor, input, None, true).await
 }
 
 /// Test seam for proving that every intermediate event/projection rolls back.
@@ -685,13 +782,25 @@ pub async fn commit_durable_output_with_failure(
     db: &Db,
     principal: Principal<'_>,
     actor: &str,
+    input: CommitDurableOutputInput,
+    failure: Option<CommitFailurePoint>,
+) -> Result<CommitDurableOutputResult> {
+    commit_durable_output_impl(db, principal, actor, input, failure, false).await
+}
+
+async fn commit_durable_output_impl(
+    db: &Db,
+    principal: Principal<'_>,
+    actor: &str,
     mut input: CommitDurableOutputInput,
     failure: Option<CommitFailurePoint>,
+    ordinary_note_only: bool,
 ) -> Result<CommitDurableOutputResult> {
     require_actor(actor)?;
     normalize_package(&mut input)?;
     let intent = intent_sha256(&input)?;
     let mut tx = begin_write(db.write_pool()).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
     // Authorization precedes idempotency occupancy lookup.
     require_capability_on(
         &mut tx,
@@ -700,6 +809,9 @@ pub async fn commit_durable_output_with_failure(
         Capability::Edit,
     )
     .await?;
+    if ordinary_note_only {
+        require_ordinary_note_output_on(&mut tx, &input.consumer_record_id).await?;
+    }
     for reference in input
         .assembly
         .sources
@@ -1044,6 +1156,7 @@ pub async fn commit_durable_output_with_failure(
             },
             actor,
         )?,
+        &mut act_alloc,
     )
     .await?;
     if failure == Some(CommitFailurePoint::BeforeCommit) {
@@ -1051,7 +1164,7 @@ pub async fn commit_durable_output_with_failure(
             "injected durable output failure before commit",
         ));
     }
-    tx.commit().await?;
+    db.commit_content(tx).await?;
     let mut conn = db.pool().acquire().await?;
     load_commit_result_on(&mut conn, &receipt_event.id).await
 }
@@ -1412,6 +1525,7 @@ pub async fn reconcile_dependency(
     }
     let intent = intent_sha256(&input)?;
     let mut tx = begin_write(db.write_pool()).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
     let row = sqlx::query(
         "SELECT d.consumer_record_id,d.consumer_revision,d.source_revision,d.affected_conclusion
            FROM dependencies d
@@ -1506,6 +1620,7 @@ pub async fn reconcile_dependency(
             },
             actor,
         )?,
+        &mut act_alloc,
     )
     .await?;
     tx.commit().await?;
@@ -1532,6 +1647,7 @@ pub async fn supersede_unit(
     });
     let intent = intent_sha256(&input)?;
     let mut tx = begin_write(db.write_pool()).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
     require_capability_on(
         &mut tx,
         principal,
@@ -1579,6 +1695,7 @@ pub async fn supersede_unit(
             },
             actor,
         )?,
+        &mut act_alloc,
     )
     .await?;
     tx.commit().await?;
@@ -1618,6 +1735,7 @@ pub async fn audit_dependency(
     }
     let intent = intent_sha256(&input)?;
     let mut tx = begin_write(db.write_pool()).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
     let consumer: String =
         sqlx::query_scalar("SELECT consumer_record_id FROM receipts WHERE receipt_id=?")
             .bind(input.receipt_id.as_str())
@@ -1705,6 +1823,7 @@ pub async fn audit_dependency(
             },
             actor,
         )?,
+        &mut act_alloc,
     )
     .await?;
     tx.commit().await?;

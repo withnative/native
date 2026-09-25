@@ -99,6 +99,64 @@ async fn keyed_replay_returns_the_original_receipt_and_appends_nothing() {
 }
 
 #[tokio::test]
+async fn keyed_replay_preserves_alias_warnings_byte_identical() {
+    // A keyed WorkItem/task create carrying the `assignee` alias warns on
+    // the fresh call; both replay branches (unchanged fast path and
+    // pinned-prefix slow path) must return that same receipt byte-for-byte.
+    let db = db().await;
+    let registry = registry();
+    let args = json!({
+        "type": "WorkItem",
+        "kind": "task",
+        "name": "assigned task",
+        "facets": { "assignee": "someone" },
+        "idempotency_key": "alias-key-1",
+    });
+
+    let first = create(&registry, &db, Caller::local(), args.clone())
+        .await
+        .unwrap();
+    let warnings = first["warnings"].as_array().unwrap();
+    assert_eq!(warnings.len(), 1, "{first}");
+    assert_eq!(warnings[0]["code"], "governed_relationship_alias");
+    assert_eq!(warnings[0]["facet_key"], "assignee");
+    assert_eq!(warnings[0]["relationship_type"], "assigned_to");
+
+    let retry = create(&registry, &db, Caller::local(), args.clone())
+        .await
+        .unwrap();
+    assert_eq!(retry, first, "alias-warning replay must be byte-identical");
+
+    // Presentation-only shaping keeps the structured warning: a verbose
+    // retry reshapes but carries the same warnings array.
+    let mut verbose_args = args.clone();
+    verbose_args["response_mode"] = json!("verbose");
+    let verbose = create(&registry, &db, Caller::local(), verbose_args)
+        .await
+        .unwrap();
+    assert_eq!(verbose["id"], first["id"]);
+    assert_eq!(verbose["warnings"], first["warnings"]);
+
+    // An intervening write forces the pinned-prefix slow path; the
+    // reconstructed receipt still carries the warnings identically.
+    let record_id = first["id"].as_str().unwrap().to_string();
+    call(
+        &registry,
+        &db,
+        Caller::local(),
+        "update_record",
+        json!({ "id": record_id, "body": "another agent's edit" }),
+    )
+    .await
+    .unwrap();
+    let pinned = create(&registry, &db, Caller::local(), args).await.unwrap();
+    assert_eq!(
+        pinned, first,
+        "pinned-prefix replay must reconstruct the alias warnings"
+    );
+}
+
+#[tokio::test]
 async fn reused_key_with_materially_different_request_conflicts() {
     let db = db().await;
     let registry = registry();

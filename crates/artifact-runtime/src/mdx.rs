@@ -1920,6 +1920,21 @@ fn bounded_relation_rows<'a>(
     Ok(rows)
 }
 
+/// The nine fixed fields of a `native.artifact-record.v1` row. The shape is
+/// closed by design: a tenth field is not a wider row but a different grain,
+/// and the rejection below names the governed SQL relation port that serves it.
+const ARTIFACT_RECORD_ROW_FIELDS: [&str; 9] = [
+    "id",
+    "type",
+    "kind",
+    "name",
+    "summary",
+    "lifecycle_interpretation",
+    "maturity",
+    "persistence",
+    "facets",
+];
+
 fn validate_record_relation(relation: &Value) -> Result<(), Failure> {
     let relation = exact_input_object(
         relation,
@@ -1954,21 +1969,18 @@ fn validate_record_relation(relation: &Value) -> Result<(), Failure> {
     }
     let mut ids = BTreeSet::new();
     for row in rows {
-        let row = exact_input_object(
-            row,
-            &[
-                "id",
-                "type",
-                "kind",
-                "name",
-                "summary",
-                "lifecycle_interpretation",
-                "maturity",
-                "persistence",
-                "facets",
-            ],
-            "artifact record row",
-        )?;
+        let row = row
+            .as_object()
+            .ok_or_else(|| input_failure("artifact record row must be an object"))?;
+        if row.len() != ARTIFACT_RECORD_ROW_FIELDS.len()
+            || ARTIFACT_RECORD_ROW_FIELDS
+                .iter()
+                .any(|field| !row.contains_key(*field))
+        {
+            return Err(input_failure(
+                "artifact record row carries nine fixed fields; for aggregates, joins, or derived values use a governed SQL relation port",
+            ));
+        }
         let id = row
             .get("id")
             .and_then(Value::as_str)
@@ -2019,7 +2031,10 @@ fn validate_governed_sql_relation(relation: &Value) -> Result<(), Failure> {
             .map_err(|_| input_failure("governed SQL columns are not valid JSON"))?,
     );
     if schema_digest != Some(expected_schema.as_str()) {
-        return Err(input_failure("governed SQL schema digest is invalid"));
+        return Err(input_failure(format!(
+            "governed SQL schema digest is invalid (expected {expected_schema}, supplied {})",
+            schema_digest.unwrap_or("missing")
+        )));
     }
     let mut declared = BTreeMap::<&str, (&str, bool)>::new();
     for column in columns {
@@ -4228,6 +4243,30 @@ const Child=()=>globalThis.__nativeBridge.jsx("BarChart",{label:"Clone",data:{..
     }
 
     #[test]
+    fn governed_sql_schema_digest_failure_reports_the_expected_digest() {
+        let columns = json!([{ "name": "id", "type": "identifier", "nullable": false }]);
+        let expected = sha256_hex(&crate::mdx_v2::canonical_json_bytes(&columns));
+        let relation = json!({
+            "grain": "governed_sql",
+            "key": ["id"],
+            "columns": columns,
+            "schema_sha256": "0".repeat(64),
+            "extent": {},
+            "rows": [],
+            "rows_sha256": ""
+        });
+        let failure =
+            validate_governed_sql_relation(&relation).expect_err("wrong schema digest fails");
+        assert_eq!(failure.code, "mdx_output_invalid");
+        assert!(
+            failure.message.contains("schema digest is invalid"),
+            "{failure:?}"
+        );
+        assert!(failure.message.contains(&expected), "{failure:?}");
+        assert!(failure.message.contains(&"0".repeat(64)), "{failure:?}");
+    }
+
+    #[test]
     fn relation_rows_are_authenticated_and_malformed_envelopes_fail_before_authored_code() {
         let _guard = test_guard();
         let input = json!({
@@ -4344,6 +4383,23 @@ const Child=()=>globalThis.__nativeBridge.jsx("RecordCard",{record:{...child.inp
         )
         .expect_err("authored clones are not canonical relation rows");
         assert_eq!(cloned.code, "mdx_capability_denied");
+
+        let mut extra_derived_field = relation_envelope(json!([artifact_record("one")]));
+        extra_derived_field["relation"]["rows"][0]["comment_count"] = json!(0);
+        extra_derived_field["relation"]["rows_sha256"] = json!(sha256_hex(
+            &crate::mdx_v2::canonical_json_bytes(&extra_derived_field["relation"]["rows"])
+        ));
+        let failure = validate_relation_envelope(&extra_derived_field)
+            .expect_err("a field outside the fixed nine must name the governed SQL route");
+        assert_eq!(
+            failure.message,
+            "artifact record row carries nine fixed fields; for aggregates, joins, or derived values use a governed SQL relation port"
+        );
+
+        let not_an_object = relation_envelope(json!(["not-an-object"]));
+        let failure = validate_relation_envelope(&not_an_object)
+            .expect_err("a non-object row must keep its own diagnostic, not the field-count route");
+        assert_eq!(failure.message, "artifact record row must be an object");
 
         for (source, component) in [
             (

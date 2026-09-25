@@ -1094,14 +1094,28 @@ pub async fn missing_representation_evidence() -> Result<MissingRepresentationEv
     .ok_or_else(|| Error::engine("primary Occurrence disappeared"))?;
     let fixture_pool = crate::common::fixture_write_pool(&database).await;
     let expected_original_artefact_revision = occurrence.artefact_revision.clone();
+    // content_events is append-only by trigger; this corruption fixture drops
+    // only the update guard and restores the exact sqlite_master SQL on the
+    // same connection around the mutation, before resolution continues.
+    let mut fixture = fixture_pool.acquire().await?;
+    let update_guard: String = sqlx::query_scalar(
+        "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='content_events_no_update'",
+    )
+    .fetch_one(&mut *fixture)
+    .await?;
+    sqlx::query("DROP TRIGGER content_events_no_update")
+        .execute(&mut *fixture)
+        .await?;
     sqlx::query(
         "UPDATE content_events
             SET payload=json_set(payload,'$.body','historical representation unavailable')
           WHERE id=?",
     )
     .bind(&occurrence.artefact_revision.revision_event_id)
-    .execute(&fixture_pool)
+    .execute(&mut *fixture)
     .await?;
+    sqlx::query(&update_guard).execute(&mut *fixture).await?;
+    drop(fixture);
     let resolution = native_ce::freshness::resolve_occurrence(
         &database,
         SqliteFreshnessHarness::principal(),

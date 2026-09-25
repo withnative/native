@@ -1,0 +1,210 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "name": "bare_basic",
+      "body": "See abc1234 for details.",
+      "expected": [
+        { "form": "bare_hex", "authored_reference": "abc1234", "lookup_key": "abc1234", "span_start": 4, "span_end": 11 }
+      ]
+    },
+    {
+      "name": "bare_uppercase_folds_lookup",
+      "body": "See ABC1234 now.",
+      "expected": [
+        { "form": "bare_hex", "authored_reference": "ABC1234", "lookup_key": "abc1234", "span_start": 4, "span_end": 11 }
+      ]
+    },
+    {
+      "name": "nine_hex_excluded",
+      "body": "token abc123456 here",
+      "expected": []
+    },
+    {
+      "name": "uuid_excluded",
+      "body": "id 0189d4c6-1f2a-4a1b-9c3d-5e6f70819293 end",
+      "expected": []
+    },
+    {
+      "name": "alnum_and_dash_adjacent_excluded",
+      "body": "xabc1234 and abc1234-def",
+      "expected": []
+    },
+    {
+      "name": "underscore_adjacent_allowed",
+      "body": "_abc1234_ ok",
+      "expected": [
+        { "form": "bare_hex", "authored_reference": "abc1234", "lookup_key": "abc1234", "span_start": 1, "span_end": 8 }
+      ]
+    },
+    {
+      "name": "wiki_hex_precedence_over_bare",
+      "body": "See [[abc1234]] and abc1234.",
+      "expected": [
+        { "form": "wiki_hex", "authored_reference": "abc1234", "lookup_key": "abc1234", "span_start": 4, "span_end": 15 },
+        { "form": "bare_hex", "authored_reference": "abc1234", "lookup_key": "abc1234", "span_start": 20, "span_end": 27 }
+      ]
+    },
+    {
+      "name": "wiki_name",
+      "body": "See [[My Note]] today.",
+      "expected": [
+        { "form": "wiki_name", "authored_reference": "My Note", "lookup_key": "my note", "span_start": 4, "span_end": 15 }
+      ]
+    },
+    {
+      "name": "wiki_padded_hex_trims",
+      "body": "See [[ abc1234 ]] now.",
+      "expected": [
+        { "form": "wiki_hex", "authored_reference": "abc1234", "lookup_key": "abc1234", "span_start": 4, "span_end": 17 }
+      ]
+    },
+    {
+      "name": "wiki_padded_name_trims",
+      "body": "See [[ My Note ]] now.",
+      "expected": [
+        { "form": "wiki_name", "authored_reference": "My Note", "lookup_key": "my note", "span_start": 4, "span_end": 17 }
+      ]
+    },
+    {
+      "name": "wiki_whitespace_only_rejected",
+      "body": "See [[   ]] now.",
+      "expected": []
+    },
+    {
+      "name": "wiki_pipe_rejected_atomically",
+      "body": "See [[ABC1234|Alias]] end.",
+      "expected": []
+    },
+    {
+      "name": "wiki_80_accepted",
+      "body": "See [[aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa]] end.",
+      "expected": [
+        { "form": "wiki_name", "authored_reference": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "lookup_key": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "span_start": 4, "span_end": 88 }
+      ]
+    },
+    {
+      "name": "wiki_over_80_rejected",
+      "body": "See [[aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa]] end.",
+      "expected": []
+    },
+    {
+      "name": "wiki_padded_80_accepted_after_trim",
+      "body": "See [[ aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ]] end.",
+      "expected": [
+        { "form": "wiki_name", "authored_reference": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "lookup_key": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "span_start": 4, "span_end": 90 }
+      ]
+    },
+    {
+      "name": "wiki_padded_81_rejected_after_trim",
+      "body": "See [[ aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ]] end.",
+      "expected": []
+    },
+    {
+      "name": "url_n8vto",
+      "body": "Read https://n8v.to/abc1234 today.",
+      "expected": [
+        { "form": "url", "authored_reference": "abc1234", "lookup_key": "abc1234", "span_start": 5, "span_end": 27 }
+      ]
+    },
+    {
+      "name": "url_app_query_fragment",
+      "body": "Read https://app.withnative.ai/abc1234?x=1#frag today.",
+      "expected": [
+        { "form": "url", "authored_reference": "abc1234", "lookup_key": "abc1234", "span_start": 5, "span_end": 47 }
+      ]
+    },
+    {
+      "name": "url_full_uuid_is_lexical",
+      "body": "Read https://n8v.to/0189d4c6-1f2a-4a1b-9c3d-5e6f70819293 today.",
+      "expected": [
+        { "form": "url", "authored_reference": "0189d4c6-1f2a-4a1b-9c3d-5e6f70819293", "lookup_key": "0189d4c6-1f2a-4a1b-9c3d-5e6f70819293", "span_start": 5, "span_end": 56 }
+      ]
+    },
+    {
+      "name": "url_schemeless_short",
+      "body": "Read n8v.to/abc123 today.",
+      "expected": [
+        { "form": "url", "authored_reference": "abc123", "lookup_key": "abc123", "span_start": 5, "span_end": 18 }
+      ]
+    },
+    {
+      "name": "url_schemeless_32",
+      "body": "See n8v.to/0123456789abcdef0123456789abcdef end.",
+      "expected": [
+        { "form": "url", "authored_reference": "0123456789abcdef0123456789abcdef", "lookup_key": "0123456789abcdef0123456789abcdef", "span_start": 4, "span_end": 43 }
+      ]
+    },
+    {
+      "name": "url_schemeless_uuid",
+      "body": "See n8v.to/0189d4c6-1f2a-4a1b-9c3d-5e6f70819293 end.",
+      "expected": [
+        { "form": "url", "authored_reference": "0189d4c6-1f2a-4a1b-9c3d-5e6f70819293", "lookup_key": "0189d4c6-1f2a-4a1b-9c3d-5e6f70819293", "span_start": 4, "span_end": 47 }
+      ]
+    },
+    {
+      "name": "url_short_segment_rejected",
+      "body": "See n8v.to/abc end.",
+      "expected": []
+    },
+    {
+      "name": "url_long_segment_rejected",
+      "body": "See n8v.to/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa end.",
+      "expected": []
+    },
+    {
+      "name": "fence_skipped",
+      "body": "```\nabc1234\n```\nReal abc1234 here.",
+      "expected": [
+        { "form": "bare_hex", "authored_reference": "abc1234", "lookup_key": "abc1234", "span_start": 21, "span_end": 28 }
+      ]
+    },
+    {
+      "name": "unclosed_fence_runs_to_end",
+      "body": "Text abc1234\n```\nabc1234 tail",
+      "expected": [
+        { "form": "bare_hex", "authored_reference": "abc1234", "lookup_key": "abc1234", "span_start": 5, "span_end": 12 }
+      ]
+    },
+    {
+      "name": "fence_close_ignores_trailing_text",
+      "body": "```\nabc1234\n``` trailing\nReal abc1234.",
+      "expected": [
+        { "form": "bare_hex", "authored_reference": "abc1234", "lookup_key": "abc1234", "span_start": 30, "span_end": 37 }
+      ]
+    },
+    {
+      "name": "fence_mismatched_char_never_closes",
+      "body": "```\nabc1234\n~~~\nmore abc1234\n",
+      "expected": []
+    },
+    {
+      "name": "fence_longer_close",
+      "body": "```\nabc1234\n`````\nReal abc1234.",
+      "expected": [
+        { "form": "bare_hex", "authored_reference": "abc1234", "lookup_key": "abc1234", "span_start": 23, "span_end": 30 }
+      ]
+    },
+    {
+      "name": "fence_info_string_allowed",
+      "body": "```rust\nabc1234\n```\nReal abc1234.",
+      "expected": [
+        { "form": "bare_hex", "authored_reference": "abc1234", "lookup_key": "abc1234", "span_start": 25, "span_end": 32 }
+      ]
+    },
+    {
+      "name": "fence_two_space_indent_parity",
+      "body": "  ```\nabc1234\n  ```\nReal abc1234.",
+      "expected": [
+        { "form": "bare_hex", "authored_reference": "abc1234", "lookup_key": "abc1234", "span_start": 25, "span_end": 32 }
+      ]
+    },
+    {
+      "name": "utf8_prefix_byte_spans",
+      "body": "café abc1234",
+      "expected": [
+        { "form": "bare_hex", "authored_reference": "abc1234", "lookup_key": "abc1234", "span_start": 6, "span_end": 13 }
+      ]
+    }
+  ]
+}

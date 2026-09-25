@@ -43,6 +43,13 @@ pub(crate) trait AttachmentPhysicalPort {
     ) -> BoxFuture<'a, Result<Option<BlobSlice>>>;
 
     fn append_content<'a>(&'a mut self, spec: AppendSpec) -> BoxFuture<'a, Result<()>>;
+
+    /// The act this transaction allocated, if it has appended anything
+    /// canonical yet. Lets the shared write-response builders echo the
+    /// coordinate of the write they just performed on every backend.
+    fn allocated_act(&self) -> Option<i64> {
+        None
+    }
 }
 
 pub(crate) struct AttachmentCreate<'a> {
@@ -363,12 +370,16 @@ where
     }
     let after = required_violations(port, &schema_rows, &[&attachment_id]).await?;
     assert_required_not_worsened(tool, &before, &after)?;
-    Ok(json!({
+    let mut response = json!({
         "attachment_id": attachment_id,
         "record_id": bearer_id,
         "name": name,
         "blob": meta,
-    }))
+    });
+    if let Some(act) = port.allocated_act() {
+        response["act"] = act.into();
+    }
+    Ok(response)
 }
 
 fn attachment_not_found(tool: &str, attachment_id: &str) -> Error {
@@ -842,10 +853,14 @@ where
         actor: Some(actor.into()),
     })
     .await?;
-    Ok(json!({
+    let mut response = json!({
         "attachment_id": attachment_id,
         "detached": true,
         "blob_id": state.blob_id,
         "blob_retained": true,
-    }))
+    });
+    if let Some(act) = port.allocated_act() {
+        response["act"] = act.into();
+    }
+    Ok(response)
 }

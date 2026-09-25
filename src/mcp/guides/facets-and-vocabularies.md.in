@@ -52,6 +52,12 @@ Owned by the attachment seam and points an attachment record at immutable blob b
 
 Owned by `manage_canvas.promote` and records that a record was minted by promoting an object on a canvas. Its value is an object: `{canvas_id, object_id, batch_event_id, attestation_id}`. It is reserved rather than a governed namespaced facet precisely so that it cannot be forged: a facet any Edit holder could set through `create_record` or `update_record` would make canvas provenance a claim rather than evidence. Promotion writes it inside the same transaction that mints the record, under the same action attestation, so the facet, the `derived_from` link and the canvas batch all share one identity.
 
+## Governed relationships are not facets
+
+Governed relationships are asserted with `manage_relationships.assert`, never as facets. Task assignment is `assigned_to` from a `WorkItem/task` to an `Entity/person`; do not represent it with an `assignee` or `assigned_to` facet.
+
+A facet is not a substitute: a facet does not participate in relationship reads such as assigned-to-me, does not preserve the claimant, cannot be contested, and does not resolve its value to a person record. Writing an exact governed relationship name (for example `assigned_to`; the full set derives from the core relationship manifest and grows with it) as a facet is refused; writing the listed alias `assignee` on a `WorkItem/task` succeeds with a warning and still establishes no relationship.
+
 ## Safe read and write path
 
 Call `resolve_facets` with exactly one record or type context to see spine values, the effective shape, pack floor, provenance, and current values. For a governed facet, take its resolved vocabulary identity and call `manage_vocabularies` with `action:"list_values"`, `status:"active"`, and `resolve_aliases:true` before writing. Skipping resolution can select a same-named or stale vocabulary under the cascade.

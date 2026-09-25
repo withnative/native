@@ -1,7 +1,8 @@
 //! Experimental agent-speed context-freshness kernel.
 //!
-//! Unit/Revision/Occurrence plus the internal Receipt-driven runtime. Public
-//! tools and UI remain deliberately out of scope while the contract calibrates.
+//! Unit/Revision/Occurrence plus the internal Receipt-driven runtime. The
+//! supported ordinary-note authoring wrapper uses the Receipt aggregate;
+//! the general Unit and assessment grammar remains internal.
 
 #[cfg(feature = "experimental-agent-intents")]
 mod agent_intents;

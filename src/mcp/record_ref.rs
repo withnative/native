@@ -1215,7 +1215,7 @@ pub(crate) fn is_canonical_uuid_v4_or_v7(id: &str) -> bool {
     ) && uuid.hyphenated().to_string() == id
 }
 
-fn is_canonical_uuid(id: &str) -> bool {
+pub(crate) fn is_canonical_uuid(id: &str) -> bool {
     let bytes = id.as_bytes();
     if bytes.len() != UUID_LEN {
         return false;

@@ -9,8 +9,8 @@
     "manifest": { "$ref": "manifest.schema.json" },
     "sections": {
       "type": "array",
-      "minItems": 97,
-      "maxItems": 97,
+      "minItems": 99,
+      "maxItems": 99,
       "items": { "$ref": "section.schema.json" }
     }
   }

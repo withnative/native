@@ -54,7 +54,7 @@ async fn fresh_database_has_one_root_genesis_and_content_replay_creates_no_polic
     assert_eq!(count, 1);
 
     let rows = sqlx::query(
-        "SELECT seq,id,record_id,type,payload,actor,run_key,parent_key,intent,created_at
+        "SELECT seq,id,record_id,type,payload,actor,run_key,parent_key,intent,created_at,act
            FROM content_events ORDER BY seq",
     )
     .fetch_all(db.pool())
@@ -74,6 +74,7 @@ async fn fresh_database_has_one_root_genesis_and_content_replay_creates_no_polic
             intent: row.get("intent"),
             created_at: row.get("created_at"),
             causal_envelope: native_ce::events::CausalEnvelopeV1::legacy_unknown(),
+            act: row.get("act"),
         })
         .collect::<Vec<_>>();
     let scratch = open_database(":memory:").await.unwrap();

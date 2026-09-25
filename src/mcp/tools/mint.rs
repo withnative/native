@@ -96,6 +96,7 @@ pub(super) async fn mint_record_in(
     request: &MintRequest<'_>,
     policy: &MintPolicy,
     draft: &crate::provenance::ActionAttestationDraft,
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<String> {
     let tool = policy.tool;
 
@@ -266,10 +267,17 @@ pub(super) async fn mint_record_in(
             payload: Value::Object(fields),
             actor: Some(caller.actor().into()),
         },
+        act_alloc,
     )
     .await?;
     for facet in &facets {
-        append_in(db, tx, facet_set_spec(&id, facet, caller.actor())).await?;
+        append_in(
+            db,
+            tx,
+            facet_set_spec(&id, facet, caller.actor()),
+            act_alloc,
+        )
+        .await?;
     }
     for (index, link) in request.links.iter().enumerate() {
         if relationship_link_indexes.contains(&index) {
@@ -284,6 +292,7 @@ pub(super) async fn mint_record_in(
                 &link.relationship,
                 link.note.clone(),
                 draft,
+                act_alloc,
             )
             .await?;
         } else {
@@ -302,6 +311,7 @@ pub(super) async fn mint_record_in(
                     })?,
                     actor: Some(caller.actor().into()),
                 },
+                act_alloc,
             )
             .await?;
         }

@@ -55,6 +55,11 @@ fn reject(category: QuerySqlErrorCategory, detail: impl AsRef<str>) -> crate::Er
 }
 
 pub(crate) fn validate(sql: &str) -> Result<()> {
+    // I1 (E1 M2): the Turso AST normalises every parameter spelling to a
+    // bare index, so the `?N`-only spelling check cannot live on
+    // `Expr::Variable`. Run the shared classifier first — the same check
+    // that gates the SQLite and Postgres validates.
+    sql_contract::classify_single_read_statement(sql_contract::QuerySqlProfile::TursoLocal, sql)?;
     let mut parser = Parser::new(sql.as_bytes());
     let cmd = parser
         .next()
@@ -200,20 +205,31 @@ fn validate_table(table: &SelectTable, scopes: &[BTreeSet<String>]) -> Result<()
                 .rev()
                 .any(|scope| scope.contains(&relation.to_ascii_lowercase()));
             if !is_logical_relation(relation) && !in_scope {
-                return Err(reject(
-                    QuerySqlErrorCategory::UnauthorizedRelation,
-                    format!("relation '{relation}' is outside the logical catalog"),
-                ));
+                let base = format!("relation '{relation}' is outside the logical catalog");
+                let detail = match sql_contract::blocked_relation_repair(
+                    relation,
+                    sql_contract::QuerySqlProfile::TursoLocal,
+                ) {
+                    Some(repair) => format!("{base}. {repair}"),
+                    None => base,
+                };
+                return Err(reject(QuerySqlErrorCategory::UnauthorizedRelation, detail));
             }
             if let Some(alias) = alias {
                 checked_name(alias.name())?;
             }
         }
-        SelectTable::TableCall(_, _, _) => {
-            return Err(reject(
-                QuerySqlErrorCategory::UnauthorizedRelation,
-                "table-valued functions are unavailable",
-            ))
+        SelectTable::TableCall(name, _, _) => {
+            let called = name.name.as_str();
+            let base = "table-valued functions are unavailable".to_string();
+            let detail = match sql_contract::blocked_relation_repair(
+                called,
+                sql_contract::QuerySqlProfile::TursoLocal,
+            ) {
+                Some(repair) => format!("{base}. {repair}"),
+                None => base,
+            };
+            return Err(reject(QuerySqlErrorCategory::UnauthorizedRelation, detail));
         }
         SelectTable::Select(select, alias) => {
             validate_select(select, scopes)?;
@@ -474,7 +490,15 @@ fn checked_name(name: &Name) -> Result<&str> {
     {
         Err(reject(
             QuerySqlErrorCategory::UnauthorizedRelation,
-            format!("identifier '{value}' is unavailable"),
+            match sql_contract::blocked_relation_repair(
+                value,
+                sql_contract::QuerySqlProfile::TursoLocal,
+            ) {
+                Some(repair) => {
+                    format!("identifier '{value}' is unavailable. {repair}")
+                }
+                None => format!("identifier '{value}' is unavailable"),
+            },
         ))
     } else {
         Ok(value)
@@ -514,5 +538,57 @@ mod tests {
         ] {
             assert!(validate(sql).is_err(), "accepted {sql}");
         }
+    }
+
+    #[test]
+    fn rejects_non_positional_placeholders_with_the_portable_repair() {
+        // I1 (E1 M2): `?N` is the only admitted spelling. The parser would
+        // normalise every other spelling to a bare index, so the shared
+        // classifier runs first and names the fix.
+        let bare = validate("SELECT id FROM records WHERE id = ?").unwrap_err();
+        assert!(
+            bare.to_string()
+                .contains("Postgres `?`/`?|`/`?&` operators"),
+            "missing jsonb note: {bare}"
+        );
+        for sql in [
+            "SELECT id FROM records WHERE id = $1",
+            "SELECT id FROM records WHERE id = ?0",
+            "SELECT id FROM records WHERE id = :name",
+            "SELECT id FROM records WHERE id = @name",
+            "SELECT id FROM records WHERE id = $name",
+        ] {
+            let error = validate(sql).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("use positional `?N` placeholders"),
+                "{sql}: missing repair: {error}"
+            );
+        }
+        validate("SELECT id FROM records WHERE id = ?1").unwrap();
+        validate("SELECT '$1' AS value").unwrap();
+    }
+
+    #[test]
+    fn blocked_probes_name_the_catalog_fix() {
+        let rendered = |sql: &str| validate(sql).unwrap_err().to_string();
+        let probe = rendered("SELECT * FROM sqlite_master");
+        assert!(probe.contains("catalog introspection"), "{probe}");
+        let pragma = rendered("SELECT * FROM pragma_table_info('records')");
+        assert!(pragma.contains("catalog introspection"), "{pragma}");
+        let mapped = rendered("SELECT * FROM relationships");
+        // effective_relationships is sqlite-only: Turso falls through to
+        // the profile-filtered list instead of mis-pointing at it.
+        assert!(!mapped.contains("effective_relationships"), "{mapped}");
+        assert!(
+            mapped.contains("Queryable relations on turso-local:"),
+            "{mapped}"
+        );
+        let unmapped = rendered("SELECT * FROM member_contexts");
+        assert!(
+            unmapped.contains("Queryable relations on turso-local:"),
+            "{unmapped}"
+        );
     }
 }

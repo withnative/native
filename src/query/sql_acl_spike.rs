@@ -567,8 +567,8 @@ async fn negative_controls_expose_todays_bypass_and_unsafe_connection_state() {
 #[tokio::test]
 async fn logical_contract_covers_records_aggregates_and_scoped_relations() {
     let fixture = fixture(2).await;
-    let alice = QueryPrincipal::authenticated("alice");
-    let bea = QueryPrincipal::authenticated("bea");
+    let alice = QueryPrincipal::authenticated("alice", true);
+    let bea = QueryPrincipal::authenticated("bea", true);
 
     assert_eq!(
         prototype_query_sql(
@@ -690,9 +690,9 @@ async fn logical_contract_covers_records_aggregates_and_scoped_relations() {
 #[tokio::test]
 async fn ctes_joins_validator_policy_changes_fts_and_stdio_are_consistent() {
     let fixture = fixture(2).await;
-    let alice = QueryPrincipal::authenticated("alice");
-    let bea = QueryPrincipal::authenticated("bea");
-    let stdio = QueryPrincipal::authenticated("stdio-account");
+    let alice = QueryPrincipal::authenticated("alice", true);
+    let bea = QueryPrincipal::authenticated("bea", true);
+    let stdio = QueryPrincipal::authenticated("stdio-account", true);
 
     let cte = "WITH visible AS (SELECT id FROM records) \
                SELECT CAST(count(*) AS TEXT) FROM visible v \
@@ -840,8 +840,10 @@ async fn one_thousand_interleaved_and_reused_requests_never_cross_principals() {
                 } else {
                     "bea-private"
                 };
-                let caller =
-                    QueryPrincipal::authenticated(if index % 2 == 0 { "alice" } else { "bea" });
+                let caller = QueryPrincipal::authenticated(
+                    if index % 2 == 0 { "alice" } else { "bea" },
+                    true,
+                );
                 let rows = prototype_query_sql(
                     &pool,
                     &caller,
@@ -869,7 +871,7 @@ async fn one_thousand_interleaved_and_reused_requests_never_cross_principals() {
         assert_eq!(
             prototype_query_sql(
                 &single.pool,
-                &QueryPrincipal::authenticated(account),
+                &QueryPrincipal::authenticated(account, true),
                 "SELECT id FROM records WHERE kind IS NULL AND id <> 'common'"
             )
             .await
@@ -883,8 +885,8 @@ async fn one_thousand_interleaved_and_reused_requests_never_cross_principals() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn success_denial_execution_error_handler_error_cancellation_and_timeout_clean_up() {
     let fixture = fixture(1).await;
-    let alice = QueryPrincipal::authenticated("alice");
-    let bea = QueryPrincipal::authenticated("bea");
+    let alice = QueryPrincipal::authenticated("alice", true);
+    let bea = QueryPrincipal::authenticated("bea", true);
 
     // Seed the exact dirty state the defensive clear exists to repair. Because
     // clear is outside the request transaction, Bea's rollback returns the
@@ -1041,7 +1043,7 @@ where
 #[tokio::test]
 async fn benchmark_current_shape_against_transaction_scoped_principal() {
     let fixture = fixture(1).await;
-    let alice = QueryPrincipal::authenticated("alice");
+    let alice = QueryPrincipal::authenticated("alice", true);
     let iterations = 100;
     let current_validation_us = elapsed_per_call(iterations, || async {
         sql::validate("SELECT id FROM records WHERE id='alice-private'").unwrap();

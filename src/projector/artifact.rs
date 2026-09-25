@@ -308,6 +308,7 @@ async fn verified_equal_declaration_surfaces(
     artifact_id: &str,
     old: CarrySourceIdentity<'_>,
     new: CarrySourceIdentity<'_>,
+    port: Option<&str>,
     event_seq: i64,
 ) -> Result<()> {
     let rows = sqlx::query(
@@ -338,28 +339,48 @@ async fn verified_equal_declaration_surfaces(
             (
                 row.try_get::<String, _>("source_event_id")?,
                 crate::mcp::tools::artifacts::declaration_surface_sha256(&descriptor)?,
+                descriptor,
             ),
         );
     }
     if attestations
         .get(old.attestation_event_id)
-        .map(|(source, _)| source.as_str())
+        .map(|(source, _, _)| source.as_str())
         != Some(old.source_event_id)
         || attestations
             .get(new.attestation_event_id)
-            .map(|(source, _)| source.as_str())
+            .map(|(source, _, _)| source.as_str())
             != Some(new.source_event_id)
         || attestations
             .get(old.attestation_event_id)
-            .map(|(_, digest)| digest.as_str())
+            .map(|(_, digest, _)| digest.as_str())
             != Some(old.declaration_surface_sha256)
         || attestations
             .get(new.attestation_event_id)
-            .map(|(_, digest)| digest.as_str())
+            .map(|(_, digest, _)| digest.as_str())
             != Some(new.declaration_surface_sha256)
-        || old.declaration_surface_sha256 != new.declaration_surface_sha256
     {
         return Err(Error::engine("artifact carry declaration surface changed"));
+    }
+    // Per-port carry: only the carried item's own port declaration must match
+    // across the two revisions. A grant with no port in scope (navigation) is
+    // not gated on any port. The whole-surface digests above are still
+    // verified against their own descriptors; only the equality requirement
+    // between them is dropped.
+    if let Some(port) = port {
+        let old_descriptor = &attestations
+            .get(old.attestation_event_id)
+            .expect("old carry attestation checked above")
+            .2;
+        let new_descriptor = &attestations
+            .get(new.attestation_event_id)
+            .expect("new carry attestation checked above")
+            .2;
+        if crate::mcp::tools::artifacts::changed_ports(old_descriptor, new_descriptor)?
+            .contains(port)
+        {
+            return Err(Error::engine("artifact carry port declaration changed"));
+        }
     }
     let revisions = sqlx::query_scalar::<_, String>(
         "SELECT id FROM content_events WHERE record_id=? AND seq < ?
@@ -425,6 +446,7 @@ pub(super) async fn project_artifact_input_carried(
             source_event_id: &binding.artifact_source_event_id,
             declaration_surface_sha256: &payload.new_declaration_surface_sha256,
         },
+        Some(&binding.port_name),
         event.local_seq,
     )
     .await?;
@@ -635,6 +657,11 @@ pub(super) async fn project_artifact_module_grant_carried(
                 .expect("new carry attestation identity checked above"),
             declaration_surface_sha256: &payload.new_declaration_surface_sha256,
         },
+        payload
+            .grant
+            .scope
+            .get("artifact_port")
+            .and_then(Value::as_str),
         event.local_seq,
     )
     .await?;

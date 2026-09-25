@@ -2,11 +2,11 @@
 
 # Engine-native read-only SQL
 
-`query_sql` accepts one read-only statement in the active engine's native dialect. Native does not translate SQL between engines. Call `engine_info` first and inspect its `query_sql` object: it is the admission truth for availability, immutable profile revision, dialect, parameter convention, limits, and any fail-closed reason.
+`query_sql` accepts one read-only statement in the active engine's native dialect. Native does not translate SQL between engines. The `sql_read` descriptor card names the relations, value model and worked statements; `engine_info` remains available for the active profile revision, dialect, parameter convention, limits, and any fail-closed reason, but is not required before use.
 
 ## Parameters
 
-Parameters are optional and positional. Every supplied item requires both a `type` tag and an explicit `value`; `value: null` is a typed SQL NULL, while the string `"null"` is a JSON null for the `json` tag. Use the active profile's generated placeholder and encoding metadata below.
+Parameters are optional and positional (`?N`, 1-based and contiguous, on every profile — `$N`, bare `?`, and `:name` are rejected). Every supplied item requires both a `type` tag and an explicit `value`; `value: null` is a typed SQL NULL, while the string `"null"` is a JSON null for the `json` tag. Use the active profile's encoding metadata below.
 
 ```json
 {
@@ -21,7 +21,9 @@ Queries are not portable merely because their parameter values are.
 
 Rows and relations are caller-filtered. Physical policy, principal, catalog, FTS, embedding, job, metadata, and introspection relations are not part of the logical catalog. A read-only transaction alone is not authorization.
 
-SQLite retains its established normalization: SQL NULL to JSON null, INTEGER to a JSON integer, REAL to a finite JSON number, BLOB to base64 text, and other values to text. Engines with distinct boolean, arbitrary numeric, JSON, or timestamp types must follow the generated encoding contract. Ordering, collation, null placement, and timestamp precision remain dialect-specific.
+Prefixing an admissible statement with `EXPLAIN QUERY PLAN` returns its plan instead of its rows, showing whether the query probes a caller-relative relation by key or scans it. The plan names internal helper relations such as `_query_sql_authorization_subjects` by design: that is the authorization relation the query is evaluated against, not a leak.
+
+Every engine presents the same value model: timestamps as fixed UTC-millis text with integer epoch-millis `*_ms` companions (date maths is portable integer arithmetic), booleans as 0/1, binary (`C`) text ordering, and one numeric encoding per value shape — integer-valued numerics (notably `sum` over integers) as JSON integers, non-integral ones (notably `avg`) as JSON numbers, with out-of-range integers refused rather than rounded. SQL NULL becomes JSON null, INTEGER a JSON integer, REAL a finite JSON number, BLOB base64 text, and other values text. Null placement in ordering remains dialect-specific, so state `NULLS FIRST` or `NULLS LAST` explicitly on nullable sort keys; every engine admits the explicit form.
 
 ## Saved governed SQL
 
@@ -38,7 +40,7 @@ execution validates it again and runs through the same caller-filtered
   "v":"1.1",
   "kind":"governed_sql",
   "profile":{"id":"sqlite-local","revision":2},
-  "catalog_revision":3,
+  "catalog_revision":4,
   "relations":{"records":{"identity":"native.query-sql.records","semantic_version":1}},
   "sql":"SELECT name,id FROM records WHERE type=?1",
   "parameters":[{"type":"text","value":"WorkItem"}],
@@ -85,6 +87,19 @@ logical run across stateless calls. It is useful for grouping and recognizing
 that run, but it is not authentication, proof of exclusive possession, or a
 persistent identity for the actor behind the calls. `activity_id` remains the
 opaque relational key used to join activity with `agent_activity_claims`.
+
+`agent_activity.declared_intent` is the latest text the run declared with
+`set_intent`, or NULL. Intent is caller-authored disclosure, never verified
+fact, and it is disclosed only to the declaring account. The companion
+`declared_intent_state` is engine-authored and tells the NULLs apart:
+`disclosed` (text shown), `none` (own run, nothing declared), `withheld`
+(another account's run), or `unavailable` (the `read_log_calls` capture table
+was absent for this observation). Precedence is fixed: `unavailable` shadows
+`withheld`, since there is nothing to withhold when capture contributed
+nothing. Known gap: a standby export strips read-log rows but keeps the
+tables, so a stripped-but-present read log reports `none` rather than
+`unavailable`. Telling "capture ran and found nothing" from "capture was
+removed" needs a durable signal the export writes, which does not exist yet.
 
 `native.relation-envelope.v1` artifact ports may bind a governed SQL
 Collection when the port declares the exact `schema_sha256` expected from its
@@ -173,9 +188,13 @@ This exhaustive reference is generated from the same typed metadata used by `eng
         "maturity",
         "summary",
         "last_activity_at",
+        "last_activity_at_ms",
         "created_at",
+        "created_at_ms",
         "updated_at",
-        "deleted_at"
+        "updated_at_ms",
+        "deleted_at",
+        "deleted_at_ms"
       ]
     },
     {
@@ -194,7 +213,8 @@ This exhaustive reference is generated from the same typed metadata used by `eng
         "id",
         "record_id",
         "type",
-        "created_at"
+        "created_at",
+        "created_at_ms"
       ]
     },
     {
@@ -214,7 +234,8 @@ This exhaustive reference is generated from the same typed metadata used by `eng
         "target_id",
         "relationship",
         "note",
-        "created_at"
+        "created_at",
+        "created_at_ms"
       ]
     },
     {
@@ -235,7 +256,8 @@ This exhaustive reference is generated from the same typed metadata used by `eng
         "value",
         "value_num",
         "vocab_ref",
-        "created_at"
+        "created_at",
+        "created_at_ms"
       ]
     },
     {
@@ -258,6 +280,7 @@ This exhaustive reference is generated from the same typed metadata used by `eng
         "vocab_ref",
         "as_of",
         "observed_at",
+        "observed_at_ms",
         "event_seq"
       ]
     },
@@ -279,7 +302,8 @@ This exhaustive reference is generated from the same typed metadata used by `eng
         "is_canonical",
         "url",
         "etag",
-        "last_seen_at"
+        "last_seen_at",
+        "last_seen_at_ms"
       ]
     },
     {
@@ -302,7 +326,8 @@ This exhaustive reference is generated from the same typed metadata used by `eng
         "original_filename",
         "storage_tier",
         "external_ref",
-        "created_at"
+        "created_at",
+        "created_at_ms"
       ]
     },
     {
@@ -319,7 +344,8 @@ This exhaustive reference is generated from the same typed metadata used by `eng
       "columns": [
         "id",
         "name",
-        "created_at"
+        "created_at",
+        "created_at_ms"
       ]
     },
     {
@@ -363,7 +389,8 @@ This exhaustive reference is generated from the same typed metadata used by `eng
         "data",
         "applies_to_collection_id",
         "version_lineage",
-        "created_at"
+        "created_at",
+        "created_at_ms"
       ]
     },
     {
@@ -386,13 +413,14 @@ This exhaustive reference is generated from the same typed metadata used by `eng
         "epistemic_state",
         "support_count",
         "contest_count",
-        "recomputed_at"
+        "recomputed_at",
+        "recomputed_at_ms"
       ]
     },
     {
       "identity": "native.semantic.agent_activity",
       "name": "agent_activity",
-      "semantic_version": 2,
+      "semantic_version": 3,
       "caller_relative": true,
       "completeness": "best_effort",
       "profiles": [
@@ -404,10 +432,16 @@ This exhaustive reference is generated from the same typed metadata used by `eng
         "principal_ref",
         "principal_display_name",
         "started_at",
+        "started_at_ms",
         "ended_at",
+        "ended_at_ms",
         "last_observed_activity_at",
+        "last_observed_activity_at_ms",
         "active_until",
-        "appears_active"
+        "active_until_ms",
+        "appears_active",
+        "declared_intent",
+        "declared_intent_state"
       ]
     },
     {
@@ -424,7 +458,9 @@ This exhaustive reference is generated from the same typed metadata used by `eng
         "activity_id",
         "record_id",
         "claimed_at",
+        "claimed_at_ms",
         "released_at",
+        "released_at_ms",
         "is_current"
       ]
     },
@@ -440,6 +476,44 @@ This exhaustive reference is generated from the same typed metadata used by `eng
       "columns": [
         "message_id"
       ]
+    },
+    {
+      "identity": "native.query-sql.catalog-relations",
+      "name": "catalog_relations",
+      "semantic_version": 1,
+      "caller_relative": false,
+      "completeness": "complete",
+      "profiles": [
+        "sqlite-local",
+        "postgres-server",
+        "turso-local"
+      ],
+      "columns": [
+        "relation_name",
+        "identity",
+        "semantic_version",
+        "caller_relative",
+        "completeness",
+        "profiles",
+        "comment"
+      ]
+    },
+    {
+      "identity": "native.query-sql.catalog-columns",
+      "name": "catalog_columns",
+      "semantic_version": 1,
+      "caller_relative": false,
+      "completeness": "complete",
+      "profiles": [
+        "sqlite-local",
+        "postgres-server",
+        "turso-local"
+      ],
+      "columns": [
+        "relation_name",
+        "column_name",
+        "column_position"
+      ]
     }
   ],
   "result_encoding": {
@@ -447,7 +521,9 @@ This exhaustive reference is generated from the same typed metadata used by `eng
       "columns",
       "rows",
       "row_count",
-      "truncated"
+      "truncated",
+      "truncation_hint",
+      "as_of_seq"
     ],
     "row_shape": "object-keyed-by-unique-column-label",
     "unique_column_labels": true,
@@ -460,7 +536,7 @@ This exhaustive reference is generated from the same typed metadata used by `eng
       {
         "logical_type": "boolean",
         "json_encoding": "boolean",
-        "qualification": "when the engine exposes a distinct boolean type; SQLite integer expressions remain signed_i64"
+        "qualification": "computed boolean expressions on postgres-server only; every catalog boolean column presents 0/1 as signed_i64 on every engine"
       },
       {
         "logical_type": "signed_i64",
@@ -470,12 +546,12 @@ This exhaustive reference is generated from the same typed metadata used by `eng
       {
         "logical_type": "finite_real",
         "json_encoding": "number",
-        "qualification": "finite IEEE-754 value"
+        "qualification": "finite IEEE-754 value for non-integral postgres-server numerics within the double range; integer-valued numerics encode as signed-json-integer"
       },
       {
         "logical_type": "arbitrary_numeric",
         "json_encoding": "decimal-string",
-        "qualification": "lossless canonical decimal text for values outside signed_i64 or finite_real"
+        "qualification": "reserved: no current profile emits decimal strings; integer-valued numerics outside i64 and values outside the double range reject instead of encoding as text"
       },
       {
         "logical_type": "text",
@@ -495,12 +571,12 @@ This exhaustive reference is generated from the same typed metadata used by `eng
       {
         "logical_type": "timestamp",
         "json_encoding": "rfc3339-string",
-        "qualification": "preserve engine precision and offset when representable"
+        "qualification": "fixed UTC millisecond precision with Z suffix on every engine, plus integer epoch-millis *_ms companions for engine-managed timestamps"
       }
     ],
     "engine_type_rules": [
       {
-        "profile": "postgres-server@5",
+        "profile": "postgres-server@6",
         "engine_types": [
           "*"
         ],
@@ -510,7 +586,7 @@ This exhaustive reference is generated from the same typed metadata used by `eng
         "error_category": null
       },
       {
-        "profile": "postgres-server@5",
+        "profile": "postgres-server@6",
         "engine_types": [
           "bool"
         ],
@@ -520,7 +596,7 @@ This exhaustive reference is generated from the same typed metadata used by `eng
         "error_category": null
       },
       {
-        "profile": "postgres-server@5",
+        "profile": "postgres-server@6",
         "engine_types": [
           "int2",
           "int4",
@@ -532,7 +608,7 @@ This exhaustive reference is generated from the same typed metadata used by `eng
         "error_category": null
       },
       {
-        "profile": "postgres-server@5",
+        "profile": "postgres-server@6",
         "engine_types": [
           "float4",
           "float8"
@@ -543,7 +619,7 @@ This exhaustive reference is generated from the same typed metadata used by `eng
         "error_category": null
       },
       {
-        "profile": "postgres-server@5",
+        "profile": "postgres-server@6",
         "engine_types": [
           "float4",
           "float8"
@@ -554,27 +630,47 @@ This exhaustive reference is generated from the same typed metadata used by `eng
         "error_category": "syntax_or_type"
       },
       {
-        "profile": "postgres-server@5",
+        "profile": "postgres-server@6",
         "engine_types": [
           "numeric"
         ],
-        "condition": "finite",
+        "condition": "integer-valued and fits in i64",
         "outcome": "encode",
-        "json_encoding": "lossless-canonical-decimal-string",
+        "json_encoding": "signed-json-integer",
         "error_category": null
       },
       {
-        "profile": "postgres-server@5",
+        "profile": "postgres-server@6",
         "engine_types": [
           "numeric"
         ],
-        "condition": "NaN, +Infinity, or -Infinity",
+        "condition": "integer-valued but outside the i64 range",
         "outcome": "reject",
         "json_encoding": null,
         "error_category": "syntax_or_type"
       },
       {
-        "profile": "postgres-server@5",
+        "profile": "postgres-server@6",
+        "engine_types": [
+          "numeric"
+        ],
+        "condition": "non-integral, finite, and within the IEEE-754 double range",
+        "outcome": "encode",
+        "json_encoding": "json-number",
+        "error_category": null
+      },
+      {
+        "profile": "postgres-server@6",
+        "engine_types": [
+          "numeric"
+        ],
+        "condition": "NaN, +Infinity, -Infinity, or magnitude beyond the double range",
+        "outcome": "reject",
+        "json_encoding": null,
+        "error_category": "syntax_or_type"
+      },
+      {
+        "profile": "postgres-server@6",
         "engine_types": [
           "text",
           "varchar",
@@ -588,7 +684,7 @@ This exhaustive reference is generated from the same typed metadata used by `eng
         "error_category": null
       },
       {
-        "profile": "postgres-server@5",
+        "profile": "postgres-server@6",
         "engine_types": [
           "bytea"
         ],
@@ -598,7 +694,7 @@ This exhaustive reference is generated from the same typed metadata used by `eng
         "error_category": null
       },
       {
-        "profile": "postgres-server@5",
+        "profile": "postgres-server@6",
         "engine_types": [
           "json",
           "jsonb"
@@ -609,7 +705,7 @@ This exhaustive reference is generated from the same typed metadata used by `eng
         "error_category": null
       },
       {
-        "profile": "postgres-server@5",
+        "profile": "postgres-server@6",
         "engine_types": [
           "timestamptz"
         ],
@@ -619,7 +715,7 @@ This exhaustive reference is generated from the same typed metadata used by `eng
         "error_category": null
       },
       {
-        "profile": "postgres-server@5",
+        "profile": "postgres-server@6",
         "engine_types": [
           "timestamp"
         ],
@@ -629,7 +725,7 @@ This exhaustive reference is generated from the same typed metadata used by `eng
         "error_category": "syntax_or_type"
       },
       {
-        "profile": "postgres-server@5",
+        "profile": "postgres-server@6",
         "engine_types": [
           "array types (*[])"
         ],
@@ -671,13 +767,13 @@ This exhaustive reference is generated from the same typed metadata used by `eng
     },
     {
       "id": "postgres-server",
-      "revision": 5,
+      "revision": 6,
       "mode": "network",
       "dialect": {
         "name": "postgresql",
         "version": "16+"
       },
-      "placeholder": "$1",
+      "placeholder": "?1",
       "available": true,
       "unavailable_reason": null
     },
@@ -697,6 +793,6 @@ This exhaustive reference is generated from the same typed metadata used by `eng
 }
 ```
 
-The front-door scanner rejects multiple statements and obvious writes, DDL, transaction control, mutable pragmas, attachment/extension operations, and copy/export forms. Its lexical rules follow the active profile: SQLite/Turso understand their quoted forms and `$name` parameters but never PostgreSQL dollar quoting; PostgreSQL additionally understands escape strings, nested block comments, quoted identifiers, and dollar quoting. This remains defence in depth. The qualified backend parser, authorization provider, read-only controls, and function/catalog restrictions remain authoritative.
+The front-door scanner rejects multiple statements and obvious writes, DDL, transaction control, mutable pragmas, attachment/extension operations, and copy/export forms. Its lexical rules follow the active profile: caller placeholders are positional `?N` on every profile. SQLite/Turso understand their quoted forms but never PostgreSQL dollar quoting; PostgreSQL additionally understands escape strings, nested block comments, quoted identifiers, and dollar quoting. This remains defence in depth. The qualified backend parser, authorization provider, read-only controls, and function/catalog restrictions remain authoritative.
 
 Never infer availability from dialect similarity. Use `engine_info.query_sql.available` for the active profile.

@@ -18,10 +18,9 @@ use native_ce::postgres::{
 };
 use native_ce::query::sql::query_sql as sqlite_query_sql;
 use native_ce::query::sql_contract::{
-    QuerySqlParameter, QuerySqlRequest, LOGICAL_RELATIONS, MAX_CELL_ENCODED_BYTES, MAX_COLUMNS,
-    MAX_RESULT_ENCODED_BYTES, MAX_ROWS,
+    truncation_hint, QuerySqlParameter, QuerySqlRequest, CARD_WORKED_STATEMENTS, LOGICAL_RELATIONS,
+    MAX_CELL_ENCODED_BYTES, MAX_COLUMNS, MAX_RESULT_ENCODED_BYTES, MAX_ROWS,
 };
-
 use native_ce::store::{create_record, set_facet};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -70,6 +69,7 @@ async fn postgres_describe_schema_is_normalized_allowlisted_and_owner_gated() {
             actor: "contract:describe-schema".into(),
             reason: "Restrict the hidden schema configuration bearer.".into(),
             created_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            act: None,
         })
         .await
         .unwrap();
@@ -82,6 +82,7 @@ async fn postgres_describe_schema_is_normalized_allowlisted_and_owner_gated() {
             payload: scenarios::describe_schema_kind_payload(),
             actor: Some("contract:describe-schema".into()),
             created_at: created_at.clone(),
+            act: None,
         },
         PostgresMetaEvent {
             id: "event:describe-schema:global-config".into(),
@@ -96,6 +97,7 @@ async fn postgres_describe_schema_is_normalized_allowlisted_and_owner_gated() {
             }),
             actor: Some("contract:describe-schema".into()),
             created_at: created_at.clone(),
+            act: None,
         },
         PostgresMetaEvent {
             id: "event:describe-schema:hidden-config".into(),
@@ -110,6 +112,7 @@ async fn postgres_describe_schema_is_normalized_allowlisted_and_owner_gated() {
             }),
             actor: Some("contract:describe-schema".into()),
             created_at: created_at.clone(),
+            act: None,
         },
     ] {
         database.append_meta_event(event).await.unwrap();
@@ -126,10 +129,10 @@ async fn postgres_describe_schema_is_normalized_allowlisted_and_owner_gated() {
     assert_eq!(owner["engine"]["storage_profile"], "postgres-server");
     assert_eq!(
         owner["engine"]["ddl_fingerprint"],
-        "3ee20c39d45c4c8d7cf2738685f6b311164264d5ba3ae23d4955e0cfe3e74b6a"
+        "52025443a3641300ddc2e984a05c2b3ed4e3c67178da77cceb32048ba199d56d"
     );
-    assert_eq!(owner["tables"].as_array().unwrap().len(), 35);
-    assert_eq!(owner["ddl_statements"].as_array().unwrap().len(), 54);
+    assert_eq!(owner["tables"].as_array().unwrap().len(), 37);
+    assert_eq!(owner["ddl_statements"].as_array().unwrap().len(), 56);
     let ddl = owner["ddl_statements"]
         .as_array()
         .unwrap()
@@ -1133,7 +1136,10 @@ async fn postgres_query_sql_full_boundary_contract() {
     assert_eq!(current_facet.rows[0]["value"], "11");
     assert_eq!(current_facet.rows[0]["value_num"], 11.0);
     assert_eq!(current_facet.rows[0]["vocab_ref"], serde_json::Value::Null);
-    assert_eq!(current_facet.rows[0]["created_at"], "2026-01-03T00:00:00Z");
+    assert_eq!(
+        current_facet.rows[0]["created_at"],
+        "2026-01-03T00:00:00.000Z"
+    );
     let activity = qualification_query_sql(
         database.clone(),
         Caller::authenticated("acct:alice"),
@@ -1141,7 +1147,10 @@ async fn postgres_query_sql_full_boundary_contract() {
     )
     .await
     .unwrap();
-    assert_eq!(activity.rows[0]["last_activity_at"], "2026-01-02T00:00:00Z");
+    assert_eq!(
+        activity.rows[0]["last_activity_at"],
+        "2026-01-02T00:00:00.000Z"
+    );
     assert_ne!(
         activity.rows[0]["last_activity_at"],
         activity.rows[0]["updated_at"]
@@ -1293,7 +1302,7 @@ async fn postgres_query_sql_full_boundary_contract() {
         database.clone(),
         Caller::authenticated("acct:alice"),
         QuerySqlRequest {
-            sql: "SELECT $1 AS boolean_value,$2 AS integer_value,$3 AS real_value,$4 AS text_value,$5 AS bytes_value,$6 AS json_value,$7 AS timestamp_value".into(),
+            sql: "SELECT ?1 AS boolean_value,?2 AS integer_value,?3 AS real_value,?4 AS text_value,?5 AS bytes_value,?6 AS json_value,?7 AS timestamp_value".into(),
             parameters: vec![
                 QuerySqlParameter::Boolean { value: Some(true) },
                 QuerySqlParameter::Integer { value: Some(i64::MAX.to_string()) },
@@ -1310,20 +1319,20 @@ async fn postgres_query_sql_full_boundary_contract() {
     assert_eq!(
         typed.rows,
         [json!({
-            "boolean_value":true,
+            "boolean_value":1,
             "integer_value":i64::MAX,
             "real_value":1.5,
             "text_value":"native",
             "bytes_value":"AP8=",
             "json_value":r#"{"stable": true}"#,
-            "timestamp_value":"2026-08-10T12:00:00Z"
+            "timestamp_value":"2026-08-10T12:00:00.000Z"
         })]
     );
     let huge_json = qualification_query_sql(
         database.clone(),
         Caller::authenticated("acct:alice"),
         QuerySqlRequest {
-            sql: "SELECT $1 AS value".into(),
+            sql: "SELECT ?1 AS value".into(),
             parameters: vec![QuerySqlParameter::Json {
                 value: Some(r#"{"huge":1234567890123456789012345678901234567890}"#.into()),
             }],
@@ -1409,31 +1418,31 @@ async fn postgres_query_sql_full_boundary_contract() {
         ),
         (
             "content_events",
-            "SELECT local_seq,id,record_id,type,created_at FROM content_events WHERE id IN ('observation:old','observation:correction') ORDER BY local_seq",
+            "SELECT local_seq,id,record_id,type,created_at,created_at_ms FROM content_events WHERE id IN ('observation:old','observation:correction') ORDER BY local_seq",
         ),
         (
             "links",
-            "SELECT id,source_id,target_id,relationship,note,created_at FROM links WHERE id='fixture:link:attachment'",
+            "SELECT id,source_id,target_id,relationship,note,created_at,created_at_ms FROM links WHERE id='fixture:link:attachment'",
         ),
         (
             "facet_values",
-            "SELECT id,record_id,key,value,value_num,vocab_ref,created_at FROM facet_values WHERE id='fv:9c150000-0000-4000-8000-100000000001:score'",
+            "SELECT id,record_id,key,value,value_num,vocab_ref,created_at,created_at_ms FROM facet_values WHERE id='fv:9c150000-0000-4000-8000-100000000001:score'",
         ),
         (
             "facet_observations",
-            "SELECT id,record_id,key,value,op,vocab_ref,as_of,observed_at,event_seq FROM facet_observations WHERE id='fo:9c150000-0000-4000-8000-100000000001:score:2026-01-01T00:00:00Z'",
+            "SELECT id,record_id,key,value,op,vocab_ref,as_of,observed_at,observed_at_ms,event_seq FROM facet_observations WHERE id='fo:9c150000-0000-4000-8000-100000000001:score:2026-01-01T00:00:00Z'",
         ),
         (
             "bindings",
-            "SELECT record_id,system,identifier,CASE WHEN is_canonical THEN 1 ELSE 0 END AS is_canonical,url,etag,last_seen_at FROM bindings WHERE record_id='9c150000-0000-4000-8000-002000000034'",
+            "SELECT record_id,system,identifier,is_canonical,url,etag,last_seen_at,last_seen_at_ms FROM bindings WHERE record_id='9c150000-0000-4000-8000-002000000034'",
         ),
         (
             "blobs",
-            "SELECT id,bytes,mime,size_bytes,sha256,original_filename,storage_tier,external_ref,created_at FROM blobs WHERE id='blob:visible'",
+            "SELECT id,bytes,mime,size_bytes,sha256,original_filename,storage_tier,external_ref,created_at,created_at_ms FROM blobs WHERE id='blob:visible'",
         ),
         (
             "vocabularies",
-            "SELECT id,name,created_at FROM vocabularies WHERE id='fixture:vocab'",
+            "SELECT id,name,created_at,created_at_ms FROM vocabularies WHERE id='fixture:vocab'",
         ),
         (
             "vocabulary_values",
@@ -1441,7 +1450,15 @@ async fn postgres_query_sql_full_boundary_contract() {
         ),
         (
             "schema_config",
-            "SELECT id,layer,name,data,applies_to_collection_id,version_lineage,created_at FROM schema_config WHERE id='fixture:config'",
+            "SELECT id,layer,name,data,applies_to_collection_id,version_lineage,created_at,created_at_ms FROM schema_config WHERE id='fixture:config'",
+        ),
+        (
+            "catalog_relations",
+            "SELECT relation_name,identity,semantic_version,caller_relative,completeness,profiles,comment FROM catalog_relations ORDER BY relation_name",
+        ),
+        (
+            "catalog_columns",
+            "SELECT relation_name,column_name,column_position FROM catalog_columns ORDER BY relation_name,column_position",
         ),
     ];
     let postgres_relations = LOGICAL_RELATIONS
@@ -1518,7 +1535,7 @@ async fn postgres_query_sql_full_boundary_contract() {
     let total_result_rows =
         MAX_RESULT_ENCODED_BYTES / (serde_json::to_vec(&total_result_cell).unwrap().len() + 12) + 1;
     assert!(total_result_rows < MAX_ROWS);
-    let total_result_values = std::iter::repeat_n("($1)", total_result_rows)
+    let total_result_values = std::iter::repeat_n("(?1)", total_result_rows)
         .collect::<Vec<_>>()
         .join(",");
     let total_result_error = qualification_query_sql(
@@ -1550,6 +1567,7 @@ async fn postgres_query_sql_full_boundary_contract() {
     .unwrap();
     assert_eq!(capped.row_count, MAX_ROWS);
     assert!(capped.truncated);
+    assert_eq!(capped.truncation_hint, Some(truncation_hint()));
     let timeout = qualification_query_sql(
         database.clone(),
         Caller::authenticated("acct:alice"),
@@ -1558,6 +1576,7 @@ async fn postgres_query_sql_full_boundary_contract() {
     .await
     .unwrap_err();
     assert!(timeout.to_string().contains("[timeout]"), "{timeout}");
+    assert!(timeout.to_string().contains("visibility join"), "{timeout}");
     assert_eq!(
         qualification_query_sql(
             database.clone(),
@@ -1704,6 +1723,361 @@ async fn postgres_query_sql_full_boundary_contract() {
 }
 
 #[tokio::test]
+async fn postgres_query_sql_positional_placeholders_run_end_to_end() {
+    // I1b: callers send `?N`; the Postgres path rewrites to `$N` after the
+    // classifier and before `pg_query` parse, then executes the rewritten
+    // statement.
+    let Some(harness) = configured_harness().await else {
+        return;
+    };
+    let database = harness.fresh_logical_database().await.unwrap();
+    harness
+        .call(
+            &database,
+            TestCaller::Local,
+            "create_record",
+            json!({
+                "id": "1b000000-0000-4000-8000-000000000001",
+                "type": "Entity",
+                "kind": "person",
+                "name": "Placeholder",
+                "reason": "Create a query_sql placeholder fixture."
+            }),
+        )
+        .await
+        .unwrap();
+    harness
+        .provision_member(
+            &database,
+            "1b000000-0000-4000-8000-000000000001",
+            "acct:holder",
+            "principal:holder",
+        )
+        .await
+        .unwrap();
+    harness
+        .call(
+            &database,
+            TestCaller::Member {
+                account_id: "acct:holder".into(),
+            },
+            "create_record",
+            json!({
+                "id": "1b000000-0000-4000-8000-100000000001",
+                "type": "Document",
+                "kind": "note",
+                "name": "1b000000-0000-4000-8000-100000000001",
+                "reason": "Create a query_sql placeholder fixture."
+            }),
+        )
+        .await
+        .unwrap();
+    let policies = database.qualified_table("record_policies").unwrap();
+    let entries = database.qualified_table("policy_entries").unwrap();
+    let records = database.qualified_table("records").unwrap();
+    let record_id = "1b000000-0000-4000-8000-100000000001";
+    let mut tx = database.pool().begin().await.unwrap();
+    sqlx::query(&format!("INSERT INTO {policies}(record_id) VALUES($1)"))
+        .bind(record_id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query(&format!(
+        "UPDATE {records} SET policy_anchor_id=$1 WHERE id=$1"
+    ))
+    .bind(record_id)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    sqlx::query(&format!("INSERT INTO {entries}(policy_anchor_id,subject_kind,subject_id,effect,capability) VALUES($1,'account','acct:holder','allow','view')"))
+        .bind(record_id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    let request = |sql: &str, parameters: Vec<QuerySqlParameter>| QuerySqlRequest {
+        sql: sql.into(),
+        parameters,
+    };
+    let text = |value: &str| QuerySqlParameter::Text {
+        value: Some(value.into()),
+    };
+    let holder = Caller::authenticated("acct:holder");
+    let rows = qualification_query_sql(
+        database.clone(),
+        holder.clone(),
+        request(
+            "SELECT id FROM records WHERE id = ?1",
+            vec![text(record_id)],
+        ),
+    )
+    .await
+    .unwrap()
+    .rows;
+    assert_eq!(rows, [json!({"id": record_id})]);
+    // A second placeholder plus a literal: `?10` is one placeholder, and a
+    // `?1` inside a string stays data.
+    let rows = qualification_query_sql(
+        database.clone(),
+        holder.clone(),
+        request(
+            "SELECT id FROM records WHERE id = ?1 AND name <> '?2'",
+            vec![text(record_id)],
+        ),
+    )
+    .await
+    .unwrap()
+    .rows;
+    assert_eq!(rows, [json!({"id": record_id})]);
+    // `$N` from callers is rejected with the portable repair, and a `?2`
+    // against one parameter fails the exact-`$n`-set check on the rewritten
+    // text.
+    let dollar = qualification_query_sql(
+        database.clone(),
+        holder.clone(),
+        request(
+            "SELECT id FROM records WHERE id = $1",
+            vec![text(record_id)],
+        ),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(
+        dollar.contains("use positional `?N` placeholders"),
+        "missing repair: {dollar}"
+    );
+    let gap = qualification_query_sql(
+        database.clone(),
+        holder,
+        request(
+            "SELECT id FROM records WHERE id = ?2",
+            vec![text(record_id)],
+        ),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(
+        gap.contains("ordered parameters and $n placeholders must match exactly"),
+        "unexpected refusal: {gap}"
+    );
+
+    harness.close(&database).await;
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn postgres_query_sql_computed_booleans_encode_as_zero_one() {
+    let Some(harness) = configured_harness().await else {
+        return;
+    };
+    let database = harness.fresh_logical_database().await.unwrap();
+    // E1 M2 Option N: boolean expression results encode as 1/0 (matching
+    // SQLite and Turso), and NULL stays null. This extends the E1 M1
+    // catalog 0/1 casts to computed expressions.
+    let sql = "SELECT (1 = 1) AS t, (1 = 2) AS f, (NULL = 1) AS n";
+    let postgres_result = qualification_query_sql(
+        database.clone(),
+        Caller::local(),
+        QuerySqlRequest {
+            sql: sql.into(),
+            parameters: vec![],
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(postgres_result.rows, [json!({"t": 1, "f": 0, "n": null})]);
+    let sqlite = create_database(":memory:").await.unwrap();
+    let sqlite_result = sqlite_query_sql(&sqlite, &Caller::local(), sql)
+        .await
+        .unwrap();
+    assert_eq!(postgres_result.columns, sqlite_result.columns);
+    assert_eq!(postgres_result.rows, sqlite_result.rows);
+    sqlite.close().await;
+    harness.close(&database).await;
+    harness.shutdown().await;
+}
+
+/// Type-check failures carry the sanitised engine message, the caller-text
+/// position, and the 0/1 boolean repair when the engine complains about a
+/// boolean context. Prepare fails before execution, so no fixtures are
+/// needed: a fresh database suffices.
+#[tokio::test]
+async fn postgres_type_check_errors_carry_position_and_hint() {
+    let Some(harness) = configured_harness().await else {
+        return;
+    };
+    let database = harness.fresh_logical_database().await.unwrap();
+    let check = |sql: &str| {
+        qualification_query_sql(
+            database.clone(),
+            Caller::authenticated("acct:alice"),
+            QuerySqlRequest {
+                sql: sql.into(),
+                parameters: vec![],
+            },
+        )
+    };
+    let bare_where = check("SELECT record_id FROM bindings WHERE is_canonical")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(bare_where.contains("[syntax_or_type]"), "{bare_where}");
+    assert!(bare_where.contains("at position 38"), "{bare_where}");
+    assert!(bare_where.contains("must be type boolean"), "{bare_where}");
+    assert!(
+        bare_where.contains("WHERE is_canonical = 1"),
+        "{bare_where}"
+    );
+    let case_when = check("SELECT CASE WHEN 1 THEN id ELSE id END FROM records")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(case_when.contains("at position"), "{case_when}");
+    assert!(case_when.contains("must be type boolean"), "{case_when}");
+    assert!(case_when.contains("same for CASE WHEN"), "{case_when}");
+    let mismatch = check("SELECT id FROM records WHERE id = 1")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(mismatch.contains("[syntax_or_type]"), "{mismatch}");
+    assert!(mismatch.contains("at position"), "{mismatch}");
+    assert!(mismatch.contains("operator does not exist"), "{mismatch}");
+    assert!(!mismatch.contains("is_canonical = 1"), "{mismatch}");
+    for error in [&bare_where, &case_when, &mismatch] {
+        assert!(!error.contains("_native_query"), "{error}");
+        assert!(!error.contains("_query_sql_"), "{error}");
+        assert!(!error.contains("pg_temp"), "{error}");
+    }
+    harness.close(&database).await;
+    harness.shutdown().await;
+}
+
+/// The four catalog-card worked statements run on Postgres with the same
+/// rows as the SQLite/Turso conformance cases. The loop iterates
+/// `CARD_WORKED_STATEMENTS` itself (binding `?1` to fixture literals;
+/// Postgres callers spell placeholders `$N`, and those rules belong to
+/// E1 M2), so a card edit without a passing run fails here.
+#[tokio::test]
+async fn postgres_worked_statements_match_sqlite() {
+    let Some(harness) = configured_harness().await else {
+        return;
+    };
+    let database = harness.fresh_logical_database().await.unwrap();
+    let records = database.qualified_table("records").unwrap();
+    let links = database.qualified_table("links").unwrap();
+    let policies = database.qualified_table("record_policies").unwrap();
+    let entries = database.qualified_table("policy_entries").unwrap();
+    let events = database.qualified_table("content_events").unwrap();
+    sqlx::query(&format!(
+        "INSERT INTO {records}(id,record_type,kind,name,body,home_id,lifecycle,policy_anchor_id,created_at,updated_at) VALUES \
+         ('wk:root','Entity','person','Root',NULL,NULL,NULL,'wk:root','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z'), \
+         ('wk:a','WorkItem','note','Work A','- [ ] write report','wk:root','open','wk:a','2026-01-01T00:00:00Z','2026-01-03T00:00:00Z'), \
+         ('wk:b','WorkItem','note','Work B','quoting `- [ ]` inline',NULL,'in_progress','wk:b','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')"
+    ))
+    .execute(database.pool())
+    .await
+    .unwrap();
+    sqlx::query(&format!(
+        "INSERT INTO {policies}(record_id) VALUES('wk:root'),('wk:a'),('wk:b') ON CONFLICT DO NOTHING"
+    ))
+    .execute(database.pool())
+    .await
+    .unwrap();
+    sqlx::query(&format!(
+        "INSERT INTO {entries}(policy_anchor_id,subject_kind,subject_id,effect,capability) VALUES \
+         ('wk:root','account','acct:alice','allow','view'), \
+         ('wk:a','account','acct:alice','allow','view'), \
+         ('wk:b','account','acct:alice','allow','view') ON CONFLICT DO NOTHING"
+    ))
+    .execute(database.pool())
+    .await
+    .unwrap();
+    sqlx::query(&format!(
+        "INSERT INTO {links}(id,source_id,target_id,relationship,created_at) VALUES \
+         ('wk:link','wk:root','wk:a','part_of','2026-01-01T00:00:00Z')"
+    ))
+    .execute(database.pool())
+    .await
+    .unwrap();
+    sqlx::query(&format!(
+        "INSERT INTO {events}(seq,id,record_id,type,payload,actor,created_at,causal_envelope_version,causal_status) VALUES \
+         (91001,'wk:event-a','wk:a','record.updated','{{}}','acct:alice','2026-01-03T00:00:00Z',1,'legacy_unknown')"
+    ))
+    .execute(database.pool())
+    .await
+    .unwrap();
+
+    let sqlite = create_database(":memory:").await.unwrap();
+    sqlx::raw_sql(
+        "INSERT INTO records(id,type,kind,name,body,home_id,lifecycle,policy_anchor_id,created_at,updated_at,last_activity_at) VALUES \
+         ('wk:root','Entity','person','Root',NULL,NULL,NULL,'wk:root','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z'), \
+         ('wk:a','WorkItem','note','Work A','- [ ] write report','wk:root','open','wk:a','2026-01-01T00:00:00Z','2026-01-03T00:00:00Z','2026-01-03T00:00:00Z'), \
+         ('wk:b','WorkItem','note','Work B','quoting `- [ ]` inline',NULL,'in_progress','wk:b','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z'); \
+         INSERT INTO record_policies(record_id,created_at) VALUES \
+         ('wk:root','2026-01-01T00:00:00Z'),('wk:a','2026-01-01T00:00:00Z'),('wk:b','2026-01-01T00:00:00Z'); \
+         INSERT INTO policy_entries(policy_anchor_id,subject_kind,subject_id,effect,capability) VALUES \
+         ('wk:root','account','acct:alice','allow','view'),('wk:a','account','acct:alice','allow','view'),('wk:b','account','acct:alice','allow','view'); \
+         INSERT INTO links(id,source_id,target_id,relationship,created_at) VALUES \
+         ('wk:link','wk:root','wk:a','part_of','2026-01-01T00:00:00Z'); \
+         INSERT INTO content_events(seq,id,record_id,type,payload,actor,created_at,causal_envelope_version,causal_status) VALUES \
+         (91001,'wk:event-a','wk:a','record.updated','{}','acct:alice','2026-01-03T00:00:00Z',1,'legacy_unknown');",
+    )
+    .execute(sqlite.qualification_write_pool())
+    .await
+    .unwrap();
+
+    // Every catalog-card worked statement runs verbatim on Postgres (with
+    // `?1` bound to a fixture literal; the placeholder spelling rules
+    // belong to E1 M2) and returns the same rows as SQLite.
+    for (intent, card_sql) in CARD_WORKED_STATEMENTS {
+        let sql = match *intent {
+            "Current work" => card_sql.to_string(),
+            "Direct children of a folder or record" => card_sql.replace("?1", "'wk:root'"),
+            "Parts of a record (semantic part_of links run child source -> parent target)" => {
+                card_sql.replace("?1", "'wk:a'")
+            }
+            "Recent history of one record" => card_sql.replace("?1", "'wk:a'"),
+            unknown => panic!("no Postgres fixture binding for card statement '{unknown}'"),
+        };
+        let postgres_result = qualification_query_sql(
+            database.clone(),
+            Caller::authenticated("acct:alice"),
+            QuerySqlRequest {
+                sql: sql.clone(),
+                parameters: vec![],
+            },
+        )
+        .await
+        .unwrap_or_else(|error| panic!("postgres failed {intent}: {error}"));
+        let sqlite_result = sqlite_query_sql(&sqlite, &Caller::authenticated("acct:alice"), &sql)
+            .await
+            .unwrap_or_else(|error| panic!("sqlite failed {intent}: {error}"));
+        assert_eq!(postgres_result.columns, sqlite_result.columns, "{intent}");
+        assert_eq!(postgres_result.rows, sqlite_result.rows, "{intent}");
+    }
+    assert_eq!(
+        qualification_query_sql(
+            database.clone(),
+            Caller::authenticated("acct:alice"),
+            QuerySqlRequest {
+                sql: "SELECT local_seq, type, created_at FROM content_events WHERE record_id = 'wk:a' ORDER BY local_seq DESC LIMIT 10".into(),
+                parameters: vec![],
+            },
+        )
+        .await
+        .unwrap()
+        .rows,
+        [json!({"local_seq": 91001, "type": "record.updated", "created_at": "2026-01-03T00:00:00.000Z"})]
+    );
+    sqlite.close().await;
+    harness.close(&database).await;
+    harness.shutdown().await;
+}
+
+#[tokio::test]
 async fn postgres_guarded_write_race_contract() {
     let Some(harness) = configured_harness().await else {
         return;
@@ -1780,10 +2154,12 @@ async fn postgres_ddl_migration_and_pool_contract() {
     let database = harness.fresh_logical_database().await.unwrap();
     let search_path_before = current_search_path(&database).await.unwrap();
 
-    assert_eq!(migration_version(&database).await.unwrap(), 6);
+    assert_eq!(migration_version(&database).await.unwrap(), 7);
     assert_eq!(
         physical_tables(&database).await.unwrap(),
         [
+            "act_cutover",
+            "act_state",
             "authorization_revision",
             "binding_audit",
             "binding_systems",
@@ -1857,10 +2233,12 @@ async fn postgres_legacy_v3_shape_never_reports_ready_under_the_v5_runtime() {
     let migrations = database.qualified_table("schema_migrations").unwrap();
     let binding_audit = database.qualified_table("binding_audit").unwrap();
     let mut tx = database.pool().begin().await.unwrap();
-    sqlx::query(&format!("DELETE FROM {migrations} WHERE version IN (5,6)"))
-        .execute(&mut *tx)
-        .await
-        .unwrap();
+    sqlx::query(&format!(
+        "DELETE FROM {migrations} WHERE version IN (5,6,7)"
+    ))
+    .execute(&mut *tx)
+    .await
+    .unwrap();
     sqlx::query(&format!("INSERT INTO {migrations}(version) VALUES(3)"))
         .execute(&mut *tx)
         .await
@@ -1875,7 +2253,7 @@ async fn postgres_legacy_v3_shape_never_reports_ready_under_the_v5_runtime() {
 
     let health = database.health().await.unwrap();
     assert_eq!(health.observed_schema_version, Some(3));
-    assert_eq!(health.expected_schema_version, 6);
+    assert_eq!(health.expected_schema_version, 7);
     assert_eq!(health.schema_currency, PostgresSchemaCurrency::Behind);
     assert!(!health.ready);
     assert!(!health.write_ready);
@@ -1974,6 +2352,7 @@ async fn postgres_policy_anchor_is_fail_closed_and_members_shape_is_guarded() {
                 actor: "contract:test".into(),
                 reason: "Prove normalized policy shape fails closed.".into(),
                 created_at: chrono::Utc::now().to_rfc3339(),
+                act: None,
             })
             .await
             .unwrap_err();
@@ -2035,6 +2414,7 @@ async fn postgres_policy_anchor_is_fail_closed_and_members_shape_is_guarded() {
                 actor: "contract:test".into(),
                 reason: "Prove nearest-anchor propagation.".into(),
                 created_at: chrono::Utc::now().to_rfc3339(),
+                act: None,
             })
             .await
             .unwrap();
@@ -2078,6 +2458,7 @@ async fn postgres_policy_anchor_is_fail_closed_and_members_shape_is_guarded() {
             actor: "contract:test".into(),
             reason: "Restore the nearest parent anchor.".into(),
             created_at: chrono::Utc::now().to_rfc3339(),
+            act: None,
         })
         .await
         .unwrap();
@@ -2124,6 +2505,7 @@ async fn postgres_policy_anchor_is_fail_closed_and_members_shape_is_guarded() {
                     actor: "contract:test".into(),
                     reason: "Exercise cursor-first parent locking.".into(),
                     created_at: chrono::Utc::now().to_rfc3339(),
+                    act: None,
                 }),
                 child.append_policy_event(PostgresPolicyEvent {
                     id: format!("policy:race:child:{round}"),
@@ -2133,6 +2515,7 @@ async fn postgres_policy_anchor_is_fail_closed_and_members_shape_is_guarded() {
                     actor: "contract:test".into(),
                     reason: "Exercise cursor-first child locking.".into(),
                     created_at: chrono::Utc::now().to_rfc3339(),
+                    act: None,
                 })
             )
         })
@@ -2177,6 +2560,7 @@ async fn postgres_independent_logs_are_gapless_atomic_idempotent_and_replayable(
             payload: json!({}),
             actor: Some("contract:test".into()),
             created_at: now.clone(),
+            act: None,
         })
         .await
         .unwrap_err();
@@ -2195,6 +2579,7 @@ async fn postgres_independent_logs_are_gapless_atomic_idempotent_and_replayable(
                 payload: json!({"name":"Accepted"}),
                 actor: Some("contract:test".into()),
                 created_at: now.clone(),
+                act: None,
             })
             .await
             .unwrap(),
@@ -2208,6 +2593,7 @@ async fn postgres_independent_logs_are_gapless_atomic_idempotent_and_replayable(
             payload: json!({}),
             actor: Some("contract:test".into()),
             created_at: now.clone(),
+            act: None,
         })
         .await
         .unwrap_err();
@@ -2220,7 +2606,7 @@ async fn postgres_independent_logs_are_gapless_atomic_idempotent_and_replayable(
             payload: json!({"vocabulary_id":"voc:accepted","value":"canonical","gloss":null,"status":"active","ordinal":1.0,"terminality":"open","metadata":{}}),
             actor: Some("contract:test".into()),
             created_at: now.clone(),
-        })
+        act: None,})
         .await
         .unwrap();
     let invalid_terminality = database
@@ -2231,7 +2617,7 @@ async fn postgres_independent_logs_are_gapless_atomic_idempotent_and_replayable(
             payload: json!({"vocabulary_id":"voc:accepted","value":"invalid terminality","gloss":null,"status":"proposed","ordinal":3.0,"terminality":"eventually","metadata":{}}),
             actor: Some("contract:test".into()),
             created_at: now.clone(),
-        })
+        act: None,})
         .await
         .unwrap_err();
     assert!(
@@ -2248,7 +2634,7 @@ async fn postgres_independent_logs_are_gapless_atomic_idempotent_and_replayable(
             payload: json!({"vocabulary_id":"voc:accepted","value":"alias","gloss":null,"status":"proposed","ordinal":2.0,"terminality":"open","metadata":{}}),
             actor: Some("contract:test".into()),
             created_at: now.clone(),
-        })
+        act: None,})
         .await
         .unwrap();
     database
@@ -2259,6 +2645,7 @@ async fn postgres_independent_logs_are_gapless_atomic_idempotent_and_replayable(
             payload: json!({"alias_of":"voc:value:canonical"}),
             actor: Some("contract:test".into()),
             created_at: now.clone(),
+            act: None,
         })
         .await
         .unwrap();
@@ -2270,6 +2657,7 @@ async fn postgres_independent_logs_are_gapless_atomic_idempotent_and_replayable(
             payload: json!({}),
             actor: Some("contract:test".into()),
             created_at: now.clone(),
+            act: None,
         })
         .await
         .unwrap();
@@ -2294,6 +2682,7 @@ async fn postgres_independent_logs_are_gapless_atomic_idempotent_and_replayable(
         reason: "Prove control idempotency.".into(),
         payload: json!({"account_id":"acct:member","person_record_id":"native:root","root_record_id":"native:root","created_at":now.clone()}),
         created_at: now.clone(),
+        act: None,
     };
     assert_eq!(
         database
@@ -2313,12 +2702,14 @@ async fn postgres_independent_logs_are_gapless_atomic_idempotent_and_replayable(
             id: "control:unknown".into(),
             idempotency_key: "control:idempotency:unknown".into(),
             event_type: "unknown.control".into(),
+            act: None,
             ..control.clone()
         },
         PostgresControlEvent {
             id: "control:wrong-kind".into(),
             idempotency_key: "control:idempotency:wrong-kind".into(),
             aggregate_kind: "member".into(),
+            act: None,
             ..control.clone()
         },
     ] {
@@ -2337,6 +2728,7 @@ async fn postgres_independent_logs_are_gapless_atomic_idempotent_and_replayable(
         reason: "Reject a change before creation.".into(),
         payload: json!({"id":"binding:missing","scope_kind":"database","scope_id":"native:root","source_record_id":"native:root","position":1,"enabled":true,"created_by":"contract:test","created_at":now.clone(),"updated_at":now.clone()}),
         created_at: now.clone(),
+        act: None,
     };
     let changed_before_created = database
         .append_control_event(orphan_binding_change)
@@ -2364,7 +2756,7 @@ async fn postgres_independent_logs_are_gapless_atomic_idempotent_and_replayable(
             reason: "Reject progress without a pending obligation.".into(),
             payload: json!({"account_id":"acct:missing","programme_id":"programme:missing","generation":1,"phase":"anchor_established","updated_at":now.clone(),"evidence":{"basis":"user_stated"},"resume_after":null,"artifact_id":null}),
             created_at: now.clone(),
-        })
+        act: None,})
         .await
         .unwrap_err();
     assert!(
@@ -2723,6 +3115,7 @@ async fn postgres_authoritative_logs_are_append_only_and_cursor_checked() {
             payload: json!({"name":"Append only"}),
             actor: Some("contract:test".into()),
             created_at: now.clone(),
+            act: None,
         })
         .await
         .unwrap();
@@ -2735,7 +3128,7 @@ async fn postgres_authoritative_logs_are_append_only_and_cursor_checked() {
             actor: "contract:test".into(),
             reason: "Create policy event.".into(),
             created_at: now.clone(),
-        })
+        act: None,})
         .await
         .unwrap();
     database
@@ -2751,7 +3144,7 @@ async fn postgres_authoritative_logs_are_append_only_and_cursor_checked() {
             reason: "Create control event.".into(),
             payload: json!({"account_id":"acct:append-only","person_record_id":"native:root","root_record_id":"native:root","created_at":now.clone()}),
             created_at: now,
-        })
+        act: None,})
         .await
         .unwrap();
     for table in [
@@ -2806,6 +3199,7 @@ async fn postgres_snapshots_are_repeatable_during_concurrent_appends() {
                 payload: json!({"name":"Snapshot concurrency"}),
                 actor: Some("contract:snapshot-writer".into()),
                 created_at: now.clone(),
+                act: None,
             })
             .await
             .unwrap();
@@ -2818,7 +3212,7 @@ async fn postgres_snapshots_are_repeatable_during_concurrent_appends() {
                     payload: json!({"vocabulary_id":"snapshot:vocabulary","value":format!("value {index}"),"gloss":null,"status":"proposed","ordinal":index as f64,"terminality":"open","metadata":{}}),
                     actor: Some("contract:snapshot-writer".into()),
                     created_at: now.clone(),
-                })
+                act: None,})
                 .await
                 .unwrap();
             tokio::task::yield_now().await;
@@ -2869,6 +3263,7 @@ async fn postgres_replay_proofs_are_repeatable_during_concurrent_appends() {
                 payload: json!({"name":"Replay concurrency"}),
                 actor: Some("contract:replay-writer".into()),
                 created_at: now.clone(),
+                act: None,
             })
             .await
             .unwrap();
@@ -2881,7 +3276,7 @@ async fn postgres_replay_proofs_are_repeatable_during_concurrent_appends() {
                     payload: json!({"vocabulary_id":"replay:vocabulary","value":format!("value {index}"),"gloss":null,"status":"proposed","ordinal":index as f64,"terminality":"open","metadata":{}}),
                     actor: Some("contract:replay-writer".into()),
                     created_at: now.clone(),
-                })
+                act: None,})
                 .await
                 .unwrap();
             tokio::task::yield_now().await;
@@ -3393,7 +3788,7 @@ async fn postgres_message_delete_withdraws_candidates_and_retains_adjunct_state(
             actor: "contract".into(),
             reason: "Retain an authoritative explicit policy across Message deletion.".into(),
             created_at: chrono::Utc::now().to_rfc3339(),
-        })
+        act: None,})
         .await
         .unwrap();
     harness.call(database, TestCaller::Local, "manage_links", json!({"action":"add","source_id":message_id,"target_id":target_id,"relationship":"relates_to","note":"Retained generic link."})).await.unwrap();
@@ -4804,4 +5199,156 @@ async fn postgres_record_references(
     );
     plan_transaction.rollback().await?;
     Ok(())
+}
+
+/// Act-number parity on the Postgres adapter: one transaction stamping two
+/// domains shares a single act, and a rolled-back transaction consumes no
+/// act. Mirrors the SQLite AC1/AC2 coverage with the adapter's own
+/// cross-domain fixture (Message delete withdrawing a live candidate).
+#[tokio::test]
+async fn postgres_act_number_is_one_per_transaction_and_gapless() {
+    let Some(harness) = configured_harness().await else {
+        return;
+    };
+    let database = harness.fresh_logical_database().await.unwrap();
+    let message_id = "9c150000-0000-4000-8000-00a000000001";
+    for (id, record_type, kind) in [
+        ("9c150000-0000-4000-8000-00a000000002", "Entity", "person"),
+        ("9c150000-0000-4000-8000-00a000000003", "Entity", "person"),
+    ] {
+        harness
+            .call(
+                &database,
+                TestCaller::Local,
+                "create_record",
+                json!({"id":id,"type":record_type,"kind":kind,"reason":"Create act fixture people."}),
+            )
+            .await
+            .unwrap();
+    }
+    harness
+        .provision_member(
+            &database,
+            "9c150000-0000-4000-8000-00a000000002",
+            "acct:act-sender",
+            "native/act-sender",
+        )
+        .await
+        .unwrap();
+    harness
+        .provision_member(
+            &database,
+            "9c150000-0000-4000-8000-00a000000003",
+            "acct:act-recipient",
+            "native/act-recipient",
+        )
+        .await
+        .unwrap();
+    harness
+        .deliver_message_fixture(
+            &database,
+            TestCaller::member("acct:act-sender"),
+            DeliveredMessageFixture {
+                id: message_id,
+                name: "Act fixture message",
+                body: "A Message whose delete spans two domains.",
+                addressed_to: &["9c150000-0000-4000-8000-00a000000003"],
+                idempotency_key: "contract:act-fixture-delivery",
+            },
+        )
+        .await
+        .unwrap();
+    let events = database
+        .qualified_table("notification_candidate_events")
+        .unwrap();
+    let candidates = database.qualified_table("notification_candidates").unwrap();
+    let state = database.qualified_table("act_state").unwrap();
+    let mut tx = database.pool().begin().await.unwrap();
+    let proposed_seq: i64 = sqlx::query_scalar(&format!("INSERT INTO {events}(id,candidate_key,action,recipient_account_id,message_id,reason,priority,redaction_class,evaluator_kind,policy_version,source_event_type,source_event_id,payload,created_at) VALUES('candidate:act','candidate:act-key','proposed','acct:act-recipient',$1,'routine_arrival','routine','metadata_only','portable_default','v1','message.delivered','delivery:event','{{\"schema\":\"native.notification-candidate.v1\"}}'::jsonb,transaction_timestamp()) RETURNING seq"))
+        .bind(message_id).fetch_one(&mut *tx).await.unwrap();
+    sqlx::query(&format!("INSERT INTO {candidates}(candidate_id,candidate_key,recipient_account_id,message_id,reason,priority,redaction_class,evaluator_kind,policy_version,source_event_type,source_event_id,candidate_event_seq,status,created_at) VALUES('candidate:act','candidate:act-key','acct:act-recipient',$1,'routine_arrival','routine','metadata_only','portable_default','v1','message.delivered','delivery:event',$2,'effective',transaction_timestamp())"))
+        .bind(message_id).bind(proposed_seq).execute(&mut *tx).await.unwrap();
+    tx.commit().await.unwrap();
+
+    let next_act_before: i64 =
+        sqlx::query_scalar(&format!("SELECT next_act FROM {state} WHERE singleton=1"))
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    harness
+        .call(
+            &database,
+            TestCaller::Local,
+            "delete_record",
+            json!({"id":message_id,"reason":"Delete the act fixture message."}),
+        )
+        .await
+        .unwrap();
+    let content = database.qualified_table("content_events").unwrap();
+    let deletion_act: Option<i64> = sqlx::query_scalar(&format!(
+        "SELECT act FROM {content} WHERE record_id=$1 AND type='record.deleted'"
+    ))
+    .bind(message_id)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    let withdrawal_acts: Vec<Option<i64>> = sqlx::query_scalar(&format!(
+        "SELECT act FROM {events} WHERE message_id=$1 AND action='withdrawn' ORDER BY seq"
+    ))
+    .bind(message_id)
+    .fetch_all(database.pool())
+    .await
+    .unwrap();
+    assert!(
+        !withdrawal_acts.is_empty(),
+        "delete must withdraw candidates"
+    );
+    let deletion_act = deletion_act.expect("deletion event carries an act");
+    assert!(
+        withdrawal_acts.iter().all(|act| *act == Some(deletion_act)),
+        "one Postgres transaction must stamp one act across domains"
+    );
+    // Two appends, one act: the counter advanced exactly once.
+    let next_act_after: i64 =
+        sqlx::query_scalar(&format!("SELECT next_act FROM {state} WHERE singleton=1"))
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert_eq!(next_act_after, next_act_before + 1);
+    assert_eq!(deletion_act, next_act_after);
+
+    // A rolled-back transaction consumes no act.
+    let rollback_id = "9c150000-0000-4000-8000-009900000004";
+    harness
+        .call(
+            &database,
+            TestCaller::Local,
+            "create_record",
+            json!({"id":rollback_id,"type":"Document","kind":"note","reason":"Create rollback fixture."}),
+        )
+        .await
+        .unwrap();
+    let before_sequences = event_sequences(&database).await.unwrap();
+    install_projection_failure_trigger(&database).await.unwrap();
+    harness
+        .call(
+            &database,
+            TestCaller::Local,
+            "delete_record",
+            json!({"id":rollback_id,"reason":"Force delete projection failure."}),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(event_sequences(&database).await.unwrap(), before_sequences);
+    let next_act_rolled_back: i64 =
+        sqlx::query_scalar(&format!("SELECT next_act FROM {state} WHERE singleton=1"))
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    // One committed create happened since the delete above.
+    assert_eq!(next_act_rolled_back, next_act_after + 1);
+
+    database.assert_replay_equivalent().await.unwrap();
+    harness.close(&database).await;
+    harness.shutdown().await;
 }

@@ -16,7 +16,9 @@ use super::views_history::{self, PortableRecord, SnapshotRows, MAX_VIEW_CANDIDAT
 use crate::error::{Error, Result};
 use crate::mcp::registry::Caller;
 use crate::portable_sql::DomainStatementExecutor;
-use crate::query::fts::{self, SearchHit, NEAR_MISS_CAP, THIN_RESULTS_THRESHOLD};
+use crate::query::fts::{
+    self, SearchHit, CAPPED_RESULTS_GUIDANCE, NEAR_MISS_CAP, THIN_RESULTS_THRESHOLD,
+};
 
 pub(crate) const NATIVE_CANDIDATE_CAP: i64 = 5_000;
 pub(crate) const NATIVE_CANDIDATE_BYTES: usize = 4 * 1024 * 1024;
@@ -372,7 +374,15 @@ pub(crate) async fn execute<E: SearchPhysicalPort>(
             .then_with(|| left.id.cmp(&right.id))
     });
     hits.truncate(limit as usize);
-    let thin = hits.len() < THIN_RESULTS_THRESHOLD;
+    // One evaluation, two readers: the payload field and the guidance branch
+    // below must not be able to drift apart.
+    let limit_reached = hits.len() as i64 == limit;
+    // Thin means "few matches exist", not "few matches were asked for". A
+    // caller who set limit 3 and got 3 has a truncated result set, possibly
+    // out of hundreds — treating that as scarcity both contradicts
+    // `limit_reached` in the same payload and appends up to
+    // 3 x NEAR_MISS_CAP rows nobody requested.
+    let thin = hits.len() < THIN_RESULTS_THRESHOLD && !limit_reached;
     let mut payload = json!({
         "query":args.query,
         "scope":args.scope,
@@ -380,7 +390,7 @@ pub(crate) async fn execute<E: SearchPhysicalPort>(
         "total":hits.len(),
         "returned":hits.len(),
         "limit":limit,
-        "limit_reached":hits.len() as i64 == limit,
+        "limit_reached":limit_reached,
         "thin":thin,
     });
     if thin {
@@ -469,6 +479,14 @@ pub(crate) async fn execute<E: SearchPhysicalPort>(
             json!({"name_prefix":prefix,"name_infix":infix,"tree_siblings":siblings}),
         );
         object.insert("guidance".into(), json!(guidance));
+    } else if limit_reached {
+        // The capped branch is the false-negative risk: the caller sees a
+        // full page and cannot tell what was cut off. Point at the
+        // narrow-answer route. A capped result is never also thin — `thin`
+        // excludes `limit_reached` by construction — so these two branches
+        // cannot both describe one response.
+        let object = payload.as_object_mut().expect("search payload");
+        object.insert("guidance".into(), json!(CAPPED_RESULTS_GUIDANCE));
     }
     Ok(payload)
 }

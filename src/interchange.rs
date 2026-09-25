@@ -1,4 +1,4 @@
-//! Canonical storage interchange v1, revision 2.
+//! Canonical storage interchange v1, revision 5.
 //!
 //! The wire representation is intentionally logical rather than a SQLite file
 //! copy: every durable table is an ordered section, every SQLite value carries
@@ -8,13 +8,13 @@
 //! usable destination.
 
 use std::cmp::Ordering;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sqlx::{QueryBuilder, Row as _, Sqlite, TypeInfo as _, ValueRef as _};
+use sqlx::{Sqlite, TypeInfo as _, ValueRef as _};
 
 use crate::db::{
     apply_schema, open_database_at, open_existing_database_at, Db, CURRENT_ENGINE_SCHEMA_VERSION,
@@ -22,7 +22,27 @@ use crate::db::{
 use crate::{Error, Result};
 
 pub const FORMAT: &str = "native.canonical-interchange.v1";
-pub const REVISION: u64 = 2;
+pub const REVISION: u64 = 5;
+
+// SQLite's application id is database-local provenance, not portable content.
+// The high bytes identify Native's canonical-history marker and the low byte
+// records the interchange revision from which this database was materialised.
+// Zero/foreign values are deliberately "unknown" and may not author deltas.
+pub(crate) const SOURCE_HISTORY_APPLICATION_ID_BASE: i64 = 0x4e41_5400;
+
+pub(crate) const fn source_history_application_id(revision: u64) -> i64 {
+    SOURCE_HISTORY_APPLICATION_ID_BASE + revision as i64
+}
+
+fn source_history_revision_from_application_id(marker: i64) -> Option<u64> {
+    let revision = marker.checked_sub(SOURCE_HISTORY_APPLICATION_ID_BASE)?;
+    (1..=REVISION as i64)
+        .contains(&revision)
+        .then_some(revision as u64)
+}
+const REVISION_4: u64 = 4;
+const ACT_REVISION: u64 = 3;
+const REVISION_2: u64 = 2;
 const LEGACY_REVISION: u64 = 1;
 pub const SECTION_FORMAT: &str = "native.canonical-interchange.section.v1";
 pub const LOGICAL_CONTRACT: &str = "native.logical.v1";
@@ -38,10 +58,327 @@ const ORDERING: &str = "sections-by-contract;rows-by-primary-key;columns-by-sche
 // `engine_migration_drills` is deliberately absent: it is engine-local
 // promotion-drill bookkeeping about one physical file's migration history,
 // so a canonically rebuilt destination honestly starts without it.
-const SECTION_NAMES: &[&str] = &[
+pub(crate) const SECTION_NAMES: &[&str] = &[
     "content_events",
     "content_event_causal_frontier",
     "content_event_causal_cutover",
+    "act_state",
+    "act_cutover",
+    "policy_events",
+    "meta_events",
+    "control_events",
+    "derivation_events",
+    "awareness_events",
+    "notification_candidate_events",
+    "relationship_events",
+    "relationship_foreign_action_attestations",
+    "relationship_foreign_action_outputs",
+    "relationship_federation_events",
+    "relationship_federation_quarantine",
+    "content_event_sources",
+    "replicated_message_provenance",
+    "destination_message_ingest",
+    "replicated_message_references",
+    "provenance_interaction_receipts",
+    "provenance_action_attestations",
+    "provenance_action_events",
+    "provenance_attestation_validity_events",
+    "provenance_action_outputs",
+    "webhook_endpoints",
+    "webhook_credentials",
+    "webhook_deliveries",
+    "records",
+    "record_policies",
+    "policy_entries",
+    "links",
+    "relationships",
+    "relationship_endpoints",
+    "relationship_legacy_links",
+    "relationship_assertion_heads",
+    "relationship_endpoint_activity",
+    "message_audience_state",
+    "message_audiences",
+    "message_origin_state",
+    "message_origin_principals",
+    "message_conversations",
+    "awareness_command_intents",
+    "human_message_awareness",
+    "agent_message_dispositions",
+    "awareness_event_evidence",
+    "message_inbox_routing",
+    "message_preferences",
+    "member_destinations",
+    "message_mentions",
+    "record_mentions",
+    "notification_candidates",
+    "module_releases",
+    "module_release_imports",
+    "artifact_source_attestations",
+    "artifact_inputs",
+    "artifact_module_grants",
+    "annotation_targets",
+    "attribution_targets",
+    "attribution_assertions",
+    "attribution_evidence",
+    "attribution_retractions",
+    "facet_values",
+    "facet_observations",
+    "semantic_units",
+    "unit_revisions",
+    "unit_heads",
+    "occurrences",
+    "freshness_command_results",
+    "freshness_runtime_command_results",
+    "receipts",
+    "receipt_provenance",
+    "dependencies",
+    "dependency_assessments",
+    "receipt_comparisons",
+    "receipt_uncertainty_lineage",
+    "reconciliations",
+    "unit_supersessions",
+    "dependency_audits",
+    "canvas_objects",
+    "canvas_batches",
+    "bindings",
+    "binding_audit",
+    "external_observations",
+    "database_identity",
+    "database_identity_audit",
+    "blobs",
+    "vocabularies",
+    "vocabulary_values",
+    "schema_config",
+    "member_contexts",
+    "instruction_bindings",
+    "onboarding_programmes",
+    "onboarding_programme_sources",
+    "member_obligations",
+    "member_obligation_progress",
+    "seeded_instruction_sources",
+    "control_event_applications",
+    "storage_portability_policy",
+];
+
+// The expected inventories of earlier wire revisions are frozen here as
+// explicit lists. They are deliberately NOT derived from `SECTION_NAMES`: an
+// earlier bug did exactly that, so removing the read log from the current
+// revision also shrank the expected revision-1/2/3 inventories, and every
+// pre-existing bundle failed the section-inventory check before its upgrade
+// path ran. A historical list must not track the current revision.
+//
+// Revision 4 is `SECTION_NAMES` above: the read log is not portable.
+//
+// Revision 3 is revision 4 plus `read_log_calls` and `read_log_touches`
+// (inserted after `schema_config`).
+const REVISION_3_SECTION_NAMES: &[&str] = &[
+    "content_events",
+    "content_event_causal_frontier",
+    "content_event_causal_cutover",
+    "act_state",
+    "act_cutover",
+    "policy_events",
+    "meta_events",
+    "control_events",
+    "awareness_events",
+    "notification_candidate_events",
+    "relationship_events",
+    "relationship_foreign_action_attestations",
+    "relationship_foreign_action_outputs",
+    "relationship_federation_events",
+    "relationship_federation_quarantine",
+    "content_event_sources",
+    "replicated_message_provenance",
+    "destination_message_ingest",
+    "replicated_message_references",
+    "provenance_interaction_receipts",
+    "provenance_action_attestations",
+    "provenance_action_events",
+    "provenance_attestation_validity_events",
+    "provenance_action_outputs",
+    "webhook_endpoints",
+    "webhook_credentials",
+    "webhook_deliveries",
+    "records",
+    "record_policies",
+    "policy_entries",
+    "links",
+    "relationships",
+    "relationship_endpoints",
+    "relationship_legacy_links",
+    "relationship_assertion_heads",
+    "relationship_endpoint_activity",
+    "message_audience_state",
+    "message_audiences",
+    "message_origin_state",
+    "message_origin_principals",
+    "message_conversations",
+    "awareness_command_intents",
+    "human_message_awareness",
+    "agent_message_dispositions",
+    "awareness_event_evidence",
+    "message_inbox_routing",
+    "message_preferences",
+    "member_destinations",
+    "message_mentions",
+    "notification_candidates",
+    "module_releases",
+    "module_release_imports",
+    "artifact_source_attestations",
+    "artifact_inputs",
+    "artifact_module_grants",
+    "annotation_targets",
+    "attribution_targets",
+    "attribution_assertions",
+    "attribution_evidence",
+    "attribution_retractions",
+    "facet_values",
+    "facet_observations",
+    "semantic_units",
+    "unit_revisions",
+    "unit_heads",
+    "occurrences",
+    "freshness_command_results",
+    "freshness_runtime_command_results",
+    "receipts",
+    "receipt_provenance",
+    "dependencies",
+    "dependency_assessments",
+    "receipt_comparisons",
+    "receipt_uncertainty_lineage",
+    "reconciliations",
+    "unit_supersessions",
+    "dependency_audits",
+    "canvas_objects",
+    "canvas_batches",
+    "bindings",
+    "binding_audit",
+    "external_observations",
+    "database_identity",
+    "database_identity_audit",
+    "blobs",
+    "vocabularies",
+    "vocabulary_values",
+    "schema_config",
+    "read_log_calls",
+    "read_log_touches",
+    "member_contexts",
+    "instruction_bindings",
+    "onboarding_programmes",
+    "onboarding_programme_sources",
+    "member_obligations",
+    "member_obligation_progress",
+    "seeded_instruction_sources",
+    "control_event_applications",
+    "storage_portability_policy",
+];
+
+// Revision 2 is revision 3 without `act_state`/`act_cutover` (and with the
+// read log).
+const REVISION_2_SECTION_NAMES: &[&str] = &[
+    "content_events",
+    "content_event_causal_frontier",
+    "content_event_causal_cutover",
+    "policy_events",
+    "meta_events",
+    "control_events",
+    "awareness_events",
+    "notification_candidate_events",
+    "relationship_events",
+    "relationship_foreign_action_attestations",
+    "relationship_foreign_action_outputs",
+    "relationship_federation_events",
+    "relationship_federation_quarantine",
+    "content_event_sources",
+    "replicated_message_provenance",
+    "destination_message_ingest",
+    "replicated_message_references",
+    "provenance_interaction_receipts",
+    "provenance_action_attestations",
+    "provenance_action_events",
+    "provenance_attestation_validity_events",
+    "provenance_action_outputs",
+    "webhook_endpoints",
+    "webhook_credentials",
+    "webhook_deliveries",
+    "records",
+    "record_policies",
+    "policy_entries",
+    "links",
+    "relationships",
+    "relationship_endpoints",
+    "relationship_legacy_links",
+    "relationship_assertion_heads",
+    "relationship_endpoint_activity",
+    "message_audience_state",
+    "message_audiences",
+    "message_origin_state",
+    "message_origin_principals",
+    "message_conversations",
+    "awareness_command_intents",
+    "human_message_awareness",
+    "agent_message_dispositions",
+    "awareness_event_evidence",
+    "message_inbox_routing",
+    "message_preferences",
+    "member_destinations",
+    "message_mentions",
+    "notification_candidates",
+    "module_releases",
+    "module_release_imports",
+    "artifact_source_attestations",
+    "artifact_inputs",
+    "artifact_module_grants",
+    "annotation_targets",
+    "attribution_targets",
+    "attribution_assertions",
+    "attribution_evidence",
+    "attribution_retractions",
+    "facet_values",
+    "facet_observations",
+    "semantic_units",
+    "unit_revisions",
+    "unit_heads",
+    "occurrences",
+    "freshness_command_results",
+    "freshness_runtime_command_results",
+    "receipts",
+    "receipt_provenance",
+    "dependencies",
+    "dependency_assessments",
+    "receipt_comparisons",
+    "receipt_uncertainty_lineage",
+    "reconciliations",
+    "unit_supersessions",
+    "dependency_audits",
+    "canvas_objects",
+    "canvas_batches",
+    "bindings",
+    "binding_audit",
+    "external_observations",
+    "database_identity",
+    "database_identity_audit",
+    "blobs",
+    "vocabularies",
+    "vocabulary_values",
+    "schema_config",
+    "read_log_calls",
+    "read_log_touches",
+    "member_contexts",
+    "instruction_bindings",
+    "onboarding_programmes",
+    "onboarding_programme_sources",
+    "member_obligations",
+    "member_obligation_progress",
+    "seeded_instruction_sources",
+    "control_event_applications",
+    "storage_portability_policy",
+];
+
+// Revision 1 is revision 2 without `content_event_causal_frontier`/
+// `content_event_causal_cutover` (and with the read log).
+const REVISION_1_SECTION_NAMES: &[&str] = &[
+    "content_events",
     "policy_events",
     "meta_events",
     "control_events",
@@ -150,6 +487,11 @@ struct Bundle {
 struct Manifest {
     format: String,
     revision: u64,
+    /// Original history fidelity after compatibility import. Older revision-5
+    /// documents omit this and therefore remain unknown rather than being
+    /// silently promoted to exhaustive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_history_revision: Option<u64>,
     source_profile: ProfileRevision,
     source_engine_schema: i64,
     logical_contract: String,
@@ -193,7 +535,7 @@ pub(crate) struct Column {
     pub(crate) declared_type: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub(crate) enum Cell {
     Null,
@@ -208,22 +550,51 @@ pub(crate) enum Cell {
 /// An integrity-checked interchange document. Sibling backends can inspect
 /// immutable sections, but cannot construct or mutate a value that bypasses
 /// the canonical validator.
-pub(crate) struct ValidatedInterchange(Bundle);
+pub(crate) struct ValidatedInterchange {
+    bundle: Bundle,
+    source_revision: u64,
+}
 
-#[cfg(feature = "postgres")]
 impl ValidatedInterchange {
+    /// The revision carried by the input before compatibility upgrades.
+    pub(crate) fn source_revision(&self) -> u64 {
+        self.source_revision
+    }
+
+    /// Only a document authored at the current revision is exhaustive for
+    /// every current canonical log. Compatibility upgrades preserve import
+    /// support, but cannot recover derivation history omitted by revisions
+    /// 1 through 3, nor observation/intent grouping omitted by revision 4.
+    #[cfg(test)]
+    pub(crate) fn require_native_current_revision(&self) -> Result<()> {
+        ensure(
+            self.source_revision == REVISION,
+            "canonical interchange must be authored at revision 5 for exhaustive canonical history",
+        )
+    }
+
+    fn bundle(&self) -> &Bundle {
+        &self.bundle
+    }
+
+    #[cfg(feature = "postgres")]
     pub(crate) fn sections(&self) -> &[Section] {
-        &self.0.sections
+        &self.bundle.sections
     }
 
+    #[cfg(feature = "postgres")]
     pub(crate) fn section(&self, name: &str) -> Option<&Section> {
-        self.0.sections.iter().find(|section| section.name == name)
+        self.bundle
+            .sections
+            .iter()
+            .find(|section| section.name == name)
     }
 
+    #[cfg(feature = "postgres")]
     pub(crate) fn source_profile(&self) -> (&str, u64) {
         (
-            &self.0.manifest.source_profile.id,
-            self.0.manifest.source_profile.revision,
+            &self.bundle.manifest.source_profile.id,
+            self.bundle.manifest.source_profile.revision,
         )
     }
 }
@@ -232,22 +603,86 @@ impl ValidatedInterchange {
 pub(crate) fn validate_canonical_interchange(bytes: &[u8]) -> Result<ValidatedInterchange> {
     let mut bundle: Bundle = serde_json::from_slice(bytes)
         .map_err(|error| Error::engine(format!("invalid canonical interchange JSON: {error}")))?;
+    let wire_revision = bundle.manifest.revision;
+    let source_revision = if wire_revision == REVISION {
+        bundle.manifest.source_history_revision.unwrap_or_default()
+    } else {
+        wire_revision
+    };
     if bundle.manifest.revision == LEGACY_REVISION {
-        let legacy_names = SECTION_NAMES
-            .iter()
-            .copied()
-            .filter(|name| {
-                !matches!(
-                    *name,
-                    "content_event_causal_frontier" | "content_event_causal_cutover"
-                )
-            })
-            .collect::<Vec<_>>();
-        validate_bundle_revision(&bundle, &legacy_names, LEGACY_REVISION, 45)?;
+        validate_bundle_revision(&bundle, REVISION_1_SECTION_NAMES, LEGACY_REVISION, 45)?;
         upgrade_legacy_bundle(&mut bundle)?;
     }
+    if bundle.manifest.revision == REVISION_2 {
+        validate_bundle_revision(
+            &bundle,
+            REVISION_2_SECTION_NAMES,
+            REVISION_2,
+            bundle.manifest.source_engine_schema,
+        )?;
+        upgrade_revision_2_bundle(&mut bundle)?;
+    }
+    if bundle.manifest.revision == ACT_REVISION {
+        validate_bundle_revision(
+            &bundle,
+            REVISION_3_SECTION_NAMES,
+            ACT_REVISION,
+            bundle.manifest.source_engine_schema,
+        )?;
+        upgrade_revision_3_bundle(&mut bundle)?;
+    }
+    if bundle.manifest.revision == REVISION_4 {
+        // Two revision-4 inventories shipped independently with the same
+        // section count. Select by exact ordered names, never by count.
+        let main_revision_4_names = REVISION_3_SECTION_NAMES
+            .iter()
+            .copied()
+            .filter(|name| !matches!(*name, "read_log_calls" | "read_log_touches"))
+            .flat_map(|name| {
+                if name == "message_mentions" {
+                    vec![name, "record_mentions"]
+                } else {
+                    vec![name]
+                }
+            })
+            .collect::<Vec<_>>();
+        let branch_revision_4_names = REVISION_3_SECTION_NAMES
+            .iter()
+            .copied()
+            .filter(|name| !matches!(*name, "read_log_calls" | "read_log_touches"))
+            .flat_map(|name| {
+                if name == "awareness_events" {
+                    vec!["derivation_events", name]
+                } else {
+                    vec![name]
+                }
+            })
+            .collect::<Vec<_>>();
+        let actual_names = bundle
+            .sections
+            .iter()
+            .map(|section| section.name.as_str())
+            .collect::<Vec<_>>();
+        let names = if actual_names == main_revision_4_names {
+            main_revision_4_names.as_slice()
+        } else if actual_names == branch_revision_4_names {
+            branch_revision_4_names.as_slice()
+        } else {
+            return Err(Error::engine("unsupported revision-4 section inventory"));
+        };
+        validate_bundle_revision(
+            &bundle,
+            names,
+            REVISION_4,
+            bundle.manifest.source_engine_schema,
+        )?;
+        upgrade_revision_4_bundle(&mut bundle)?;
+    }
     validate_bundle(&bundle)?;
-    Ok(ValidatedInterchange(bundle))
+    Ok(ValidatedInterchange {
+        bundle,
+        source_revision,
+    })
 }
 
 fn upgrade_legacy_bundle(bundle: &mut Bundle) -> Result<()> {
@@ -296,7 +731,7 @@ fn upgrade_legacy_bundle(bundle: &mut Bundle) -> Result<()> {
 
     let frontier = Section {
         format: SECTION_FORMAT.into(),
-        revision: REVISION,
+        revision: REVISION_2,
         name: "content_event_causal_frontier".into(),
         columns: vec![
             Column {
@@ -313,7 +748,7 @@ fn upgrade_legacy_bundle(bundle: &mut Bundle) -> Result<()> {
     };
     let cutover = Section {
         format: SECTION_FORMAT.into(),
-        revision: REVISION,
+        revision: REVISION_2,
         name: "content_event_causal_cutover".into(),
         columns: vec![
             Column {
@@ -344,6 +779,380 @@ fn upgrade_legacy_bundle(bundle: &mut Bundle) -> Result<()> {
     bundle.sections.insert(1, frontier);
     bundle.sections.insert(2, cutover);
     for section in &mut bundle.sections {
+        section.revision = REVISION_2;
+    }
+    bundle.manifest.revision = REVISION_2;
+    bundle.manifest.sections = bundle
+        .sections
+        .iter()
+        .map(|section| {
+            Ok(SectionDescriptor {
+                name: section.name.clone(),
+                revision: REVISION_2,
+                row_count: section.rows.len() as u64,
+                sha256: sha256_json(section)?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    bundle.manifest.content_sha256 = sha256_json(&bundle.sections)?;
+    Ok(())
+}
+
+/// Upgrade a revision-2 bundle to revision 3 in place: stamp a trailing
+/// `act` column (all NULL — revision-2 rows predate act stamping, so their
+/// grouping is unknown) on the sequenced event sections the bundle carries,
+/// and add the `act_state` counter plus the recorded `act_cutover`.
+///
+/// The counter resumes above every act the bundle carries (zero when none
+/// do), and the cutover marks each domain's whole section grouping-unknown
+/// at its current maximum replay position.
+///
+/// `derivation_events` did not travel at revision 3. Its cutover row is still
+/// emitted — honestly zero for the state this document can materialize — so
+/// the cutover inventory covers all ten sequenced canonical domains.
+fn upgrade_revision_2_bundle(bundle: &mut Bundle) -> Result<()> {
+    const ACT_DOMAINS: [&str; 10] = [
+        "content_events",
+        "policy_events",
+        "awareness_events",
+        "notification_candidate_events",
+        "binding_audit",
+        "database_identity_audit",
+        "meta_events",
+        "control_events",
+        "derivation_events",
+        "relationship_events",
+    ];
+    let source_engine_schema = bundle.manifest.source_engine_schema;
+    // Revision-2 sections carry no act column at all, so no bundle act can
+    // exist and the counter honestly resumes at zero.
+    let max_act = 0_i64;
+    // Section rows are primary-key ordered, so the cutover rows are emitted
+    // in domain sort order, not stamping order.
+    const SORTED_DOMAINS: [&str; 10] = [
+        "awareness_events",
+        "binding_audit",
+        "content_events",
+        "control_events",
+        "database_identity_audit",
+        "derivation_events",
+        "meta_events",
+        "notification_candidate_events",
+        "policy_events",
+        "relationship_events",
+    ];
+    let mut cutover_rows = Vec::with_capacity(ACT_DOMAINS.len());
+    let mut legacy_max: std::collections::BTreeMap<&str, i64> = std::collections::BTreeMap::new();
+    for domain in ACT_DOMAINS {
+        // Domains without an interchange section (today only
+        // `derivation_events`) contribute an honestly empty cutover row.
+        let Some(section) = bundle
+            .sections
+            .iter_mut()
+            .find(|section| section.name == domain)
+        else {
+            legacy_max.insert(domain, 0);
+            continue;
+        };
+        let seq = section
+            .columns
+            .iter()
+            .position(|column| column.name == "seq")
+            .ok_or_else(|| Error::engine(format!("revision-2 {domain} is missing seq")))?;
+        section.columns.push(Column {
+            name: "act".into(),
+            declared_type: "INTEGER".into(),
+        });
+        let mut last_legacy_seq = 0_i64;
+        for row in &mut section.rows {
+            if let Some(Cell::Integer(value)) = row.get(seq) {
+                last_legacy_seq = last_legacy_seq.max(*value);
+            }
+            row.push(Cell::Null);
+        }
+        legacy_max.insert(domain, last_legacy_seq);
+    }
+    for domain in SORTED_DOMAINS {
+        cutover_rows.push(vec![
+            Cell::Text(domain.into()),
+            Cell::Integer(legacy_max[domain]),
+            Cell::Text("1970-01-01T00:00:00.000Z".into()),
+            Cell::Integer(source_engine_schema),
+        ]);
+    }
+    let state = Section {
+        format: SECTION_FORMAT.into(),
+        revision: ACT_REVISION,
+        name: "act_state".into(),
+        columns: vec![
+            Column {
+                name: "singleton".into(),
+                declared_type: "INTEGER".into(),
+            },
+            Column {
+                name: "next_act".into(),
+                declared_type: "INTEGER".into(),
+            },
+        ],
+        primary_key: vec!["singleton".into()],
+        rows: vec![vec![Cell::Integer(1), Cell::Integer(max_act)]],
+    };
+    let cutover = Section {
+        format: SECTION_FORMAT.into(),
+        revision: ACT_REVISION,
+        name: "act_cutover".into(),
+        columns: vec![
+            Column {
+                name: "domain".into(),
+                declared_type: "TEXT".into(),
+            },
+            Column {
+                name: "last_legacy_seq".into(),
+                declared_type: "INTEGER".into(),
+            },
+            Column {
+                name: "cutover_at".into(),
+                declared_type: "TEXT".into(),
+            },
+            Column {
+                name: "from_engine_schema".into(),
+                declared_type: "INTEGER".into(),
+            },
+        ],
+        primary_key: vec!["domain".into()],
+        rows: cutover_rows,
+    };
+    let position = bundle
+        .sections
+        .iter()
+        .position(|section| section.name == "content_event_causal_cutover")
+        .ok_or_else(|| Error::engine("revision-2 interchange is missing its causal cutover"))?
+        + 1;
+    bundle.sections.insert(position, state);
+    bundle.sections.insert(position + 1, cutover);
+    for section in &mut bundle.sections {
+        section.revision = ACT_REVISION;
+    }
+    bundle.manifest.revision = ACT_REVISION;
+    bundle.manifest.sections = bundle
+        .sections
+        .iter()
+        .map(|section| {
+            Ok(SectionDescriptor {
+                name: section.name.clone(),
+                revision: ACT_REVISION,
+                row_count: section.rows.len() as u64,
+                sha256: sha256_json(section)?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    bundle.manifest.content_sha256 = sha256_json(&bundle.sections)?;
+    Ok(())
+}
+
+/// Upgrade a revision-3 document to revision 4. Revision 3 omitted the
+/// derivation log entirely and predates act stamping for provenance validity
+/// changes. The compatibility image is therefore explicit about both unknowns:
+/// it synthesizes an empty derivation log and stamps every historical validity
+/// row with NULL. Callers that claim exhaustive source fidelity must reject
+/// this upgraded representation at any exhaustive-history authority boundary.
+fn upgrade_revision_3_bundle(bundle: &mut Bundle) -> Result<()> {
+    bundle
+        .sections
+        .retain(|section| !matches!(section.name.as_str(), "read_log_calls" | "read_log_touches"));
+    let validity = bundle
+        .sections
+        .iter_mut()
+        .find(|section| section.name == "provenance_attestation_validity_events")
+        .ok_or_else(|| Error::engine("revision-3 interchange is missing validity events"))?;
+    ensure(
+        !validity.columns.iter().any(|column| column.name == "act"),
+        "revision-3 validity events unexpectedly carry an act column",
+    )?;
+    validity.columns.push(Column {
+        name: "act".into(),
+        declared_type: "INTEGER".into(),
+    });
+    for row in &mut validity.rows {
+        row.push(Cell::Null);
+    }
+
+    let derivation = Section {
+        format: SECTION_FORMAT.into(),
+        revision: REVISION_4,
+        name: "derivation_events".into(),
+        columns: vec![
+            Column {
+                name: "seq".into(),
+                declared_type: "INTEGER".into(),
+            },
+            Column {
+                name: "id".into(),
+                declared_type: "TEXT".into(),
+            },
+            Column {
+                name: "idempotency_key".into(),
+                declared_type: "TEXT".into(),
+            },
+            Column {
+                name: "type".into(),
+                declared_type: "TEXT".into(),
+            },
+            Column {
+                name: "schema_version".into(),
+                declared_type: "INTEGER".into(),
+            },
+            Column {
+                name: "aggregate_kind".into(),
+                declared_type: "TEXT".into(),
+            },
+            Column {
+                name: "aggregate_id".into(),
+                declared_type: "TEXT".into(),
+            },
+            Column {
+                name: "actor".into(),
+                declared_type: "TEXT".into(),
+            },
+            Column {
+                name: "run_key".into(),
+                declared_type: "TEXT".into(),
+            },
+            Column {
+                name: "reason".into(),
+                declared_type: "TEXT".into(),
+            },
+            Column {
+                name: "payload".into(),
+                declared_type: "TEXT".into(),
+            },
+            Column {
+                name: "created_at".into(),
+                declared_type: "TEXT".into(),
+            },
+            Column {
+                name: "act".into(),
+                declared_type: "INTEGER".into(),
+            },
+        ],
+        primary_key: vec!["seq".into()],
+        rows: Vec::new(),
+    };
+    let position = SECTION_NAMES
+        .iter()
+        .position(|name| *name == "derivation_events")
+        .expect("current inventory contains derivation_events");
+    bundle.sections.insert(position, derivation);
+    for section in &mut bundle.sections {
+        section.revision = REVISION_4;
+    }
+    bundle.manifest.revision = REVISION_4;
+    bundle.manifest.sections = bundle
+        .sections
+        .iter()
+        .map(|section| {
+            Ok(SectionDescriptor {
+                name: section.name.clone(),
+                revision: REVISION_4,
+                row_count: section.rows.len() as u64,
+                sha256: sha256_json(section)?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    bundle.manifest.content_sha256 = sha256_json(&bundle.sections)?;
+    Ok(())
+}
+
+/// Upgrade a revision-4 document to revision 5. Revision 4 predates act
+/// stamping for external observations and awareness command intents: both
+/// sections gain a trailing `act` column with every historical row stamped
+/// NULL. Their transaction grouping is permanently unknown, so the upgrade
+/// never fabricates grouping — it only preserves import support. Callers
+/// that claim exhaustive source fidelity must reject this upgraded
+/// representation at any exhaustive-history authority boundary,
+/// which now requires revision 5.
+fn empty_derivation_section() -> Section {
+    let columns = [
+        ("seq", "INTEGER"),
+        ("id", "TEXT"),
+        ("idempotency_key", "TEXT"),
+        ("type", "TEXT"),
+        ("schema_version", "INTEGER"),
+        ("aggregate_kind", "TEXT"),
+        ("aggregate_id", "TEXT"),
+        ("actor", "TEXT"),
+        ("run_key", "TEXT"),
+        ("reason", "TEXT"),
+        ("payload", "TEXT"),
+        ("created_at", "TEXT"),
+        ("act", "INTEGER"),
+    ]
+    .into_iter()
+    .map(|(name, declared_type)| Column {
+        name: name.into(),
+        declared_type: declared_type.into(),
+    })
+    .collect();
+    Section {
+        format: SECTION_FORMAT.into(),
+        revision: REVISION,
+        name: "derivation_events".into(),
+        columns,
+        primary_key: vec!["seq".into()],
+        rows: Vec::new(),
+    }
+}
+
+fn upgrade_revision_4_bundle(bundle: &mut Bundle) -> Result<()> {
+    bundle
+        .sections
+        .retain(|section| !matches!(section.name.as_str(), "read_log_calls" | "read_log_touches"));
+    if !bundle
+        .sections
+        .iter()
+        .any(|section| section.name == "derivation_events")
+    {
+        let position = SECTION_NAMES
+            .iter()
+            .position(|name| *name == "derivation_events")
+            .expect("current inventory contains derivation_events");
+        bundle.sections.insert(position, empty_derivation_section());
+    }
+    if !bundle
+        .sections
+        .iter()
+        .any(|section| section.name == "record_mentions")
+    {
+        let rows = derive_record_mentions_rows(bundle)?;
+        let position = SECTION_NAMES
+            .iter()
+            .position(|name| *name == "record_mentions")
+            .expect("current inventory contains record_mentions");
+        bundle
+            .sections
+            .insert(position, record_mentions_section(rows));
+    }
+    for table in [
+        "provenance_attestation_validity_events",
+        "external_observations",
+        "awareness_command_intents",
+    ] {
+        let section = bundle
+            .sections
+            .iter_mut()
+            .find(|section| section.name == table)
+            .ok_or_else(|| Error::engine(format!("revision-4 interchange is missing {table}")))?;
+        if !section.columns.iter().any(|column| column.name == "act") {
+            section.columns.push(Column {
+                name: "act".into(),
+                declared_type: "INTEGER".into(),
+            });
+            for row in &mut section.rows {
+                row.push(Cell::Null);
+            }
+        }
+    }
+    for section in &mut bundle.sections {
         section.revision = REVISION;
     }
     bundle.manifest.revision = REVISION;
@@ -363,6 +1172,174 @@ fn upgrade_legacy_bundle(bundle: &mut Bundle) -> Result<()> {
     Ok(())
 }
 
+/// The `record_mentions` section descriptor, in `SECTION_NAMES` column order.
+fn record_mentions_section(rows: Vec<Vec<Cell>>) -> Section {
+    Section {
+        format: SECTION_FORMAT.into(),
+        revision: REVISION,
+        name: "record_mentions".into(),
+        columns: vec![
+            Column {
+                name: "source_id".into(),
+                declared_type: "TEXT".into(),
+            },
+            Column {
+                name: "occurrence_ix".into(),
+                declared_type: "INTEGER".into(),
+            },
+            Column {
+                name: "source_event_seq".into(),
+                declared_type: "INTEGER".into(),
+            },
+            Column {
+                name: "span_start".into(),
+                declared_type: "INTEGER".into(),
+            },
+            Column {
+                name: "span_end".into(),
+                declared_type: "INTEGER".into(),
+            },
+            Column {
+                name: "authored_reference".into(),
+                declared_type: "TEXT".into(),
+            },
+            Column {
+                name: "lookup_key".into(),
+                declared_type: "TEXT".into(),
+            },
+            Column {
+                name: "form".into(),
+                declared_type: "TEXT".into(),
+            },
+            Column {
+                name: "parser_version".into(),
+                declared_type: "INTEGER".into(),
+            },
+        ],
+        primary_key: vec!["source_id".into(), "occurrence_ix".into()],
+        rows,
+    }
+}
+
+/// Derive revision-4 `record_mentions` rows from a revision-3 bundle's own
+/// `records` and `content_events` sections.
+///
+/// The source of truth is the record's current `body` column — never an event
+/// payload — scanned with the current parser. Provenance is the latest
+/// body-carrying content event for that record
+/// (`record_body::payload_carries_body`, the Rust twin of the migration
+/// backfill's `BODY_CARRYING_EVENT_SQL`), so a metadata-only update after the
+/// body keeps the body event's sequence. A live non-empty body with no
+/// body-carrying event yields no rows, exactly as the migration backfill
+/// leaves it: stamping a sequence the log cannot justify would make the
+/// imported projection disagree with replay, so the missing provenance is
+/// refused by the post-import conformance run rather than invented here.
+///
+/// Rows are deterministic: `records` is ordered by its primary key and
+/// occurrences follow `scan_body`'s left-to-right order, so the section
+/// digest is stable across imports.
+fn derive_record_mentions_rows(bundle: &Bundle) -> Result<Vec<Vec<Cell>>> {
+    let records = bundle
+        .sections
+        .iter()
+        .find(|section| section.name == "records")
+        .ok_or_else(|| Error::engine("revision-3 interchange is missing records"))?;
+    let events = bundle
+        .sections
+        .iter()
+        .find(|section| section.name == "content_events")
+        .ok_or_else(|| Error::engine("revision-3 interchange is missing content_events"))?;
+    let record_column = |name: &str| {
+        records
+            .columns
+            .iter()
+            .position(|column| column.name == name)
+            .ok_or_else(|| Error::engine(format!("revision-3 records is missing {name}")))
+    };
+    let event_column = |name: &str| {
+        events
+            .columns
+            .iter()
+            .position(|column| column.name == name)
+            .ok_or_else(|| Error::engine(format!("revision-3 content_events is missing {name}")))
+    };
+    let record_id = record_column("id")?;
+    let record_body = record_column("body")?;
+    let record_deleted = record_column("deleted_at")?;
+    let event_record = event_column("record_id")?;
+    let event_seq = event_column("seq")?;
+    let event_type = event_column("type")?;
+    let event_payload = event_column("payload")?;
+
+    let mut provenance: BTreeMap<&str, i64> = BTreeMap::new();
+    for row in &events.rows {
+        let Some(Cell::Text(event_type)) = row.get(event_type) else {
+            continue;
+        };
+        if !matches!(
+            event_type.as_str(),
+            "record.created"
+                | "record.updated"
+                | "receipt.committed.v1"
+                | "unit.revision.recorded.v1"
+        ) {
+            continue;
+        }
+        let Some(Cell::Text(payload)) = row.get(event_payload) else {
+            continue;
+        };
+        let payload: serde_json::Value = serde_json::from_str(payload).map_err(|error| {
+            Error::engine(format!(
+                "revision-3 content event payload is not valid JSON: {error}"
+            ))
+        })?;
+        if !crate::record_body::payload_carries_body(event_type, &payload) {
+            continue;
+        }
+        let (Some(Cell::Text(record_id)), Some(Cell::Integer(seq))) =
+            (row.get(event_record), row.get(event_seq))
+        else {
+            continue;
+        };
+        provenance
+            .entry(record_id.as_str())
+            .and_modify(|current| *current = (*current).max(*seq))
+            .or_insert(*seq);
+    }
+
+    let mut rows = Vec::new();
+    for row in &records.rows {
+        if !matches!(row.get(record_deleted), Some(Cell::Null)) {
+            continue;
+        }
+        let (Some(Cell::Text(record_id)), Some(Cell::Text(body))) =
+            (row.get(record_id), row.get(record_body))
+        else {
+            continue;
+        };
+        if body.is_empty() {
+            continue;
+        }
+        let Some(&source_event_seq) = provenance.get(record_id.as_str()) else {
+            continue;
+        };
+        for (occurrence_ix, occurrence) in crate::mentions::scan_body(body).iter().enumerate() {
+            rows.push(vec![
+                Cell::Text(record_id.clone()),
+                Cell::Integer(occurrence_ix as i64),
+                Cell::Integer(source_event_seq),
+                Cell::Integer(occurrence.span_start as i64),
+                Cell::Integer(occurrence.span_end as i64),
+                Cell::Text(occurrence.authored_reference.clone()),
+                Cell::Text(occurrence.lookup_key.clone()),
+                Cell::Text(occurrence.form.as_str().to_owned()),
+                Cell::Integer(crate::mentions::MENTION_PARSER_VERSION),
+            ]);
+        }
+    }
+    Ok(rows)
+}
+
 #[derive(sqlx::FromRow)]
 struct TableColumn {
     name: String,
@@ -375,6 +1352,9 @@ struct TableColumn {
 /// database seam. The result is compact UTF-8 JSON.
 pub async fn export_canonical_interchange(db: &Db) -> Result<Vec<u8>> {
     let mut tx = db.write_pool().begin().await?;
+    let source_history_marker: i64 = sqlx::query_scalar("PRAGMA application_id")
+        .fetch_one(&mut *tx)
+        .await?;
     reject_nonportable_state(&mut tx).await?;
     let mut sections = Vec::with_capacity(SECTION_NAMES.len());
     for &name in SECTION_NAMES {
@@ -398,6 +1378,9 @@ pub async fn export_canonical_interchange(db: &Db) -> Result<Vec<u8>> {
         manifest: Manifest {
             format: FORMAT.into(),
             revision: REVISION,
+            source_history_revision: source_history_revision_from_application_id(
+                source_history_marker,
+            ),
             source_profile: ProfileRevision {
                 id: SOURCE_PROFILE_ID.into(),
                 revision: SOURCE_PROFILE_REVISION,
@@ -427,7 +1410,8 @@ pub async fn import_canonical_interchange(bytes: &[u8], destination: &Path) -> R
         )));
     }
     let validated = validate_canonical_interchange(bytes)?;
-    let bundle = &validated.0;
+    let source_revision = validated.source_revision();
+    let bundle = validated.bundle();
 
     let parent = destination.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(parent)?;
@@ -452,13 +1436,24 @@ pub async fn import_canonical_interchange(bytes: &[u8], destination: &Path) -> R
             if section.name == "storage_portability_policy" {
                 continue;
             }
-            if section.name == "content_event_causal_cutover" {
-                sqlx::query("DELETE FROM content_event_causal_cutover")
+            if section.name == "content_event_causal_cutover"
+                || section.name == "act_state"
+                || section.name == "act_cutover"
+            {
+                sqlx::query(&format!("DELETE FROM {}", quote_identifier(&section.name)))
                     .execute(&mut *tx)
                     .await?;
             }
             import_section(&mut tx, section).await?;
         }
+        sqlx::query(&format!(
+            "PRAGMA application_id = {}",
+            source_history_application_id(source_revision)
+        ))
+        .execute(&mut *tx)
+        .await?;
+        let derivation_events = crate::derivation::read_all_derivation_events(&mut tx).await?;
+        crate::derivation::replay_derivations_in(&mut tx, &derivation_events).await?;
         crate::relationship::initialize_receiver_local_state_after_import_in(&mut tx).await?;
         tx.commit().await?;
 
@@ -540,31 +1535,25 @@ where
     E: sqlx::Executor<'e, Database = Sqlite>,
 {
     let sql = format!("PRAGMA table_info({})", quote_identifier(table));
-    let mut columns = sqlx::query_as::<_, TableColumn>(&sql)
+    let columns = sqlx::query_as::<_, TableColumn>(&sql)
         .fetch_all(executor)
         .await?;
-    // Interchange carries logical historical IDs. Dictionary references are
-    // receiver-local storage, not a new portable identity or section.
-    if table == "read_log_touches" {
-        for column in &mut columns {
-            if column.name == "record_ref" {
-                ensure(
-                    column.declared_type == "INTEGER" && column.pk == 2,
-                    "read-log dictionary reference has an unsupported shape",
-                )?;
-                column.name = "record_id".into();
-                column.declared_type = "TEXT".into();
-            }
-        }
-    }
     Ok(columns)
 }
 
-async fn export_section(tx: &mut sqlx::Transaction<'_, Sqlite>, name: &str) -> Result<Section> {
-    let table_info = table_columns(&mut **tx, name).await?;
+/// Logical columns plus the declared primary key for one interchange
+/// table. This is the single section-shape helper: the full export and the
+/// standby authority act-range cut both build their `Column` inventory and
+/// `ORDER BY` from it, so a schema change cannot move one path without the
+/// other.
+async fn section_shape<'e, E>(executor: E, table: &str) -> Result<(Vec<Column>, Vec<String>)>
+where
+    E: sqlx::Executor<'e, Database = Sqlite>,
+{
+    let table_info = table_columns(executor, table).await?;
     if table_info.is_empty() {
         return Err(Error::engine(format!(
-            "canonical interchange table is missing: {name}"
+            "canonical interchange table is missing: {table}"
         )));
     }
     let columns = table_info
@@ -586,7 +1575,125 @@ async fn export_section(tx: &mut sqlx::Transaction<'_, Sqlite>, name: &str) -> R
         .collect::<Vec<_>>();
     if primary_key.is_empty() {
         return Err(Error::engine(format!(
-            "canonical interchange table has no primary key: {name}"
+            "canonical interchange table has no primary key: {table}"
+        )));
+    }
+    Ok((columns, primary_key))
+}
+
+/// Encode one fetched SQLite row with the exact canonical cell rules: NULL
+/// stays NULL, INTEGER/REAL/TEXT/BLOB carry their storage-class tags, REAL
+/// is finite-only exact-bits hex, and BLOB is canonical padded base64. This
+/// is the single cell codec: the full export and the standby authority
+/// act-range cut share it, so the cut preserves interchange encoding
+/// byte-for-byte.
+fn encode_row_cells(
+    row: &sqlx::sqlite::SqliteRow,
+    columns: &[Column],
+    table: &str,
+) -> Result<Vec<Cell>> {
+    use sqlx::Row as _;
+    let mut cells = Vec::with_capacity(columns.len());
+    for index in 0..columns.len() {
+        let raw = row.try_get_raw(index)?;
+        if table == "read_log_touches"
+            && index == 1
+            && (raw.is_null() || raw.type_info().name() != "TEXT")
+        {
+            return Err(Error::engine(
+                "canonical read-log touch has no TEXT dictionary identity",
+            ));
+        }
+        if raw.is_null() {
+            cells.push(Cell::Null);
+            continue;
+        }
+        let cell = match raw.type_info().name() {
+            "INTEGER" => Cell::Integer(row.try_get(index)?),
+            "REAL" => {
+                let value: f64 = row.try_get(index)?;
+                if !value.is_finite() {
+                    return Err(Error::engine(format!(
+                        "canonical interchange rejects non-finite REAL in {table}"
+                    )));
+                }
+                Cell::Real(format!("{:016x}", value.to_bits()))
+            }
+            "TEXT" => Cell::Text(row.try_get(index)?),
+            "BLOB" => Cell::Blob(
+                base64::engine::general_purpose::STANDARD.encode(row.try_get::<Vec<u8>, _>(index)?),
+            ),
+            storage_class => {
+                return Err(Error::engine(format!(
+                    "unsupported SQLite storage class {storage_class} in {table}"
+                )))
+            }
+        };
+        cells.push(cell);
+    }
+    Ok(cells)
+}
+
+async fn export_section(tx: &mut sqlx::Transaction<'_, Sqlite>, name: &str) -> Result<Section> {
+    let (columns, primary_key) = section_shape(&mut **tx, name).await?;
+
+    let select_columns = columns
+        .iter()
+        .map(|column| quote_identifier(&column.name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let order = primary_key
+        .iter()
+        .map(|column| quote_identifier(column))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT {select_columns} FROM {} ORDER BY {order}",
+        quote_identifier(name)
+    );
+    let result_rows = sqlx::query(&sql).fetch_all(&mut **tx).await?;
+    let mut rows = Vec::with_capacity(result_rows.len());
+    for row in &result_rows {
+        rows.push(encode_row_cells(row, &columns, name)?);
+    }
+
+    Ok(Section {
+        format: SECTION_FORMAT.into(),
+        revision: REVISION,
+        name: name.into(),
+        columns,
+        primary_key,
+        rows,
+    })
+}
+
+/// Export the act-stamped rows of one canonical table in
+/// `(from_exclusive_act, to_inclusive_act]`, ordered by the declared primary
+/// key with the exact interchange [`Column`]/[`Cell`] encoding.
+///
+/// This is the authority-side row reader for the standby whole-act cut. It
+/// shares [`section_shape`] and [`encode_row_cells`] with the full export, so
+/// there is exactly one canonical cell codec; the `WHERE` clause is the only
+/// difference. `NULL` acts never match the range predicate, which is what
+/// keeps grouping-unknown legacy rows out of a live-authority cut.
+pub(crate) async fn export_act_range_section(
+    conn: &mut sqlx::SqliteConnection,
+    table: &str,
+    from_exclusive_act: i64,
+    to_inclusive_act: i64,
+) -> Result<Section> {
+    ensure(
+        from_exclusive_act >= 0 && to_inclusive_act >= 0,
+        "canonical act-range export bounds must be non-negative",
+    )?;
+    ensure(
+        from_exclusive_act <= to_inclusive_act,
+        "canonical act-range export range is reversed",
+    )?;
+    let (columns, primary_key) = section_shape(&mut *conn, table).await?;
+    if !columns.iter().any(|column| column.name == "act") {
+        return Err(Error::engine(format!(
+            "authority act cut table has no act column: {table}"
         )));
     }
 
@@ -600,65 +1707,91 @@ async fn export_section(tx: &mut sqlx::Transaction<'_, Sqlite>, name: &str) -> R
         .map(|column| quote_identifier(column))
         .collect::<Vec<_>>()
         .join(", ");
-    let sql = if name == "read_log_touches" {
-        // LEFT JOIN retains any broken reference as a NULL logical key, which
-        // the decoder below refuses instead of silently dropping the row.
-        "SELECT t.call_seq, d.record_id, t.interaction, t.result_rank FROM read_log_touches t LEFT JOIN read_log_record_ids d ON d.record_ref=t.record_ref ORDER BY t.call_seq, d.record_id, t.interaction".to_string()
-    } else {
-        format!(
-            "SELECT {select_columns} FROM {} ORDER BY {order}",
-            quote_identifier(name)
-        )
-    };
-    let result_rows = sqlx::query(&sql).fetch_all(&mut **tx).await?;
+    // This generic reader intentionally does not reproduce the
+    // `read_log_touches` dictionary join used by full interchange export.
+    // Act-range callers are restricted to ACT_STAMPED_TABLES; tables without
+    // an `act` column fail above rather than receiving subtly different
+    // logical-row encoding.
+    let sql = format!(
+        "SELECT {select_columns} FROM {} WHERE act > ? AND act <= ? ORDER BY {order}",
+        quote_identifier(table)
+    );
+    let result_rows = sqlx::query(&sql)
+        .bind(from_exclusive_act)
+        .bind(to_inclusive_act)
+        .fetch_all(&mut *conn)
+        .await?;
     let mut rows = Vec::with_capacity(result_rows.len());
-    for row in result_rows {
-        let mut cells = Vec::with_capacity(columns.len());
-        for index in 0..columns.len() {
-            let raw = row.try_get_raw(index)?;
-            if name == "read_log_touches"
-                && index == 1
-                && (raw.is_null() || raw.type_info().name() != "TEXT")
-            {
-                return Err(Error::engine(
-                    "canonical read-log touch has no TEXT dictionary identity",
-                ));
-            }
-            if raw.is_null() {
-                cells.push(Cell::Null);
-                continue;
-            }
-            let cell = match raw.type_info().name() {
-                "INTEGER" => Cell::Integer(row.try_get(index)?),
-                "REAL" => {
-                    let value: f64 = row.try_get(index)?;
-                    if !value.is_finite() {
-                        return Err(Error::engine(format!(
-                            "canonical interchange rejects non-finite REAL in {name}"
-                        )));
-                    }
-                    Cell::Real(format!("{:016x}", value.to_bits()))
-                }
-                "TEXT" => Cell::Text(row.try_get(index)?),
-                "BLOB" => Cell::Blob(
-                    base64::engine::general_purpose::STANDARD
-                        .encode(row.try_get::<Vec<u8>, _>(index)?),
-                ),
-                storage_class => {
-                    return Err(Error::engine(format!(
-                        "unsupported SQLite storage class {storage_class} in {name}"
-                    )))
-                }
-            };
-            cells.push(cell);
-        }
-        rows.push(cells);
+    for row in &result_rows {
+        rows.push(encode_row_cells(row, &columns, table)?);
     }
 
     Ok(Section {
         format: SECTION_FORMAT.into(),
         revision: REVISION,
-        name: name.into(),
+        name: table.into(),
+        columns,
+        primary_key,
+        rows,
+    })
+}
+
+/// A bound value for [`export_where_section`]. The bounded companion closure
+/// binds integer act bounds and explicit text identifiers only, never a
+/// caller-controlled identifier list of arbitrary shape.
+#[derive(Debug, Clone)]
+pub(crate) enum SelectionBind {
+    Text(String),
+    Integer(i64),
+}
+
+/// Export the rows of one table selected by a trusted, internal `WHERE`
+/// fragment, ordered by the declared primary key and encoded by the single
+/// canonical cell codec shared with the full export and the act-range reader.
+///
+/// `where_clause` is never caller input: it is a fixed literal built by the
+/// companion closure in `crate::standby::companion_closure`, whose nested
+/// subqueries restrict every companion selection to identifiers reachable from
+/// the act-stamped cut. The fragment carries `?` placeholders that are bound
+/// positionally from `bindings`.
+pub(crate) async fn export_where_section(
+    conn: &mut sqlx::SqliteConnection,
+    table: &str,
+    where_clause: &str,
+    bindings: &[SelectionBind],
+) -> Result<Section> {
+    let (columns, primary_key) = section_shape(&mut *conn, table).await?;
+    let select_columns = columns
+        .iter()
+        .map(|column| quote_identifier(&column.name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let order = primary_key
+        .iter()
+        .map(|column| quote_identifier(column))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT {select_columns} FROM {} WHERE {where_clause} ORDER BY {order}",
+        quote_identifier(table)
+    );
+    let mut query = sqlx::query(&sql);
+    for binding in bindings {
+        query = match binding {
+            SelectionBind::Text(value) => query.bind(value.clone()),
+            SelectionBind::Integer(value) => query.bind(*value),
+        };
+    }
+    let result_rows = query.fetch_all(&mut *conn).await?;
+    let mut rows = Vec::with_capacity(result_rows.len());
+    for row in &result_rows {
+        rows.push(encode_row_cells(row, &columns, table)?);
+    }
+
+    Ok(Section {
+        format: SECTION_FORMAT.into(),
+        revision: REVISION,
+        name: table.into(),
         columns,
         primary_key,
         rows,
@@ -666,10 +1799,13 @@ async fn export_section(tx: &mut sqlx::Transaction<'_, Sqlite>, name: &str) -> R
 }
 
 fn validate_bundle(bundle: &Bundle) -> Result<()> {
+    // Accepted engine stamps are explicit. Older wire revisions upgrade
+    // their section inventory and keep their source-history revision so a
+    // re-export cannot claim exhaustive authority for a legacy source.
     ensure(
         matches!(
             bundle.manifest.source_engine_schema,
-            45 | 53 | CURRENT_ENGINE_SCHEMA_VERSION
+            45 | 53 | 55 | 56 | 57 | 58 | 59 | 60 | 61 | 62 | 63 | CURRENT_ENGINE_SCHEMA_VERSION
         ),
         "unsupported source engine schema revision",
     )?;
@@ -692,6 +1828,12 @@ fn validate_bundle_revision(
     ensure(
         manifest.revision == revision,
         "unsupported interchange revision",
+    )?;
+    ensure(
+        manifest
+            .source_history_revision
+            .is_none_or(|source| source > 0 && source <= REVISION),
+        "invalid canonical source-history revision",
     )?;
     ensure(
         !manifest.source_profile.id.is_empty() && manifest.source_profile.revision > 0,
@@ -743,7 +1885,7 @@ fn validate_bundle_revision(
     Ok(())
 }
 
-fn validate_section_shape(section: &Section) -> Result<()> {
+pub(crate) fn validate_section_shape(section: &Section) -> Result<()> {
     ensure(
         !section.columns.is_empty(),
         "canonical section has no columns",
@@ -887,40 +2029,85 @@ fn compare_integer_real(integer: i64, real: f64) -> Ordering {
     }
 }
 
+/// Negative zero's bit pattern. SQLite cannot round-trip it bit-exactly, so
+/// canonical REAL cells never carry it.
+const NEGATIVE_ZERO_BITS: u64 = 0x8000_0000_0000_0000;
+
+/// Parse one canonical REAL cell and enforce the canonical value policy:
+/// exactly sixteen lowercase hexadecimal digits, finite, and never negative
+/// zero. Returns a `Result`, so a malformed cell is an error rather than a
+/// panic even on a path that skipped section-level validation.
+fn real_from_canonical_bits(bits: &str) -> Result<f64> {
+    ensure(
+        bits.len() == 16
+            && bits
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "canonical REAL must be 16 lowercase hexadecimal digits",
+    )?;
+    let raw = u64::from_str_radix(bits, 16)
+        .map_err(|_| Error::engine("canonical REAL has invalid bits"))?;
+    let value = f64::from_bits(raw);
+    ensure(value.is_finite(), "canonical REAL must be finite")?;
+    ensure(
+        raw != NEGATIVE_ZERO_BITS,
+        "canonical REAL must not be negative zero",
+    )?;
+    Ok(value)
+}
+
+/// Decode one canonical BLOB cell and enforce canonical padded base64. Returns
+/// a `Result`, so a malformed cell is an error rather than a panic.
+fn bytes_from_canonical_blob(encoded: &str) -> Result<Vec<u8>> {
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|_| Error::engine("canonical BLOB is not valid padded base64"))?;
+    ensure(
+        base64::engine::general_purpose::STANDARD.encode(&decoded) == encoded,
+        "canonical BLOB is not canonical padded base64",
+    )?;
+    Ok(decoded)
+}
+
 fn validate_cell(cell: &Cell) -> Result<()> {
     match cell {
-        Cell::Real(bits) => {
-            ensure(
-                bits.len() == 16
-                    && bits
-                        .bytes()
-                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
-                "canonical REAL must be 16 lowercase hexadecimal digits",
-            )?;
-            let bits = u64::from_str_radix(bits, 16)
-                .map_err(|_| Error::engine("canonical REAL has invalid bits"))?;
-            ensure(
-                f64::from_bits(bits).is_finite(),
-                "canonical REAL must be finite",
-            )
-        }
-        Cell::Blob(encoded) => {
-            let decoded = base64::engine::general_purpose::STANDARD
-                .decode(encoded)
-                .map_err(|_| Error::engine("canonical BLOB is not valid padded base64"))?;
-            ensure(
-                base64::engine::general_purpose::STANDARD.encode(decoded) == *encoded,
-                "canonical BLOB is not canonical padded base64",
-            )
-        }
+        Cell::Real(bits) => real_from_canonical_bits(bits).map(|_| ()),
+        Cell::Blob(encoded) => bytes_from_canonical_blob(encoded).map(|_| ()),
         Cell::Null | Cell::Integer(_) | Cell::Text(_) => Ok(()),
     }
 }
 
-async fn validate_destination_section(
+/// The only two admitted destination conflict semantics. A receiver never
+/// overwrites a canonical row: there is deliberately no upsert and no
+/// `INSERT OR IGNORE` that could hide a divergence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConflictMode {
+    /// Append-only act-stamped logs: every incoming primary key must be
+    /// absent. An identical existing row is an overlapping act and refuses
+    /// exactly like a divergent collision.
+    ActLogRefuseExisting,
+    /// Immutable canonical companions: an absent row inserts, an exactly
+    /// equal row is an idempotent no-op, and any difference at all — a
+    /// changed value, NULL versus non-NULL, or a different SQLite storage
+    /// class — refuses. The row is never updated.
+    ImmutableAllowIdentical,
+}
+
+/// Per-section insert-or-verify counts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct SectionIngestOutcome {
+    pub(crate) inserted: usize,
+    pub(crate) identical: usize,
+}
+
+/// Destination columns and declared primary key, or a refusal naming the
+/// drift from `section`. The returned [`TableColumn`] inventory is the
+/// trusted source for quoting every identifier a later ingest uses, so no
+/// section-supplied name reaches SQL before this check passes.
+async fn destination_columns(
     tx: &mut sqlx::Transaction<'_, Sqlite>,
     section: &Section,
-) -> Result<()> {
+) -> Result<Vec<TableColumn>> {
     let columns = table_columns(&mut **tx, &section.name).await?;
     let expected_columns = columns
         .iter()
@@ -946,17 +2133,275 @@ async fn validate_destination_section(
     ensure(
         section.primary_key == primary_key,
         "canonical section primary key does not match the destination schema",
-    )
+    )?;
+    Ok(columns)
+}
+
+/// Refuse a section whose column list or primary key does not match the live
+/// destination schema. This runs before any mutation of that schema.
+pub(crate) async fn validate_destination_section(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
+    section: &Section,
+) -> Result<()> {
+    destination_columns(tx, section).await.map(|_| ())
+}
+
+/// Bind one canonical cell with its exact storage class. This is the single
+/// `Cell` -> SQLite bind rule, shared by the interchange importer and the
+/// receiver insert-or-verify primitive, so no path may bind a value under a
+/// different storage class or quietly stringify it. The conversions are
+/// checked: a malformed REAL or BLOB cell is an error, never a panic.
+fn bind_cell<'q>(
+    query: sqlx::query::Query<'q, Sqlite, sqlx::sqlite::SqliteArguments<'q>>,
+    cell: &Cell,
+) -> Result<sqlx::query::Query<'q, Sqlite, sqlx::sqlite::SqliteArguments<'q>>> {
+    Ok(match cell {
+        Cell::Null => query.bind(None::<i64>),
+        Cell::Integer(value) => query.bind(*value),
+        Cell::Real(bits) => query.bind(real_from_canonical_bits(bits)?),
+        Cell::Text(value) => query.bind(value.clone()),
+        Cell::Blob(encoded) => query.bind(bytes_from_canonical_blob(encoded)?),
+    })
+}
+
+/// Insert one canonical row under an already-quoted column list of the same
+/// width. Every cell is bound by [`bind_cell`]; the SQL text carries no value.
+async fn insert_row_cells(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
+    quoted_table: &str,
+    column_list: &str,
+    row: &[Cell],
+) -> Result<()> {
+    let placeholders = vec!["?"; row.len()].join(", ");
+    let sql = format!("INSERT INTO {quoted_table} ({column_list}) VALUES ({placeholders})");
+    let mut query = sqlx::query(&sql);
+    for cell in row {
+        query = bind_cell(query, cell)?;
+    }
+    query.execute(&mut **tx).await?;
+    Ok(())
+}
+
+/// Fetch the destination row for one primary key and decode it with the
+/// canonical [`encode_row_cells`] codec. `LIMIT 2` turns a schema that lost its
+/// primary-key uniqueness into a refusal instead of a silently picked row.
+async fn select_existing_row(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
+    quoted_table: &str,
+    column_list: &str,
+    primary_key_predicate: &str,
+    primary_key_cells: &[&Cell],
+    columns: &[Column],
+    table: &str,
+) -> Result<Option<Vec<Cell>>> {
+    let sql =
+        format!("SELECT {column_list} FROM {quoted_table} WHERE {primary_key_predicate} LIMIT 2");
+    let mut query = sqlx::query(&sql);
+    for cell in primary_key_cells {
+        query = bind_cell(query, cell)?;
+    }
+    let rows = query.fetch_all(&mut **tx).await?;
+    match rows.as_slice() {
+        [] => Ok(None),
+        [row] => Ok(Some(encode_row_cells(row, columns, table)?)),
+        _ => Err(Error::engine(
+            "destination holds more than one row for a canonical primary key",
+        )),
+    }
+}
+
+/// SQLite treats a single-column `INTEGER PRIMARY KEY` as a rowid alias, and
+/// recognizes the type case-insensitively, so an exact-case comparison would
+/// miss `integer PRIMARY KEY`. Surrounding whitespace is deliberately *not*
+/// trimmed: SQLite's parser already normalizes token whitespace, and a quoted
+/// type like `" INTEGER "` is not a rowid alias at all, so trimming would
+/// classify a non-alias column as one. This is the one classification helper
+/// for that rule.
+fn is_rowid_alias_declared_type(declared_type: &str) -> bool {
+    declared_type.eq_ignore_ascii_case("INTEGER")
+}
+
+/// Refuse a NULL in any declared primary-key cell, and require an [`Cell::Integer`]
+/// for a single-column `INTEGER PRIMARY KEY`: that is SQLite's rowid alias,
+/// where a NULL would auto-assign a rowid and a non-integer would not pin the
+/// row the caller named. This runs before any SQL for the row.
+fn validate_primary_key_cells(
+    row: &[Cell],
+    primary_key_indexes: &[usize],
+    rowid_alias: bool,
+) -> Result<()> {
+    for index in primary_key_indexes {
+        ensure(
+            !matches!(row.get(*index), None | Some(Cell::Null)),
+            "canonical primary-key cell must not be NULL",
+        )?;
+    }
+    if rowid_alias {
+        ensure(
+            matches!(row.get(primary_key_indexes[0]), Some(Cell::Integer(_))),
+            "canonical INTEGER PRIMARY KEY cell must be an Integer",
+        )?;
+    }
+    Ok(())
+}
+
+/// Insert-or-verify every row of one canonical [`Section`] against the live
+/// destination schema, using the section's declared full primary key and every
+/// declared column.
+///
+/// Identifiers are quoted from the destination inventory returned by
+/// [`destination_columns`] only after it has proven `section` matches it, so no
+/// untrusted section name reaches SQL before validation. Values are bound with
+/// [`bind_cell`] and compared with the canonical [`encode_row_cells`] codec, so
+/// `seq`, `act`, timestamps, BLOB bytes, REAL bits and NULL are preserved
+/// exactly and a storage-class difference refuses.
+///
+/// `read_log_touches` is deliberately refused: its logical `record_id` is
+/// reconstructed through the receiver-local dictionary in
+/// [`import_read_log_touches`], which this primitive cannot reproduce.
+pub(crate) async fn ingest_section_rows(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
+    section: &Section,
+    mode: ConflictMode,
+) -> Result<SectionIngestOutcome> {
+    ensure(
+        section.name != "read_log_touches",
+        "canonical read-log touches need the dictionary importer, not the pinned ingest primitive",
+    )?;
+    // Local, fail-closed well-formedness: this primitive may be reached by a
+    // crate-internal caller that skipped the outer bundle/section validation,
+    // so malformed REAL/BLOB cells and bad shapes must error here, not panic.
+    validate_section_shape(section)?;
+    let columns = destination_columns(tx, section).await?;
+    let quoted_table = quote_identifier(&section.name);
+    let column_list = columns
+        .iter()
+        .map(|column| quote_identifier(&column.name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let primary_key_predicate = section
+        .primary_key
+        .iter()
+        .map(|column| format!("{} = ?", quote_identifier(column)))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    let primary_key_indexes = section
+        .primary_key
+        .iter()
+        .map(|name| {
+            section
+                .columns
+                .iter()
+                .position(|column| &column.name == name)
+                .ok_or_else(|| Error::engine("canonical primary-key column is missing"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    // A single-column `INTEGER PRIMARY KEY` is SQLite's rowid alias.
+    let rowid_alias = section.primary_key.len() == 1
+        && is_rowid_alias_declared_type(&section.columns[primary_key_indexes[0]].declared_type);
+
+    let mut outcome = SectionIngestOutcome::default();
+    for row in &section.rows {
+        validate_primary_key_cells(row, &primary_key_indexes, rowid_alias)?;
+        let primary_key_cells = primary_key_indexes
+            .iter()
+            .map(|index| &row[*index])
+            .collect::<Vec<_>>();
+        match select_existing_row(
+            tx,
+            &quoted_table,
+            &column_list,
+            &primary_key_predicate,
+            &primary_key_cells,
+            &section.columns,
+            &section.name,
+        )
+        .await?
+        {
+            Some(existing) => match mode {
+                ConflictMode::ActLogRefuseExisting => {
+                    return Err(Error::engine(format!(
+                        "canonical act log '{}' refuses an existing primary key",
+                        section.name
+                    )));
+                }
+                ConflictMode::ImmutableAllowIdentical => {
+                    ensure(
+                        existing == *row,
+                        "immutable canonical companion row diverged from the destination",
+                    )?;
+                    outcome.identical += 1;
+                }
+            },
+            None => {
+                insert_row_cells(tx, &quoted_table, &column_list, row).await?;
+                // Fail closed on affinity or normalization: re-read the row
+                // through the canonical codec and require the exact incoming
+                // cells, so a coerced class, value or REAL bit pattern refuses
+                // and the surrounding transaction rolls back.
+                let stored = select_existing_row(
+                    tx,
+                    &quoted_table,
+                    &column_list,
+                    &primary_key_predicate,
+                    &primary_key_cells,
+                    &section.columns,
+                    &section.name,
+                )
+                .await?
+                .ok_or_else(|| {
+                    Error::engine(format!(
+                        "canonical row vanished after insert into '{}'",
+                        section.name
+                    ))
+                })?;
+                ensure(
+                    stored == *row,
+                    "destination coerced or normalized a canonical row during insert",
+                )?;
+                outcome.inserted += 1;
+            }
+        }
+    }
+    Ok(outcome)
 }
 
 async fn import_section(tx: &mut sqlx::Transaction<'_, Sqlite>, section: &Section) -> Result<()> {
-    let touches = section.name == "read_log_touches";
-    let mut dictionary = std::collections::BTreeMap::<String, i64>::new();
+    if section.name == "read_log_touches" {
+        return import_read_log_touches(tx, section).await;
+    }
+    ingest_section_rows(tx, section, ConflictMode::ActLogRefuseExisting)
+        .await
+        .map(|_| ())
+}
+
+/// The one path that reconstructs a logical read-log touch: the exported
+/// `record_id` TEXT identity is interned into the receiver-local
+/// `read_log_record_ids` dictionary and the row is inserted against its
+/// INTEGER `record_ref`. It shares [`insert_row_cells`]/[`bind_cell`] with
+/// every other canonical insert, so malformed cells still error rather than
+/// panic.
+///
+/// This is the one intentional exception to the post-insert exact re-read in
+/// [`ingest_section_rows`]: the logical row's identity is split across the
+/// dictionary table and `read_log_touches` stores an INTEGER `record_ref`
+/// where the section carries TEXT `record_id`, so the physical row cannot be
+/// compared cell-for-cell to the incoming logical row. Read-log touches are
+/// operational, disposable evidence rather than canonical state.
+async fn import_read_log_touches(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
+    section: &Section,
+) -> Result<()> {
+    ensure(
+        section.columns.len() >= 2 && section.columns[1].name == "record_id",
+        "canonical read-log touch must carry record_id in its second column",
+    )?;
     let columns = section
         .columns
         .iter()
-        .map(|column| {
-            quote_identifier(if touches && column.name == "record_id" {
+        .enumerate()
+        .map(|(index, column)| {
+            quote_identifier(if index == 1 {
                 "record_ref"
             } else {
                 &column.name
@@ -964,57 +2409,30 @@ async fn import_section(tx: &mut sqlx::Transaction<'_, Sqlite>, section: &Sectio
         })
         .collect::<Vec<_>>()
         .join(", ");
+    let quoted_table = quote_identifier(&section.name);
+    let mut dictionary = std::collections::BTreeMap::<String, i64>::new();
     for row in &section.rows {
-        let record_ref = if touches {
-            let Some(Cell::Text(record_id)) = row.get(1) else {
-                return Err(Error::engine("canonical read-log record ID must be TEXT"));
-            };
-            let record_ref = if let Some(record_ref) = dictionary.get(record_id) {
-                *record_ref
-            } else {
-                sqlx::query("INSERT OR IGNORE INTO read_log_record_ids(record_id) VALUES (?)")
-                    .bind(record_id)
-                    .execute(&mut **tx)
-                    .await?;
-                let record_ref: i64 = sqlx::query_scalar(
-                    "SELECT record_ref FROM read_log_record_ids WHERE record_id=?",
-                )
-                .bind(record_id)
-                .fetch_one(&mut **tx)
-                .await?;
-                dictionary.insert(record_id.clone(), record_ref);
-                record_ref
-            };
-            Some(record_ref)
-        } else {
-            None
+        let Some(Cell::Text(record_id)) = row.get(1) else {
+            return Err(Error::engine("canonical read-log record ID must be TEXT"));
         };
-        let mut query = QueryBuilder::<Sqlite>::new(format!(
-            "INSERT INTO {} ({columns}) ",
-            quote_identifier(&section.name)
-        ));
-        query.push_values(std::iter::once(row), |mut separated, cells| {
-            for (index, cell) in cells.iter().enumerate() {
-                if let Some(record_ref) = record_ref.filter(|_| index == 1) {
-                    separated.push_bind(record_ref);
-                    continue;
-                }
-                match cell {
-                    Cell::Null => separated.push_bind(None::<i64>),
-                    Cell::Integer(value) => separated.push_bind(*value),
-                    Cell::Real(bits) => separated.push_bind(f64::from_bits(
-                        u64::from_str_radix(bits, 16).expect("validated REAL bits"),
-                    )),
-                    Cell::Text(value) => separated.push_bind(value.clone()),
-                    Cell::Blob(value) => separated.push_bind(
-                        base64::engine::general_purpose::STANDARD
-                            .decode(value)
-                            .expect("validated BLOB"),
-                    ),
-                };
-            }
-        });
-        query.build().execute(&mut **tx).await?;
+        let record_ref = if let Some(record_ref) = dictionary.get(record_id) {
+            *record_ref
+        } else {
+            sqlx::query("INSERT OR IGNORE INTO read_log_record_ids(record_id) VALUES (?)")
+                .bind(record_id)
+                .execute(&mut **tx)
+                .await?;
+            let record_ref: i64 =
+                sqlx::query_scalar("SELECT record_ref FROM read_log_record_ids WHERE record_id=?")
+                    .bind(record_id)
+                    .fetch_one(&mut **tx)
+                    .await?;
+            dictionary.insert(record_id.clone(), record_ref);
+            record_ref
+        };
+        let mut owned = row.clone();
+        owned[1] = Cell::Integer(record_ref);
+        insert_row_cells(tx, &quoted_table, &columns, &owned).await?;
     }
     Ok(())
 }
@@ -1045,10 +2463,114 @@ mod tests {
         bundle.manifest.content_sha256 = sha256_json(&bundle.sections).unwrap();
     }
 
+    /// A populated read log in the logical shape revisions 1–3 carried.
+    ///
+    /// The pre-revision-4 wire format exported `read_log_touches` with a
+    /// logical TEXT `record_id` column, not the physical `record_ref`
+    /// dictionary integer. The 3→4 upgrade drops these sections wholesale, so
+    /// only their generic section shape and presence matter here.
+    fn read_log_sections(revision: u64) -> Vec<Section> {
+        vec![
+            Section {
+                format: SECTION_FORMAT.into(),
+                revision,
+                name: "read_log_calls".into(),
+                columns: vec![
+                    Column {
+                        name: "seq".into(),
+                        declared_type: "INTEGER".into(),
+                    },
+                    Column {
+                        name: "id".into(),
+                        declared_type: "TEXT".into(),
+                    },
+                    Column {
+                        name: "tool".into(),
+                        declared_type: "TEXT".into(),
+                    },
+                    Column {
+                        name: "outcome".into(),
+                        declared_type: "TEXT".into(),
+                    },
+                    Column {
+                        name: "started_at".into(),
+                        declared_type: "TEXT".into(),
+                    },
+                    Column {
+                        name: "ended_at".into(),
+                        declared_type: "TEXT".into(),
+                    },
+                ],
+                primary_key: vec!["seq".into()],
+                rows: vec![vec![
+                    Cell::Integer(1),
+                    Cell::Text("portable-call".into()),
+                    Cell::Text("get_record".into()),
+                    Cell::Text("ok".into()),
+                    Cell::Text("2026-09-12T00:00:00.000Z".into()),
+                    Cell::Text("2026-09-12T00:00:00.000Z".into()),
+                ]],
+            },
+            Section {
+                format: SECTION_FORMAT.into(),
+                revision,
+                name: "read_log_touches".into(),
+                columns: vec![
+                    Column {
+                        name: "call_seq".into(),
+                        declared_type: "INTEGER".into(),
+                    },
+                    Column {
+                        name: "record_id".into(),
+                        declared_type: "TEXT".into(),
+                    },
+                    Column {
+                        name: "interaction".into(),
+                        declared_type: "TEXT".into(),
+                    },
+                    Column {
+                        name: "result_rank".into(),
+                        declared_type: "INTEGER".into(),
+                    },
+                ],
+                primary_key: vec!["call_seq".into(), "record_id".into(), "interaction".into()],
+                rows: vec![vec![
+                    Cell::Integer(1),
+                    Cell::Text("portable-record".into()),
+                    Cell::Text("opened".into()),
+                    Cell::Integer(1),
+                ]],
+            },
+        ]
+    }
+
+    /// Insert the read-log sections in their historical position (after
+    /// `schema_config`) so a downgraded bundle honestly resembles the wire
+    /// format that revision actually shipped.
+    fn insert_read_log_sections(bundle: &mut Bundle, revision: u64) {
+        let position = bundle
+            .sections
+            .iter()
+            .position(|section| section.name == "schema_config")
+            .expect("fixture carries schema_config")
+            + 1;
+        for (offset, section) in read_log_sections(revision).into_iter().enumerate() {
+            bundle.sections.insert(position + offset, section);
+        }
+    }
+
     fn downgrade_to_revision_1(mut bundle: Bundle) -> Bundle {
+        // `record_mentions` postdates every wire revision below 4 (it first
+        // ships as a revision-4 section at engine 59): a faithful revision-1
+        // reconstruction carries no such section, so strip it before the
+        // frozen-inventory gate counts sections.
         for name in [
             "content_event_causal_cutover",
             "content_event_causal_frontier",
+            "act_state",
+            "act_cutover",
+            "derivation_events",
+            "record_mentions",
         ] {
             let index = bundle
                 .sections
@@ -1057,33 +2579,31 @@ mod tests {
                 .unwrap();
             bundle.sections.remove(index);
         }
-        let events = bundle
-            .sections
-            .iter_mut()
-            .find(|section| section.name == "content_events")
-            .unwrap();
-        let mut causal_columns = events
-            .columns
-            .iter()
-            .enumerate()
-            .filter_map(|(index, column)| {
-                matches!(
-                    column.name.as_str(),
-                    "causal_envelope_version" | "causal_status"
-                )
-                .then_some(index)
-            })
-            .collect::<Vec<_>>();
-        causal_columns.sort_unstable_by(|left, right| right.cmp(left));
-        for index in causal_columns {
-            events.columns.remove(index);
-            for row in &mut events.rows {
-                row.remove(index);
+        for section in &mut bundle.sections {
+            let mut upgraded_columns = section
+                .columns
+                .iter()
+                .enumerate()
+                .filter_map(|(index, column)| {
+                    matches!(
+                        column.name.as_str(),
+                        "causal_envelope_version" | "causal_status" | "act"
+                    )
+                    .then_some(index)
+                })
+                .collect::<Vec<_>>();
+            upgraded_columns.sort_unstable_by(|left, right| right.cmp(left));
+            for index in upgraded_columns {
+                section.columns.remove(index);
+                for row in &mut section.rows {
+                    row.remove(index);
+                }
             }
         }
         for section in &mut bundle.sections {
             section.revision = LEGACY_REVISION;
         }
+        insert_read_log_sections(&mut bundle, LEGACY_REVISION);
         bundle.manifest.revision = LEGACY_REVISION;
         bundle.manifest.source_profile.revision = 1;
         bundle.manifest.source_engine_schema = 45;
@@ -1139,6 +2659,84 @@ mod tests {
         (bundle, attestation_id, origin)
     }
 
+    /// The validity section is act-stamped canonical state, and its `act`
+    /// column travels through the generic section mechanism: export reads the
+    /// column from `PRAGMA table_info` and import writes whatever columns the
+    /// validated bundle carries, so a post-cutover validity change round-trips
+    /// with its act and leaves no NULL.
+    ///
+    /// This is a *current-revision* round trip only. The changed validity
+    /// section shape makes an old revision-3 descriptor non-interchangeable,
+    /// and the revision-3→4 upgrade/downgrade fixtures that reconcile that are
+    /// deliberately owned by ca5d258's single revision bump, not here.
+    #[tokio::test]
+    async fn validity_act_round_trips_through_current_interchange() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = crate::create_database(temp.path().join("source.db").to_str().unwrap())
+            .await
+            .unwrap();
+        let (_, attestation_id, _) = populated_provenance_bundle(&source).await;
+        let before_act = source.current_act().await.unwrap();
+
+        let mut tx = crate::db::begin_write(source.write_pool()).await.unwrap();
+        let mut act_alloc = crate::act::ActAllocation::new();
+        crate::provenance::append_validity_event_in(
+            &mut tx,
+            &mut act_alloc,
+            &attestation_id,
+            crate::provenance::ValidityChange::Invalidated,
+            "interchange round trip",
+            "test",
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(source.current_act().await.unwrap(), before_act + 1);
+
+        let bytes = export_canonical_interchange(&source).await.unwrap();
+        let bundle: Bundle = serde_json::from_slice(&bytes).unwrap();
+        let validity = bundle
+            .sections
+            .iter()
+            .find(|section| section.name == "provenance_attestation_validity_events")
+            .unwrap();
+        let act_index = validity
+            .columns
+            .iter()
+            .position(|column| column.name == "act")
+            .expect("current export carries the validity act column");
+        assert!(
+            validity
+                .rows
+                .iter()
+                .all(|row| cell_integer(&row[act_index]) == Some(before_act + 1)),
+            "every exported validity row carries the transaction act"
+        );
+
+        let destination = temp.path().join("imported.db");
+        let imported = import_canonical_interchange(&bytes, &destination)
+            .await
+            .unwrap();
+        let imported_acts: Vec<Option<i64>> = sqlx::query_scalar(
+            "SELECT act FROM provenance_attestation_validity_events
+              WHERE status='invalidated' ORDER BY ordinal",
+        )
+        .fetch_all(imported.write_pool())
+        .await
+        .unwrap();
+        assert_eq!(imported_acts, vec![Some(before_act + 1)]);
+        let post_cutover_nulls: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM provenance_attestation_validity_events WHERE act IS NULL",
+        )
+        .fetch_one(imported.write_pool())
+        .await
+        .unwrap();
+        assert_eq!(post_cutover_nulls, 0);
+        assert_eq!(imported.current_act().await.unwrap(), before_act + 1);
+        imported.close().await;
+        source.close().await;
+    }
+
     fn key_section(rows: Vec<Vec<Cell>>, primary_key: &[&str]) -> Section {
         Section {
             format: SECTION_FORMAT.into(),
@@ -1178,7 +2776,13 @@ mod tests {
     }
 
     fn assert_protocol_inventory_tracks_section_names() {
-        assert_eq!(SECTION_NAMES.len(), 97);
+        assert_eq!(SECTION_NAMES.len(), 99);
+        for table in crate::act::CANONICAL_EVENT_TABLES {
+            assert!(
+                SECTION_NAMES.contains(&table),
+                "canonical event table {table} is missing from interchange"
+            );
+        }
         for (label, source) in [
             (
                 "manifest",
@@ -1254,7 +2858,7 @@ mod tests {
 
         let upgraded = validate_canonical_interchange(&serde_json::to_vec(&legacy).unwrap())
             .unwrap()
-            .0;
+            .bundle;
         assert_eq!(upgraded.manifest.revision, REVISION);
         let events = upgraded
             .sections
@@ -1285,15 +2889,21 @@ mod tests {
         assert_eq!(cell_integer(&cutover.rows[0][3]), Some(45));
     }
 
+    /// A read log is a person's attention, never shared state. It must not
+    /// appear in the portable interchange surface at all: no `read_log_calls`,
+    /// `read_log_touches`, or receiver-local `read_log_record_ids` section
+    /// crosses, and a round trip carries no rows into the destination.
+    ///
+    /// This replaces the former round-trip tests that asserted the logical
+    /// touch rows and their TEXT identity survived the crossing.
     #[tokio::test]
-    async fn dictionary_touches_round_trip_as_legacy_text_identity() {
+    async fn read_log_never_crosses_the_portable_interchange() {
         let temp = tempfile::tempdir().unwrap();
         let source = crate::create_database(temp.path().join("source.db").to_str().unwrap())
             .await
             .unwrap();
         sqlx::query("INSERT INTO read_log_calls (seq,id,tool,outcome,started_at,ended_at) VALUES (1,'portable-call','test','ok','2026-09-12','2026-09-12')")
             .execute(source.write_pool()).await.unwrap();
-        // Deliberately assign references in a different order from TEXT keys.
         for (index, id) in ["z", "Case", "case", "", "dangling-id", "雪"]
             .iter()
             .enumerate()
@@ -1308,82 +2918,883 @@ mod tests {
                 .bind(index as i64 + 1).bind(if index == 0 { None } else { Some(index as i64) })
                 .execute(source.write_pool()).await.unwrap();
         }
-        let bytes = export_canonical_interchange(&source).await.unwrap();
-        let bundle: Bundle = serde_json::from_slice(&bytes).unwrap();
-        assert!(!bundle
-            .sections
-            .iter()
-            .any(|section| section.name == "read_log_record_ids"));
-        let original = bundle
-            .sections
-            .iter()
-            .find(|section| section.name == "read_log_touches")
-            .unwrap()
-            .clone();
-        assert_eq!(original.columns[1].name, "record_id");
-        assert_eq!(original.columns[1].declared_type, "TEXT");
-        assert!(matches!(&original.rows[0][1], Cell::Text(id) if id.is_empty()));
-        // Every accepted wire generation carries the same logical IDs,
-        // including populated revision-1 bundles from engine 45.
-        for version in [45, 53, CURRENT_ENGINE_SCHEMA_VERSION] {
-            let mut input = if version == 45 {
-                downgrade_to_revision_1(bundle.clone())
-            } else {
-                bundle.clone()
-            };
-            input.manifest.source_engine_schema = version;
-            let imported = import_canonical_interchange(
-                &serde_json::to_vec(&input).unwrap(),
-                &temp.path().join(format!("import-{version}.db")),
-            )
+        let calls: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM read_log_calls")
+            .fetch_one(source.write_pool())
             .await
             .unwrap();
-            let exported: Bundle =
-                serde_json::from_slice(&export_canonical_interchange(&imported).await.unwrap())
-                    .unwrap();
-            let decoded = exported
-                .sections
-                .iter()
-                .find(|section| section.name == "read_log_touches")
-                .unwrap();
-            assert_eq!(
-                serde_json::to_value(decoded).unwrap(),
-                serde_json::to_value(&original).unwrap(),
-                "source engine {version}"
+        let touches: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM read_log_touches")
+            .fetch_one(source.write_pool())
+            .await
+            .unwrap();
+        assert!(calls > 0 && touches > 0, "fixture must have a read log");
+
+        let bytes = export_canonical_interchange(&source).await.unwrap();
+        let bundle: Bundle = serde_json::from_slice(&bytes).unwrap();
+        for name in ["read_log_calls", "read_log_touches", "read_log_record_ids"] {
+            assert!(
+                !bundle.sections.iter().any(|section| section.name == name),
+                "portable interchange must not carry a '{name}' section"
             );
-            let refs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM read_log_record_ids")
+            assert!(
+                !bundle
+                    .manifest
+                    .sections
+                    .iter()
+                    .any(|descriptor| descriptor.name == name),
+                "portable interchange manifest must not describe a '{name}' section"
+            );
+        }
+
+        let destination = temp.path().join("imported.db");
+        let imported = import_canonical_interchange(&bytes, &destination)
+            .await
+            .unwrap();
+        for table in ["read_log_calls", "read_log_touches", "read_log_record_ids"] {
+            let rows: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
                 .fetch_one(imported.write_pool())
                 .await
                 .unwrap();
-            assert_eq!(refs, 6);
+            assert_eq!(rows, 0, "import must not materialize '{table}' rows");
         }
+
+        imported.close().await;
+        source.close().await;
+    }
+
+    fn downgrade_to_revision_2(mut bundle: Bundle) -> Bundle {
+        for name in [
+            "act_state",
+            "act_cutover",
+            "derivation_events",
+            "record_mentions",
+        ] {
+            let index = bundle
+                .sections
+                .iter()
+                .position(|section| section.name == name)
+                .unwrap();
+            bundle.sections.remove(index);
+        }
+        for section in &mut bundle.sections {
+            if let Some(act) = section
+                .columns
+                .iter()
+                .position(|column| column.name == "act")
+            {
+                section.columns.remove(act);
+                for row in &mut section.rows {
+                    row.remove(act);
+                }
+            }
+            section.revision = REVISION_2;
+        }
+        insert_read_log_sections(&mut bundle, REVISION_2);
+        bundle.manifest.revision = REVISION_2;
+        bundle.manifest.source_profile.revision = 2;
+        bundle.manifest.source_engine_schema = 55;
+        bundle.manifest.sections = bundle
+            .sections
+            .iter()
+            .map(|section| SectionDescriptor {
+                name: section.name.clone(),
+                revision: REVISION_2,
+                row_count: section.rows.len() as u64,
+                sha256: sha256_json(section).unwrap(),
+            })
+            .collect();
+        bundle.manifest.content_sha256 = sha256_json(&bundle.sections).unwrap();
+        bundle
+    }
+
+    fn downgrade_to_revision_3(mut bundle: Bundle) -> Bundle {
+        let derivation = bundle
+            .sections
+            .iter()
+            .position(|section| section.name == "derivation_events")
+            .unwrap();
+        bundle.sections.remove(derivation);
+        let mentions = bundle
+            .sections
+            .iter()
+            .position(|section| section.name == "record_mentions")
+            .unwrap();
+        bundle.sections.remove(mentions);
+        for table in [
+            "provenance_attestation_validity_events",
+            "external_observations",
+            "awareness_command_intents",
+        ] {
+            let section = bundle
+                .sections
+                .iter_mut()
+                .find(|section| section.name == table)
+                .unwrap();
+            let act = section
+                .columns
+                .iter()
+                .position(|column| column.name == "act")
+                .unwrap();
+            section.columns.remove(act);
+            for row in &mut section.rows {
+                row.remove(act);
+            }
+        }
+        for section in &mut bundle.sections {
+            section.revision = ACT_REVISION;
+        }
+        insert_read_log_sections(&mut bundle, ACT_REVISION);
+        bundle.manifest.revision = ACT_REVISION;
+        bundle.manifest.source_engine_schema = 56;
+        bundle.manifest.sections = bundle
+            .sections
+            .iter()
+            .map(|section| SectionDescriptor {
+                name: section.name.clone(),
+                revision: ACT_REVISION,
+                row_count: section.rows.len() as u64,
+                sha256: sha256_json(section).unwrap(),
+            })
+            .collect();
+        bundle.manifest.content_sha256 = sha256_json(&bundle.sections).unwrap();
+        bundle
+    }
+
+    fn downgrade_to_revision_4(mut bundle: Bundle) -> Bundle {
+        let derivation = bundle
+            .sections
+            .iter()
+            .position(|section| section.name == "derivation_events")
+            .unwrap();
+        bundle.sections.remove(derivation);
+        for table in [
+            "provenance_attestation_validity_events",
+            "external_observations",
+            "awareness_command_intents",
+        ] {
+            let section = bundle
+                .sections
+                .iter_mut()
+                .find(|section| section.name == table)
+                .unwrap();
+            let act = section
+                .columns
+                .iter()
+                .position(|column| column.name == "act")
+                .unwrap();
+            section.columns.remove(act);
+            for row in &mut section.rows {
+                row.remove(act);
+            }
+        }
+        for section in &mut bundle.sections {
+            section.revision = REVISION_4;
+        }
+        bundle.manifest.revision = REVISION_4;
+        bundle.manifest.source_engine_schema = 59;
+        bundle.manifest.sections = bundle
+            .sections
+            .iter()
+            .map(|section| SectionDescriptor {
+                name: section.name.clone(),
+                revision: REVISION_4,
+                row_count: section.rows.len() as u64,
+                sha256: sha256_json(section).unwrap(),
+            })
+            .collect();
+        bundle.manifest.content_sha256 = sha256_json(&bundle.sections).unwrap();
+        bundle
     }
 
     #[tokio::test]
-    async fn dictionary_export_refuses_a_missing_identity() {
+    async fn revision_5_admits_data_only_62_and_63_sources_but_not_future_engine() {
         let temp = tempfile::tempdir().unwrap();
         let source = crate::create_database(temp.path().join("source.db").to_str().unwrap())
             .await
             .unwrap();
-        let mut connection = source.write_pool().acquire().await.unwrap();
-        sqlx::query("PRAGMA foreign_keys=OFF")
-            .execute(&mut *connection)
+        let bytes = export_canonical_interchange(&source).await.unwrap();
+        let mut bundle: Bundle = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(bundle.manifest.revision, REVISION);
+        for version in [62, 63, CURRENT_ENGINE_SCHEMA_VERSION] {
+            bundle.manifest.source_engine_schema = version;
+            validate_bundle(&bundle).unwrap();
+        }
+        bundle.manifest.source_engine_schema = CURRENT_ENGINE_SCHEMA_VERSION + 1;
+        assert!(validate_bundle(&bundle).is_err());
+        source.close().await;
+    }
+
+    /// Canonical interchange round-trips at revision 5 preserving act
+    /// numbers.
+    #[tokio::test]
+    async fn revision_5_round_trip_preserves_act_numbers() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = crate::create_database(temp.path().join("source.db").to_str().unwrap())
             .await
             .unwrap();
-        sqlx::query("INSERT INTO read_log_calls (seq,id,tool,outcome,started_at,ended_at) VALUES (1,'broken-call','test','ok','2026-09-12','2026-09-12')").execute(&mut *connection).await.unwrap();
-        sqlx::query(
-            "INSERT INTO read_log_touches(call_seq,record_ref,interaction) VALUES (1,99,'opened')",
+        crate::store::create_record(
+            &source,
+            serde_json::json!({
+                "id":"1a7e4000-0000-4000-8000-000000000060",
+                "type":"Document",
+                "kind":"note",
+                "name":"act round trip"
+            }),
         )
-        .execute(&mut *connection)
         .await
         .unwrap();
-        sqlx::query("PRAGMA foreign_keys=ON")
-            .execute(&mut *connection)
+        let bytes = export_canonical_interchange(&source).await.unwrap();
+        let bundle: Bundle = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(bundle.manifest.revision, REVISION);
+        let validated = validate_canonical_interchange(&bytes).unwrap();
+        assert_eq!(validated.source_revision(), REVISION);
+        validated.require_native_current_revision().unwrap();
+        let source_acts: Vec<Option<i64>> =
+            sqlx::query_scalar("SELECT act FROM content_events ORDER BY seq")
+                .fetch_all(source.write_pool())
+                .await
+                .unwrap();
+        assert!(!source_acts.is_empty());
+        assert!(source_acts.iter().all(|act| act.is_some()));
+
+        let destination = temp.path().join("destination.db");
+        let imported = import_canonical_interchange(&bytes, &destination)
             .await
             .unwrap();
-        drop(connection);
-        let error = export_canonical_interchange(&source).await.unwrap_err();
-        assert!(error.to_string().contains("dictionary identity"), "{error}");
+        let imported_acts: Vec<Option<i64>> =
+            sqlx::query_scalar("SELECT act FROM content_events ORDER BY seq")
+                .fetch_all(imported.write_pool())
+                .await
+                .unwrap();
+        assert_eq!(imported_acts, source_acts);
+        let source_counter: i64 =
+            sqlx::query_scalar("SELECT next_act FROM act_state WHERE singleton = 1")
+                .fetch_one(source.write_pool())
+                .await
+                .unwrap();
+        let imported_counter: i64 =
+            sqlx::query_scalar("SELECT next_act FROM act_state WHERE singleton = 1")
+                .fetch_one(imported.write_pool())
+                .await
+                .unwrap();
+        assert_eq!(imported_counter, source_counter);
+        let reexported = export_canonical_interchange(&imported).await.unwrap();
+        assert_eq!(reexported, bytes);
+        imported.close().await;
+        source.close().await;
+    }
+
+    /// Revision-5 import preserves observation and intent acts exactly and
+    /// never advances the act counter: the destination re-exports
+    /// byte-identical.
+    #[tokio::test]
+    async fn revision_5_round_trip_preserves_observation_and_intent_acts() {
+        let temp = tempfile::tempdir().unwrap();
+        let source =
+            crate::create_database(temp.path().join("obs-intent-source.db").to_str().unwrap())
+                .await
+                .unwrap();
+        let claim = crate::identity::BindingClaim {
+            system: "native-principal".into(),
+            identifier: "native/rev5-roundtrip".into(),
+        };
+        let actor = crate::identity::resolve_stdio_account_identity(&source, None)
+            .await
+            .unwrap();
+        let observation = crate::identity::observe_external(
+            &source,
+            &crate::identity::MutationContext {
+                actor: &actor,
+                reason: "rev5 round trip",
+                run_key: None,
+                parent_key: None,
+                intent: None,
+                is_member: true,
+                internal: false,
+                source_read_authorized: false,
+            },
+            std::slice::from_ref(&claim),
+            &crate::identity::StubHints {
+                name: Some("Rev5".into()),
+                ..Default::default()
+            },
+            &claim,
+            crate::identity::ObservationQuality::Reported,
+            crate::identity::MaterializationPolicy::IdentityOnly,
+            None,
+            &crate::identity::ObservationProvenance::default(),
+            Some("Rev5"),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let mut tx = crate::db::begin_write(source.write_pool()).await.unwrap();
+        let mut act_alloc = crate::act::ActAllocation::new();
+        crate::awareness::register_human_batch_command(
+            &mut tx,
+            "acct:rev5",
+            crate::awareness::HumanStage::Acknowledged,
+            &[],
+            &std::collections::BTreeMap::new(),
+            "rev5-roundtrip-key",
+            None,
+            &crate::awareness::VerifiedHumanInteraction {
+                nonce: "rev5".into(),
+                executor_ref: "ui".into(),
+            },
+            "rev5",
+            &mut act_alloc,
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+
+        let bytes = export_canonical_interchange(&source).await.unwrap();
+        let source_observation_act: Option<i64> =
+            sqlx::query_scalar("SELECT act FROM external_observations WHERE id = ?")
+                .bind(&observation.observation_id)
+                .fetch_one(source.write_pool())
+                .await
+                .unwrap();
+        let source_intent_act: Option<i64> = sqlx::query_scalar(
+            "SELECT act FROM awareness_command_intents WHERE idempotency_key = 'rev5-roundtrip-key'",
+        )
+        .fetch_one(source.write_pool())
+        .await
+        .unwrap();
+        assert!(source_observation_act.is_some());
+        assert!(source_intent_act.is_some());
+        let source_counter: i64 =
+            sqlx::query_scalar("SELECT next_act FROM act_state WHERE singleton = 1")
+                .fetch_one(source.write_pool())
+                .await
+                .unwrap();
+
+        let destination = temp.path().join("obs-intent-imported.db");
+        let imported = import_canonical_interchange(&bytes, &destination)
+            .await
+            .unwrap();
+        let imported_observation_act: Option<i64> =
+            sqlx::query_scalar("SELECT act FROM external_observations WHERE id = ?")
+                .bind(&observation.observation_id)
+                .fetch_one(imported.write_pool())
+                .await
+                .unwrap();
+        let imported_intent_act: Option<i64> = sqlx::query_scalar(
+            "SELECT act FROM awareness_command_intents WHERE idempotency_key = 'rev5-roundtrip-key'",
+        )
+        .fetch_one(imported.write_pool())
+        .await
+        .unwrap();
+        assert_eq!(imported_observation_act, source_observation_act);
+        assert_eq!(imported_intent_act, source_intent_act);
+        let imported_counter: i64 =
+            sqlx::query_scalar("SELECT next_act FROM act_state WHERE singleton = 1")
+                .fetch_one(imported.write_pool())
+                .await
+                .unwrap();
+        assert_eq!(imported_counter, source_counter);
+        assert_eq!(
+            export_canonical_interchange(&imported).await.unwrap(),
+            bytes
+        );
+        imported.close().await;
+        source.close().await;
+    }
+
+    #[tokio::test]
+    async fn revision_5_round_trip_preserves_a_whole_act_across_content_and_derivation() {
+        let temp = tempfile::tempdir().unwrap();
+        let source =
+            crate::create_database(temp.path().join("source-whole-act.db").to_str().unwrap())
+                .await
+                .unwrap();
+        let mut tx = crate::db::begin_write(source.write_pool()).await.unwrap();
+        let mut act_alloc = crate::act::ActAllocation::new();
+        let content = crate::store::append_in(
+            &source,
+            &mut tx,
+            crate::store::AppendSpec {
+                record_id: "1a7e4000-0000-4000-8000-000000000064".into(),
+                event_type: "record.created".into(),
+                payload: serde_json::json!({
+                    "type":"Document",
+                    "kind":"note",
+                    "name":"whole act interchange"
+                }),
+                actor: Some("agent:test".into()),
+            },
+            &mut act_alloc,
+        )
+        .await
+        .unwrap();
+        let derivation = crate::derivation::append_derivation_event_in(
+            &mut tx,
+            crate::derivation::NewDerivationEvent::authored(
+                "interchange-whole-act-series",
+                "agent:test",
+                Some("run:interchange-whole-act".into()),
+                "prove whole-act carriage",
+                crate::derivation::DerivationEventPayload::SeriesCreated(
+                    crate::derivation::DerivationSeriesCreated {
+                        id: "interchange-whole-act-series".into(),
+                        series_key: "interchange:whole-act".into(),
+                        definition: serde_json::json!({"kind":"test"}),
+                    },
+                ),
+            )
+            .unwrap(),
+            &mut act_alloc,
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+
+        let content_act: i64 = sqlx::query_scalar("SELECT act FROM content_events WHERE id=?")
+            .bind(&content.id)
+            .fetch_one(source.write_pool())
+            .await
+            .unwrap();
+        let derivation_act: i64 =
+            sqlx::query_scalar("SELECT act FROM derivation_events WHERE id=?")
+                .bind(&derivation.id)
+                .fetch_one(source.write_pool())
+                .await
+                .unwrap();
+        assert_eq!(content_act, derivation_act);
+
+        let bytes = export_canonical_interchange(&source).await.unwrap();
+        let destination = temp.path().join("whole-act-imported.db");
+        let imported = import_canonical_interchange(&bytes, &destination)
+            .await
+            .unwrap();
+        let imported_content_act: i64 =
+            sqlx::query_scalar("SELECT act FROM content_events WHERE id=?")
+                .bind(&content.id)
+                .fetch_one(imported.write_pool())
+                .await
+                .unwrap();
+        let imported_derivation_act: i64 =
+            sqlx::query_scalar("SELECT act FROM derivation_events WHERE id=?")
+                .bind(&derivation.id)
+                .fetch_one(imported.write_pool())
+                .await
+                .unwrap();
+        assert_eq!(imported_content_act, content_act);
+        assert_eq!(imported_derivation_act, content_act);
+        let projected: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM derivation_series WHERE id=?")
+                .bind("interchange-whole-act-series")
+                .fetch_one(imported.write_pool())
+                .await
+                .unwrap();
+        assert_eq!(projected, 1, "import must rebuild derivation projections");
+        assert_eq!(
+            export_canonical_interchange(&imported).await.unwrap(),
+            bytes
+        );
+        imported.close().await;
+        source.close().await;
+    }
+
+    #[tokio::test]
+    async fn revision_3_upgrade_is_importable_but_not_derivation_exhaustive() {
+        let temp = tempfile::tempdir().unwrap();
+        let source =
+            crate::create_database(temp.path().join("revision-3-source.db").to_str().unwrap())
+                .await
+                .unwrap();
+        let (_, attestation_id, _) = populated_provenance_bundle(&source).await;
+        let mut tx = crate::db::begin_write(source.write_pool()).await.unwrap();
+        let mut act_alloc = crate::act::ActAllocation::new();
+        crate::provenance::append_validity_event_in(
+            &mut tx,
+            &mut act_alloc,
+            &attestation_id,
+            crate::provenance::ValidityChange::Invalidated,
+            "revision-3 fixture",
+            "test",
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+
+        let current: Bundle =
+            serde_json::from_slice(&export_canonical_interchange(&source).await.unwrap()).unwrap();
+        let revision_3 = downgrade_to_revision_3(current);
+        let validated =
+            validate_canonical_interchange(&serde_json::to_vec(&revision_3).unwrap()).unwrap();
+        assert_eq!(validated.source_revision(), ACT_REVISION);
+        assert!(validated.require_native_current_revision().is_err());
+        let derivation = validated
+            .bundle()
+            .sections
+            .iter()
+            .find(|section| section.name == "derivation_events")
+            .unwrap();
+        assert!(derivation.rows.is_empty());
+        let validity = validated
+            .bundle()
+            .sections
+            .iter()
+            .find(|section| section.name == "provenance_attestation_validity_events")
+            .unwrap();
+        let act = validity
+            .columns
+            .iter()
+            .position(|column| column.name == "act")
+            .unwrap();
+        assert!(validity
+            .rows
+            .iter()
+            .all(|row| matches!(row[act], Cell::Null)));
+
+        let imported = import_canonical_interchange(
+            &serde_json::to_vec(&revision_3).unwrap(),
+            &temp.path().join("revision-3-imported.db"),
+        )
+        .await
+        .unwrap();
+        let validity_acts: Vec<Option<i64>> = sqlx::query_scalar(
+            "SELECT act FROM provenance_attestation_validity_events ORDER BY attestation_id,ordinal",
+        )
+        .fetch_all(imported.write_pool())
+        .await
+        .unwrap();
+        assert!(!validity_acts.is_empty());
+        assert!(validity_acts.iter().all(Option::is_none));
+        assert!(crate::standby::read_authority_act_head(&imported)
+            .await
+            .is_err());
+        let reexported = export_canonical_interchange(&imported).await.unwrap();
+        let reimported = import_canonical_interchange(
+            &reexported,
+            &temp.path().join("revision-3-reimported.db"),
+        )
+        .await
+        .unwrap();
+        assert!(crate::standby::read_authority_act_head(&reimported)
+            .await
+            .is_err());
+        reimported.close().await;
+        imported.close().await;
+        source.close().await;
+    }
+
+    /// A revision-4 document upgrades to revision 5 with trailing NULL acts
+    /// on both new act-stamped sections, preserves source_revision=4, never
+    /// fabricates grouping, and imports — but is not exhaustive, so the
+    /// native-delta gate rejects it.
+    fn downgrade_to_branch_revision_4(mut bundle: Bundle) -> Bundle {
+        let mentions = bundle
+            .sections
+            .iter()
+            .position(|section| section.name == "record_mentions")
+            .unwrap();
+        bundle.sections.remove(mentions);
+        for table in ["external_observations", "awareness_command_intents"] {
+            let section = bundle
+                .sections
+                .iter_mut()
+                .find(|section| section.name == table)
+                .unwrap();
+            let act = section
+                .columns
+                .iter()
+                .position(|column| column.name == "act")
+                .unwrap();
+            section.columns.remove(act);
+            for row in &mut section.rows {
+                row.remove(act);
+            }
+        }
+        for section in &mut bundle.sections {
+            section.revision = REVISION_4;
+        }
+        bundle.manifest.revision = REVISION_4;
+        bundle.manifest.source_engine_schema = 60;
+        bundle.manifest.sections = bundle
+            .sections
+            .iter()
+            .map(|section| SectionDescriptor {
+                name: section.name.clone(),
+                revision: REVISION_4,
+                row_count: section.rows.len() as u64,
+                sha256: sha256_json(section).unwrap(),
+            })
+            .collect();
+        bundle.manifest.content_sha256 = sha256_json(&bundle.sections).unwrap();
+        bundle
+    }
+
+    #[tokio::test]
+    async fn both_revision_4_inventories_upgrade_without_inventing_source_history() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = crate::create_database(
+            temp.path()
+                .join("rev4-inventory-source.db")
+                .to_str()
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        let record_id = crate::store::create_record(
+            &source,
+            serde_json::json!({
+                "type":"Document", "kind":"note", "name":"mentions", "body":"See [[My Note]]"
+            }),
+        )
+        .await
+        .unwrap();
+        let current: Bundle =
+            serde_json::from_slice(&export_canonical_interchange(&source).await.unwrap()).unwrap();
+        let main = downgrade_to_revision_4(current.clone());
+        let branch = downgrade_to_branch_revision_4(current);
+        assert_eq!(main.sections.len(), branch.sections.len());
+        for (label, historical) in [("main", main), ("branch", branch)] {
+            let bytes = serde_json::to_vec(&historical).unwrap();
+            let validated = validate_canonical_interchange(&bytes).unwrap();
+            assert_eq!(validated.source_revision(), REVISION_4);
+            assert!(validated.require_native_current_revision().is_err());
+            let mentions = validated
+                .bundle()
+                .sections
+                .iter()
+                .find(|section| section.name == "record_mentions")
+                .unwrap();
+            assert!(
+                !mentions.rows.is_empty(),
+                "{label} rev4 upgrade lost mentions"
+            );
+            let imported =
+                import_canonical_interchange(&bytes, &temp.path().join(format!("{label}.db")))
+                    .await
+                    .unwrap();
+            let count: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM record_mentions WHERE source_id = ?")
+                    .bind(&record_id)
+                    .fetch_one(imported.write_pool())
+                    .await
+                    .unwrap();
+            assert!(count > 0, "{label} rev4 import lost mention projection");
+            imported.close().await;
+        }
+        source.close().await;
+    }
+
+    #[tokio::test]
+    async fn revision_4_upgrade_adds_null_observation_and_intent_acts() {
+        let temp = tempfile::tempdir().unwrap();
+        let source =
+            crate::create_database(temp.path().join("revision-4-source.db").to_str().unwrap())
+                .await
+                .unwrap();
+        // An identity-only observation and a batch intent, both stamped at
+        // revision 5. Downgrading strips their acts; upgrading must restore
+        // NULLs without fabricating grouping.
+        let claim = crate::identity::BindingClaim {
+            system: "native-principal".into(),
+            identifier: "native/rev4-upgrade".into(),
+        };
+        let actor = crate::identity::resolve_stdio_account_identity(&source, None)
+            .await
+            .unwrap();
+        let observation = crate::identity::observe_external(
+            &source,
+            &crate::identity::MutationContext {
+                actor: &actor,
+                reason: "rev4 upgrade fixture",
+                run_key: None,
+                parent_key: None,
+                intent: None,
+                is_member: true,
+                internal: false,
+                source_read_authorized: false,
+            },
+            std::slice::from_ref(&claim),
+            &crate::identity::StubHints {
+                name: Some("Rev4".into()),
+                ..Default::default()
+            },
+            &claim,
+            crate::identity::ObservationQuality::Reported,
+            crate::identity::MaterializationPolicy::IdentityOnly,
+            None,
+            &crate::identity::ObservationProvenance::default(),
+            Some("Rev4"),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let mut tx = crate::db::begin_write(source.write_pool()).await.unwrap();
+        let mut act_alloc = crate::act::ActAllocation::new();
+        crate::awareness::register_human_batch_command(
+            &mut tx,
+            "acct:rev4",
+            crate::awareness::HumanStage::Acknowledged,
+            &[],
+            &std::collections::BTreeMap::new(),
+            "rev4-key",
+            None,
+            &crate::awareness::VerifiedHumanInteraction {
+                nonce: "rev4".into(),
+                executor_ref: "ui".into(),
+            },
+            "rev4",
+            &mut act_alloc,
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+
+        let current: Bundle =
+            serde_json::from_slice(&export_canonical_interchange(&source).await.unwrap()).unwrap();
+        assert_eq!(current.manifest.revision, REVISION);
+        let revision_4 = downgrade_to_revision_4(current);
+        let validated =
+            validate_canonical_interchange(&serde_json::to_vec(&revision_4).unwrap()).unwrap();
+        assert_eq!(validated.source_revision(), REVISION_4);
+        assert!(validated.require_native_current_revision().is_err());
+        for table in ["external_observations", "awareness_command_intents"] {
+            let section = validated
+                .bundle()
+                .sections
+                .iter()
+                .find(|section| section.name == table)
+                .unwrap();
+            let act = section
+                .columns
+                .iter()
+                .position(|column| column.name == "act")
+                .unwrap();
+            assert_eq!(
+                section.columns[act],
+                Column {
+                    name: "act".into(),
+                    declared_type: "INTEGER".into()
+                }
+            );
+            assert!(!section.rows.is_empty());
+            assert!(section
+                .rows
+                .iter()
+                .all(|row| matches!(row[act], Cell::Null)));
+        }
+
+        let imported = import_canonical_interchange(
+            &serde_json::to_vec(&revision_4).unwrap(),
+            &temp.path().join("revision-4-imported.db"),
+        )
+        .await
+        .unwrap();
+        let observation_act: Option<i64> =
+            sqlx::query_scalar("SELECT act FROM external_observations WHERE id = ?")
+                .bind(&observation.observation_id)
+                .fetch_one(imported.write_pool())
+                .await
+                .unwrap();
+        assert_eq!(observation_act, None);
+        let intent_act: Option<i64> = sqlx::query_scalar(
+            "SELECT act FROM awareness_command_intents WHERE idempotency_key = 'rev4-key'",
+        )
+        .fetch_one(imported.write_pool())
+        .await
+        .unwrap();
+        assert_eq!(intent_act, None);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("PRAGMA application_id")
+                .fetch_one(imported.write_pool())
+                .await
+                .unwrap(),
+            source_history_application_id(REVISION_4)
+        );
+        assert!(crate::standby::read_authority_act_head(&imported)
+            .await
+            .is_err());
+        imported.close().await;
+        source.close().await;
+    }
+
+    /// Revision-5 import still reads
+    /// revision-2 documents, leaving their rows unstamped (grouping
+    /// unknown) with a recorded cutover and a zeroed counter.
+    #[tokio::test]
+    async fn revision_2_import_leaves_rows_unstamped_with_a_recorded_cutover() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = crate::create_database(temp.path().join("source.db").to_str().unwrap())
+            .await
+            .unwrap();
+        crate::store::create_record(
+            &source,
+            serde_json::json!({
+                "id":"1a7e4000-0000-4000-8000-000000000061",
+                "type":"Document",
+                "kind":"note",
+                "name":"legacy interchange"
+            }),
+        )
+        .await
+        .unwrap();
+        let current: Bundle =
+            serde_json::from_slice(&export_canonical_interchange(&source).await.unwrap()).unwrap();
+        let legacy_event_count = current
+            .sections
+            .iter()
+            .find(|section| section.name == "content_events")
+            .unwrap()
+            .rows
+            .len() as i64;
+        let legacy = downgrade_to_revision_2(current);
+
+        let upgraded = validate_canonical_interchange(&serde_json::to_vec(&legacy).unwrap())
+            .unwrap()
+            .bundle;
+        assert_eq!(upgraded.manifest.revision, REVISION);
+        let events = upgraded
+            .sections
+            .iter()
+            .find(|section| section.name == "content_events")
+            .unwrap();
+        let act = events
+            .columns
+            .iter()
+            .position(|column| column.name == "act")
+            .unwrap();
+        assert!(events.rows.iter().all(|row| matches!(row[act], Cell::Null)));
+        let cutover = upgraded
+            .sections
+            .iter()
+            .find(|section| section.name == "act_cutover")
+            .unwrap();
+        let content_row = cutover
+            .rows
+            .iter()
+            .find(|row| cell_text(&row[0]) == Some("content_events"))
+            .unwrap();
+        assert_eq!(cell_integer(&content_row[1]), Some(legacy_event_count));
+        assert_eq!(cell_integer(&content_row[3]), Some(55));
+
+        let destination = temp.path().join("legacy-imported.db");
+        let imported =
+            import_canonical_interchange(&serde_json::to_vec(&legacy).unwrap(), &destination)
+                .await
+                .unwrap();
+        let stamped: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM content_events WHERE act IS NOT NULL")
+                .fetch_one(imported.write_pool())
+                .await
+                .unwrap();
+        assert_eq!(stamped, 0);
+        let counter: i64 = sqlx::query_scalar("SELECT next_act FROM act_state WHERE singleton = 1")
+            .fetch_one(imported.write_pool())
+            .await
+            .unwrap();
+        assert_eq!(counter, 0);
+        imported.close().await;
+        source.close().await;
     }
 
     #[tokio::test]
@@ -2019,5 +4430,384 @@ mod tests {
         .unwrap_err();
         assert!(error.to_string().contains("provenance-state"), "{error}");
         source.close().await;
+    }
+
+    /// A destination-schema-pinned insert preserves every SQLite storage class
+    /// exactly. `seq` and `act` travel as ordinary integer columns and the
+    /// comparison is over canonical exported [`Cell`]s — never `CAST` to text —
+    /// so INTEGER zero, REAL bits, BLOB bytes and NULL are all pinned.
+    #[tokio::test]
+    async fn pinned_ingest_preserves_every_sqlite_cell_kind_exactly() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        sqlx::query(
+            "CREATE TABLE pinned_cells (
+                 id TEXT NOT NULL,
+                 part INTEGER NOT NULL,
+                 seq INTEGER,
+                 act INTEGER,
+                 flag INTEGER,
+                 ratio REAL,
+                 label TEXT,
+                 payload BLOB,
+                 optional TEXT,
+                 PRIMARY KEY (id, part)
+             )",
+        )
+        .execute(db.write_pool())
+        .await
+        .unwrap();
+
+        let (columns, primary_key) = section_shape(db.pool(), "pinned_cells").await.unwrap();
+        let row = vec![
+            Cell::Text("alpha".into()),
+            Cell::Integer(2),
+            Cell::Integer(7),
+            Cell::Integer(42),
+            Cell::Integer(0),
+            real(1.5),
+            Cell::Text("héllo".into()),
+            Cell::Blob(base64::engine::general_purpose::STANDARD.encode([0x00, 0xff, 0x10, 0x7f])),
+            Cell::Null,
+        ];
+        let section = Section {
+            format: SECTION_FORMAT.into(),
+            revision: REVISION,
+            name: "pinned_cells".into(),
+            columns,
+            primary_key,
+            rows: vec![row.clone()],
+        };
+
+        let mut tx = db.write_pool().begin().await.unwrap();
+        let outcome = ingest_section_rows(&mut tx, &section, ConflictMode::ActLogRefuseExisting)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(
+            outcome,
+            SectionIngestOutcome {
+                inserted: 1,
+                identical: 0
+            }
+        );
+
+        let stored = sqlx::query(
+            "SELECT id, part, seq, act, flag, ratio, label, payload, optional FROM pinned_cells",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        let exported = encode_row_cells(&stored, &section.columns, "pinned_cells").unwrap();
+        assert_eq!(exported, row, "canonical cells must round-trip exactly");
+
+        // Storage classes are pinned, not merely value-equal: zero stays
+        // INTEGER, the REAL stays REAL, the payload is BLOB and absent is NULL.
+        let classes: String = sqlx::query_scalar(
+            "SELECT typeof(id) || ',' || typeof(part) || ',' || typeof(seq) || ',' ||
+                    typeof(act) || ',' || typeof(flag) || ',' || typeof(ratio) || ',' ||
+                    typeof(label) || ',' || typeof(payload) || ',' || typeof(optional)
+               FROM pinned_cells",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            classes,
+            "text,integer,integer,integer,integer,real,text,blob,null"
+        );
+        db.close().await;
+    }
+
+    async fn table_count(db: &Db, table: &str) -> i64 {
+        sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+            .fetch_one(db.pool())
+            .await
+            .unwrap()
+    }
+
+    async fn empty_section_for(db: &Db, table: &str) -> Section {
+        let (columns, primary_key) = section_shape(db.pool(), table).await.unwrap();
+        Section {
+            format: SECTION_FORMAT.into(),
+            revision: REVISION,
+            name: table.into(),
+            columns,
+            primary_key,
+            rows: Vec::new(),
+        }
+    }
+
+    async fn primitive_refusal(db: &Db, section: &Section, mode: ConflictMode) -> String {
+        let mut tx = db.write_pool().begin().await.unwrap();
+        let error = ingest_section_rows(&mut tx, section, mode)
+            .await
+            .unwrap_err();
+        tx.rollback().await.unwrap();
+        error.to_string()
+    }
+
+    /// Negative zero cannot round-trip bit-exactly, so canonical validation
+    /// refuses it, and the pinned primitive refuses malformed REAL/BLOB cells
+    /// as errors rather than panicking. No row is left behind.
+    #[tokio::test]
+    async fn pinned_ingest_rejects_negative_zero_real_and_malformed_cells() {
+        assert!(validate_cell(&Cell::Real("8000000000000000".into())).is_err());
+        assert!(validate_cell(&Cell::Real("3ff8000000000000".into())).is_ok());
+        // Positive zero is a valid canonical REAL; only negative zero is
+        // unrepresentable in SQLite and refuses.
+        assert!(validate_cell(&real(0.0)).is_ok());
+        assert_eq!(real(0.0), Cell::Real("0000000000000000".into()));
+        assert!(validate_cell(&Cell::Real("zzzzzzzzzzzzzzzz".into())).is_err());
+        assert!(validate_cell(&Cell::Blob("AA".into())).is_err());
+        assert!(validate_cell(&Cell::Blob("!!!!".into())).is_err());
+
+        let db = crate::create_database(":memory:").await.unwrap();
+        sqlx::query(
+            "CREATE TABLE pinned_reals (
+                 id TEXT NOT NULL,
+                 ratio REAL,
+                 payload BLOB,
+                 PRIMARY KEY (id)
+             )",
+        )
+        .execute(db.write_pool())
+        .await
+        .unwrap();
+
+        let mut section = empty_section_for(&db, "pinned_reals").await;
+        for (ratio, payload) in [
+            (Cell::Real("8000000000000000".into()), Cell::Null),
+            (Cell::Real("zzzzzzzzzzzzzzzz".into()), Cell::Null),
+            (real(1.0), Cell::Blob("AA".into())),
+            (real(1.0), Cell::Blob("!!!!".into())),
+        ] {
+            section.rows = vec![vec![Cell::Text("k".into()), ratio, payload]];
+            // The failure must surface as an error, never as a panic.
+            let error = primitive_refusal(&db, &section, ConflictMode::ActLogRefuseExisting).await;
+            assert!(!error.is_empty(), "malformed cell must name an error");
+        }
+        assert_eq!(table_count(&db, "pinned_reals").await, 0);
+        db.close().await;
+    }
+
+    /// `insert_row_cells` is reached directly by the read-log reconstruction,
+    /// which skips section-shape validation. Its checked conversions must
+    /// return an error for malformed cells instead of panicking.
+    #[tokio::test]
+    async fn insert_row_cells_errors_on_malformed_cells_instead_of_panicking() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        sqlx::query("CREATE TABLE raw_cells (id TEXT, ratio REAL, payload BLOB)")
+            .execute(db.write_pool())
+            .await
+            .unwrap();
+        for row in [
+            vec![
+                Cell::Text("a".into()),
+                Cell::Real("zzzzzzzzzzzzzzzz".into()),
+                Cell::Null,
+            ],
+            vec![
+                Cell::Text("b".into()),
+                Cell::Real("8000000000000000".into()),
+                Cell::Null,
+            ],
+            vec![Cell::Text("c".into()), real(1.0), Cell::Blob("AA".into())],
+        ] {
+            let mut tx = db.write_pool().begin().await.unwrap();
+            let error = insert_row_cells(
+                &mut tx,
+                "\"raw_cells\"",
+                "\"id\", \"ratio\", \"payload\"",
+                &row,
+            )
+            .await
+            .unwrap_err();
+            assert!(!error.to_string().is_empty(), "{error}");
+            tx.rollback().await.unwrap();
+        }
+        assert_eq!(table_count(&db, "raw_cells").await, 0);
+        db.close().await;
+    }
+
+    /// A cell that SQLite's column affinity would coerce (INTEGER in a TEXT
+    /// column, numeric TEXT in an INTEGER column, INTEGER in a REAL column)
+    /// inserts but fails the post-insert exact re-read, so the transaction
+    /// rolls back and no row remains. A canonical row then inserts and an
+    /// identical retry stays an idempotent no-op.
+    #[tokio::test]
+    async fn pinned_ingest_refuses_affinity_coercion_and_leaves_no_row() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        sqlx::query(
+            "CREATE TABLE coercion (
+                 id TEXT NOT NULL,
+                 int_col INTEGER,
+                 text_col TEXT,
+                 real_col REAL,
+                 PRIMARY KEY (id)
+             )",
+        )
+        .execute(db.write_pool())
+        .await
+        .unwrap();
+
+        let mut section = empty_section_for(&db, "coercion").await;
+        let coercions = [
+            // INTEGER affinity would turn numeric TEXT into the integer 123.
+            (Cell::Text("123".into()), Cell::Null, Cell::Null, "int_col"),
+            // TEXT affinity would turn the integer into the text '123'.
+            (Cell::Null, Cell::Integer(123), Cell::Null, "text_col"),
+            // REAL affinity would turn the integer into the REAL 1.0.
+            (Cell::Null, Cell::Null, Cell::Integer(1), "real_col"),
+        ]
+        .map(|(int_col, text_col, real_col, column)| {
+            (
+                vec![Cell::Text("k".into()), int_col, text_col, real_col],
+                column,
+            )
+        });
+        for (row, column) in coercions {
+            section.rows = vec![row];
+            let error = primitive_refusal(&db, &section, ConflictMode::ActLogRefuseExisting).await;
+            assert!(
+                error.contains("coerced or normalized"),
+                "{column} coercion must be refused by the post-insert re-read: {error}"
+            );
+        }
+        assert_eq!(
+            table_count(&db, "coercion").await,
+            0,
+            "every coerced insert must roll back"
+        );
+
+        section.rows = vec![vec![
+            Cell::Text("k".into()),
+            Cell::Integer(5),
+            Cell::Text("hello".into()),
+            real(2.5),
+        ]];
+        let mut tx = db.write_pool().begin().await.unwrap();
+        let inserted = ingest_section_rows(&mut tx, &section, ConflictMode::ActLogRefuseExisting)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(inserted.inserted, 1);
+
+        let mut tx = db.write_pool().begin().await.unwrap();
+        let retry = ingest_section_rows(&mut tx, &section, ConflictMode::ImmutableAllowIdentical)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!((retry.inserted, retry.identical), (0, 1));
+        assert_eq!(table_count(&db, "coercion").await, 1);
+        db.close().await;
+    }
+
+    /// A NULL in any declared primary-key cell is refused before SQL, and a
+    /// single-column `INTEGER PRIMARY KEY` (SQLite's rowid alias) must be an
+    /// Integer so SQLite cannot auto-assign or coerce a rowid. No insert or
+    /// duplicate survives a refusal.
+    #[tokio::test]
+    async fn pinned_ingest_rejects_null_and_non_integer_primary_keys() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        sqlx::query("CREATE TABLE text_pk (id TEXT NOT NULL, value TEXT, PRIMARY KEY (id))")
+            .execute(db.write_pool())
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE int_pk (rid INTEGER PRIMARY KEY, value TEXT)")
+            .execute(db.write_pool())
+            .await
+            .unwrap();
+
+        // TEXT primary key: NULL refuses.
+        let mut text_section = empty_section_for(&db, "text_pk").await;
+        text_section.rows = vec![vec![Cell::Null, Cell::Text("v".into())]];
+        let error = primitive_refusal(&db, &text_section, ConflictMode::ActLogRefuseExisting).await;
+        assert!(error.contains("must not be NULL"), "{error}");
+        assert_eq!(table_count(&db, "text_pk").await, 0);
+
+        // INTEGER rowid alias: NULL and non-Integer both refuse.
+        let mut int_section = empty_section_for(&db, "int_pk").await;
+        for (cell, needle) in [
+            (Cell::Null, "must not be NULL"),
+            (Cell::Text("7".into()), "must be an Integer"),
+            (real(7.0), "must be an Integer"),
+        ] {
+            int_section.rows = vec![vec![cell, Cell::Text("v".into())]];
+            let error =
+                primitive_refusal(&db, &int_section, ConflictMode::ActLogRefuseExisting).await;
+            assert!(error.contains(needle), "{error}");
+        }
+        assert_eq!(
+            table_count(&db, "int_pk").await,
+            0,
+            "a refused rowid alias must not auto-assign a row"
+        );
+
+        // A canonical key inserts exactly once; an identical retry refuses
+        // rather than duplicating.
+        text_section.rows = vec![vec![Cell::Text("t1".into()), Cell::Text("v".into())]];
+        let mut tx = db.write_pool().begin().await.unwrap();
+        ingest_section_rows(&mut tx, &text_section, ConflictMode::ActLogRefuseExisting)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        int_section.rows = vec![vec![Cell::Integer(7), Cell::Text("v".into())]];
+        let mut tx = db.write_pool().begin().await.unwrap();
+        ingest_section_rows(&mut tx, &int_section, ConflictMode::ActLogRefuseExisting)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(table_count(&db, "text_pk").await, 1);
+        assert_eq!(table_count(&db, "int_pk").await, 1);
+
+        let error = primitive_refusal(&db, &text_section, ConflictMode::ActLogRefuseExisting).await;
+        assert!(error.contains("refuses an existing primary key"), "{error}");
+        let error = primitive_refusal(&db, &int_section, ConflictMode::ActLogRefuseExisting).await;
+        assert!(error.contains("refuses an existing primary key"), "{error}");
+        assert_eq!(table_count(&db, "text_pk").await, 1);
+        assert_eq!(table_count(&db, "int_pk").await, 1);
+        db.close().await;
+    }
+
+    /// The rowid-alias classification is case-insensitive, matching SQLite:
+    /// `integer PRIMARY KEY` requires an Integer key before any SQL, while a
+    /// quoted `" INTEGER "` type is not an alias and admits a non-numeric text
+    /// key. Trimming would wrongly classify the quoted column as an alias.
+    #[tokio::test]
+    async fn pinned_ingest_classifies_rowid_alias_case_insensitively_without_trimming() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        sqlx::query("CREATE TABLE int_pk_lower (rid integer PRIMARY KEY, value TEXT)")
+            .execute(db.write_pool())
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE int_pk_quoted_space (rid \" INTEGER \" PRIMARY KEY, value TEXT)")
+            .execute(db.write_pool())
+            .await
+            .unwrap();
+
+        let mut lower = empty_section_for(&db, "int_pk_lower").await;
+        lower.rows = vec![vec![Cell::Text("7".into()), Cell::Text("v".into())]];
+        let error = primitive_refusal(&db, &lower, ConflictMode::ActLogRefuseExisting).await;
+        assert!(error.contains("must be an Integer"), "{error}");
+        assert_eq!(table_count(&db, "int_pk_lower").await, 0);
+
+        let mut quoted = empty_section_for(&db, "int_pk_quoted_space").await;
+        quoted.rows = vec![vec![
+            Cell::Text("not-an-int".into()),
+            Cell::Text("v".into()),
+        ]];
+        let mut tx = db.write_pool().begin().await.unwrap();
+        ingest_section_rows(&mut tx, &quoted, ConflictMode::ActLogRefuseExisting)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(table_count(&db, "int_pk_quoted_space").await, 1);
+        let stored: String =
+            sqlx::query_scalar("SELECT CAST(rid AS TEXT) FROM int_pk_quoted_space")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(stored, "not-an-int");
+        db.close().await;
     }
 }

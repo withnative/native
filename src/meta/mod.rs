@@ -45,6 +45,8 @@ pub mod vocabulary;
 
 pub use events::*;
 pub use kind::*;
+#[allow(unused_imports)] // R3 consumes the bounded fold; the reader lands ahead of its caller.
+pub(crate) use log::meta_events_in_act_range;
 pub use log::read_all_meta_events;
 pub use schema_config::*;
 pub use vocabulary::*;

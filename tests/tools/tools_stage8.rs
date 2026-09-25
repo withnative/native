@@ -1962,6 +1962,7 @@ async fn overlap_notices_persist_only_their_safe_emission_annotations() {
                     "name": "Emission fresh create",
                     "lifecycle": "in_progress",
                     "links": [{ "target_id": parent, "relationship": "part_of" }],
+                    "sources": [{ "record_id": sibling, "reason": "overlap measurement basis" }],
                     "run_key": "pilot-river-b748b2",
                 }),
             ),
@@ -1970,9 +1971,9 @@ async fn overlap_notices_persist_only_their_safe_emission_annotations() {
         .unwrap();
     assert!(fresh_create.get("work_overlap").is_some());
 
-    // `set_intent` notices are based on its bounded briefing anchors. Touch a
-    // record that its existing response is authorized to disclose as claimed,
-    // then declare again to exercise this independent notice surface.
+    // `set_intent` notices are based on bounded declared-source anchors. The
+    // preceding write cites the claimed sibling, so this later declaration
+    // can emit an independent notice without retaining the read below.
     registry
         .call(
             db.clone(),
@@ -2124,7 +2125,9 @@ async fn overlap_notices_persist_only_their_safe_emission_annotations() {
     .fetch_all(db.pool())
     .await
     .unwrap();
-    assert_eq!(no_notice_annotations, vec![None, None]);
+    // Read-only preview is disposable. The retained quiet declaration has
+    // no notice annotation.
+    assert_eq!(no_notice_annotations, vec![None]);
 }
 
 // ---------------------------------------------------------------------------

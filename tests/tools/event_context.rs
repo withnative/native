@@ -72,6 +72,26 @@ const NEIGHBOUR_TWO: &str = "e0e70000-0000-4000-8000-00000000001b";
 const NEIGHBOUR_THREE: &str = "e0e70000-0000-4000-8000-00000000001c";
 /// `other-run`
 const OTHER_RUN: &str = "e0e70000-0000-4000-8000-00000000001d";
+/// `basis-caller-source`
+const BASIS_CALLER_SOURCE: &str = "e0e70000-0000-4000-8000-00000000001e";
+/// `basis-engine-source`
+const BASIS_ENGINE_SOURCE: &str = "e0e70000-0000-4000-8000-00000000001f";
+/// `basis-citing`
+const BASIS_CITING: &str = "e0e70000-0000-4000-8000-000000000020";
+/// `basis-none`
+const BASIS_NONE: &str = "e0e70000-0000-4000-8000-000000000021";
+/// `basis-absent`
+const BASIS_ABSENT: &str = "e0e70000-0000-4000-8000-000000000022";
+/// `basis-self-target`
+const BASIS_SELF_TARGET: &str = "e0e70000-0000-4000-8000-000000000023";
+/// `basis-secret`
+const BASIS_SECRET: &str = "e0e70000-0000-4000-8000-000000000024";
+/// `basis-open`
+const BASIS_OPEN: &str = "e0e70000-0000-4000-8000-000000000025";
+/// `basis-filtered-subject`
+const BASIS_FILTERED_SUBJECT: &str = "e0e70000-0000-4000-8000-000000000026";
+/// `basis-reshaped`
+const BASIS_RESHAPED: &str = "e0e70000-0000-4000-8000-000000000027";
 
 fn registry() -> ToolRegistry {
     let mut registry = ToolRegistry::new();
@@ -132,6 +152,39 @@ async fn call(registry: &ToolRegistry, db: &Db, tool: &str, args: Value) -> Valu
         .unwrap_or_else(|error| panic!("{tool} failed: {error}"));
     db.drain_captures_for_tests().await;
     result
+}
+
+/// Model an already-retained historical read. New read calls deliberately do
+/// not create these rows; the context reader must still interpret old ones.
+async fn legacy_touch(db: &Db, run: &str, id: &str, tool: &str, interaction: &str) {
+    let pool = crate::common::fixture_write_pool(db).await;
+    let call = sqlx::query(
+        "INSERT INTO read_log_calls
+         (id,tool,run_key,actor,outcome,started_at,ended_at)
+         VALUES (lower(hex(randomblob(16))),?,?,'local','ok',
+                 strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+                 strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+    )
+    .bind(tool)
+    .bind(run)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT OR IGNORE INTO read_log_record_ids(record_id) VALUES(?)")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO read_log_touches(call_seq,record_ref,interaction)
+         VALUES(?,(SELECT record_ref FROM read_log_record_ids WHERE record_id=?),?)",
+    )
+    .bind(call.last_insert_rowid())
+    .bind(id)
+    .bind(interaction)
+    .execute(&pool)
+    .await
+    .unwrap();
 }
 
 async fn note(registry: &ToolRegistry, db: &Db, run: &str, id: &str, body: &str) -> Value {
@@ -434,6 +487,7 @@ async fn opened_records_are_listed_newest_first_and_deduplicated() {
         in_run(run, json!({ "ids": [ALPHA] })),
     )
     .await;
+    legacy_touch(&db, run, ALPHA, "get_record", "opened").await;
     call(
         &registry,
         &db,
@@ -441,6 +495,7 @@ async fn opened_records_are_listed_newest_first_and_deduplicated() {
         in_run(run, json!({ "ids": [BETA] })),
     )
     .await;
+    legacy_touch(&db, run, BETA, "get_record", "opened").await;
     call(
         &registry,
         &db,
@@ -448,6 +503,7 @@ async fn opened_records_are_listed_newest_first_and_deduplicated() {
         in_run(run, json!({ "ids": [BETA] })),
     )
     .await;
+    legacy_touch(&db, run, BETA, "get_record", "opened").await;
 
     note(&registry, &db, run, SUBJECT, "Written after consulting.").await;
     let event_id = creation_event(&db, SUBJECT).await;
@@ -514,6 +570,7 @@ async fn surfaced_records_are_a_separate_weaker_count_and_never_consulted() {
         in_run(run, json!({ "ids": [OPENED_ONE] })),
     )
     .await;
+    legacy_touch(&db, run, OPENED_ONE, "get_record", "opened").await;
     // A search surfaces its hits without opening them.
     call(
         &registry,
@@ -522,6 +579,7 @@ async fn surfaced_records_are_a_separate_weaker_count_and_never_consulted() {
         in_run(run, json!({ "query": "surfaced" })),
     )
     .await;
+    legacy_touch(&db, run, MERELY_SURFACED, "search", "surfaced").await;
 
     note(&registry, &db, run, SURFACED_SUBJECT, "Body.").await;
     let event_id = creation_event(&db, SURFACED_SUBJECT).await;
@@ -564,6 +622,7 @@ async fn the_events_own_target_is_labelled_rather_than_silently_removed() {
         in_run(run, json!({ "ids": [SELF_TARGET] })),
     )
     .await;
+    legacy_touch(&db, run, SELF_TARGET, "get_record", "opened").await;
     edit(
         &registry,
         &db,
@@ -601,6 +660,7 @@ async fn the_consulted_scan_is_bounded_to_the_active_intent_episode() {
         in_run(run, json!({ "ids": [BEFORE_BOUNDARY] })),
     )
     .await;
+    legacy_touch(&db, run, BEFORE_BOUNDARY, "get_record", "opened").await;
 
     // A new declaration closes the previous episode.
     call(
@@ -634,6 +694,7 @@ async fn the_consulted_scan_is_bounded_to_the_active_intent_episode() {
         in_run(run, json!({ "ids": [AFTER_BOUNDARY] })),
     )
     .await;
+    legacy_touch(&db, run, AFTER_BOUNDARY, "get_record", "opened").await;
 
     note(&registry, &db, run, EPISODE_SUBJECT, "Body.").await;
     let event_id = creation_event(&db, EPISODE_SUBJECT).await;
@@ -671,6 +732,7 @@ async fn more_than_eight_opens_truncate_and_say_so() {
             in_run(run, json!({ "ids": [id] })),
         )
         .await;
+        legacy_touch(&db, run, &id, "get_record", "opened").await;
     }
     note(&registry, &db, run, BULK_SUBJECT, "Body.").await;
     let event_id = creation_event(&db, BULK_SUBJECT).await;
@@ -707,6 +769,8 @@ async fn a_hidden_opened_record_is_omitted_without_disclosing_it() {
         in_run(run, json!({ "ids": [SECRET_SOURCE, OPEN_SOURCE] })),
     )
     .await;
+    legacy_touch(&db, run, SECRET_SOURCE, "get_record", "opened").await;
+    legacy_touch(&db, run, OPEN_SOURCE, "get_record", "opened").await;
     note(&registry, &db, run, FILTERED_SUBJECT, "Body.").await;
     let event_id = creation_event(&db, FILTERED_SUBJECT).await;
 
@@ -803,6 +867,7 @@ async fn every_response_carries_the_interpretation_limitations() {
         "consulted_context_is_bounded",
         "consulted_context_may_be_visibility_filtered",
         "read_log_is_best_effort_not_canonical_history",
+        "basis_is_declared_not_verified",
     ] {
         assert!(limits.contains(&expected), "missing {expected}: {limits:?}");
     }
@@ -885,4 +950,562 @@ async fn neighbouring_events_come_from_the_same_exact_run() {
         );
     }
     assert!(!text.contains(OTHER_RUN), "{text}");
+}
+
+// ---------------------------------------------------------------------------
+// Declared source basis: the run's own account of what a write rested on
+// ---------------------------------------------------------------------------
+
+/// A citing write declaring one caller-pinned and one engine-stamped source.
+async fn cite_two_sources(registry: &ToolRegistry, db: &Db, run: &str) -> Value {
+    note(registry, db, run, BASIS_CALLER_SOURCE, "Pinned source.").await;
+    note(registry, db, run, BASIS_ENGINE_SOURCE, "Stamped source.").await;
+    let pinned = latest_body_event(db, BASIS_CALLER_SOURCE).await;
+    call(
+        registry,
+        db,
+        "create_record",
+        in_run(
+            run,
+            json!({
+                "id": BASIS_CITING,
+                "type": "Document",
+                "kind": "note",
+                "name": BASIS_CITING,
+                "body": "Composed from both sources.",
+                "sources": [
+                    {
+                        "record_id": BASIS_CALLER_SOURCE,
+                        "reason": "the pinned reading",
+                        "role": "primary",
+                        "revision_event_id": pinned,
+                    },
+                    {
+                        "record_id": BASIS_ENGINE_SOURCE,
+                        "reason": "the stamped reading",
+                    },
+                ],
+            }),
+        ),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn a_declared_basis_is_returned_with_revision_provenance() {
+    let (db, registry) = fixture().await;
+    let run = "scout-chair-a748b2";
+    cite_two_sources(&registry, &db, run).await;
+    let event_id = creation_event(&db, BASIS_CITING).await;
+    let context = call(
+        &registry,
+        &db,
+        "get_event_context",
+        json!({ "event_id": event_id }),
+    )
+    .await;
+
+    let basis = &context["basis"];
+    assert_eq!(basis["label"], json!("Sources"));
+    assert_eq!(basis["status"], json!("declared"));
+    assert_eq!(basis["completeness"], json!("complete"));
+    let sources = basis["sources"].as_array().unwrap();
+    assert_eq!(sources.len(), 2, "{basis}");
+    assert_eq!(sources[0]["record_id"], json!(BASIS_CALLER_SOURCE));
+    assert_eq!(sources[0]["name"], json!(BASIS_CALLER_SOURCE));
+    assert_eq!(sources[0]["type"], json!("Document"));
+    assert_eq!(sources[0]["kind"], json!("note"));
+    assert_eq!(
+        sources[0]["revision_event_id"],
+        json!(latest_body_event(&db, BASIS_CALLER_SOURCE).await)
+    );
+    assert_eq!(sources[0]["revision_supplied_by"], json!("caller"));
+    assert_eq!(sources[0]["role"], json!("primary"));
+    assert_eq!(sources[0]["reason"], json!("the pinned reading"));
+    assert_eq!(sources[0]["is_event_target"], json!(false));
+    assert_eq!(sources[1]["record_id"], json!(BASIS_ENGINE_SOURCE));
+    assert_eq!(sources[1]["revision_supplied_by"], json!("engine"));
+    assert_eq!(
+        sources[1]["revision_event_id"],
+        json!(latest_body_event(&db, BASIS_ENGINE_SOURCE).await)
+    );
+    assert_eq!(sources[1]["role"], json!(null));
+    assert_eq!(sources[1]["is_event_target"], json!(false));
+
+    let limits: Vec<&str> = context["interpretation_limits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|limit| limit.as_str().unwrap())
+        .collect();
+    assert!(
+        limits.contains(&"basis_is_declared_not_verified"),
+        "declarations carry their own authored-claim limit: {limits:?}"
+    );
+
+    let text = render::render("get_event_context", &context).unwrap();
+    assert!(text.contains("Declared sources: declared"), "{text}");
+    assert!(text.contains("complete"), "{text}");
+    assert!(text.contains(BASIS_CALLER_SOURCE), "{text}");
+    assert!(
+        text.contains("authored claim of use, not verified use"),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn an_explicit_empty_basis_reads_declared_none() {
+    let (db, registry) = fixture().await;
+    let run = "scout-chair-a748b2";
+    call(
+        &registry,
+        &db,
+        "create_record",
+        in_run(
+            run,
+            json!({
+                "id": BASIS_NONE,
+                "type": "Document",
+                "kind": "note",
+                "name": BASIS_NONE,
+                "body": "Transcribed verbatim; rested on nothing.",
+                "sources": [],
+            }),
+        ),
+    )
+    .await;
+    let event_id = creation_event(&db, BASIS_NONE).await;
+    let context = call(
+        &registry,
+        &db,
+        "get_event_context",
+        json!({ "event_id": event_id }),
+    )
+    .await;
+
+    assert_eq!(context["basis"]["label"], json!("Sources"));
+    assert_eq!(context["basis"]["status"], json!("declared_none"));
+    assert_eq!(context["basis"]["completeness"], json!("complete"));
+    assert_eq!(context["basis"]["sources"], json!([]));
+    let text = render::render("get_event_context", &context).unwrap();
+    assert!(
+        text.contains("Declared sources: declared as none"),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn an_absent_basis_reads_not_declared() {
+    let (db, registry) = fixture().await;
+    let run = "scout-chair-a748b2";
+    note(&registry, &db, run, BASIS_ABSENT, "No declaration.").await;
+    let event_id = creation_event(&db, BASIS_ABSENT).await;
+    let context = call(
+        &registry,
+        &db,
+        "get_event_context",
+        json!({ "event_id": event_id }),
+    )
+    .await;
+
+    assert_eq!(context["basis"]["label"], json!("Sources"));
+    assert_eq!(context["basis"]["status"], json!("not_declared"));
+    assert_eq!(context["basis"]["completeness"], json!("complete"));
+    assert_eq!(context["basis"]["sources"], json!([]));
+    let text = render::render("get_event_context", &context).unwrap();
+    assert!(text.contains("Declared sources: not declared"), "{text}");
+}
+
+#[tokio::test]
+async fn the_event_target_is_labelled_not_removed() {
+    let (db, registry) = fixture().await;
+    let run = "scout-chair-a748b2";
+    note(&registry, &db, run, BASIS_SELF_TARGET, "First version.").await;
+    let digest = body_digest(&registry, &db, BASIS_SELF_TARGET).await;
+    call(
+        &registry,
+        &db,
+        "update_record",
+        in_run(
+            run,
+            json!({
+                "id": BASIS_SELF_TARGET,
+                "body": "Second version, resting on the first.",
+                "if_body_digest": digest,
+                "sources": [{ "record_id": BASIS_SELF_TARGET, "reason": "reworked my own draft" }],
+            }),
+        ),
+    )
+    .await;
+    let event_id = latest_body_event(&db, BASIS_SELF_TARGET).await;
+    let context = call(
+        &registry,
+        &db,
+        "get_event_context",
+        json!({ "event_id": event_id }),
+    )
+    .await;
+
+    assert_eq!(context["basis"]["status"], json!("declared"));
+    let sources = context["basis"]["sources"].as_array().unwrap();
+    assert_eq!(sources.len(), 1, "{sources:?}");
+    assert_eq!(sources[0]["record_id"], json!(BASIS_SELF_TARGET));
+    assert_eq!(sources[0]["is_event_target"], json!(true));
+}
+
+#[tokio::test]
+async fn a_hidden_declared_source_is_omitted_without_disclosure() {
+    let (db, registry) = fixture().await;
+    let run = "scout-chair-a748b2";
+    note(&registry, &db, run, BASIS_SECRET, "Confidential.").await;
+    note(&registry, &db, run, BASIS_OPEN, "Ordinary.").await;
+    call(
+        &registry,
+        &db,
+        "create_record",
+        in_run(
+            run,
+            json!({
+                "id": BASIS_FILTERED_SUBJECT,
+                "type": "Document",
+                "kind": "note",
+                "name": BASIS_FILTERED_SUBJECT,
+                "body": "Composed from both.",
+                "sources": [
+                    {
+                        "record_id": BASIS_SECRET,
+                        "reason": "confidential-basis-reason-must-not-leak",
+                        "role": "confidential-basis-role-must-not-leak",
+                    },
+                    { "record_id": BASIS_OPEN, "reason": "the ordinary reading" },
+                ],
+            }),
+        ),
+    )
+    .await;
+    let event_id = creation_event(&db, BASIS_FILTERED_SUBJECT).await;
+
+    native_ce::authorization::replace_explicit_policy(
+        &db,
+        "test:policy",
+        BASIS_SECRET,
+        vec![native_ce::authorization::AllowEntry::account(
+            "someone-else",
+            native_ce::authorization::Capability::Manage,
+        )],
+    )
+    .await
+    .unwrap();
+
+    let stranger = Caller::authenticated("stranger").with_channel(Channel::Mcp);
+    let context = registry
+        .call(
+            db.clone(),
+            stranger,
+            "get_event_context",
+            json!({ "event_id": event_id }),
+        )
+        .await
+        .unwrap();
+    // Whole-response regression: the hidden entry is removed entire — id,
+    // reason and role — from the sibling block AND the redacted payload
+    // echo, where generic redaction alone would keep the prose beside a
+    // nulled id. The visible entry survives intact, proving the scrub is
+    // narrow rather than a wholesale envelope drop.
+    let serialized = context.to_string();
+    for leaked in [
+        BASIS_SECRET,
+        "confidential-basis-reason-must-not-leak",
+        "confidential-basis-role-must-not-leak",
+    ] {
+        assert!(
+            !serialized.contains(leaked),
+            "a hidden source must leak neither name, existence, reason nor role: {leaked}"
+        );
+    }
+    assert!(serialized.contains(BASIS_OPEN));
+    assert!(serialized.contains("the ordinary reading"));
+    // Absent and empty never collapse: a declaration with a hidden member is
+    // still a declaration, reported partial rather than complete or none.
+    assert_eq!(context["basis"]["status"], json!("declared"));
+    assert_eq!(context["basis"]["completeness"], json!("partial"));
+    let sources = context["basis"]["sources"].as_array().unwrap();
+    assert_eq!(sources.len(), 1, "{sources:?}");
+    assert_eq!(sources[0]["record_id"], json!(BASIS_OPEN));
+}
+
+/// The selected event is visible and declares nothing, but a neighbouring
+/// event in the same run cites a source that later becomes hidden. That
+/// neighbour's echoed payload must be scrubbed whole-entry too: generic
+/// redaction alone would null the record id and keep the reason and role,
+/// disclosing a hidden source on the same response.
+#[tokio::test]
+async fn a_hidden_declared_source_is_scrubbed_from_a_neighbouring_echo() {
+    let (db, registry) = fixture().await;
+    let run = "scout-chair-a748b2";
+    note(&registry, &db, run, SECRET_SOURCE, "Confidential.").await;
+    note(&registry, &db, run, OPEN_SOURCE, "Ordinary.").await;
+    // The citing write is the neighbour. It lands while both sources are
+    // still visible to the author; the policy change below comes afterwards,
+    // exactly as it would for a basis that went stale or was later restricted.
+    call(
+        &registry,
+        &db,
+        "create_record",
+        in_run(
+            run,
+            json!({
+                "id": NEIGHBOUR_ONE,
+                "type": "Document",
+                "kind": "note",
+                "name": NEIGHBOUR_ONE,
+                "body": "Neighbour resting on a source that later becomes hidden.",
+                "sources": [
+                    {
+                        "record_id": SECRET_SOURCE,
+                        "reason": "neighbour-secret-reason-must-not-leak",
+                        "role": "neighbour-secret-role-must-not-leak",
+                    },
+                    { "record_id": OPEN_SOURCE, "reason": "neighbour-open-reason" },
+                ],
+            }),
+        ),
+    )
+    .await;
+    // The selected event, visible to the caller, one step later in the same
+    // run, so the citing write is inside the neighbour window.
+    note(&registry, &db, run, NEIGHBOUR_TWO, "Selected body.").await;
+    let event_id = creation_event(&db, NEIGHBOUR_TWO).await;
+
+    native_ce::authorization::replace_explicit_policy(
+        &db,
+        "test:policy",
+        SECRET_SOURCE,
+        vec![native_ce::authorization::AllowEntry::account(
+            "someone-else",
+            native_ce::authorization::Capability::Manage,
+        )],
+    )
+    .await
+    .unwrap();
+
+    let stranger = Caller::authenticated("stranger").with_channel(Channel::Mcp);
+    let context = registry
+        .call(
+            db.clone(),
+            stranger,
+            "get_event_context",
+            json!({ "event_id": event_id }),
+        )
+        .await
+        .unwrap();
+    // The citing neighbour is actually present; otherwise the scrub would be
+    // vacuously satisfied.
+    let neighbour_records: Vec<&str> = context["neighbouring_events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|event| event["record_id"].as_str())
+        .collect();
+    assert!(
+        neighbour_records.contains(&NEIGHBOUR_ONE),
+        "the citing write must be a returned neighbour: {neighbour_records:?}"
+    );
+
+    let serialized = context.to_string();
+    for leaked in [
+        SECRET_SOURCE,
+        "neighbour-secret-reason-must-not-leak",
+        "neighbour-secret-role-must-not-leak",
+    ] {
+        assert!(
+            !serialized.contains(leaked),
+            "a hidden source must not leak from a neighbouring echo: {leaked}"
+        );
+    }
+    // The visible entry on the SAME neighbour survives, so the scrub is
+    // narrow rather than a wholesale neighbour-payload drop.
+    assert!(serialized.contains(OPEN_SOURCE));
+    assert!(serialized.contains("neighbour-open-reason"));
+
+    let text = render::render("get_event_context", &context).unwrap();
+    for leaked in [
+        SECRET_SOURCE,
+        "neighbour-secret-reason-must-not-leak",
+        "neighbour-secret-role-must-not-leak",
+    ] {
+        assert!(
+            !text.contains(leaked),
+            "the rendered text must not leak a hidden neighbour source: {leaked}"
+        );
+    }
+    assert!(text.contains(OPEN_SOURCE), "{text}");
+}
+
+/// Overwrite one event's stored payload with a hand-built envelope. The write
+/// path validates, so malformed and future-format envelopes can only arrive
+/// through forward compatibility or direct storage edits; the read path must
+/// still answer honestly rather than misread or fail.
+async fn rewrite_basis_payload(db: &Db, record_id: &str, basis: Value) {
+    let pool = crate::common::fixture_write_pool(db).await;
+    let raw: String = sqlx::query_scalar(
+        "SELECT payload FROM content_events WHERE record_id = ? AND type = 'record.created' ORDER BY seq LIMIT 1",
+    )
+    .bind(record_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let mut payload: Value = serde_json::from_str(&raw).unwrap();
+    payload
+        .as_object_mut()
+        .unwrap()
+        .insert("basis".into(), basis);
+    // The log is append-only by trigger; a test-only rewrite drops and
+    // restores the guard around the single surgical update.
+    let guard: String = sqlx::query_scalar(
+        "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'content_events_no_update'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    sqlx::query("DROP TRIGGER content_events_no_update")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE content_events SET payload = ? WHERE record_id = ? AND type = 'record.created'",
+    )
+    .bind(serde_json::to_string(&payload).unwrap())
+    .bind(record_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(&guard).execute(&pool).await.unwrap();
+}
+
+#[tokio::test]
+async fn an_unrecognized_envelope_reads_not_declared_never_misread() {
+    let (db, registry) = fixture().await;
+    let run = "scout-chair-a748b2";
+    for (id, basis) in [
+        (
+            BASIS_RESHAPED,
+            // A future format version must not be parsed as v1.
+            json!({ "format": "native.source-basis.v9", "sources": [{ "record_id": BASIS_OPEN, "reason": "x" }] }),
+        ),
+        (
+            "e0e70000-0000-4000-8000-000000000028",
+            // A different format string is not this version either.
+            json!({ "format": "native.source-basis", "sources": [] }),
+        ),
+        (
+            "e0e70000-0000-4000-8000-000000000029",
+            // A non-object envelope names nothing.
+            json!("declared"),
+        ),
+        (
+            "e0e70000-0000-4000-8000-00000000002a",
+            // An object with no format is unrecognized, not v1.
+            json!({ "sources": [{ "record_id": BASIS_OPEN, "reason": "x" }] }),
+        ),
+    ] {
+        note(&registry, &db, run, id, "Body.").await;
+        rewrite_basis_payload(&db, id, basis).await;
+        let event_id = creation_event(&db, id).await;
+        let context = call(
+            &registry,
+            &db,
+            "get_event_context",
+            json!({ "event_id": event_id }),
+        )
+        .await;
+        assert_eq!(context["basis"]["status"], json!("not_declared"), "{id}");
+        assert_eq!(context["basis"]["completeness"], json!("complete"), "{id}");
+        assert_eq!(context["basis"]["sources"], json!([]), "{id}");
+    }
+}
+
+#[tokio::test]
+async fn a_recognized_v1_envelope_without_usable_sources_reads_declared_partial() {
+    let (db, registry) = fixture().await;
+    let run = "scout-chair-a748b2";
+    for (id, basis) in [
+        (
+            BASIS_RESHAPED,
+            // v1 with no sources key: a declaration this server cannot
+            // enumerate — declared, not "nothing was declared".
+            json!({ "format": "native.source-basis.v1" }),
+        ),
+        (
+            "e0e70000-0000-4000-8000-00000000002b",
+            // v1 with a non-array sources value: same answer.
+            json!({ "format": "native.source-basis.v1", "sources": "malformed" }),
+        ),
+    ] {
+        note(&registry, &db, run, id, "Body.").await;
+        rewrite_basis_payload(&db, id, basis).await;
+        let event_id = creation_event(&db, id).await;
+        let context = call(
+            &registry,
+            &db,
+            "get_event_context",
+            json!({ "event_id": event_id }),
+        )
+        .await;
+        assert_eq!(context["basis"]["status"], json!("declared"), "{id}");
+        assert_eq!(context["basis"]["completeness"], json!("partial"), "{id}");
+        assert_eq!(context["basis"]["sources"], json!([]), "{id}");
+        // Never a fourth status: the three-state distinction still holds.
+        assert_ne!(context["basis"]["status"], json!("not_declared"), "{id}");
+        let text = render::render("get_event_context", &context).unwrap();
+        assert!(
+            text.contains("Declared sources: declared"),
+            "declaration must render as declared, not not-declared: {text}"
+        );
+        assert!(text.contains("partial"), "{text}");
+    }
+}
+
+#[tokio::test]
+async fn a_malformed_entry_is_skipped_and_reported_partial() {
+    let (db, registry) = fixture().await;
+    let run = "scout-chair-a748b2";
+    note(&registry, &db, run, BASIS_OPEN, "Ordinary.").await;
+    note(&registry, &db, run, BASIS_RESHAPED, "Citing.").await;
+    let head = latest_body_event(&db, BASIS_OPEN).await;
+    rewrite_basis_payload(
+        &db,
+        BASIS_RESHAPED,
+        json!({
+            "format": "native.source-basis.v1",
+            "sources": [
+                // No record id: names nothing showable, skipped like a hidden
+                // source rather than hiding the well-formed sibling.
+                { "reason": "an entry that names nothing" },
+                {
+                    "ordinal": 1,
+                    "record_id": BASIS_OPEN,
+                    "revision_event_id": head,
+                    "revision_supplied_by": "caller",
+                    "role": null,
+                    "reason": "the ordinary reading",
+                },
+            ],
+        }),
+    )
+    .await;
+    let event_id = creation_event(&db, BASIS_RESHAPED).await;
+    let context = call(
+        &registry,
+        &db,
+        "get_event_context",
+        json!({ "event_id": event_id }),
+    )
+    .await;
+
+    assert_eq!(context["basis"]["status"], json!("declared"));
+    assert_eq!(context["basis"]["completeness"], json!("partial"));
+    let sources = context["basis"]["sources"].as_array().unwrap();
+    assert_eq!(sources.len(), 1, "{sources:?}");
+    assert_eq!(sources[0]["record_id"], json!(BASIS_OPEN));
 }

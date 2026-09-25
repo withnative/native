@@ -516,6 +516,11 @@ mod tests {
         );
         for phrase in [
             "## Author a live artifact from scratch",
+            "### Fields outside the nine fixed record fields",
+            "### Minimal HTML relationship map",
+            "### Comment counts per record",
+            "governed SQL relation port",
+            "comment_count",
             "not one atomic snapshot",
             "pack → user cascade",
             "status:\"active\"",

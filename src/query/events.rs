@@ -260,6 +260,7 @@ pub(crate) fn event_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<EventRow> 
         intent: row.try_get("intent")?,
         created_at: row.try_get("created_at")?,
         causal_envelope,
+        act: row.try_get("act")?,
     })
 }
 
@@ -299,7 +300,7 @@ async fn page(
             sqlx::query(&format!(
                 "SELECT seq, id, record_id, type, payload, actor,
                         run_key, parent_key, intent, created_at,
-                        causal_envelope_version, causal_status,
+                        causal_envelope_version, causal_status, act,
                         (SELECT json_group_array(parent_event_id)
                            FROM content_event_causal_frontier
                           WHERE event_id = content_events.id) AS causal_frontier
@@ -318,7 +319,7 @@ async fn page(
             sqlx::query(&format!(
                 "SELECT seq, id, record_id, type, payload, actor,
                         run_key, parent_key, intent, created_at,
-                        causal_envelope_version, causal_status,
+                        causal_envelope_version, causal_status, act,
                         (SELECT json_group_array(parent_event_id)
                            FROM content_event_causal_frontier
                           WHERE event_id = content_events.id) AS causal_frontier
@@ -389,15 +390,16 @@ pub async fn events_for_run_ordered(
     let comparison = order.comparison();
     let ordering = order.sql();
 
-    // Exact-run reads use idx_content_events_run. The recursive form deliberately
-    // stays on the existing content tier: CE-scale descendant traversal does not
-    // justify a parent_key index or a schema re-freeze.
+    // Exact-run reads use idx_content_events_run; the recursive child-run form
+    // joins included descendants on content_events.parent_key, which engine 58
+    // indexes (idx_content_events_parent) so each recursion step is a lookup
+    // rather than a full scan of the content log.
     let rows = match (include_child_runs, record_id) {
         (false, Some(record_id)) => {
             sqlx::query(&format!(
                 "SELECT seq, id, record_id, type, payload, actor,
                         run_key, parent_key, intent, created_at,
-                        causal_envelope_version, causal_status,
+                        causal_envelope_version, causal_status, act,
                         (SELECT json_group_array(parent_event_id)
                            FROM content_event_causal_frontier
                           WHERE event_id = content_events.id) AS causal_frontier
@@ -416,7 +418,7 @@ pub async fn events_for_run_ordered(
             sqlx::query(&format!(
                 "SELECT seq, id, record_id, type, payload, actor,
                         run_key, parent_key, intent, created_at,
-                        causal_envelope_version, causal_status,
+                        causal_envelope_version, causal_status, act,
                         (SELECT json_group_array(parent_event_id)
                            FROM content_event_causal_frontier
                           WHERE event_id = content_events.id) AS causal_frontier
@@ -442,8 +444,8 @@ pub async fn events_for_run_ordered(
                  )
                  SELECT event.seq, event.id, event.record_id, event.type, event.payload,
                         event.actor, event.run_key, event.parent_key, event.intent,
-                        event.created_at, event.causal_envelope_version,
-                        event.causal_status,
+                         event.created_at, event.causal_envelope_version,
+                         event.causal_status, event.act,
                         (SELECT json_group_array(parent_event_id)
                            FROM content_event_causal_frontier frontier
                           WHERE frontier.event_id = event.id) AS causal_frontier
@@ -472,8 +474,8 @@ pub async fn events_for_run_ordered(
                  )
                  SELECT event.seq, event.id, event.record_id, event.type, event.payload,
                         event.actor, event.run_key, event.parent_key, event.intent,
-                        event.created_at, event.causal_envelope_version,
-                        event.causal_status,
+                         event.created_at, event.causal_envelope_version,
+                         event.causal_status, event.act,
                         (SELECT json_group_array(parent_event_id)
                            FROM content_event_causal_frontier frontier
                           WHERE frontier.event_id = event.id) AS causal_frontier
@@ -487,6 +489,142 @@ pub async fn events_for_run_ordered(
             .bind(after)
             .bind(limit + 1)
             .fetch_all(db.write_pool())
+            .await?
+        }
+    };
+
+    let has_more = rows.len() as i64 > limit;
+    let events = rows[..rows.len().min(limit as usize)]
+        .iter()
+        .map(public_event_from_row)
+        .collect::<Result<Vec<_>>>()?;
+    let next_after_seq = if has_more {
+        events.last().map(|event| event.local_seq)
+    } else {
+        None
+    };
+    Ok(EventsPage {
+        events,
+        next_after_seq,
+    })
+}
+
+/// Snapshot-scoped form of [`events_for_run_ordered`]: identical logic on a
+/// caller-supplied transaction, so a non-mutating read handler can keep the
+/// whole page walk on the physically read-only pool's snapshot.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn events_for_run_ordered_in(
+    tx: &mut Transaction<'_, Sqlite>,
+    run_key: &str,
+    include_child_runs: bool,
+    record_id: Option<&str>,
+    after_seq: Option<i64>,
+    limit: i64,
+    order: EventOrder,
+) -> Result<EventsPage> {
+    if limit <= 0 {
+        return Err(contract_violation("events page limit must be positive"));
+    }
+    let limit = limit.min(MAX_PAGE);
+    let after = after_seq.unwrap_or_else(|| order.initial_cursor());
+    let comparison = order.comparison();
+    let ordering = order.sql();
+
+    let rows = match (include_child_runs, record_id) {
+        (false, Some(record_id)) => {
+            sqlx::query(&format!(
+                "SELECT seq, id, record_id, type, payload, actor,
+                        run_key, parent_key, intent, created_at,
+                        causal_envelope_version, causal_status, act,
+                        (SELECT json_group_array(parent_event_id)
+                           FROM content_event_causal_frontier
+                          WHERE event_id = content_events.id) AS causal_frontier
+                   FROM content_events
+                  WHERE run_key = ? AND record_id = ? AND seq {comparison} ? AND {PUBLIC_HISTORY_FILTER}
+                  ORDER BY seq {ordering} LIMIT ?"
+            ))
+            .bind(run_key)
+            .bind(record_id)
+            .bind(after)
+            .bind(limit + 1)
+            .fetch_all(&mut **tx)
+            .await?
+        }
+        (false, None) => {
+            sqlx::query(&format!(
+                "SELECT seq, id, record_id, type, payload, actor,
+                        run_key, parent_key, intent, created_at,
+                        causal_envelope_version, causal_status, act,
+                        (SELECT json_group_array(parent_event_id)
+                           FROM content_event_causal_frontier
+                          WHERE event_id = content_events.id) AS causal_frontier
+                   FROM content_events
+                  WHERE run_key = ? AND seq {comparison} ? AND {PUBLIC_HISTORY_FILTER}
+                  ORDER BY seq {ordering} LIMIT ?"
+            ))
+            .bind(run_key)
+            .bind(after)
+            .bind(limit + 1)
+            .fetch_all(&mut **tx)
+            .await?
+        }
+        (true, Some(record_id)) => {
+            sqlx::query(&format!(
+                "WITH RECURSIVE included_runs(run_key) AS (
+                     SELECT ?
+                     UNION
+                     SELECT event.run_key
+                       FROM content_events event
+                       JOIN included_runs parent ON event.parent_key = parent.run_key
+                      WHERE event.run_key IS NOT NULL
+                 )
+                 SELECT event.seq, event.id, event.record_id, event.type, event.payload,
+                        event.actor, event.run_key, event.parent_key, event.intent,
+                        event.created_at, event.causal_envelope_version,
+                        event.causal_status, event.act,
+                        (SELECT json_group_array(parent_event_id)
+                           FROM content_event_causal_frontier frontier
+                          WHERE frontier.event_id = event.id) AS causal_frontier
+                   FROM content_events event
+                   JOIN included_runs included ON event.run_key = included.run_key
+                  WHERE event.record_id = ? AND event.seq {comparison} ?
+                    AND event.type NOT IN ('reconciliation.recorded.v1','unit.superseded.v1','receipt.dependency_audited.v1')
+                  ORDER BY event.seq {ordering} LIMIT ?"
+            ))
+            .bind(run_key)
+            .bind(record_id)
+            .bind(after)
+            .bind(limit + 1)
+            .fetch_all(&mut **tx)
+            .await?
+        }
+        (true, None) => {
+            sqlx::query(&format!(
+                "WITH RECURSIVE included_runs(run_key) AS (
+                     SELECT ?
+                     UNION
+                     SELECT event.run_key
+                       FROM content_events event
+                       JOIN included_runs parent ON event.parent_key = parent.run_key
+                      WHERE event.run_key IS NOT NULL
+                 )
+                 SELECT event.seq, event.id, event.record_id, event.type, event.payload,
+                        event.actor, event.run_key, event.parent_key, event.intent,
+                        event.created_at, event.causal_envelope_version,
+                        event.causal_status, event.act,
+                        (SELECT json_group_array(parent_event_id)
+                           FROM content_event_causal_frontier frontier
+                          WHERE frontier.event_id = event.id) AS causal_frontier
+                   FROM content_events event
+                   JOIN included_runs included ON event.run_key = included.run_key
+                  WHERE event.seq {comparison} ?
+                    AND event.type NOT IN ('reconciliation.recorded.v1','unit.superseded.v1','receipt.dependency_audited.v1')
+                  ORDER BY event.seq {ordering} LIMIT ?"
+            ))
+            .bind(run_key)
+            .bind(after)
+            .bind(limit + 1)
+            .fetch_all(&mut **tx)
             .await?
         }
     };
@@ -549,7 +687,7 @@ pub(crate) async fn events_for_record_ordered_in(
     let rows = sqlx::query(&format!(
         "SELECT seq, id, record_id, type, payload, actor,
                 run_key, parent_key, intent, created_at,
-                causal_envelope_version, causal_status,
+                causal_envelope_version, causal_status, act,
                 (SELECT json_group_array(parent_event_id)
                    FROM content_event_causal_frontier
                   WHERE event_id = content_events.id) AS causal_frontier
@@ -589,6 +727,52 @@ pub async fn all_events_ordered(
     order: EventOrder,
 ) -> Result<EventsPage> {
     page(db, None, after_seq, limit, order).await
+}
+
+/// Snapshot-scoped form of [`all_events_ordered`]: identical logic on a
+/// caller-supplied transaction so a non-mutating read handler stays on the
+/// physically read-only pool's snapshot.
+pub(crate) async fn all_events_ordered_in(
+    tx: &mut Transaction<'_, Sqlite>,
+    after_seq: Option<i64>,
+    limit: i64,
+    order: EventOrder,
+) -> Result<EventsPage> {
+    if limit <= 0 {
+        return Err(contract_violation("events page limit must be positive"));
+    }
+    let limit = limit.min(MAX_PAGE);
+    let after = after_seq.unwrap_or_else(|| order.initial_cursor());
+    let rows = sqlx::query(&format!(
+        "SELECT seq, id, record_id, type, payload, actor,
+                run_key, parent_key, intent, created_at,
+                causal_envelope_version, causal_status, act,
+                (SELECT json_group_array(parent_event_id)
+                   FROM content_event_causal_frontier
+                  WHERE event_id = content_events.id) AS causal_frontier
+           FROM content_events WHERE seq {} ? AND {PUBLIC_HISTORY_FILTER}
+           ORDER BY seq {} LIMIT ?",
+        order.comparison(),
+        order.sql()
+    ))
+    .bind(after)
+    .bind(limit + 1)
+    .fetch_all(&mut **tx)
+    .await?;
+    let has_more = rows.len() as i64 > limit;
+    let events = rows[..rows.len().min(limit as usize)]
+        .iter()
+        .map(public_event_from_row)
+        .collect::<Result<Vec<_>>>()?;
+    let next_after_seq = if has_more {
+        events.last().map(|event| event.local_seq)
+    } else {
+        None
+    };
+    Ok(EventsPage {
+        events,
+        next_after_seq,
+    })
 }
 
 /// Read the next raw page in a stable global event-log window.
@@ -769,6 +953,19 @@ where
             "whats_changed through_local_seq is beyond available history",
         ));
     }
+    // The mirror of the bound above, and the reason honest absence needs a
+    // contract (`docs/honest-absence-contract.md` §3). Without it, a caller
+    // resuming from a baseline below the window receives the events at or
+    // after W as though they were the whole change set since their position —
+    // silently, and with no way to tell that from "nothing happened". Vacuous
+    // at window = ∞, where the floor is the first event.
+    let holding = crate::holding::HoldingDisclosure::observe(&mut tx).await?;
+    if !holding.holds_content_position(after_seq) {
+        return Err(holding.not_held(
+            "whats_changed",
+            &format!("the baseline at after_local_seq {after_seq}"),
+        ));
+    }
     // Oldest-first ascends towards the pin, so a cursor past it is a caller
     // error. Newest-first descends from it, and its opening cursor is
     // deliberately above every existing sequence; clamp rather than reject so
@@ -801,7 +998,7 @@ where
         let sql = format!(
             "SELECT seq, id, record_id, type, payload, actor,
                     run_key, parent_key, intent, created_at,
-                    causal_envelope_version, causal_status,
+                    causal_envelope_version, causal_status, act,
                     (SELECT json_group_array(parent_event_id)
                        FROM content_event_causal_frontier
                       WHERE event_id = content_events.id) AS causal_frontier
@@ -912,7 +1109,7 @@ pub(crate) async fn log_prefix_in_pool(
     let rows = sqlx::query(
         "SELECT seq, id, record_id, type, payload, actor,
                 run_key, parent_key, intent, created_at,
-                causal_envelope_version, causal_status,
+                causal_envelope_version, causal_status, act,
                 (SELECT json_group_array(parent_event_id)
                    FROM content_event_causal_frontier
                   WHERE event_id = content_events.id) AS causal_frontier
@@ -920,6 +1117,35 @@ pub(crate) async fn log_prefix_in_pool(
     )
     .bind(up_to_seq)
     .fetch_all(pool)
+    .await?;
+    rows.iter().map(event_from_row).collect()
+}
+
+/// The one content-only act-range reader used by the standby materialiser. It
+/// selects exactly the rows whose `act` is in the half-open interval
+/// `(from_exclusive_act, to_inclusive_act]`, ordered by `seq`, and decodes each
+/// with the same [`event_from_row`] the public history path uses. The
+/// correlated `content_event_causal_frontier` subselect is the same SQL as
+/// `log_prefix_in_pool`, so `EventRow.causal_envelope` is reconstructed
+/// identically and no second decoder or full-log read exists.
+pub(crate) async fn events_in_act_range(
+    conn: &mut sqlx::SqliteConnection,
+    from_exclusive_act: i64,
+    to_inclusive_act: i64,
+) -> Result<Vec<EventRow>> {
+    let rows = sqlx::query(
+        "SELECT seq, id, record_id, type, payload, actor,
+                run_key, parent_key, intent, created_at,
+                causal_envelope_version, causal_status, act,
+                (SELECT json_group_array(parent_event_id)
+                   FROM content_event_causal_frontier
+                  WHERE event_id = content_events.id) AS causal_frontier
+          FROM content_events
+          WHERE act > ? AND act <= ? ORDER BY seq",
+    )
+    .bind(from_exclusive_act)
+    .bind(to_inclusive_act)
+    .fetch_all(&mut *conn)
     .await?;
     rows.iter().map(event_from_row).collect()
 }

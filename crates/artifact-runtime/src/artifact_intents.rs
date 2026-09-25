@@ -31,6 +31,31 @@ const MAX_INVOCATION_VALUE_NODES: usize = 1_024;
 const MAX_OBSERVED_RECORDS: usize = 64;
 const MAX_OBSERVED_KEYS: usize = 32;
 
+/// Optional exact personal-install guard for a reversible facet intent
+/// originating from an alpha tab (task `26ba75a`).
+///
+/// When present, the host checks it inside the write transaction against the
+/// same account's install: status `installed`, verified `shell_adopt.v1`
+/// adoption, generation CAS on `expected_install_event_id`, exact
+/// `artifact_id` / `source_revision` / `version` / `digest`
+/// (`alpha-tab-digest.v1`) / `declaration_digest`, plus viewer `View` on the
+/// artifact and a digest recomputation over the consented source. Absent, the
+/// invocation behaves exactly as before (existing Workbench callers).
+///
+/// A disabled install refuses only the guarded invocation — it never
+/// globally disables the artifact for other Workbench use.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct AlphaTabInstallGuard {
+    pub package: String,
+    pub expected_install_event_id: String,
+    pub artifact_id: String,
+    pub source_revision: String,
+    pub version: String,
+    pub digest: String,
+    pub declaration_digest: String,
+}
+
 /// One artifact-authored request to run one declared interaction entry.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -56,13 +81,19 @@ pub struct ArtifactInvocation {
     #[serde(default)]
     pub gesture: Option<String>,
     /// Opt-in: when true and the invocation commits, the host attaches the
-    /// next authoritative render plan under `refresh.plan`, so one exchange
-    /// covers both the write and the re-render. Omitted (false) is the fast
-    /// receipt: no render, no plan. This flag changes nothing about the
+    /// next authoritative render plan with the input it was rendered over
+    /// under `refresh` (`plan`, plus `input` and `input_digest` when the
+    /// render carries them), so one exchange covers both the write and the
+    /// re-render. Omitted (false) is the fast receipt: no render, no plan. This flag changes nothing about the
     /// committed effect, so it is deliberately NOT part of the idempotency
     /// digest — a retry with the flag flipped replays the same commit.
     #[serde(default)]
     pub include_next_plan: bool,
+    /// Optional exact personal-install guard (alpha tab). Omitted (`None`)
+    /// preserves existing Workbench behaviour; the alpha host supplies it in
+    /// a later slice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alpha_install_guard: Option<AlphaTabInstallGuard>,
 }
 
 /// An authoritative host response. Each status carries only the fields
@@ -267,6 +298,45 @@ impl ArtifactInvocation {
             .is_some_and(|gesture| validate_identity(gesture, "x").is_err())
         {
             return Err("invocation gesture is blank or too long");
+        }
+        if let Some(guard) = &self.alpha_install_guard {
+            guard.validate_shape()?;
+        }
+        Ok(())
+    }
+}
+
+impl AlphaTabInstallGuard {
+    /// Validate envelope shape only: non-blank identities plus digest formats.
+    /// Passing says nothing about whether the named install exists or matches
+    /// — the host re-checks all of that inside the write transaction.
+    pub fn validate_shape(&self) -> Result<(), &'static str> {
+        for value in [
+            &self.package,
+            &self.expected_install_event_id,
+            &self.artifact_id,
+            &self.source_revision,
+            &self.version,
+        ] {
+            validate_identity(value, "install guard identity is blank or too long")?;
+        }
+        let Some(hex) = self.digest.strip_prefix("sha256:") else {
+            return Err("install guard digest must start with 'sha256:'");
+        };
+        if hex.len() != 64
+            || !hex
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err("install guard digest must be 'sha256:' plus 64 lowercase hex characters");
+        }
+        if self.declaration_digest.len() != 64
+            || !self
+                .declaration_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err("install guard declaration digest must be 64 lowercase hex characters");
         }
         Ok(())
     }
@@ -483,6 +553,19 @@ mod tests {
             idempotency_key: "k".into(),
             gesture: Some("click".into()),
             include_next_plan: false,
+            alpha_install_guard: None,
+        }
+    }
+
+    fn install_guard() -> AlphaTabInstallGuard {
+        AlphaTabInstallGuard {
+            package: "agent.attention-cockpit".into(),
+            expected_install_event_id: "evt-1".into(),
+            artifact_id: "a".into(),
+            source_revision: "evt-src-1".into(),
+            version: "0.1.0".into(),
+            digest: format!("sha256:{}", "b".repeat(64)),
+            declaration_digest: "c".repeat(64),
         }
     }
 
@@ -734,6 +817,56 @@ mod tests {
             forged.validate_shape(),
             Err("result facet version is not a host-issued token")
         );
+    }
+
+    /// The install guard is additive and optional: omitted stays `None` and
+    /// validates exactly as before (existing Workbench callers), while a
+    /// present guard must carry exact pin shapes and round-trips.
+    #[test]
+    fn the_install_guard_defaults_absent_and_validates_pin_shape() {
+        // Omitted on the wire means absent: current behaviour is unchanged.
+        let legacy = serde_json::json!({
+            "version": INVOCATION_VERSION,
+            "artifact_id": "a",
+            "entry_id": "mark_triaged",
+            "source_digest": "a".repeat(64),
+            "slots": { "record": "r" },
+            "observed": { "r": { "triage": "obs:12" } },
+            "idempotency_key": "k",
+        });
+        let decoded: ArtifactInvocation = serde_json::from_value(legacy).unwrap();
+        assert!(decoded.alpha_install_guard.is_none());
+        assert!(decoded.validate_shape().is_ok());
+        let encoded = serde_json::to_value(invocation()).unwrap();
+        assert!(
+            encoded.get("alpha_install_guard").is_none(),
+            "an absent guard must not be serialized: {encoded}"
+        );
+
+        let mut guarded = invocation();
+        guarded.alpha_install_guard = Some(install_guard());
+        assert!(guarded.validate_shape().is_ok());
+        let encoded = serde_json::to_value(&guarded).unwrap();
+        assert_eq!(
+            serde_json::from_value::<ArtifactInvocation>(encoded).unwrap(),
+            guarded
+        );
+
+        // Malformed digests fail closed at shape time, never reach the install
+        // lookup.
+        let mut bad_digest = guarded.clone();
+        bad_digest.alpha_install_guard.as_mut().unwrap().digest = "not-a-digest".into();
+        assert!(bad_digest.validate_shape().is_err());
+        let mut bad_declaration = guarded.clone();
+        bad_declaration
+            .alpha_install_guard
+            .as_mut()
+            .unwrap()
+            .declaration_digest = "zz".into();
+        assert!(bad_declaration.validate_shape().is_err());
+        let mut blank_package = guarded.clone();
+        blank_package.alpha_install_guard.as_mut().unwrap().package = "".into();
+        assert!(blank_package.validate_shape().is_err());
     }
 
     /// The next-plan opt-in is additive: an older caller that never heard of

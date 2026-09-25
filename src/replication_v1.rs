@@ -862,6 +862,7 @@ async fn ingest_prepared(
     prepared: PreparedBatch,
 ) -> Result<(usize, usize, bool)> {
     let mut tx = crate::db::begin_write(db.write_pool()).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
     let mut first_by_event = HashMap::new();
     let mut first_by_record = HashMap::new();
     let mut classes = vec![ReplayClass::New; prepared.units.len()];
@@ -954,6 +955,7 @@ async fn ingest_prepared(
         run_key: None,
         parent_key: None,
         intent: Some("federated-message-ingest"),
+        is_member: true,
         internal: true,
         source_read_authorized: false,
     };
@@ -974,6 +976,7 @@ async fn ingest_prepared(
                 &internal_context,
                 sender_descriptor,
                 &unit.wire.source_event.source_account_token,
+                &mut act_alloc,
             )
             .await?;
             if let Some(record_id) = &resolution.record_id {
@@ -985,7 +988,8 @@ async fn ingest_prepared(
             let descriptor = &prepared.wire.participants[*audience_index];
             if !participant_records.contains_key(&descriptor.principal) {
                 let record_id =
-                    resolve_participant(db, &mut tx, &internal_context, descriptor).await?;
+                    resolve_participant(db, &mut tx, &internal_context, descriptor, &mut act_alloc)
+                        .await?;
                 participant_records.insert(descriptor.principal.clone(), record_id);
             }
         }
@@ -997,7 +1001,7 @@ async fn ingest_prepared(
             sender,
             &sender_descriptor.principal,
         )?;
-        append_prepared_in(db, &mut tx, event).await?;
+        append_prepared_in(db, &mut tx, event, &mut act_alloc).await?;
         inserted_indices.push(index);
         unknown_kind |= unit.wire.kind != "text";
     }
@@ -1020,7 +1024,7 @@ async fn ingest_prepared(
         let sender_descriptor = &prepared.wire.participants[unit.wire.sender];
         let sender = &sender_by_principal[&sender_descriptor.principal];
         persist_provenance(db, &mut tx, context, unit, sender).await?;
-        persist_references(db, &mut tx, unit, &batch_records).await?;
+        persist_references(db, &mut tx, unit, &batch_records, &mut act_alloc).await?;
         if let Some(origin) = &unit.wire.origin {
             append_in(
                 db,
@@ -1034,6 +1038,7 @@ async fn ingest_prepared(
                     payload: serde_json::to_value(origin)?,
                     actor: Some(sender.actor.clone()),
                 },
+                &mut act_alloc,
             )
             .await?;
             if let MessageOriginDeclaredPayload::Direct { principals } = origin {
@@ -1049,6 +1054,7 @@ async fn ingest_prepared(
                         .into_iter()
                         .map(|account| AllowEntry::account(account, Capability::View))
                         .collect(),
+                    &mut act_alloc,
                 )
                 .await?;
             }
@@ -1061,6 +1067,7 @@ async fn ingest_prepared(
                 &context.ingest_actor,
                 &unit.wire.message_record_id,
                 Vec::new(),
+                &mut act_alloc,
             )
             .await?;
         }
@@ -1079,6 +1086,7 @@ async fn ingest_prepared(
                 }),
                 actor: Some(sender.actor.clone()),
             },
+            &mut act_alloc,
         )
         .await?;
         if let Some(sender_record_id) = &sender.record_id {
@@ -1110,6 +1118,7 @@ async fn ingest_prepared(
                     })?,
                     actor: Some(sender.actor.clone()),
                 },
+                &mut act_alloc,
             )
             .await?;
         }
@@ -1148,6 +1157,7 @@ async fn resolve_sender(
     context: &MutationContext<'_>,
     descriptor: &ParticipantDescriptorV1,
     incoming_account: &str,
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<SenderResolution> {
     let existing: Option<String> = sqlx::query_scalar(
         "SELECT record_id FROM bindings WHERE system='native-principal' AND identifier=?",
@@ -1202,6 +1212,7 @@ async fn resolve_sender(
             kind: Some("person".into()),
             name: descriptor.display_hint.clone(),
         },
+        act_alloc,
     )
     .await?;
     let mut actor: Option<String> = sqlx::query_scalar(
@@ -1221,6 +1232,7 @@ async fn resolve_sender(
             "account",
             &local,
             true,
+            act_alloc,
         )
         .await?;
         actor = Some(local);
@@ -1233,6 +1245,7 @@ async fn resolve_sender(
         "account",
         incoming_account,
         false,
+        act_alloc,
     )
     .await?;
     Ok(SenderResolution {
@@ -1252,6 +1265,7 @@ async fn resolve_participant(
     tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
     context: &MutationContext<'_>,
     descriptor: &ParticipantDescriptorV1,
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<String> {
     let mut claims = vec![BindingClaim {
         system: "native-principal".into(),
@@ -1279,6 +1293,7 @@ async fn resolve_participant(
                 .clone()
                 .or_else(|| Some(descriptor.principal.clone())),
         },
+        act_alloc,
     )
     .await?
     .record_id)
@@ -1327,6 +1342,7 @@ fn prepared_event(
         intent: annotations.intent,
         created_at: unit.wire.source_event.created_at.clone(),
         causal_envelope: unit.causal_envelope.clone(),
+        act: None,
     };
     Ok(PreparedEvent {
         event,
@@ -1392,6 +1408,7 @@ async fn persist_references(
     tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
     unit: &PreparedUnit,
     batch_records: &BTreeMap<(String, String), String>,
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<()> {
     for reference in &unit.references {
         let resolved = resolve_reference(tx, &reference.target, batch_records).await?;
@@ -1437,6 +1454,7 @@ async fn persist_references(
                     })?,
                     actor: None,
                 },
+                act_alloc,
             )
             .await?;
         }
@@ -2194,6 +2212,88 @@ fn participant_for_export(
     index.insert(participant.principal.clone(), next);
     participants.push(participant);
     next
+}
+
+/// Test-only production seam for the authority act-cut companion closure.
+///
+/// Slice 2c needs genuine `content_event_sources`,
+/// `replicated_message_provenance`, `destination_message_ingest` and
+/// `replicated_message_references` rows, but the authenticated transport
+/// verifier that mints [`VerifiedEnvelopeContext`] is sealed to this module.
+/// This drives one remote fixture batch through the real
+/// [`ingest_verified_native_message`] path — the same code the transport will
+/// call — so the closure is exercised against production writers rather than a
+/// hand-built companion table.
+#[cfg(test)]
+pub(crate) async fn ingest_remote_fixture_message(db: &Db, home: &str) -> IngestResult {
+    const ORIGIN: &str = "ndb_44444444444444444444444444444444";
+    const TARGET_ORIGIN: &str = "ndb_55555555555555555555555555555555";
+    let participant = |principal: &str, person: &str, name: &str| ParticipantDescriptorV1 {
+        principal: principal.into(),
+        origin_database_id: ORIGIN.into(),
+        origin_person_record_id: Some(person.into()),
+        origin_account_token: (principal == "native/alice").then(|| "acct_remote_alice".into()),
+        verified_aliases: Vec::new(),
+        display_hint: Some(name.into()),
+        extensions: None,
+    };
+    let unit = MessageUnitV1 {
+        message_record_id: "20000000-0000-4000-8000-0000000000aa".into(),
+        source_event: SourceEventV1 {
+            id: "10000000-0000-4000-8000-0000000000aa".into(),
+            source_seq: 1,
+            created_at: "2026-08-03T10:11:12.123Z".into(),
+            source_account_token: "acct_remote_alice".into(),
+            operation: "message.created".into(),
+            causal_envelope: Some(CausalEnvelopeV1::complete(CausalFrontierV1::empty())),
+        },
+        sender: 0,
+        audience: vec![1, 2],
+        kind: "text".into(),
+        prose: "remote act-cut fixture".into(),
+        name: None,
+        expectation: Some("none".into()),
+        origin: None,
+        thread: None,
+        reply_to: None,
+        supersedes: None,
+        references: vec![MessageReferenceV1 {
+            reference_id: "act-cut-ref-1".into(),
+            relationship: "mention".into(),
+            target: ExternalRecordRefV1 {
+                origin_database_id: TARGET_ORIGIN.into(),
+                record_id: "30000000-0000-4000-8000-0000000000bb".into(),
+                binding: None,
+            },
+            display_label: None,
+        }],
+        required_capabilities: Vec::new(),
+        extensions: None,
+    };
+    let content = serde_jcs::to_vec(&MessageBatchV1 {
+        content_version: CONTENT_VERSION.into(),
+        origin_db_id: ORIGIN.into(),
+        participants: vec![
+            participant("native/alice", "person-alice", "Alice Remote"),
+            participant("native/bob", "person-bob", "Bob"),
+            participant("native/carol", "person-carol", "Carol"),
+        ],
+        messages: vec![unit],
+        required_capabilities: vec!["message.created".into()],
+        extensions: None,
+    })
+    .unwrap();
+    let context = VerifiedEnvelopeContext {
+        envelope_id: "env-act-cut-fixture".into(),
+        envelope_digest: Sha256::digest(b"env-act-cut-fixture").into(),
+        authenticated_sender_principal: "native/alice".into(),
+        recipient_principals: vec!["native/bob".into(), "native/carol".into()],
+        destination_home_id: home.into(),
+        ingest_actor: "acct_destination_ingest".into(),
+        relay_state: RelayState::Acknowledged,
+        received_at: "2026-08-03T10:11:13.000Z".into(),
+    };
+    ingest_verified_native_message(db, context, &content).await
 }
 
 #[cfg(test)]

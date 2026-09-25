@@ -1,5 +1,5 @@
 //! The write-path contract break (spec fbfaf25 §3): required `reason` on the
-//! twelve reason-bearing mutation tools, a populated `actor`, a run key on every
+//! thirteen reason-bearing mutation tools, a populated `actor`, a run key on every
 //! tool — required
 //! in the schema since ecc586d, though gated on nowhere — key issuance on
 //! `bootstrap`/`quickstart` and via the `"new"` sentinel, and the echo after
@@ -20,15 +20,20 @@ use serde_json::{json, Value};
 /// `a748b2` a lowercase Crockford Base32 run id.
 const RUN: &str = "scout-chair-a748b2";
 
-/// The twelve public mutation tools that require durable rationale (§3.1).
-const REASON_REQUIRED: [&str; 12] = [
+/// The fourteen public mutation tools that require durable rationale (§3.1).
+const REASON_REQUIRED: [&str; 14] = [
     "create_record",
     "create_many",
+    // An atomic batch is still an authoring act. `batch_write` commits field,
+    // facet, link and archive mutations under one reason, so it sits on the
+    // durable authored-change side of the line, not the mechanics side.
+    "batch_write",
     // A composite authoring act is still an authoring act. `create_exploration`
     // mints a collection and every candidate in it, so it sits on the durable
     // authored-change side of the line, not the mechanics side.
     "create_exploration",
     "update_record",
+    "save_account",
     "claim_unowned_record",
     "correct_record_type",
     "archive_record",
@@ -80,7 +85,7 @@ async fn seed(registry: &ToolRegistry, db: &Db) -> String {
 /// One otherwise-valid call for every reason-required tool. Keeping the
 /// missing- and blank-reason tests on this shared matrix prevents either
 /// runtime contract from silently covering fewer tools than the schema audit.
-fn reason_required_calls(record_id: &str) -> [(&'static str, Value); 12] {
+fn reason_required_calls(record_id: &str) -> [(&'static str, Value); 14] {
     let external_binding = json!({
         "system": "native-principal",
         "identifier": "native/write-path-reason-contract"
@@ -108,7 +113,21 @@ fn reason_required_calls(record_id: &str) -> [(&'static str, Value); 12] {
                 "records": [{ "type": "Document", "kind": "note", "name": "x" }]
             }),
         ),
+        (
+            "batch_write",
+            json!({
+                "items": [{ "op": "archive", "id": record_id }]
+            }),
+        ),
         ("update_record", json!({ "id": record_id, "summary": "x" })),
+        (
+            "save_account",
+            json!({
+                "record_id": record_id, "expected_revision_event_id": "selected-body-event",
+                "body": "An authored account.", "sources": [{"record_id":"source", "revision_event_id":"source-event", "role":"basis", "reason":"Used for the account."}],
+                "idempotency_key":"reason-contract"
+            }),
+        ),
         ("claim_unowned_record", json!({ "record_id": record_id })),
         (
             "correct_record_type",
@@ -155,7 +174,7 @@ fn reason_required_calls(record_id: &str) -> [(&'static str, Value); 12] {
 }
 
 // ---------------------------------------------------------------------------
-// `reason` — required, and on exactly twelve tools
+// `reason` — required, and on exactly thirteen tools
 // ---------------------------------------------------------------------------
 
 /// Done-when 1: no write tool is callable without a `reason`.
@@ -179,7 +198,7 @@ async fn no_write_tool_is_callable_without_a_reason() {
     db.close().await;
 }
 
-/// All twelve tools ADVERTISE it as required, and the description asks for the
+/// All fourteen tools ADVERTISE it as required, and the description asks for the
 /// reasoning rather than the record.
 ///
 /// The wording is the feature, not decoration: a vague prompt gets filled with a
@@ -214,13 +233,13 @@ async fn the_reason_field_asks_for_reasoning_not_a_restatement() {
     }
 }
 
-/// And on EXACTLY those twelve. The line is durable authored or governed change
+/// And on EXACTLY those fourteen. The line is durable authored or governed change
 /// versus mechanics: links and lifecycle transitions usually execute a choice
 /// captured elsewhere, while external resolution and observation make durable
 /// identity/provenance claims of their own. Mandatory prose on the remaining
 /// mechanics would produce noise.
 #[tokio::test]
-async fn exactly_twelve_tools_require_a_reason() {
+async fn exactly_fourteen_tools_require_a_reason() {
     let registry = registry();
     let mut actual = Vec::new();
     for spec in registry.specs() {
@@ -237,15 +256,15 @@ async fn exactly_twelve_tools_require_a_reason() {
     expected.sort_unstable();
     assert_eq!(
         actual, expected,
-        "the exactly-twelve reason/mechanics boundary moved"
+        "the exactly-fourteen reason/mechanics boundary moved"
     );
 }
 
 /// Runtime enforcement is independent of JSON Schema: empty and whitespace-only
-/// strings must fail before any of the twelve handlers mutates authoritative or
+/// strings must fail before any of the thirteen handlers mutates authoritative or
 /// audit state.
 #[tokio::test]
-async fn blank_reasons_are_rejected_before_mutation_on_all_twelve_tools() {
+async fn blank_reasons_are_rejected_before_mutation_on_all_fourteen_tools() {
     let db = db().await;
     let registry = registry();
     let id = seed(&registry, &db).await;

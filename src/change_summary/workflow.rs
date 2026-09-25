@@ -97,6 +97,10 @@ pub struct ChangeSummaryConfirmation {
     pub revision_id: String,
     pub event_id: String,
     pub event_seq: i64,
+    /// The act this write allocated. A true no-op omits it; a write that
+    /// appended returns it. See `echo_act`'s contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub act: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -113,6 +117,10 @@ pub struct ChangeSummaryWorkflowInspection {
     pub confirmation_id: Option<String>,
     pub confirmed_body: Option<String>,
     pub request: Option<DerivationRequestSnapshot>,
+    /// The act this write allocated; absent on a read (`inspect`) and on a
+    /// true no-op. See `echo_act`'s contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub act: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -357,6 +365,7 @@ pub async fn create_or_reuse_change_summary(
     let recipe_revision = request.recipe.revision();
     let definition = series_definition(&request.workflow_key, &recipe_revision, &audience_sha256);
     let mut tx = begin_write(db.write_pool()).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
     let carrier: Option<(String, String, Option<String>)> =
         sqlx::query_as("SELECT type,kind,deleted_at FROM records WHERE id=?")
             .bind(&ids.carrier)
@@ -419,6 +428,7 @@ pub async fn create_or_reuse_change_summary(
                     payload,
                     actor: Some(request.actor.clone()),
                 },
+                &mut act_alloc,
             ),
         )
         .await?;
@@ -431,6 +441,7 @@ pub async fn create_or_reuse_change_summary(
                 Capability::Manage,
             )],
             &request.reason,
+            &mut act_alloc,
         )
         .await?;
     }
@@ -475,6 +486,7 @@ pub async fn create_or_reuse_change_summary(
             run_key: request.run_key.clone(),
             reason: request.reason.clone(),
         },
+        &mut act_alloc,
     )
     .await?;
     let target = DerivationTarget::record_body(&ids.carrier);
@@ -521,6 +533,7 @@ pub async fn create_or_reuse_change_summary(
                     expected_body_sha256: None,
                 }),
             )?,
+            &mut act_alloc,
         )
         .await?;
     }
@@ -561,6 +574,7 @@ pub async fn create_or_reuse_change_summary(
                     expected_role_head_event_id: None,
                 }),
             )?,
+            &mut act_alloc,
         )
         .await?;
     }
@@ -569,7 +583,11 @@ pub async fn create_or_reuse_change_summary(
     } else {
         tx.commit().await?;
     }
-    inspect_change_summary(db, principal, &request.workflow_key).await
+    let mut inspection = inspect_change_summary(db, principal, &request.workflow_key).await?;
+    // `inspect_change_summary` is a read and leaves `act` absent; this call
+    // appended, so it carries the act it allocated.
+    inspection.act = act_alloc.get();
+    Ok(inspection)
 }
 
 #[derive(Default)]
@@ -763,6 +781,20 @@ fn source_boundary(
     }
 }
 
+/// Derive deliberately returns no `act`, unlike the other change-summary
+/// writes.
+///
+/// It is a find-or-create coordination call, not an idempotency-keyed write,
+/// and has three outcomes: join an existing request, reuse a succeeded result,
+/// or execute and publish. Only the last writes canonical events, and it does
+/// so in a *separate* transaction inside `complete_request_with_publication`,
+/// whose act belongs to that derivation publication rather than to this call.
+/// The first commit here (`create_or_join_request_in`) allocates no act at all,
+/// because a derivation request row is coordination state, not a canonical
+/// event. Echoing the publication's act would therefore claim an act for a
+/// joining or reusing caller that allocated none, and with no idempotency key
+/// there is no keyed replay to keep indistinguishable. There is no single act
+/// this call owns to return.
 pub async fn request_change_summary(
     db: &Db,
     principal: Principal<'_>,
@@ -1166,6 +1198,7 @@ pub async fn inspect_change_summary(
         confirmation_id: confirmed.map(|value| value.1),
         confirmed_body,
         request,
+        act: None,
     })
 }
 
@@ -1183,6 +1216,7 @@ pub async fn confirm_change_summary(
     }
     let ids = ids(workflow_key, actor)?;
     let mut tx = begin_write(db.write_pool()).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
     require_exact_workflow_audience(&mut tx, &ids, workflow_key, actor, principal.is_member)
         .await
         .map_err(|_| Error::engine("change-summary candidate is unavailable"))?;
@@ -1216,6 +1250,16 @@ pub async fn confirm_change_summary(
         .as_deref()
         == Some(revision_id.as_str())
     {
+        // Already confirmed at this revision: this call appends nothing, but
+        // the confirmation event exists and carries the act of the write that
+        // established it. Returning that known act keeps the answer stable.
+        let event_id: String = row.try_get("confirmed_event_id")?;
+        let replayed_act: Option<i64> =
+            sqlx::query_scalar("SELECT act FROM content_events WHERE id=?")
+                .bind(&event_id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .flatten();
         let result = ChangeSummaryConfirmation {
             workflow_key: workflow_key.into(),
             carrier_id: ids.carrier,
@@ -1224,8 +1268,9 @@ pub async fn confirm_change_summary(
                 .try_get::<Option<String>, _>("current_confirmation_id")?
                 .expect("joined active confirmation has an id"),
             revision_id,
-            event_id: row.try_get("confirmed_event_id")?,
+            event_id,
             event_seq: row.try_get("confirmed_event_seq")?,
+            act: replayed_act,
         };
         tx.rollback().await?;
         return Ok(result);
@@ -1261,6 +1306,7 @@ pub async fn confirm_change_summary(
             expected_output_sha256: row.try_get("output_sha256")?,
             expected_confirmation_head_event_id: row.try_get("head_event_id")?,
         },
+        &mut act_alloc,
     )
     .await?;
     tx.commit().await?;
@@ -1272,6 +1318,7 @@ pub async fn confirm_change_summary(
         revision_id,
         event_id: event.id,
         event_seq: event.seq,
+        act: act_alloc.get(),
     })
 }
 
@@ -1288,6 +1335,7 @@ pub async fn revoke_change_summary(
     }
     let ids = ids(workflow_key, actor)?;
     let mut tx = begin_write(db.write_pool()).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
     crate::authorization::require_capability_on(&mut tx, principal, &ids.carrier, Capability::Edit)
         .await
         .map_err(|_| Error::engine("change-summary confirmation is unavailable"))?;
@@ -1323,6 +1371,7 @@ pub async fn revoke_change_summary(
             target: DerivationTarget::record_body(&ids.carrier),
             expected_confirmation_head_event_id: row.try_get("head_event_id")?,
         },
+        &mut act_alloc,
     )
     .await?;
     tx.commit().await?;
@@ -1334,6 +1383,7 @@ pub async fn revoke_change_summary(
         revision_id,
         event_id: event.id,
         event_seq: event.seq,
+        act: act_alloc.get(),
     })
 }
 

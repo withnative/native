@@ -279,6 +279,15 @@ pub(crate) const STANDBY_DISPOSABLE_TABLES: &[&str] = &[
     "relationship_federation_quarantine",
 ];
 
+/// Bookkeeping whose rows are a person's attention, never shared state.
+///
+/// It is stripped from *every* portable export, not only hosted standby
+/// snapshots: a workspace artifact handed to another person must not carry
+/// their reads. The tables stay (empty) so `FROZEN_DDL_SHA256` and the
+/// artifact's DDL identity are unchanged; only the rows leave. VACUUM then
+/// reclaims the freed pages so the reads are not merely unreferenced.
+const READ_LOG_TABLES: &[&str] = &["read_log_calls", "read_log_touches", "read_log_record_ids"];
+
 /// Strip disposable bookkeeping from a completed export, in place.
 ///
 /// Rows are deleted and the tables are kept. `consumer.ddl_sha256` pins the
@@ -292,18 +301,106 @@ pub(crate) const STANDBY_DISPOSABLE_TABLES: &[&str] = &[
 /// contract never claimed: it requires only that the manifest be derived from
 /// the completed exported image.
 async fn strip_disposable_bookkeeping(target: &std::path::Path) -> Result<u64> {
+    strip_tables_from_snapshot(target, STANDBY_DISPOSABLE_TABLES).await
+}
+
+/// Does this database have a `sqlite_sequence` table?
+///
+/// It exists only once some table uses `AUTOINCREMENT`, so a database with no
+/// such table (or no schema at all) legitimately has none, and callers must
+/// tolerate its absence rather than treat it as a failure.
+async fn sqlite_sequence_exists(conn: &mut SqliteConnection) -> Result<bool> {
+    let exists: i64 = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='sqlite_sequence')",
+    )
+    .fetch_one(&mut *conn)
+    .await?;
+    Ok(exists != 0)
+}
+
+/// Is there anything left of the named tables in this snapshot?
+///
+/// A table can be empty yet still disclose its history through
+/// `sqlite_sequence`, so this checks rows AND the AUTOINCREMENT high-water
+/// mark. Only called on a read-only connection.
+async fn stripped_tables_leave_traces(
+    conn: &mut SqliteConnection,
+    tables: &[&str],
+) -> Result<bool> {
+    for table in tables {
+        let rows: i64 = sqlx::query_scalar(&format!("SELECT EXISTS(SELECT 1 FROM {table})"))
+            .fetch_one(&mut *conn)
+            .await?;
+        if rows != 0 {
+            return Ok(true);
+        }
+    }
+    if sqlite_sequence_exists(conn).await? {
+        for table in tables {
+            let marked: i64 =
+                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM sqlite_sequence WHERE name = ?)")
+                    .bind(table)
+                    .fetch_one(&mut *conn)
+                    .await?;
+            if marked != 0 {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Strip the read log from a completed portable snapshot.
+///
+/// A snapshot with nothing left to remove is left byte-identical: there is
+/// nothing to reclaim, and the extra VACUUM would needlessly slow every export
+/// that never had a read log. When rows (or an AUTOINCREMENT mark) do exist
+/// they are cleared and the pages reclaimed, so the reads are not merely
+/// unreferenced on the volume.
+async fn strip_read_log_from_snapshot(target: &std::path::Path) -> Result<u64> {
+    let mut conn = SqliteConnectOptions::from_str(&format!("sqlite:{}", target.to_string_lossy()))?
+        .read_only(true)
+        .connect()
+        .await?;
+    let present = stripped_tables_leave_traces(&mut conn, READ_LOG_TABLES).await?;
+    conn.close().await?;
+    if !present {
+        return Ok(tokio::fs::metadata(target).await?.len());
+    }
+    strip_tables_from_snapshot(target, READ_LOG_TABLES).await
+}
+
+/// Delete every row of `tables` from a completed snapshot, then VACUUM and
+/// verify the result.
+///
+/// `read_log_calls.seq` is `AUTOINCREMENT`, so SQLite also keeps an all-time
+/// high-water mark in `sqlite_sequence`. Emptying the table is not enough: the
+/// mark alone still discloses how many reads happened, so it is cleared for
+/// every named table. The table is absent when no table uses AUTOINCREMENT, so
+/// the clear is guarded by an existence check.
+///
+/// `tables` is always a compile-time constant, never caller input, so the
+/// identifier interpolation is safe.
+async fn strip_tables_from_snapshot(target: &std::path::Path, tables: &[&str]) -> Result<u64> {
     let mut conn = SqliteConnectOptions::from_str(&format!("sqlite:{}", target.to_string_lossy()))?
         .read_only(false)
         .connect()
         .await?;
-    for table in STANDBY_DISPOSABLE_TABLES {
-        // The table list is a compile-time constant, never caller input.
+    for table in tables {
         sqlx::query(&format!("DELETE FROM {table}"))
             .execute(&mut conn)
             .await?;
     }
+    if sqlite_sequence_exists(&mut conn).await? {
+        for table in tables {
+            sqlx::query("DELETE FROM sqlite_sequence WHERE name = ?")
+                .bind(table)
+                .execute(&mut conn)
+                .await?;
+        }
+    }
     // Reclaim the pages the deletes freed; without this the file keeps its
-    // original size and the whole exercise is pointless.
+    // original size and the deleted reads remain recoverable on the volume.
     sqlx::query("VACUUM").execute(&mut conn).await?;
     let verdict: String = sqlx::query("PRAGMA integrity_check")
         .fetch_one(&mut conn)
@@ -312,7 +409,7 @@ async fn strip_disposable_bookkeeping(target: &std::path::Path) -> Result<u64> {
     conn.close().await?;
     if verdict != "ok" {
         return Err(Error::engine(format!(
-            "standby export failed verification after filtering: integrity_check reported '{verdict}'"
+            "export failed verification after filtering: integrity_check reported '{verdict}'"
         )));
     }
     Ok(tokio::fs::metadata(target).await?.len())
@@ -379,7 +476,16 @@ async fn export_connection_snapshot(
     // RPO is measured from this conservative instant, immediately before the
     // consistent SQLite capture begins, never from later verification.
     let captured_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-    match snapshot_into(conn, &dir.path().join(&file_name)).await {
+    let snapshot_path = dir.path().join(&file_name);
+    // The read log is never shared state, so every portable snapshot drops it
+    // before it is handed anywhere: ordinary export, eject, and standby. The
+    // standby context is attached later, so this cannot be deferred to it.
+    let result = async {
+        snapshot_into(conn, &snapshot_path).await?;
+        strip_read_log_from_snapshot(&snapshot_path).await
+    }
+    .await;
+    match result {
         Ok(size_bytes) => Ok(Export {
             dir,
             file_name,
@@ -638,7 +744,156 @@ mod tests {
         export.cleanup().await;
     }
 
-    /// An ordinary export or backup must keep everything.
+    /// The read log is never shared state, so a portable export carries no
+    /// read-log rows at all: not the hosted `/export` eject artifact, and not
+    /// the `.native-eject` package, which embeds this exact file's digest.
+    ///
+    /// The tables survive as empty tables so `FROZEN_DDL_SHA256` and the
+    /// artifact's DDL identity are unchanged; only the rows leave. This covers
+    /// the shared snapshot core behind both `export_connected_db` and the
+    /// hosted `export_database_file` the eject route calls.
+    #[tokio::test]
+    async fn portable_export_drops_the_read_log_and_keeps_the_tables() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("read-log-source.db");
+        let db = crate::create_database(source.to_str().unwrap())
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO read_log_calls (seq,id,tool,outcome,started_at,ended_at)
+             VALUES (1,'call-1','get_record','ok','2026-09-12','2026-09-12')",
+        )
+        .execute(db.write_pool())
+        .await
+        .unwrap();
+        // A high explicit seq so the AUTOINCREMENT high-water mark is
+        // distinguishable from the one surviving row.
+        sqlx::query(
+            "INSERT INTO read_log_calls (seq,id,tool,outcome,started_at,ended_at)
+             VALUES (1000,'call-high','get_record','ok','2026-09-12','2026-09-12')",
+        )
+        .execute(db.write_pool())
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO read_log_record_ids(record_ref,record_id) VALUES (1,'record-x')")
+            .execute(db.write_pool())
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO read_log_touches(call_seq,record_ref,interaction,result_rank)
+             VALUES (1,1,'opened',1)",
+        )
+        .execute(db.write_pool())
+        .await
+        .unwrap();
+
+        let connected = super::export_connected_db(&db, Some(directory.path()))
+            .await
+            .unwrap();
+        let named = export_database_file(&source, &directory.path().join("named"), "eject-core")
+            .await
+            .unwrap();
+        db.close().await;
+
+        for export in [&connected, &named] {
+            let conn = rusqlite::Connection::open(export.path()).unwrap();
+            for table in ["read_log_calls", "read_log_touches", "read_log_record_ids"] {
+                let columns: i64 = conn
+                    .query_row(
+                        &format!("SELECT COUNT(*) FROM pragma_table_info('{table}')"),
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert!(
+                    columns > 0,
+                    "'{table}' must still exist: dropping it changes ddl_sha256"
+                );
+                let rows: i64 = conn
+                    .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap();
+                assert_eq!(
+                    rows, 0,
+                    "'{table}' rows must not travel in a portable export"
+                );
+            }
+            // `read_log_calls.seq` is AUTOINCREMENT, so an emptied table still
+            // discloses its all-time read volume through `sqlite_sequence`.
+            let sequence_tables: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                      WHERE type='table' AND name='sqlite_sequence'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                sequence_tables, 1,
+                "fixture must exercise sqlite_sequence, or the leak assertion is vacuous"
+            );
+            let marks: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_sequence
+                      WHERE name IN ('read_log_calls','read_log_touches','read_log_record_ids')",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                marks, 0,
+                "AUTOINCREMENT high-water marks must not disclose read volume"
+            );
+            let verdict: String = conn
+                .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(verdict, "ok");
+        }
+        connected.cleanup().await;
+        named.cleanup().await;
+    }
+
+    /// Clearing `sqlite_sequence` must not assume it exists: it is absent in a
+    /// database where no table uses AUTOINCREMENT. Such an export must still
+    /// succeed rather than fail hard.
+    #[tokio::test]
+    async fn stripping_a_database_without_sqlite_sequence_is_not_an_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("no-sequence.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE plain_thing (id TEXT PRIMARY KEY);
+                 INSERT INTO plain_thing (id) VALUES ('a');",
+            )
+            .unwrap();
+            let sequence_tables: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                      WHERE type='table' AND name='sqlite_sequence'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(sequence_tables, 0, "fixture must have no sqlite_sequence");
+        }
+
+        let size = super::strip_tables_from_snapshot(&path, &["plain_thing"])
+            .await
+            .unwrap();
+        assert!(size > 0);
+
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM plain_thing", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 0);
+    }
+
+    /// The standby filter is a no-op without a hosted standby context: the
+    /// read-log strip already happened at snapshot time, and this second pass
+    /// must not touch the artifact.
     #[tokio::test]
     async fn filtering_is_a_no_op_without_a_hosted_standby_context() {
         let directory = tempfile::tempdir().unwrap();
@@ -667,26 +922,35 @@ mod tests {
         export.cleanup().await;
     }
 
-    /// The denylist must name tables the frozen DDL actually creates.
+    /// Every disposable denylist must name tables the frozen DDL actually
+    /// creates.
     ///
-    /// This is the guard that stops the filter rotting silently. If a
+    /// This is the guard that stops the filters rotting silently. If a
     /// disposable table is renamed or removed, the filter would quietly stop
-    /// stripping it and standby snapshots would grow back toward the 1.63 GB
-    /// that made the agreed refresh cadence impossible — with nothing failing.
-    /// A new bookkeeping table is deliberately *not* caught here: adding one is
-    /// a conscious decision for a human, and forgetting it only costs size.
+    /// stripping it and snapshots would grow back toward the 1.63 GB that made
+    /// the agreed refresh cadence impossible — with nothing failing. It covers
+    /// both the standby list and the always-stripped read-log list, so a
+    /// read-log table rename cannot become a runtime failure on every export
+    /// without a test noticing. A new bookkeeping table is deliberately *not*
+    /// caught here: adding one is a conscious decision for a human, and
+    /// forgetting it only costs size.
     #[test]
-    fn standby_disposable_tables_are_declared_in_the_frozen_ddl() {
+    fn disposable_tables_are_declared_in_the_frozen_ddl() {
         let ddl = crate::schema::ddl::DDL_STATEMENTS.join("\n").to_lowercase();
-        for table in super::STANDBY_DISPOSABLE_TABLES {
-            assert!(
-                ddl.contains(&format!("create table if not exists {table} "))
-                    || ddl.contains(&format!("create table {table} "))
-                    || ddl.contains(&format!("create table if not exists {table}("))
-                    || ddl.contains(&format!("create table {table}(")),
-                "standby denylist names '{table}', which the frozen DDL does not create; \
-                 the filter would silently stop stripping it"
-            );
+        for (label, tables) in [
+            ("standby denylist", super::STANDBY_DISPOSABLE_TABLES),
+            ("read-log denylist", super::READ_LOG_TABLES),
+        ] {
+            for table in tables {
+                assert!(
+                    ddl.contains(&format!("create table if not exists {table} "))
+                        || ddl.contains(&format!("create table {table} "))
+                        || ddl.contains(&format!("create table if not exists {table}("))
+                        || ddl.contains(&format!("create table {table}(")),
+                    "{label} names '{table}', which the frozen DDL does not create; \
+                     the filter would silently stop stripping it"
+                );
+            }
         }
     }
 

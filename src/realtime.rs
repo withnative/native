@@ -358,9 +358,13 @@ impl RealtimeHub {
     }
 
     /// Fail-closed visibility check for one payload-free invalidation.
+    /// `is_member` is the subscriber's subscribe-time catalog footing: guests
+    /// evaluate with their own account grants only, never the members
+    /// baseline.
     pub async fn can_view_invalidation_for_account(
         &self,
         account_id: &str,
+        is_member: bool,
         envelope: &ContentInvalidation,
     ) -> bool {
         if matches!(
@@ -370,7 +374,7 @@ impl RealtimeHub {
             return false;
         }
         let pool = self.current_pool();
-        let principal = Principal::bound(account_id, true);
+        let principal = Principal::bound(account_id, is_member);
         let capability = if envelope.event_type == "record.deleted" {
             crate::authorization::effective_capability_for_tombstone_in_pool(
                 &pool,
@@ -579,10 +583,12 @@ mod tests {
         );
 
         let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+        let mut act_alloc = crate::act::ActAllocation::new();
         append_in(
             &db,
             &mut tx,
             spec("4ea17000-0000-4000-8000-000000000003", "record.created"),
+            &mut act_alloc,
         )
         .await
         .unwrap();
@@ -601,6 +607,7 @@ mod tests {
         let before = inbox_invalidation_vector(&db).await.unwrap();
         let mut receiver = hub.subscribe_inbox();
         let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+        let mut act_alloc = crate::act::ActAllocation::new();
         crate::awareness::advance_human(
             &mut tx,
             "acct:a",
@@ -613,6 +620,7 @@ mod tests {
                 executor_ref: "ui".into(),
             },
             "rendered exact id",
+            &mut act_alloc,
         )
         .await
         .unwrap();

@@ -65,6 +65,20 @@ enum ResolveManyItem {
         match_count: usize,
         matches: Vec<IdentityMatch>,
     },
+    /// Honest absence (`docs/honest-absence-contract.md` §5a). Resolution by
+    /// name is exactly where collapsing "not held here" into "not found"
+    /// produces a duplicate record, because a caller that fails to resolve a
+    /// name is usually about to create it.
+    ///
+    /// Unreachable until record-level subsets ship; landed early so the
+    /// vocabulary precedes anything that can produce it. The allow is the
+    /// cost of that: nothing constructs it yet outside the test that pins its
+    /// wire form, and that is the intended state rather than an oversight.
+    #[allow(dead_code)]
+    NotHeld {
+        index: usize,
+        input: String,
+    },
 }
 
 /// Authoritative operation schema.  The executor contract should reuse this
@@ -255,6 +269,10 @@ async fn resolve_many_in(
     let mut resolved_count = 0usize;
     let mut not_found_count = 0usize;
     let mut ambiguous_count = 0usize;
+    // Never incremented today: a time window leaves the projection complete,
+    // so every visible record is held. The counter exists so the shape a
+    // caller parses does not change when record-level subsets arrive.
+    let not_held_count = 0usize;
     let results = args
         .names
         .iter()
@@ -294,11 +312,39 @@ async fn resolve_many_in(
         "counts": {
             "resolved": resolved_count,
             "not_found": not_found_count,
-            "ambiguous": ambiguous_count
+            "ambiguous": ambiguous_count,
+            // Disclosed separately from any authorization redaction, per the
+            // ratified fork 1 of a42f6e3: "exists, you may not see it" and
+            // "exists, this device does not have it" are different facts and a
+            // caller may act differently on each. Always 0 until record-level
+            // subsets ship.
+            "not_held": not_held_count
         },
         "type": args.record_type,
         "kind": args.kind,
         "include_archived": args.include_archived.unwrap_or(false),
         "match": "exact"
     }))
+}
+
+#[cfg(test)]
+mod honest_absence_tests {
+    use super::*;
+
+    /// Pins the wire form of the honest-absence status before anything can
+    /// produce it. The point of landing the variant early is that a caller
+    /// can be written against it now; that is only true if the shape is
+    /// fixed, and only a test fixes it.
+    #[test]
+    fn not_held_serializes_as_its_own_status() {
+        let item = ResolveManyItem::NotHeld {
+            index: 2,
+            input: "Quarterly plan".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(&item).unwrap(),
+            json!({ "status": "not_held", "index": 2, "input": "Quarterly plan" }),
+            "not_held is a status of its own, distinguishable from not_found"
+        );
+    }
 }

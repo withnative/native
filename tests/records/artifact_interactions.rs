@@ -180,18 +180,36 @@ async fn call_as(
 
 /// One artifact bound to one Collection holding exactly one of two records.
 async fn fixture() -> (Db, ToolRegistry, String, tokio::sync::OwnedMutexGuard<()>) {
+    fixture_with_source(artifact_source("Orders"), "native.mdx.v2").await
+}
+
+fn html_interaction_source(source: &str) -> String {
+    let parsed = native_artifact_runtime::mdx_v2::parse_artifact(source).unwrap();
+    let native_artifact_runtime::mdx_v2::Manifest::Artifact(manifest) = parsed.manifest else {
+        unreachable!()
+    };
+    let declaration = json!({
+        "schema": "native.html.artifact.v2", "inputs": manifest.inputs,
+        "capability_requests": manifest.capability_requests, "interactions": manifest.interactions,
+    });
+    format!("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Interactions</title><script type=\"application/json\" id=\"native-artifact-manifest\">{declaration}</script></head><body><main><h1>Interactions</h1></main></body></html>")
+}
+
+async fn fixture_with_source(
+    source: String,
+    runtime: &str,
+) -> (Db, ToolRegistry, String, tokio::sync::OwnedMutexGuard<()>) {
     let guard = Arc::clone(integration_guard()).lock_owned().await;
     let db = create_database(":memory:").await.unwrap();
     let mut registry = ToolRegistry::new();
     register_surface_tools(&mut registry).unwrap();
-    let source = artifact_source("Orders");
     let created = call(
         &registry,
         &db,
         "create_record",
         json!({
             "id": ARTIFACT, "type": "Document", "kind": "artifact", "name": "Triage board",
-            "body": source, "facets": { "runtime": "native.mdx.v2" },
+            "body": source, "facets": { "runtime": runtime },
             "reason": "Declare interaction entries against a bound Collection."
         }),
     )
@@ -239,19 +257,166 @@ async fn fixture() -> (Db, ToolRegistry, String, tokio::sync::OwnedMutexGuard<()
     (db, registry, digest_of(&source), guard)
 }
 
+#[tokio::test]
+async fn html_interactions_share_scope_domains_cas_replay_attribution_and_host_plan() {
+    native_ce::artifact_html::configure(
+        native_ce::artifact_html::RuntimeConfig::new(
+            "https://workbench.test",
+            "https://artifacts.test",
+        )
+        .unwrap(),
+    );
+    let source = html_interaction_source(&artifact_source("Orders"));
+    let (db, registry, digest, _guard) = fixture_with_source(source, "native.html.v1").await;
+    let rendered = call(&registry, &db, "render_artifact", json!({"id":ARTIFACT})).await;
+    assert_eq!(rendered["status"], "rendered", "{rendered:#}");
+    assert_eq!(rendered["plan"]["kind"], "isolated_html");
+    assert_eq!(rendered["plan"]["body_digest"], digest);
+    assert_eq!(rendered["plan"]["observed"][INSIDE]["triage"], "obs:0");
+    assert!(rendered["plan"]["observed"].get(OUTSIDE).is_none());
+    assert!(
+        rendered["plan"]["interaction_availability"]["supported_entries"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("set_triage"))
+    );
+    assert!(rendered["input"].get("observed").is_none());
+    assert!(rendered["input"].get("interactions").is_none());
+    let descriptor: String = sqlx::query_scalar(
+        "SELECT descriptor FROM artifact_source_attestations WHERE artifact_id=?",
+    )
+    .bind(ARTIFACT)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    let descriptor: Value = serde_json::from_str(&descriptor).unwrap();
+    assert_eq!(descriptor["interactions"], rendered["plan"]["interactions"]);
+    let invocation = json!({"version":INVOCATION_VERSION,"artifact_id":ARTIFACT,
+        "entry_id":"set_triage","source_digest":digest,"slots":{"record":INSIDE},
+        "values":{"choice":"triaged"},"observed":{INSIDE:{"triage":"obs:0"}},
+        "idempotency_key":"html:one"});
+    replace_explicit_policy(
+        &db,
+        "test:html-caller",
+        INSIDE,
+        vec![AllowEntry::account("acct:html-reader", Capability::View)],
+    )
+    .await
+    .unwrap();
+    let reader = Caller::authenticated("acct:html-reader")
+        .with_hosting_context("host:html-reader", "db:test")
+        .with_hosting_owner(false);
+    let refused = call_as(
+        &registry,
+        &db,
+        reader,
+        "invoke_artifact_interaction",
+        invocation.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(refused["status"], "rejected", "{refused:#}");
+    assert_eq!(refused["error"]["code"], "permission_denied", "{refused:#}");
+    for (patch, expected) in [
+        (
+            json!({"slots":{"record":OUTSIDE},"observed":{}}),
+            "record_outside_binding",
+        ),
+        (
+            json!({"values":{"choice":"forged"}}),
+            "value_outside_domain",
+        ),
+        (
+            json!({"source_digest":"0".repeat(64)}),
+            "stale_source_digest",
+        ),
+        (json!({"entry_id":"undeclared"}), "unknown_entry"),
+    ] {
+        let mut invalid = invocation.clone();
+        invalid
+            .as_object_mut()
+            .unwrap()
+            .extend(patch.as_object().unwrap().clone());
+        let result = call(&registry, &db, "invoke_artifact_interaction", invalid).await;
+        assert_eq!(result["status"], "rejected", "{result:#}");
+        assert_eq!(result["error"]["code"], expected, "{result:#}");
+    }
+    let first = call(
+        &registry,
+        &db,
+        "invoke_artifact_interaction",
+        invocation.clone(),
+    )
+    .await;
+    assert_eq!(first["status"], "committed", "{first:#}");
+    let replay = call(
+        &registry,
+        &db,
+        "invoke_artifact_interaction",
+        invocation.clone(),
+    )
+    .await;
+    assert_eq!(replay["status"], "committed", "{replay:#}");
+    assert_eq!(
+        replay["changes"][0]["version"],
+        first["changes"][0]["version"]
+    );
+    let mut stale = invocation.clone();
+    stale["idempotency_key"] = json!("html:two");
+    let conflict = call(&registry, &db, "invoke_artifact_interaction", stale).await;
+    assert_eq!(conflict["status"], "conflict", "{conflict:#}");
+    let payload: String = sqlx::query_scalar("SELECT payload FROM content_events WHERE record_id=? AND type='facet.set' AND json_extract(payload,'$.origin.artifact_id')=?")
+        .bind(INSIDE).bind(ARTIFACT).fetch_one(db.pool()).await.unwrap();
+    let payload: Value = serde_json::from_str(&payload).unwrap();
+    assert_eq!(payload["origin"]["source_digest"], digest);
+    assert_eq!(payload["origin"]["entry_id"], "set_triage");
+    let subjects = call(
+        &registry,
+        &db,
+        "manage_artifact_module_grants",
+        json!({"action":"read","artifact_id":ARTIFACT}),
+    )
+    .await;
+    let subject = &subjects["subjects"][0];
+    call(
+        &registry,
+        &db,
+        "manage_artifact_module_grants",
+        json!({
+            "action":"revoke","artifact_id":ARTIFACT,"subject_kind":"artifact_source",
+            "subject_record_id":ARTIFACT,"subject_event_id":subject["subject_event_id"],
+            "source_sha256":subject["source_sha256"],"capability":"input.read",
+            "scope":{"artifact_port":"orders"}
+        }),
+    )
+    .await;
+    let denied = call(&registry, &db, "invoke_artifact_interaction", invocation).await;
+    assert_eq!(denied["status"], "rejected", "{denied:#}");
+    assert_eq!(
+        denied["error"]["code"], "module_capability_denied",
+        "{denied:#}"
+    );
+}
+
 async fn create_fixture() -> (Db, ToolRegistry, String, tokio::sync::OwnedMutexGuard<()>) {
+    create_fixture_with_source(create_artifact_source(), "native.mdx.v2").await
+}
+
+async fn create_fixture_with_source(
+    source: String,
+    runtime: &str,
+) -> (Db, ToolRegistry, String, tokio::sync::OwnedMutexGuard<()>) {
     let guard = Arc::clone(integration_guard()).lock_owned().await;
     let db = create_database(":memory:").await.unwrap();
     let mut registry = ToolRegistry::new();
     register_surface_tools(&mut registry).unwrap();
-    let source = create_artifact_source();
     let created = call(
         &registry,
         &db,
         "create_record",
         json!({
             "id": ARTIFACT, "type": "Document", "kind": "artifact", "name": "Creation board",
-            "body": source, "facets": { "runtime": "native.mdx.v2" },
+            "body": source, "facets": { "runtime": runtime },
             "reason": "Declare general record creation against a bound Collection."
         }),
     )
@@ -294,6 +459,183 @@ async fn create_fixture() -> (Db, ToolRegistry, String, tokio::sync::OwnedMutexG
     grant_input_read(&registry, &db).await;
     grant_input_read_port(&registry, &db, "refs").await;
     (db, registry, digest_of(&source), guard)
+}
+
+#[tokio::test]
+async fn html_interactions_record_create_is_governed_and_idempotent() {
+    let source = html_interaction_source(&create_artifact_source());
+    let (db, registry, digest, _guard) = create_fixture_with_source(source, "native.html.v1").await;
+    native_ce::artifact_html::configure(
+        native_ce::artifact_html::RuntimeConfig::new(
+            "https://workbench.test",
+            "https://artifacts.test",
+        )
+        .unwrap(),
+    );
+    let rendered = call(&registry, &db, "render_artifact", json!({"id":ARTIFACT})).await;
+    assert_eq!(rendered["status"], "rendered", "{rendered:#}");
+    let availability = &rendered["plan"]["interaction_availability"];
+    assert_eq!(
+        availability["create_destinations"]["create_task"],
+        COLLECTION
+    );
+    assert_eq!(
+        availability["record_labels"][COLLECTION]["name"],
+        "Created here"
+    );
+    assert!(!rendered["input"]
+        .to_string()
+        .contains("create_destinations"));
+    assert!(!rendered["input"].to_string().contains("record_labels"));
+    let invocation = json!({"version":INVOCATION_VERSION,"artifact_id":ARTIFACT,
+        "entry_id":"create_task","source_digest":digest,
+        "values":{"title":"Created from HTML","triage":"ready"},"idempotency_key":"html:create"});
+    let first = call(
+        &registry,
+        &db,
+        "invoke_artifact_interaction",
+        invocation.clone(),
+    )
+    .await;
+    assert_eq!(first["status"], "committed", "{first:#}");
+    assert_eq!(first["refresh"]["record"]["home_id"], COLLECTION);
+    let replay = call(&registry, &db, "invoke_artifact_interaction", invocation).await;
+    assert_eq!(replay["status"], "committed", "{replay:#}");
+    assert_eq!(
+        replay["refresh"]["record"]["id"],
+        first["refresh"]["record"]["id"]
+    );
+    assert_eq!(replay["refresh"]["record"]["idempotent_retry"], true);
+}
+
+/// An HTML creation into its own bound input with the flag set refreshes the
+/// created record, the post-write plan, and the input that plan was rendered
+/// over — so the caller can synthesise a settled result and continue in place
+/// without a second `render_artifact`. The digest always moves here: the new
+/// row IS the changed input.
+#[tokio::test]
+async fn html_creation_with_the_flag_set_refreshes_record_plan_and_input() {
+    let source = html_interaction_source(&create_artifact_source());
+    let (db, registry, digest, _guard) = create_fixture_with_source(source, "native.html.v1").await;
+    native_ce::artifact_html::configure(
+        native_ce::artifact_html::RuntimeConfig::new(
+            "https://workbench.test",
+            "https://artifacts.test",
+        )
+        .unwrap(),
+    );
+    let before = call(&registry, &db, "render_artifact", json!({"id":ARTIFACT})).await;
+    assert_eq!(before["status"], "rendered", "{before:#}");
+    let committed = call(
+        &registry,
+        &db,
+        "invoke_artifact_interaction",
+        json!({
+            "version": INVOCATION_VERSION,
+            "artifact_id": ARTIFACT,
+            "entry_id": "create_task",
+            "source_digest": digest,
+            "values": { "title": "Bonus input row", "triage": "ready" },
+            "idempotency_key": "html:create:bonus-input",
+            "gesture": "submit",
+            "include_next_plan": true,
+        }),
+    )
+    .await;
+    assert_eq!(committed["status"], "committed", "{committed:#}");
+    let created_id = committed["refresh"]["record"]["id"]
+        .as_str()
+        .expect("a creation refreshes its record");
+    let plan = &committed["refresh"]["plan"];
+    assert_eq!(plan["kind"], "isolated_html", "{committed:#}");
+    let input_digest = committed["refresh"]["input_digest"]
+        .as_str()
+        .expect("the bonus carries the digest the plan was rendered over");
+    assert_ne!(
+        input_digest,
+        before["input_digest"].as_str().unwrap(),
+        "the new row moves the digest: {committed:#}"
+    );
+    let input = &committed["refresh"]["input"];
+    assert!(input.is_object(), "{committed:#}");
+    assert!(
+        input.to_string().contains(created_id),
+        "the bonus input already holds the created row: {committed:#}"
+    );
+    // No launch rides along: a creation never changes the body, so the
+    // caller continues in place on its live launch.
+    assert!(
+        committed["refresh"].get("launch").is_none(),
+        "{committed:#}"
+    );
+    // And the bonus agrees with what a separate render would hand out, so
+    // the caller can skip that second round trip.
+    let after = call(&registry, &db, "render_artifact", json!({"id":ARTIFACT})).await;
+    assert_eq!(after["status"], "rendered", "{after:#}");
+    assert_eq!(after["input_digest"].as_str().unwrap(), input_digest);
+    assert_eq!(
+        after["plan"]["observed"].to_string(),
+        plan["observed"].to_string(),
+        "{after:#}"
+    );
+}
+
+#[tokio::test]
+async fn html_interactions_attestation_replay_rejects_forged_or_omitted_entries() {
+    let (db, _registry, _digest, _guard) = fixture_with_source(
+        html_interaction_source(&artifact_source("Orders")),
+        "native.html.v1",
+    )
+    .await;
+    let descriptor: String = sqlx::query_scalar(
+        "SELECT descriptor FROM artifact_source_attestations WHERE artifact_id=?",
+    )
+    .bind(ARTIFACT)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    let descriptor: Value = serde_json::from_str(&descriptor).unwrap();
+    let seq: i64 = sqlx::query_scalar("SELECT MAX(seq) FROM content_events")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    for omit in [false, true] {
+        let mut descriptor = descriptor.clone();
+        let event_id = "daaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        descriptor["attestation_event_id"] = json!(event_id);
+        if omit {
+            descriptor.as_object_mut().unwrap().remove("interactions");
+        } else {
+            descriptor["interactions"][0]["value"]["value"] = json!("forged");
+        }
+        let digest = hex::encode(Sha256::digest(
+            native_artifact_runtime::mdx_v2::canonical_json_bytes(&descriptor),
+        ));
+        let event = native_ce::events::EventRow {
+            local_seq: seq + 1,
+            id: event_id.into(),
+            record_id: ARTIFACT.into(),
+            event_type: "artifact.source_attested".into(),
+            payload: Some(
+                json!({"artifact_source":descriptor,"attestation_sha256":digest}).to_string(),
+            ),
+            actor: Some("test".into()),
+            run_key: None,
+            parent_key: None,
+            intent: None,
+            created_at: "2026-09-17T00:00:00Z".into(),
+            causal_envelope: native_ce::events::CausalEnvelopeV1::complete(
+                native_ce::events::CausalFrontierV1::empty(),
+            ),
+            act: None,
+        };
+        let mut conn = db.pool().acquire().await.unwrap();
+        let error = native_ce::projector::project(&mut conn, &event)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("exact declaration surface"), "{error}");
+    }
 }
 
 /// The exact `input.read` grant rendering requires for a root-exposed port.
@@ -522,6 +864,19 @@ async fn record_create_rechecks_destination_authority_at_invocation() {
         .await
         .unwrap();
     }
+    let rendered = call_as(
+        &registry,
+        &db,
+        caller.clone(),
+        "render_artifact",
+        json!({"id":ARTIFACT}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(rendered["status"], "rendered", "{rendered:#}");
+    let availability = &rendered["plan"]["interaction_availability"];
+    assert!(availability.get("create_destinations").is_none());
+    assert!(availability["record_labels"].get(COLLECTION).is_none());
     let denied = call_as(
         &registry,
         &db,
@@ -565,6 +920,17 @@ async fn record_create_is_general_and_render_availability_is_creation_aware() {
     assert!(!supported.iter().any(|entry| entry == "create_with_list"));
     assert!(!supported.iter().any(|entry| entry == "create_with_boolean"));
     assert!(supported.iter().any(|entry| entry == "create_with_number"));
+    let availability = &rendered["plan"]["interaction_availability"];
+    let destinations = availability["create_destinations"].as_object().unwrap();
+    assert_eq!(destinations.len(), supported.len());
+    assert!(destinations
+        .values()
+        .all(|destination| destination == COLLECTION));
+    assert_eq!(
+        availability["record_labels"][COLLECTION]["name"],
+        "Created here"
+    );
+    assert!(destinations.get("create_comment").is_none());
     assert!(
         !supported.iter().any(|entry| entry == "create_with_ref"),
         "an empty bound reference port must keep its unfillable entry unavailable: {rendered:#}"
@@ -953,11 +1319,31 @@ async fn render_plan_restores_zero_tokens_for_missing_grouped_rows() {
             .fetch_one(db.pool())
             .await
             .unwrap();
-    sqlx::query("DELETE FROM content_events WHERE record_id=?")
-        .bind(second_inside)
-        .execute(&crate::common::fixture_write_pool(&db).await)
+    // content_events is append-only by trigger; this corruption fixture drops
+    // only the delete guard and restores the exact sqlite_master SQL on the
+    // same connection around the deletion, before rendering continues.
+    let fixture_pool = crate::common::fixture_write_pool(&db).await;
+    let mut fixture = fixture_pool.acquire().await.unwrap();
+    let delete_guard: String = sqlx::query_scalar(
+        "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='content_events_no_delete'",
+    )
+    .fetch_one(&mut *fixture)
+    .await
+    .unwrap();
+    sqlx::query("DROP TRIGGER content_events_no_delete")
+        .execute(&mut *fixture)
         .await
         .unwrap();
+    sqlx::query("DELETE FROM content_events WHERE record_id=?")
+        .bind(second_inside)
+        .execute(&mut *fixture)
+        .await
+        .unwrap();
+    sqlx::query(&delete_guard)
+        .execute(&mut *fixture)
+        .await
+        .unwrap();
+    drop(fixture);
 
     let rendered = call(&registry, &db, "render_artifact", json!({ "id": ARTIFACT })).await;
     assert_eq!(rendered["status"], "rendered", "{rendered:#}");
@@ -1083,6 +1469,37 @@ async fn a_declared_entry_writes_an_open_facet_on_a_bound_record() {
     .await
     .unwrap();
     assert_eq!(writes, 1);
+}
+
+#[tokio::test]
+async fn the_commit_origin_still_names_artifact_entry_digest_key_and_gesture() {
+    // The durable origin is the entire ground `6f99174` rests on: removing the
+    // Apply step must not weaken it. One facet write's event payload must still
+    // name the exact artifact, entry, source digest, idempotency key and
+    // gesture that produced it, so what the frame displayed is reconstructable.
+    let (db, registry, digest, _guard) = fixture().await;
+    let mut invocation = envelope("mark_triaged", &digest, "origin:one");
+    invocation["slots"] = json!({ "record": INSIDE });
+    invocation["observed"] = observed(&registry, &db, INSIDE, "triage").await;
+    let result = call(&registry, &db, "invoke_artifact_interaction", invocation).await;
+    assert_eq!(result["status"], "committed", "{result:#}");
+
+    let payload: String = sqlx::query_scalar(
+        "SELECT payload FROM content_events
+          WHERE record_id=? AND type='facet.set'
+            AND json_extract(payload,'$.origin.idempotency_key')='origin:one'",
+    )
+    .bind(INSIDE)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    let payload: Value = serde_json::from_str(&payload).unwrap();
+    let origin = &payload["origin"];
+    assert_eq!(origin["artifact_id"], ARTIFACT);
+    assert_eq!(origin["entry_id"], "mark_triaged");
+    assert_eq!(origin["source_digest"], digest);
+    assert_eq!(origin["idempotency_key"], "origin:one");
+    assert_eq!(origin["gesture"], "click");
 }
 
 #[tokio::test]
@@ -1851,6 +2268,7 @@ async fn a_stale_source_digest_cannot_invoke_against_an_edited_manifest() {
             intent: None,
             created_at: row.get("created_at"),
             causal_envelope: native_ce::events::CausalEnvelopeV1::default(),
+            act: None,
         };
         let mut conn = crate::common::fixture_write_pool(&db)
             .await
@@ -1878,8 +2296,7 @@ async fn changing_one_input_declaration_drops_all_exact_input_state() {
     )
     .await;
     assert_eq!(
-        updated["artifact_input_continuity"]["status"],
-        "artifact_inputs_dropped_by_declaration_change",
+        updated["artifact_input_continuity"]["status"], "artifact_inputs_dropped",
         "{updated:#}"
     );
     assert_eq!(
@@ -1909,6 +2326,593 @@ async fn changing_one_input_declaration_drops_all_exact_input_state() {
     .unwrap();
     assert_eq!((bindings, grants), (0, 0));
     assert!(native_ce::conformance::run_conformance(&db).await.ok);
+}
+
+/// Two bound ports plus a navigation grant: the per-port carry fixture.
+fn two_port_nav_source(label: &str) -> String {
+    format!(
+        r#"export const nativeArtifact = {{
+  schema: "native.mdx.artifact.v2",
+  inputs: {{
+    orders: {{ envelope: "native.collection-envelope.v1", required: true, expose_to_root: true }},
+    refs: {{ envelope: "native.collection-envelope.v1", required: false, expose_to_root: true }}
+  }},
+  module_inputs: {{}},
+  capability_requests: [
+    {{ capability: "input.read", scope: {{ port: "orders" }} }},
+    {{ capability: "input.read", scope: {{ port: "refs" }} }},
+    {{ capability: "navigation.record.user_gesture", scope: {{}} }}
+  ],
+  interactions: [
+    {{ id: "mark_triaged", label: "Mark triaged", effect: "facet.set",
+      slots: {{ record: {{ domain: {{ kind: "bound_input", port: "orders" }} }} }},
+      facet: "triage", value: {{ from: "literal", value: "triaged" }} }}
+  ]
+}}
+
+<Metric label={label:?} value={{1}} />
+"#
+    )
+}
+
+async fn grant_navigation(registry: &ToolRegistry, db: &Db) {
+    let subjects = call(
+        registry,
+        db,
+        "manage_artifact_module_grants",
+        json!({ "action": "read", "artifact_id": ARTIFACT }),
+    )
+    .await;
+    let subject = subjects["subjects"]
+        .as_array()
+        .and_then(|subjects| subjects.first().cloned())
+        .expect("the artifact source requests navigation");
+    let granted = call(
+        registry,
+        db,
+        "manage_artifact_module_grants",
+        json!({
+            "action": "grant", "artifact_id": ARTIFACT, "subject_kind": "artifact_source",
+            "subject_record_id": ARTIFACT,
+            "subject_event_id": subject["subject_event_id"],
+            "source_sha256": subject["source_sha256"],
+            "capability": "navigation.record.user_gesture", "scope": {}
+        }),
+    )
+    .await;
+    assert_eq!(granted["status"], "granted", "{granted:#}");
+}
+
+async fn two_port_nav_fixture() -> (Db, ToolRegistry, String, tokio::sync::OwnedMutexGuard<()>) {
+    let guard = Arc::clone(integration_guard()).lock_owned().await;
+    let db = create_database(":memory:").await.unwrap();
+    let mut registry = ToolRegistry::new();
+    register_surface_tools(&mut registry).unwrap();
+    let source = two_port_nav_source("Two ports");
+    let created = call(
+        &registry,
+        &db,
+        "create_record",
+        json!({
+            "id": ARTIFACT, "type": "Document", "kind": "artifact", "name": "Two-port board",
+            "body": source, "facets": { "runtime": "native.mdx.v2" },
+            "reason": "Bind two deterministic artifact inputs plus navigation."
+        }),
+    )
+    .await;
+    assert!(
+        created.get("diagnostic").is_none() && created.get("error").is_none(),
+        "{created:#}"
+    );
+    call(
+        &registry,
+        &db,
+        "create_record",
+        json!({ "id": COLLECTION, "type": "Collection", "kind": "selection", "name": "Orders",
+                "reason": "Bind one deterministic artifact input." }),
+    )
+    .await;
+    call(
+        &registry,
+        &db,
+        "create_record",
+        json!({ "id": REFERENCE_COLLECTION, "type": "Collection", "kind": "folder",
+                "name": "References", "reason": "Bind the second deterministic input." }),
+    )
+    .await;
+    for id in [INSIDE, OUTSIDE] {
+        call(
+            &registry,
+            &db,
+            "create_record",
+            json!({ "id": id, "type": "WorkItem", "kind": "task", "name": id,
+                    "reason": "Populate the per-port fixture." }),
+        )
+        .await;
+    }
+    call(
+        &registry,
+        &db,
+        "manage_links",
+        json!({ "action": "add", "source_id": INSIDE, "target_id": COLLECTION,
+                "relationship": "member_of" }),
+    )
+    .await;
+    for (port, collection) in [("orders", COLLECTION), ("refs", REFERENCE_COLLECTION)] {
+        let bound = call(
+            &registry,
+            &db,
+            "manage_artifact_inputs",
+            json!({ "action": "bind", "artifact_id": ARTIFACT, "port_name": port,
+                    "collection_id": collection }),
+        )
+        .await;
+        assert_eq!(bound["status"], "bound", "{bound:#}");
+    }
+    grant_input_read_port(&registry, &db, "orders").await;
+    grant_input_read_port(&registry, &db, "refs").await;
+    grant_navigation(&registry, &db).await;
+    (db, registry, digest_of(&source), guard)
+}
+
+#[tokio::test]
+async fn adding_a_port_carries_every_existing_binding_and_grant() {
+    let (db, registry, digest, _guard) = two_port_nav_fixture().await;
+    let added = two_port_nav_source("Two ports")
+        .replace(
+            "    refs: { envelope: \"native.collection-envelope.v1\", required: false, expose_to_root: true }",
+            "    refs: { envelope: \"native.collection-envelope.v1\", required: false, expose_to_root: true },\n    extra: { envelope: \"native.collection-envelope.v1\", required: false, expose_to_root: true }",
+        )
+        .replace(
+            "    { capability: \"navigation.record.user_gesture\", scope: {} }",
+            "    { capability: \"input.read\", scope: { port: \"extra\" } },\n    { capability: \"navigation.record.user_gesture\", scope: {} }",
+        );
+    assert_ne!(added, two_port_nav_source("Two ports"));
+    let updated = call(
+        &registry,
+        &db,
+        "update_record",
+        json!({ "id": ARTIFACT, "body": added, "if_body_digest": digest,
+                "reason": "Add an input port beside the bound ones." }),
+    )
+    .await;
+    let continuity = &updated["artifact_input_continuity"];
+    assert_eq!(
+        continuity["status"], "artifact_inputs_carried_forward",
+        "{updated:#}"
+    );
+    assert_eq!(continuity["carried_binding_count"], 2);
+    assert_eq!(continuity["dropped_binding_count"], 0);
+    assert_eq!(continuity["carried_grant_count"], 3);
+    assert_eq!(continuity["dropped_grant_count"], 0);
+    assert_eq!(continuity["changed_ports"], json!(["extra"]));
+    assert_eq!(continuity["dropped"], json!([]));
+    // The navigation grant carried across the port addition re-pins to the new
+    // exact source rather than lingering on the old one.
+    let new_event = updated["source_event_id"].as_str().unwrap();
+    let nav_source: String = sqlx::query_scalar(
+        "SELECT artifact_source_event_id FROM artifact_module_grants
+          WHERE artifact_id=? AND capability='navigation.record.user_gesture'",
+    )
+    .bind(ARTIFACT)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(nav_source, new_event);
+    let bindings: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM artifact_inputs WHERE artifact_id=?")
+            .bind(ARTIFACT)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    let grants: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM artifact_module_grants WHERE artifact_id=?")
+            .bind(ARTIFACT)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!((bindings, grants), (2, 3));
+    assert!(native_ce::conformance::run_conformance(&db).await.ok);
+}
+
+#[tokio::test]
+async fn changing_one_port_declaration_drops_only_that_port() {
+    let (db, registry, digest, _guard) = two_port_nav_fixture().await;
+    let changed = two_port_nav_source("Two ports").replace(
+        "orders: { envelope: \"native.collection-envelope.v1\", required: true",
+        "orders: { envelope: \"native.collection-envelope.v1\", required: false",
+    );
+    assert_ne!(changed, two_port_nav_source("Two ports"));
+    let updated = call(
+        &registry,
+        &db,
+        "update_record",
+        json!({ "id": ARTIFACT, "body": changed, "if_body_digest": digest,
+                "reason": "Change one declared input contract." }),
+    )
+    .await;
+    let continuity = &updated["artifact_input_continuity"];
+    assert_eq!(
+        continuity["status"], "artifact_inputs_partially_carried",
+        "{updated:#}"
+    );
+    assert_eq!(continuity["carried_binding_count"], 1);
+    assert_eq!(continuity["dropped_binding_count"], 1);
+    assert_eq!(continuity["carried_grant_count"], 2);
+    assert_eq!(continuity["dropped_grant_count"], 1);
+    assert_eq!(continuity["changed_ports"], json!(["orders"]));
+    assert_eq!(
+        continuity["restoration_tools"],
+        json!(["manage_artifact_inputs", "manage_artifact_module_grants"])
+    );
+    let dropped = continuity["dropped"].as_array().unwrap();
+    assert_eq!(dropped.len(), 2, "{updated:#}");
+    assert!(
+        dropped.iter().any(|item| item["kind"] == "binding"
+            && item["port"] == "orders"
+            && item["collection_id"] == COLLECTION),
+        "{updated:#}"
+    );
+    assert!(
+        dropped.iter().any(|item| item["kind"] == "grant"
+            && item["port"] == "orders"
+            && item["capability"] == "input.read"
+            && item["scope"] == json!({ "artifact_port": "orders" })),
+        "{updated:#}"
+    );
+    // The untouched port keeps its binding and grant; the navigation grant is
+    // not port-scoped and carries too.
+    let new_event = updated["source_event_id"].as_str().unwrap();
+    let orders_binding: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM artifact_inputs WHERE artifact_id=? AND port_name='orders'",
+    )
+    .bind(ARTIFACT)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    let refs_binding: String = sqlx::query_scalar(
+        "SELECT artifact_source_event_id FROM artifact_inputs
+          WHERE artifact_id=? AND port_name='refs'",
+    )
+    .bind(ARTIFACT)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!((orders_binding, refs_binding.as_str()), (0, new_event));
+    let remaining_grants: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT capability,scope,artifact_source_event_id FROM artifact_module_grants
+          WHERE artifact_id=? ORDER BY capability",
+    )
+    .bind(ARTIFACT)
+    .fetch_all(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(remaining_grants.len(), 2, "{remaining_grants:?}");
+    assert!(
+        remaining_grants
+            .iter()
+            .all(|(_, _, source)| source == new_event),
+        "{remaining_grants:?}"
+    );
+    assert!(
+        remaining_grants
+            .iter()
+            .any(|(capability, scope, _)| capability == "input.read"
+                && scope == r#"{"artifact_port":"refs"}"#),
+        "{remaining_grants:?}"
+    );
+    assert!(
+        remaining_grants
+            .iter()
+            .any(
+                |(capability, scope, _)| capability == "navigation.record.user_gesture"
+                    && scope == "{}"
+            ),
+        "{remaining_grants:?}"
+    );
+    assert!(native_ce::conformance::run_conformance(&db).await.ok);
+}
+
+#[tokio::test]
+async fn a_navigation_grant_survives_an_input_declaration_change() {
+    let (db, registry, digest, _guard) = two_port_nav_fixture().await;
+    // Change every input port declaration while keeping the requests: both
+    // bindings and both input.read grants must drop, the navigation grant
+    // must carry.
+    let changed = two_port_nav_source("Two ports")
+        .replace(
+            "orders: { envelope: \"native.collection-envelope.v1\", required: true",
+            "orders: { envelope: \"native.collection-envelope.v1\", required: false",
+        )
+        .replace(
+            "refs: { envelope: \"native.collection-envelope.v1\", required: false",
+            "refs: { envelope: \"native.collection-envelope.v1\", required: true",
+        );
+    let updated = call(
+        &registry,
+        &db,
+        "update_record",
+        json!({ "id": ARTIFACT, "body": changed, "if_body_digest": digest,
+                "reason": "Change every declared input contract." }),
+    )
+    .await;
+    let continuity = &updated["artifact_input_continuity"];
+    assert_eq!(
+        continuity["status"], "artifact_inputs_partially_carried",
+        "{updated:#}"
+    );
+    assert_eq!(continuity["carried_binding_count"], 0);
+    assert_eq!(continuity["dropped_binding_count"], 2);
+    assert_eq!(continuity["carried_grant_count"], 1);
+    assert_eq!(continuity["dropped_grant_count"], 2);
+    assert_eq!(continuity["changed_ports"], json!(["orders", "refs"]));
+    let bindings: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM artifact_inputs WHERE artifact_id=?")
+            .bind(ARTIFACT)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(bindings, 0);
+    let new_event = updated["source_event_id"].as_str().unwrap();
+    let nav_source: String = sqlx::query_scalar(
+        "SELECT artifact_source_event_id FROM artifact_module_grants
+          WHERE artifact_id=? AND capability='navigation.record.user_gesture'",
+    )
+    .bind(ARTIFACT)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(nav_source, new_event);
+    let input_grants: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM artifact_module_grants
+          WHERE artifact_id=? AND capability='input.read'",
+    )
+    .bind(ARTIFACT)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(input_grants, 0);
+    assert!(native_ce::conformance::run_conformance(&db).await.ok);
+}
+
+#[tokio::test]
+async fn a_grant_from_revision_n_is_not_honoured_at_revision_n_plus_one() {
+    let (db, registry, digest, _guard) = two_port_nav_fixture().await;
+    let revision_n_event: String = sqlx::query_scalar(
+        "SELECT id FROM content_events WHERE record_id=?
+          AND type IN ('record.created','record.updated','receipt.committed.v1')
+          AND json_type(payload,'$.body') IS NOT NULL ORDER BY seq DESC LIMIT 1",
+    )
+    .bind(ARTIFACT)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    // A label-only edit keeps every declaration, so everything carries — but
+    // the source revision still advances to N+1.
+    let relabelled = two_port_nav_source("Two ports relabelled");
+    let updated = call(
+        &registry,
+        &db,
+        "update_record",
+        json!({ "id": ARTIFACT, "body": relabelled, "if_body_digest": digest,
+                "reason": "Advance the exact source without touching declarations." }),
+    )
+    .await;
+    assert_eq!(
+        updated["artifact_input_continuity"]["status"], "artifact_inputs_carried_forward",
+        "{updated:#}"
+    );
+    let revision_n_plus_one = updated["source_event_id"].as_str().unwrap().to_owned();
+    assert_ne!(revision_n_plus_one, revision_n_event);
+    // No grant or binding row still points at revision N: authority moved only
+    // through re-attestation to N+1, never by inheritance.
+    let stale_grants: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM artifact_module_grants
+          WHERE artifact_id=? AND artifact_source_event_id=?",
+    )
+    .bind(ARTIFACT)
+    .bind(&revision_n_event)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    let stale_bindings: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM artifact_inputs
+          WHERE artifact_id=? AND artifact_source_event_id=?",
+    )
+    .bind(ARTIFACT)
+    .bind(&revision_n_event)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!((stale_grants, stale_bindings), (0, 0));
+    // The re-attested grants are honoured at N+1 ...
+    let rendered = call(&registry, &db, "render_artifact", json!({"id":ARTIFACT})).await;
+    assert_eq!(rendered["status"], "rendered", "{rendered:#}");
+    // ... while the old revision identity is dead.
+    let mut invocation = envelope("mark_triaged", &digest, "k-stale-revision");
+    invocation["slots"] = json!({ "record": INSIDE });
+    invocation["observed"] = observed(&registry, &db, INSIDE, "triage").await;
+    let refused = call(&registry, &db, "invoke_artifact_interaction", invocation).await;
+    assert_eq!(refused["status"], "rejected", "{refused:#}");
+    assert_eq!(refused["error"]["code"], "stale_source_digest");
+    assert!(native_ce::conformance::run_conformance(&db).await.ok);
+}
+
+#[tokio::test]
+async fn a_forged_carry_for_a_changed_port_is_rejected() {
+    let (db, registry, digest, _guard) = two_port_nav_fixture().await;
+    // The revision-0 binding and its content-event sequence: the predecessor
+    // a forged carry would have to name.
+    let bound_rows: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT seq,payload FROM content_events
+          WHERE record_id=? AND type='artifact.input_bound'",
+    )
+    .bind(ARTIFACT)
+    .fetch_all(db.pool())
+    .await
+    .unwrap();
+    let (bound_seq, bound) = bound_rows
+        .into_iter()
+        .map(|(seq, payload)| (seq, serde_json::from_str::<Value>(&payload).unwrap()))
+        .find(|(_, payload)| payload["port_name"] == "orders")
+        .expect("the orders port was bound");
+    let old_attestation = bound["artifact_source_attestation_event_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let old_descriptor: Value = serde_json::from_str(
+        &sqlx::query_scalar::<_, String>(
+            "SELECT descriptor FROM artifact_source_attestations WHERE attestation_event_id=?",
+        )
+        .bind(&old_attestation)
+        .fetch_one(db.pool())
+        .await
+        .unwrap(),
+    )
+    .unwrap();
+    // Change the orders declaration: the write path unbinds it.
+    let changed = two_port_nav_source("Two ports").replace(
+        "orders: { envelope: \"native.collection-envelope.v1\", required: true",
+        "orders: { envelope: \"native.collection-envelope.v1\", required: false",
+    );
+    let updated = call(
+        &registry,
+        &db,
+        "update_record",
+        json!({ "id": ARTIFACT, "body": changed, "if_body_digest": digest,
+                "reason": "Drop the orders binding for the forgery fixture." }),
+    )
+    .await;
+    assert_eq!(
+        updated["artifact_input_continuity"]["status"], "artifact_inputs_partially_carried",
+        "{updated:#}"
+    );
+    assert!(native_ce::conformance::run_conformance(&db).await.ok);
+    let old_surface = updated["artifact_input_continuity"]["old_declaration_surface_sha256"]
+        .as_str()
+        .unwrap();
+    let new_surface = updated["artifact_input_continuity"]["new_declaration_surface_sha256"]
+        .as_str()
+        .unwrap();
+    // Calibration: the test's canonical digest must match the engine's surface
+    // digest, or the forged payload below would prove nothing.
+    assert_eq!(
+        canonical_digest(&old_descriptor["artifact_ports"]),
+        old_surface,
+        "the test canonicalisation must match the engine"
+    );
+    let new_event = updated["source_event_id"].as_str().unwrap().to_owned();
+    let new_digest = updated["body_digest"].as_str().unwrap().to_owned();
+    let new_attestation: String = sqlx::query_scalar(
+        "SELECT attestation_event_id FROM artifact_source_attestations
+          WHERE artifact_id=? AND source_event_id=?",
+    )
+    .bind(ARTIFACT)
+    .bind(&new_event)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    let new_descriptor: Value = serde_json::from_str(
+        &sqlx::query_scalar::<_, String>(
+            "SELECT descriptor FROM artifact_source_attestations WHERE attestation_event_id=?",
+        )
+        .bind(&new_attestation)
+        .fetch_one(db.pool())
+        .await
+        .unwrap(),
+    )
+    .unwrap();
+    let new_orders = new_descriptor["artifact_ports"]["orders"].clone();
+    // Resurrect the dropped predecessor row, as a stale cache would.
+    let write_pool = crate::common::fixture_write_pool(&db).await;
+    sqlx::query(
+        "INSERT INTO artifact_inputs
+          (artifact_id,port_name,collection_id,artifact_source_attestation_event_id,
+           artifact_source_event_id,artifact_source_sha256,event_seq)
+         VALUES(?,?,?,?,?,?,?)",
+    )
+    .bind(ARTIFACT)
+    .bind("orders")
+    .bind(bound["collection_id"].as_str().unwrap())
+    .bind(
+        bound["artifact_source_attestation_event_id"]
+            .as_str()
+            .unwrap(),
+    )
+    .bind(bound["artifact_source_event_id"].as_str().unwrap())
+    .bind(bound["artifact_source_sha256"].as_str().unwrap())
+    .bind(bound_seq)
+    .execute(&write_pool)
+    .await
+    .unwrap();
+    // An otherwise-valid carry chaining the two revisions for the changed
+    // port: predecessor, digests, adjacency and binding attestation all check
+    // out, so only the per-port gate can refuse it.
+    let attestation_value = json!({
+        "namespace": "native.mdx.artifact-input-attestation.v1",
+        "artifact_id": ARTIFACT,
+        "artifact_source_event_id": new_event,
+        "artifact_source_sha256": new_digest,
+        "artifact_source_attestation_event_id": new_attestation,
+        "port_name": "orders",
+        "port_declaration": new_orders,
+    });
+    let forged = json!({
+        "binding": {
+            "artifact_id": ARTIFACT,
+            "port_name": "orders",
+            "collection_id": bound["collection_id"],
+            "artifact_source_event_id": new_event,
+            "artifact_source_sha256": new_digest,
+            "artifact_source_attestation_event_id": new_attestation,
+            "port_declaration": new_orders,
+            "attestation_sha256": canonical_digest(&attestation_value),
+        },
+        "predecessor_binding_event_seq": bound_seq,
+        "predecessor_source_attestation_event_id": bound["artifact_source_attestation_event_id"],
+        "predecessor_source_event_id": bound["artifact_source_event_id"],
+        "predecessor_source_sha256": bound["artifact_source_sha256"],
+        "old_declaration_surface_sha256": old_surface,
+        "new_declaration_surface_sha256": new_surface,
+    });
+    let seq: i64 = sqlx::query_scalar("SELECT MAX(seq) FROM content_events")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    let created_at: String = sqlx::query_scalar(
+        "SELECT created_at FROM content_events WHERE record_id=? ORDER BY seq DESC LIMIT 1",
+    )
+    .bind(ARTIFACT)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    let event = native_ce::events::EventRow {
+        local_seq: seq + 100,
+        id: uuid::Uuid::new_v4().to_string(),
+        record_id: ARTIFACT.into(),
+        event_type: "artifact.input_carried".into(),
+        payload: Some(forged.to_string()),
+        actor: Some("test:forged-carry".into()),
+        run_key: None,
+        parent_key: None,
+        intent: None,
+        created_at: created_at.clone(),
+        causal_envelope: native_ce::events::CausalEnvelopeV1::default(),
+        act: None,
+    };
+    let mut conn = crate::common::fixture_write_pool(&db)
+        .await
+        .acquire()
+        .await
+        .unwrap();
+    let error = native_ce::projector::project(&mut conn, &event)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("port declaration changed"),
+        "a changed port must fail closed at the per-port gate: {error}"
+    );
 }
 
 #[tokio::test]
@@ -2200,6 +3204,7 @@ async fn carry_events_cannot_skip_an_incompatible_intervening_revision() {
             intent: None,
             created_at: created_at.clone(),
             causal_envelope: native_ce::events::CausalEnvelopeV1::default(),
+            act: None,
         };
         let mut conn = crate::common::fixture_write_pool(&db)
             .await
@@ -2959,4 +3964,1322 @@ async fn a_creation_with_the_flag_set_refreshes_both_record_and_plan() {
         "{committed:#}"
     );
     assert!(committed["refresh"]["plan"].is_object(), "{committed:#}");
+    // The bonus mirrors the render shape generically: the safe-tree render
+    // carries an input (but no top-level digest), so both ride along.
+    assert!(committed["refresh"]["input"].is_object(), "{committed:#}");
+}
+
+/// A document that publishes its own view state travels the real bridge: the
+/// body validates and renders to an isolated launch, the delivered bytes carry
+/// the handoff surface, and a body rewrite renders a new digest for the host
+/// to hand that state to. Nothing here changes validation or the authority
+/// boundary — it exercises create, render, rewrite and launch delivery.
+#[tokio::test]
+async fn html_view_state_body_renders_and_its_launch_carries_the_handoff_bridge() {
+    use axum::body::{to_bytes, Body};
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    const VIEW_ARTIFACT: &str = "9a210000-0000-4000-8000-000000000001";
+    fn tabs_source(active: &str) -> String {
+        format!(
+            "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+            <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
+            <title>Workspace tabs</title></head><body><main><h1>Workspace</h1>\
+            <div role=\"tablist\"><button type=\"button\" data-tab=\"usage\">Usage</button>\
+            <button type=\"button\" data-tab=\"billing\">Billing</button></div>\
+            <p data-active-tab>{active}</p></main><script>var tabs=\
+            document.querySelectorAll('[data-tab]');function show(name){{for(var \
+            i=0;i<tabs.length;i+=1){{tabs[i].setAttribute('aria-selected',\
+            tabs[i].getAttribute('data-tab')===name?'true':'false')}};\
+            document.querySelector('[data-active-tab]').textContent=name;\
+            window.nativeArtifact.setViewState({{tab:name}},{{schema:'tabs.v1'}})}}\
+            for(var j=0;j<tabs.length;j+=1){{(function(button){{button.\
+            addEventListener('click',function(){{show(button.getAttribute('data-tab'))}})}})\
+            (tabs[j])}}window.nativeArtifact.ready.then(function(delivery){{var \
+            handed=delivery.viewState||window.nativeArtifact.viewState;\
+            if(handed&&handed.value&&handed.value.tab){{show(handed.value.tab)}}}})\
+            </script></body></html>"
+        )
+    }
+
+    native_ce::artifact_html::configure(
+        native_ce::artifact_html::RuntimeConfig::new(
+            "https://workbench.test",
+            "https://artifacts.test",
+        )
+        .unwrap(),
+    );
+    let guard = Arc::clone(integration_guard()).lock_owned().await;
+    let db = create_database(":memory:").await.unwrap();
+    let mut registry = ToolRegistry::new();
+    register_surface_tools(&mut registry).unwrap();
+    let first = tabs_source("usage");
+    let created = registry
+        .call(
+            db.clone(),
+            Caller::local(),
+            "create_record",
+            json!({
+                "id": VIEW_ARTIFACT, "type": "Document", "kind": "artifact",
+                "name": "Workspace tabs", "body": first,
+                "facets": { "runtime": "native.html.v1" },
+                "reason": "Prove a view-state body validates and renders.",
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(
+        created.get("diagnostic").is_none() && created.get("error").is_none(),
+        "{created:#}"
+    );
+    let rendered = call(
+        &registry,
+        &db,
+        "render_artifact",
+        json!({ "id": VIEW_ARTIFACT }),
+    )
+    .await;
+    assert_eq!(rendered["status"], "rendered", "{rendered:#}");
+    assert_eq!(rendered["plan"]["kind"], "isolated_html");
+    assert_eq!(rendered["plan"]["body_digest"], digest_of(&first));
+
+    // The body rewrite a successor frame must restore across: a new digest,
+    // still rendered, with the same bridge waiting underneath.
+    let second = tabs_source("billing");
+    assert_ne!(digest_of(&second), digest_of(&first));
+    registry
+        .call(
+            db.clone(),
+            Caller::local(),
+            "update_record",
+            json!({
+                "id": VIEW_ARTIFACT, "body": second,
+                "if_body_digest": digest_of(&first),
+                "reason": "Rewrite the body out of band, as the agent edit does.",
+            }),
+        )
+        .await
+        .unwrap();
+    let rewritten = call(
+        &registry,
+        &db,
+        "render_artifact",
+        json!({ "id": VIEW_ARTIFACT }),
+    )
+    .await;
+    assert_eq!(rewritten["status"], "rendered", "{rewritten:#}");
+    assert_eq!(rewritten["plan"]["body_digest"], digest_of(&second));
+
+    // The real delivery path: validate, mint the one-use launch, redeem it
+    // over HTTP, and prove the delivered bytes carry the handoff surface.
+    let manifest = native_ce::artifact_html::validate(&second).unwrap();
+    let config = native_ce::artifact_html::configuration().unwrap();
+    let issued = native_ce::artifact_html::issue_launch(
+        &second,
+        &manifest,
+        "principal",
+        Some("db:test"),
+        VIEW_ARTIFACT,
+    )
+    .unwrap();
+    let token = issued.url.rsplit('/').next().unwrap().to_string();
+    let app = native_ce::artifact_html::router(config);
+    let request = || {
+        Request::builder()
+            .uri(format!("/artifact-runtime/v1/launch/{token}"))
+            .header("host", "artifacts.test")
+            .body(Body::empty())
+            .unwrap()
+    };
+    let response = app.clone().oneshot(request()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let delivered = String::from_utf8_lossy(&body);
+    for marker in [
+        "setViewState",
+        "viewState",
+        "type:\"view-state\"",
+        "view_state",
+        "from_body_digest",
+        "native-html-init",
+    ] {
+        assert!(
+            delivered.contains(marker),
+            "delivered launch is missing the handoff surface: {marker}"
+        );
+    }
+    assert_eq!(
+        app.oneshot(request()).await.unwrap().status(),
+        StatusCode::GONE,
+        "the launch stays one-use with a view-state body"
+    );
+    drop(guard);
+}
+
+// --- Alpha personal-install guard (task 26ba75a L2 backend slice) ---
+//
+// An optional exact guard on a reversible facet intent, checked inside the
+// facet write transaction against the same account's install. A refusal names
+// the personal install only and never globally disables the artifact.
+
+const ALPHA_GUARD_ACCOUNT: &str = "alice";
+const ALPHA_GUARD_PACKAGE_A: &str = "agent.attention-cockpit";
+const ALPHA_GUARD_PACKAGE_B: &str = "agent.team-pulse";
+
+fn alpha_guard_declaration() -> Value {
+    json!({"needs": ["attention.query.v1"], "effects": ["task.triage-set.v1"]})
+}
+
+fn alpha_guard_declaration_no_effect() -> Value {
+    json!({"needs": ["attention.query.v1"], "effects": []})
+}
+
+fn alpha_guard_configure_html() {
+    native_ce::artifact_html::configure(
+        native_ce::artifact_html::RuntimeConfig::new(
+            "https://workbench.test",
+            "https://artifacts.test",
+        )
+        .unwrap(),
+    );
+}
+
+async fn alpha_guard_source_revision(db: &Db, artifact_id: &str) -> String {
+    sqlx::query_scalar(
+        "SELECT id FROM content_events WHERE record_id=? AND json_type(payload,'$.body') IS NOT NULL ORDER BY seq DESC LIMIT 1",
+    )
+    .bind(artifact_id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap()
+}
+
+fn alpha_guard_pin_for(body: &str, declaration: &Value) -> (String, String) {
+    use native_ce::mcp::tools::alpha_tabs::{
+        alpha_tab_bundle_digest, alpha_tab_declaration_digest, alpha_tab_digest,
+    };
+    let declaration_digest = alpha_tab_declaration_digest(declaration);
+    let digest = alpha_tab_digest(
+        &alpha_tab_bundle_digest(body),
+        &declaration_digest,
+        "native.html.v1",
+    );
+    (digest, declaration_digest)
+}
+
+fn alpha_guard_preview_caller(account: &str, args: &Value) -> Caller {
+    use native_ce::mcp::tools::alpha_tabs::alpha_tab_preview_authority_for;
+    let field = |key: &str| args.get(key).and_then(Value::as_str).unwrap_or_default();
+    let declaration = args.get("declaration").cloned().unwrap_or(Value::Null);
+    Caller::authenticated(account).with_verified_alpha_tab_preview(alpha_tab_preview_authority_for(
+        account,
+        field("package"),
+        field("version"),
+        field("digest"),
+        field("artifact_id"),
+        field("source_revision"),
+        &declaration,
+    ))
+}
+
+fn alpha_guard_adopt_caller(account: &str, args: &Value) -> Caller {
+    use native_ce::mcp::tools::alpha_tabs::alpha_tab_preview_authority_for;
+    let field = |key: &str| args.get(key).and_then(Value::as_str).unwrap_or_default();
+    let declaration = args.get("declaration").cloned().unwrap_or(Value::Null);
+    Caller::authenticated(account).with_verified_alpha_tab_adopt(alpha_tab_preview_authority_for(
+        account,
+        field("package"),
+        field("version"),
+        field("digest"),
+        field("artifact_id"),
+        field("source_revision"),
+        &declaration,
+    ))
+}
+
+async fn alpha_guard_grants(db: &Db, account: &str) {
+    replace_explicit_policy(
+        db,
+        "test:policy",
+        ARTIFACT,
+        vec![AllowEntry::account(account, Capability::View)],
+    )
+    .await
+    .unwrap();
+    replace_explicit_policy(
+        db,
+        "test:policy",
+        COLLECTION,
+        vec![AllowEntry::account(account, Capability::View)],
+    )
+    .await
+    .unwrap();
+    replace_explicit_policy(
+        db,
+        "test:policy",
+        INSIDE,
+        vec![
+            AllowEntry::account(account, Capability::View),
+            AllowEntry::account(account, Capability::Edit),
+        ],
+    )
+    .await
+    .unwrap();
+}
+
+/// Install + attested preview + attested adopt for one package, returning the
+/// verified generation event plus the exact pin the guard must echo.
+async fn alpha_guard_verified_install(
+    db: &Db,
+    registry: &ToolRegistry,
+    account: &str,
+    package: &str,
+    body: &str,
+    declaration: Value,
+) -> (String, String, String, String) {
+    let source_revision = alpha_guard_source_revision(db, ARTIFACT).await;
+    let (digest, declaration_digest) = alpha_guard_pin_for(body, &declaration);
+    let installed = registry
+        .call(
+            db.clone(),
+            Caller::authenticated(account),
+            "manage_alpha_tabs",
+            json!({
+                "action": "install",
+                "package": package,
+                "version": "0.1.0",
+                "digest": digest,
+                "artifact_id": ARTIFACT,
+                "source_revision": source_revision,
+                "declaration": declaration,
+                "reason": "Install the guarded alpha tab.",
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(installed["changed"], true, "{installed:#}");
+    let install_event = installed["install"]["event_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let preview_args = json!({
+        "action": "preview",
+        "package": package,
+        "version": "0.1.0",
+        "digest": digest,
+        "artifact_id": ARTIFACT,
+        "source_revision": source_revision,
+        "declaration": declaration,
+        "reason": "Preview the guarded alpha tab.",
+    });
+    let preview = registry
+        .call(
+            db.clone(),
+            alpha_guard_preview_caller(account, &preview_args),
+            "manage_alpha_tabs",
+            preview_args,
+        )
+        .await
+        .unwrap();
+    let receipt_id = preview["receipt"]["receipt_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let nonce = preview["receipt"]["nonce"].as_str().unwrap().to_string();
+    let session = preview["receipt"]["preview_session"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let adopt_args = json!({
+        "action": "adopt",
+        "package": package,
+        "version": "0.1.0",
+        "digest": digest,
+        "artifact_id": ARTIFACT,
+        "source_revision": source_revision,
+        "declaration": declaration,
+        "receipt_id": receipt_id,
+        "nonce": nonce,
+        "preview_session": session,
+        "expected_install_event_id": install_event,
+        "reason": "Adopt the guarded alpha tab.",
+    });
+    let adopted = registry
+        .call(
+            db.clone(),
+            alpha_guard_adopt_caller(account, &adopt_args),
+            "manage_alpha_tabs",
+            adopt_args,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        adopted["install"]["adoption"], "shell_adopt.v1",
+        "{adopted:#}"
+    );
+    let verified_event = adopted["install"]["event_id"].as_str().unwrap().to_string();
+    (verified_event, source_revision, digest, declaration_digest)
+}
+
+fn alpha_guard_json(
+    package: &str,
+    event_id: &str,
+    source_revision: &str,
+    digest: &str,
+    declaration_digest: &str,
+) -> Value {
+    json!({
+        "package": package,
+        "expected_install_event_id": event_id,
+        "artifact_id": ARTIFACT,
+        "source_revision": source_revision,
+        "version": "0.1.0",
+        "digest": digest,
+        "declaration_digest": declaration_digest,
+    })
+}
+
+async fn alpha_guard_facet_value(db: &Db) -> Option<String> {
+    sqlx::query_scalar("SELECT value FROM facet_values WHERE record_id=? AND key='triage'")
+        .bind(INSIDE)
+        .fetch_optional(db.pool())
+        .await
+        .unwrap()
+        .flatten()
+}
+
+async fn alpha_guard_keyed_writes(db: &Db, key: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM content_events WHERE record_id=? AND json_extract(payload,'$.origin.idempotency_key')=?",
+    )
+    .bind(INSIDE)
+    .bind(key)
+    .fetch_one(db.pool())
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn alpha_guard_commits_guarded_facet_set_and_preserves_unguarded_path() {
+    alpha_guard_configure_html();
+    let body = html_interaction_source(&artifact_source("Orders"));
+    let (db, registry, body_digest, _lock) =
+        fixture_with_source(body.clone(), "native.html.v1").await;
+    alpha_guard_grants(&db, ALPHA_GUARD_ACCOUNT).await;
+    let alice = Caller::authenticated(ALPHA_GUARD_ACCOUNT);
+    let (verified, source_revision, digest, declaration_digest) = alpha_guard_verified_install(
+        &db,
+        &registry,
+        ALPHA_GUARD_ACCOUNT,
+        ALPHA_GUARD_PACKAGE_A,
+        &body,
+        alpha_guard_declaration(),
+    )
+    .await;
+    let guard = alpha_guard_json(
+        ALPHA_GUARD_PACKAGE_A,
+        &verified,
+        &source_revision,
+        &digest,
+        &declaration_digest,
+    );
+    let invocation = json!({
+        "version": INVOCATION_VERSION,
+        "artifact_id": ARTIFACT,
+        "entry_id": "mark_triaged",
+        "source_digest": body_digest,
+        "slots": { "record": INSIDE },
+        "observed": { INSIDE: { "triage": "obs:0" } },
+        "idempotency_key": "alpha:guarded:one",
+        "alpha_install_guard": guard,
+    });
+    let committed = call_as(
+        &registry,
+        &db,
+        alice.clone(),
+        "invoke_artifact_interaction",
+        invocation,
+    )
+    .await
+    .unwrap();
+    assert_eq!(committed["status"], "committed", "{committed:#}");
+    assert_eq!(committed["changes"][0]["after"], "triaged");
+    assert_eq!(
+        alpha_guard_facet_value(&db).await.as_deref(),
+        Some("triaged")
+    );
+    // Unguarded existing path is unchanged: same caller, fresh CAS, no guard.
+    let version = committed["changes"][0]["version"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let unguarded = json!({
+        "version": INVOCATION_VERSION,
+        "artifact_id": ARTIFACT,
+        "entry_id": "set_triage",
+        "source_digest": body_digest,
+        "slots": { "record": INSIDE },
+        "values": { "choice": "blocked" },
+        "observed": { INSIDE: { "triage": version } },
+        "idempotency_key": "alpha:unguarded:two",
+    });
+    let second = call_as(
+        &registry,
+        &db,
+        alice,
+        "invoke_artifact_interaction",
+        unguarded,
+    )
+    .await
+    .unwrap();
+    assert_eq!(second["status"], "committed", "{second:#}");
+    assert_eq!(second["changes"][0]["after"], "blocked");
+}
+
+#[tokio::test]
+async fn alpha_guard_refuses_disabled_and_stale_generation_before_write() {
+    alpha_guard_configure_html();
+    let body = html_interaction_source(&artifact_source("Orders"));
+    let (db, registry, body_digest, _lock) =
+        fixture_with_source(body.clone(), "native.html.v1").await;
+    alpha_guard_grants(&db, ALPHA_GUARD_ACCOUNT).await;
+    let alice = Caller::authenticated(ALPHA_GUARD_ACCOUNT);
+    let (verified, source_revision, digest, declaration_digest) = alpha_guard_verified_install(
+        &db,
+        &registry,
+        ALPHA_GUARD_ACCOUNT,
+        ALPHA_GUARD_PACKAGE_A,
+        &body,
+        alpha_guard_declaration(),
+    )
+    .await;
+    // Baseline guarded write proves the pin.
+    let baseline_guard = alpha_guard_json(
+        ALPHA_GUARD_PACKAGE_A,
+        &verified,
+        &source_revision,
+        &digest,
+        &declaration_digest,
+    );
+    let baseline = call_as(
+        &registry,
+        &db,
+        alice.clone(),
+        "invoke_artifact_interaction",
+        json!({
+            "version": INVOCATION_VERSION,
+            "artifact_id": ARTIFACT,
+            "entry_id": "mark_triaged",
+            "source_digest": body_digest,
+            "slots": { "record": INSIDE },
+            "observed": { INSIDE: { "triage": "obs:0" } },
+            "idempotency_key": "alpha:disable:base",
+            "alpha_install_guard": baseline_guard,
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(baseline["status"], "committed", "{baseline:#}");
+    let current = baseline["changes"][0]["version"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // Disable moves the generation; the old guard is now stale.
+    let disabled = call_as(
+        &registry,
+        &db,
+        alice.clone(),
+        "manage_alpha_tabs",
+        json!({
+            "action": "disable",
+            "package": ALPHA_GUARD_PACKAGE_A,
+            "expected_install_event_id": verified,
+            "reason": "Pause the guarded tab.",
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(disabled["install"]["status"], "disabled");
+    let disabled_event = disabled["install"]["event_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // Stale generation refuses before any write.
+    let stale_guard = alpha_guard_json(
+        ALPHA_GUARD_PACKAGE_A,
+        &verified,
+        &source_revision,
+        &digest,
+        &declaration_digest,
+    );
+    let stale = call_as(
+        &registry,
+        &db,
+        alice.clone(),
+        "invoke_artifact_interaction",
+        json!({
+            "version": INVOCATION_VERSION,
+            "artifact_id": ARTIFACT,
+            "entry_id": "set_triage",
+            "source_digest": body_digest,
+            "slots": { "record": INSIDE },
+            "values": { "choice": "blocked" },
+            "observed": { INSIDE: { "triage": current } },
+            "idempotency_key": "alpha:disable:stale",
+            "alpha_install_guard": stale_guard,
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(stale["status"], "rejected", "{stale:#}");
+    assert_eq!(
+        stale["error"]["code"], "alpha_guard_cas_mismatch",
+        "{stale:#}"
+    );
+    assert_eq!(
+        alpha_guard_keyed_writes(&db, "alpha:disable:stale").await,
+        0
+    );
+    assert_eq!(
+        alpha_guard_facet_value(&db).await.as_deref(),
+        Some("triaged")
+    );
+    // A fresh generation against the disabled row refuses as disabled.
+    let fresh_guard = alpha_guard_json(
+        ALPHA_GUARD_PACKAGE_A,
+        &disabled_event,
+        &source_revision,
+        &digest,
+        &declaration_digest,
+    );
+    let refused = call_as(
+        &registry,
+        &db,
+        alice.clone(),
+        "invoke_artifact_interaction",
+        json!({
+            "version": INVOCATION_VERSION,
+            "artifact_id": ARTIFACT,
+            "entry_id": "set_triage",
+            "source_digest": body_digest,
+            "slots": { "record": INSIDE },
+            "values": { "choice": "blocked" },
+            "observed": { INSIDE: { "triage": current } },
+            "idempotency_key": "alpha:disable:fresh",
+            "alpha_install_guard": fresh_guard,
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(refused["status"], "rejected", "{refused:#}");
+    assert_eq!(
+        refused["error"]["code"], "alpha_guard_disabled",
+        "{refused:#}"
+    );
+    assert_eq!(
+        alpha_guard_keyed_writes(&db, "alpha:disable:fresh").await,
+        0
+    );
+    assert_eq!(
+        alpha_guard_facet_value(&db).await.as_deref(),
+        Some("triaged")
+    );
+    // A disabled personal tab never globally disables the artifact: the same
+    // caller without a guard still writes.
+    let plain = call_as(
+        &registry,
+        &db,
+        alice,
+        "invoke_artifact_interaction",
+        json!({
+            "version": INVOCATION_VERSION,
+            "artifact_id": ARTIFACT,
+            "entry_id": "set_triage",
+            "source_digest": body_digest,
+            "slots": { "record": INSIDE },
+            "values": { "choice": "blocked" },
+            "observed": { INSIDE: { "triage": current } },
+            "idempotency_key": "alpha:disable:plain",
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(plain["status"], "committed", "{plain:#}");
+}
+
+#[tokio::test]
+async fn alpha_guard_sibling_install_stays_independent() {
+    alpha_guard_configure_html();
+    let body = html_interaction_source(&artifact_source("Orders"));
+    let (db, registry, body_digest, _lock) =
+        fixture_with_source(body.clone(), "native.html.v1").await;
+    alpha_guard_grants(&db, ALPHA_GUARD_ACCOUNT).await;
+    let alice = Caller::authenticated(ALPHA_GUARD_ACCOUNT);
+    let (event_a, source_revision, digest, declaration_digest) = alpha_guard_verified_install(
+        &db,
+        &registry,
+        ALPHA_GUARD_ACCOUNT,
+        ALPHA_GUARD_PACKAGE_A,
+        &body,
+        alpha_guard_declaration(),
+    )
+    .await;
+    let (event_b, _, _, _) = alpha_guard_verified_install(
+        &db,
+        &registry,
+        ALPHA_GUARD_ACCOUNT,
+        ALPHA_GUARD_PACKAGE_B,
+        &body,
+        alpha_guard_declaration(),
+    )
+    .await;
+    // Disable only the sibling.
+    let disabled_b = call_as(
+        &registry,
+        &db,
+        alice.clone(),
+        "manage_alpha_tabs",
+        json!({
+            "action": "disable",
+            "package": ALPHA_GUARD_PACKAGE_B,
+            "expected_install_event_id": event_b,
+            "reason": "Pause the sibling tab.",
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(disabled_b["install"]["status"], "disabled");
+    // The first tab's guard still commits.
+    let guard_a = alpha_guard_json(
+        ALPHA_GUARD_PACKAGE_A,
+        &event_a,
+        &source_revision,
+        &digest,
+        &declaration_digest,
+    );
+    let committed = call_as(
+        &registry,
+        &db,
+        alice.clone(),
+        "invoke_artifact_interaction",
+        json!({
+            "version": INVOCATION_VERSION,
+            "artifact_id": ARTIFACT,
+            "entry_id": "mark_triaged",
+            "source_digest": body_digest,
+            "slots": { "record": INSIDE },
+            "observed": { INSIDE: { "triage": "obs:0" } },
+            "idempotency_key": "alpha:sibling:a",
+            "alpha_install_guard": guard_a,
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(committed["status"], "committed", "{committed:#}");
+    // The disabled sibling refuses on its own guard.
+    let disabled_event_b = disabled_b["install"]["event_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let guard_b = alpha_guard_json(
+        ALPHA_GUARD_PACKAGE_B,
+        &disabled_event_b,
+        &source_revision,
+        &digest,
+        &declaration_digest,
+    );
+    let current = committed["changes"][0]["version"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let refused = call_as(
+        &registry,
+        &db,
+        alice,
+        "invoke_artifact_interaction",
+        json!({
+            "version": INVOCATION_VERSION,
+            "artifact_id": ARTIFACT,
+            "entry_id": "set_triage",
+            "source_digest": body_digest,
+            "slots": { "record": INSIDE },
+            "values": { "choice": "blocked" },
+            "observed": { INSIDE: { "triage": current } },
+            "idempotency_key": "alpha:sibling:b",
+            "alpha_install_guard": guard_b,
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(refused["status"], "rejected", "{refused:#}");
+    assert_eq!(
+        refused["error"]["code"], "alpha_guard_disabled",
+        "{refused:#}"
+    );
+}
+
+#[tokio::test]
+async fn alpha_guard_refuses_unconsented_effect_before_write() {
+    // An otherwise valid verified pin whose consented effects omit
+    // task.triage-set.v1 refuses: a declared v2 interaction or a matching
+    // bundle digest alone is never effect consent.
+    alpha_guard_configure_html();
+    let body = html_interaction_source(&artifact_source("Orders"));
+    let (db, registry, body_digest, _lock) =
+        fixture_with_source(body.clone(), "native.html.v1").await;
+    alpha_guard_grants(&db, ALPHA_GUARD_ACCOUNT).await;
+    let alice = Caller::authenticated(ALPHA_GUARD_ACCOUNT);
+    let (verified, source_revision, digest, declaration_digest) = alpha_guard_verified_install(
+        &db,
+        &registry,
+        ALPHA_GUARD_ACCOUNT,
+        ALPHA_GUARD_PACKAGE_A,
+        &body,
+        alpha_guard_declaration_no_effect(),
+    )
+    .await;
+    let guard = alpha_guard_json(
+        ALPHA_GUARD_PACKAGE_A,
+        &verified,
+        &source_revision,
+        &digest,
+        &declaration_digest,
+    );
+    let refused = call_as(
+        &registry,
+        &db,
+        alice,
+        "invoke_artifact_interaction",
+        json!({
+            "version": INVOCATION_VERSION,
+            "artifact_id": ARTIFACT,
+            "entry_id": "mark_triaged",
+            "source_digest": body_digest,
+            "slots": { "record": INSIDE },
+            "observed": { INSIDE: { "triage": "obs:0" } },
+            "idempotency_key": "alpha:effect:one",
+            "alpha_install_guard": guard,
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(refused["status"], "rejected", "{refused:#}");
+    assert_eq!(
+        refused["error"]["code"], "alpha_guard_effect_unconsented",
+        "{refused:#}"
+    );
+    assert_eq!(alpha_guard_keyed_writes(&db, "alpha:effect:one").await, 0);
+    assert_eq!(alpha_guard_facet_value(&db).await, None);
+}
+
+#[tokio::test]
+async fn alpha_guard_absent_preserves_existing_invocation() {
+    // No install at all: the pre-guard envelope commits exactly as before.
+    let (db, registry, digest, _lock) = fixture().await;
+    let invocation = json!({
+        "version": INVOCATION_VERSION,
+        "artifact_id": ARTIFACT,
+        "entry_id": "mark_triaged",
+        "source_digest": digest,
+        "slots": { "record": INSIDE },
+        "observed": { INSIDE: { "triage": "obs:0" } },
+        "idempotency_key": "alpha:plain:one",
+    });
+    let committed = call(&registry, &db, "invoke_artifact_interaction", invocation).await;
+    assert_eq!(committed["status"], "committed", "{committed:#}");
+    assert!(committed.get("alpha_install_guard").is_none());
+}
+
+fn alpha_guard_dummy() -> Value {
+    // Well-formed shape (passes envelope validation) with no install behind
+    // it: scope checks run before any install lookup, so these refuse on
+    // scope alone.
+    json!({
+        "package": "agent.attention-cockpit",
+        "expected_install_event_id": "evt-dummy",
+        "artifact_id": ARTIFACT,
+        "source_revision": "rev-dummy",
+        "version": "0.1.0",
+        "digest": format!("sha256:{}", "d".repeat(64)),
+        "declaration_digest": "e".repeat(64),
+    })
+}
+
+#[tokio::test]
+async fn alpha_guard_refuses_record_create_with_guard() {
+    // Consent to triage-set never authorizes record.create: the guarded
+    // creation refuses before any write, even with a well-formed guard.
+    let (db, registry, digest, _lock) = create_fixture().await;
+    let refused = call(
+        &registry,
+        &db,
+        "invoke_artifact_interaction",
+        json!({
+            "version": INVOCATION_VERSION,
+            "artifact_id": ARTIFACT,
+            "entry_id": "create_task",
+            "source_digest": digest,
+            "values": { "title": "Guarded creation", "triage": "ready" },
+            "idempotency_key": "alpha:scope:create",
+            "alpha_install_guard": alpha_guard_dummy(),
+        }),
+    )
+    .await;
+    assert_eq!(refused["status"], "rejected", "{refused:#}");
+    assert_eq!(
+        refused["error"]["code"], "alpha_guard_unsupported_effect",
+        "{refused:#}"
+    );
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM records WHERE home_id=? AND type='WorkItem' AND kind='task'",
+    )
+    .bind(COLLECTION)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(count, 0, "a guarded creation must not write");
+}
+
+#[tokio::test]
+async fn alpha_guard_refuses_non_triage_facet_with_guard() {
+    // A verified triage-consented pin plus a declared non-triage entry
+    // (lifecycle) still refuses: effect consent is not facet consent.
+    // Scope is checked on the actual parsed entry before any write.
+    alpha_guard_configure_html();
+    let body = html_interaction_source(&artifact_source("Orders"));
+    let (db, registry, body_digest, _lock) =
+        fixture_with_source(body.clone(), "native.html.v1").await;
+    alpha_guard_grants(&db, ALPHA_GUARD_ACCOUNT).await;
+    let alice = Caller::authenticated(ALPHA_GUARD_ACCOUNT);
+    let (verified, source_revision, digest, declaration_digest) = alpha_guard_verified_install(
+        &db,
+        &registry,
+        ALPHA_GUARD_ACCOUNT,
+        ALPHA_GUARD_PACKAGE_A,
+        &body,
+        alpha_guard_declaration(),
+    )
+    .await;
+    let guard = alpha_guard_json(
+        ALPHA_GUARD_PACKAGE_A,
+        &verified,
+        &source_revision,
+        &digest,
+        &declaration_digest,
+    );
+    let refused = call_as(
+        &registry,
+        &db,
+        alice,
+        "invoke_artifact_interaction",
+        json!({
+            "version": INVOCATION_VERSION,
+            "artifact_id": ARTIFACT,
+            "entry_id": "start_work",
+            "source_digest": body_digest,
+            "slots": { "record": INSIDE },
+            "observed": { INSIDE: { "lifecycle": "rec:0" } },
+            "idempotency_key": "alpha:scope:lifecycle",
+            "alpha_install_guard": guard,
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(refused["status"], "rejected", "{refused:#}");
+    assert_eq!(
+        refused["error"]["code"], "alpha_guard_facet_unconsented",
+        "{refused:#}"
+    );
+    assert_eq!(
+        alpha_guard_keyed_writes(&db, "alpha:scope:lifecycle").await,
+        0
+    );
+}
+
+#[tokio::test]
+async fn alpha_guard_refuses_non_html_runtime_with_guard() {
+    // Guarded writes require native.html.v1, matching the alpha launch path.
+    // An MDX artifact with a well-formed guard refuses before any write,
+    // even though the same entry commits unguarded.
+    let (db, registry, digest, _lock) = fixture().await;
+    let refused = call(
+        &registry,
+        &db,
+        "invoke_artifact_interaction",
+        json!({
+            "version": INVOCATION_VERSION,
+            "artifact_id": ARTIFACT,
+            "entry_id": "mark_triaged",
+            "source_digest": digest,
+            "slots": { "record": INSIDE },
+            "observed": { INSIDE: { "triage": "obs:0" } },
+            "idempotency_key": "alpha:scope:mdx",
+            "alpha_install_guard": alpha_guard_dummy(),
+        }),
+    )
+    .await;
+    assert_eq!(refused["status"], "rejected", "{refused:#}");
+    assert_eq!(
+        refused["error"]["code"], "alpha_guard_unsupported_runtime",
+        "{refused:#}"
+    );
+    assert_eq!(alpha_guard_keyed_writes(&db, "alpha:scope:mdx").await, 0);
+    assert_eq!(alpha_guard_facet_value(&db).await, None);
+    // The same entry without a guard still commits: scope narrows only the
+    // guarded path.
+    let plain = call(
+        &registry,
+        &db,
+        "invoke_artifact_interaction",
+        json!({
+            "version": INVOCATION_VERSION,
+            "artifact_id": ARTIFACT,
+            "entry_id": "mark_triaged",
+            "source_digest": digest,
+            "slots": { "record": INSIDE },
+            "observed": { INSIDE: { "triage": "obs:0" } },
+            "idempotency_key": "alpha:scope:mdx-plain",
+        }),
+    )
+    .await;
+    assert_eq!(plain["status"], "committed", "{plain:#}");
+}
+
+// --- Guarded facet replay identity (P2-1): the persisted guard context is
+// part of replay identity. Same actor/artifact/entry/record/key replays only
+// under the identical guard context; anything else conflicts, never commits.
+
+#[tokio::test]
+async fn alpha_guard_replay_guarded_to_unguarded_conflicts() {
+    // A guarded commit followed by an unguarded retry under the same key must
+    // conflict: the unguarded call must not inherit the guarded commit's
+    // receipt and version token.
+    alpha_guard_configure_html();
+    let body = html_interaction_source(&artifact_source("Orders"));
+    let (db, registry, body_digest, _lock) =
+        fixture_with_source(body.clone(), "native.html.v1").await;
+    alpha_guard_grants(&db, ALPHA_GUARD_ACCOUNT).await;
+    let alice = Caller::authenticated(ALPHA_GUARD_ACCOUNT);
+    let (verified, source_revision, digest, declaration_digest) = alpha_guard_verified_install(
+        &db,
+        &registry,
+        ALPHA_GUARD_ACCOUNT,
+        ALPHA_GUARD_PACKAGE_A,
+        &body,
+        alpha_guard_declaration(),
+    )
+    .await;
+    let guard = alpha_guard_json(
+        ALPHA_GUARD_PACKAGE_A,
+        &verified,
+        &source_revision,
+        &digest,
+        &declaration_digest,
+    );
+    let committed = call_as(
+        &registry,
+        &db,
+        alice.clone(),
+        "invoke_artifact_interaction",
+        json!({
+            "version": INVOCATION_VERSION,
+            "artifact_id": ARTIFACT,
+            "entry_id": "mark_triaged",
+            "source_digest": body_digest,
+            "slots": { "record": INSIDE },
+            "observed": { INSIDE: { "triage": "obs:0" } },
+            "idempotency_key": "alpha:replay:guarded-plain",
+            "alpha_install_guard": guard,
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(committed["status"], "committed", "{committed:#}");
+    let current = committed["changes"][0]["version"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // Same actor/artifact/entry/record/key, guard dropped: the tool
+    // command-identity boundary refuses the changed input before the handler
+    // result surfaces, and the facet log-level guard comparison (the P2-1 fix)
+    // conflicts the same way if the attestation side table ever diverges.
+    let replay = call_as(
+        &registry,
+        &db,
+        alice,
+        "invoke_artifact_interaction",
+        json!({
+            "version": INVOCATION_VERSION,
+            "artifact_id": ARTIFACT,
+            "entry_id": "mark_triaged",
+            "source_digest": body_digest,
+            "slots": { "record": INSIDE },
+            "observed": { INSIDE: { "triage": current } },
+            "idempotency_key": "alpha:replay:guarded-plain",
+        }),
+    )
+    .await
+    .expect_err("reusing a guarded key without its guard must not replay");
+    assert!(
+        replay.to_string().contains("conflicting action input"),
+        "{replay:#}"
+    );
+    assert_eq!(
+        alpha_guard_keyed_writes(&db, "alpha:replay:guarded-plain").await,
+        1,
+        "a conflicting replay commits nothing"
+    );
+    assert_eq!(
+        alpha_guard_facet_value(&db).await.as_deref(),
+        Some("triaged")
+    );
+}
+
+#[tokio::test]
+async fn alpha_guard_replay_distinct_guard_contexts_conflict() {
+    // Two valid installs, one key: the second package's guard must not replay
+    // the first package's commit, even though its own guard verifies.
+    alpha_guard_configure_html();
+    let body = html_interaction_source(&artifact_source("Orders"));
+    let (db, registry, body_digest, _lock) =
+        fixture_with_source(body.clone(), "native.html.v1").await;
+    alpha_guard_grants(&db, ALPHA_GUARD_ACCOUNT).await;
+    let alice = Caller::authenticated(ALPHA_GUARD_ACCOUNT);
+    let (event_a, source_revision, digest, declaration_digest) = alpha_guard_verified_install(
+        &db,
+        &registry,
+        ALPHA_GUARD_ACCOUNT,
+        ALPHA_GUARD_PACKAGE_A,
+        &body,
+        alpha_guard_declaration(),
+    )
+    .await;
+    let (event_b, _, _, _) = alpha_guard_verified_install(
+        &db,
+        &registry,
+        ALPHA_GUARD_ACCOUNT,
+        ALPHA_GUARD_PACKAGE_B,
+        &body,
+        alpha_guard_declaration(),
+    )
+    .await;
+    let guard_a = alpha_guard_json(
+        ALPHA_GUARD_PACKAGE_A,
+        &event_a,
+        &source_revision,
+        &digest,
+        &declaration_digest,
+    );
+    let committed = call_as(
+        &registry,
+        &db,
+        alice.clone(),
+        "invoke_artifact_interaction",
+        json!({
+            "version": INVOCATION_VERSION,
+            "artifact_id": ARTIFACT,
+            "entry_id": "mark_triaged",
+            "source_digest": body_digest,
+            "slots": { "record": INSIDE },
+            "observed": { INSIDE: { "triage": "obs:0" } },
+            "idempotency_key": "alpha:replay:a-to-b",
+            "alpha_install_guard": guard_a,
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(committed["status"], "committed", "{committed:#}");
+    let current = committed["changes"][0]["version"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // Same key under package B's own valid guard: the tool command-identity
+    // boundary refuses the changed input (and the facet log-level guard
+    // comparison conflicts the same way if the side table ever diverges), so
+    // B never inherits A's receipt or version token.
+    let guard_b = alpha_guard_json(
+        ALPHA_GUARD_PACKAGE_B,
+        &event_b,
+        &source_revision,
+        &digest,
+        &declaration_digest,
+    );
+    let replay = call_as(
+        &registry,
+        &db,
+        alice,
+        "invoke_artifact_interaction",
+        json!({
+            "version": INVOCATION_VERSION,
+            "artifact_id": ARTIFACT,
+            "entry_id": "mark_triaged",
+            "source_digest": body_digest,
+            "slots": { "record": INSIDE },
+            "observed": { INSIDE: { "triage": current } },
+            "idempotency_key": "alpha:replay:a-to-b",
+            "alpha_install_guard": guard_b,
+        }),
+    )
+    .await
+    .expect_err("reusing a guarded key under another package must not replay");
+    assert!(
+        replay.to_string().contains("conflicting action input"),
+        "{replay:#}"
+    );
+    assert_eq!(
+        alpha_guard_keyed_writes(&db, "alpha:replay:a-to-b").await,
+        1,
+        "a conflicting replay commits nothing"
+    );
+    assert_eq!(
+        alpha_guard_facet_value(&db).await.as_deref(),
+        Some("triaged")
+    );
+}
+
+#[tokio::test]
+async fn alpha_guard_replay_same_guard_stays_idempotent() {
+    // The identical guard context under the same key still replays idempotent:
+    // committed, no second write, and the original version token is returned.
+    alpha_guard_configure_html();
+    let body = html_interaction_source(&artifact_source("Orders"));
+    let (db, registry, body_digest, _lock) =
+        fixture_with_source(body.clone(), "native.html.v1").await;
+    alpha_guard_grants(&db, ALPHA_GUARD_ACCOUNT).await;
+    let alice = Caller::authenticated(ALPHA_GUARD_ACCOUNT);
+    let (verified, source_revision, digest, declaration_digest) = alpha_guard_verified_install(
+        &db,
+        &registry,
+        ALPHA_GUARD_ACCOUNT,
+        ALPHA_GUARD_PACKAGE_A,
+        &body,
+        alpha_guard_declaration(),
+    )
+    .await;
+    let guard = alpha_guard_json(
+        ALPHA_GUARD_PACKAGE_A,
+        &verified,
+        &source_revision,
+        &digest,
+        &declaration_digest,
+    );
+    let committed = call_as(
+        &registry,
+        &db,
+        alice.clone(),
+        "invoke_artifact_interaction",
+        json!({
+            "version": INVOCATION_VERSION,
+            "artifact_id": ARTIFACT,
+            "entry_id": "mark_triaged",
+            "source_digest": body_digest,
+            "slots": { "record": INSIDE },
+            "observed": { INSIDE: { "triage": "obs:0" } },
+            "idempotency_key": "alpha:replay:same-guard",
+            "alpha_install_guard": guard.clone(),
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(committed["status"], "committed", "{committed:#}");
+    let original_token = committed["changes"][0]["version"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let replay = call_as(
+        &registry,
+        &db,
+        alice,
+        "invoke_artifact_interaction",
+        json!({
+            "version": INVOCATION_VERSION,
+            "artifact_id": ARTIFACT,
+            "entry_id": "mark_triaged",
+            "source_digest": body_digest,
+            "slots": { "record": INSIDE },
+            "observed": { INSIDE: { "triage": "obs:0" } },
+            "idempotency_key": "alpha:replay:same-guard",
+            "alpha_install_guard": guard,
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(replay["status"], "committed", "{replay:#}");
+    assert_eq!(
+        replay["changes"][0]["version"],
+        original_token.as_str(),
+        "{replay:#}"
+    );
+    assert_eq!(
+        alpha_guard_keyed_writes(&db, "alpha:replay:same-guard").await,
+        1,
+        "a replay commits nothing"
+    );
+}
+
+#[tokio::test]
+async fn alpha_guard_replay_unguarded_to_unguarded_still_replays() {
+    // Ordinary replay is untouched by the guard comparison: the same
+    // unguarded invocation under the same key replays committed with the
+    // original token and no second write. (Pre-guard legacy rows, whose origin
+    // lacks the guard key entirely, normalize to the same null context; that
+    // branch is pinned by the `facet_guard_context_matches` unit test, since
+    // the test pool is read-only and cannot rewrite a row to legacy shape.)
+    alpha_guard_configure_html();
+    let body = html_interaction_source(&artifact_source("Orders"));
+    let (db, registry, body_digest, _lock) =
+        fixture_with_source(body.clone(), "native.html.v1").await;
+    alpha_guard_grants(&db, ALPHA_GUARD_ACCOUNT).await;
+    let alice = Caller::authenticated(ALPHA_GUARD_ACCOUNT);
+    let committed = call_as(
+        &registry,
+        &db,
+        alice.clone(),
+        "invoke_artifact_interaction",
+        json!({
+            "version": INVOCATION_VERSION,
+            "artifact_id": ARTIFACT,
+            "entry_id": "mark_triaged",
+            "source_digest": body_digest,
+            "slots": { "record": INSIDE },
+            "observed": { INSIDE: { "triage": "obs:0" } },
+            "idempotency_key": "alpha:replay:plain-plain",
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(committed["status"], "committed", "{committed:#}");
+    let original_token = committed["changes"][0]["version"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let replay = call_as(
+        &registry,
+        &db,
+        alice,
+        "invoke_artifact_interaction",
+        json!({
+            "version": INVOCATION_VERSION,
+            "artifact_id": ARTIFACT,
+            "entry_id": "mark_triaged",
+            "source_digest": body_digest,
+            "slots": { "record": INSIDE },
+            "observed": { INSIDE: { "triage": "obs:0" } },
+            "idempotency_key": "alpha:replay:plain-plain",
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(replay["status"], "committed", "{replay:#}");
+    assert_eq!(
+        replay["changes"][0]["version"],
+        original_token.as_str(),
+        "{replay:#}"
+    );
+    assert_eq!(
+        alpha_guard_keyed_writes(&db, "alpha:replay:plain-plain").await,
+        1,
+        "a replay commits nothing"
+    );
 }

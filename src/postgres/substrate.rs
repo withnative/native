@@ -64,6 +64,7 @@ pub struct PostgresAuthoritativeEvent {
     pub schema_version: Option<i64>,
     pub aggregate_kind: Option<String>,
     pub created_at: String,
+    pub act: Option<i64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -74,6 +75,9 @@ pub struct PostgresMetaEvent {
     pub payload: Value,
     pub actor: Option<String>,
     pub created_at: String,
+    /// Replay preservation: `Some` reuses the act instead of allocating.
+    /// Live appends pass `None` to allocate exactly once per transaction.
+    pub act: Option<i64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -85,6 +89,9 @@ pub struct PostgresPolicyEvent {
     pub actor: String,
     pub reason: String,
     pub created_at: String,
+    /// Replay preservation: `Some` reuses the act instead of allocating.
+    /// Live appends pass `None` to allocate exactly once per transaction.
+    pub act: Option<i64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -100,6 +107,9 @@ pub struct PostgresControlEvent {
     pub reason: String,
     pub payload: Value,
     pub created_at: String,
+    /// Replay preservation: `Some` reuses the act instead of allocating.
+    /// Live appends pass `None` to allocate exactly once per transaction.
+    pub act: Option<i64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -310,6 +320,7 @@ impl PostgresDb {
                 Some(match error {
                     Error::Engine(_) => "engine",
                     Error::Conflict(_) => "conflict",
+                    Error::NotHeld(_) => "not_held",
                     Error::Auth(_) => "auth",
                     Error::Delivery(_) => "delivery",
                     Error::DeploymentReadOnly(_) => "deployment_read_only",
@@ -363,8 +374,12 @@ impl PostgresDb {
             .allocate_log_position(&mut tx, PostgresLogKind::Meta)
             .await?;
         let events = self.qualified_table("meta_events")?;
+        let act = match event.act {
+            Some(act) => act,
+            None => super::allocate_act_in(self, &mut tx).await?,
+        };
         sqlx::query(&format!(
-            "INSERT INTO {events}(seq,id,subject_id,type,payload,actor,created_at) VALUES($1,$2,$3,$4,$5,$6,$7::timestamptz)"
+            "INSERT INTO {events}(seq,id,subject_id,type,payload,actor,created_at,act) VALUES($1,$2,$3,$4,$5,$6,$7::timestamptz,$8)"
         ))
         .bind(seq)
         .bind(&event.id)
@@ -373,6 +388,7 @@ impl PostgresDb {
         .bind(&event.payload)
         .bind(&event.actor)
         .bind(&event.created_at)
+        .bind(act)
         .execute(&mut *tx)
         .await?;
         self.project_meta_event(&mut tx, &event).await?;
@@ -549,9 +565,14 @@ impl PostgresDb {
             .fetch_one(&mut *tx)
             .await?;
         let events = self.qualified_table("policy_events")?;
-        sqlx::query(&format!("INSERT INTO {events}(seq,id,record_id,type,payload,actor,reason,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8::timestamptz)"))
+        let act = match event.act {
+            Some(act) => act,
+            None => super::allocate_act_in(self, &mut tx).await?,
+        };
+        sqlx::query(&format!("INSERT INTO {events}(seq,id,record_id,type,payload,actor,reason,created_at,act) VALUES($1,$2,$3,$4,$5,$6,$7,$8::timestamptz,$9)"))
             .bind(seq).bind(&event.id).bind(&event.record_id).bind(&event.event_type)
             .bind(&event.payload).bind(&event.actor).bind(&event.reason).bind(&event.created_at)
+            .bind(act)
             .execute(&mut *tx).await?;
         self.project_policy_event(&mut tx, &event).await?;
         bump_authorization_revision(self, &mut tx).await?;
@@ -693,6 +714,7 @@ impl PostgresDb {
             reason: event.reason.clone(),
             payload: serde_json::to_string(&event.payload)?,
             created_at: event.created_at.clone(),
+            act: event.act,
         };
         crate::control::validate_control_event(&canonical_event)?;
         let mut tx = self.pool.begin().await?;
@@ -730,7 +752,7 @@ impl PostgresDb {
         }
         canonical_event.seq = seq;
         let rows = sqlx::query(&format!(
-            "SELECT seq,id,idempotency_key,type,schema_version,aggregate_kind,aggregate_id,actor,run_key,reason,payload::text AS payload,created_at FROM {events} ORDER BY seq"
+            "SELECT seq,id,idempotency_key,type,schema_version,aggregate_kind,aggregate_id,actor,run_key,reason,payload::text AS payload,created_at,act FROM {events} ORDER BY seq"
         ))
         .fetch_all(&mut *tx)
         .await?;
@@ -752,6 +774,7 @@ impl PostgresDb {
                     created_at: row
                         .try_get::<chrono::DateTime<chrono::Utc>, _>("created_at")?
                         .to_rfc3339(),
+                    act: row.try_get("act")?,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -762,10 +785,14 @@ impl PostgresDb {
             .await?;
         let canonical_projection =
             crate::control::canonical_projection_snapshot(&canonical_events, &record_ids).await?;
-        sqlx::query(&format!("INSERT INTO {events}(seq,id,idempotency_key,type,schema_version,aggregate_kind,aggregate_id,actor,run_key,reason,payload,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::timestamptz)"))
+        sqlx::query(&format!("INSERT INTO {events}(seq,id,idempotency_key,type,schema_version,aggregate_kind,aggregate_id,actor,run_key,reason,payload,created_at,act) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::timestamptz,$13)"))
             .bind(seq).bind(&event.id).bind(&event.idempotency_key).bind(&event.event_type)
             .bind(event.schema_version).bind(&event.aggregate_kind).bind(&event.aggregate_id)
             .bind(&event.actor).bind(&event.run_key).bind(&event.reason).bind(&event.payload).bind(&event.created_at)
+            .bind(match event.act {
+                Some(act) => act,
+                None => super::allocate_act_in(self, &mut tx).await?,
+            })
             .execute(&mut *tx).await?;
         let projections = self.qualified_table("control_projections")?;
         sqlx::query(&format!("DELETE FROM {projections}"))
@@ -797,16 +824,16 @@ impl PostgresDb {
         let table = self.qualified_table(log.relation())?;
         let sql = match log {
             PostgresLogKind::Content => format!(
-                "SELECT seq,id,record_id AS subject_id,type,payload,actor,run_key,parent_key,intent,NULL::text AS reason,NULL::text AS idempotency_key,NULL::bigint AS schema_version,NULL::text AS aggregate_kind,created_at FROM {table} ORDER BY seq"
+                "SELECT seq,id,record_id AS subject_id,type,payload,actor,run_key,parent_key,intent,NULL::text AS reason,NULL::text AS idempotency_key,NULL::bigint AS schema_version,NULL::text AS aggregate_kind,created_at,act FROM {table} ORDER BY seq"
             ),
             PostgresLogKind::Meta => format!(
-                "SELECT seq,id,subject_id,type,payload,actor,NULL::text AS run_key,NULL::text AS parent_key,NULL::text AS intent,NULL::text AS reason,NULL::text AS idempotency_key,NULL::bigint AS schema_version,NULL::text AS aggregate_kind,created_at FROM {table} ORDER BY seq"
+                "SELECT seq,id,subject_id,type,payload,actor,NULL::text AS run_key,NULL::text AS parent_key,NULL::text AS intent,NULL::text AS reason,NULL::text AS idempotency_key,NULL::bigint AS schema_version,NULL::text AS aggregate_kind,created_at,act FROM {table} ORDER BY seq"
             ),
             PostgresLogKind::Policy => format!(
-                "SELECT seq,id,record_id AS subject_id,type,payload,actor,NULL::text AS run_key,NULL::text AS parent_key,NULL::text AS intent,reason,NULL::text AS idempotency_key,NULL::bigint AS schema_version,NULL::text AS aggregate_kind,created_at FROM {table} ORDER BY seq"
+                "SELECT seq,id,record_id AS subject_id,type,payload,actor,NULL::text AS run_key,NULL::text AS parent_key,NULL::text AS intent,reason,NULL::text AS idempotency_key,NULL::bigint AS schema_version,NULL::text AS aggregate_kind,created_at,act FROM {table} ORDER BY seq"
             ),
             PostgresLogKind::Control => format!(
-                "SELECT seq,id,aggregate_id AS subject_id,type,payload,actor,run_key,NULL::text AS parent_key,NULL::text AS intent,reason,idempotency_key,schema_version,aggregate_kind,created_at FROM {table} ORDER BY seq"
+                "SELECT seq,id,aggregate_id AS subject_id,type,payload,actor,run_key,NULL::text AS parent_key,NULL::text AS intent,reason,idempotency_key,schema_version,aggregate_kind,created_at,act FROM {table} ORDER BY seq"
             ),
         };
         let rows = sqlx::query(&sql).fetch_all(&mut **tx).await?;
@@ -827,6 +854,7 @@ impl PostgresDb {
                     idempotency_key: row.try_get("idempotency_key")?,
                     schema_version: row.try_get("schema_version")?,
                     aggregate_kind: row.try_get("aggregate_kind")?,
+                    act: row.try_get("act")?,
                     created_at: row
                         .try_get::<chrono::DateTime<chrono::Utc>, _>("created_at")?
                         .to_rfc3339(),

@@ -313,7 +313,7 @@ async fn bootstrap_resolves_ordered_caller_context_without_consuming_obligations
         native_ce::ENGINE_VERSION
     );
     assert_eq!(entries[0]["source"]["template_key"], "engine-orientation");
-    assert_eq!(entries[0]["source"]["template_version"], 8);
+    assert_eq!(entries[0]["source"]["template_version"], 9);
     assert!(entries[0]["source"]["record_id"].is_null());
     let orientation = entries[0]["content"].as_str().unwrap();
     for guarantee in [
@@ -1004,19 +1004,41 @@ async fn bootstrap_recovery_is_pre_call_discoverable_and_preserves_the_run_key()
     // Recovery guidance must be visible before the first bootstrap succeeds:
     // a caller stranded by a transient failure only has tools/list.
     let description = registry.get("bootstrap").unwrap().description.clone();
-    assert!(description.contains("retry at most twice"), "{description}");
-    assert!(description.contains("pool failure"), "{description}");
+    assert!(description.contains("at most twice"), "{description}");
+    assert!(description.contains("transport/pool/HTTP"), "{description}");
     assert!(description.contains("Never retry auth"), "{description}");
-    assert!(
-        description.contains("Retain the run key once received"),
-        "{description}"
-    );
+    for required in [
+        "once per fresh host conversation",
+        "later turns or task/artifact/aim changes are not new boundaries",
+        "Reuse the key",
+        "changed aims use set_intent",
+        "The host owns that boundary",
+    ] {
+        assert!(
+            description.contains(required),
+            "missing {required:?}: {description}"
+        );
+    }
 
     let db = create_database(":memory:").await.unwrap();
     let member = Caller::authenticated("acct:recover");
     let first = call(&registry, &db, member.clone(), "bootstrap", json!({})).await;
     let key = first["run"]["run_key"].as_str().unwrap().to_string();
     assert_eq!(first["session"]["run_key"].as_str().unwrap(), key);
+    let session_guidance = first["session"]["guidance"].as_str().unwrap();
+    for required in [
+        "successful bootstrap establishes the one run key",
+        "fresh host conversation",
+        "Later user turns, task/intent/artifact changes, or renewed Native use are not new bootstrap boundaries",
+        "use set_intent when the aim materially changes",
+        "no trustworthy host-conversation identity",
+        "does not deduplicate by conversation/account",
+    ] {
+        assert!(
+            session_guidance.contains(required),
+            "missing {required:?}: {session_guidance}"
+        );
+    }
 
     let before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM control_events")
         .fetch_one(db.pool())

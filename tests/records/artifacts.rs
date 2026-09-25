@@ -920,6 +920,47 @@ async fn html_source_is_validated_prospectively_and_render_returns_only_an_isola
         available_verification(),
         "{configured_render}"
     );
+    // A clean artifact carries no diagnostics member anywhere: absent is none.
+    assert!(configured_render.get("write_diagnostics").is_none());
+
+    // Write-time diagnostics: warnings only, the same fixed element shape on the
+    // write receipt and on the render a person opens.
+    let diagnostic_body = HTML_DOCUMENT.replace(
+        "</body>",
+        "<script>\n  const names = taskClientNames();\n</script>\n</body>",
+    );
+    let diagnostic_created = html_artifact(
+        &registry,
+        &db,
+        "a7710000-0000-4000-8000-000000000051",
+        &diagnostic_body,
+    )
+    .await;
+    let receipt = diagnostic_created["html_body_write"]["write_diagnostics"]
+        .as_array()
+        .expect("the write receipt carries the findings");
+    assert_eq!(receipt.len(), 1, "{receipt:?}");
+    assert_eq!(receipt[0]["format"], "native.artifact-write-diagnostic.v1");
+    assert_eq!(receipt[0]["code"], "html_undefined_identifier");
+    assert_eq!(receipt[0]["severity"], "warning");
+    assert_eq!(receipt[0]["name"], "taskClientNames");
+    assert_eq!(
+        receipt[0]["message"],
+        "`taskClientNames` is not defined in this document"
+    );
+    let diagnostic_render = call(
+        &registry,
+        &db,
+        "render_artifact",
+        json!({ "id": "a7710000-0000-4000-8000-000000000051" }),
+    )
+    .await;
+    assert_eq!(diagnostic_render["status"], "rendered");
+    assert_eq!(
+        diagnostic_render["write_diagnostics"].as_array().unwrap(),
+        receipt,
+        "the render serves the persisted finding with the same element shape"
+    );
 
     let mdx_id = "a7710001-0000-4000-8000-000000000101";
     let mdx_source = r#"export const nativeArtifact = { schema: "native.mdx.artifact.v2", inputs: {}, module_inputs: {}, capability_requests: [] }

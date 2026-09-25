@@ -14,11 +14,27 @@ contracts.
 
 ## Canonical rules
 
-- The manifest format is `native.canonical-interchange.v1`, revision `2`, and
+- The manifest format is `native.canonical-interchange.v1`, revision `5`, and
   the section format is `native.canonical-interchange.section.v1`, revision
-  `2`. Revision 1 engine-45 inputs remain readable: import classifies every
+  `5`. Revision 1 engine-45 inputs remain readable: import classifies every
   legacy content event as `legacy_unknown`, records the engine-45 cutover, and
-  never fabricates frontier edges.
+  never fabricates frontier edges. Revision 2 inputs remain readable: import
+  leaves every revision-2 event unstamped (`act` NULL, grouping unknown),
+  resumes the counter at zero, and records the per-domain cutover at each
+  log's current maximum replay position. Revision 3 inputs also remain
+  readable, but because that revision omitted derivation history, import
+  materializes an explicitly empty `derivation_events` section and treats the
+  upgraded document as non-exhaustive source history. Both historical
+  revision-4 inventories remain readable: main's record-mentions section and
+  the act branch's derivation-events section have the same count but different
+  names. Missing sections are derived from source evidence or honestly empty;
+  their ordered names select the upgrade path. Revision 4 inputs remain
+  readable: both `external_observations` and `awareness_command_intents`
+  sections gain a trailing NULL `act` cell per row (grouping unknown, never
+  fabricated), the source revision stays `4`, and only revision-5 documents
+  are exhaustive for native deltas. A revision-5 manifest may carry
+  `source_history_revision` to preserve this original-history classification
+  across re-export; absence means unknown rather than exhaustive.
 - The logical contract is `native.logical.v1`. Implementations reject unknown
   revisions, fields, sections, or column layouts before publishing any data.
 - Sections use the contract inventory order. Rows are strictly increasing by
@@ -60,15 +76,18 @@ or a lossless full-database migration.
 
 ## Section inventory
 
-Revision 2 contains exactly these sections, in this order:
+Revision 5 contains exactly these sections, in this order:
 
 ```text
 content_events
 content_event_causal_frontier
 content_event_causal_cutover
+act_state
+act_cutover
 policy_events
 meta_events
 control_events
+derivation_events
 awareness_events
 notification_candidate_events
 relationship_events
@@ -110,6 +129,7 @@ message_inbox_routing
 message_preferences
 member_destinations
 message_mentions
+record_mentions
 notification_candidates
 module_releases
 module_release_imports
@@ -149,8 +169,6 @@ blobs
 vocabularies
 vocabulary_values
 schema_config
-read_log_calls
-read_log_touches
 member_contexts
 instruction_bindings
 onboarding_programmes
@@ -162,8 +180,6 @@ control_event_applications
 storage_portability_policy
 ```
 
-The `read_log_touches` section carries logical TEXT `record_id` values in
-`(call_seq, record_id, interaction)` primary-key order. SQLite engine 54 and
-later decode these from a local `read_log_record_ids` dictionary on export
-and intern them again on import. The physical dictionary is not a portable
-section, and its integer references are not portable record identities.
+Revision 4 removed the read log from the portable surface: a person's reads
+are receiver-local surveillance state, not shared workspace history. Revision
+5 retains that boundary while adding derivation history and act coordinates.

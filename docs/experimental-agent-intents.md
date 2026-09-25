@@ -75,8 +75,10 @@ admits the audited `experimental_freshness` executor (six operations:
 `.assess_exact_change`, and
 `.reconcile_affected_output`) on both the ordinary and lens catalogues, served
 through `describe_operation` and dispatched to the unchanged legacy handler.
-Unset or empty means the stable-only surface, byte-identical to before. Any
-other name fails process startup naming the variable and the offending value.
+Unset or empty means the stable-only surface, byte-identical to before. The
+separate `sql_write` preview executor is also a recognized allowlist value;
+any unrecognized name fails process startup naming the variable and the
+offending value.
 This advertises the seam where an operator asks for it; it is not a promotion
 out of experimental, and the seam's limitations below apply unchanged.
 

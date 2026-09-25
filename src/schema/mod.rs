@@ -12,6 +12,10 @@
 
 pub mod contract;
 pub mod ddl;
+// Slice 0 is intentionally descriptive; delta materialisation consumes this
+// metadata in the next slice.
+#[allow(dead_code)]
+pub(crate) mod standby_classification;
 // Most presentation helpers are consumed by optional backend adapters; the
 // default build still uses the column-semantics subset for MCP orientation.
 #[cfg_attr(

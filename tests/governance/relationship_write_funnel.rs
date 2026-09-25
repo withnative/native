@@ -31,6 +31,10 @@ fn relationship_writes_are_confined_to_the_kernel_projector_and_data_movement_se
         // Sealed compatibility migration and authenticated federation import.
         Path::new("src/relationship/legacy.rs"),
         Path::new("src/relationship/federation.rs"),
+        // Standby cut/materialisation tests construct production-shaped relationship
+        // evidence directly; the production materialiser uses the preserved-act replay seam.
+        Path::new("src/standby/act_cut.rs"),
+        Path::new("src/standby/act_materialise.rs"),
         // The sole event append seam and synchronous minimal projector.
         Path::new("src/relationship/persistence.rs"),
         Path::new("src/relationship/projector.rs"),

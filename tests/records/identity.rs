@@ -24,6 +24,8 @@ fn context<'a>(actor: &'a str, reason: &'a str) -> MutationContext<'a> {
         run_key: Some("test-agent-abc123"),
         parent_key: None,
         intent: Some("exercise identity contract"),
+        // Member-footed fixtures: preserves the historical resolution.
+        is_member: true,
         internal: false,
         source_read_authorized: false,
     }
@@ -974,12 +976,28 @@ async fn observation_failure_rolls_back_shadow_binding_blob_attachment_and_audit
 #[tokio::test]
 async fn governed_registry_drift_and_non_authoritative_sources_fail_closed() {
     let (db, actor) = setup().await;
+    let write_pool = crate::common::fixture_write_pool(&db).await;
+    // The engine-58 immutability guard makes raw registry drift impossible
+    // through ordinary DML, so the drift probe runs beneath it: capture the
+    // exact trigger SQL, drop the update guard, tamper, and restore the
+    // guard before asserting, leaving the fixture's protection intact.
+    let guard_sql: String = sqlx::query_scalar(
+        "SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='binding_systems_no_update'",
+    )
+    .fetch_one(&write_pool)
+    .await
+    .unwrap();
+    sqlx::query("DROP TRIGGER binding_systems_no_update")
+        .execute(&write_pool)
+        .await
+        .unwrap();
     sqlx::query(
         "UPDATE binding_systems SET authoritative_provenance=0 WHERE system='native-principal'",
     )
-    .execute(&crate::common::fixture_write_pool(&db).await)
+    .execute(&write_pool)
     .await
     .unwrap();
+    sqlx::query(&guard_sql).execute(&write_pool).await.unwrap();
     let violations = identity::state_violations(&db).await.unwrap();
     assert!(violations
         .iter()
@@ -1040,12 +1058,26 @@ async fn rekey_requires_exact_preimage_and_preserves_old_identity_only_as_proven
     assert!(wrong.to_string().contains("confirmation"));
 
     let tampered = rusqlite::Connection::open(&backup).unwrap();
+    // content_events is append-only by trigger; this corruption fixture drops
+    // only the update guard and restores the exact sqlite_master SQL on this
+    // same connection around the tamper, before the rekey path continues.
+    let update_guard: String = tampered
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='content_events_no_update'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    tampered
+        .execute("DROP TRIGGER content_events_no_update", [])
+        .unwrap();
     tampered
         .execute(
             "UPDATE content_events SET actor='tampered-with-same-head' WHERE seq=(SELECT MIN(seq) FROM content_events)",
             [],
         )
         .unwrap();
+    tampered.execute(&update_guard, []).unwrap();
     drop(tampered);
     let mismatch = identity::rekey_database_offline(
         &source,
@@ -1164,5 +1196,183 @@ async fn connect_restores_a_reserved_instruction_folder_moved_by_an_ordinary_wri
     assert_eq!(
         reserved_folder_home_id(&db).await.as_deref(),
         Some("native:root")
+    );
+}
+
+fn guest_context<'a>(actor: &'a str, reason: &'a str) -> MutationContext<'a> {
+    MutationContext {
+        actor,
+        reason,
+        run_key: Some("test-agent-abc123"),
+        parent_key: None,
+        intent: Some("exercise identity contract"),
+        // Guest footing: the caller's role folded in, not assumed.
+        is_member: false,
+        internal: false,
+        source_read_authorized: false,
+    }
+}
+
+/// C1: identity-tool visibility gates resolve through the caller's folded
+/// footing. A guest must neither distinguish a member-only binding (the
+/// existence oracle closed on the reference route) nor mint a stub where
+/// only the members baseline would admit the write.
+#[tokio::test]
+async fn guest_footing_cannot_resolve_member_only_bindings_or_mint_stubs() {
+    let (db, actor) = setup().await;
+    let claim = principal("guest-probe-target");
+    let resolved = identity::resolve_external(
+        &db,
+        &context(&actor, "create member-only target"),
+        std::slice::from_ref(&claim),
+        &StubHints::default(),
+    )
+    .await
+    .unwrap();
+    native_ce::authorization::replace_explicit_policy(
+        &db,
+        "test:policy",
+        &resolved.record_id,
+        vec![AllowEntry::members(Capability::View)],
+    )
+    .await
+    .unwrap();
+
+    // Hit: the member-only binding is invisible to the guest — no record id.
+    let err = identity::resolve_external(
+        &db,
+        &guest_context("acct_guest", "probe a member-only binding"),
+        std::slice::from_ref(&claim),
+        &StubHints::default(),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("binding_not_visible"),
+        "unexpected: {err}"
+    );
+    // Control: the creating member still resolves.
+    let hit = identity::resolve_external(
+        &db,
+        &context(&actor, "control resolution"),
+        std::slice::from_ref(&claim),
+        &StubHints::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(hit.record_id, resolved.record_id);
+
+    // Miss: a guest cannot mint a stub where only the members baseline
+    // admits the UNFILED write, and no record is created for the attempt.
+    let records_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM records")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    let miss = identity::resolve_external(
+        &db,
+        &guest_context("acct_guest", "probe an unbound claim"),
+        std::slice::from_ref(&principal("guest-probe-miss")),
+        &StubHints::default(),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        !miss.to_string().contains("binding_not_visible"),
+        "a miss must fail on the write gate, not the visibility gate: {miss}"
+    );
+    let records_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM records")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(records_after, records_before);
+}
+
+/// Prerequisite 781a566a: observations are first-class act-stamped rows.
+/// An identity-only observation allocates a visible act of its own, while a
+/// captured snapshot shares the content-event act its attachment appends
+/// allocated in the same transaction.
+#[tokio::test]
+async fn observations_carry_acts_sharing_content_when_captured() {
+    let (db, actor) = setup().await;
+    let claim = principal("act-observation");
+    let hints = StubHints {
+        name: Some("Act observation".into()),
+        ..StubHints::default()
+    };
+
+    // The first identity-only observation may also create its shadow record
+    // and bindings; every write in that transaction shares one visible act.
+    let reported = identity::observe_external(
+        &db,
+        &context(&actor, "identity-only act"),
+        std::slice::from_ref(&claim),
+        &hints,
+        &claim,
+        ObservationQuality::Reported,
+        MaterializationPolicy::IdentityOnly,
+        None,
+        &ObservationProvenance::default(),
+        Some("Act observation"),
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let reported_act: Option<i64> =
+        sqlx::query_scalar("SELECT act FROM external_observations WHERE id = ?")
+            .bind(&reported.observation_id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert!(
+        reported_act.is_some(),
+        "identity-only observation must carry a visible act"
+    );
+
+    // Captured: the three attachment content appends allocate first, and the
+    // observation row shares that act.
+    let mut trusted = context(&actor, "captured act shares content");
+    trusted.source_read_authorized = true;
+    let snapshot = identity::observe_external(
+        &db,
+        &trusted,
+        std::slice::from_ref(&claim),
+        &StubHints::default(),
+        &claim,
+        ObservationQuality::Fetched,
+        MaterializationPolicy::Snapshot,
+        None,
+        &captured_provenance("act-rev-1", Some("source:act1")),
+        None,
+        Some(b"act body"),
+        Some("text/plain"),
+        Some("act.txt"),
+    )
+    .await
+    .unwrap();
+    let attachment = snapshot.provenance_attachment_id.clone().unwrap();
+    let observation_act: Option<i64> =
+        sqlx::query_scalar("SELECT act FROM external_observations WHERE id = ?")
+            .bind(&snapshot.observation_id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    let content_acts: Vec<Option<i64>> =
+        sqlx::query_scalar("SELECT act FROM content_events WHERE record_id = ? ORDER BY seq")
+            .bind(&attachment)
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(content_acts.len(), 3);
+    let shared = observation_act.expect("captured observation carries an act");
+    assert!(
+        content_acts.iter().all(|act| *act == Some(shared)),
+        "captured observation must share the content-event act, got observation {shared} vs content {content_acts:?}"
+    );
+    assert_ne!(
+        Some(shared),
+        reported_act,
+        "the captured transaction must advance beyond the identity-only act"
     );
 }

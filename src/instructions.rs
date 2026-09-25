@@ -20,7 +20,7 @@ pub const MAX_BOOTSTRAP_INSTRUCTION_ENTRIES: usize = 128;
 pub const MAX_BOOTSTRAP_PENDING_OBLIGATIONS: usize = 64;
 pub const MAX_BOOTSTRAP_CONTEXT_METADATA_BYTES: usize = 64 * 1024;
 pub const ENGINE_ORIENTATION_TEMPLATE_KEY: &str = "engine-orientation";
-pub const ENGINE_ORIENTATION_TEMPLATE_VERSION: i64 = 8;
+pub const ENGINE_ORIENTATION_TEMPLATE_VERSION: i64 = 9;
 pub const ENGINE_ORIENTATION: &str = include_str!("mcp/posture-capsule.md");
 pub const DURABLE_ORIENTATION_GUIDANCE: &str = "Bootstrap is read-only. Repeating or ending a session does not complete, decline, reopen, or otherwise consume an onboarding obligation; it remains pending until an explicit member action changes it.";
 pub const NEUTRAL_PRECEDENCE_GUIDANCE: &str = "Consider all active instructions together. Their scopes describe where they came from, not an automatic priority. If they materially conflict, exercise judgement and ask the user when necessary.";
@@ -235,10 +235,11 @@ fn metadata_overflow(
 pub async fn resolve_for_account(
     pool: &SqlitePool,
     account_id: &str,
+    is_member: bool,
     current_run_key: Option<&str>,
 ) -> Result<BootstrapInstructionResolution> {
     let mut tx = pool.begin().await?;
-    let result = resolve_for_account_in(&mut tx, account_id, current_run_key).await;
+    let result = resolve_for_account_in(&mut tx, account_id, is_member, current_run_key).await;
     tx.rollback().await?;
     result
 }
@@ -246,6 +247,7 @@ pub async fn resolve_for_account(
 async fn resolve_for_account_in(
     tx: &mut Transaction<'_, Sqlite>,
     account_id: &str,
+    is_member: bool,
     current_run_key: Option<&str>,
 ) -> Result<BootstrapInstructionResolution> {
     let obligation_rows = sqlx::query(
@@ -422,6 +424,10 @@ async fn resolve_for_account_in(
                     NULL programme_position,NULL source_role,NULL source_position,NULL trigger_key
                FROM instruction_bindings b
               WHERE b.scope_kind='database' AND b.scope_id='native:database' AND b.enabled=1
+                -- Guests get no workspace agent instructions: the
+                -- database-scope layer is members content, and a guest
+                -- stack that included it could never resolve.
+                AND ? <> 0
              UNION ALL
              SELECT 1,s.source_record_id,NULL,NULL,NULL,NULL,p.id,o.generation,p.position,
                     s.source_role,s.position,p.trigger_key
@@ -442,6 +448,7 @@ async fn resolve_for_account_in(
                    c.programme_id,c.source_position,c.source_record_id
           LIMIT ?",
     )
+    .bind(is_member as i64)
     .bind(account_id)
     .bind(account_id)
     .bind((MAX_BOOTSTRAP_INSTRUCTION_ENTRIES + 1) as i64)
@@ -473,7 +480,7 @@ async fn resolve_for_account_in(
         }
         let readable = authorization::effective_capability_on(
             tx,
-            Principal::bound(account_id, true),
+            Principal::bound(account_id, is_member),
             &source_record_id,
         )
         .await
@@ -649,13 +656,18 @@ pub struct StackMeasure {
 pub async fn measure_stack_in(
     tx: &mut Transaction<'_, Sqlite>,
     account_id: Option<&str>,
+    is_member: bool,
 ) -> Result<StackMeasure> {
+    // Guests resolve no database-scope layer (see resolve_for_account_in);
+    // the prospective-member system probe keeps the full stack.
+    let include_workspace = account_id.is_none() || is_member;
     let rows = sqlx::query(
         "SELECT scope,source_record_id,title,body_bytes,deleted_at,binding_id,programme_id,generation,source_role FROM (
            SELECT 'workspace' scope,b.source_record_id,r.name title,length(CAST(COALESCE(r.body,'') AS BLOB)) body_bytes,r.deleted_at,
                   b.id binding_id,NULL programme_id,NULL generation,NULL source_role,0 layer,b.position outer_pos,0 inner_pos
              FROM instruction_bindings b LEFT JOIN records r ON r.id=b.source_record_id
             WHERE b.scope_kind='database' AND b.scope_id='native:database' AND b.enabled=1
+              AND ? <> 0
            UNION ALL
            SELECT 'onboarding',s.source_record_id,r.name,length(CAST(COALESCE(r.body,'') AS BLOB)),r.deleted_at,NULL,p.id,o.generation,s.source_role,1,p.position,s.position
              FROM member_obligations o JOIN onboarding_programmes p ON p.id=o.programme_id AND p.enabled=1
@@ -668,6 +680,7 @@ pub async fn measure_stack_in(
             WHERE ? IS NOT NULL AND b.scope_kind='account' AND b.scope_id=? AND b.enabled=1
          ) ORDER BY layer,outer_pos,inner_pos,source_record_id",
     )
+    .bind(include_workspace as i64)
     .bind(account_id)
     .bind(account_id)
     .bind(account_id)
@@ -691,9 +704,13 @@ pub async fn measure_stack_in(
             )));
         }
         let principal_id = account_id.unwrap_or("native:prospective-member");
+        // The prospective-member probe is a system readability check for
+        // workspace-wide sources, not a caller; it keeps member footing. A
+        // real account resolves with its folded membership footing.
+        let principal_is_member = account_id.is_none() || is_member;
         let capability = authorization::effective_capability_on(
             tx,
-            Principal::bound(principal_id, true),
+            Principal::bound(principal_id, principal_is_member),
             &source_record_id,
         )
         .await
@@ -743,7 +760,7 @@ async fn measure_future_trigger_stack_in(
     tx: &mut Transaction<'_, Sqlite>,
     trigger_key: &str,
 ) -> Result<StackMeasure> {
-    let mut measure = measure_stack_in(tx, None).await?;
+    let mut measure = measure_stack_in(tx, None, true).await?;
     measure.account_id = Some(format!("<future:{trigger_key}>"));
     let rows = sqlx::query(
         "SELECT s.source_record_id,s.source_role,r.name,r.body,r.deleted_at,s.position,p.id programme_id,p.position programme_position
@@ -821,8 +838,9 @@ pub async fn validate_account_stack_in(
     tx: &mut Transaction<'_, Sqlite>,
     tool: &str,
     account_id: Option<&str>,
+    is_member: bool,
 ) -> Result<StackMeasure> {
-    let measure = measure_stack_in(tx, account_id).await?;
+    let measure = measure_stack_in(tx, account_id, is_member).await?;
     if measure.resolved_bytes <= measure.limit_bytes {
         return Ok(measure);
     }
@@ -857,11 +875,18 @@ pub async fn validate_all_known_stacks_in(
     )
     .fetch_all(&mut **tx)
     .await?;
-    let mut measures = vec![validate_account_stack_in(tx, tool, None).await?];
+    let mut measures = vec![validate_account_stack_in(tx, tool, None, true).await?];
     for account in accounts {
-        measures.push(validate_account_stack_in(tx, tool, Some(&account)).await?);
+        // Portable validation scans stored accounts without catalog context;
+        // it preserves the historical member footing. Hosted callers resolve
+        // with their folded footing at their own call sites.
+        measures.push(validate_account_stack_in(tx, tool, Some(&account), true).await?);
     }
-    for trigger_key in ["on_owner_first_run", "on_member_joined"] {
+    for trigger_key in [
+        "on_owner_first_run",
+        "on_member_joined",
+        "on_guest_welcomed",
+    ] {
         let measure = measure_future_trigger_stack_in(tx, trigger_key).await?;
         measures.push(assert_measure_within_budget(tool, measure)?);
     }

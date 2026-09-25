@@ -32,6 +32,7 @@ use crate::events::{
     ArtifactInputCarriedPayload, ArtifactInputUnboundPayload, ArtifactModuleGrantCarriedPayload,
     ArtifactModuleGrantPayload,
 };
+use crate::provenance::Channel;
 use crate::query::lens::{self, ReadLens};
 use crate::query::{cascade, read};
 use crate::record_type_correction::Blocker;
@@ -43,8 +44,8 @@ use crate::store::{
 use super::super::registry::{Caller, ToolRegistry};
 use super::super::ToolKind;
 use super::{
-    echo_previous_seq, parse_args, previous_record_seq_in, require_nonblank_reason, require_record,
-    require_record_in, PREVIOUS_SEQ_DESCRIPTION, REASON_DESCRIPTION,
+    echo_act, echo_previous_seq, parse_args, previous_record_seq_in, require_nonblank_reason,
+    require_record, require_record_in, PREVIOUS_SEQ_DESCRIPTION, REASON_DESCRIPTION,
 };
 
 /// Cap on one `get_record` batch.
@@ -252,14 +253,25 @@ async fn summarize_write_receipt(db: &Db, result: Value, version_seq: i64) -> Re
         "body_digest",
         "lifecycle_interpretation",
     ];
-    const OPTIONAL_RECEIPTS: [&str; 7] = [
+    const OPTIONAL_RECEIPTS: [&str; 11] = [
         "previous_seq",
+        "act",
         "body_receipt",
         "html_body_write",
         "delivery",
         "action_attestation_ids",
         "artifact_input_continuity",
         "work_overlap",
+        // The declared source basis's write-response line, when this call had
+        // one to report. Its absence is meaningful: no declaration and no
+        // pointer (replay, non-agent channel, or already declared this run).
+        "basis",
+        // Present only when this call created a body-bearing event: the event
+        // id is the exact-source identity artifact grants name as
+        // `subject_event_id`, next to the `body_digest` they use as
+        // `source_sha256`.
+        "source_event_id",
+        "similar_existing",
     ];
 
     let object = result
@@ -298,8 +310,83 @@ async fn summarize_write_receipt(db: &Db, result: Value, version_seq: i64) -> Re
     Ok(Value::Object(receipt))
 }
 
+/// Deterministic write-response confirmation for a declared basis. It depends
+/// only on the request, so an idempotent replay reproduces it byte-for-byte.
+fn declared_basis_feedback(declared: Option<usize>) -> Option<Value> {
+    let count = declared?;
+    let (status, message) = match count {
+        0 => ("declared_none", "basis: declared as none".to_string()),
+        1 => ("declared", "basis: 1 source recorded".to_string()),
+        _ => ("declared", format!("basis: {count} sources recorded")),
+    };
+    Some(json!({
+        "status": status,
+        "source_count": count,
+        "message": message,
+    }))
+}
+
+/// The one quiet pointer shown on an agent channel when a write declares
+/// nothing. Suppressed once the run has declared at least once, read cheaply
+/// from that run's own committed events rather than tracked in new
+/// run-scoped state. Absent (or non-MCP) channels get nothing.
+async fn undeclared_basis_feedback(db: &Db, caller: &Caller) -> Result<Option<Value>> {
+    if caller.channel() != Channel::Mcp {
+        return Ok(None);
+    }
+    if let Some(run_key) = caller.run_key() {
+        let already: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM content_events \
+             WHERE run_key=? AND json_extract(payload,'$.basis') IS NOT NULL)",
+        )
+        .bind(run_key)
+        .fetch_one(db.write_pool())
+        .await?;
+        if already {
+            return Ok(None);
+        }
+    }
+    Ok(Some(json!({
+        "status": "not_declared",
+        "source_count": 0,
+        "message": "no sources declared",
+    })))
+}
+
+/// Attach the write-response basis line: the deterministic declaration
+/// confirmation when the caller declared (including declared-none), and the
+/// quiet absence pointer only when this create is not a replay. A keyed
+/// create's replay must return a byte-identical receipt, and the absence
+/// pointer is derived from live run history, so it is suppressed there exactly
+/// as `similar_existing` is.
+///
+/// Deliberately infallible. It runs after the write has committed, so an error
+/// here must never turn a committed write into an `Err`: on a keyless create a
+/// caller's natural retry would then duplicate the record. The absence pointer
+/// is an advisory, and every advisory on this path is fail-silent — see
+/// `similar::notice_for_create`, which swallows its own lookup the same way.
+/// The declared confirmation does not query, so it is unaffected and exact.
+pub(super) async fn attach_basis_feedback(
+    db: &Db,
+    caller: &Caller,
+    result: &mut Value,
+    declared: Option<usize>,
+    replay: bool,
+) {
+    let feedback = match declared_basis_feedback(declared) {
+        Some(feedback) => Some(feedback),
+        None if replay => None,
+        None => undeclared_basis_feedback(db, caller).await.ok().flatten(),
+    };
+    if let Some(feedback) = feedback {
+        if let Some(object) = result.as_object_mut() {
+            object.insert("basis".into(), feedback);
+        }
+    }
+}
+
 async fn current_record_version_in(
-    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    tx: &mut sqlx::Transaction<'static, Sqlite>,
     record_id: &str,
 ) -> Result<i64> {
     sqlx::query_scalar::<_, Option<i64>>("SELECT MAX(seq) FROM content_events WHERE record_id = ?")
@@ -310,12 +397,25 @@ async fn current_record_version_in(
 }
 
 fn html_body_write_result(manifest: &crate::artifact_html::Manifest, source: &str) -> Value {
-    json!({
+    let mut receipt = json!({
         "algorithm": "sha256",
         "sha256": manifest.body_digest,
         "utf8_bytes": manifest.body_utf8_bytes,
         "characters": source.chars().count(),
-    })
+    });
+    // Warning-only write-time findings ride the same fixed element shape the
+    // render serves, so an agent reading the receipt and a person reading the
+    // artifact see the same list. Absent means none; the write always succeeds.
+    if !manifest.diagnostics.is_empty() {
+        if let Some(object) = receipt.as_object_mut() {
+            object.insert(
+                "write_diagnostics".into(),
+                serde_json::to_value(&manifest.diagnostics)
+                    .unwrap_or_else(|_| serde_json::Value::Array(Vec::new())),
+            );
+        }
+    }
+    receipt
 }
 
 /// The governed-HTML write receipt.
@@ -344,32 +444,70 @@ fn attach_artifact_input_continuity(mut result: Value, continuity: Option<Value>
         .unwrap_or("artifact_inputs_no_existing_state")
         .to_owned();
     let ports = continuity["ports"].clone();
+    // The new exact source this write attested. A caller restoring dropped
+    // grants needs exactly these two values for
+    // `manage_artifact_module_grants.grant`: the event id as `subject_event_id`
+    // and the digest as `source_sha256` (the receipt's `body_digest`).
+    let source_event_id = continuity["source_event_id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    let source_sha256 = continuity["source_sha256"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    // Not every drop is caused by a declaration change: a withdrawn capability
+    // request drops its grant while every port declaration stays byte-identical.
+    // Say which happened rather than asserting a diff the caller cannot find.
+    let declarations_changed = continuity["changed_ports"]
+        .as_array()
+        .is_some_and(|ports| !ports.is_empty());
     let message = match status.as_str() {
         "artifact_inputs_carried_forward" => {
-            "Input bindings and every compatible capability grant were carried to the new exact source."
+            "Input bindings and every compatible capability grant were carried to the new exact source.".to_owned()
         }
         "artifact_inputs_partially_carried" => {
-            "Input bindings were carried, but grants whose exact request or module path no longer verified were dropped; restore them with manage_artifact_module_grants."
+            let cause = if declarations_changed {
+                "across a declaration change"
+            } else {
+                "because some grants no longer match the new source"
+            };
+            format!(
+                "Input state was partially carried {cause}; the drops are listed in artifact_input_continuity.dropped; restore them with manage_artifact_inputs and manage_artifact_module_grants.grant using subject_event_id \"{source_event_id}\" and source_sha256 \"{source_sha256}\"."
+            )
         }
-        "artifact_inputs_dropped_by_declaration_change" => {
-            "Input declarations changed, so all bindings and capability grants were dropped; restore them with manage_artifact_inputs and manage_artifact_module_grants."
+        "artifact_inputs_dropped" => {
+            let cause = if declarations_changed {
+                "Input declarations changed, so nothing could be carried"
+            } else {
+                "Nothing could be carried, because no remaining grant matches the new source"
+            };
+            format!(
+                "{cause}; the drops are listed in artifact_input_continuity.dropped; restore them with manage_artifact_inputs and manage_artifact_module_grants.grant using subject_event_id \"{source_event_id}\" and source_sha256 \"{source_sha256}\"."
+            )
         }
-        _ => "The artifact body changed, but there was no exact current input state to carry.",
+        _ => "The artifact body changed, but there was no exact current input state to carry.".to_owned(),
     };
     let object = result
         .as_object_mut()
         .ok_or_else(|| Error::engine("update_record returned a non-object result"))?;
-    object.insert("artifact_input_continuity".into(), continuity);
-    let warning = json!({"code": status, "message": message, "ports": ports});
-    match object.get_mut("warnings") {
-        Some(Value::Array(warnings)) => warnings.push(warning),
-        Some(existing) => {
-            *existing = Value::Array(vec![existing.clone(), warning]);
-        }
-        None => {
-            object.insert("warnings".into(), Value::Array(vec![warning]));
-        }
+    let mut warning = json!({"code": status, "message": message, "ports": ports});
+    // Machine-readable form of the same restoration identity the message
+    // names, so a caller re-granting does not have to parse prose.
+    if !source_event_id.is_empty() && !source_sha256.is_empty() {
+        warning["source_event_id"] = json!(source_event_id);
+        warning["source_sha256"] = json!(source_sha256);
     }
+    // The per-port carry decision, so a caller restoring drops does not have
+    // to diff declarations itself.
+    if let Some(changed_ports) = continuity.get("changed_ports") {
+        warning["changed_ports"] = changed_ports.clone();
+    }
+    if let Some(dropped) = continuity.get("dropped") {
+        warning["dropped"] = dropped.clone();
+    }
+    object.insert("artifact_input_continuity".into(), continuity);
+    crate::domain_transaction::push_receipt_warning(&mut result, warning)?;
     Ok(result)
 }
 
@@ -910,6 +1048,7 @@ pub(crate) async fn correct_record_type(db: Db, caller: Caller, arguments: Value
         })
         .ok_or_else(|| Error::engine("correct_record_type: executor effect_digest is required"))?;
     let mut tx = crate::db::begin_write(db.write_pool()).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
     let plan = correction_snapshot_in(
         &mut tx,
         &caller,
@@ -946,10 +1085,12 @@ pub(crate) async fn correct_record_type(db: Db, caller: Caller, arguments: Value
             }),
             actor: Some(caller.actor().into()),
         },
+        &mut act_alloc,
     )
     .await?;
     db.commit_content(tx).await?;
-    Ok(json!({
+    echo_act(
+        json!({
         "record_id": args.record_id,
         "type": plan.classification().target.record_type,
         "kind": plan.classification().target.kind,
@@ -958,7 +1099,9 @@ pub(crate) async fn correct_record_type(db: Db, caller: Caller, arguments: Value
         "event_seq": event.local_seq,
         "previous_seq": plan.previous_seq(),
         "body_digest": plan.body_digest(),
-    }))
+        }),
+        act_alloc.get(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1257,6 +1400,7 @@ mod required_guard_tests {
             created_at: String::new(),
         }];
         let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+        let mut act_alloc = crate::act::ActAllocation::new();
         // Pinned fixture record ids. Both appear verbatim inside the expected
         // diagnostic text, so the fixture and the assertions share one literal.
         const FIRST_ID: &str = "11fec000-0000-4000-8000-000000000002";
@@ -1278,6 +1422,7 @@ mod required_guard_tests {
                     payload: json!({ "type": record_type, "kind": kind }),
                     actor: Some("agent:test".into()),
                 },
+                &mut act_alloc,
             )
             .await
             .unwrap();
@@ -1522,6 +1667,7 @@ mod required_guard_tests {
                 // Seed the already-authorized external dependency directly;
                 // this test is about correction classification and CAS, not
                 // the binding operation's separate Manage gate.
+                is_member: true,
                 internal: true,
                 source_read_authorized: false,
             },
@@ -1602,7 +1748,7 @@ pub(super) async fn assert_home_target_in(
 /// ceiling — would silently under-check a deep chain); the visited-path
 /// guard alone bounds it, so a pre-existing cycle terminates rather than
 /// spins.
-async fn assert_no_containment_cycle_in(
+pub(super) async fn assert_no_containment_cycle_in(
     tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
     tool: &str,
     id: &str,
@@ -1718,6 +1864,181 @@ pub(super) async fn enriched_or_none(db: &Db, caller: &Caller, id: &str) -> Resu
 // Tool 5 — create_record
 // ---------------------------------------------------------------------------
 
+/// The versioned payload key a declared source basis is stored under, beside
+/// `reason`, on the write event itself. One format, shared with the strong
+/// `save_account` receipt shape so a reader sees one source vocabulary.
+pub(crate) const SOURCE_BASIS_FORMAT: &str = "native.source-basis.v1";
+
+/// One caller-declared source on an ordinary write: a record this write rested
+/// on, why, and optionally the exact body revision the caller actually read.
+///
+/// Lighter than `save_account`'s source line in two ways the spec names:
+/// `role` is optional because most ordinary writes have one role ("I read it"),
+/// and `revision_event_id` may be omitted so the engine stamps the current body
+/// head. A supplied revision must be a real body revision of the cited record
+/// but need not be the head — the honest stale-but-real case.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SourceBasisInput {
+    pub record_id: String,
+    pub reason: String,
+    #[serde(default)]
+    pub role: Option<String>,
+    #[serde(default)]
+    pub revision_event_id: Option<String>,
+}
+
+/// JSON Schema for the optional `sources` declaration, shared verbatim by
+/// `create_record`, `update_record` and each `create_many` item.
+pub(crate) fn source_basis_input_schema() -> Value {
+    json!({
+        "type": "array",
+        "maxItems": crate::authoring::MAX_SAVE_ACCOUNT_SOURCES,
+        "description": "Records this write rests on; [] declares none, omitted means undeclared.",
+        "items": {
+            "type": "object",
+            "properties": {
+                "record_id": { "type": "string" },
+                "reason": { "type": "string", "minLength": 1 },
+                "role": { "type": "string" },
+                "revision_event_id": {
+                    "type": "string",
+                    "description": "A body revision you read; omit to stamp the current head."
+                }
+            },
+            "required": ["record_id", "reason"],
+            "additionalProperties": false
+        }
+    })
+}
+
+/// `sources: null` is out of contract, but serde folds it into `None`, which
+/// would silently mean "not declared" — the opposite of what a caller reaching
+/// for `null` to mean "none" intends, and the absent/declared-none distinction
+/// is the point of the feature. Reject it against the raw arguments, before
+/// parsing, where the difference is still visible, and point at the empty
+/// array.
+fn reject_null_sources(tool: &str, arguments: &Value) -> Result<()> {
+    if arguments.get("sources").is_some_and(Value::is_null) {
+        return Err(Error::engine(format!(
+            "{tool}: 'sources' must be an array; pass [] to declare that this write rests on none, or omit it to leave the basis undeclared"
+        )));
+    }
+    Ok(())
+}
+
+/// Validate a declared basis and materialize the stored envelope, inside the
+/// same `BEGIN IMMEDIATE` transaction the write commits in. `None` means the
+/// caller did not declare; `Some` over an empty slice is the distinct
+/// "declared as none" state and stores an empty source list rather than
+/// nothing at all.
+///
+/// Every refusal is a whole-call error naming the ordinal, never the cited
+/// record: a write that could report *which* unseen id was denied would be an
+/// existence oracle.
+pub(super) async fn resolve_source_basis_in(
+    tx: &mut Transaction<'static, Sqlite>,
+    caller: &Caller,
+    tool: &str,
+    declared: Option<&[SourceBasisInput]>,
+) -> Result<Option<Value>> {
+    let Some(sources) = declared else {
+        return Ok(None);
+    };
+    // An explicit empty array is valid and means "declared as none". The bound
+    // reuses `save_account`'s; it caps a declaration, it does not require one.
+    if sources.len() > crate::authoring::MAX_SAVE_ACCOUNT_SOURCES {
+        return Err(Error::engine(format!(
+            "{tool}: 'sources' may name at most {} records",
+            crate::authoring::MAX_SAVE_ACCOUNT_SOURCES
+        )));
+    }
+    let mut seen = BTreeSet::new();
+    let mut stored = Vec::with_capacity(sources.len());
+    for (ordinal, source) in sources.iter().enumerate() {
+        if !seen.insert(source.record_id.as_str()) {
+            return Err(Error::engine(format!(
+                "{tool}: sources[{ordinal}] repeats a record_id already declared"
+            )));
+        }
+        // The same source vocabulary `save_account` stores, validated by the
+        // same helpers: an identifier is non-blank and control-free, prose is
+        // non-blank. A basis line and a save-account source line must not admit
+        // different bytes.
+        crate::authoring::validate_identifier(
+            tool,
+            &source.record_id,
+            &format!("sources[{ordinal}].record_id"),
+        )?;
+        crate::authoring::validate_prose(
+            tool,
+            &source.reason,
+            &format!("sources[{ordinal}].reason"),
+        )?;
+        if let Some(role) = source.role.as_deref() {
+            crate::authoring::validate_prose(tool, role, &format!("sources[{ordinal}].role"))?;
+        }
+        if let Some(revision) = source.revision_event_id.as_deref() {
+            crate::authoring::validate_identifier(
+                tool,
+                revision,
+                &format!("sources[{ordinal}].revision_event_id"),
+            )?;
+        }
+        // Existence, liveness and View folded into one opaque refusal: the
+        // canonical in-transaction guard's own id-naming error is discarded on
+        // purpose.
+        if require_record_in(tx, caller, tool, &source.record_id, Capability::View)
+            .await
+            .is_err()
+        {
+            return Err(Error::engine(format!(
+                "{tool}: sources[{ordinal}] names a record that does not exist or is not visible to the caller"
+            )));
+        }
+        let (revision_event_id, revision_supplied_by) = match &source.revision_event_id {
+            Some(revision) => {
+                let real: bool = sqlx::query_scalar(&format!(
+                    "SELECT EXISTS(SELECT 1 FROM content_events WHERE id=? AND record_id=? AND {})",
+                    crate::contribution::BODY_PRODUCING_EVENT_SQL
+                ))
+                .bind(revision)
+                .bind(&source.record_id)
+                .fetch_one(&mut **tx)
+                .await?;
+                if !real {
+                    return Err(Error::engine(format!(
+                        "{tool}: sources[{ordinal}].revision_event_id is not a body revision of the cited record"
+                    )));
+                }
+                (revision.clone(), "caller")
+            }
+            None => {
+                let head: String = sqlx::query_scalar(&format!(
+                    "SELECT id FROM content_events WHERE record_id=? AND {} ORDER BY seq DESC LIMIT 1",
+                    crate::contribution::BODY_PRODUCING_EVENT_SQL
+                ))
+                .bind(&source.record_id)
+                .fetch_one(&mut **tx)
+                .await?;
+                (head, "engine")
+            }
+        };
+        stored.push(json!({
+            "ordinal": ordinal,
+            "record_id": source.record_id,
+            "revision_event_id": revision_event_id,
+            "revision_supplied_by": revision_supplied_by,
+            "role": source.role,
+            "reason": source.reason,
+        }));
+    }
+    Ok(Some(json!({
+        "format": SOURCE_BASIS_FORMAT,
+        "sources": stored,
+    })))
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CreateRecordArgs {
@@ -1727,6 +2048,10 @@ struct CreateRecordArgs {
     /// -field error IS the enforcement, so the tool is uncallable without it
     /// rather than merely discouraged.
     reason: String,
+    /// Optional declared source basis. Absent means "not declared"; an explicit
+    /// empty array means "declared as none". The two states are stored
+    /// distinguishably and must not collapse.
+    sources: Option<Vec<SourceBasisInput>>,
     id: Option<String>,
     kind: String,
     name: Option<String>,
@@ -1893,16 +2218,22 @@ async fn resolve_message_origin_in(
 }
 
 pub(super) async fn create_record(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
-    create_record_inner(db, caller, arguments, None, None, None).await
+    create_record_inner(db, caller, arguments, None, None, None, Some(&[])).await
 }
 
 /// Internal graph and host-composed creation routes need the pre-existing
 /// enriched response even though the public singleton surface now defaults to
 /// a compact receipt.
-pub(super) async fn create_record_verbose(
+///
+/// `create_many`'s singular dispatch. The batch's own reserved ids travel as
+/// the similar-records exclusion set so one item's notice can never name a
+/// sibling created by the same call, while a genuine match with a record
+/// outside the batch is still reported.
+pub(super) async fn create_record_verbose_excluding(
     db: Db,
     caller: Caller,
     arguments: Value,
+    similar_exclusion: &[String],
 ) -> Result<Value> {
     create_record_inner(
         db,
@@ -1911,6 +2242,7 @@ pub(super) async fn create_record_verbose(
         None,
         None,
         Some(ResponseMode::Verbose),
+        Some(similar_exclusion),
     )
     .await
 }
@@ -1978,6 +2310,7 @@ pub(crate) async fn create_record_from_artifact(
         None,
         Some(plan.clone()),
         Some(ResponseMode::Verbose),
+        Some(&[]),
     )
     .await
     {
@@ -2035,6 +2368,10 @@ pub(crate) async fn send_message_record(
         Some(plan),
         None,
         Some(ResponseMode::Verbose),
+        // Sending a Message is not a duplication site: the notice is
+        // type-blind, so a Message could match unrelated Documents, and this
+        // response has no curated rendering for it. Suppress it here.
+        None,
     )
     .await
 }
@@ -2046,8 +2383,10 @@ async fn create_record_inner(
     send_plan: Option<SendMessagePlan>,
     artifact_plan: Option<ArtifactCreatePlan>,
     response_mode_override: Option<ResponseMode>,
+    similar_notice: Option<&[String]>,
 ) -> Result<Value> {
     const TOOL: &str = "create_record";
+    reject_null_sources(TOOL, &arguments)?;
     // The provenance digests run over the raw tool arguments, not the parsed
     // shape: a server-minted `id` must never enter the conflict detector, or
     // every retry of a key without a caller-supplied id would conflict with
@@ -2085,6 +2424,7 @@ async fn create_record_inner(
             .is_some_and(|key| !key.trim().is_empty());
     require_nonblank_reason(TOOL, &args.reason)?;
     let lifecycle = args.lifecycle.take();
+    let source_inputs = args.sources.take();
     if args.kind.is_empty() {
         return Err(Error::engine(format!("{TOOL}: 'kind' must not be empty")));
     }
@@ -2192,6 +2532,7 @@ async fn create_record_inner(
     // at all. Link-target liveness rides on the projector's own in-transaction
     // guard (ef32e44).
     let mut tx = crate::db::begin_write(db.write_pool()).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
     if let Some(plan) = artifact_plan.as_ref() {
         if let Some(existing_id) = artifact_create_replay_in(&mut tx, caller.actor(), plan).await? {
             tx.rollback().await?;
@@ -2850,6 +3191,17 @@ async fn create_record_inner(
             }),
         );
     }
+    // Deterministic alias warnings are a pure function of the admitted
+    // request (facet keys plus the admitted type and canonical kind), so the
+    // first call and every replay compute the same value. Compute before the
+    // replay branches so the fast (unchanged) and slow (pinned-prefix)
+    // receipts carry them exactly as the fresh receipt does; pushing an empty
+    // set is a no-op, so non-alias receipts stay byte-identical.
+    let alias_warnings = crate::domain_transaction::governed_alias_warnings_for_sets(
+        &facets,
+        &record_type,
+        Some(&record_kind),
+    );
     // Idempotent replay, after every authorization and validation check and
     // inside the same BEGIN IMMEDIATE transaction as the mutation — the same
     // ordering contract `manage_relationships` keeps so the tool cannot become
@@ -2912,22 +3264,61 @@ async fn create_record_inner(
                         )));
                     }
                 };
+                // No content event followed the attested horizon or this would
+                // be the slow path, so the live latest body event is the
+                // attested source event the first receipt named.
+                let mut receipt = finish_create_receipt(existing, html_body_write)?;
+                let replayed_source = latest_body_event_id(&db, &attested.record_id, None).await?;
+                annotate_source_event_id(&mut receipt, replayed_source.as_deref());
+                attach_basis_feedback(
+                    &db,
+                    &caller,
+                    &mut receipt,
+                    source_inputs.as_ref().map(Vec::len),
+                    true,
+                )
+                .await;
+                // The replay returns the original write's act: a keyed retry
+                // must be indistinguishable from the call that did the work.
+                crate::domain_transaction::push_receipt_warnings(
+                    &mut receipt,
+                    alias_warnings.clone(),
+                )?;
+                receipt = echo_act(receipt, attested.act)?;
                 return response_mode
-                    .render(
-                        &db,
-                        finish_create_receipt(existing, html_body_write)?,
-                        attested.content_horizon,
-                    )
+                    .render(&db, receipt, attested.content_horizon)
                     .await;
             }
+            let mut receipt =
+                read_attested_create_receipt(&db, &caller, &attested, html_body_write).await?;
+            attach_basis_feedback(
+                &db,
+                &caller,
+                &mut receipt,
+                source_inputs.as_ref().map(Vec::len),
+                true,
+            )
+            .await;
+            crate::domain_transaction::push_receipt_warnings(&mut receipt, alias_warnings.clone())?;
             return response_mode
                 .render(
                     &db,
-                    read_attested_create_receipt(&db, &caller, &attested, html_body_write).await?,
+                    echo_act(receipt, attested.act)?,
                     attested.content_horizon,
                 )
                 .await;
         }
+    }
+    // The basis rides beside `reason` on the record.created event ALONE, for
+    // the same reason `reason` does: it is one authoring act, and copying it
+    // onto the facet and link events this call also emits would multiply one
+    // declaration into several. Validated here, in the same transaction that
+    // appends the event, so existence, liveness, View and the revision check
+    // all observe one snapshot.
+    if let Some(basis) =
+        resolve_source_basis_in(&mut tx, &caller, TOOL, source_inputs.as_deref()).await?
+    {
+        fields.insert("basis".into(), basis);
     }
     let source_event = append_in(
         &db,
@@ -2938,10 +3329,17 @@ async fn create_record_inner(
             payload: Value::Object(fields),
             actor: Some(caller.actor().into()),
         },
+        &mut act_alloc,
     )
     .await?;
     for facet in &facets {
-        append_in(&db, &mut tx, facet_set_spec(&id, facet, caller.actor())).await?;
+        append_in(
+            &db,
+            &mut tx,
+            facet_set_spec(&id, facet, caller.actor()),
+            &mut act_alloc,
+        )
+        .await?;
     }
     if let Some(compiler_attestation) = artifact_attestation {
         let source = source.as_deref().expect("validated v2 artifact has a body");
@@ -2963,6 +3361,7 @@ async fn create_record_inner(
                 payload: serde_json::to_value(payload)?,
                 actor: Some(caller.actor().into()),
             },
+            &mut act_alloc,
         )
         .await?;
     }
@@ -2992,6 +3391,7 @@ async fn create_record_inner(
                 relationship_draft
                     .as_ref()
                     .expect("relationship links reserve one action identity"),
+                &mut act_alloc,
             )
             .await?;
         } else {
@@ -3108,7 +3508,7 @@ async fn create_record_inner(
         });
     }
     for spec in specs {
-        append_in(&db, &mut tx, spec).await?;
+        append_in(&db, &mut tx, spec, &mut act_alloc).await?;
     }
     if record_type == "Message" {
         audience_accounts.sort();
@@ -3142,6 +3542,7 @@ async fn create_record_inner(
                     .cloned()
                     .map(|account| AllowEntry::account(account, Capability::View))
                     .collect(),
+                &mut act_alloc,
             )
             .await?;
         }
@@ -3158,6 +3559,7 @@ async fn create_record_inner(
                 &audience_accounts,
                 "record.created",
                 &source_event.id,
+                &mut act_alloc,
             )
             .await?;
         }
@@ -3183,6 +3585,7 @@ async fn create_record_inner(
                     caller.actor(),
                     collection_id,
                     &source_event.id,
+                    &mut act_alloc,
                 )
                 .await?;
             }
@@ -3193,6 +3596,11 @@ async fn create_record_inner(
     if let Some(draft) = action_draft {
         crate::provenance::issue_reserved_pending_action_in(&mut tx, draft).await?;
     }
+    // Alias shadows warn on success: exact governed names never reach here.
+    // `alias_warnings` was computed from the admitted kind before the replay
+    // branches so replays carry the identical value; reuse it here rather
+    // than recomputing. Independent of any existing relationship so
+    // redundancy still warns.
     let compact_result = if response_mode == ResponseMode::Summary {
         Some(compact_record_source_in(&mut tx, &caller, TOOL, &id).await?)
     } else {
@@ -3233,6 +3641,27 @@ async fn create_record_inner(
     // substrates uniform — Postgres and Turso mint it from their shared read
     // shape — so the corpus can pin it on creation instead of looking away.
     let mut receipt = finish_create_receipt(result, html_body_write)?;
+    // The act this write allocated, on the fresh-create path only: every
+    // idempotent replay returns above through its own receipt without
+    // reaching here, so replays keep byte-identical receipts with no act.
+    receipt = echo_act(receipt, act_alloc.get())?;
+    // The exact-source identity this create minted, when it minted one: a
+    // body-bearing `record.created` is the artifact source event a later
+    // `manage_artifact_module_grants.grant` must name as `subject_event_id`.
+    // A body-less create mints no source event and leaves the field absent.
+    annotate_source_event_id(
+        &mut receipt,
+        source.is_some().then_some(source_event.id.as_str()),
+    );
+    attach_basis_feedback(
+        &db,
+        &caller,
+        &mut receipt,
+        source_inputs.as_ref().map(Vec::len),
+        idempotent_create,
+    )
+    .await;
+    crate::domain_transaction::push_receipt_warnings(&mut receipt, alias_warnings)?;
     // A non-replayed advisory naming active claims in the new record's
     // neighbourhood, attached AFTER the receipt is assembled and only on this
     // fresh-create path: every idempotent replay returns above through its own
@@ -3259,6 +3688,37 @@ async fn create_record_inner(
                 .insert("work_overlap".into(), overlap);
         }
     }
+    // The similar-records advisory is advisory in the strictest sense. It runs
+    // after the write has committed, on the SQLite product path only, over a
+    // bounded set of indexed queries (typically 1-2 ms at workspace sizes),
+    // and every error is swallowed by `notice_for_create`. There is no
+    // enforced deadline: bounded work is not bounded latency, and pool
+    // contention or a cold FTS index can still stretch the receipt, but the
+    // lookup cannot fail the write. The key is omitted entirely when nothing
+    // is similar, so its presence is itself the signal. The exclusion set
+    // carries a `create_many` batch's own reserved ids, so batch siblings
+    // never point at one another; `None` suppresses the notice entirely (the
+    // delivered-Message send path).
+    //
+    // Suppressed for keyed creates. A keyed create is replayable and the
+    // idempotency contract requires the replay to return a byte-identical
+    // receipt; both replay branches above return before this point. The notice
+    // is computed from the live workspace, so it cannot be reproduced from the
+    // pinned event prefix a replay reconstructs from — and persisting it would
+    // mean either computing it before the write commits (where a failure could
+    // fail the write) or appending advisory data to the immutable log. It is
+    // therefore outside the replayed identity: keyed creates carry no notice at
+    // all, first call or replay. Keyless creates have no replay and keep it.
+    let similar_notice = similar_notice.filter(|_| !idempotent_create);
+    if let Some(similar_notice) = similar_notice {
+        if let Some(similar) =
+            super::similar::notice_for_create(&db, &caller, &id, similar_notice).await
+        {
+            if let Some(object) = receipt.as_object_mut() {
+                object.insert("similar_existing".into(), similar);
+            }
+        }
+    }
     response_mode.render(&db, receipt, version_seq).await
 }
 
@@ -3272,6 +3732,10 @@ struct AttestedCreate {
     record_id: String,
     content_horizon: i64,
     relationship_horizon: Option<i64>,
+    /// The act the original create allocated. A keyed replay returns it so the
+    /// replay receipt is indistinguishable from the first call; only a true
+    /// no-op omits `act`.
+    act: Option<i64>,
 }
 
 /// Decide inside the replay transaction whether the live projection still
@@ -3398,10 +3862,18 @@ async fn attested_create_horizons_in(
     let content_horizon = content_horizon
         .ok_or_else(|| Error::engine("create_record: idempotent receipt is incomplete"))?;
     let relationship_horizon: Option<i64> = sqlx::query_scalar(
+        // `relationship_events` is UNIQUE `(issuer_origin_db_id, id)`, not `id`
+        // alone: a federated peer can ingest an event reusing a canonical UUID
+        // a local keyed write already used. Joining on the id alone would let
+        // the foreign row's seq win. Qualify by the attestation's issuer
+        // origin, as every other relationship-event lookup in the tree does.
         "SELECT MAX(e.seq) FROM provenance_action_outputs o
            JOIN relationship_events e ON e.id=o.output_event_id
-          WHERE o.action_attestation_id=? AND o.output_domain='relationship'",
+          WHERE o.action_attestation_id=? AND o.output_domain='relationship'
+            AND e.issuer_origin_db_id=(
+                SELECT issuer_origin_database_id FROM provenance_action_attestations WHERE id=?)",
     )
+    .bind(attestation_id)
     .bind(attestation_id)
     .fetch_optional(&mut **tx)
     .await?
@@ -3411,6 +3883,7 @@ async fn attested_create_horizons_in(
         record_id,
         content_horizon,
         relationship_horizon,
+        act: super::attested_act_in(tx, attestation_id).await?,
     })
 }
 
@@ -3502,7 +3975,13 @@ async fn read_attested_create_receipt(
         // live disclosure, mirroring `contribution_for_record_in` exactly.
         record.contribution =
             attested_contribution_for_record(&scratch, db, caller, &record.record.id).await?;
-        finish_create_receipt(serde_json::to_value(record)?, html_body_write)
+        let mut receipt = finish_create_receipt(serde_json::to_value(record)?, html_body_write)?;
+        // The pinned horizon bounds the read: later writers may have moved the
+        // live source since, but the attested receipt names its own event.
+        let attested_source =
+            latest_body_event_id(db, &attested.record_id, Some(attested.content_horizon)).await?;
+        annotate_source_event_id(&mut receipt, attested_source.as_deref());
+        Ok(receipt)
     }
     .await;
     scratch.close().await;
@@ -3524,13 +4003,22 @@ async fn attested_contribution_for_record(
     let mut record_tx = record_db.write_pool().begin().await?;
     let raw = crate::contribution::raw_contribution_in(&mut record_tx, record_id).await?;
     record_tx.rollback().await?;
-    let Some(raw) = raw else {
+    let Some(mut raw) = raw else {
         return Ok(None);
     };
     let mut auth_tx = auth_db.write_pool().begin().await?;
     let result = async {
         let disclosure =
             crate::contribution::viewer_disclosure_in(&mut auth_tx, caller, &raw).await?;
+        // The client claim is a run-level fact the pinned scratch projection
+        // does not carry; read it live, on the same rule as everything else
+        // here, and only when the run is this viewer's to see.
+        if disclosure.current_run_visible {
+            if let Some(run_key) = raw.current.run_key.as_deref() {
+                raw.reported_client =
+                    crate::contribution::reported_client_for_run_in(&mut auth_tx, run_key).await?;
+            }
+        }
         let alternative_set =
             crate::contribution::alternative_set_context_in(&mut auth_tx, caller, record_id)
                 .await?;
@@ -3851,7 +4339,10 @@ async fn validate_artifact_create_scope_in(
             .fetch_optional(&mut **tx)
             .await?
             .flatten();
-    if runtime.as_deref() != Some(mdx_v2::RUNTIME_ID) {
+    if !matches!(
+        runtime.as_deref(),
+        Some(mdx_v2::RUNTIME_ID | crate::artifact_html::RUNTIME_ID)
+    ) {
         return Err(Error::engine(
             "create_record: originating artifact runtime changed before creation committed",
         ));
@@ -3960,6 +4451,67 @@ async fn validate_artifact_create_scope_in(
 // Tool 6 — get_record
 // ---------------------------------------------------------------------------
 
+/// Attach body-mention evidence to one already-authorized record, reading the
+/// projection from `record_pool` and deciding visibility against `auth_pool`.
+///
+/// The two pools are deliberately separate: an `as_of` read replays the
+/// projection into a scratch database while `View` is decided against live
+/// meta, so a historical body is paired with live authorization. Reads happen
+/// before visibility, but counts and windows are computed after it, so a hidden
+/// source can never move a total or a page.
+async fn attach_mentions_in_pools(
+    record_pool: &sqlx::SqlitePool,
+    auth_pool: &sqlx::SqlitePool,
+    caller: &Caller,
+    record: &mut read::EnrichedRecord,
+    opts: read::EnrichOptions,
+) -> Result<()> {
+    // Two phases so the record pool never holds a connection while the auth
+    // pool checks one out — with record and auth being the same pool on the
+    // live path, holding one across the other would reserve two of five
+    // connections per concurrent read for no reason.
+    let gathered = {
+        let mut conn = record_pool.acquire().await?;
+        read::gather_mentions(&mut conn, &record.record.id).await?
+    };
+    let ids = gathered.authorization_ids();
+    let visible = super::visible_ids_in_pool(auth_pool, caller, ids).await?;
+    let resolved = {
+        let mut conn = record_pool.acquire().await?;
+        read::finish_mentions(
+            &mut conn,
+            gathered,
+            &visible,
+            opts.links_limit,
+            opts.links_offset,
+        )
+        .await?
+    };
+    record.mentions_out = resolved.out;
+    record.mentions_out_count = resolved.out_count;
+    record.mentions_in = resolved.incoming;
+    record.mentions_in_count = resolved.incoming_count;
+    Ok(())
+}
+
+async fn attach_mentions_in(
+    tx: &mut Transaction<'_, Sqlite>,
+    caller: &Caller,
+    record: &mut read::EnrichedRecord,
+    opts: read::EnrichOptions,
+) -> Result<()> {
+    let gathered = read::gather_mentions(tx, &record.record.id).await?;
+    let ids = gathered.authorization_ids();
+    let visible = super::visible_ids_in(tx, caller, ids).await?;
+    let resolved =
+        read::finish_mentions(tx, gathered, &visible, opts.links_limit, opts.links_offset).await?;
+    record.mentions_out = resolved.out;
+    record.mentions_out_count = resolved.out_count;
+    record.mentions_in = resolved.incoming;
+    record.mentions_in_count = resolved.incoming_count;
+    Ok(())
+}
+
 pub(super) async fn filter_enriched_record_with_auth(
     record_db: &Db,
     auth_db: &Db,
@@ -3967,12 +4519,17 @@ pub(super) async fn filter_enriched_record_with_auth(
     record: &mut read::EnrichedRecord,
     opts: read::EnrichOptions,
 ) -> Result<()> {
+    // One record, one request: a fresh memo is correct here and keeps this
+    // single-record entry point free of a cache parameter its callers do not
+    // have. The batch path below threads a shared one instead.
+    let mut reported = crate::contribution::ReportedIdentityCache::new();
     filter_enriched_record_with_auth_in_pools(
         record_db.write_pool(),
         auth_db.write_pool(),
         caller,
         record,
         opts,
+        &mut reported,
     )
     .await
 }
@@ -3983,6 +4540,7 @@ async fn filter_enriched_record_with_auth_in_pools(
     caller: &Caller,
     record: &mut read::EnrichedRecord,
     opts: read::EnrichOptions,
+    reported: &mut crate::contribution::ReportedIdentityCache,
 ) -> Result<()> {
     let authored_home = record.record.home_id.clone();
     record.custody_boundary = crate::query::tree::custody_boundary_in_pool(
@@ -4143,8 +4701,9 @@ async fn filter_enriched_record_with_auth_in_pools(
     {
         record.target = None;
     }
+    attach_mentions_in_pools(record_pool, auth_pool, caller, record, opts).await?;
     let mut snapshot = auth_pool.begin().await?;
-    let hydrated = hydrate_contributions_in(&mut snapshot, caller, record).await;
+    let hydrated = hydrate_contributions_in(&mut snapshot, caller, record, reported).await;
     snapshot.rollback().await?;
     hydrated
 }
@@ -4154,6 +4713,7 @@ async fn filter_enriched_record_in(
     caller: &Caller,
     record: &mut read::EnrichedRecord,
     opts: read::EnrichOptions,
+    reported: &mut crate::contribution::ReportedIdentityCache,
 ) -> Result<()> {
     let authored_home = record.record.home_id.clone();
     record.custody_boundary =
@@ -4302,7 +4862,8 @@ async fn filter_enriched_record_in(
     {
         record.target = None;
     }
-    hydrate_contributions_in(tx, caller, record).await
+    attach_mentions_in(tx, caller, record, opts).await?;
+    hydrate_contributions_in(tx, caller, record, reported).await
 }
 
 /// Attach the generic contribution projection to a record and to every comment
@@ -4311,17 +4872,24 @@ async fn filter_enriched_record_in(
 /// This runs in the visibility-filtering layer on purpose. The projection is
 /// viewer-relative — which run, which principal, which alternative set — so it
 /// cannot be built by the projection reader that does not know who is asking.
+///
+/// `reported` is the request's shared per-run memo, threaded in rather than
+/// created here: a record and its comments (and every further act the same
+/// request hydrates) repeat one run's `agent_runs` read once, not per act.
 async fn hydrate_contributions_in(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     caller: &Caller,
     record: &mut read::EnrichedRecord,
+    reported: &mut crate::contribution::ReportedIdentityCache,
 ) -> Result<()> {
     record.contribution =
-        crate::contribution::contribution_for_record_in(tx, caller, &record.record.id).await?;
+        crate::contribution::contribution_for_record_in(tx, caller, &record.record.id, reported)
+            .await?;
     if let Some(comments) = record.comments.as_mut() {
         for comment in comments.iter_mut() {
             comment.contribution =
-                crate::contribution::contribution_for_record_in(tx, caller, &comment.id).await?;
+                crate::contribution::contribution_for_record_in(tx, caller, &comment.id, reported)
+                    .await?;
         }
     }
     Ok(())
@@ -4582,7 +5150,7 @@ async fn finish_read_snapshot<T>(
     }
 }
 
-async fn get_record(db: Db, caller: Caller, mut arguments: Value) -> Result<Value> {
+pub(crate) async fn get_record(db: Db, caller: Caller, mut arguments: Value) -> Result<Value> {
     const TOOL: &str = "get_record";
     let as_of = lens::take_as_of(TOOL, &mut arguments)?;
     let args: GetRecordArgs = parse_args(TOOL, arguments)?;
@@ -4597,7 +5165,7 @@ async fn get_record(db: Db, caller: Caller, mut arguments: Value) -> Result<Valu
         ));
     }
     let Some(selector) = as_of else {
-        return get_record_from_lens(&ReadLens::live(&db), &caller, args).await;
+        return get_record_from_lens(&ReadLens::live(&db), &caller, args, Some(&db)).await;
     };
     let resolved = lens::resolve_as_of(&db, selector).await?;
     let scratch = open_database(":memory:").await?;
@@ -4605,7 +5173,7 @@ async fn get_record(db: Db, caller: Caller, mut arguments: Value) -> Result<Valu
         apply_schema(&scratch).await?;
         lens::replay_projection(&db, &scratch, resolved.resolved_content_seq).await?;
         let read_lens = ReadLens::historical(&scratch, &db, &resolved);
-        let mut output = get_record_from_lens(&read_lens, &caller, args).await?;
+        let mut output = get_record_from_lens(&read_lens, &caller, args, None).await?;
         lens::echo_temporal(&mut output, &resolved);
         Ok(output)
     }
@@ -4618,6 +5186,7 @@ async fn get_record_from_lens(
     lens: &ReadLens<'_>,
     caller: &Caller,
     args: GetRecordArgs,
+    index_db: Option<&Db>,
 ) -> Result<Value> {
     const TOOL: &str = "get_record";
     if args.ids.is_empty() {
@@ -4666,15 +5235,45 @@ async fn get_record_from_lens(
         comments_limit: args.comments_limit.unwrap_or(defaults.comments_limit),
         comments_offset: args.comments_offset.unwrap_or(defaults.comments_offset),
     };
-    let record_pool = lens.projection().snapshot_pool();
-    let auth_pool = lens.meta().snapshot_pool();
+    // A live get_record request writes nothing and carries its own read
+    // transaction. Keep the governed body, admission and enrichment on one
+    // physically read-only snapshot; historical replay retains its existing
+    // projection pool below.
+    let record_pool = if lens.temporal().is_none() {
+        lens.projection().shared_pool()
+    } else {
+        lens.projection().snapshot_pool()
+    };
+    let auth_pool = if lens.temporal().is_none() {
+        lens.meta().shared_pool()
+    } else {
+        lens.meta().snapshot_pool()
+    };
     let resolve = args.resolve.unwrap_or(true);
+    // One memo for the whole batch: every act hydrated below that names the
+    // same run shares a single `agent_runs` read. A run page resolving many
+    // acts through one `get_record` call therefore issues one lookup per run.
+    let mut reported = crate::contribution::ReportedIdentityCache::new();
+    let mut indexed_header_ids = crate::mcp::request_timing::m4_index_measurement_enabled()
+        .then(std::collections::HashSet::new);
     let mut items = if lens.temporal().is_none() {
+        let indexed_heads = if let Some(db) = index_db {
+            db.indexed_record_heads_for(&args.ids).await
+        } else {
+            None
+        };
         let mut snapshot = record_pool.begin().await?;
         let principal = (!super::is_legacy_local(caller)).then(|| super::principal(caller));
         let result = async {
-            let mut items =
-                read::get_records_live_in(&mut snapshot, &args.ids, opts, principal).await?;
+            let mut items = read::get_records_live_with_heads_and_usage_in(
+                &mut snapshot,
+                &args.ids,
+                opts,
+                principal,
+                indexed_heads.as_ref(),
+                indexed_header_ids.as_mut(),
+            )
+            .await?;
             hide_attribution_batch_items(&mut items);
             // One disclosure memo for every summary on this call: a batch
             // holds many records but few distinct actors.
@@ -4683,7 +5282,8 @@ async fn get_record_from_lens(
                 let read::BatchGetItem::Found(record) = item else {
                     continue;
                 };
-                filter_enriched_record_in(&mut snapshot, caller, record, opts).await?;
+                filter_enriched_record_in(&mut snapshot, caller, record, opts, &mut reported)
+                    .await?;
                 // Advisory freshness projection, live reads only: the same
                 // snapshot transaction keeps the authorization decision and
                 // the kernel state on one SQLite snapshot. Records without
@@ -4757,8 +5357,15 @@ async fn get_record_from_lens(
                 *item = read::BatchGetItem::NotFound { id };
                 continue;
             }
-            filter_enriched_record_with_auth_in_pools(record_pool, auth_pool, caller, record, opts)
-                .await?;
+            filter_enriched_record_with_auth_in_pools(
+                record_pool,
+                auth_pool,
+                caller,
+                record,
+                opts,
+                &mut reported,
+            )
+            .await?;
         }
         supplement_get_record_items(
             &mut RecordSupplementSource::Lens(lens),
@@ -4802,6 +5409,22 @@ async fn get_record_from_lens(
             .expect("get_record response is an object")
             .insert("include_interpretation".into(), Value::Bool(true));
     }
+    // One decision per successful tool call. A held head rejected by the
+    // read transaction's fence, or a batch with no *returned* indexed record,
+    // counts as governed fallback. Later filtering can hide a record whose
+    // header was read; only the final found items can establish a hit.
+    // Historical replay has no indexed headers and counts as governed.
+    let used_indexed_header = output["records"].as_array().is_some_and(|records| {
+        records.iter().any(|record| {
+            record["status"] == "found"
+                && record["id"].as_str().is_some_and(|id| {
+                    indexed_header_ids
+                        .as_ref()
+                        .is_some_and(|ids| ids.contains(id))
+                })
+        })
+    });
+    crate::mcp::request_timing::record_m4_index_decision(used_indexed_header);
     Ok(output)
 }
 
@@ -5231,6 +5854,10 @@ struct UpdateRecordArgs {
     id: String,
     /// Required (fbfaf25 §3.1).
     reason: String,
+    /// Optional declared source basis, as on `create_record`. The batch form
+    /// rejects it: one basis for many records is ambiguous and the batch skips
+    /// no-op targets, so it is unclear which events would carry it.
+    sources: Option<Vec<SourceBasisInput>>,
     #[serde(default, deserialize_with = "present")]
     name: Option<Value>,
     #[serde(default, deserialize_with = "present")]
@@ -5259,6 +5886,7 @@ struct UpdateRecordArgs {
     if_body_digest: Option<String>,
     if_unmodified_since: Option<String>,
     facets: Option<Map<String, Value>>,
+    links: Option<Vec<NewLink>>,
     #[serde(default)]
     response_mode: ResponseMode,
 }
@@ -5463,6 +6091,56 @@ pub fn annotate_body_digest(record: &mut Value) {
     }
     let digest = body_digest(object.get("body").and_then(Value::as_str));
     object.insert("body_digest".into(), json!(digest));
+}
+
+/// Stamp `source_event_id` onto a write receipt: the content-event id of the
+/// body-bearing event this call created, next to the `body_digest` of that
+/// same body. An artifact grant names exactly this value as `subject_event_id`,
+/// so publishing it here (and in the grant-invalidation warning) means a
+/// caller never has to provoke a failure to learn a required grant input.
+///
+/// Only called when the write actually created a body-bearing event. A write
+/// that touched no body (facet-only edits, body-less creates) leaves the field
+/// absent rather than naming a stale event.
+fn annotate_source_event_id(receipt: &mut Value, source_event_id: Option<&str>) {
+    let Some(source_event_id) = source_event_id else {
+        return;
+    };
+    if let Some(object) = receipt.as_object_mut() {
+        object.insert("source_event_id".into(), json!(source_event_id));
+    }
+}
+
+/// Latest body-bearing content event for `record_id`, optionally bounded by a
+/// pinned content sequence. Used only by idempotent-create replays, which must
+/// return byte-identical receipts: the fast path replays nothing because no
+/// content event followed the attested horizon, so the live latest is the
+/// attested one; the slow path bounds the read at the attested horizon for the
+/// same reason.
+async fn latest_body_event_id(
+    db: &Db,
+    record_id: &str,
+    max_seq: Option<i64>,
+) -> Result<Option<String>> {
+    const BASE: &str = "SELECT id FROM content_events WHERE record_id=? \
+        AND type IN ('record.created','record.updated','receipt.committed.v1') \
+        AND json_type(payload,'$.body') IS NOT NULL";
+    let row = if let Some(max_seq) = max_seq {
+        sqlx::query(&format!("{BASE} AND seq<=? ORDER BY seq DESC LIMIT 1"))
+            .bind(record_id)
+            .bind(max_seq)
+            .fetch_optional(db.write_pool())
+            .await?
+    } else {
+        sqlx::query(&format!("{BASE} ORDER BY seq DESC LIMIT 1"))
+            .bind(record_id)
+            .fetch_optional(db.write_pool())
+            .await?
+    };
+    match row {
+        Some(row) => Ok(Some(row.try_get("id")?)),
+        None => Ok(None),
+    }
 }
 
 /// Everything a refusal needs to identify its target without returning the
@@ -5874,7 +6552,7 @@ fn multi_update_rejection(
     }
 }
 
-async fn facet_state_in(
+pub(super) async fn facet_state_in(
     tx: &mut Transaction<'static, Sqlite>,
     record_id: &str,
     key: &str,
@@ -5891,6 +6569,17 @@ async fn facet_state_in(
 
 async fn update_record_multi(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
     const TOOL: &str = "update_record";
+    // `sources` is unsupported on the batch form in every shape. The parsed
+    // field cannot see `sources: null` — serde folds it into `None`, which is
+    // exactly the silent no-declaration collapse `reject_null_sources` exists
+    // to prevent — so the check runs on the raw arguments, where null survives.
+    // Every shape gets the same batch message: on this tool `sources` is
+    // unsupported outright, so there is no `[]`-versus-null distinction to draw.
+    if arguments.get("sources").is_some() {
+        return Err(Error::engine(format!(
+            "{TOOL}: 'sources' is not supported on the batch form; call update_record once per record to declare a basis"
+        )));
+    }
     let args: MultiUpdateRecordArgs = parse_args(TOOL, arguments)?;
     require_nonblank_reason(TOOL, &args.reason)?;
     if args.ids.is_empty() {
@@ -5949,6 +6638,7 @@ async fn update_record_multi(db: Db, caller: Caller, arguments: Value) -> Result
     }
 
     let mut tx = crate::db::begin_write(db.write_pool()).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
     if let Some(new_home) = args.home_id.as_deref() {
         require_record_in(&mut tx, &caller, TOOL, new_home, Capability::Edit)
             .await
@@ -5997,6 +6687,10 @@ async fn update_record_multi(db: Db, caller: Caller, arguments: Value) -> Result
         facet_inputs.contains_key(crate::message_expectation::EXPECTATION_FACET_KEY);
     let mut prepared = Vec::with_capacity(args.ids.len());
     let mut unchanged = 0usize;
+    // Alias warnings per prepared target, correlated by request index like
+    // `create_many`. Unsets stay quiet (only `facet_sets` are judged) and
+    // kinds the governed relationship does not admit stay quiet.
+    let mut batch_warnings = Vec::new();
 
     for (index, id) in args.ids.iter().enumerate() {
         if !authorized[index] {
@@ -6214,6 +6908,17 @@ async fn update_record_multi(db: Db, caller: Caller, arguments: Value) -> Result
         if !target.changed() {
             unchanged += 1;
         }
+        // Warn on the requested sets with this target's kind, matching the
+        // singular write: unsets never warn and ineligible kinds stay quiet.
+        for warning in crate::domain_transaction::governed_alias_warnings_for_sets(
+            &facet_sets,
+            &record_type,
+            kind.as_deref(),
+        ) {
+            batch_warnings.push(crate::domain_transaction::index_warning_for_batch(
+                index, id, warning,
+            ));
+        }
         prepared.push(target);
     }
 
@@ -6239,6 +6944,7 @@ async fn update_record_multi(db: Db, caller: Caller, arguments: Value) -> Result
                     payload: Value::Object(target.fields),
                     actor: Some(caller.actor().into()),
                 },
+                &mut act_alloc,
             )
             .await?;
         }
@@ -6249,7 +6955,7 @@ async fn update_record_multi(db: Db, caller: Caller, arguments: Value) -> Result
                 spec.payload["reason"] = json!(args.reason.clone());
             }
             first_facet = false;
-            append_in(&db, &mut tx, spec).await?;
+            append_in(&db, &mut tx, spec, &mut act_alloc).await?;
         }
         for key in target.facet_unsets {
             let mut payload = json!({ "key": key });
@@ -6266,6 +6972,7 @@ async fn update_record_multi(db: Db, caller: Caller, arguments: Value) -> Result
                     payload,
                     actor: Some(caller.actor().into()),
                 },
+                &mut act_alloc,
             )
             .await?;
         }
@@ -6293,12 +7000,19 @@ async fn update_record_multi(db: Db, caller: Caller, arguments: Value) -> Result
             })
         })
         .collect::<Vec<_>>();
-    Ok(json!({
-        "requested": args.ids.len(),
-        "changed": changed,
-        "unchanged": args.ids.len() - changed,
-        "results": results,
-    }))
+    // Alias warnings ride a top-level `warnings` array correlated by request
+    // index, like `create_many`. The key is absent when nothing warned, so
+    // existing receipts stay byte-identical.
+    let mut batch_response = json!({
+    "requested": args.ids.len(),
+    "changed": changed,
+    "unchanged": args.ids.len() - changed,
+    "results": results,
+    });
+    if !batch_warnings.is_empty() {
+        batch_response["warnings"] = Value::Array(batch_warnings);
+    }
+    echo_act(batch_response, act_alloc.get())
 }
 
 async fn update_record(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
@@ -6311,6 +7025,7 @@ async fn update_record(db: Db, caller: Caller, arguments: Value) -> Result<Value
 
 async fn update_record_singular(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
     const TOOL: &str = "update_record";
+    reject_null_sources(TOOL, &arguments)?;
     // `body_replace: null` would fold to `None` through `Option<Vec<..>>`
     // and silently vanish — including alongside another body op. Reject the
     // explicit null up front so malformed input cannot bypass exclusivity.
@@ -6319,9 +7034,10 @@ async fn update_record_singular(db: Db, caller: Caller, arguments: Value) -> Res
             "{TOOL}: 'body_replace' must be an array of {{old, new}} edits, got null"
         )));
     }
-    let args: UpdateRecordArgs = parse_args(TOOL, arguments)?;
+    let mut args: UpdateRecordArgs = parse_args(TOOL, arguments)?;
     let response_mode = args.response_mode;
     require_nonblank_reason(TOOL, &args.reason)?;
+    let source_inputs = args.sources.take();
     let touches_message_expectation = args.facets.as_ref().is_some_and(|facets| {
         facets.contains_key(crate::message_expectation::EXPECTATION_FACET_KEY)
     });
@@ -6448,6 +7164,25 @@ async fn update_record_singular(db: Db, caller: Caller, arguments: Value) -> Res
             }
         }
     }
+    let links = args.links.unwrap_or_default();
+    // Add-only links in the create_record-compatible shape. Links ride along
+    // with a record edit — they do not satisfy the no-changes guard on their
+    // own (manage_links.add remains the links-only path). This keeps the
+    // reason/basis placement below untouched: the first emitted event is
+    // always the record.updated field event or the first facet event, never
+    // a link event.
+    for link in &links {
+        if link.relationship.trim().is_empty() {
+            return Err(Error::engine(format!(
+                "{TOOL}: link relationship must contain non-whitespace text"
+            )));
+        }
+        if link.relationship == "addressed_to" {
+            return Err(Error::engine(format!(
+                "{TOOL}: addressed_to must use the Message addressed_to field"
+            )));
+        }
+    }
     if fields.is_empty()
         && facet_specs.is_empty()
         && args.body_replace.is_none()
@@ -6491,6 +7226,7 @@ async fn update_record_singular(db: Db, caller: Caller, arguments: Value) -> Res
     // serializes writers, so a concurrent cross-rehome cannot slip a cycle
     // past a check that already committed.
     let mut tx = crate::db::begin_write(db.write_pool()).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
     let structural = args.home_id.is_some();
     require_record_in(
         &mut tx,
@@ -6504,6 +7240,29 @@ async fn update_record_singular(db: Db, caller: Caller, arguments: Value) -> Res
         },
     )
     .await?;
+    // Link preflight, before any event is appended: the source Edit above
+    // already covers manage_links' source side, so each link needs only its
+    // target View, bearer-immutability, reserved-relationship refusal, and
+    // relationship-ownership classification. Every failure here rolls the
+    // whole call back — the record edit and the links commit together or not
+    // at all.
+    let mut relationship_link_indexes = BTreeSet::new();
+    for (index, link) in links.iter().enumerate() {
+        crate::surface_binding::refuse_reserved_surface_binding(TOOL, &link.relationship)?;
+        require_record_in(&mut tx, &caller, TOOL, &link.target_id, Capability::View).await?;
+        crate::comments::assert_bearer_immutable_on(&mut tx, TOOL, &args.id, &link.relationship)
+            .await?;
+        if super::links::relationship_owned_in(
+            &mut tx,
+            &args.id,
+            &link.target_id,
+            &link.relationship,
+        )
+        .await?
+        {
+            relationship_link_indexes.insert(index);
+        }
+    }
     if let Some(Value::String(new_home)) = &args.home_id {
         let origin = sqlx::query(
             "SELECT status,origin_type,collection_id
@@ -6652,6 +7411,23 @@ async fn update_record_singular(db: Db, caller: Caller, arguments: Value) -> Res
         }
         if let Some(canonical) = resolution.canonical_kind_for_write() {
             fields.insert("kind".into(), json!(canonical));
+        }
+    }
+    // The basis follows the `reason` rule exactly: on the first event this call
+    // emits — the `record.updated` field event when there is one, else the
+    // first facet event — and never on the link or later facet events the same
+    // call emits. `reason` was placed before the transaction opened; the basis
+    // must be resolved inside it, so it is placed here under the identical
+    // condition.
+    if let Some(basis) =
+        resolve_source_basis_in(&mut tx, &caller, TOOL, source_inputs.as_deref()).await?
+    {
+        if !fields.is_empty() || args.body_replace.is_some() || args.body_append.is_some() {
+            fields.insert("basis".into(), basis);
+        } else if let Some(first) = facet_specs.first_mut() {
+            if let Some(payload) = first.payload.as_object_mut() {
+                payload.insert("basis".into(), basis);
+            }
         }
     }
     let previous_seq = previous_record_seq_in(&mut tx, &args.id).await?;
@@ -7178,6 +7954,7 @@ async fn update_record_singular(db: Db, caller: Caller, arguments: Value) -> Res
                     payload: Value::Object(fields),
                     actor: Some(caller.actor().into()),
                 },
+                &mut act_alloc,
             )
             .await?,
         )
@@ -7185,7 +7962,56 @@ async fn update_record_singular(db: Db, caller: Caller, arguments: Value) -> Res
         None
     };
     for spec in facet_specs {
-        append_in(&db, &mut tx, spec).await?;
+        append_in(&db, &mut tx, spec, &mut act_alloc).await?;
+    }
+    // Links emit after the record/facet events in the same transaction, never
+    // carrying reason or basis (those rode on the first event above). A
+    // relationship-owned link routes through the sealed legacy adapter under
+    // one reserved action identity for the whole call, exactly as
+    // create_record does; everything else appends link.added.
+    let link_draft = if relationship_link_indexes.is_empty() {
+        None
+    } else {
+        Some(crate::provenance::reserve_action_attestation()?)
+    };
+    for (index, link) in links.iter().enumerate() {
+        if relationship_link_indexes.contains(&index) {
+            crate::relationship::legacy::mutate_from_update_record_in(
+                &mut tx,
+                &caller,
+                &args.id,
+                &link.target_id,
+                &link.relationship,
+                link.note.clone(),
+                link_draft
+                    .as_ref()
+                    .expect("relationship links reserve one action identity"),
+                &mut act_alloc,
+            )
+            .await?;
+        } else {
+            append_in(
+                &db,
+                &mut tx,
+                AppendSpec {
+                    record_id: args.id.clone(),
+                    event_type: "link.added".into(),
+                    payload: serde_json::to_value(crate::events::LinkAddedPayload {
+                        id: None,
+                        source_id: args.id.clone(),
+                        target_id: link.target_id.clone(),
+                        relationship: link.relationship.clone(),
+                        note: link.note.clone(),
+                    })?,
+                    actor: Some(caller.actor().into()),
+                },
+                &mut act_alloc,
+            )
+            .await?;
+        }
+    }
+    if let Some(draft) = link_draft {
+        crate::provenance::issue_reserved_pending_action_in(&mut tx, draft).await?;
     }
     if let Some(compiler_attestation) = artifact_attestation {
         let (source_event_id, source) = if source_changed {
@@ -7243,6 +8069,7 @@ async fn update_record_singular(db: Db, caller: Caller, arguments: Value) -> Res
                     payload: serde_json::to_value(payload)?,
                     actor: Some(caller.actor().into()),
                 },
+                &mut act_alloc,
             )
             .await?;
             let new_surface = super::artifacts::declaration_surface_sha256(&new_descriptor)?;
@@ -7255,9 +8082,13 @@ async fn update_record_singular(db: Db, caller: Caller, arguments: Value) -> Res
                         "dropped_binding_count": 0,
                         "carried_grant_count": 0,
                         "dropped_grant_count": 0,
+                        "changed_ports": [],
+                        "dropped": [],
                         "old_declaration_surface_sha256": old_surface,
                         "new_declaration_surface_sha256": new_surface,
                         "restoration_tools": [],
+                        "source_event_id": source_event_id.clone(),
+                        "source_sha256": new_source_sha256.clone(),
                     }));
                 }
             }
@@ -7285,102 +8116,21 @@ async fn update_record_singular(db: Db, caller: Caller, arguments: Value) -> Res
                 let mut dropped_bindings = 0usize;
                 let mut carried_grants = 0usize;
                 let mut dropped_grants = 0usize;
-                if old_surface == new_surface {
-                    for binding in snapshot.bindings {
-                        let new_binding = super::artifacts::carried_input_payload(
-                            &args.id,
-                            &binding.port_name,
-                            &binding.collection_id,
-                            &attestation_event_id,
-                            &source_event_id,
-                            &new_source_sha256,
-                            &new_descriptor,
-                        )?;
-                        append_in(
-                            &db,
-                            &mut tx,
-                            AppendSpec {
-                                record_id: args.id.clone(),
-                                event_type: "artifact.input_carried".into(),
-                                payload: serde_json::to_value(ArtifactInputCarriedPayload {
-                                    binding: new_binding,
-                                    predecessor_binding_event_seq: binding.event_seq,
-                                    predecessor_source_attestation_event_id: snapshot
-                                        .source_attestation_event_id
-                                        .clone(),
-                                    predecessor_source_event_id: snapshot.source_event_id.clone(),
-                                    predecessor_source_sha256: snapshot.source_sha256.clone(),
-                                    old_declaration_surface_sha256: old_surface.clone(),
-                                    new_declaration_surface_sha256: new_surface.clone(),
-                                })?,
-                                actor: Some(caller.actor().into()),
-                            },
-                        )
-                        .await?;
-                        carried_bindings += 1;
-                    }
-                    for predecessor in snapshot.grants {
-                        let mut grant = predecessor.payload.clone();
-                        if grant.subject_kind == "artifact_source" {
-                            grant.subject_event_id = source_event_id.clone();
-                            grant.source_sha256 = new_source_sha256.clone();
-                        }
-                        match super::artifacts::try_build_carried_grant_attestation_in(
-                            &mut tx, &caller, &grant,
-                        )
-                        .await?
-                        {
-                            Some((attestation, digest)) => {
-                                grant.attestation = Some(attestation);
-                                grant.attestation_sha256 = Some(digest);
-                                append_in(
-                                    &db,
-                                    &mut tx,
-                                    AppendSpec {
-                                        record_id: args.id.clone(),
-                                        event_type: "artifact.module_grant_carried".into(),
-                                        payload: serde_json::to_value(
-                                            ArtifactModuleGrantCarriedPayload {
-                                                grant,
-                                                predecessor: predecessor.payload,
-                                                predecessor_grant_event_seq: predecessor.event_seq,
-                                                predecessor_source_attestation_event_id: snapshot
-                                                    .source_attestation_event_id
-                                                    .clone(),
-                                                predecessor_source_event_id: snapshot
-                                                    .source_event_id
-                                                    .clone(),
-                                                predecessor_source_sha256: snapshot
-                                                    .source_sha256
-                                                    .clone(),
-                                                old_declaration_surface_sha256: old_surface.clone(),
-                                                new_declaration_surface_sha256: new_surface.clone(),
-                                            },
-                                        )?,
-                                        actor: Some(caller.actor().into()),
-                                    },
-                                )
-                                .await?;
-                                carried_grants += 1;
-                            }
-                            None => {
-                                append_in(
-                                    &db,
-                                    &mut tx,
-                                    AppendSpec {
-                                        record_id: args.id.clone(),
-                                        event_type: "artifact.module_grant_unset".into(),
-                                        payload: serde_json::to_value(predecessor.payload)?,
-                                        actor: Some(caller.actor().into()),
-                                    },
-                                )
-                                .await?;
-                                dropped_grants += 1;
-                            }
-                        }
-                    }
-                } else {
-                    for binding in snapshot.bindings {
+                // Per-port carry: a binding survives iff its own port
+                // declaration is unchanged; a grant naming an `artifact_port`
+                // survives iff that port is unchanged and the new source still
+                // declares the identical capability request; a grant with no
+                // port in scope (navigation) is gated only on the request. A
+                // renamed port is a different port and drops; adding a port
+                // drops nothing.
+                let changed =
+                    super::artifacts::changed_ports(&snapshot.descriptor, &new_descriptor)?;
+                let changed_list = changed.iter().cloned().collect::<Vec<_>>();
+                let mut dropped: Vec<Value> = Vec::new();
+                for binding in snapshot.bindings {
+                    let port_name = binding.port_name.clone();
+                    let collection_id = binding.collection_id.clone();
+                    if changed.contains(&port_name) {
                         append_in(
                             &db,
                             &mut tx,
@@ -7389,34 +8139,159 @@ async fn update_record_singular(db: Db, caller: Caller, arguments: Value) -> Res
                                 event_type: "artifact.input_unbound".into(),
                                 payload: serde_json::to_value(ArtifactInputUnboundPayload {
                                     artifact_id: args.id.clone(),
-                                    port_name: binding.port_name,
+                                    port_name: port_name.clone(),
                                 })?,
                                 actor: Some(caller.actor().into()),
                             },
+                            &mut act_alloc,
                         )
                         .await?;
                         dropped_bindings += 1;
+                        dropped.push(json!({
+                            "kind": "binding",
+                            "port": port_name,
+                            "capability": Value::Null,
+                            "scope": Value::Null,
+                            "collection_id": collection_id,
+                        }));
+                        continue;
                     }
-                    for grant in snapshot.grants {
+                    let new_binding = super::artifacts::carried_input_payload(
+                        &args.id,
+                        &binding.port_name,
+                        &binding.collection_id,
+                        &attestation_event_id,
+                        &source_event_id,
+                        &new_source_sha256,
+                        &new_descriptor,
+                    )?;
+                    append_in(
+                        &db,
+                        &mut tx,
+                        AppendSpec {
+                            record_id: args.id.clone(),
+                            event_type: "artifact.input_carried".into(),
+                            payload: serde_json::to_value(ArtifactInputCarriedPayload {
+                                binding: new_binding,
+                                predecessor_binding_event_seq: binding.event_seq,
+                                predecessor_source_attestation_event_id: snapshot
+                                    .source_attestation_event_id
+                                    .clone(),
+                                predecessor_source_event_id: snapshot.source_event_id.clone(),
+                                predecessor_source_sha256: snapshot.source_sha256.clone(),
+                                old_declaration_surface_sha256: old_surface.clone(),
+                                new_declaration_surface_sha256: new_surface.clone(),
+                            })?,
+                            actor: Some(caller.actor().into()),
+                        },
+                        &mut act_alloc,
+                    )
+                    .await?;
+                    carried_bindings += 1;
+                }
+                for predecessor in snapshot.grants {
+                    let port = predecessor
+                        .payload
+                        .scope
+                        .get("artifact_port")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
+                    let dropped_grant = json!({
+                        "kind": "grant",
+                        "port": port.clone(),
+                        "capability": predecessor.payload.capability.clone(),
+                        "scope": predecessor.payload.scope.clone(),
+                    });
+                    if port.as_ref().is_some_and(|port| changed.contains(port)) {
                         append_in(
                             &db,
                             &mut tx,
                             AppendSpec {
                                 record_id: args.id.clone(),
                                 event_type: "artifact.module_grant_unset".into(),
-                                payload: serde_json::to_value(grant.payload)?,
+                                payload: serde_json::to_value(predecessor.payload)?,
                                 actor: Some(caller.actor().into()),
                             },
+                            &mut act_alloc,
                         )
                         .await?;
                         dropped_grants += 1;
+                        dropped.push(dropped_grant.clone());
+                        continue;
+                    }
+                    let mut grant = predecessor.payload.clone();
+                    if grant.subject_kind == "artifact_source" {
+                        grant.subject_event_id = source_event_id.clone();
+                        grant.source_sha256 = new_source_sha256.clone();
+                    }
+                    match super::artifacts::try_build_carried_grant_attestation_in(
+                        &mut tx, &caller, &grant,
+                    )
+                    .await?
+                    {
+                        Some((attestation, digest)) => {
+                            grant.attestation = Some(attestation);
+                            grant.attestation_sha256 = Some(digest);
+                            append_in(
+                                &db,
+                                &mut tx,
+                                AppendSpec {
+                                    record_id: args.id.clone(),
+                                    event_type: "artifact.module_grant_carried".into(),
+                                    payload: serde_json::to_value(
+                                        ArtifactModuleGrantCarriedPayload {
+                                            grant,
+                                            predecessor: predecessor.payload,
+                                            predecessor_grant_event_seq: predecessor.event_seq,
+                                            predecessor_source_attestation_event_id: snapshot
+                                                .source_attestation_event_id
+                                                .clone(),
+                                            predecessor_source_event_id: snapshot
+                                                .source_event_id
+                                                .clone(),
+                                            predecessor_source_sha256: snapshot
+                                                .source_sha256
+                                                .clone(),
+                                            old_declaration_surface_sha256: old_surface.clone(),
+                                            new_declaration_surface_sha256: new_surface.clone(),
+                                        },
+                                    )?,
+                                    actor: Some(caller.actor().into()),
+                                },
+                                &mut act_alloc,
+                            )
+                            .await?;
+                            carried_grants += 1;
+                        }
+                        None => {
+                            append_in(
+                                &db,
+                                &mut tx,
+                                AppendSpec {
+                                    record_id: args.id.clone(),
+                                    event_type: "artifact.module_grant_unset".into(),
+                                    payload: serde_json::to_value(predecessor.payload)?,
+                                    actor: Some(caller.actor().into()),
+                                },
+                                &mut act_alloc,
+                            )
+                            .await?;
+                            dropped_grants += 1;
+                            dropped.push(dropped_grant.clone());
+                        }
                     }
                 }
+                // The status reports how much survived, and nothing about why.
+                // Naming a cause here is what made the old
+                // artifact_inputs_dropped_by_declaration_change false in both
+                // directions: a total drop with identical declarations does not
+                // deserve the name, and adding a port sets changed_ports without
+                // dropping anything. Cause lives in changed_ports and dropped[].
                 let status = if binding_count == 0 && grant_count == 0 {
                     "artifact_inputs_no_existing_state"
-                } else if old_surface != new_surface {
-                    "artifact_inputs_dropped_by_declaration_change"
-                } else if dropped_grants > 0 {
+                } else if carried_bindings == 0 && carried_grants == 0 {
+                    "artifact_inputs_dropped"
+                } else if dropped_bindings > 0 || dropped_grants > 0 {
                     "artifact_inputs_partially_carried"
                 } else {
                     "artifact_inputs_carried_forward"
@@ -7428,6 +8303,8 @@ async fn update_record_singular(db: Db, caller: Caller, arguments: Value) -> Res
                     "dropped_binding_count": dropped_bindings,
                     "carried_grant_count": carried_grants,
                     "dropped_grant_count": dropped_grants,
+                    "changed_ports": changed_list,
+                    "dropped": dropped,
                     "old_declaration_surface_sha256": old_surface,
                     "new_declaration_surface_sha256": new_surface,
                     "restoration_tools": if dropped_bindings > 0 {
@@ -7437,6 +8314,8 @@ async fn update_record_singular(db: Db, caller: Caller, arguments: Value) -> Res
                     } else {
                         json!([])
                     },
+                    "source_event_id": source_event_id.clone(),
+                    "source_sha256": new_source_sha256.clone(),
                 }));
             }
         }
@@ -7448,6 +8327,17 @@ async fn update_record_singular(db: Db, caller: Caller, arguments: Value) -> Res
     }
     let after = required_violations_in(&mut tx, &schema_rows, &[&args.id]).await?;
     assert_required_not_worsened(TOOL, &before, &after)?;
+    // Alias shadows warn on success, silent on unsets and on kinds the
+    // governed relationship does not admit. Uses the resulting kind so a
+    // kind-changing update judges the record it leaves behind.
+    let alias_kind = resulting_effective_kind
+        .as_deref()
+        .or(resulting_kind.as_deref());
+    let alias_warnings = crate::domain_transaction::governed_alias_warnings_for_sets(
+        &facet_writes,
+        &record_type,
+        alias_kind,
+    );
     let compact_result = if response_mode == ResponseMode::Summary {
         Some(compact_record_source_in(&mut tx, &caller, TOOL, &args.id).await?)
     } else {
@@ -7473,7 +8363,18 @@ async fn update_record_singular(db: Db, caller: Caller, arguments: Value) -> Res
         )?,
         artifact_input_continuity,
     )?;
+    updated = echo_act(updated, act_alloc.get())?;
     annotate_body_digest(&mut updated);
+    // The event id of the body this call just wrote, when it wrote one: the
+    // exact-source identity a re-grant must name as `subject_event_id`.
+    // `record_event` exists for every field-bearing update, but only a body
+    // change mints a new source event; anything else leaves the field absent.
+    if source_changed {
+        annotate_source_event_id(
+            &mut updated,
+            record_event.as_ref().map(|event| event.id.as_str()),
+        );
+    }
     if let Some(receipt) = body_receipt {
         updated
             .as_object_mut()
@@ -7500,6 +8401,15 @@ async fn update_record_singular(db: Db, caller: Caller, arguments: Value) -> Res
             }
         }
     }
+    crate::domain_transaction::push_receipt_warnings(&mut updated, alias_warnings)?;
+    attach_basis_feedback(
+        &db,
+        &caller,
+        &mut updated,
+        source_inputs.as_ref().map(Vec::len),
+        false,
+    )
+    .await;
     response_mode.render(&db, updated, version_seq).await
 }
 
@@ -7536,6 +8446,7 @@ async fn claim_unowned_record(db: Db, caller: Caller, arguments: Value) -> Resul
     require_nonblank_reason(TOOL, &args.reason)?;
 
     let mut tx = crate::db::begin_write(db.write_pool()).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
     require_record_in(&mut tx, &caller, TOOL, &args.record_id, Capability::View).await?;
 
     let claimant_ids = sqlx::query_scalar::<_, String>(
@@ -7598,16 +8509,20 @@ async fn claim_unowned_record(db: Db, caller: Caller, arguments: Value) -> Resul
             }),
             actor: Some(caller.actor().into()),
         },
+        &mut act_alloc,
     )
     .await?;
     db.commit_content(tx).await?;
-    Ok(json!({
+    echo_act(
+        json!({
         "id": args.record_id,
         "owner_id": owner_id,
         "event_id": event.id,
         "event_seq": event.local_seq,
         "previous_seq": previous_seq,
-    }))
+        }),
+        act_alloc.get(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -7769,6 +8684,7 @@ async fn delete_record(db: Db, caller: Caller, arguments: Value) -> Result<Value
     // event can carry the reason payload; the event type, guard and projection
     // are identical.
     let mut tx = crate::db::begin_write(db.write_pool()).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
     require_record_in(&mut tx, &caller, TOOL, &args.id, Capability::Manage).await?;
     crate::instructions::assert_source_deletable_in(&mut tx, TOOL, &args.id).await?;
     let previous_seq = previous_record_seq_in(&mut tx, &args.id).await?;
@@ -7793,6 +8709,7 @@ async fn delete_record(db: Db, caller: Caller, arguments: Value) -> Result<Value
             payload: json!({ "reason": args.reason }),
             actor: Some(caller.actor().into()),
         },
+        &mut act_alloc,
     )
     .await?;
     if record_type == "Message" {
@@ -7801,6 +8718,7 @@ async fn delete_record(db: Db, caller: Caller, arguments: Value) -> Result<Value
             &args.id,
             "record.deleted",
             &deletion.id,
+            &mut act_alloc,
         )
         .await?;
     }
@@ -7810,12 +8728,15 @@ async fn delete_record(db: Db, caller: Caller, arguments: Value) -> Result<Value
         .fetch_one(db.write_pool())
         .await?
         .try_get::<Option<String>, _>("deleted_at")?;
-    Ok(json!({
+    echo_act(
+        json!({
         "id": args.id,
         "deleted": true,
         "deleted_at": deleted_at,
         "previous_seq": previous_seq,
-    }))
+        }),
+        act_alloc.get(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -7845,6 +8766,7 @@ async fn archive_record(db: Db, caller: Caller, arguments: Value) -> Result<Valu
     // unarchived restore) returns changed:false WITHOUT committing a
     // meaningless authoritative event.
     let mut tx = crate::db::begin_write(db.write_pool()).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
     require_record_in(&mut tx, &caller, TOOL, &args.id, Capability::Manage).await?;
     let previous_seq = previous_record_seq_in(&mut tx, &args.id).await?;
     let row = sqlx::query(
@@ -7904,14 +8826,17 @@ async fn archive_record(db: Db, caller: Caller, arguments: Value) -> Result<Valu
             actor: Some(caller.actor().into()),
         }
     };
-    append_in(&db, &mut tx, spec).await?;
+    append_in(&db, &mut tx, spec, &mut act_alloc).await?;
     db.commit_content(tx).await?;
-    Ok(json!({
+    echo_act(
+        json!({
         "id": args.id,
         "archived": want_archived,
         "changed": true,
         "previous_seq": previous_seq,
-    }))
+        }),
+        act_alloc.get(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -8065,6 +8990,55 @@ fn push_link_lines(
     }
 }
 
+/// Body mentions are parser evidence, kept visually distinct from the
+/// asserted `Links` sections above. Outgoing resolution shows its state
+/// honestly; an ambiguous reference names only the visible match count.
+fn push_mention_out_lines(out: &mut String, record: &read::EnrichedRecord) {
+    let Some(entries) = record.mentions_out.as_ref() else {
+        return;
+    };
+    let total = record.mentions_out_count.unwrap_or(entries.len() as i64);
+    if total == 0 {
+        return;
+    }
+    out.push_str(&section_heading("Mentions", entries.len(), total));
+    for entry in entries {
+        let reference = crate::mcp::render::display_inline(&entry.authored_reference);
+        let tail = match &entry.resolution {
+            read::MentionResolution::Unresolved => "unresolved".to_string(),
+            read::MentionResolution::Resolved { id, name } => format!(
+                "resolved to {} (`{id}`)",
+                crate::mcp::render::display_inline(name)
+            ),
+            read::MentionResolution::Ambiguous {
+                visible_candidate_count,
+            } => format!("ambiguous ({visible_candidate_count} visible matches)"),
+        };
+        out.push_str(&format!(
+            "- → {reference} ({}, ×{}) — {tail}\n",
+            entry.form, entry.occurrence_count
+        ));
+    }
+}
+
+fn push_mention_in_lines(out: &mut String, record: &read::EnrichedRecord) {
+    let Some(entries) = record.mentions_in.as_ref() else {
+        return;
+    };
+    let total = record.mentions_in_count.unwrap_or(entries.len() as i64);
+    if total == 0 {
+        return;
+    }
+    out.push_str(&section_heading("Mentioned by", entries.len(), total));
+    for entry in entries {
+        let name = crate::mcp::render::display_inline(&entry.source_name);
+        out.push_str(&format!(
+            "- ← {name} (`{}`) ×{}\n",
+            entry.source_id, entry.occurrence_count
+        ));
+    }
+}
+
 /// Canonical deterministic record Markdown for adapters that have already
 /// assembled the ordinary enriched-record contract in their own snapshot.
 /// Interpretation is deliberately separate: portable adapters reject that
@@ -8174,6 +9148,8 @@ pub(crate) fn render_enriched_record_markdown(
         names,
         "←",
     );
+    push_mention_out_lines(&mut out, record);
+    push_mention_in_lines(&mut out, record);
     if !record.children.is_empty() {
         out.push_str(&section_heading(
             "Children",
@@ -8228,6 +9204,7 @@ async fn render_record(db: Db, caller: Caller, arguments: Value) -> Result<Value
                 principal,
             )
             .await?;
+            let mut reported = crate::contribution::ReportedIdentityCache::new();
             let record = match items.pop() {
                 Some(read::BatchGetItem::Found(mut record)) => {
                     filter_enriched_record_in(
@@ -8235,6 +9212,7 @@ async fn render_record(db: Db, caller: Caller, arguments: Value) -> Result<Value
                         &caller,
                         &mut record,
                         read::EnrichOptions::default(),
+                        &mut reported,
                     )
                     .await?;
                     *record
@@ -8321,11 +9299,12 @@ fn update_record_input_schema() -> Value {
     // and ignores sibling properties (see `tool_types.rs` `schema_to_ts`).
     let singular_body = json!({
         "type": "object",
-        "description": "Replacing a non-empty body requires if_body_digest (get_record.body_digest) and/or if_unmodified_since. Append/surgical guards optional; supplied guards must match.",
+        "description": "non-empty body guard: if_body_digest (get_record.body_digest) or if_unmodified_since.",
         "properties": {
             "id": { "type": "string" },
-            "record_id": { "type": "string", "description": "Single-write alias for id; normalized before dispatch. ids (even one element) stays the batch branch below." },
+            "record_id": { "type": "string", "description": "Alias for id; ids selects batch mode." },
             "reason": { "type": "string", "minLength": 1 },
+            "sources": source_basis_input_schema(),
             "name": { "type": "string" },
             "body": { "type": ["string", "null"], "description": "Deprecated body_set alias." },
             "body_set": { "type": ["string", "null"], "description": "Replace all; null clears." },
@@ -8358,8 +9337,22 @@ fn update_record_input_schema() -> Value {
             "maturity": { "type": ["string", "null"] },
             "facets": {
                 "type": "object",
-                "description": "Open facets: scalar values, schema-validated atomic objects, or null to unset; objects require type:object.",
+                "description": "Open facets; use observations for evidence.",
                 "additionalProperties": true
+            },
+            "links": {
+                "type": "array",
+                "description": "Add outgoing links with edits; links-only: manage_links.add.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "target_id": { "type": "string" },
+                        "relationship": { "type": "string" },
+                        "note": { "type": "string" }
+                    },
+                    "required": ["target_id", "relationship"],
+                    "additionalProperties": false
+                }
             }
         },
         "required": ["reason"],
@@ -8437,7 +9430,7 @@ pub fn register_lifecycle_tools(registry: &mut ToolRegistry) -> Result<()> {
         .join(";");
     registry.register(
         ToolKind::CreateRecord,
-        "Create atomically. Compact default; response_mode=verbose gives full record. Requires spine type/open kind; preview_record_shape advises; create revalidates. Artifacts: Document/artifact, source body, facets.runtime; see compositions guide. Messages require fixed audience. Comments require type Annotation, kind comment, nonblank body and exactly one outgoing part_of link. Roots default informational/open. A reply bears directly on the root comment; inherits context/null lifecycle. Targets require text_quote + canonical UTF-8 data_position. Replies stay targetless. Omit summary until resolution.",
+        "Create atomically. Compact default; response_mode=verbose gives full record. Requires spine type/open kind; preview_record_shape advises; create revalidates. Use manage_relationships.assert, not facets; assignment is assigned_to (WorkItem/task to Entity/person), not assignee. Artifacts: Document/artifact, source body, facets.runtime; see compositions guide. Messages require fixed audience. Comments require type Annotation, kind comment, nonblank body and exactly one outgoing part_of link. Roots default informational/open. A reply bears directly on the root comment; inherits context/null lifecycle. Targets require text_quote + canonical UTF-8 data_position. Replies stay targetless. Omit summary until resolution. Name what it rests on in sources; [] says none.",
         json!({
             "type": "object",
             "properties": {
@@ -8447,6 +9440,7 @@ pub fn register_lifecycle_tools(registry: &mut ToolRegistry) -> Result<()> {
                     "description": type_description
                 },
                 "reason": { "type": "string", "minLength": 1, "description": REASON_DESCRIPTION },
+                "sources": source_basis_input_schema(),
                 "id": {
                     "type": "string",
                     "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[47][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
@@ -8599,7 +9593,7 @@ pub fn register_lifecycle_tools(registry: &mut ToolRegistry) -> Result<()> {
     )?;
     registry.register(
         ToolKind::UpdateRecord,
-        "Default summary; response_mode=verbose is full. body_set replaces; body_append appends; body_replace is surgical; body aliases body_set. if_body_digest guards. Batch: 1–100 ids; skips no-ops. facets=current; use facet observations for evidence. Resolve comments: lifecycle:\"resolved\", nonblank summary (open -> resolved). Tombstones reject. Recovery: previous_seq -> get_record as_of.content_seq; compensation covers record fields only, is non-destructive and not atomic; do not create a v2 copy.",
+        "Summary default; verbose full. body_set replaces, body_append appends, body_replace edits spans; body aliases body_set. Whole-body guard: if_body_digest. Batch 1–100 ids; skips no-ops. facets=current; observations=evidence. Use manage_relationships.assert; assigned_to: WorkItem/task -> Entity/person. Resolve comments: lifecycle:\"resolved\", nonblank summary (open -> resolved). Tombstones reject. previous_seq -> get_record as_of.content_seq; compensation covers record fields only, is non-destructive and not atomic; do not create a v2 copy. Declare sources; [] means none.",
         update_record_input_schema(),
         update_record,
     )?;
@@ -9065,8 +10059,11 @@ mod create_idempotency_tests {
         // row, so the log heads alone cannot see it: the validity check is
         // what closes the gate.
         let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+        let before_act = crate::act::current_act(&mut tx).await.unwrap();
+        let mut act_alloc = crate::act::ActAllocation::new();
         crate::provenance::append_validity_event_in(
             &mut tx,
+            &mut act_alloc,
             &attestation,
             crate::provenance::ValidityChange::Invalidated,
             "gate fixture",
@@ -9075,6 +10072,16 @@ mod create_idempotency_tests {
         .await
         .unwrap();
         tx.commit().await.unwrap();
+        assert_eq!(db.current_act().await.unwrap(), before_act + 1);
+        let validity_act: Option<i64> = sqlx::query_scalar(
+            "SELECT act FROM provenance_attestation_validity_events
+             WHERE attestation_id=? ORDER BY ordinal DESC LIMIT 1",
+        )
+        .bind(&attestation)
+        .fetch_one(db.write_pool())
+        .await
+        .unwrap();
+        assert_eq!(validity_act, Some(before_act + 1));
         assert!(
             !replay_gate_open(&db, &attestation).await,
             "invalidation without new events must still reconstruct"

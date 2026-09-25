@@ -14,6 +14,7 @@
 
 pub mod html;
 pub mod verify;
+pub mod write_diagnostics;
 
 /// A message-carrying failure from the HTML artifact surface.
 ///

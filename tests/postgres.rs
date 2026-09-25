@@ -31,5 +31,7 @@ mod postgres_query_sql_admission;
 mod postgres_request_pipeline;
 #[path = "postgres/postgres_runtime.rs"]
 mod postgres_runtime;
+#[path = "postgres/rebuild_contract.rs"]
+mod rebuild_contract;
 #[path = "postgres/views_history_contract.rs"]
 mod views_history_contract;

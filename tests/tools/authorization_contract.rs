@@ -10,8 +10,10 @@ use std::sync::Arc;
 
 use native_ce::authorization::{replace_explicit_policy, AllowEntry, Capability};
 use native_ce::export::LocalSnapshotSource;
+use native_ce::mcp::register_authority_act_tool_schema;
 use native_ce::mcp::register_membership_tool_schema;
 use native_ce::mcp::register_reach_tool_schema;
+use native_ce::mcp::register_workspace_tool_schema;
 use native_ce::mcp::{
     register_builtin_tools, register_snapshot_tool, register_surface_tools,
     AuthorizationDisposition, Caller, ToolKind, ToolRegistry,
@@ -83,10 +85,32 @@ struct OperationContract {
     access: Access,
     non_disclosure: bool,
     no_write_on_deny: bool,
-    positive_evidence: Evidence,
-    negative_evidence: Evidence,
+    #[serde(deserialize_with = "one_or_many_evidence")]
+    positive_evidence: Vec<Evidence>,
+    #[serde(deserialize_with = "one_or_many_evidence")]
+    negative_evidence: Vec<Evidence>,
     #[serde(default)]
     rationale: String,
+}
+
+/// A side of the contract may cite one test or, when a conjunction threshold
+/// is proven by separate tests, several. Single citations stay a bare object
+/// so the hand-written rows read unchanged.
+fn one_or_many_evidence<'de, D>(deserializer: D) -> Result<Vec<Evidence>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(Evidence),
+        Many(Vec<Evidence>),
+    }
+
+    Ok(match OneOrMany::deserialize(deserializer)? {
+        OneOrMany::One(evidence) => vec![evidence],
+        OneOrMany::Many(evidence) => evidence,
+    })
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
@@ -134,7 +158,9 @@ fn production_registry() -> ToolRegistry {
     register_surface_tools(&mut registry).unwrap();
     register_snapshot_tool(&mut registry, Arc::new(LocalSnapshotSource::new())).unwrap();
     register_membership_tool_schema(&mut registry).unwrap();
+    register_workspace_tool_schema(&mut registry).unwrap();
     register_reach_tool_schema(&mut registry).unwrap();
+    register_authority_act_tool_schema(&mut registry).unwrap();
     registry
 }
 
@@ -337,19 +363,29 @@ fn validate_manifest(
             }
             _ => {}
         }
-        if !matches!(contract.positive_evidence, Evidence::Test { .. }) {
+        if contract.positive_evidence.is_empty()
+            || !contract
+                .positive_evidence
+                .iter()
+                .all(|evidence| matches!(evidence, Evidence::Test { .. }))
+        {
             return Err(format!("{}.{} has no positive test evidence", key.0, key.1));
         }
-        match (&contract.access, &contract.negative_evidence) {
-            (Access::Mutation, Evidence::NotApplicable { .. }) => {
+        if contract.negative_evidence.is_empty() {
+            return Err(format!("{}.{} has no negative evidence", key.0, key.1));
+        }
+        let negative_not_applicable = contract
+            .negative_evidence
+            .iter()
+            .any(|evidence| matches!(evidence, Evidence::NotApplicable { .. }));
+        match &contract.access {
+            Access::Mutation if negative_not_applicable => {
                 return Err(format!(
                     "{}.{} mutation has no negative test evidence",
                     key.0, key.1
                 ));
             }
-            (Access::Read, Evidence::NotApplicable { .. })
-                if contract.expected_threshold != "none" =>
-            {
+            Access::Read if negative_not_applicable && contract.expected_threshold != "none" => {
                 return Err(format!(
                     "{}.{} protected read has no negative test evidence",
                     key.0, key.1
@@ -357,8 +393,12 @@ fn validate_manifest(
             }
             _ => {}
         }
-        validate_evidence(&contract.positive_evidence, "positive", &key, root)?;
-        validate_evidence(&contract.negative_evidence, "negative", &key, root)?;
+        for evidence in &contract.positive_evidence {
+            validate_evidence(evidence, "positive", &key, root)?;
+        }
+        for evidence in &contract.negative_evidence {
+            validate_evidence(evidence, "negative", &key, root)?;
+        }
 
         match contract.risk_tier.as_str() {
             "ordinary" => stats.ordinary += 1,
@@ -372,10 +412,7 @@ fn validate_manifest(
         }
         stats.non_disclosure += usize::from(contract.non_disclosure);
         stats.no_write_on_deny += usize::from(contract.no_write_on_deny);
-        stats.negative_not_applicable += usize::from(matches!(
-            contract.negative_evidence,
-            Evidence::NotApplicable { .. }
-        ));
+        stats.negative_not_applicable += usize::from(negative_not_applicable);
     }
     let expected_keys = expected.keys().cloned().collect::<BTreeSet<_>>();
     if seen != expected_keys {
@@ -494,9 +531,9 @@ fn contract_validator_fails_closed_on_action_evidence_and_mutation_drift() {
         .iter_mut()
         .find(|operation| operation.tool == "update_record")
         .unwrap();
-    update.negative_evidence = Evidence::NotApplicable {
+    update.negative_evidence = vec![Evidence::NotApplicable {
         reason: "incorrectly omitted".into(),
-    };
+    }];
     let error = validate_manifest(&missing_negative, &expected, root).unwrap_err();
     assert!(
         error.contains("mutation has no negative test evidence"),
@@ -514,13 +551,12 @@ fn contract_validator_fails_closed_on_action_evidence_and_mutation_drift() {
     assert!(error.contains("no_write_on_deny is false"), "{error}");
 
     let mut substring_only = manifest;
-    if let Evidence::Test { test, .. } = &mut substring_only
+    let substring_operation = substring_only
         .operations
         .iter_mut()
         .find(|operation| operation.tool == "update_record")
-        .unwrap()
-        .positive_evidence
-    {
+        .unwrap();
+    if let Some(Evidence::Test { test, .. }) = substring_operation.positive_evidence.first_mut() {
         *test = "ordinary_dispatch_matrix".into();
     }
     let error = validate_manifest(&substring_only, &expected, root).unwrap_err();

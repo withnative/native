@@ -21,7 +21,7 @@ use crate::store::{append_in, now_iso, AppendSpec};
 
 use super::super::registry::{Caller, ToolRegistry};
 use super::super::ToolKind;
-use super::{parse_args, require_record_in};
+use super::{echo_act, parse_args, require_record_in};
 
 const MAX_ATTRIBUTION_WINDOW: i64 = 100;
 pub(crate) const MAX_GENERIC_INTERPRETATION_BEARERS: usize = 50;
@@ -73,12 +73,16 @@ async fn retry_result_in(
     .ok_or_else(|| {
         Error::engine("create_attribution: durable idempotency result is unavailable")
     })?;
-    Ok(json!({
-        "annotation_id": row.try_get::<String, _>("annotation_id")?,
-        "bearer_id": bearer_id,
-        "claim_mode": row.try_get::<String, _>("claim_mode")?,
-        "action_attestation_id": attestation_id,
-    }))
+    echo_act(
+        json!({
+            "annotation_id": row.try_get::<String, _>("annotation_id")?,
+            "bearer_id": bearer_id,
+            "claim_mode": row.try_get::<String, _>("claim_mode")?,
+            "action_attestation_id": attestation_id,
+        }),
+        // A keyed replay returns the original write's act.
+        super::attested_act_in(tx, attestation_id).await?,
+    )
 }
 
 async fn evidence_visible_in(
@@ -161,6 +165,7 @@ async fn create_attribution(db: Db, caller: Caller, arguments: Value) -> Result<
         )));
     }
     let mut tx = crate::db::begin_write(db.write_pool()).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
     require_record_in(&mut tx, &caller, TOOL, &args.bearer_id, Capability::Edit).await?;
 
     if let Some(attestation_id) = crate::provenance::lookup_authorized_command_attestation(
@@ -310,6 +315,7 @@ async fn create_attribution(db: Db, caller: Caller, arguments: Value) -> Result<
                 }),
                 actor: Some(caller.actor().into()),
             },
+            &mut act_alloc,
         )
         .await?,
     );
@@ -329,6 +335,7 @@ async fn create_attribution(db: Db, caller: Caller, arguments: Value) -> Result<
                 })?,
                 actor: Some(caller.actor().into()),
             },
+            &mut act_alloc,
         )
         .await?,
     );
@@ -351,6 +358,7 @@ async fn create_attribution(db: Db, caller: Caller, arguments: Value) -> Result<
                     })?,
                     actor: Some(caller.actor().into()),
                 },
+                &mut act_alloc,
             )
             .await?,
         );
@@ -365,6 +373,7 @@ async fn create_attribution(db: Db, caller: Caller, arguments: Value) -> Result<
                 payload: serde_json::to_value(target)?,
                 actor: Some(caller.actor().into()),
             },
+            &mut act_alloc,
         )
         .await?,
     );
@@ -378,6 +387,7 @@ async fn create_attribution(db: Db, caller: Caller, arguments: Value) -> Result<
                 payload: serde_json::to_value(assertion)?,
                 actor: Some(caller.actor().into()),
             },
+            &mut act_alloc,
         )
         .await?,
     );
@@ -396,18 +406,22 @@ async fn create_attribution(db: Db, caller: Caller, arguments: Value) -> Result<
                     })?,
                     actor: Some(caller.actor().into()),
                 },
+                &mut act_alloc,
             )
             .await?,
         );
     }
     crate::provenance::issue_action_attestation_in(&mut tx, attestation_draft, &events).await?;
     db.commit_content(tx).await?;
-    Ok(json!({
+    echo_act(
+        json!({
         "annotation_id": annotation_id,
         "bearer_id": args.bearer_id,
         "claim_mode": claim_mode,
         "action_attestation_id": authoring_attestation_id,
-    }))
+        }),
+        act_alloc.get(),
+    )
 }
 
 #[derive(Deserialize)]
@@ -1061,6 +1075,7 @@ async fn manage_attributions(db: Db, caller: Caller, arguments: Value) -> Result
     const TOOL: &str = "manage_attributions";
     let args: ManageAttributionsArgs = parse_args(TOOL, arguments)?;
     let mut tx = crate::db::begin_write(db.write_pool()).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
     let (annotation_id, event_type, payload, action) = match args {
         ManageAttributionsArgs::Retract {
             annotation_id,
@@ -1143,10 +1158,14 @@ async fn manage_attributions(db: Db, caller: Caller, arguments: Value) -> Result
             payload,
             actor: Some(caller.actor().into()),
         },
+        &mut act_alloc,
     )
     .await?;
     db.commit_content(tx).await?;
-    Ok(json!({ "annotation_id": annotation_id, "action": action }))
+    echo_act(
+        json!({ "annotation_id": annotation_id, "action": action }),
+        act_alloc.get(),
+    )
 }
 
 pub fn register_attribution_tools(registry: &mut ToolRegistry) -> Result<()> {

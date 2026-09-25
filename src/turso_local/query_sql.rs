@@ -67,6 +67,9 @@ fn columns(relation: &str) -> Vec<ColumnSpec> {
         .expect("known query_sql logical relation")
         .columns
         .iter()
+        // `*_ms` companions are computed in Rust by `with_millis`, never
+        // read from the backend: the physical tables have no such columns.
+        .filter(|column| !column.ends_with("_ms"))
         .map(|column| {
             let logical_type = match (relation, *column) {
                 ("content_events", "local_seq")
@@ -260,18 +263,155 @@ async fn source_blob_rows(
     Ok(blobs)
 }
 
+/// Workspace content head inside the current backend snapshot. Unfiltered
+/// on purpose: hidden writes advance the stamp exactly as they do on the
+/// SQLite path.
+async fn snapshot_head_seq(transaction: &mut TursoDomainTransaction<'_>) -> Result<i64> {
+    let select = statement(
+        StatementKind::Select,
+        "content_events",
+        &["SELECT COALESCE(MAX(seq),0) AS head FROM {{relation}}"],
+    )
+    .map_err(|error| stable("query_sql snapshot head", error))?;
+    let rows = transaction
+        .rows(
+            "query_sql snapshot head",
+            &select,
+            &[],
+            &[ColumnSpec::required("head", LogicalType::Integer)],
+        )
+        .await?;
+    rows.first()
+        .map(|row| integer(row, "head", "query_sql snapshot"))
+        .transpose()?
+        .ok_or_else(|| Error::engine("query_sql snapshot head returned no row"))
+}
+
+/// Served catalog rows, generated from LOGICAL_RELATIONS so Turso returns
+/// the same catalog every other engine serves from `catalog_view_statements`.
+fn catalog_relation_rows() -> Vec<NormalizedRow> {
+    crate::query::sql_contract::catalog_relation_rows()
+        .into_iter()
+        .map(
+            |(name, identity, version, caller_relative, completeness, profiles, comment)| {
+                NormalizedRow::from([
+                    (
+                        "relation_name".to_string(),
+                        NormalizedValue::Text(name.into()),
+                    ),
+                    (
+                        "identity".to_string(),
+                        NormalizedValue::Text(identity.into()),
+                    ),
+                    (
+                        "semantic_version".to_string(),
+                        NormalizedValue::Integer(i64::from(version)),
+                    ),
+                    (
+                        "caller_relative".to_string(),
+                        NormalizedValue::Integer(caller_relative),
+                    ),
+                    (
+                        "completeness".to_string(),
+                        NormalizedValue::Text(completeness.into()),
+                    ),
+                    ("profiles".to_string(), NormalizedValue::Text(profiles)),
+                    ("comment".to_string(), NormalizedValue::Text(comment.into())),
+                ])
+            },
+        )
+        .collect()
+}
+
+fn catalog_column_rows() -> Vec<NormalizedRow> {
+    crate::query::sql_contract::catalog_column_rows()
+        .into_iter()
+        .map(|(relation, column, position)| {
+            NormalizedRow::from([
+                (
+                    "relation_name".to_string(),
+                    NormalizedValue::Text(relation.into()),
+                ),
+                (
+                    "column_name".to_string(),
+                    NormalizedValue::Text(column.into()),
+                ),
+                (
+                    "column_position".to_string(),
+                    NormalizedValue::Integer(position as i64),
+                ),
+            ])
+        })
+        .collect()
+}
+
+/// Portable value-model companions (E1 M1 slice B). For each
+/// engine-managed timestamp column, parse the backend text once and project
+/// both the fixed UTC-millis text and the integer epoch-millis companion,
+/// so date maths is portable integer arithmetic. NULL or unparseable text
+/// NULLs both cells, matching the SQLite views' `strftime` behaviour.
+/// `as_of` is free-form valid-time input and is never touched.
+fn with_millis(mut rows: Vec<NormalizedRow>, columns: &[&str]) -> Vec<NormalizedRow> {
+    for row in &mut rows {
+        for column in columns {
+            let is_timestamp = matches!(row.get(*column), Some(NormalizedValue::Timestamp(_)));
+            let (text, ms) = match row.get(*column) {
+                Some(NormalizedValue::Text(value)) | Some(NormalizedValue::Timestamp(value)) => {
+                    match chrono::DateTime::parse_from_rfc3339(value) {
+                        Ok(parsed) => (
+                            Some(parsed.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)),
+                            Some(parsed.timestamp_millis()),
+                        ),
+                        Err(_) => (None, None),
+                    }
+                }
+                _ => (None, None),
+            };
+            let text_value = text.map(|text| {
+                if is_timestamp {
+                    NormalizedValue::Timestamp(text)
+                } else {
+                    NormalizedValue::Text(text)
+                }
+            });
+            row.insert(
+                (*column).into(),
+                text_value.unwrap_or(NormalizedValue::Null),
+            );
+            row.insert(
+                format!("{column}_ms"),
+                ms.map(NormalizedValue::Integer)
+                    .unwrap_or(NormalizedValue::Null),
+            );
+        }
+    }
+    rows
+}
+
 async fn build_projection(
     transaction: &mut TursoDomainTransaction<'_>,
     caller: &crate::mcp::Caller,
 ) -> Result<crate::query::turso_sql::IsolatedProjection> {
+    // Freshness stamp (E1 M1 slice A): the workspace content sequence
+    // observed inside this same backend snapshot, before any projection row
+    // is read, so rows and stamp share one snapshot.
+    let as_of_seq = snapshot_head_seq(transaction).await?;
     let mut budget = SourceBudget::default();
-    let mut records = source_rows(
-        transaction,
-        &mut budget,
-        "records",
-        &["SELECT id,type,kind,name,body,home_id,lifecycle,persistence,maturity,summary,last_activity_at,created_at,updated_at,deleted_at FROM {{relation}} WHERE deleted_at IS NULL LIMIT 20001"],
-    )
-    .await?;
+    let mut records = with_millis(
+        source_rows(
+            transaction,
+            &mut budget,
+            "records",
+            &["SELECT id,type,kind,name,body,home_id,lifecycle,persistence,maturity,summary,last_activity_at,created_at,updated_at,deleted_at FROM {{relation}} WHERE deleted_at IS NULL LIMIT 20001"],
+        )
+        .await?,
+        &[
+            "last_activity_at",
+            "created_at",
+            "updated_at",
+            "deleted_at",
+        ],
+    );
     let semantic_rows = {
         source_rows(
             transaction,
@@ -343,13 +483,16 @@ async fn build_projection(
         }
     }
 
-    let events = source_rows(
-        transaction,
-        &mut budget,
-        "content_events",
-        &["SELECT seq AS local_seq,id,record_id,type,created_at FROM {{relation}} LIMIT 20001"],
+    let events = with_millis(
+        source_rows(
+            transaction,
+            &mut budget,
+            "content_events",
+            &["SELECT seq AS local_seq,id,record_id,type,created_at FROM {{relation}} LIMIT 20001"],
+        )
+        .await?,
+        &["created_at"],
     )
-    .await?
     .into_iter()
     .filter_map(|mut row| {
         let record_id = value_text(&row, "record_id")?;
@@ -373,13 +516,16 @@ async fn build_projection(
         Some(row)
     })
     .collect();
-    let links = source_rows(
-        transaction,
-        &mut budget,
-        "links",
-        &["SELECT id,source_id,target_id,relationship,note,created_at FROM {{relation}} LIMIT 20001"],
-    )
-    .await?;
+    let links = with_millis(
+        source_rows(
+            transaction,
+            &mut budget,
+            "links",
+            &["SELECT id,source_id,target_id,relationship,note,created_at FROM {{relation}} LIMIT 20001"],
+        )
+        .await?,
+        &["created_at"],
+    );
     let attachment_ids = records
         .iter()
         .filter(|row| {
@@ -406,13 +552,16 @@ async fn build_projection(
                 && value_text(row, "target_id").is_some_and(|id| visible.contains(id))
         })
         .collect();
-    let facets = source_rows(
-        transaction,
-        &mut budget,
-        "facet_values",
-        &["SELECT id,record_id,key,value,value_num,vocab_ref,created_at FROM {{relation}} LIMIT 20001"],
-    )
-    .await?;
+    let facets = with_millis(
+        source_rows(
+            transaction,
+            &mut budget,
+            "facet_values",
+            &["SELECT id,record_id,key,value,value_num,vocab_ref,created_at FROM {{relation}} LIMIT 20001"],
+        )
+        .await?,
+        &["created_at"],
+    );
     let visible_blob_ids = facets
         .iter()
         .filter(|row| {
@@ -425,23 +574,29 @@ async fn build_projection(
         .into_iter()
         .filter(|row| value_text(row, "record_id").is_some_and(|id| visible.contains(id)))
         .collect();
-    let observations = source_rows(
-        transaction,
-        &mut budget,
-        "facet_observations",
-        &["SELECT id,record_id,key,value,op,vocab_ref,as_of,observed_at,event_seq FROM {{relation}} LIMIT 20001"],
+    let observations = with_millis(
+        source_rows(
+            transaction,
+            &mut budget,
+            "facet_observations",
+            &["SELECT id,record_id,key,value,op,vocab_ref,as_of,observed_at,event_seq FROM {{relation}} LIMIT 20001"],
+        )
+        .await?,
+        &["observed_at"],
     )
-    .await?
     .into_iter()
     .filter(|row| value_text(row, "record_id").is_some_and(|id| visible.contains(id)))
     .collect();
-    let bindings = source_rows(
-        transaction,
-        &mut budget,
-        "bindings",
-        &["SELECT record_id,system,identifier,is_canonical,url,etag,last_seen_at FROM {{relation}} LIMIT 20001"],
-    )
-    .await?;
+    let bindings = with_millis(
+        source_rows(
+            transaction,
+            &mut budget,
+            "bindings",
+            &["SELECT record_id,system,identifier,is_canonical,url,etag,last_seen_at FROM {{relation}} LIMIT 20001"],
+        )
+        .await?,
+        &["last_seen_at"],
+    );
     let owned = bindings
         .iter()
         .filter(|row| {
@@ -462,14 +617,20 @@ async fn build_projection(
     // Blob payloads are the largest physical cells. Do not fetch them while
     // discovering visibility: only exact ids already proven reachable from a
     // visible attachment and its visible bearer cross this boundary.
-    let blobs = source_blob_rows(transaction, &mut budget, &visible_blob_ids).await?;
-    let vocabularies = source_rows(
-        transaction,
-        &mut budget,
-        "vocabularies",
-        &["SELECT id,name,created_at FROM {{relation}} LIMIT 20001"],
-    )
-    .await?;
+    let blobs = with_millis(
+        source_blob_rows(transaction, &mut budget, &visible_blob_ids).await?,
+        &["created_at"],
+    );
+    let vocabularies = with_millis(
+        source_rows(
+            transaction,
+            &mut budget,
+            "vocabularies",
+            &["SELECT id,name,created_at FROM {{relation}} LIMIT 20001"],
+        )
+        .await?,
+        &["created_at"],
+    );
     let vocabulary_values = source_rows(
         transaction,
         &mut budget,
@@ -477,13 +638,16 @@ async fn build_projection(
         &["SELECT id,vocabulary_id,value,gloss,status,ordinal,terminality,metadata,alias_of FROM {{relation}} LIMIT 20001"],
     )
     .await?;
-    let schema_config = source_rows(
-        transaction,
-        &mut budget,
-        "schema_config",
-        &["SELECT id,layer,name,data,applies_to_collection_id,version_lineage,created_at FROM {{relation}} LIMIT 20001"],
+    let schema_config = with_millis(
+        source_rows(
+            transaction,
+            &mut budget,
+            "schema_config",
+            &["SELECT id,layer,name,data,applies_to_collection_id,version_lineage,created_at FROM {{relation}} LIMIT 20001"],
+        )
+        .await?,
+        &["created_at"],
     )
-    .await?
     .into_iter()
     .filter(|row| match row.get("applies_to_collection_id") {
         Some(NormalizedValue::Null) => true,
@@ -492,6 +656,7 @@ async fn build_projection(
     .collect();
 
     let mut projection = crate::query::turso_sql::IsolatedProjection::default();
+    projection.as_of_seq = as_of_seq;
     projection.insert("records", records)?;
     projection.insert("content_events", events)?;
     projection.insert("links", projected_links)?;
@@ -502,6 +667,10 @@ async fn build_projection(
     projection.insert("vocabularies", vocabularies)?;
     projection.insert("vocabulary_values", vocabulary_values)?;
     projection.insert("schema_config", schema_config)?;
+    // Served catalog rows are generated from LOGICAL_RELATIONS (E2 I-2),
+    // so Turso returns the same catalog as every other engine.
+    projection.insert("catalog_relations", catalog_relation_rows())?;
+    projection.insert("catalog_columns", catalog_column_rows())?;
     // The isolated core owns one closed logical catalog across profiles. Turso
     // rejects unavailable relations before building this projection, but the
     // core still requires their sealed table shapes to be present. Materialize

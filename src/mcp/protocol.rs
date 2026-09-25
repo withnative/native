@@ -947,10 +947,11 @@ async fn legacy_tools_call_result(
     params: &Value,
     persistence_lease: Option<DeploymentPersistenceLease>,
 ) -> std::result::Result<Value, (i64, String)> {
+    let (reported_name, reported_version) = reported_mcp_client(params.get("_meta"));
     tools_call_kernel(
         registry,
         engine,
-        caller,
+        caller.with_reported_mcp_client(reported_name, reported_version),
         params.get("name").and_then(Value::as_str),
         params.get("arguments"),
         persistence_lease,
@@ -1030,6 +1031,27 @@ pub(crate) fn validate_implementation(value: &Value) -> std::result::Result<(), 
         }
     }
     Ok(())
+}
+
+/// Read the self-asserted client identity off one call's `params._meta`.
+///
+/// Each field is `None` when the call carried no usable value — absent
+/// `clientInfo`, a non-object, or a non-string member all read as absence,
+/// never as a default string. Validation ([`validate_implementation`]) already
+/// rejected malformed `clientInfo` on the modern path before dispatch; this
+/// stays total so legacy and direct-dispatch callers without `_meta` simply
+/// record absence. An empty string the client did send stays `Some("")`,
+/// distinguishable from absence.
+pub(crate) fn reported_mcp_client(meta: Option<&Value>) -> (Option<String>, Option<String>) {
+    let info = meta
+        .and_then(|meta| meta.get(CLIENT_INFO_META))
+        .and_then(Value::as_object);
+    let field = |key: &str| {
+        info.and_then(|info| info.get(key))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    };
+    (field("name"), field("version"))
 }
 
 pub(crate) fn validate_client_capabilities(value: &Value) -> std::result::Result<(), String> {
@@ -1195,7 +1217,7 @@ fn discover_result() -> Value {
         "resultType": "complete",
         "supportedVersions": [PROTOCOL_VERSION],
         "capabilities": { "tools": {}, "resources": {} },
-        "instructions": "Native's event-authoritative knowledge store. Use tools/list to discover the available tool surface. Bootstrap is read-only: after transient transport/pool failure or HTTP 502/503/504, retry at most twice (1s, then 2s; honor Retry-After up to 30s), then stop. Never retry auth, validation, or instruction-readiness failures. Retain the run key once received.",
+        "instructions": "Native's event-authoritative knowledge store. Use tools/list to discover the available tool surface. Call read-only Bootstrap once per fresh host conversation; later user turns, task/intent/artifact changes, or renewed Native use are not new bootstrap boundaries. The host must determine that boundary: Native has no trustworthy host-conversation identity and does not deduplicate by conversation/account. After success retain the run key for every call and use set_intent when the aim materially changes. After transient transport/pool failure or HTTP 502/503/504, retry Bootstrap at most twice (1s, then 2s; honor Retry-After up to 30s), then stop. Never retry auth, validation, or instruction-readiness failures.",
         "ttlMs": 0,
         "cacheScope": "private",
         "_meta": result_meta(),
@@ -1228,10 +1250,11 @@ async fn tools_call_result(
     params: &serde_json::Map<String, Value>,
     persistence_lease: Option<DeploymentPersistenceLease>,
 ) -> std::result::Result<Value, (i64, String)> {
+    let (reported_name, reported_version) = reported_mcp_client(params.get("_meta"));
     let result = tools_call_kernel(
         registry,
         engine,
-        caller,
+        caller.with_reported_mcp_client(reported_name, reported_version),
         params.get("name").and_then(Value::as_str),
         params.get("arguments"),
         persistence_lease,
@@ -1305,6 +1328,60 @@ mod tests {
                 "body": "Complete body mentioning structuredContent as ordinary payload text"
             }]
         })
+    }
+
+    #[test]
+    fn reported_mcp_client_reads_name_and_version_without_defaults() {
+        let present = json!({
+            CLIENT_INFO_META: {"name": "hazel", "version": "2.1.0"},
+        });
+        assert_eq!(
+            reported_mcp_client(Some(&present)),
+            (Some("hazel".into()), Some("2.1.0".into())),
+        );
+        // Absent is absent: no default string, no "unknown".
+        assert_eq!(reported_mcp_client(None), (None, None));
+        assert_eq!(reported_mcp_client(Some(&json!({}))), (None, None));
+        assert_eq!(
+            reported_mcp_client(Some(&json!({CLIENT_INFO_META: {"name": "hazel"}}))),
+            (Some("hazel".into()), None),
+        );
+        // Malformed members read as absence (validation rejects them on the
+        // modern path before dispatch; this stays total for other callers).
+        assert_eq!(
+            reported_mcp_client(Some(
+                &json!({CLIENT_INFO_META: {"name": 7, "version": null}})
+            )),
+            (None, None),
+        );
+        // An empty string the client sent stays distinguishable from absence.
+        assert_eq!(
+            reported_mcp_client(Some(
+                &json!({CLIENT_INFO_META: {"name": "", "version": ""}})
+            )),
+            (Some(String::new()), Some(String::new())),
+        );
+    }
+
+    #[test]
+    fn server_discover_states_bootstrap_host_conversation_boundaries_and_recovery() {
+        let discovery = discover_result();
+        let instructions = discovery["instructions"].as_str().unwrap();
+        for required in [
+            "once per fresh host conversation",
+            "later user turns, task/intent/artifact changes, or renewed Native use are not new bootstrap boundaries",
+            "no trustworthy host-conversation identity",
+            "does not deduplicate by conversation/account",
+            "After success retain the run key for every call",
+            "use set_intent when the aim materially changes",
+            "retry Bootstrap at most twice",
+            "Never retry auth, validation, or instruction-readiness failures",
+        ] {
+            assert!(
+                instructions.contains(required),
+                "missing {required:?}: {instructions}"
+            );
+        }
     }
 
     #[test]

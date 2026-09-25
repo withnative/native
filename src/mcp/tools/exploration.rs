@@ -41,7 +41,7 @@ use super::lifecycle::{
     assert_facet_value_predicates_in, assert_home_target_in, assert_required_not_worsened,
     enriched_or_error, facet_set_spec, required_violations_in, FacetWrite, NewLink,
 };
-use super::{parse_args, require_nonblank_reason, require_record_in, REASON_DESCRIPTION};
+use super::{echo_act, parse_args, require_nonblank_reason, require_record_in, REASON_DESCRIPTION};
 use crate::authorization::Capability;
 use crate::contribution::{ALTERNATIVE_SET_ROLE, SELECTION_ROLE_FACET};
 use crate::db::Db;
@@ -233,6 +233,7 @@ async fn create_exploration(db: Db, caller: Caller, arguments: Value) -> Result<
     // exist. The reserved action identity is taken before any relationship
     // write so every output binds to one accepted action.
     let mut tx = crate::db::begin_write(db.write_pool()).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
     let draft = crate::provenance::reserve_action_attestation()?;
     let caller_owner = super::mint::caller_owner_in(&mut tx, &caller, TOOL).await?;
     let schema_rows = cascade::schema_config_rows_in(&mut tx).await?;
@@ -283,6 +284,7 @@ async fn create_exploration(db: Db, caller: Caller, arguments: Value) -> Result<
                     payload: Value::Object(fields),
                     actor: Some(caller.actor().into()),
                 },
+                &mut act_alloc,
             )
             .await?;
 
@@ -305,7 +307,13 @@ async fn create_exploration(db: Db, caller: Caller, arguments: Value) -> Result<
             )
             .await?;
             for facet in &marker {
-                append_in(&db, &mut tx, facet_set_spec(&id, facet, caller.actor())).await?;
+                append_in(
+                    &db,
+                    &mut tx,
+                    facet_set_spec(&id, facet, caller.actor()),
+                    &mut act_alloc,
+                )
+                .await?;
             }
             (id, true)
         }
@@ -322,6 +330,7 @@ async fn create_exploration(db: Db, caller: Caller, arguments: Value) -> Result<
             &args.reason,
             candidate,
             &draft,
+            &mut act_alloc,
         )
         .await?;
         // Membership is constituted by an explicit `member_of` link. It means
@@ -342,6 +351,7 @@ async fn create_exploration(db: Db, caller: Caller, arguments: Value) -> Result<
                 })?,
                 actor: Some(caller.actor().into()),
             },
+            &mut act_alloc,
         )
         .await?;
         minted.push(id);
@@ -415,11 +425,12 @@ async fn create_exploration(db: Db, caller: Caller, arguments: Value) -> Result<
             for candidate_id in &attested.candidate_ids {
                 candidates.push(enriched_or_error(&db, &caller, TOOL, candidate_id).await?);
             }
-            return Ok(exploration_receipt(
-                exploration,
-                attested.exploration_created,
-                candidates,
-            ));
+            return echo_act(
+                exploration_receipt(exploration, attested.exploration_created, candidates),
+                // The replay returns the original write's act so the two
+                // receipts are indistinguishable.
+                attested.act,
+            );
         }
     }
 
@@ -433,11 +444,10 @@ async fn create_exploration(db: Db, caller: Caller, arguments: Value) -> Result<
     for record in &minted {
         candidates.push(enriched_or_error(&db, &caller, TOOL, &record.id).await?);
     }
-    Ok(exploration_receipt(
-        exploration,
-        created_exploration,
-        candidates,
-    ))
+    echo_act(
+        exploration_receipt(exploration, created_exploration, candidates),
+        act_alloc.get(),
+    )
 }
 
 /// One receipt shape for the first call and every replay: the enriched
@@ -477,6 +487,8 @@ struct AttestedExploration {
     exploration_id: String,
     candidate_ids: Vec<String>,
     exploration_created: bool,
+    /// The act the original call allocated; a replay returns it.
+    act: Option<i64>,
 }
 
 async fn attested_exploration_in(
@@ -538,6 +550,7 @@ async fn attested_exploration_in(
         exploration_id,
         candidate_ids,
         exploration_created,
+        act: super::attested_act_in(tx, attestation_id).await?,
     })
 }
 
@@ -584,6 +597,7 @@ async fn mint_candidate_in(
     reason: &str,
     candidate: &CandidateInput,
     draft: &crate::provenance::ActionAttestationDraft,
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<Minted> {
     let id = super::mint::mint_record_in(
         db,
@@ -612,6 +626,7 @@ async fn mint_candidate_in(
             workitem_lifecycle_default: false,
         },
         draft,
+        act_alloc,
     )
     .await?;
     Ok(Minted { id })

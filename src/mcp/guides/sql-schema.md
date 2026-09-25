@@ -6,9 +6,9 @@ This is native-ce's exact ordered SQLite DDL contract for a fresh database. It i
 
 ## Contract identity
 
-- Engine schema version: `55`
-- Ordered DDL statements: `294`
-- Frozen DDL SHA-256: `eb10e6879ffa1bdbac22289bd0d85d68ea75892d98c5bcc77a5594aeeefa9d7f`
+- Engine schema version: `65`
+- Ordered DDL statements: `321`
+- Frozen DDL SHA-256: `3284d80259000f4c8ab4c88ad7ec06175561b6d526462aaf893235a8f3201111`
 
 The fingerprint is SHA-256 over the canonical statement sequence joined by `\n;\n`. Generation fails before writing if the compiled sequence and frozen pin disagree.
 
@@ -28,11 +28,19 @@ CREATE TABLE content_events (
      causal_envelope_version INTEGER NOT NULL CHECK (causal_envelope_version = 1),
      causal_status           TEXT NOT NULL CHECK (causal_status IN ('complete','import_incomplete','legacy_unknown')),
      created_at              TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-   )
+     , act INTEGER)
 ;
 CREATE INDEX idx_content_events_record ON content_events(record_id, seq)
 ;
 CREATE INDEX idx_content_events_run ON content_events(run_key, seq)
+;
+CREATE INDEX idx_content_events_act ON content_events(act) WHERE act IS NOT NULL
+;
+CREATE TRIGGER content_events_no_update BEFORE UPDATE ON content_events
+       BEGIN SELECT RAISE(ABORT, 'content_events is append-only'); END
+;
+CREATE TRIGGER content_events_no_delete BEFORE DELETE ON content_events
+       BEGIN SELECT RAISE(ABORT, 'content_events is append-only'); END
 ;
 CREATE TABLE content_event_causal_frontier (
      event_id        TEXT NOT NULL REFERENCES content_events(id) ON DELETE CASCADE,
@@ -55,6 +63,32 @@ INSERT INTO content_event_causal_cutover
        (singleton,last_legacy_local_seq,cutover_at,from_engine_schema)
        VALUES (1,0,strftime('%Y-%m-%dT%H:%M:%fZ','now'),NULL)
 ;
+CREATE TABLE act_state (
+     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+     next_act  INTEGER NOT NULL CHECK (next_act >= 0)
+    )
+;
+INSERT INTO act_state (singleton, next_act) VALUES (1, 0)
+;
+CREATE TABLE act_cutover (
+     domain            TEXT PRIMARY KEY CHECK (domain IN ('content_events','policy_events','awareness_events','notification_candidate_events','binding_audit','database_identity_audit','meta_events','control_events','derivation_events','relationship_events')),
+     last_legacy_seq   INTEGER NOT NULL CHECK (last_legacy_seq >= 0),
+     cutover_at        TEXT NOT NULL,
+     from_engine_schema INTEGER
+    )
+;
+INSERT INTO act_cutover (domain,last_legacy_seq,cutover_at,from_engine_schema)
+       VALUES ('awareness_events',0,strftime('%Y-%m-%dT%H:%M:%fZ','now'),NULL),
+              ('binding_audit',0,strftime('%Y-%m-%dT%H:%M:%fZ','now'),NULL),
+              ('content_events',0,strftime('%Y-%m-%dT%H:%M:%fZ','now'),NULL),
+              ('control_events',0,strftime('%Y-%m-%dT%H:%M:%fZ','now'),NULL),
+              ('database_identity_audit',0,strftime('%Y-%m-%dT%H:%M:%fZ','now'),NULL),
+              ('derivation_events',0,strftime('%Y-%m-%dT%H:%M:%fZ','now'),NULL),
+              ('meta_events',0,strftime('%Y-%m-%dT%H:%M:%fZ','now'),NULL),
+              ('notification_candidate_events',0,strftime('%Y-%m-%dT%H:%M:%fZ','now'),NULL),
+              ('policy_events',0,strftime('%Y-%m-%dT%H:%M:%fZ','now'),NULL),
+              ('relationship_events',0,strftime('%Y-%m-%dT%H:%M:%fZ','now'),NULL)
+;
 CREATE TABLE policy_events (
      seq        INTEGER PRIMARY KEY AUTOINCREMENT,
      id         TEXT NOT NULL UNIQUE,
@@ -64,9 +98,11 @@ CREATE TABLE policy_events (
      actor      TEXT NOT NULL CHECK (length(trim(actor)) > 0),
      reason     TEXT NOT NULL CHECK (length(trim(reason)) > 0),
      created_at TEXT NOT NULL
-   )
+     , act INTEGER)
 ;
 CREATE INDEX idx_policy_events_record ON policy_events(record_id, seq)
+;
+CREATE INDEX idx_policy_events_act ON policy_events(act) WHERE act IS NOT NULL
 ;
 CREATE TRIGGER policy_events_no_update BEFORE UPDATE ON policy_events
        BEGIN SELECT RAISE(ABORT, 'policy_events is append-only'); END
@@ -320,6 +356,7 @@ CREATE TABLE awareness_events (
      interaction_nonce      TEXT,
      payload                TEXT NOT NULL CHECK (json_valid(payload)),
      created_at             TEXT NOT NULL,
+     act                    INTEGER,
      UNIQUE (subject_account_id, idempotency_key),
      UNIQUE (subject_account_id, message_id, interaction_nonce),
      UNIQUE (subject_account_id, destination_id, interaction_nonce),
@@ -336,6 +373,8 @@ CREATE INDEX idx_awareness_events_message
 CREATE INDEX idx_awareness_events_destination
        ON awareness_events(destination_id, subject_account_id, seq)
 ;
+CREATE INDEX idx_awareness_events_act ON awareness_events(act) WHERE act IS NOT NULL
+;
 CREATE TRIGGER awareness_events_no_update BEFORE UPDATE ON awareness_events
        BEGIN SELECT RAISE(ABORT, 'awareness_events is append-only'); END
 ;
@@ -347,8 +386,12 @@ CREATE TABLE awareness_command_intents (
      idempotency_key    TEXT NOT NULL CHECK (length(trim(idempotency_key)) > 0),
      intent_sha256      TEXT NOT NULL CHECK (length(intent_sha256) = 64),
      created_at         TEXT NOT NULL,
+     act            INTEGER,
      PRIMARY KEY (subject_account_id, idempotency_key)
    )
+;
+CREATE INDEX idx_awareness_command_intents_act
+       ON awareness_command_intents(act) WHERE act IS NOT NULL
 ;
 CREATE TRIGGER awareness_command_intents_no_update BEFORE UPDATE ON awareness_command_intents
        BEGIN SELECT RAISE(ABORT, 'awareness_command_intents is append-only'); END
@@ -459,6 +502,25 @@ CREATE TABLE message_mentions (
 CREATE INDEX idx_message_mentions_target
        ON message_mentions(target_kind, target_binding, effective, message_id)
 ;
+CREATE TABLE record_mentions (
+      source_id          TEXT NOT NULL REFERENCES records(id) ON DELETE CASCADE,
+      occurrence_ix      INTEGER NOT NULL,
+      source_event_seq   INTEGER NOT NULL REFERENCES content_events(seq),
+      span_start         INTEGER NOT NULL CHECK (span_start >= 0),
+      span_end           INTEGER NOT NULL CHECK (span_end > span_start),
+      authored_reference TEXT NOT NULL CHECK (length(trim(authored_reference)) > 0),
+      lookup_key         TEXT NOT NULL CHECK (length(trim(lookup_key)) > 0),
+      form               TEXT NOT NULL CHECK (form IN ('url', 'wiki_hex', 'wiki_name', 'bare_hex')),
+      parser_version     INTEGER NOT NULL CHECK (parser_version > 0),
+      PRIMARY KEY (source_id, occurrence_ix)
+    )
+;
+CREATE INDEX idx_record_mentions_lookup
+        ON record_mentions(lookup_key, source_id)
+;
+CREATE INDEX idx_record_mentions_source
+        ON record_mentions(source_id)
+;
 CREATE TABLE notification_candidate_events (
      seq                INTEGER PRIMARY KEY AUTOINCREMENT,
      id                 TEXT NOT NULL UNIQUE,
@@ -476,10 +538,12 @@ CREATE TABLE notification_candidate_events (
      source_event_id    TEXT NOT NULL,
      payload            TEXT NOT NULL CHECK (json_valid(payload)),
      created_at         TEXT NOT NULL
-   )
+     , act INTEGER)
 ;
 CREATE INDEX idx_notification_candidate_events_recipient
        ON notification_candidate_events(recipient_account_id, seq)
+;
+CREATE INDEX idx_notification_candidate_events_act ON notification_candidate_events(act) WHERE act IS NOT NULL
 ;
 CREATE TRIGGER notification_candidate_events_no_update BEFORE UPDATE ON notification_candidate_events
        BEGIN SELECT RAISE(ABORT, 'notification_candidate_events is append-only'); END
@@ -684,6 +748,15 @@ INSERT INTO binding_systems
        ('native-record', 'native-record-v1', NULL, NULL, 'public',
         'record_manage', 'record_manage', 'record_manage', 'record_manage', 'binding_only', 1, 1, 1)
 ;
+CREATE TRIGGER binding_systems_no_insert BEFORE INSERT ON binding_systems
+       BEGIN SELECT RAISE(ABORT, 'binding_systems is immutable'); END
+;
+CREATE TRIGGER binding_systems_no_update BEFORE UPDATE ON binding_systems
+       BEGIN SELECT RAISE(ABORT, 'binding_systems is immutable'); END
+;
+CREATE TRIGGER binding_systems_no_delete BEFORE DELETE ON binding_systems
+       BEGIN SELECT RAISE(ABORT, 'binding_systems is immutable'); END
+;
 CREATE TABLE binding_audit (
      seq               INTEGER PRIMARY KEY AUTOINCREMENT,
      id                TEXT NOT NULL UNIQUE,
@@ -700,6 +773,7 @@ CREATE TABLE binding_audit (
      parent_key        TEXT,
      intent            TEXT,
      created_at        TEXT NOT NULL,
+     act               INTEGER,
      CHECK ((action = 'add' AND old_record_id IS NULL AND new_record_id IS NOT NULL
                               AND old_canonical IS NULL AND new_canonical IS NOT NULL)
          OR (action = 'remove' AND old_record_id IS NOT NULL AND new_record_id IS NULL
@@ -712,6 +786,8 @@ CREATE TABLE binding_audit (
     )
 ;
 CREATE INDEX idx_binding_audit_identity ON binding_audit(system, identifier, seq)
+;
+CREATE INDEX idx_binding_audit_act ON binding_audit(act) WHERE act IS NOT NULL
 ;
 CREATE TRIGGER binding_audit_no_update BEFORE UPDATE ON binding_audit
        BEGIN SELECT RAISE(ABORT, 'binding_audit is append-only'); END
@@ -743,6 +819,7 @@ CREATE TABLE external_observations (
      retained_from_observation_id TEXT REFERENCES external_observations(id),
      provenance_attachment_id TEXT REFERENCES records(id),
      derived_render_id        TEXT REFERENCES records(id),
+     act            INTEGER,
      CHECK ((materialization_policy = 'identity_only' AND retention_state = 'none'
               AND retained_from_observation_id IS NULL AND provenance_attachment_id IS NULL
               AND derived_render_id IS NULL)
@@ -755,6 +832,9 @@ CREATE TABLE external_observations (
    )
 ;
 CREATE INDEX idx_external_observations_record ON external_observations(record_id, observed_at)
+;
+CREATE INDEX idx_external_observations_act
+       ON external_observations(act) WHERE act IS NOT NULL
 ;
 CREATE TABLE database_identity (
      singleton    INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -777,11 +857,14 @@ CREATE TABLE database_identity_audit (
      parent_key       TEXT,
      intent           TEXT,
      created_at       TEXT NOT NULL,
+     act              INTEGER,
      CHECK ((action = 'mint' AND old_origin_db_id IS NULL)
          OR (action = 'rekey' AND old_origin_db_id IS NOT NULL AND old_origin_db_id <> new_origin_db_id))
    )
 ;
 CREATE INDEX idx_database_identity_audit_new ON database_identity_audit(new_origin_db_id, seq)
+;
+CREATE INDEX idx_database_identity_audit_act ON database_identity_audit(act) WHERE act IS NOT NULL
 ;
 CREATE TABLE blobs (
      id                TEXT PRIMARY KEY,
@@ -851,9 +934,11 @@ CREATE TABLE meta_events (
      payload    TEXT,
      actor      TEXT,
      created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-   )
+     , act INTEGER)
 ;
 CREATE INDEX idx_meta_events_subject ON meta_events(subject_id, seq)
+;
+CREATE INDEX idx_meta_events_act ON meta_events(act) WHERE act IS NOT NULL
 ;
 CREATE TABLE vocabularies (
      id          TEXT PRIMARY KEY,
@@ -1034,9 +1119,11 @@ CREATE TABLE control_events (
      reason          TEXT NOT NULL CHECK (length(trim(reason)) > 0),
      payload         TEXT NOT NULL CHECK (json_valid(payload) AND json_type(payload) = 'object'),
      created_at      TEXT NOT NULL
-   )
+     , act INTEGER)
 ;
 CREATE INDEX idx_control_events_aggregate ON control_events(aggregate_kind, aggregate_id, seq)
+;
+CREATE INDEX idx_control_events_act ON control_events(act) WHERE act IS NOT NULL
 ;
 CREATE TRIGGER control_events_no_update BEFORE UPDATE ON control_events
        BEGIN SELECT RAISE(ABORT, 'control_events is append-only'); END
@@ -1054,6 +1141,9 @@ CREATE TABLE agent_runs (
      start_event_seq    INTEGER NOT NULL UNIQUE REFERENCES control_events(seq),
      close_event_id     TEXT UNIQUE REFERENCES control_events(id),
      close_event_seq    INTEGER UNIQUE REFERENCES control_events(seq),
+     reported_mcp_client_name TEXT,
+     reported_mcp_client_version TEXT,
+     reported_model     TEXT,
      CHECK ((ended_at IS NULL AND close_event_id IS NULL AND close_event_seq IS NULL)
          OR (ended_at IS NOT NULL AND close_event_id IS NOT NULL AND close_event_seq IS NOT NULL))
    )
@@ -1153,6 +1243,25 @@ CREATE TABLE control_event_applications (
      applied_at TEXT NOT NULL
    )
 ;
+CREATE TABLE alpha_tab_installs (
+     account_id                TEXT NOT NULL CHECK (length(trim(account_id)) > 0),
+     package                   TEXT NOT NULL CHECK (length(trim(package)) > 0),
+     version                   TEXT NOT NULL CHECK (length(trim(version)) > 0),
+     digest                    TEXT NOT NULL CHECK (length(trim(digest)) > 0),
+     artifact_id               TEXT NOT NULL REFERENCES records(id),
+     consented_source_revision TEXT NOT NULL CHECK (length(trim(consented_source_revision)) > 0),
+     declaration_digest        TEXT NOT NULL CHECK (length(declaration_digest) = 64),
+     consented_declaration     TEXT NOT NULL CHECK (json_valid(consented_declaration) AND json_type(consented_declaration) = 'object'),
+     adoption                  TEXT NOT NULL CHECK (adoption IN ('caller_asserted','shell_adopt.v1')),
+     status                    TEXT NOT NULL CHECK (status IN ('installed','disabled','removed')),
+     event_id                  TEXT NOT NULL UNIQUE REFERENCES control_events(id),
+     event_seq                 INTEGER NOT NULL UNIQUE REFERENCES control_events(seq),
+     updated_at                TEXT NOT NULL,
+     PRIMARY KEY (account_id, package)
+    )
+;
+CREATE INDEX idx_alpha_tab_installs_artifact ON alpha_tab_installs(artifact_id)
+;
 CREATE TABLE derivation_events (
      seq             INTEGER PRIMARY KEY AUTOINCREMENT,
      id              TEXT NOT NULL UNIQUE,
@@ -1166,6 +1275,7 @@ CREATE TABLE derivation_events (
      reason          TEXT NOT NULL CHECK (length(trim(reason)) > 0),
      payload         TEXT NOT NULL CHECK (json_valid(payload) AND json_type(payload) = 'object'),
      created_at      TEXT NOT NULL,
+     act             INTEGER,
      CHECK ((type = 'derivation.series.created' AND aggregate_kind = 'derivation_series')
          OR (type = 'derivation.revision.completed' AND aggregate_kind = 'derivation_revision')
          OR (type = 'derivation.attempt.failed' AND aggregate_kind = 'derivation_attempt')
@@ -1176,6 +1286,8 @@ CREATE TABLE derivation_events (
    )
 ;
 CREATE INDEX idx_derivation_events_aggregate ON derivation_events(aggregate_kind, aggregate_id, seq)
+;
+CREATE INDEX idx_derivation_events_act ON derivation_events(act) WHERE act IS NOT NULL
 ;
 CREATE TRIGGER derivation_events_no_update BEFORE UPDATE ON derivation_events
        BEGIN SELECT RAISE(ABORT, 'derivation_events is append-only'); END
@@ -1837,11 +1949,15 @@ CREATE TABLE provenance_attestation_validity_events (
      reason         TEXT NOT NULL CHECK (length(trim(reason)) > 0),
      issuer         TEXT NOT NULL CHECK (length(trim(issuer)) > 0),
      issued_at      TEXT NOT NULL,
+     act            INTEGER,
      UNIQUE (attestation_id, ordinal)
    )
 ;
 CREATE INDEX idx_provenance_validity_attestation
        ON provenance_attestation_validity_events(attestation_id, ordinal)
+;
+CREATE INDEX idx_provenance_validity_act
+       ON provenance_attestation_validity_events(act) WHERE act IS NOT NULL
 ;
 CREATE TRIGGER provenance_attestation_validity_events_no_update
        BEFORE UPDATE ON provenance_attestation_validity_events
@@ -1960,6 +2076,7 @@ CREATE TABLE relationship_events (
      ),
      occurred_at               TEXT NOT NULL,
      ingested_at               TEXT NOT NULL,
+     act                       INTEGER,
      UNIQUE (issuer_origin_db_id, id),
      UNIQUE (issuer_origin_db_id, stream_kind, stream_id, stream_version),
      CHECK ((stream_kind = 'relationship' AND type IN (
@@ -1974,6 +2091,8 @@ CREATE INDEX idx_relationship_events_stream
 ;
 CREATE INDEX idx_relationship_events_relationship
        ON relationship_events(relationship_origin_db_id, relationship_id, seq)
+;
+CREATE INDEX idx_relationship_events_act ON relationship_events(act) WHERE act IS NOT NULL
 ;
 CREATE TRIGGER relationship_events_no_update BEFORE UPDATE ON relationship_events
        BEGIN SELECT RAISE(ABORT, 'relationship_events is append-only'); END
@@ -2324,5 +2443,5 @@ CREATE TRIGGER engine_migration_drills_no_update BEFORE UPDATE ON engine_migrati
 CREATE TRIGGER engine_migration_drills_no_delete BEFORE DELETE ON engine_migration_drills
        BEGIN SELECT RAISE(ABORT, 'engine_migration_drills is append-only'); END
 ;
-PRAGMA user_version = 55;
+PRAGMA user_version = 65;
 ```

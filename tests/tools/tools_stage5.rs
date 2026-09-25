@@ -14,7 +14,7 @@ use native_ce::meta::{
     alias_value, create_vocabulary, promote_value, propose_value, write_user_schema_config,
     SchemaConfigOptions,
 };
-use native_ce::query::fts::{NEAR_MISS_CAP, THIN_RESULTS_THRESHOLD};
+use native_ce::query::fts::{CAPPED_RESULTS_GUIDANCE, NEAR_MISS_CAP, THIN_RESULTS_THRESHOLD};
 use native_ce::store::{add_link, archive_record, create_record, create_record_as, set_facet};
 use native_ce::{create_database, open_database, Db};
 use serde_json::{json, Value};
@@ -1943,6 +1943,70 @@ async fn search_with_enough_hits_stays_strict() {
     assert!(
         out.get("near_misses").is_none() && out.get("guidance").is_none(),
         "at or above the threshold the strict results stand alone: {out}"
+    );
+}
+
+#[tokio::test]
+async fn capped_search_points_at_query_record() {
+    let db = db().await;
+    let registry = registry();
+    for i in 0..THIN_RESULTS_THRESHOLD + 1 {
+        task(&db, &format!("capped meeting notes {i}")).await;
+    }
+    let out = call(
+        &registry,
+        &db,
+        "search",
+        json!({ "query": "capped", "limit": THIN_RESULTS_THRESHOLD }),
+    )
+    .await;
+    assert_eq!(out["thin"], false);
+    assert_eq!(out["limit_reached"], true);
+    assert!(out.get("near_misses").is_none(), "{out}");
+    let guidance = out["guidance"]
+        .as_str()
+        .expect("capped search carries guidance");
+    // Identity, not keywords: the renderer states the cap above this line, so
+    // a guidance string that drifts back into restating it must fail here
+    // whatever case it comes back in.
+    assert_eq!(guidance, CAPPED_RESULTS_GUIDANCE, "{guidance}");
+    assert!(guidance.contains("query_record"), "{guidance}");
+}
+
+/// A cap below the thin threshold is still a cap. The existing capped test
+/// uses `limit = THIN_RESULTS_THRESHOLD`, where `hits.len() < THRESHOLD` is
+/// false regardless — so it never exercised the case where the two disagree.
+/// Below the threshold they did: a caller asking for 3 and getting 3 was read
+/// as scarcity and answered with up to 3 x NEAR_MISS_CAP unrequested rows,
+/// alongside a `limit_reached` flag in the same payload saying the opposite.
+#[tokio::test]
+async fn a_cap_below_the_thin_threshold_is_not_scarcity() {
+    let db = db().await;
+    let registry = registry();
+    for i in 0..THIN_RESULTS_THRESHOLD + 3 {
+        task(&db, &format!("narrow meeting notes {i}")).await;
+    }
+    // Something a near-miss mechanism would reach, so an unfixed run has
+    // rows to surface and this test can fail for the right reason.
+    task(&db, "NarrowlyMissedSibling").await;
+
+    let out = call(
+        &registry,
+        &db,
+        "search",
+        json!({ "query": "narrow", "limit": 3 }),
+    )
+    .await;
+
+    assert_eq!(out["total"], 3, "{out}");
+    assert_eq!(out["limit_reached"], true, "{out}");
+    assert_eq!(
+        out["thin"], false,
+        "a caller-set cap was reported as scarcity: {out}"
+    );
+    assert!(
+        out.get("near_misses").is_none(),
+        "near misses appended to a result set the caller truncated: {out}"
     );
 }
 

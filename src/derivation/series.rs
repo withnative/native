@@ -107,6 +107,7 @@ pub(crate) async fn create_or_get_series_for_recipe_in(
     tx: &mut Transaction<'_, Sqlite>,
     principal: Principal<'_>,
     input: &CreateOrGetDerivationSeries,
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<CreatedOrExistingDerivationSeries> {
     for (label, value) in [
         ("id", input.id.as_str()),
@@ -195,6 +196,7 @@ pub(crate) async fn create_or_get_series_for_recipe_in(
                 definition: input.definition.clone(),
             }),
         )?,
+        act_alloc,
     )
     .await?;
     let series = inspect_series_in(tx, &input.id)
@@ -212,7 +214,9 @@ pub async fn create_or_get_series_for_recipe(
     input: CreateOrGetDerivationSeries,
 ) -> Result<CreatedOrExistingDerivationSeries> {
     let mut tx = begin_write(db.write_pool()).await?;
-    let result = create_or_get_series_for_recipe_in(&mut tx, principal, &input).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
+    let result =
+        create_or_get_series_for_recipe_in(&mut tx, principal, &input, &mut act_alloc).await?;
     tx.commit().await?;
     Ok(result)
 }

@@ -45,12 +45,17 @@ pub(crate) use persistence::{
     append_relationship_event_in, create_relationship_with_assertion,
     create_relationship_with_assertion_in, prepare_relationship_with_assertion,
 };
+#[allow(unused_imports)] // R3 consumes the bounded fold; the reader lands ahead of its caller.
+pub(crate) use projector::relationship_events_in_act_range;
+#[allow(unused_imports)] // R3 wire-boundary decoders land ahead of the unified materialiser.
 pub(crate) use projector::{
     initialize_receiver_local_state_after_import_in,
+    initialize_receiver_local_state_for_replayed_events_in,
     project_receiver_local_admissions_for_outputs_in, read_all_relationship_events,
     read_relationship_event_prefix, rebuild_receiver_local_state_in,
-    refresh_receiver_local_admissions_for_attestation_in, replay_relationship_events,
-    ReceiverAdmissionDecision,
+    refresh_receiver_local_admissions_for_attestation_in,
+    relationship_federation_identities_from_section, relationship_replay_events_from_section,
+    replay_relationship_events, ReceiverAdmissionDecision, RelationshipReplayEvent,
 };
 pub const RELATIONSHIP_TYPE_SCHEMA_VERSION: u64 = 1;
 pub const CORE_RELATIONSHIP_TYPE_MANIFEST_JSON: &str = include_str!("core_relationship_types.json");

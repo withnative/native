@@ -14,7 +14,7 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use futures::TryStreamExt;
 use serde_json::value::RawValue;
 use serde_json::{Map, Value};
-use sqlx::postgres::{PgArguments, PgRow, PgTypeInfo};
+use sqlx::postgres::{PgArguments, PgDatabaseError, PgErrorPosition, PgRow, PgTypeInfo};
 use sqlx::types::{BigDecimal, Json};
 use sqlx::{Acquire, Arguments, Column, Executor, Row, Statement, TypeInfo, ValueRef};
 use tokio::time::Instant;
@@ -125,6 +125,216 @@ const SAFE_NODE_VARIANTS: &[&str] = &[
 
 fn reject(category: QuerySqlErrorCategory, detail: impl AsRef<str>) -> Error {
     sql_contract::categorized_error(category, detail)
+}
+
+/// Map a 1-based PG character position in the capped wrapper text back to
+/// a 1-based position in the caller's statement. The `?N`→`$N` rewrite
+/// swaps one sigil character for another, so rewritten and caller text
+/// have equal character counts and the mapping is exact. Returns `None`
+/// for positions inside the wrapper itself.
+///
+/// E2 I-5: carry the sanitised engine message plus the caller-text position
+/// instead of discarding both. Positions index the prepared (capped, `$N`)
+/// text; the `?N`→`$N` rewrite swaps one sigil character for another, so it
+/// preserves length and subtracting the wrapper prefix maps positions back
+/// onto the caller's statement exactly.
+fn caller_position(pg_position: usize, statement: &str) -> Option<usize> {
+    const WRAPPER_PREFIX_LEN: usize = "SELECT * FROM (".len();
+    if pg_position <= WRAPPER_PREFIX_LEN {
+        return None;
+    }
+    let position = pg_position - WRAPPER_PREFIX_LEN;
+    if position == 0 || position > statement.chars().count() + 1 {
+        return None;
+    }
+    Some(position)
+}
+
+fn type_check_error(error: sqlx::Error, statement: &str) -> Error {
+    const HEADLINE: &str = "PostgreSQL could not type-check the query";
+    let sqlx::Error::Database(database) = &error else {
+        return reject(QuerySqlErrorCategory::SyntaxOrType, HEADLINE);
+    };
+    let Some(pg_error) = database.try_downcast_ref::<PgDatabaseError>() else {
+        return reject(QuerySqlErrorCategory::SyntaxOrType, HEADLINE);
+    };
+    let message = sanitize_type_message(pg_error.message());
+    let mut detail = String::from(HEADLINE);
+    if let Some(PgErrorPosition::Original(position)) = pg_error.position() {
+        if let Some(caller_position) = caller_position(position, statement) {
+            detail.push_str(&format!(" at position {caller_position}"));
+        }
+    }
+    if !message.is_empty() {
+        detail.push_str(": ");
+        detail.push_str(&message);
+    }
+    if message.contains("must be type boolean") {
+        detail.push_str(
+            ". Hint: Catalog booleans are 0/1 integers: write `WHERE is_canonical = 1`, \
+             not `WHERE is_canonical`; same for CASE WHEN.",
+        );
+    }
+    reject(QuerySqlErrorCategory::SyntaxOrType, detail)
+}
+
+/// First meaningful line only, redacted then capped at 300 chars.
+/// Never emits PG detail/hint/where text, internal view names, physical
+/// table names, or DDL: only the message head with internals scrubbed.
+/// Redaction is quote-aware: engine-inserted identifiers never appear
+/// inside caller string literals, so balanced quoted caller text (which may
+/// legitimately mention `_query_sql_` or `pg_temp`) is left intact.
+/// Double-quoted identifiers are tracked separately so an apostrophe inside
+/// `"a'b"` cannot suppress later redaction; when quotes do not balance at
+/// all, the pass falls back to scrubbing the internal tokens everywhere.
+fn sanitize_type_message(message: &str) -> String {
+    let head = message
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("");
+    let redacted = redact_outside_literals(head);
+    redacted.chars().take(300).collect()
+}
+
+fn redact_outside_literals(message: &str) -> String {
+    match redact_quote_aware(message) {
+        Some(redacted) => redacted,
+        // A stray apostrophe (an unbalanced engine contraction, or a quote
+        // the scanner cannot pair) would otherwise suppress every later
+        // redaction, so fall back to scrubbing the internal tokens
+        // everywhere. A caller literal may be rewritten on this path; that
+        // is the price of a redactor one quote character cannot silence.
+        None => redact_everywhere(message),
+    }
+}
+
+/// Single internal-token replacement at the head of `rest`, quote-unaware.
+/// Returns the replacement text and the bytes to skip.
+fn match_internal_token(rest: &str) -> Option<(&'static str, usize)> {
+    if rest.starts_with("_native_query") {
+        return Some(("(query)", "_native_query".len()));
+    }
+    if rest.starts_with("pg_temp") {
+        let mut skip = "pg_temp".len();
+        let digits: usize = rest[skip..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || *c == '_')
+            .map(|c| c.len_utf8())
+            .sum();
+        // Accept pg_temp. and pg_temp_N. (digits/underscores then a dot).
+        if rest[skip + digits..].starts_with('.') {
+            skip += digits + 1;
+            return Some(("", skip));
+        }
+        return None;
+    }
+    if let Some(tail) = rest.strip_prefix("_query_sql_") {
+        let skip = tail
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(tail.len());
+        return Some(("(internal relation)", "_query_sql_".len() + skip));
+    }
+    None
+}
+
+/// Quote-aware pass: `None` when a quote never closes. Single-quoted
+/// string literals are copied verbatim (with `''` escape): engine-inserted
+/// identifiers never appear inside caller literals, so balanced quoted
+/// caller text (which may legitimately mention `_query_sql_` or `pg_temp`)
+/// is intact. Double-quoted identifiers are tracked separately but their
+/// contents are still scrubbed: PostgreSQL engine inserts its own names
+/// double-quoted (`relation "_query_sql_…" does not exist`), while the
+/// tracking keeps an apostrophe inside `"a'b"` from flipping the literal
+/// state and suppressing later redaction.
+fn redact_quote_aware(message: &str) -> Option<String> {
+    let mut out = String::with_capacity(message.len());
+    let mut rest = message;
+    while !rest.is_empty() {
+        // Normal span up to the next quote character; scrub tokens in it.
+        let mut next = rest.len();
+        let mut quote = None;
+        if let Some(index) = rest.find('\'') {
+            next = index;
+            quote = Some('\'');
+        }
+        if let Some(index) = rest.find('"') {
+            if index < next {
+                next = index;
+                quote = Some('"');
+            }
+        }
+        out.push_str(&redact_everywhere(&rest[..next]));
+        rest = &rest[next..];
+        match quote {
+            None => break,
+            Some('\'') => {
+                // Caller literal: copy verbatim through the closing quote.
+                out.push('\'');
+                rest = &rest[1..];
+                loop {
+                    if rest.is_empty() {
+                        return None;
+                    }
+                    if rest.starts_with("''") {
+                        out.push_str("''");
+                        rest = &rest[2..];
+                    } else if rest.starts_with('\'') {
+                        out.push('\'');
+                        rest = &rest[1..];
+                        break;
+                    } else {
+                        let end = rest.find('\'').unwrap_or(rest.len());
+                        out.push_str(&rest[..end]);
+                        rest = &rest[end..];
+                    }
+                }
+            }
+            Some('"') => {
+                // Engine identifier: scrub the contents, keep the quoting.
+                // A single quote inside is literal text, not a literal.
+                out.push('"');
+                rest = &rest[1..];
+                loop {
+                    if rest.is_empty() {
+                        return None;
+                    }
+                    if rest.starts_with("\"\"") {
+                        out.push_str("\"\"");
+                        rest = &rest[2..];
+                    } else if rest.starts_with('"') {
+                        out.push('"');
+                        rest = &rest[1..];
+                        break;
+                    } else {
+                        let end = rest.find('"').unwrap_or(rest.len());
+                        out.push_str(&redact_everywhere(&rest[..end]));
+                        rest = &rest[end..];
+                    }
+                }
+            }
+            _ => break,
+        }
+    }
+    Some(out)
+}
+
+/// Unconditional internal-token scrub, used only when the quote-aware pass
+/// reports unbalanced quotes and literal boundaries cannot be trusted.
+fn redact_everywhere(message: &str) -> String {
+    let mut out = String::with_capacity(message.len());
+    let mut rest = message;
+    while !rest.is_empty() {
+        if let Some((replacement, skip)) = match_internal_token(rest) {
+            out.push_str(replacement);
+            rest = &rest[skip..];
+            continue;
+        }
+        let mut chars = rest.chars();
+        out.push(chars.next().expect("non-empty rest has a first char"));
+        rest = chars.as_str();
+    }
+    out
 }
 
 fn object<'a>(value: &'a Value, context: &str) -> Result<&'a Map<String, Value>> {
@@ -665,10 +875,23 @@ fn walk_scopes(value: &Value, scopes: &[HashSet<String>]) -> Result<()> {
                 ));
             }
             if !catalog.is_empty() || !schema.is_empty() || !relation_in_scope(relation, scopes) {
-                return Err(reject(
-                    QuerySqlErrorCategory::UnauthorizedRelation,
-                    format!("relation '{relation}' is outside the caller-visible logical catalog"),
-                ));
+                let base =
+                    format!("relation '{relation}' is outside the caller-visible logical catalog");
+                // Keep a schema qualifier for the repair: pg_catalog and
+                // information_schema arrive split off from the relation name.
+                let probe_target = [catalog, schema, relation]
+                    .into_iter()
+                    .filter(|part| !part.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(".");
+                let detail = match sql_contract::blocked_relation_repair(
+                    &probe_target,
+                    sql_contract::QuerySqlProfile::PostgresServer,
+                ) {
+                    Some(repair) => format!("{base}. {repair}"),
+                    None => base,
+                };
+                return Err(reject(QuerySqlErrorCategory::UnauthorizedRelation, detail));
             }
         }
     }
@@ -759,6 +982,15 @@ pub fn validate(request: &QuerySqlRequest) -> Result<String> {
         sql_contract::QuerySqlProfile::PostgresServer,
         &request.sql,
     )?;
+    // I1b: callers write `?N`; Postgres executes `$N`. The rewrite reuses
+    // the classifier's own token spans, so placeholders inside literals,
+    // comments and quoted forms are untouched. Everything downstream —
+    // `pg_query` parse, the AST walk and the exact-`$n`-set check — runs on
+    // the rewritten text, and the rewritten statement is what executes.
+    let statement = sql_contract::rewrite_placeholders_for_postgres(
+        sql_contract::QuerySqlProfile::PostgresServer,
+        &statement,
+    )?;
     let parsed = pg_query::parse(&statement).map_err(|_| {
         reject(
             QuerySqlErrorCategory::SyntaxOrType,
@@ -820,7 +1052,18 @@ fn quote_identifier(identifier: &str) -> Result<String> {
     Ok(format!("\"{identifier}\""))
 }
 
-fn projection_statements(db: &PostgresDb) -> Result<Vec<String>> {
+/// Portable value-model timestamp pair (E1 M1 slice B): fixed UTC millis
+/// text plus integer epoch millis, matching the SQLite governed views and
+/// the Turso projection. NULL in, NULL out on both arms.
+fn portable_ts(column: &str) -> String {
+    format!("to_char({column} AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')")
+}
+
+fn portable_ts_ms(column: &str) -> String {
+    format!("floor(extract(epoch from {column}) * 1000)::bigint")
+}
+
+pub(crate) fn projection_statements(db: &PostgresDb) -> Result<Vec<String>> {
     let schema = quote_identifier(db.schema())?;
     let relations = |name: &str| format!("{schema}.\"{name}\"");
     let records = relations("records");
@@ -833,9 +1076,21 @@ fn projection_statements(db: &PostgresDb) -> Result<Vec<String>> {
     let vocabulary_values = relations("vocabulary_values");
     let schema_config = relations("schema_config");
     let max_bearer_depth = crate::authorization::MAX_DERIVED_BEARER_DEPTH;
-    Ok(vec![
-        "CREATE TEMP TABLE _query_sql_principal(singleton boolean PRIMARY KEY CHECK(singleton), account_id text NOT NULL, trusted_local_bypass boolean NOT NULL)".into(),
-        // Bearer-first (subject -> derived artifact), matching the SQLite
+    // The records view's last_activity_at falls back to the record's own
+    // creation time when no content event exists. The subselect is built
+    // with format! here so the qualified events table is interpolated:
+    // passing it as a plain literal into portable_ts would ship a verbatim
+    // `{events}` to Postgres (42601), since portable_ts only substitutes
+    // its own {column}.
+    let last_activity_src = format!(
+        "COALESCE((SELECT event.created_at FROM {events} event \
+          WHERE event.record_id=record.id \
+            AND event.type NOT IN \
+              ('reconciliation.recorded.v1','unit.superseded.v1','receipt.dependency_audited.v1') \
+          ORDER BY event.seq DESC LIMIT 1), record.created_at)"
+    );
+    let mut statements: Vec<String> = vec![
+        "CREATE TEMP TABLE _query_sql_principal(singleton boolean PRIMARY KEY CHECK(singleton), account_id text NOT NULL, trusted_local_bypass boolean NOT NULL, is_member boolean NOT NULL)".into(),        // Bearer-first (subject -> derived artifact), matching the SQLite
         // contract in src/query/sql.rs verbatim in meaning. See the long
         // comment there for why the two directions describe the same relation
         // and why the artifact-first form was quadratic in chain depth. The
@@ -870,31 +1125,45 @@ fn projection_statements(db: &PostgresDb) -> Result<Vec<String>> {
                AND NOT(authorization_subject.record_type='Entity' AND authorization_subject.kind='semantic-unit') \
                AND EXISTS(SELECT 1 FROM {policies} policy WHERE policy.record_id=authorization_subject.policy_anchor_id) \
                AND (principal.trusted_local_bypass OR EXISTS(SELECT 1 FROM {bindings} own WHERE own.record_id=authorization_subject.owner_id AND own.system='account' AND own.identifier=principal.account_id AND own.is_canonical) \
-                    OR EXISTS(SELECT 1 FROM {entries} entry WHERE entry.policy_anchor_id=authorization_subject.policy_anchor_id AND entry.effect='allow' AND entry.capability IN ('view','edit','manage') AND ((entry.subject_kind='members' AND entry.subject_id='native:members') OR (entry.subject_kind='account' AND entry.subject_id=principal.account_id))))"
+                    OR EXISTS(SELECT 1 FROM {entries} entry WHERE entry.policy_anchor_id=authorization_subject.policy_anchor_id AND entry.effect='allow' AND entry.capability IN ('view','edit','manage') AND ((entry.subject_kind='members' AND entry.subject_id='native:members' AND principal.is_member) OR (entry.subject_kind='account' AND entry.subject_id=principal.account_id))))"
         ),
         format!(
             "CREATE TEMP VIEW records WITH (security_barrier=true) AS \
-             SELECT record.id, record.record_type AS type, record.kind, record.name, record.body, \
-                    CASE WHEN parent.id IS NULL THEN NULL ELSE record.home_id END AS home_id, \
-                    record.lifecycle, record.persistence, record.maturity, record.summary, \
-                    COALESCE((SELECT event.created_at FROM {events} event WHERE event.record_id=record.id AND event.type NOT IN ('reconciliation.recorded.v1','unit.superseded.v1','receipt.dependency_audited.v1') ORDER BY event.seq DESC LIMIT 1), record.created_at) AS last_activity_at, \
-                    record.created_at, record.updated_at, record.deleted_at \
+             SELECT record.id COLLATE \"C\" AS id, record.record_type COLLATE \"C\" AS type, record.kind COLLATE \"C\" AS kind, record.name COLLATE \"C\" AS name, record.body COLLATE \"C\" AS body, \
+                    CASE WHEN parent.id IS NULL THEN NULL ELSE record.home_id END COLLATE \"C\" AS home_id, \
+                    record.lifecycle COLLATE \"C\" AS lifecycle, record.persistence COLLATE \"C\" AS persistence, record.maturity COLLATE \"C\" AS maturity, record.summary COLLATE \"C\" AS summary, \
+                    {last_activity_at} AS last_activity_at, {last_activity_at_ms} AS last_activity_at_ms, \
+                    {record_created_at} AS created_at, {record_created_at_ms} AS created_at_ms, \
+                    {record_updated_at} AS updated_at, {record_updated_at_ms} AS updated_at_ms, \
+                    {deleted_at} AS deleted_at, {deleted_at_ms} AS deleted_at_ms \
              FROM {records} record JOIN pg_temp._query_sql_visible_records visible ON visible.id=record.id \
-             LEFT JOIN pg_temp._query_sql_visible_records parent ON parent.id=record.home_id"
+             LEFT JOIN pg_temp._query_sql_visible_records parent ON parent.id=record.home_id",
+            last_activity_at = portable_ts(&last_activity_src),
+            last_activity_at_ms = portable_ts_ms(&last_activity_src),
+            record_created_at = portable_ts("record.created_at"),
+            record_created_at_ms = portable_ts_ms("record.created_at"),
+            record_updated_at = portable_ts("record.updated_at"),
+            record_updated_at_ms = portable_ts_ms("record.updated_at"),
+            deleted_at = portable_ts("record.deleted_at"),
+            deleted_at_ms = portable_ts_ms("record.deleted_at"),
         ),
         format!(
             "CREATE TEMP VIEW content_events WITH (security_barrier=true) AS \
-             SELECT event.seq AS local_seq,event.id,event.record_id, \
-                    CASE WHEN event.type='receipt.committed.v1' THEN 'record.updated' ELSE event.type END AS type, \
-                    event.created_at FROM {events} event \
+             SELECT event.seq AS local_seq,event.id COLLATE \"C\" AS id,event.record_id COLLATE \"C\" AS record_id, \
+                    CASE WHEN event.type='receipt.committed.v1' THEN 'record.updated' ELSE event.type END COLLATE \"C\" AS type, \
+                    {created_at} AS created_at, {created_at_ms} AS created_at_ms FROM {events} event \
              JOIN pg_temp._query_sql_visible_records visible ON visible.id=event.record_id \
-             WHERE event.type NOT IN ('reconciliation.recorded.v1','unit.superseded.v1','receipt.dependency_audited.v1')"
+             WHERE event.type NOT IN ('reconciliation.recorded.v1','unit.superseded.v1','receipt.dependency_audited.v1')",
+            created_at = portable_ts("event.created_at"),
+            created_at_ms = portable_ts_ms("event.created_at"),
         ),
         format!(
             "CREATE TEMP VIEW links WITH (security_barrier=true) AS \
-             SELECT link.id,link.source_id,link.target_id,link.relationship,link.note,link.created_at FROM {links} link \
+             SELECT link.id COLLATE \"C\" AS id,link.source_id COLLATE \"C\" AS source_id,link.target_id COLLATE \"C\" AS target_id,link.relationship COLLATE \"C\" AS relationship,link.note COLLATE \"C\" AS note,{created_at} AS created_at,{created_at_ms} AS created_at_ms FROM {links} link \
              JOIN pg_temp._query_sql_visible_records source ON source.id=link.source_id \
-             JOIN pg_temp._query_sql_visible_records target ON target.id=link.target_id"
+             JOIN pg_temp._query_sql_visible_records target ON target.id=link.target_id",
+            created_at = portable_ts("link.created_at"),
+            created_at_ms = portable_ts_ms("link.created_at"),
         ),
         format!(
             "CREATE TEMP VIEW facet_values WITH (security_barrier=true) AS \
@@ -908,11 +1177,11 @@ fn projection_statements(db: &PostgresDb) -> Result<Vec<String>> {
                       AND COALESCE((event.payload->>'observation_only')::boolean,FALSE)=FALSE), \
                   latest AS (SELECT DISTINCT ON(record_id,payload->>'key') record_id,seq,type,payload \
                     FROM mutations ORDER BY record_id,payload->>'key',seq DESC) \
-             SELECT 'fv:'||current.record_id||':'||(current.payload->>'key') AS id, current.record_id, \
-                    current.payload->>'key' AS key,current.payload->>'value' AS value, \
+             SELECT 'fv:'||current.record_id||':'||(current.payload->>'key') AS id, current.record_id COLLATE \"C\" AS record_id, \
+                    current.payload->>'key' COLLATE \"C\" AS key,current.payload->>'value' COLLATE \"C\" AS value, \
                     CASE WHEN current.payload->>'value' ~ '^-?(0|[1-9][0-9]*)(\\.[0-9]+)?([eE][+-]?[0-9]+)?$' \
                          THEN (current.payload->>'value')::double precision ELSE NULL END AS value_num, \
-                    current.payload->>'vocab_ref' AS vocab_ref, epoch.created_at \
+                    current.payload->>'vocab_ref' COLLATE \"C\" AS vocab_ref, {created_at} AS created_at, {created_at_ms} AS created_at_ms \
              FROM latest current \
              JOIN LATERAL (SELECT event.created_at FROM mutations event \
                  WHERE event.record_id=current.record_id AND event.type='facet.set' \
@@ -921,7 +1190,9 @@ fn projection_statements(db: &PostgresDb) -> Result<Vec<String>> {
                        WHERE unset.record_id=current.record_id AND unset.type='facet.unset' \
                          AND unset.payload->>'key'=current.payload->>'key' AND unset.seq<current.seq),0) \
                  ORDER BY event.seq LIMIT 1) epoch ON TRUE \
-             WHERE current.type='facet.set'"
+             WHERE current.type='facet.set'",
+            created_at = portable_ts("epoch.created_at"),
+            created_at_ms = portable_ts_ms("epoch.created_at"),
         ),
         format!(
             "CREATE TEMP VIEW facet_observations WITH (security_barrier=true) AS \
@@ -931,22 +1202,26 @@ fn projection_statements(db: &PostgresDb) -> Result<Vec<String>> {
                     WHERE event.type IN ('facet.set','facet.unset') AND event.payload->>'key' IS NOT NULL \
                       AND event.payload->>'key' NOT IN ('lifecycle','owner','persistence','maturity')), \
                   corrected AS (SELECT DISTINCT ON(record_id,payload->>'key',as_of) record_id,seq,type,payload,created_at,as_of FROM candidates ORDER BY record_id,payload->>'key',as_of,seq DESC) \
-             SELECT 'fo:'||record_id||':'||(payload->>'key')||':'||as_of AS id,record_id,payload->>'key' AS key, \
-                    CASE WHEN type='facet.set' THEN payload->>'value' ELSE NULL END AS value, \
-                    CASE WHEN type='facet.set' THEN 'set' ELSE 'unset' END AS op, \
-                    CASE WHEN type='facet.set' THEN payload->>'vocab_ref' ELSE NULL END AS vocab_ref, \
-                    as_of,created_at AS observed_at,seq AS event_seq FROM corrected"
+             SELECT 'fo:'||record_id||':'||(payload->>'key')||':'||as_of AS id,record_id COLLATE \"C\" AS record_id,payload->>'key' COLLATE \"C\" AS key, \
+                    CASE WHEN type='facet.set' THEN payload->>'value' ELSE NULL END COLLATE \"C\" AS value, \
+                    CASE WHEN type='facet.set' THEN 'set' ELSE 'unset' END COLLATE \"C\" AS op, \
+                    CASE WHEN type='facet.set' THEN payload->>'vocab_ref' ELSE NULL END COLLATE \"C\" AS vocab_ref, \
+                    as_of COLLATE \"C\" AS as_of,{observed_at} AS observed_at,{observed_at_ms} AS observed_at_ms,seq AS event_seq FROM corrected",
+            observed_at = portable_ts("created_at"),
+            observed_at_ms = portable_ts_ms("created_at"),
         ),
         format!(
             "CREATE TEMP VIEW bindings WITH (security_barrier=true) AS \
-             SELECT binding.record_id,binding.system,binding.identifier,binding.is_canonical,binding.url,binding.etag,binding.last_seen_at \
+             SELECT binding.record_id COLLATE \"C\" AS record_id,binding.system COLLATE \"C\" AS system,binding.identifier COLLATE \"C\" AS identifier,CASE WHEN binding.is_canonical THEN 1 ELSE 0 END AS is_canonical,binding.url COLLATE \"C\" AS url,binding.etag COLLATE \"C\" AS etag,{last_seen_at} AS last_seen_at,{last_seen_at_ms} AS last_seen_at_ms \
              FROM {bindings} binding CROSS JOIN pg_temp._query_sql_principal principal \
              JOIN pg_temp._query_sql_visible_records visible ON visible.id=binding.record_id \
-             WHERE binding.system IN ('account','email') AND EXISTS(SELECT 1 FROM {bindings} own WHERE own.record_id=binding.record_id AND own.system='account' AND own.identifier=principal.account_id AND own.is_canonical)"
+             WHERE binding.system IN ('account','email') AND EXISTS(SELECT 1 FROM {bindings} own WHERE own.record_id=binding.record_id AND own.system='account' AND own.identifier=principal.account_id AND own.is_canonical)",
+            last_seen_at = portable_ts("binding.last_seen_at"),
+            last_seen_at_ms = portable_ts_ms("binding.last_seen_at"),
         ),
         format!(
             "CREATE TEMP VIEW blobs WITH (security_barrier=true) AS \
-             SELECT blob.id,blob.bytes,blob.mime,blob.size_bytes,blob.sha256,blob.original_filename,blob.storage_tier,blob.external_ref,blob.created_at \
+             SELECT blob.id COLLATE \"C\" AS id,blob.bytes,blob.mime COLLATE \"C\" AS mime,blob.size_bytes,blob.sha256 COLLATE \"C\" AS sha256,blob.original_filename COLLATE \"C\" AS original_filename,blob.storage_tier COLLATE \"C\" AS storage_tier,blob.external_ref COLLATE \"C\" AS external_ref,{created_at} AS created_at,{created_at_ms} AS created_at_ms \
              FROM {blobs} blob WHERE EXISTS(SELECT 1 FROM {records} attachment \
                JOIN pg_temp._query_sql_visible_records attachment_visible ON attachment_visible.id=attachment.id \
                JOIN {facet_values} blob_ref ON blob_ref.record_id=attachment.id AND blob_ref.key='blob_ref' \
@@ -955,12 +1230,87 @@ fn projection_statements(db: &PostgresDb) -> Result<Vec<String>> {
                WHERE attachment.record_type='Document' AND attachment.kind='attachment' \
                  AND jsonb_typeof(blob_ref.value)='string' AND blob_ref.value#>>'{{}}'=blob.id)",
             blobs=relations("blobs"),
-            facet_values=relations("facet_values")
+            facet_values=relations("facet_values"),
+            created_at=portable_ts("blob.created_at"),
+            created_at_ms=portable_ts_ms("blob.created_at"),
         ),
-        format!("CREATE TEMP VIEW vocabularies WITH (security_barrier=true) AS SELECT id,name,created_at FROM {vocabularies}"),
-        format!("CREATE TEMP VIEW vocabulary_values WITH (security_barrier=true) AS SELECT id,vocabulary_id,value,gloss,status,ordinal,terminality,metadata,alias_of FROM {vocabulary_values}"),
-        format!("CREATE TEMP VIEW schema_config WITH (security_barrier=true) AS SELECT config.id,config.layer,config.name,config.data,config.applies_to_collection_id,config.version_lineage,config.created_at FROM {schema_config} config WHERE config.applies_to_collection_id IS NULL OR EXISTS(SELECT 1 FROM pg_temp._query_sql_visible_records visible WHERE visible.id=config.applies_to_collection_id)"),
-    ])
+        format!(
+            "CREATE TEMP VIEW vocabularies WITH (security_barrier=true) AS SELECT id COLLATE \"C\" AS id,name COLLATE \"C\" AS name,{created_at} AS created_at,{created_at_ms} AS created_at_ms FROM {vocabularies}",
+            created_at=portable_ts("created_at"),
+            created_at_ms=portable_ts_ms("created_at"),
+        ),
+        format!("CREATE TEMP VIEW vocabulary_values WITH (security_barrier=true) AS SELECT id COLLATE \"C\" AS id,vocabulary_id COLLATE \"C\" AS vocabulary_id,value COLLATE \"C\" AS value,gloss COLLATE \"C\" AS gloss,status COLLATE \"C\" AS status,ordinal,terminality COLLATE \"C\" AS terminality,metadata,alias_of COLLATE \"C\" AS alias_of FROM {vocabulary_values}"),
+        format!(
+            "CREATE TEMP VIEW schema_config WITH (security_barrier=true) AS SELECT config.id COLLATE \"C\" AS id,config.layer COLLATE \"C\" AS layer,config.name COLLATE \"C\" AS name,config.data COLLATE \"C\" AS data,config.applies_to_collection_id COLLATE \"C\" AS applies_to_collection_id,config.version_lineage COLLATE \"C\" AS version_lineage,{created_at} AS created_at,{created_at_ms} AS created_at_ms FROM {schema_config} config WHERE config.applies_to_collection_id IS NULL OR EXISTS(SELECT 1 FROM pg_temp._query_sql_visible_records visible WHERE visible.id=config.applies_to_collection_id)",
+            created_at=portable_ts("config.created_at"),
+            created_at_ms=portable_ts_ms("config.created_at"),
+        ),
+    ];
+    // Served catalog views, generated from LOGICAL_RELATIONS so Postgres
+    // returns the same rows every other engine serves. Static metadata
+    // needs no security barrier and no collation override: agents order by
+    // the integer `column_position`, and equality filters are
+    // collation-neutral.
+    statements.extend(sql_contract::catalog_view_statements(false));
+    Ok(statements)
+}
+
+/// Portable value-model encoding for Postgres `numeric` results
+/// (E1 M1 slice B). Stored numerics in the catalog are already doubles,
+/// so only computed values (notably `avg`/`sum`/`round`) take this path:
+/// - integer-valued numerics that fit in i64 encode as JSON integers, so
+///   `sum()` over integers matches SQLite's integer sum exactly;
+/// - integer-valued numerics outside the i64 range are refused legibly,
+///   never silently rounded (2^53 would already lose precision as f64);
+/// - non-integral numerics encode as finite doubles, matching `avg()` on
+///   every engine; non-finite or out-of-double-range values are refused.
+fn numeric_cell(number: &BigDecimal) -> Result<Value> {
+    let normalized = number.normalized();
+    let text = normalized.to_string();
+    if matches!(text.as_str(), "NaN" | "Infinity" | "-Infinity") {
+        return Err(reject(
+            QuerySqlErrorCategory::SyntaxOrType,
+            "non-finite numeric result",
+        ));
+    }
+    if normalized.is_integer() {
+        // `{:.0}` renders the exact plain integer (never exponent form),
+        // which `parse` then bounds-checks against i64.
+        match format!("{normalized:.0}").parse::<i64>() {
+            Ok(int) => return Ok(Value::from(int)),
+            Err(_) => {
+                return Err(reject(
+                    QuerySqlErrorCategory::SyntaxOrType,
+                    "integer numeric result is outside the i64 range; narrow the aggregation",
+                ));
+            }
+        }
+    }
+    let value: f64 = text.parse().map_err(|_| {
+        reject(
+            QuerySqlErrorCategory::SyntaxOrType,
+            "numeric result is not a finite decimal",
+        )
+    })?;
+    serde_json::Number::from_f64(value)
+        .map(Value::Number)
+        .ok_or_else(|| {
+            reject(
+                QuerySqlErrorCategory::SyntaxOrType,
+                "numeric result is outside the JSON number range",
+            )
+        })
+}
+
+/// Portable value-model encoding for Postgres `bool` results (E1 M2,
+/// Option N). SQLite and Turso surface comparison results as integers
+/// (`1`/`0`), while Postgres decodes them as JSON booleans, so the
+/// encoder normalises here: `true`/`false` become `1`/`0`. This extends
+/// the E1 M1 catalog 0/1 casts (e.g. `bindings.is_canonical`) from stored
+/// columns to computed expressions. `NULL` never reaches this path —
+/// `row_cell` returns `Value::Null` for null cells above.
+fn bool_cell(value: bool) -> Value {
+    Value::from(i64::from(value))
 }
 
 fn parameter_types(parameters: &[QuerySqlParameter]) -> Vec<PgTypeInfo> {
@@ -1056,7 +1406,7 @@ fn row_cell(row: &PgRow, index: usize) -> Result<Value> {
     }
     let name = raw.type_info().name().to_ascii_lowercase();
     let value = match name.as_str() {
-        "bool" => Value::Bool(row.try_get(index)?),
+        "bool" => bool_cell(row.try_get(index)?),
         "int2" => Value::from(row.try_get::<i16, _>(index)?),
         "int4" => Value::from(row.try_get::<i32, _>(index)?),
         "int8" => Value::from(row.try_get::<i64, _>(index)?),
@@ -1076,17 +1426,7 @@ fn row_cell(row: &PgRow, index: usize) -> Result<Value> {
                     "non-finite float result",
                 )
             })?,
-        "numeric" => {
-            let number: BigDecimal = row.try_get(index)?;
-            let text = number.normalized().to_string();
-            if matches!(text.as_str(), "NaN" | "Infinity" | "-Infinity") {
-                return Err(reject(
-                    QuerySqlErrorCategory::SyntaxOrType,
-                    "non-finite numeric result",
-                ));
-            }
-            Value::String(text)
-        }
+        "numeric" => numeric_cell(&row.try_get(index)?)?,
         "text" | "varchar" | "bpchar" | "char" | "name" => Value::String(row.try_get(index)?),
         "bytea" => Value::String(
             base64::engine::general_purpose::STANDARD.encode(row.try_get::<Vec<u8>, _>(index)?),
@@ -1098,8 +1438,11 @@ fn row_cell(row: &PgRow, index: usize) -> Result<Value> {
                 .to_owned(),
         ),
         "timestamptz" => Value::String(
+            // Fixed UTC millis, matching the catalog views (E1 M1 slice B).
+            // Computed timestamps take the same shape; sub-millisecond
+            // precision is truncated, never rounded.
             row.try_get::<DateTime<Utc>, _>(index)?
-                .to_rfc3339_opts(SecondsFormat::AutoSi, true),
+                .to_rfc3339_opts(SecondsFormat::Millis, true),
         ),
         _ => {
             return Err(reject(
@@ -1194,9 +1537,10 @@ async fn execute_qualified(
         within_setup_deadline(setup_deadline, sqlx::query(&ddl).execute(&mut *connection)).await?;
     }
     let principal_insert =
-        sqlx::query("INSERT INTO pg_temp._query_sql_principal VALUES(true,$1,$2)")
+        sqlx::query("INSERT INTO pg_temp._query_sql_principal VALUES(true,$1,$2,$3)")
             .bind(principal.credential().to_string())
             .bind(principal.trusted_local_bypass())
+            .bind(principal.is_member())
             .execute(&mut *connection);
     within_setup_deadline(setup_deadline, principal_insert).await?;
     let query_role = quote_identifier(db.query_role())?;
@@ -1221,7 +1565,12 @@ async fn execute_qualified(
     .await?;
     let result = async {
         let mut transaction = connection.begin().await?;
-        sqlx::query("SET TRANSACTION READ ONLY")
+        // REPEATABLE READ pins one snapshot for every statement below, so
+        // the freshness stamp and the caller rows cannot straddle a
+        // concurrent commit. READ ONLY keeps the serialization guarantee
+        // free: a read-only transaction can never fail with a serialization
+        // error on SELECTs.
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
             .execute(&mut *transaction)
             .await?;
         for setting in [
@@ -1232,6 +1581,23 @@ async fn execute_qualified(
         ] {
             transaction.execute(setting).await?;
         }
+        // Freshness stamp (E1 M1 slice A): the workspace content head, read
+        // as the owning runtime role before SET LOCAL ROLE drops to the
+        // least-privilege query role, which can see only the temp-schema
+        // projection and never the physical log. Schema-qualified on
+        // purpose: the bare name would resolve to the caller-filtered temp
+        // view. Hidden writes advance this head.
+        //
+        // Snapshot placement: SET and SET LOCAL take no snapshot, so under
+        // REPEATABLE READ this SELECT is the transaction's first
+        // snapshot-taking statement — the snapshot it establishes is the one
+        // the caller statement below shares. A write committed after it is
+        // invisible to both.
+        let events_table = format!("{}.\"content_events\"", quote_identifier(db.schema())?);
+        let as_of_seq: i64 =
+            sqlx::query_scalar(&format!("SELECT COALESCE(MAX(seq),0) FROM {events_table}"))
+                .fetch_one(&mut *transaction)
+                .await?;
         transaction
             .execute(format!("SET LOCAL ROLE {query_role}").as_str())
             .await?;
@@ -1249,12 +1615,7 @@ async fn execute_qualified(
         let prepared = transaction
             .prepare_with(&capped, &types)
             .await
-            .map_err(|_| {
-                reject(
-                    QuerySqlErrorCategory::SyntaxOrType,
-                    "PostgreSQL could not type-check the query",
-                )
-            })?;
+            .map_err(|error| type_check_error(error, &statement))?;
         if prepared.columns().len() > MAX_COLUMNS {
             return Err(reject(
                 QuerySqlErrorCategory::ResultTooLarge,
@@ -1282,14 +1643,31 @@ async fn execute_qualified(
         let mut encoded_bytes = serde_json::to_vec(&columns)?.len() + 2;
         let mut truncated = false;
         while let Some(row) = stream.try_next().await.map_err(|error| {
-            let category = if error.to_string().contains("statement timeout")
-                || error.to_string().contains("canceling statement")
-            {
-                QuerySqlErrorCategory::Timeout
-            } else {
-                QuerySqlErrorCategory::SyntaxOrType
+            // 57014 is query_canceled for statement, lock and idle timeouts
+            // alike: match the text too, so a 250ms lock timeout is never
+            // reported as the 2000ms governed deadline.
+            let text = error.to_string();
+            let canceled = match &error {
+                sqlx::Error::Database(database) => database.code().as_deref() == Some("57014"),
+                _ => false,
             };
-            reject(category, "PostgreSQL query execution failed")
+            if canceled && text.contains("statement timeout") {
+                sql_contract::categorized_error(
+                    QuerySqlErrorCategory::Timeout,
+                    sql_contract::deadline_hint(),
+                )
+            } else if canceled && text.contains("lock timeout") {
+                sql_contract::categorized_error(
+                    QuerySqlErrorCategory::Timeout,
+                    "PostgreSQL canceled the statement on a lock timeout; \
+                     retry the read once the conflicting writer commits.",
+                )
+            } else {
+                reject(
+                    QuerySqlErrorCategory::SyntaxOrType,
+                    "PostgreSQL query execution failed",
+                )
+            }
         })? {
             if rows.len() == MAX_ROWS {
                 truncated = true;
@@ -1317,6 +1695,8 @@ async fn execute_qualified(
             rows,
             row_count,
             truncated,
+            truncation_hint: sql_contract::truncation_hint_for(truncated),
+            as_of_seq,
         })
     }
     .await;
@@ -1349,7 +1729,84 @@ async fn execute_qualified(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::query::sql_contract::QuerySqlParameter;
+
+    #[test]
+    fn numeric_encoder_keeps_integers_exact_and_refuses_unrepresentable() {
+        use std::str::FromStr;
+        // sum() over integers: exact JSON integer, matching SQLite.
+        assert_eq!(
+            numeric_cell(&BigDecimal::from(100)).unwrap(),
+            serde_json::json!(100)
+        );
+        // 2^53+1 is exactly representable as i64 but not as f64: the
+        // integer path must keep it exact rather than rounding it away.
+        assert_eq!(
+            numeric_cell(&BigDecimal::from(9007199254740993_i64)).unwrap(),
+            serde_json::json!(9007199254740993_i64)
+        );
+        // i64::MAX+1 is refused legibly instead of silently rounding.
+        let overflow = numeric_cell(&(BigDecimal::from(i64::MAX) + BigDecimal::from(1)))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            overflow.contains("outside the i64 range"),
+            "unexpected refusal: {overflow}"
+        );
+        // Non-integral numerics (notably avg()) encode as finite doubles.
+        assert_eq!(
+            numeric_cell(&BigDecimal::from_str("1.5").unwrap()).unwrap(),
+            serde_json::json!(1.5)
+        );
+    }
+
+    #[test]
+    fn bool_encoder_normalises_to_zero_one() {
+        // Computed comparisons (e.g. `SELECT id = 'x'`) must match
+        // SQLite/Turso, which surface them as integers. NULL never
+        // reaches bool_cell: row_cell returns Value::Null first.
+        assert_eq!(bool_cell(true), serde_json::json!(1));
+        assert_eq!(bool_cell(false), serde_json::json!(0));
+    }
+
+    #[tokio::test]
+    async fn temp_view_ddl_has_no_uninterpolated_placeholders() {
+        // No-server guard for the 42601 that broke every Postgres
+        // query_sql: a verbatim `{events}` shipped when a qualified table
+        // was passed as a plain literal into a helper instead of through
+        // format!. Lazy pools never connect; rendering only reads the
+        // schema name. The only legitimate braces in emitted DDL are the
+        // `#>>'{}'` JSON operators.
+        let lazy = || {
+            sqlx::postgres::PgPoolOptions::new()
+                .connect_lazy("postgres://localhost:5432/test")
+                .expect("lazy pool parses without connecting")
+        };
+        let db = PostgresDb {
+            pool: lazy(),
+            query_pool: lazy(),
+            query_role: "test_query_role".to_string(),
+            schema: "test_schema".to_string(),
+            schema_tag: None,
+            runtime: None,
+            portability_policy_gate: std::sync::Arc::new(tokio::sync::RwLock::new(())),
+            realtime_hub: std::sync::Arc::new(super::super::PostgresRealtimeHub::new()),
+            #[cfg(feature = "postgres-tests")]
+            intent_persist_checkpoint: std::sync::Arc::new(
+                super::super::PostgresIntentPersistCheckpoint::default(),
+            ),
+            #[cfg(test)]
+            request_lifecycle_test_bypass: false,
+        };
+        let statements = projection_statements(&db).expect("projection statements build");
+        assert!(!statements.is_empty());
+        for statement in &statements {
+            let scrubbed = statement.replace("#>>'{}'", "");
+            assert!(
+                !scrubbed.contains('{') && !scrubbed.contains('}'),
+                "uninterpolated placeholder in: {statement}"
+            );
+        }
+    }
 
     fn request(sql: &str) -> QuerySqlRequest {
         QuerySqlRequest {
@@ -1397,6 +1854,119 @@ mod tests {
     }
 
     #[test]
+    fn blocked_probes_name_the_catalog_fix() {
+        let rendered = |sql: &str| validate(&request(sql)).unwrap_err().to_string();
+        let probe = rendered("SELECT * FROM pg_catalog.pg_tables");
+        assert!(probe.contains("catalog introspection"), "{probe}");
+        let schema = rendered("SELECT * FROM information_schema.tables");
+        assert!(schema.contains("catalog introspection"), "{schema}");
+        let mapped = rendered("SELECT * FROM relationships");
+        // effective_relationships is sqlite-only: Postgres falls through
+        // to the profile-filtered list instead of mis-pointing at it.
+        assert!(!mapped.contains("effective_relationships"), "{mapped}");
+        assert!(
+            mapped.contains("Queryable relations on postgres-server:"),
+            "{mapped}"
+        );
+        assert!(!mapped.contains("agent_activity"), "{mapped}");
+        let unmapped = rendered("SELECT * FROM member_contexts");
+        assert!(
+            unmapped.contains("Queryable relations on postgres-server:"),
+            "{unmapped}"
+        );
+    }
+
+    #[test]
+    fn sanitize_type_message_keeps_first_line_and_scrubs_internals() {
+        assert_eq!(
+            sanitize_type_message("argument of WHERE must be type boolean, not type integer"),
+            "argument of WHERE must be type boolean, not type integer"
+        );
+        assert_eq!(
+            sanitize_type_message(
+                "relation \"_query_sql_visible_records\" does not exist\nHINT: nope"
+            ),
+            "relation \"(internal relation)\" does not exist"
+        );
+        assert_eq!(
+            sanitize_type_message("column _native_query.id does not exist"),
+            "column (query).id does not exist"
+        );
+        assert_eq!(
+            sanitize_type_message("x FROM pg_temp._query_sql_visible_records y"),
+            "x FROM _query_sql_visible_records y"
+                .replace("_query_sql_visible_records", "(internal relation)")
+        );
+        let long = "e".repeat(400);
+        assert_eq!(sanitize_type_message(&long).len(), 300);
+        assert_eq!(sanitize_type_message(""), "");
+        // Redaction runs before the cap: a long internal token still fits.
+        let padded = format!(
+            "{}_query_sql_visible_records{}",
+            "e".repeat(290),
+            "e".repeat(50)
+        );
+        let capped = sanitize_type_message(&padded);
+        assert!(capped.len() <= 300, "{capped}");
+        assert!(!capped.contains("_query_sql_"), "{capped}");
+        // Numbered temp schemas and blank first lines.
+        assert_eq!(
+            sanitize_type_message("x FROM pg_temp_3._query_sql_visible_records y"),
+            "x FROM (internal relation) y"
+        );
+        assert_eq!(
+            sanitize_type_message("\n  argument of WHERE must be type boolean"),
+            "argument of WHERE must be type boolean"
+        );
+        // Caller literals are quoted text, not engine identifiers; an
+        // unquoted pg_temp qualification is still scrubbed.
+        assert_eq!(
+            sanitize_type_message("value '_query_sql_foo' and pg_temp.bar"),
+            "value '_query_sql_foo' and bar"
+        );
+        assert_eq!(
+            sanitize_type_message("it''s _query_sql_foo"),
+            "it''s (internal relation)"
+        );
+        // An apostrophe inside a double-quoted identifier must not flip the
+        // literal state and suppress later redaction.
+        assert_eq!(
+            sanitize_type_message("column \"a'b\" does not exist and _query_sql_visible_records"),
+            "column \"a'b\" does not exist and (internal relation)"
+        );
+        // A stray apostrophe with no closing quote falls back to scrubbing
+        // the internal tokens everywhere rather than passing them through.
+        assert_eq!(
+            sanitize_type_message("o'brien _native_query _query_sql_x"),
+            "o'brien (query) (internal relation)"
+        );
+    }
+
+    #[test]
+    fn caller_position_maps_wrapper_offsets_in_characters() {
+        let statement = "SELECT id FROM records WHERE name = 'Äpfel' AND id = 1";
+        // 'Ä' is 2 bytes but 1 character: byte math would overshoot.
+        let char_len = statement.chars().count();
+        assert!(statement.len() > char_len);
+        // 1-based: first statement character sits at wrapper offset 16.
+        assert_eq!(caller_position(16, statement), Some(1));
+        assert_eq!(caller_position(15, statement), None);
+        // One past the end (e.g. a problem at the closing paren) still maps.
+        assert_eq!(
+            caller_position(15 + char_len + 1, statement),
+            Some(char_len + 1)
+        );
+        assert_eq!(caller_position(15 + char_len + 2, statement), None);
+        // Position of the multibyte literal itself maps exactly.
+        let literal_at = statement.find("Äpfel").unwrap();
+        let literal_char = statement[..literal_at].chars().count() + 1;
+        assert_eq!(
+            caller_position(15 + statement[..literal_at].chars().count() + 1, statement),
+            Some(literal_char)
+        );
+    }
+
+    #[test]
     fn sqlite_only_relations_fail_with_explicit_profile_diagnostic() {
         for relation in [
             "agent_activity",
@@ -1415,25 +1985,31 @@ mod tests {
     }
 
     #[test]
-    fn parameter_positions_are_typed_and_exact() {
-        let request = QuerySqlRequest {
-            sql: "SELECT $1::text FROM records WHERE id=$2".into(),
-            parameters: vec![
-                QuerySqlParameter::Text {
-                    value: Some("label".into()),
-                },
-                QuerySqlParameter::Text {
-                    value: Some("record".into()),
-                },
-            ],
-        };
-        validate(&request).unwrap();
-        let missing = QuerySqlRequest {
-            sql: "SELECT $2 FROM records".into(),
-            parameters: vec![QuerySqlParameter::Text {
-                value: Some("x".into()),
-            }],
-        };
-        assert!(validate(&missing).is_err());
+    fn dollar_placeholders_are_rejected_with_the_portable_repair() {
+        // I1 (E1 M2): callers use `?N`; `$n` is not accepted from callers.
+        // The exact `$n`-match check in `validate` stays as defence in depth
+        // for the future `?N`-to-`$N` rewrite. A `$1` inside a string
+        // literal is data and stays admitted.
+        validate(&request("SELECT id FROM records WHERE name = '$1'")).unwrap();
+        let bare = validate(&request("SELECT id FROM records WHERE id = ?"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            bare.contains("Postgres `?`/`?|`/`?&` operators"),
+            "missing jsonb note: {bare}"
+        );
+        for sql in [
+            "SELECT $1::text FROM records WHERE id=$2",
+            "SELECT $2 FROM records",
+            "SELECT id FROM records WHERE id = :name",
+        ] {
+            let error = validate(&request(sql)).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("use positional `?N` placeholders"),
+                "{sql}: missing repair: {error}"
+            );
+        }
     }
 }

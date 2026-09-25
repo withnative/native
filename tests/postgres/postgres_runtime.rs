@@ -82,14 +82,16 @@ async fn legacy_v2_binding_audit_shape_is_refused_on_runtime_reopen() {
     let logical_database_id = format!("contract-legacy-v2-{}", uuid::Uuid::new_v4().simple());
     let config = runtime_config(&url, &logical_database_id);
     let (database, report) = config.provision_and_connect().await.unwrap();
-    assert_eq!(report.schema_version, 6);
+    assert_eq!(report.schema_version, 7);
     let migrations = database.qualified_table("schema_migrations").unwrap();
     let binding_audit = database.qualified_table("binding_audit").unwrap();
     let mut transaction = database.pool().begin().await.unwrap();
-    sqlx::query(&format!("DELETE FROM {migrations} WHERE version IN (5,6)"))
-        .execute(&mut *transaction)
-        .await
-        .unwrap();
+    sqlx::query(&format!(
+        "DELETE FROM {migrations} WHERE version IN (5,6,7)"
+    ))
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
     sqlx::query(&format!("INSERT INTO {migrations}(version) VALUES(2)"))
         .execute(&mut *transaction)
         .await
@@ -106,7 +108,7 @@ async fn legacy_v2_binding_audit_shape_is_refused_on_runtime_reopen() {
     let error = config.connect().await.unwrap_err().to_string();
     assert_eq!(
         error,
-        "Postgres logical database uses legacy schema v2; authoritative substrate v6 requires operator-controlled reprovisioning"
+        "Postgres logical database uses legacy schema v2; authoritative substrate v7 requires operator-controlled reprovisioning"
     );
     config.drop_owned().await.unwrap();
 }
@@ -119,7 +121,7 @@ async fn main_era_v4_reopens_through_the_exact_v5_search_index_migration() {
     let logical_database_id = format!("contract-search-v4-{}", uuid::Uuid::new_v4().simple());
     let config = runtime_config(&url, &logical_database_id);
     let (database, report) = config.provision_and_connect().await.unwrap();
-    assert_eq!(report.schema_version, 6);
+    assert_eq!(report.schema_version, 7);
     let records = database.qualified_table("records").unwrap();
     sqlx::query(&format!(
         "INSERT INTO {records}(id,record_type,kind,name,body,policy_anchor_id,created_at,updated_at) VALUES('contract:v4-search-survivor','Document','note','Migration survivor','migrationneedle','native:root',transaction_timestamp(),transaction_timestamp())"
@@ -136,11 +138,11 @@ async fn main_era_v4_reopens_through_the_exact_v5_search_index_migration() {
     let refusal = config.connect().await.unwrap_err().to_string();
     assert_eq!(
         refusal,
-        "Postgres logical database uses legacy schema v4; authoritative substrate v6 requires provision_and_connect exact v4-to-v5 migration or operator-controlled reprovisioning"
+        "Postgres logical database uses legacy schema v4; authoritative substrate v7 requires provision_and_connect exact v4-to-v5 migration or operator-controlled reprovisioning"
     );
 
     let (migrated, migrated_report) = config.provision_and_connect().await.unwrap();
-    assert_eq!(migrated_report.schema_version, 6);
+    assert_eq!(migrated_report.schema_version, 7);
     let survivor: bool = sqlx::query_scalar(&format!(
         "SELECT EXISTS(SELECT 1 FROM {records} WHERE id='contract:v4-search-survivor' AND body='migrationneedle')"
     ))
@@ -280,7 +282,7 @@ async fn provisioning_is_owned_idempotent_and_least_privilege() {
         Some("42501")
     );
 
-    assert_eq!(migration_version(&second).await.unwrap(), 6);
+    assert_eq!(migration_version(&second).await.unwrap(), 7);
     assert_eq!(
         current_search_path(&second).await.unwrap(),
         "\"$user\", public"

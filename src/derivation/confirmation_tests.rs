@@ -80,7 +80,10 @@ struct PublishedFixture {
 
 async fn append(db: &Db, input: NewDerivationEvent) -> DerivationEventRow {
     let mut tx = begin_write(db.write_pool()).await.unwrap();
-    let event = append_derivation_event_in(&mut tx, input).await.unwrap();
+    let mut act_alloc = crate::act::ActAllocation::new();
+    let event = append_derivation_event_in(&mut tx, input, &mut act_alloc)
+        .await
+        .unwrap();
     tx.commit().await.unwrap();
     event
 }
@@ -177,6 +180,7 @@ async fn fixture() -> (Db, PublishedFixture) {
     .await
     .unwrap();
     let mut recipe_tx = begin_write(db.write_pool()).await.unwrap();
+    let mut act_alloc = crate::act::ActAllocation::new();
     crate::store::append_with_event_id_in(
         &db,
         &mut recipe_tx,
@@ -187,6 +191,7 @@ async fn fixture() -> (Db, PublishedFixture) {
             payload: recipe_publication_payload(),
             actor: Some("fixture".into()),
         },
+        &mut act_alloc,
     )
     .await
     .unwrap();

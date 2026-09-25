@@ -133,6 +133,7 @@ async fn make_historical(db: &Db, id: &str, name: &str) {
         intent: None,
         causal_envelope: native_ce::events::CausalEnvelopeV1::legacy_unknown(),
         created_at: "2026-01-01T00:00:00.000Z".into(),
+        act: None,
     };
     let pool = crate::common::fixture_write_pool(db).await;
     let mut tx = pool.begin().await.unwrap();

@@ -22,28 +22,31 @@ use crate::db::Db;
 use crate::error::{Error, Result};
 use crate::schema::ROOT_RECORD_ID;
 pub(crate) use crate::schema::{
-    INSTRUCTIONS_FOLDER_ID, MEMBER_CRITERIA_ID, MEMBER_GUIDANCE_ID, OWNER_CRITERIA_ID,
-    OWNER_GUIDANCE_ID, WORKSPACE_INSTRUCTIONS_ID,
+    GUEST_GUIDANCE_ID, INSTRUCTIONS_FOLDER_ID, MEMBER_CRITERIA_ID, MEMBER_GUIDANCE_ID,
+    OWNER_CRITERIA_ID, OWNER_GUIDANCE_ID, WORKSPACE_INSTRUCTIONS_ID,
 };
 use crate::store::{append_engine_provisioned_in, append_in, now_iso, AppendSpec};
 
 pub(crate) const DATABASE_SCOPE_ID: &str = "native:database";
 pub(crate) const OWNER_PROGRAMME_ID: &str = "native:onboarding-owner-first-run";
 pub(crate) const MEMBER_PROGRAMME_ID: &str = "native:onboarding-member-joined";
+pub(crate) const GUEST_PROGRAMME_ID: &str = "native:onboarding-guest-welcome";
 
 pub(crate) const WORKSPACE_BINDING_ID: &str = "native:binding-workspace-agent-instructions";
 
 const WORKSPACE_BODY: &str = "# Workspace agent instructions\n\nAdd guidance that should be considered by agents working in this database. These instructions are presented with their workspace provenance; they do not change permissions.";
 const PERSONAL_BODY: &str = "# My agent instructions\n\nAdd guidance and preferences that should be considered when an agent is assisting you in this database.";
-const OWNER_GUIDANCE_BODY: &str = "# Owner orientation\n\nBegin with the route the owner selects: set up a practical workflow, compare Native with another tool, or explain Native conceptually. Give enough of the product model for the choice to be meaningful. A comparison or conceptual explanation must not force concrete work or an artifact. On the practical route, anchor on the outcome the owner wants and choose one small, high-value workflow achievable now. Reuse Bootstrap's exact run key and declare a clear aim through the separate `set_intent` call. Record only bounded progress metadata with `manage_onboarding`; never put preview text or learned context in control-event evidence. Record `route_selected` with only the chosen stable route ID, then record `value_delivered` only after the owner confirms the assistance was useful.\n\nWhen practical work produces a useful durable result, propose an ordinary workspace record by default. Show its exact draft and placement, explain the relevant visibility, and obtain explicit consent before writing. Do not infer personal, organisational, or external-system facts. Shared records remain subject to ordinary inspect, edit, delete, policy, and portable-export controls.\n\nOnly when the owner intentionally chooses private agent context, offer one private `Starting context` note under the caller's `My agent context` root. Show the exact draft before any content write and include exactly: current aim, useful learned context, work or decision made, next step, and material uncertainty and source attribution. Explain the current policy status and ordinary inspect, edit, delete, and portable-export controls. Record `artifact_previewed` only after explicit consent to write, then create it if absent or inspect and update the sole existing ordinary Document/note, and record `artifact_written`. Extraction is a separate visibility-disclosed action. An interrupted session remains pending; explicit deferral is non-terminal.";
-const OWNER_CRITERIA_BODY: &str = "# Owner orientation completion\n\nComplete orientation only after useful route-appropriate assistance, any relevant visibility explanation, and the owner's explicit confirmation of completion. Comparison and conceptual routes do not require an artifact. On the practical route, writing is optional: if a workspace record is written, it must be the exact consented draft at the disclosed placement; if private agent context is chosen, the exact Starting context draft and the owner's explicit choice whether to write it are required, and any written note must be the consented draft under My agent context. Decline or defer only after explicit owner intent. Interruption, silence, or a closed session leaves the obligation pending.";
-const MEMBER_GUIDANCE_BODY: &str = "# Member orientation\n\nBegin with the route the member selects: set up a practical workflow, compare Native with another tool, or explain Native conceptually. Give enough of the product model for the choice to be meaningful. A comparison or conceptual explanation must not force concrete work or an artifact. On the practical route, anchor on the outcome the member wants and choose one small, high-value workflow achievable now. Do not conduct an owner interview or ask the member to define the workspace or organisation. Reuse Bootstrap's exact run key and declare a clear aim through the separate `set_intent` call. Record only bounded progress metadata with `manage_onboarding`; never put preview text or learned context in control-event evidence. Record `route_selected` with only the chosen stable route ID, then record `value_delivered` only after the member confirms the assistance was useful.\n\nWhen practical work produces a useful durable result, propose an ordinary workspace record by default. Show its exact draft and placement, explain the relevant visibility, and obtain explicit consent before writing. Do not infer personal, organisational, or external-system facts. Shared records remain subject to ordinary inspect, edit, delete, policy, and portable-export controls.\n\nOnly when the member intentionally chooses private agent context, offer one private `Starting context` note under the caller's `My agent context` root. Show the exact draft before any content write and include exactly: current aim, useful learned context, work or decision made, next step, and material uncertainty and source attribution. Explain the current policy status and ordinary inspect, edit, delete, and portable-export controls. Record `artifact_previewed` only after explicit consent to write, then create it if absent or inspect and update the sole existing ordinary Document/note, and record `artifact_written`. Extraction is a separate visibility-disclosed action. An interrupted session remains pending; explicit deferral is non-terminal.";
-const MEMBER_CRITERIA_BODY: &str = "# Member orientation completion\n\nComplete orientation only after useful route-appropriate assistance, any relevant visibility explanation, and the member's explicit confirmation of completion. Comparison and conceptual routes do not require an artifact. On the practical route, writing is optional: if a workspace record is written, it must be the exact consented draft at the disclosed placement; if private agent context is chosen, the exact Starting context draft and the member's explicit choice whether to write it are required, and any written note must be the consented draft under My agent context. Decline or defer only after explicit member intent. Interruption, silence, or a closed session leaves the obligation pending.";
+const OWNER_GUIDANCE_BODY: &str = "# Owner orientation\n\nBegin with the route the owner selects: bring one real piece of work (set up a practical workflow), compare Native with another tool, or explain Native conceptually. Recommend the practical workflow. Give enough of the product model for the choice to be meaningful. A comparison or conceptual explanation must not force concrete work or an artifact. On the practical route, anchor on something the owner is working on now and keep the first result small enough to finish in this conversation. Reuse Bootstrap's exact run key and declare a clear aim through the separate `set_intent` call. Record only bounded progress metadata with `manage_onboarding`; never put preview text or learned context in control-event evidence. Record `route_selected` with only the chosen stable route ID. Record `value_delivered` with basis `user_confirmed` when the owner accepts the result after your completion message: thanks, a positive reply, or their own follow-on request counts as confirmation. Do not ask a separate \"was this useful?\" question.\n\nWhen practical work produces a useful durable result, propose ordinary workspace records by default: several small connected records rather than one document, because Native's value appears when distinct things that belong together can be opened, changed, linked, and viewed together. Put the distinct parts (for example the goal, decisions, open questions, and tasks) as separate records in one collection, link the ones that depend on or inform each other, and keep the set small. Show the exact drafts, placement, and links, explain the relevant visibility, and obtain explicit consent before writing. After writing, give a direct web link to the collection taken from a read of it (`share_url`, otherwise `record_url`); never construct a URL yourself or offer the run link as the result. Invite the owner to open it and change one thing, then read that change back and respond to what actually changed. Do not infer personal, organisational, or external-system facts. Shared records remain subject to ordinary inspect, edit, delete, policy, and portable-export controls.\n\nOnly when the owner intentionally chooses private agent context, offer one private `Starting context` note under the caller's `My agent context` root. Show the exact draft before any content write and include exactly: current aim, useful learned context, work or decision made, next step, and material uncertainty and source attribution. Explain the current policy status and ordinary inspect, edit, delete, and portable-export controls. Record `artifact_previewed` only after explicit consent to write, then create it if absent or inspect and update the sole existing ordinary Document/note, and record `artifact_written`. Extraction is a separate visibility-disclosed action. An interrupted session remains pending; explicit deferral is non-terminal.";
+const OWNER_CRITERIA_BODY: &str = "# Owner orientation completion\n\nComplete orientation after useful route-appropriate assistance, any relevant visibility explanation, and a completion message that says what Native keeps for the owner, what was saved and where (with a direct link when records were written), and two or three concrete next uses. The owner's acceptance of that message confirms completion: thanks, a positive reply, or their own follow-on request. Do not ask a separate \"was this useful?\" question. Comparison and conceptual routes do not require an artifact. On the practical route, writing is optional: any workspace records written must be the exact consented drafts at the disclosed placement; if private agent context is chosen, the exact Starting context draft and the owner's explicit choice whether to write it are required, and any written note must be the consented draft under My agent context. Decline or defer only after explicit owner intent. Interruption, silence, or a closed session leaves the obligation pending.";
+const MEMBER_GUIDANCE_BODY: &str = "# Member orientation\n\nBegin with the route the member selects: bring one real piece of work (set up a practical workflow), compare Native with another tool, or explain Native conceptually. Recommend the practical workflow. Give enough of the product model for the choice to be meaningful. A comparison or conceptual explanation must not force concrete work or an artifact. On the practical route, anchor on something the member is working on now and keep the first result small enough to finish in this conversation. Do not conduct an owner interview or ask the member to define the workspace or organisation. Reuse Bootstrap's exact run key and declare a clear aim through the separate `set_intent` call. Record only bounded progress metadata with `manage_onboarding`; never put preview text or learned context in control-event evidence. Record `route_selected` with only the chosen stable route ID. Record `value_delivered` with basis `user_confirmed` when the member accepts the result after your completion message: thanks, a positive reply, or their own follow-on request counts as confirmation. Do not ask a separate \"was this useful?\" question.\n\nWhen practical work produces a useful durable result, propose ordinary workspace records by default: several small connected records rather than one document, because Native's value appears when distinct things that belong together can be opened, changed, linked, and viewed together. Put the distinct parts (for example the goal, decisions, open questions, and tasks) as separate records in one collection the member can use (ask where if it is unclear), link the ones that depend on or inform each other, and keep the set small. Show the exact drafts, placement, and links, explain the relevant visibility, and obtain explicit consent before writing. After writing, give a direct web link to the collection taken from a read of it (`share_url`, otherwise `record_url`); never construct a URL yourself or offer the run link as the result. Invite the member to open it and change one thing, then read that change back and respond to what actually changed. Do not infer personal, organisational, or external-system facts. Shared records remain subject to ordinary inspect, edit, delete, policy, and portable-export controls.\n\nOnly when the member intentionally chooses private agent context, offer one private `Starting context` note under the caller's `My agent context` root. Show the exact draft before any content write and include exactly: current aim, useful learned context, work or decision made, next step, and material uncertainty and source attribution. Explain the current policy status and ordinary inspect, edit, delete, and portable-export controls. Record `artifact_previewed` only after explicit consent to write, then create it if absent or inspect and update the sole existing ordinary Document/note, and record `artifact_written`. Extraction is a separate visibility-disclosed action. An interrupted session remains pending; explicit deferral is non-terminal.";
+const MEMBER_CRITERIA_BODY: &str = "# Member orientation completion\n\nComplete orientation after useful route-appropriate assistance, any relevant visibility explanation, and a completion message that says what Native keeps for the member, what was saved and where (with a direct link when records were written), and two or three concrete next uses. The member's acceptance of that message confirms completion: thanks, a positive reply, or their own follow-on request. Do not ask a separate \"was this useful?\" question. Comparison and conceptual routes do not require an artifact. On the practical route, writing is optional: any workspace records written must be the exact consented drafts at the disclosed placement; if private agent context is chosen, the exact Starting context draft and the member's explicit choice whether to write it are required, and any written note must be the consented draft under My agent context. Decline or defer only after explicit member intent. Interruption, silence, or a closed session leaves the obligation pending.";
+const GUEST_GUIDANCE_BODY: &str = "# Guest orientation\n\nYou were invited to collaborate on one shared part of this workspace, not to join it. Your access covers exactly the shared records your invitation names, with the view or edit capability stated there and nothing else: you cannot see the rest of the workspace, its members, or its settings, and you cannot change who can see what. Work only inside the shared scope. Do not infer personal, organisational, or external-system facts.\n\nGuest access is time-boxed and revocable. It ends at the expiry shown on your invitation, or earlier if the owner removes it; when it ends, the shared work remains but you can no longer open it. Say plainly, before any edit, that the access ends and what that means for the work at hand.\n\nGuests work in the web UI only. There are no agent-tool (MCP) steps, no personal workspace, no `My agent context` root, and no private `Starting context` note: do not offer, describe, or create any of them. Shared records you touch remain subject to ordinary inspect, edit, delete, policy, and portable-export controls. Obtain explicit consent before writing, show the exact draft and placement, and explain the current visibility. Record only bounded progress metadata with `manage_onboarding`; never put preview text or learned context in control-event evidence.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TrustedMembershipRole {
     Owner,
     Member,
+    Guest,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,7 +108,7 @@ struct ProgrammeSeed {
     position: i64,
 }
 
-const PROGRAMMES: [ProgrammeSeed; 2] = [
+const PROGRAMMES: [ProgrammeSeed; 3] = [
     ProgrammeSeed {
         id: OWNER_PROGRAMME_ID,
         trigger_key: "on_owner_first_run",
@@ -115,6 +118,11 @@ const PROGRAMMES: [ProgrammeSeed; 2] = [
         id: MEMBER_PROGRAMME_ID,
         trigger_key: "on_member_joined",
         position: 200,
+    },
+    ProgrammeSeed {
+        id: GUEST_PROGRAMME_ID,
+        trigger_key: "on_guest_welcomed",
+        position: 300,
     },
 ];
 
@@ -136,13 +144,17 @@ fn programme_payload(
     }
 }
 
-async fn ensure_programmes_in(tx: &mut Transaction<'static, Sqlite>) -> Result<()> {
+async fn ensure_programmes_in(
+    tx: &mut Transaction<'static, Sqlite>,
+    act_alloc: &mut crate::act::ActAllocation,
+) -> Result<()> {
     let existing: Vec<(String, Option<String>)> = sqlx::query(
         "SELECT id,legacy_baseline_before FROM onboarding_programmes
-          WHERE id IN (?,?) ORDER BY id",
+          WHERE id IN (?,?,?) ORDER BY id",
     )
     .bind(OWNER_PROGRAMME_ID)
     .bind(MEMBER_PROGRAMME_ID)
+    .bind(GUEST_PROGRAMME_ID)
     .fetch_all(&mut **tx)
     .await?
     .into_iter()
@@ -151,26 +163,51 @@ async fn ensure_programmes_in(tx: &mut Transaction<'static, Sqlite>) -> Result<(
     if existing.len() == PROGRAMMES.len() {
         return Ok(());
     }
-    if !existing.is_empty() {
-        return Err(Error::engine(
-            "portable onboarding programme seed is partial",
-        ));
-    }
     let at = now_iso();
-    for seed in PROGRAMMES {
-        let payload = programme_payload(seed, None, &at);
+    if existing.is_empty() {
+        for seed in PROGRAMMES {
+            let payload = programme_payload(seed, None, &at);
+            append_control_event_in(
+                tx,
+                NewControlEvent::engine_provisioned(
+                    format!("seed:v1:programme:{}", seed.id),
+                    seed.id,
+                    "seed fresh portable onboarding programme",
+                    ControlEventPayload::OnboardingProgrammeCreated(payload),
+                )?,
+                act_alloc,
+            )
+            .await?;
+        }
+        return Ok(());
+    }
+    // Version growth, not a torn write (seeding commits atomically with the
+    // provisioning transaction, so a partial set cannot come from a crash):
+    // databases seeded before the guest programme existed carry exactly the
+    // old complete set. Seed the missing guest programme rather than failing
+    // every connect; anything else partial stays a corruption refusal.
+    let missing: Vec<ProgrammeSeed> = PROGRAMMES
+        .into_iter()
+        .filter(|seed| !existing.iter().any(|(id, _)| id == seed.id))
+        .collect();
+    if missing.len() == 1 && missing[0].id == GUEST_PROGRAMME_ID {
+        let payload = programme_payload(missing[0], None, &at);
         append_control_event_in(
             tx,
             NewControlEvent::engine_provisioned(
-                format!("seed:v1:programme:{}", seed.id),
-                seed.id,
-                "seed fresh portable onboarding programme",
+                format!("seed:v1:programme:{}", missing[0].id),
+                missing[0].id,
+                "seed guest portable onboarding programme on an older database",
                 ControlEventPayload::OnboardingProgrammeCreated(payload),
             )?,
+            act_alloc,
         )
         .await?;
+        return Ok(());
     }
-    Ok(())
+    Err(Error::engine(
+        "portable onboarding programme seed is partial",
+    ))
 }
 
 pub(crate) fn instruction_body_digest(body: &str) -> String {
@@ -185,7 +222,7 @@ pub(crate) struct SeededInstructionTemplate {
     pub(crate) body: &'static str,
 }
 
-static TEMPLATE_REGISTRY: [SeededInstructionTemplate; 6] = [
+static TEMPLATE_REGISTRY: [SeededInstructionTemplate; 7] = [
     SeededInstructionTemplate {
         key: "workspace-agent-instructions",
         version: 1,
@@ -194,27 +231,33 @@ static TEMPLATE_REGISTRY: [SeededInstructionTemplate; 6] = [
     },
     SeededInstructionTemplate {
         key: "owner-onboarding-guidance",
-        version: 2,
+        version: 3,
         name: "Owner onboarding guidance",
         body: OWNER_GUIDANCE_BODY,
     },
     SeededInstructionTemplate {
         key: "owner-onboarding-completion",
-        version: 2,
+        version: 3,
         name: "Owner onboarding completion",
         body: OWNER_CRITERIA_BODY,
     },
     SeededInstructionTemplate {
         key: "member-onboarding-guidance",
-        version: 2,
+        version: 3,
         name: "Member onboarding guidance",
         body: MEMBER_GUIDANCE_BODY,
     },
     SeededInstructionTemplate {
         key: "member-onboarding-completion",
-        version: 2,
+        version: 3,
         name: "Member onboarding completion",
         body: MEMBER_CRITERIA_BODY,
+    },
+    SeededInstructionTemplate {
+        key: "guest-onboarding-guidance",
+        version: 1,
+        name: "Guest onboarding guidance",
+        body: GUEST_GUIDANCE_BODY,
     },
     SeededInstructionTemplate {
         key: "personal-agent-instructions",
@@ -244,7 +287,17 @@ async fn apply_template_in(
     db: &Db,
     tx: &mut Transaction<'static, Sqlite>,
     template: Template<'_>,
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<()> {
+    // The connect fast path checks provenance against TEMPLATE_REGISTRY, so a
+    // seeded version or body that drifts from it makes every connect take the
+    // writer path.
+    debug_assert_eq!(
+        instruction_template(template.key).map(|shipped| (shipped.version, shipped.body)),
+        Some((template.version, template.body)),
+        "seeded template '{}' must match TEMPLATE_REGISTRY",
+        template.key
+    );
     let row = sqlx::query(
         "SELECT type,kind,name,body,home_id,owner_id,deleted_at FROM records WHERE id=?",
     )
@@ -279,6 +332,7 @@ async fn apply_template_in(
                     }),
                     actor: Some("engine:provisioning".into()),
                 },
+                act_alloc,
             )
             .await?;
             applied_body = true;
@@ -345,6 +399,7 @@ async fn apply_template_in(
                         payload: serde_json::Value::Object(restored),
                         actor: Some("engine:provisioning".into()),
                     },
+                    act_alloc,
                 )
                 .await?;
             }
@@ -385,6 +440,7 @@ async fn apply_template_in(
                             payload: json!({ "body": template.body }),
                             actor: Some("engine:provisioning".into()),
                         },
+                        act_alloc,
                     )
                     .await?;
                     applied_body = true;
@@ -413,6 +469,7 @@ async fn apply_template_in(
                     },
                 ),
             )?,
+            act_alloc,
         )
         .await?;
     }
@@ -426,6 +483,7 @@ async fn create_folder_in(
     name: &str,
     home_id: &str,
     owner_id: Option<&str>,
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<bool> {
     let row =
         sqlx::query("SELECT type,kind,name,home_id,owner_id,deleted_at FROM records WHERE id=?")
@@ -489,6 +547,7 @@ async fn create_folder_in(
                     payload: serde_json::Value::Object(restored),
                     actor: Some("engine:provisioning".into()),
                 },
+                act_alloc,
             )
             .await?;
         }
@@ -512,6 +571,7 @@ async fn create_folder_in(
             }),
             actor: Some("engine:provisioning".into()),
         },
+        act_alloc,
     )
     .await?;
     Ok(true)
@@ -522,6 +582,7 @@ async fn ensure_global_defaults_in(
     tx: &mut Transaction<'static, Sqlite>,
     policy_actor: &str,
     trusted_owner_account_id: Option<&str>,
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<()> {
     let folder_created = create_folder_in(
         db,
@@ -530,6 +591,7 @@ async fn ensure_global_defaults_in(
         "Agent instructions",
         ROOT_RECORD_ID,
         None,
+        act_alloc,
     )
     .await?;
     for template in [
@@ -545,7 +607,7 @@ async fn ensure_global_defaults_in(
         Template {
             id: OWNER_GUIDANCE_ID,
             key: "owner-onboarding-guidance",
-            version: 2,
+            version: 3,
             name: "Owner onboarding guidance",
             body: OWNER_GUIDANCE_BODY,
             home_id: INSTRUCTIONS_FOLDER_ID,
@@ -554,7 +616,7 @@ async fn ensure_global_defaults_in(
         Template {
             id: OWNER_CRITERIA_ID,
             key: "owner-onboarding-completion",
-            version: 2,
+            version: 3,
             name: "Owner onboarding completion",
             body: OWNER_CRITERIA_BODY,
             home_id: INSTRUCTIONS_FOLDER_ID,
@@ -563,7 +625,7 @@ async fn ensure_global_defaults_in(
         Template {
             id: MEMBER_GUIDANCE_ID,
             key: "member-onboarding-guidance",
-            version: 2,
+            version: 3,
             name: "Member onboarding guidance",
             body: MEMBER_GUIDANCE_BODY,
             home_id: INSTRUCTIONS_FOLDER_ID,
@@ -572,15 +634,25 @@ async fn ensure_global_defaults_in(
         Template {
             id: MEMBER_CRITERIA_ID,
             key: "member-onboarding-completion",
-            version: 2,
+            version: 3,
             name: "Member onboarding completion",
             body: MEMBER_CRITERIA_BODY,
             home_id: INSTRUCTIONS_FOLDER_ID,
             owner_id: None,
         },
+        Template {
+            id: GUEST_GUIDANCE_ID,
+            key: "guest-onboarding-guidance",
+            version: 1,
+            name: "Guest onboarding guidance",
+            body: GUEST_GUIDANCE_BODY,
+            home_id: INSTRUCTIONS_FOLDER_ID,
+            owner_id: None,
+        },
     ] {
-        apply_template_in(db, tx, template).await?;
+        apply_template_in(db, tx, template, act_alloc).await?;
     }
+    ensure_guest_guidance_boundary_in(tx, policy_actor, act_alloc).await?;
     if folder_created {
         let mut entries = vec![AllowEntry::members(Capability::View)];
         if let Some(owner) = trusted_owner_account_id {
@@ -591,6 +663,7 @@ async fn ensure_global_defaults_in(
             policy_actor,
             INSTRUCTIONS_FOLDER_ID,
             entries,
+            act_alloc,
         )
         .await?;
     } else if let Some(owner) = trusted_owner_account_id {
@@ -629,6 +702,7 @@ async fn ensure_global_defaults_in(
                 policy_actor,
                 INSTRUCTIONS_FOLDER_ID,
                 entries,
+                act_alloc,
             )
             .await?;
         }
@@ -654,6 +728,7 @@ async fn ensure_global_defaults_in(
                     updated_at: at,
                 }),
             )?,
+            act_alloc,
         )
         .await?;
     } else {
@@ -684,8 +759,29 @@ async fn ensure_global_defaults_in(
             "completion_criteria",
             200,
         ),
+        (GUEST_PROGRAMME_ID, GUEST_GUIDANCE_ID, "guidance", 100),
     ] {
-        if folder_created {
+        let actual: Option<(String, i64)> = sqlx::query(
+            "SELECT source_role,position FROM onboarding_programme_sources
+              WHERE programme_id=? AND source_record_id=?",
+        )
+        .bind(programme)
+        .bind(source)
+        .fetch_optional(&mut **tx)
+        .await?
+        .map(|row| {
+            Ok::<(String, i64), sqlx::Error>((
+                row.try_get("source_role")?,
+                row.try_get("position")?,
+            ))
+        })
+        .transpose()?;
+        // Fresh seeds write every source. On older databases the folder and
+        // the owner/member sources already exist; only the guest programme's
+        // sources append as version growth — an established source that is
+        // missing or retargeted keeps failing loudly.
+        let should_append = folder_created || (actual.is_none() && programme == GUEST_PROGRAMME_ID);
+        if should_append {
             append_control_event_in(
                 tx,
                 NewControlEvent::engine_provisioned(
@@ -701,35 +797,111 @@ async fn ensure_global_defaults_in(
                         },
                     ),
                 )?,
+                act_alloc,
             )
             .await?;
-        } else {
-            let actual: Option<(String, i64)> = sqlx::query(
-                "SELECT source_role,position FROM onboarding_programme_sources
-                  WHERE programme_id=? AND source_record_id=?",
-            )
-            .bind(programme)
-            .bind(source)
-            .fetch_optional(&mut **tx)
-            .await?
-            .map(|row| {
-                Ok::<(String, i64), sqlx::Error>((
-                    row.try_get("source_role")?,
-                    row.try_get("position")?,
-                ))
-            })
-            .transpose()?;
-            if actual
-                .as_ref()
-                .map(|(actual_role, actual_position)| (actual_role.as_str(), *actual_position))
-                != Some((role, position))
-            {
-                return Err(Error::engine(
-                    "onboarding programme seed has missing or incompatible source",
-                ));
-            }
+        } else if actual
+            .as_ref()
+            .map(|(actual_role, actual_position)| (actual_role.as_str(), *actual_position))
+            != Some((role, position))
+        {
+            return Err(Error::engine(
+                "onboarding programme seed has missing or incompatible source",
+            ));
         }
     }
+    Ok(())
+}
+
+/// Seed the guest guidance record's explicit policy boundary once.
+///
+/// The record lives under the workspace instruction folder, whose inherited
+/// baseline is members-only — under inheritance a guest could never read
+/// its own onboarding, and resolve would discard the whole stack. The
+/// explicit boundary reproduces exactly the inherited readability
+/// (`members → View`; owner administration keys off the host role rather
+/// than record capabilities, so no owner entries are needed) and stays put
+/// afterwards: per-guest account grants append in
+/// [`grant_guest_guidance_in`], never by replacing this base.
+async fn ensure_guest_guidance_boundary_in(
+    tx: &mut Transaction<'static, Sqlite>,
+    policy_actor: &str,
+    act_alloc: &mut crate::act::ActAllocation,
+) -> Result<()> {
+    let existing: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM policy_entries WHERE policy_anchor_id = ?")
+            .bind(GUEST_GUIDANCE_ID)
+            .fetch_one(&mut **tx)
+            .await?;
+    if existing > 0 {
+        return Ok(());
+    }
+    crate::authorization::replace_explicit_policy_on(
+        tx,
+        policy_actor,
+        GUEST_GUIDANCE_ID,
+        vec![AllowEntry::members(Capability::View)],
+        act_alloc,
+    )
+    .await?;
+    Ok(())
+}
+
+/// Grant one guest account View on the guest guidance record.
+///
+/// Called once per guest arrival; re-provisioning the same guest is a
+/// no-op. The grant is an ordinary direct account grant, so the existing
+/// membership-offboarding grant sweep removes it when the guest is
+/// offboarded (slice 4 owns that path).
+async fn grant_guest_guidance_in(
+    tx: &mut Transaction<'static, Sqlite>,
+    policy_actor: &str,
+    account_id: &str,
+    act_alloc: &mut crate::act::ActAllocation,
+) -> Result<()> {
+    let rows = sqlx::query(
+        "SELECT subject_kind,subject_id,effect,capability FROM policy_entries
+          WHERE policy_anchor_id = ?",
+    )
+    .bind(GUEST_GUIDANCE_ID)
+    .fetch_all(&mut **tx)
+    .await?;
+    let mut entries = Vec::with_capacity(rows.len() + 1);
+    for row in &rows {
+        let subject_kind: String = row.try_get("subject_kind")?;
+        let subject_id: String = row.try_get("subject_id")?;
+        let effect: String = row.try_get("effect")?;
+        let capability: String = row.try_get("capability")?;
+        if effect != "allow" {
+            return Err(Error::engine(
+                "guest guidance policy contains an unsupported effect",
+            ));
+        }
+        if subject_kind == "account" && subject_id == account_id {
+            return Ok(());
+        }
+        let capability = Capability::from_policy_str(&capability).ok_or_else(|| {
+            Error::engine("guest guidance policy contains an unsupported capability")
+        })?;
+        entries.push(match subject_kind.as_str() {
+            "members" => AllowEntry::members(capability),
+            "account" => AllowEntry::account(subject_id, capability),
+            _ => {
+                return Err(Error::engine(
+                    "guest guidance policy contains an unsupported subject",
+                ))
+            }
+        });
+    }
+    entries.push(AllowEntry::account(account_id, Capability::View));
+    crate::authorization::replace_explicit_policy_on(
+        tx,
+        policy_actor,
+        GUEST_GUIDANCE_ID,
+        entries,
+        act_alloc,
+    )
+    .await?;
     Ok(())
 }
 
@@ -763,6 +935,7 @@ async fn provision_private_context_in(
     tx: &mut Transaction<'static, Sqlite>,
     account_id: &str,
     person_record_id: &str,
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<()> {
     if existing_context_root(tx, account_id, person_record_id)
         .await?
@@ -779,6 +952,7 @@ async fn provision_private_context_in(
         "My agent context",
         ROOT_RECORD_ID,
         Some(person_record_id),
+        act_alloc,
     )
     .await?;
     apply_template_in(
@@ -793,6 +967,7 @@ async fn provision_private_context_in(
             home_id: &root_id,
             owner_id: Some(person_record_id),
         },
+        act_alloc,
     )
     .await?;
     crate::authorization::replace_explicit_policy_on(
@@ -800,6 +975,7 @@ async fn provision_private_context_in(
         account_id,
         &root_id,
         vec![AllowEntry::account(account_id, Capability::Manage)],
+        act_alloc,
     )
     .await?;
     let at = now_iso();
@@ -816,6 +992,7 @@ async fn provision_private_context_in(
                 created_at: at.clone(),
             }),
         )?,
+        act_alloc,
     )
     .await?;
     let binding_id = format!("native:binding-personal:{account_id}");
@@ -837,6 +1014,7 @@ async fn provision_private_context_in(
                 updated_at: at,
             }),
         )?,
+        act_alloc,
     )
     .await?;
     Ok(())
@@ -846,6 +1024,7 @@ async fn ensure_arrival_obligation_in(
     tx: &mut Transaction<'static, Sqlite>,
     account_id: &str,
     arrival: Option<&TrustedMembershipArrival>,
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<()> {
     if let Some(arrival) = arrival {
         arrival.validate()?;
@@ -853,6 +1032,7 @@ async fn ensure_arrival_obligation_in(
     let programme_id = match arrival {
         None => OWNER_PROGRAMME_ID,
         Some(value) if value.role == TrustedMembershipRole::Owner => OWNER_PROGRAMME_ID,
+        Some(value) if value.role == TrustedMembershipRole::Guest => GUEST_PROGRAMME_ID,
         Some(_) => MEMBER_PROGRAMME_ID,
     };
     let already_has_state: bool = sqlx::query_scalar(
@@ -916,6 +1096,7 @@ async fn ensure_arrival_obligation_in(
             reason,
             payload,
         )?,
+        act_alloc,
     )
     .await?;
     Ok(())
@@ -931,12 +1112,13 @@ pub(crate) async fn member_provisioning_is_read_only_in(
     arrival: &TrustedMembershipArrival,
 ) -> Result<bool> {
     let programmes: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM onboarding_programmes WHERE id IN (?,?)")
+        sqlx::query_scalar("SELECT COUNT(*) FROM onboarding_programmes WHERE id IN (?,?,?)")
             .bind(OWNER_PROGRAMME_ID)
             .bind(MEMBER_PROGRAMME_ID)
+            .bind(GUEST_PROGRAMME_ID)
             .fetch_one(&mut **tx)
             .await?;
-    if programmes != 2 {
+    if programmes != 3 {
         return Ok(false);
     }
     let folder_ready: bool = sqlx::query_scalar(
@@ -957,6 +1139,7 @@ pub(crate) async fn member_provisioning_is_read_only_in(
         (OWNER_CRITERIA_ID, "owner-onboarding-completion"),
         (MEMBER_GUIDANCE_ID, "member-onboarding-guidance"),
         (MEMBER_CRITERIA_ID, "member-onboarding-completion"),
+        (GUEST_GUIDANCE_ID, "guest-onboarding-guidance"),
     ] {
         let template = instruction_template(key).expect("registered global template");
         let ready: bool = sqlx::query_scalar(
@@ -988,18 +1171,32 @@ pub(crate) async fn member_provisioning_is_read_only_in(
     }
     let programme = if arrival.role == TrustedMembershipRole::Owner {
         OWNER_PROGRAMME_ID
+    } else if arrival.role == TrustedMembershipRole::Guest {
+        GUEST_PROGRAMME_ID
     } else {
         MEMBER_PROGRAMME_ID
     };
-    let member_ready: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM member_contexts WHERE account_id=?)
-         AND EXISTS(SELECT 1 FROM member_obligations WHERE account_id=? AND programme_id=?)",
-    )
-    .bind(account_id)
-    .bind(account_id)
-    .bind(programme)
-    .fetch_one(&mut **tx)
-    .await?;
+    // Guests get no personal workspace, so there is no member context to
+    // require: the guest obligation alone marks them ready.
+    let member_ready: bool = if arrival.role == TrustedMembershipRole::Guest {
+        sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM member_obligations WHERE account_id=? AND programme_id=?)",
+        )
+        .bind(account_id)
+        .bind(programme)
+        .fetch_one(&mut **tx)
+        .await?
+    } else {
+        sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM member_contexts WHERE account_id=?)
+          AND EXISTS(SELECT 1 FROM member_obligations WHERE account_id=? AND programme_id=?)",
+        )
+        .bind(account_id)
+        .bind(account_id)
+        .bind(programme)
+        .fetch_one(&mut **tx)
+        .await?
+    };
     Ok(member_ready)
 }
 
@@ -1013,6 +1210,7 @@ pub(crate) async fn provision_member_in(
     account_id: &str,
     person_record_id: &str,
     authority: MemberProvisioningAuthority<'_>,
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<bool> {
     let arrival = authority.arrival();
     let before: (i64, i64, i64) = (
@@ -1029,7 +1227,7 @@ pub(crate) async fn provision_member_in(
     if let Some(arrival) = arrival {
         arrival.validate()?;
     }
-    ensure_programmes_in(tx).await?;
+    ensure_programmes_in(tx, act_alloc).await?;
     let trusted_owner = match authority {
         MemberProvisioningAuthority::Hosted(arrival)
             if arrival.role == TrustedMembershipRole::Owner =>
@@ -1042,11 +1240,34 @@ pub(crate) async fn provision_member_in(
         // is elevated; an ambiguous unselected open fails before provisioning.
         MemberProvisioningAuthority::Standalone => Some(account_id),
     };
-    ensure_global_defaults_in(db, tx, account_id, trusted_owner).await?;
-    provision_private_context_in(db, tx, account_id, person_record_id).await?;
-    ensure_arrival_obligation_in(tx, account_id, arrival).await?;
-    crate::instructions::validate_account_stack_in(tx, "member provisioning", Some(account_id))
-        .await?;
+    ensure_global_defaults_in(db, tx, account_id, trusted_owner, act_alloc).await?;
+    // Guests get no personal workspace by decision: no `My agent context`
+    // root, no private `Starting context` note, no account-manage policy on
+    // a context that must not exist. Only the shared scope is provisioned.
+    let is_guest_arrival =
+        matches!(arrival, Some(arrival) if arrival.role == TrustedMembershipRole::Guest);
+    if !is_guest_arrival {
+        provision_private_context_in(db, tx, account_id, person_record_id, act_alloc).await?;
+    } else {
+        // The guest's own onboarding source must be readable under guest
+        // footing, which the inherited members-only baseline never grants.
+        grant_guest_guidance_in(tx, account_id, account_id, act_alloc).await?;
+    }
+    ensure_arrival_obligation_in(tx, account_id, arrival, act_alloc).await?;
+    // Provisioning validates the workspace instruction shape (dangling
+    // sources, budget), not this account's readability: per-account
+    // readability enforces at resolve time, where an unreadable source
+    // degrades to a non-authoritative stack instead of failing connect. A
+    // guest must stay able to open the shared scope even when a
+    // workspace-wide source is members-only, so the probe keeps the
+    // historical member footing for every role.
+    crate::instructions::validate_account_stack_in(
+        tx,
+        "member provisioning",
+        Some(account_id),
+        true,
+    )
+    .await?;
     let after: (i64, i64, i64) = (
         sqlx::query_scalar("SELECT COALESCE(MAX(seq),0) FROM content_events")
             .fetch_one(&mut **tx)
@@ -1069,19 +1290,19 @@ mod tests {
     fn ratified_onboarding_corpus_is_digest_pinned() {
         assert_eq!(
             instruction_body_digest(OWNER_GUIDANCE_BODY),
-            "352768499a487cfa648cad742e3db898d92983eb71b621679f79d0f96ccd136b"
+            "0a434a7277f2cbabca377ac88145669cfc33ff2a25335dd8481fe9b494d084dd"
         );
         assert_eq!(
             instruction_body_digest(OWNER_CRITERIA_BODY),
-            "e418caad78e957e5908ef0dfcca753f052d9dd80fe1ae6307047c972d9267569"
+            "e1bbcbde8d7f195ca9aee8c676ca3354fd5fdc5d2b07381d967aa6059cfa7f26"
         );
         assert_eq!(
             instruction_body_digest(MEMBER_GUIDANCE_BODY),
-            "d5dae1587a480bb51d782e9e84ea12c2fd6c1bb70f41a4f30253d1e09823a1ac"
+            "e0fffec357491215f8d4a3f7d34772bd7ba1b811514c680245384f2bd1b99697"
         );
         assert_eq!(
             instruction_body_digest(MEMBER_CRITERIA_BODY),
-            "386c459c81c6c5d829cd163258523f5251e7059ef1be753271bcfb1af71d0526"
+            "9288c33da2bbf881ded7931f9b957341e120071434e8f07a2c18b3386ac753d7"
         );
         assert!(OWNER_GUIDANCE_BODY.contains("concrete work"));
         assert!(MEMBER_GUIDANCE_BODY.contains("Do not conduct an owner interview"));
@@ -1092,10 +1313,32 @@ mod tests {
             assert!(body.to_lowercase().contains("shared"));
             assert!(body.contains("Starting context"));
             assert!(body.contains("preview text"));
-            assert!(body.contains("workspace record by default"));
+            assert!(body.contains("workspace records by default"));
+            assert!(body.contains("several small connected records"));
+            assert!(body.contains("direct web link"));
+            assert!(!body.contains("confirms the assistance was useful"));
             assert!(body.contains("must not force concrete work or an artifact"));
             assert!(body.contains("`route_selected`"));
             assert!(body.contains("`value_delivered`"));
         }
+    }
+
+    #[test]
+    fn guest_guidance_states_scope_end_and_no_personal_surface() {
+        let template = instruction_template("guest-onboarding-guidance")
+            .expect("guest onboarding template is registered");
+        assert_eq!(template.version, 1);
+        // What they can do: the named shared scope only.
+        assert!(GUEST_GUIDANCE_BODY.contains("exactly the shared records"));
+        assert!(GUEST_GUIDANCE_BODY.contains("explicit consent"));
+        assert!(GUEST_GUIDANCE_BODY.contains("Do not infer"));
+        // When it ends: time-boxed and revocable.
+        assert!(GUEST_GUIDANCE_BODY.contains("time-boxed and revocable"));
+        assert!(GUEST_GUIDANCE_BODY.contains("when it ends"));
+        // No personal-workspace or MCP steps.
+        assert!(GUEST_GUIDANCE_BODY.contains("web UI only"));
+        assert!(GUEST_GUIDANCE_BODY.contains("no personal workspace"));
+        assert!(GUEST_GUIDANCE_BODY.contains("no private `Starting context` note"));
+        assert!(GUEST_GUIDANCE_BODY.contains("no agent-tool (MCP) steps"));
     }
 }

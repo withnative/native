@@ -1198,6 +1198,7 @@ pub(super) async fn complete_request_with_publication_at(
     failure_point: CompletionFailurePoint,
 ) -> Result<Option<super::bindings::PublishedRecordBodyRevision>> {
     let mut tx = begin_write(db.write_pool()).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
     let now = clock.now();
     let Some(request) = inspect_request_in(&mut tx, &completion.lease.request_id).await? else {
         tx.rollback().await?;
@@ -1471,6 +1472,7 @@ pub(super) async fn complete_request_with_publication_at(
         completion.publication,
         super::bindings::PublicationFailurePoint::None,
         super::bindings::PublicationAuthority::ControlledRequest,
+        &mut act_alloc,
     )
     .await?;
     if failure_point == CompletionFailurePoint::AfterPublication {
@@ -1645,6 +1647,7 @@ async fn fail_request_in_with_clock(
     failure: &DerivationRequestFailure,
     clock: &dyn DerivationCoordinatorClock,
     failure_point: RequestFailurePoint,
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<Option<DerivationEventRow>> {
     let now = clock.now();
     let now_text = format_time(now);
@@ -1687,6 +1690,7 @@ async fn fail_request_in_with_clock(
             failure.reason.clone(),
             DerivationEventPayload::AttemptFailed(failure.evidence.clone()),
         )?,
+        act_alloc,
     )
     .await?;
     if failure_point == RequestFailurePoint::AfterEvidence {
@@ -1733,12 +1737,14 @@ async fn fail_request_in_with_clock(
 pub(crate) async fn fail_request_in(
     tx: &mut Transaction<'static, Sqlite>,
     failure: &DerivationRequestFailure,
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<Option<DerivationEventRow>> {
     fail_request_in_with_clock(
         tx,
         failure,
         &SystemCoordinatorClock,
         RequestFailurePoint::None,
+        act_alloc,
     )
     .await
 }
@@ -1763,7 +1769,9 @@ pub(super) async fn fail_request_with_clock(
     failure_point: RequestFailurePoint,
 ) -> Result<Option<DerivationEventRow>> {
     let mut tx = begin_write(db.write_pool()).await?;
-    match fail_request_in_with_clock(&mut tx, &failure, clock, failure_point).await {
+    let mut act_alloc = crate::act::ActAllocation::new();
+    match fail_request_in_with_clock(&mut tx, &failure, clock, failure_point, &mut act_alloc).await
+    {
         Ok(Some(event)) => {
             tx.commit().await?;
             Ok(Some(event))

@@ -219,6 +219,8 @@ pub fn lens_tool_policy(kind: Option<ToolKind>, name: &str) -> LensToolPolicy {
             | CreateRecord
             | CreateMany
             | CreateExploration
+            | BatchWrite
+            | SaveAccount
             | UpdateRecord
             | ClaimUnownedRecord
             | CorrectRecordType
@@ -249,12 +251,15 @@ pub fn lens_tool_policy(kind: Option<ToolKind>, name: &str) -> LensToolPolicy {
             | ManageMdxModules
             | ManageArtifactInputs
             | ManageArtifactModuleGrants
+            | AdvanceArtifactPortPin
+            | ManageSurfaceBindings
+            | ManageAlphaTabs
             | ManageChangeSummaries
             | ManageCanvas,
         ) => DestinationPassThrough,
         // A moment projection is scoped to one database's own event log and
         // read log. There is nothing to federate and nothing to pass through.
-        Some(GetEventContext) => UnsupportedRead,
+        Some(GetEventContext | GetReuseContext) => UnsupportedRead,
         Some(
             Ping
             | EngineInfo
@@ -281,17 +286,21 @@ pub fn lens_tool_policy(kind: Option<ToolKind>, name: &str) -> LensToolPolicy {
             | ResolveRollup
             | QuerySql
             | Scan
+            | GetWorkspaceSnapshot
             | ReadAttachment
             | RenderSuggestionReview
             | ExportSnapshot
             | ResolveCitation
             | ReadAttributions
             | ManageMemberships
+            | WorkspaceRead
             | QueryChangeSummaries
             | ResolveMany
             | ReadCanvas
             | ReachRead
-            | ReachConnect,
+            | ReachConnect
+            | AuthorityActHead
+            | AuthorityActDelta,
         ) => UnsupportedRead,
         // Embedding-only custom tools have no mutation policy. They remain
         // routable only when the caller explicitly names one lens source.

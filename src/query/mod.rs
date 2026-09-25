@@ -42,7 +42,10 @@ pub mod lineage;
 pub mod pipeline;
 pub mod principal;
 pub mod read;
+pub mod relationship_lint;
 pub mod sql;
+#[cfg(test)]
+pub(crate) mod sql_conformance;
 pub mod sql_contract;
 pub(crate) mod stage_timing;
 #[cfg(test)]
@@ -143,6 +146,39 @@ pub(crate) fn record_from_row(row: &SqliteRow) -> Result<RecordRow> {
         communication_origin: None,
         federation_provenance: None,
     })
+}
+
+/// Rehydrate the body excluded from the bounded workspace index. The remaining
+/// fields are the same physical record header used by `record_from_row`.
+pub(crate) fn record_from_index_head(
+    head: &crate::workspace_index::RecordHead,
+    body: Option<String>,
+) -> RecordRow {
+    RecordRow {
+        id: head.id.clone(),
+        record_type: head.record_type.clone(),
+        kind: head.kind.clone(),
+        name: head.name.clone(),
+        body,
+        home_id: head.home_id.clone(),
+        lifecycle: head.lifecycle.clone(),
+        lifecycle_interpretation: lifecycle::LifecycleInterpretation::Absent(
+            lifecycle::AbsentLifecycleInterpretation {
+                axis: None,
+                vocabulary: None,
+            },
+        ),
+        owner_id: head.owner_id.clone(),
+        persistence: head.persistence.clone(),
+        maturity: head.maturity.clone(),
+        summary: head.summary.clone(),
+        last_activity_at: head.last_activity_at.clone(),
+        created_at: head.created_at.clone(),
+        updated_at: head.updated_at.clone(),
+        deleted_at: head.deleted_at.clone(),
+        communication_origin: None,
+        federation_provenance: None,
+    }
 }
 
 pub(crate) async fn hydrate_communication_origin_on(

@@ -18,6 +18,22 @@ use crate::error::{Error, Result};
 
 pub const STANDBY_SNAPSHOT_MANIFEST_CONTRACT: &str = "native.standby-snapshot-manifest.v1";
 pub const STANDBY_FRONTIER_CONTRACT: &str = "native.canonical-frontier.v1";
+
+/// The sequenced-log coordinates carried by [`CanonicalFrontierV1`]. The two
+/// remaining coordinates are revision stamps rather than event-log heads.
+#[cfg(test)]
+pub(crate) const FRONTIER_SEQUENCED_LOGS: &[&str] = &[
+    "content_events",
+    "policy_events",
+    "awareness_events",
+    "notification_candidate_events",
+    "binding_audit",
+    "database_identity_audit",
+    "meta_events",
+    "control_events",
+    "derivation_events",
+    "relationship_events",
+];
 pub const STANDBY_CONSUMER_CONTRACT: &str = "native.standby-consumer.v1";
 pub const STANDBY_SNAPSHOT_MEDIA_TYPE: &str = "application/vnd.sqlite3";
 
@@ -215,6 +231,20 @@ pub struct StandbySnapshotBytes {
     pub sha256: String,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StandbyGenerationMaterialization {
+    #[default]
+    Snapshot,
+    Delta,
+}
+
+impl StandbyGenerationMaterialization {
+    fn is_snapshot(value: &Self) -> bool {
+        *value == Self::Snapshot
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct StandbySnapshotManifest {
@@ -222,12 +252,26 @@ pub struct StandbySnapshotManifest {
     pub version: u32,
     pub hosted_route_database_id: String,
     pub origin_database_id: String,
-    /// Conservative RPO time, sampled immediately before `VACUUM INTO`.
+    /// Conservative RPO boundary: immediately before `VACUUM INTO` for a
+    /// snapshot, or before the authenticated authority probe for a delta.
     pub captured_at: String,
     pub snapshot_completed_at: String,
     pub engine: StandbySnapshotEngineIdentity,
     pub consumer: StandbyConsumerIdentity,
     pub frontier: CanonicalFrontierV1,
+    /// The accepted whole-act frontier. Older snapshot-only manifests omitted
+    /// it; omission remains canonical so already-published generation ids do
+    /// not change when read by a newer consumer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_act: Option<i64>,
+    /// How this immutable SQLite generation was produced. Snapshot is the
+    /// historical default and stays omitted from canonical JSON; delta-built
+    /// generations carry the distinction durably across restart.
+    #[serde(
+        default,
+        skip_serializing_if = "StandbyGenerationMaterialization::is_snapshot"
+    )]
+    pub materialization: StandbyGenerationMaterialization,
     pub snapshot: StandbySnapshotBytes,
 }
 
@@ -269,6 +313,16 @@ impl StandbySnapshotManifest {
             ));
         }
         self.frontier.validate()?;
+        if self.head_act.is_some_and(|head| head < 0) {
+            return Err(Error::engine(
+                "standby generation act frontier must be nonnegative",
+            ));
+        }
+        if self.engine.schema_version >= 59 && self.head_act.is_none() {
+            return Err(Error::engine(
+                "act-capable standby generation is missing its act frontier",
+            ));
+        }
         if self.snapshot.media_type != STANDBY_SNAPSHOT_MEDIA_TYPE
             || self.snapshot.size_bytes == 0
             || !lowercase_hex(&self.snapshot.sha256, 64)
@@ -294,6 +348,13 @@ impl StandbySnapshotManifest {
         if !self
             .frontier
             .is_componentwise_non_regressing_from(&current.frontier)?
+        {
+            return Ok(false);
+        }
+        if self
+            .head_act
+            .zip(current.head_act)
+            .is_some_and(|(next, prior)| next < prior)
         {
             return Ok(false);
         }
@@ -381,7 +442,8 @@ pub(crate) async fn manifest_from_completed_export(
          COALESCE((SELECT MAX(seq) FROM derivation_events),0) derivation_event_seq,
          COALESCE((SELECT MAX(seq) FROM relationship_events),0) relationship_event_seq,
          COALESCE((SELECT epoch FROM authorization_revision WHERE id=1),0) authorization_revision_epoch,
-         COALESCE((SELECT policy_revision FROM storage_portability_policy WHERE singleton=1),0) storage_portability_policy_revision",
+         COALESCE((SELECT policy_revision FROM storage_portability_policy WHERE singleton=1),0) storage_portability_policy_revision,
+         (SELECT next_act FROM act_state WHERE singleton=1) head_act",
     )
     .fetch_one(&mut connection)
     .await?;
@@ -417,6 +479,8 @@ pub(crate) async fn manifest_from_completed_export(
             storage_portability_policy_revision: row
                 .try_get("storage_portability_policy_revision")?,
         },
+        head_act: Some(row.try_get("head_act")?),
+        materialization: StandbyGenerationMaterialization::Snapshot,
         snapshot: StandbySnapshotBytes {
             media_type: STANDBY_SNAPSHOT_MEDIA_TYPE.into(),
             size_bytes,
@@ -456,8 +520,10 @@ pub(crate) async fn validate_completed_export_manifest(
       COALESCE((SELECT MAX(seq) FROM derivation_events),0) derivation_event_seq,
       COALESCE((SELECT MAX(seq) FROM relationship_events),0) relationship_event_seq,
       COALESCE((SELECT epoch FROM authorization_revision WHERE id=1),0) authorization_revision_epoch,
-      COALESCE((SELECT policy_revision FROM storage_portability_policy WHERE singleton=1),0) storage_portability_policy_revision").fetch_one(&mut connection).await?;
+      COALESCE((SELECT policy_revision FROM storage_portability_policy WHERE singleton=1),0) storage_portability_policy_revision,
+      (SELECT next_act FROM act_state WHERE singleton=1) head_act").fetch_one(&mut connection).await?;
     let f = &manifest.frontier;
+    let database_head_act: i64 = row.try_get("head_act")?;
     let matches = manifest.origin_database_id == row.try_get::<String, _>("origin_database_id")?
         && manifest.engine.schema_version == row.try_get::<i64, _>("schema_version")?
         && f.content_event_seq == row.try_get::<i64, _>("content_event_seq")?
@@ -474,7 +540,14 @@ pub(crate) async fn validate_completed_export_manifest(
         && f.authorization_revision_epoch
             == row.try_get::<i64, _>("authorization_revision_epoch")?
         && f.storage_portability_policy_revision
-            == row.try_get::<i64, _>("storage_portability_policy_revision")?;
+            == row.try_get::<i64, _>("storage_portability_policy_revision")?
+        && if manifest.engine.schema_version >= 59 {
+            manifest.head_act == Some(database_head_act)
+        } else {
+            manifest
+                .head_act
+                .is_none_or(|head| head == database_head_act)
+        };
     connection.close().await?;
     if !matches {
         return Err(Error::engine(
@@ -531,6 +604,8 @@ mod tests {
                 ddl_sha256: crate::schema::FROZEN_DDL_SHA256.into(),
             },
             frontier: frontier(frontier_value),
+            head_act: Some(frontier_value),
+            materialization: StandbyGenerationMaterialization::Snapshot,
             snapshot: StandbySnapshotBytes {
                 media_type: STANDBY_SNAPSHOT_MEDIA_TYPE.into(),
                 size_bytes: 1,
@@ -638,5 +713,15 @@ mod tests {
         let mut wrong_origin = manifest(3, 'e');
         wrong_origin.origin_database_id = "ndb_abcdef0123456789abcdef0123456789".into();
         assert!(!wrong_origin.is_safe_scalar_successor_of(&current).unwrap());
+
+        let mut missing_head = manifest(3, 'e');
+        missing_head.head_act = None;
+        assert!(missing_head.validate().is_err());
+
+        let mut regressed_head = manifest(3, 'e');
+        regressed_head.head_act = Some(1);
+        assert!(!regressed_head
+            .is_safe_scalar_successor_of(&current)
+            .unwrap());
     }
 }

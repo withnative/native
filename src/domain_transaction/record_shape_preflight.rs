@@ -325,6 +325,10 @@ fn carrier_assessment(key: &str, facet: &crate::domain_transaction::FacetWrite) 
     use crate::domain_transaction::FacetKeyClassification;
     let key_identity = bounded_identity_component(key);
     match crate::domain_transaction::classify_facet_key(key) {
+        // Open keys fall through to ordinary declared-facet assessment: an
+        // alias such as `assignee` is additive advisory on top of whatever
+        // the schema says, never a replacement for it. The caller augments
+        // the assessed predicate with the alias issue and details.
         FacetKeyClassification::Open => None,
         FacetKeyClassification::Spine { create_record_path } => Some(json!({
             "key": key_identity,
@@ -348,7 +352,85 @@ fn carrier_assessment(key: &str, facet: &crate::domain_transaction::FacetWrite) 
             "value_resolution": Value::Null,
             "issues": ["engine_reserved_facet"],
         })),
+        FacetKeyClassification::GovernedRelationship { relationship_type } => {
+            let guidance =
+                crate::domain_transaction::governed_relationship_guidance(key, &relationship_type);
+            Some(json!({
+                "key": key_identity.clone(),
+                "facet_key": key_identity,
+                "create_record_input": Value::Null,
+                "declaration": "governed_relationship",
+                "status": "rejected",
+                "value": bounded_value_identity(&facet.value),
+                "declared_type": Value::Null,
+                "governing_vocabulary": Value::Null,
+                "value_resolution": Value::Null,
+                "issues": [crate::domain_transaction::GOVERNED_RELATIONSHIP_ISSUE],
+                "relationship_type": relationship_type,
+                "suggested_operation": crate::domain_transaction::GOVERNED_RELATIONSHIP_SUGGESTED_OPERATION,
+                "guidance": guidance,
+                "facet_behavior_difference": crate::domain_transaction::GOVERNED_RELATIONSHIP_FACET_DIFFERENCE,
+            }))
+        }
     }
+}
+
+/// Add alias-carrier guidance to an already assessed open/declared facet
+/// predicate without touching its schema verdict. The declared type,
+/// governing vocabulary, value resolution, declaration and accepted/rejected
+/// status stay exactly as `assess_facet_write` reported; the alias issue and
+/// relationship details are purely additive advisory. Returns false when the
+/// key is not an alias admitted for this subject, in which case the assessed
+/// value is left untouched.
+fn augment_alias_assessment(
+    assessment: &mut Value,
+    key: &str,
+    record_type: &str,
+    kind: Option<&str>,
+) -> bool {
+    let Some(relationship_type) = crate::domain_transaction::governed_alias_target(key) else {
+        return false;
+    };
+    if !crate::domain_transaction::governed_relationship_admits_subject(
+        relationship_type,
+        record_type,
+        kind,
+    ) {
+        return false;
+    }
+    let Some(object) = assessment.as_object_mut() else {
+        return false;
+    };
+    if let Some(issues) = object.get_mut("issues").and_then(Value::as_array_mut) {
+        if !issues
+            .iter()
+            .any(|issue| issue == crate::domain_transaction::GOVERNED_ALIAS_ISSUE)
+        {
+            issues.push(Value::String(
+                crate::domain_transaction::GOVERNED_ALIAS_ISSUE.into(),
+            ));
+        }
+    }
+    let key_identity = bounded_identity_component(key);
+    let guidance =
+        crate::domain_transaction::governed_relationship_guidance(key, relationship_type);
+    object.insert("facet_key".into(), json!(key_identity));
+    object.insert("relationship_type".into(), json!(relationship_type));
+    object.insert(
+        "suggested_operation".into(),
+        json!(crate::domain_transaction::GOVERNED_RELATIONSHIP_SUGGESTED_OPERATION),
+    );
+    object.insert(
+        "guidance".into(),
+        json!(format!(
+            "{guidance} This write would not establish the relationship."
+        )),
+    );
+    object.insert(
+        "facet_behavior_difference".into(),
+        json!(crate::domain_transaction::GOVERNED_RELATIONSHIP_FACET_DIFFERENCE),
+    );
+    true
 }
 
 fn required_declarations(
@@ -814,6 +896,9 @@ pub(crate) async fn execute_preview_record_shape<E: DomainStatementExecutor>(
                 .clone();
             let mut assessments = Vec::with_capacity(proposed_facets.len());
             for (key, facet) in proposed_facets {
+                // Exact governed names, spine keys and engine-reserved keys
+                // are rejected before schema assessment; the carrier verdict
+                // is complete and needs no declared predicate.
                 if let Some(assessment) = carrier_assessment(key, facet) {
                     assessments.push(assessment);
                     continue;
@@ -827,7 +912,13 @@ pub(crate) async fn execute_preview_record_shape<E: DomainStatementExecutor>(
                     facet,
                 )
                 .await?;
-                assessments.push(bounded_predicate_assessment(key, facet, assessment));
+                let mut bounded = bounded_predicate_assessment(key, facet, assessment);
+                // Alias carrier guidance is additive advisory on top of the
+                // declared verdict: it never overwrites declared_type,
+                // governing_vocabulary, value resolution or the
+                // accepted/rejected status.
+                augment_alias_assessment(&mut bounded, key, record_type, effective_kind);
+                assessments.push(bounded);
             }
             let supplied_values_accepted = assessments
                 .iter()

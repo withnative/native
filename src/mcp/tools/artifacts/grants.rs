@@ -779,6 +779,7 @@ pub(super) async fn manage_artifact_module_grants(
             ));
         }
         let mut tx = crate::db::begin_write(db.write_pool()).await?;
+        let mut act_alloc = crate::act::ActAllocation::new();
         require_record_in(&mut tx, &caller, TOOL, &artifact_id, Capability::Edit).await?;
         if !revoke {
             require_record_in(&mut tx, &caller, TOOL, &subject_record_id, Capability::View).await?;
@@ -827,11 +828,15 @@ pub(super) async fn manage_artifact_module_grants(
                     payload: serde_json::to_value(payload)?,
                     actor: Some(caller.actor().into()),
                 },
+                &mut act_alloc,
             )
             .await?;
             db.commit_content(tx).await?;
-            return Ok(json!({ "status": "revoked", "artifact_id": artifact_id,
-                "previous_seq": previous_seq }));
+            return echo_act(
+                json!({ "status": "revoked", "artifact_id": artifact_id,
+                "previous_seq": previous_seq }),
+                act_alloc.get(),
+            );
         }
         let _permit =
             mdx::try_admit().map_err(|failure| mdx_v2_engine_error(&artifact_id, failure))?;
@@ -849,11 +854,15 @@ pub(super) async fn manage_artifact_module_grants(
                 payload: serde_json::to_value(payload)?,
                 actor: Some(caller.actor().into()),
             },
+            &mut act_alloc,
         )
         .await?;
         db.commit_content(tx).await?;
-        return Ok(json!({ "status": "granted", "artifact_id": artifact_id,
-            "previous_seq": previous_seq }));
+        return echo_act(
+            json!({ "status": "granted", "artifact_id": artifact_id,
+            "previous_seq": previous_seq }),
+            act_alloc.get(),
+        );
     }
     let rows = sqlx::query(
         "SELECT subject_kind,subject_record_id,subject_event_id,source_sha256,capability,scope,event_seq

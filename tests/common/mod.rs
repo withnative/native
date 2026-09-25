@@ -90,6 +90,7 @@ pub fn ev(
         intent: None,
         created_at: created_at.to_string(),
         causal_envelope: native_ce::events::CausalEnvelopeV1::default(),
+        act: None,
     }
 }
 

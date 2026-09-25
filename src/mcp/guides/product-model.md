@@ -42,6 +42,27 @@ Storage is not the outcome; a useful workflow, explanation, or comparison is.
 
 Records make value durable, but QuickStart should first anchor on what the user wants to accomplish and choose the smallest credible proof of that value.
 
+## Declared source basis
+
+An ordinary write may name the records it rested on under `sources`: each entry is a `record_id`, a `reason`, an optional `role`, and an optional `revision_event_id`. The engine stores the declaration on the write event itself, beside the write's `reason`, under `native.source-basis.v1`, replacing each omitted revision with the source's current body head. An omitted `sources` means *not declared*; an explicit empty list means *declared as none*, and the two are stored distinguishably.
+
+Declarations serve the agent that made them and whoever arrives next. The read log is disposable and is dropped; a declaration is canonical — recorded on the write event itself, durable, and readable from history — so it is not lost with your context window. A later agent can check whether the basis has moved instead of redoing your reading. The person you act for can see what you looked at before you acted, which is the oversight Native promises. Honesty is symmetrical: declaring none is as useful as declaring some, and not declaring is neither.
+
+A declaration is a claim, not an observation. The engine records what you said you used; it does not verify it, and it does not rank or retrieve anything by it. A false reason discredits the rest.
+
+Adoption is measured, not assumed. This query gives the weekly volume of `record.created` / `record.updated` events, bucketed with portable integer date maths over the `created_at_ms` companion column. Weeks here are Unix-epoch-aligned 7-day buckets starting Thursday 00:00 UTC: calendar weeks have no portable spelling, so say epoch weeks when you report the number.
+
+```sql
+SELECT created_at_ms / 604800000 AS week_epoch,
+       COUNT(*) AS writes
+  FROM content_events
+ WHERE type IN ('record.created', 'record.updated')
+ GROUP BY created_at_ms / 604800000
+ ORDER BY week_epoch DESC;
+```
+
+The declared-or-declared-none fraction has no portable SQL form: the logical `content_events` relation exposes no payload or run-key column, so per-write `sources` declarations can be neither filtered nor aggregated in `query_sql`. Sample records and read their history instead, where each write event carries its `sources` declaration. To bound recency, add `WHERE created_at_ms >= ?1` with a client-computed epoch-millis cutoff passed as a parameter: a relative 'now' has no portable spelling (Native e25665c).
+
 ## Applying the model
 
 Start with the user's desired outcome. Choose a practical workflow, comparison, or conceptual explanation that can create value now. Use workspace records as the normal durable destination, `native:unfiled` when no better workspace home is known, and My agent context when the user intentionally wants the result private. Do not confuse storing something with finishing the user's job.

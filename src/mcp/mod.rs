@@ -45,7 +45,9 @@
 //!     spec-proper shape — the model is allowed to see tool failures);
 //!     infrastructure failures become JSON-RPC `-32603` with the message.
 
+pub mod action_evidence;
 pub mod apps;
+pub mod authority_act;
 pub mod builtin;
 mod deployment_read_only;
 pub mod evidence;
@@ -78,6 +80,7 @@ pub mod stdio;
 mod surface;
 pub mod tools;
 
+pub use authority_act::{AuthorityActDeltaRequest, AuthorityActSource, AuthorityActSourceRef};
 pub use builtin::{register_builtin_tools, register_standby_status_tool};
 pub use deployment_read_only::{
     DeploymentAdmission, DeploymentFreezeLease, DeploymentMutationBarrier,
@@ -117,9 +120,10 @@ pub use registry::{
     descriptor_projection_bytes, governed_request_pipeline_is_exhaustive,
     membership_page_size_is_valid, register_membership_tool_schema, register_membership_tool_with,
     register_reach_connect_tool_with, register_reach_read_tool_with, register_reach_tool_schema,
-    validate_descriptor_projection, AdvertisedTool, AppMetadata, Caller, EngineHandle, EngineKind,
-    GovernedRequestOperation, GovernedRequestStage, ToolRegistry, ToolSpec, TrustedAudience,
-    COMPLETE_PROFILE_MAX_BYTES, FOCUSED_PROFILE_MAX_BYTES, GOVERNED_REQUEST_PIPELINE,
+    register_workspace_tool_schema, register_workspace_tool_with, validate_descriptor_projection,
+    AdvertisedTool, AppMetadata, Caller, EngineHandle, EngineKind, GovernedRequestOperation,
+    GovernedRequestStage, ToolRegistry, ToolSpec, TrustedAudience, COMPLETE_PROFILE_MAX_BYTES,
+    FOCUSED_PROFILE_MAX_BYTES, GOVERNED_REQUEST_PIPELINE,
 };
 pub use render::Format;
 pub use snapshot::{
@@ -130,10 +134,14 @@ pub use status_only::{StatusOnlyStdioServer, STANDBY_STATUS_ONLY_ERROR};
 pub use stdio::StdioServer;
 pub use surface::{
     ExperimentalExecutors, McpSurfaceMode, EXPERIMENTAL_EXECUTORS_ENV,
-    EXPERIMENTAL_FRESHNESS_EXECUTOR,
+    EXPERIMENTAL_FRESHNESS_EXECUTOR, EXPERIMENTAL_SQL_WRITE_EXECUTOR,
 };
+pub use tools::register_allowlisted_experimental_tools;
 #[doc(hidden)]
 pub use tools::register_build_enabled_experimental_tools;
 #[cfg(feature = "experimental-agent-intents")]
 pub use tools::register_experimental_agent_intent_tool;
-pub use tools::{register_snapshot_tool, register_surface_tools};
+pub use tools::{
+    authority_act::{register_authority_act_tool_schema, register_authority_act_tools},
+    register_snapshot_tool, register_surface_tools,
+};

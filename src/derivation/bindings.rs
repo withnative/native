@@ -488,11 +488,12 @@ pub async fn bind_target(
         DerivationEventPayload::TargetBound(binding.clone()),
     )?;
     let mut tx = begin_write(db.write_pool()).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
     if super::persistence::read_by_key(&mut tx, &idempotency_key)
         .await?
         .is_some()
     {
-        let event = append_derivation_event_in(&mut tx, command).await?;
+        let event = append_derivation_event_in(&mut tx, command, &mut act_alloc).await?;
         tx.commit().await?;
         return Ok(event);
     }
@@ -511,7 +512,7 @@ pub async fn bind_target(
         binding.expected_body_sha256.as_deref(),
     )
     .await?;
-    let event = append_derivation_event_in(&mut tx, command).await?;
+    let event = append_derivation_event_in(&mut tx, command, &mut act_alloc).await?;
     tx.commit().await?;
     Ok(event)
 }
@@ -536,11 +537,12 @@ pub async fn detach_target(
         DerivationEventPayload::TargetDetached(detach.clone()),
     )?;
     let mut tx = begin_write(db.write_pool()).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
     if super::persistence::read_by_key(&mut tx, &idempotency_key)
         .await?
         .is_some()
     {
-        let event = append_derivation_event_in(&mut tx, command).await?;
+        let event = append_derivation_event_in(&mut tx, command, &mut act_alloc).await?;
         tx.commit().await?;
         return Ok(event);
     }
@@ -551,7 +553,7 @@ pub async fn detach_target(
         Capability::Edit,
     )
     .await?;
-    let event = append_derivation_event_in(&mut tx, command).await?;
+    let event = append_derivation_event_in(&mut tx, command, &mut act_alloc).await?;
     tx.commit().await?;
     Ok(event)
 }
@@ -618,6 +620,7 @@ async fn publish_record_body_revision_impl(
     failure_point: PublicationFailurePoint,
 ) -> Result<PublishedRecordBodyRevision> {
     let mut tx = begin_write(db.write_pool()).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
     let published = publish_record_body_revision_in(
         db,
         &mut tx,
@@ -625,6 +628,7 @@ async fn publish_record_body_revision_impl(
         input,
         failure_point,
         PublicationAuthority::Generic,
+        &mut act_alloc,
     )
     .await?;
     db.commit_content(tx).await?;
@@ -638,6 +642,7 @@ pub(super) async fn publish_record_body_revision_in(
     mut input: PublishRecordBodyRevision,
     failure_point: PublicationFailurePoint,
     authority: PublicationAuthority,
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<PublishedRecordBodyRevision> {
     validate_target(&input.target)?;
     if input.revision.series_id.trim().is_empty() {
@@ -697,7 +702,7 @@ pub(super) async fn publish_record_body_revision_in(
             )));
         }
         let row = sqlx::query(
-            "SELECT seq,id,record_id,type,payload,actor,run_key,parent_key,intent,created_at
+            "SELECT seq,id,record_id,type,payload,actor,run_key,parent_key,intent,created_at,act
                FROM content_events WHERE id=?",
         )
         .bind(&publication.output_ref.event_id)
@@ -716,6 +721,7 @@ pub(super) async fn publish_record_body_revision_in(
             intent: row.try_get("intent")?,
             created_at: row.try_get("created_at")?,
             causal_envelope: crate::events::CausalEnvelopeV1::default(),
+            act: row.try_get("act")?,
         };
         let stored_output: serde_json::Value = content_event
             .payload
@@ -774,6 +780,7 @@ pub(super) async fn publish_record_body_revision_in(
                 payload: output_payload,
                 actor: Some(input.actor.clone()),
             },
+            act_alloc,
         ),
     )
     .await?;
@@ -797,6 +804,7 @@ pub(super) async fn publish_record_body_revision_in(
             input.reason.clone(),
             DerivationEventPayload::RevisionCompleted(input.revision.clone()),
         )?,
+        act_alloc,
     )
     .await?;
     if failure_point == PublicationFailurePoint::AfterRevisionEvent {
@@ -822,6 +830,7 @@ pub(super) async fn publish_record_body_revision_in(
                 output_ref: input.revision.output_ref,
             }),
         )?,
+        act_alloc,
     )
     .await?;
     if failure_point == PublicationFailurePoint::AfterPublicationEvent {

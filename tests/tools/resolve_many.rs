@@ -93,9 +93,13 @@ async fn mixed_exact_results_preserve_indexes_duplicates_and_candidate_order() {
     assert_eq!(rows[2]["matches"][1]["id"], DUPLICATE_B);
     assert_eq!(rows[3]["index"], 3);
     assert_eq!(rows[3]["match"]["id"], ALPHA);
+    // `not_held` is always 0 today and is asserted anyway: the honest-absence
+    // contract's whole point is that a caller can tell "not held here" from
+    // "not found", which only holds if the counter is always present rather
+    // than appearing the day something can produce it.
     assert_eq!(
         out["counts"],
-        json!({"resolved":2,"not_found":1,"ambiguous":1})
+        json!({"resolved":2,"not_found":1,"ambiguous":1,"not_held":0})
     );
 }
 

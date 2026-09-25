@@ -1308,8 +1308,186 @@ pub async fn replace_explicit_policy(
     entries: Vec<AllowEntry>,
 ) -> Result<()> {
     let mut tx = begin_write(db.write_pool()).await?;
-    replace_explicit_policy_on(&mut tx, actor, record_id, entries).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
+    replace_explicit_policy_on(&mut tx, actor, record_id, entries, &mut act_alloc).await?;
     db.commit_authorization(tx).await?;
+    Ok(())
+}
+
+/// Reason recorded on the guest arrival grant's policy event. The retarget
+/// path uses it to find the boundaries a previous arrival created, so it
+/// strips exactly those and never a separate per-guest guidance grant or an
+/// owner-authored account entry.
+pub(crate) const ARRIVAL_GRANT_REASON: &str = "grant account scope access on arrival";
+
+/// Add a direct account grant to the explicit policy governing `record_id`,
+/// preserving every entry already in effect there and adding nothing else.
+///
+/// The only entry it introduces is `account(account_id, capability)` at
+/// `record_id`, and it snapshots the inherited policy first so the boundary
+/// keeps exactly the reach it had (plus the guest). That snapshot creates an
+/// explicit boundary, freezing inheritance at `record_id`: reach is exact at
+/// write time, but a later tightening of a parent policy will not propagate
+/// through the copied entries. This is inherent to a per-account entry and
+/// must not be "optimised" into an inherited lookup. Idempotent: if the
+/// account already holds at least `capability`, no write is made, which is
+/// what makes a failed-arrival retry safe.
+///
+/// [`retarget_account_grant`] is the arrival path: it also strips the account's
+/// entry at any *other* boundary so a guest who redeems a second link does not
+/// keep the first link's reach.
+pub async fn add_account_grant(
+    db: &Db,
+    actor: &str,
+    record_id: &str,
+    account_id: &str,
+    capability: Capability,
+) -> Result<()> {
+    let mut tx = begin_write(db.write_pool()).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
+    let mut entries = effective_policy_entries_on(&mut tx, record_id).await?;
+    let already = entries.iter().any(|entry| {
+        matches!(&entry.subject, PolicySubject::Account(account) if account == account_id)
+            && entry.capability >= capability
+    });
+    if already {
+        tx.rollback().await?;
+        return Ok(());
+    }
+    // Replace any weaker entry for this account with the requested capability;
+    // other subjects and the inherited baseline are untouched.
+    entries.retain(
+        |entry| !matches!(&entry.subject, PolicySubject::Account(account) if account == account_id),
+    );
+    entries.push(AllowEntry::account(account_id, capability));
+    replace_explicit_policy_on_with_reason(
+        &mut tx,
+        actor,
+        record_id,
+        entries,
+        ARRIVAL_GRANT_REASON,
+        &mut act_alloc,
+    )
+    .await?;
+    db.commit_authorization(tx).await?;
+    Ok(())
+}
+
+/// Repoint a guest's arrival grant to `record_id`, removing the entry a
+/// *previous arrival* left at its own scope. A guest who redeems a second link
+/// is retargeted onto the new link's scope, and without this the first link's
+/// `account` entry would survive its link and accumulate reach.
+///
+/// Only boundaries this account created through the arrival grant are
+/// stripped, identified by the grant's policy event. It deliberately does not
+/// sweep every policy boundary the account appears on: a per-guest guidance
+/// grant and any account entry an owner authored explicitly must survive.
+/// Every entry at an old boundary is preserved as an explicit policy snapshot,
+/// so no other subject's reach changes. Like [`add_account_grant`], this creates
+/// or rewrites explicit boundaries, which freezes inheritance at those records:
+/// reach is exact at write time, but a later tightening of a parent policy will
+/// not propagate through the copied entries. That is inherent to any
+/// per-account entry and must not be "optimised" into an inherited lookup.
+pub async fn retarget_account_grant(
+    db: &Db,
+    actor: &str,
+    record_id: &str,
+    account_id: &str,
+    capability: Capability,
+) -> Result<()> {
+    let mut tx = begin_write(db.write_pool()).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
+    let mut wrote = false;
+    let prior_anchors: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT record_id FROM policy_events
+          WHERE type = 'policy.replaced' AND actor = ? AND reason = ?",
+    )
+    .bind(account_id)
+    .bind(ARRIVAL_GRANT_REASON)
+    .fetch_all(&mut *tx)
+    .await?;
+    for anchor in prior_anchors {
+        if anchor == record_id {
+            continue;
+        }
+        let live: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM records WHERE id = ? AND deleted_at IS NULL)",
+        )
+        .bind(&anchor)
+        .fetch_one(&mut *tx)
+        .await?;
+        let present: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM policy_entries
+              WHERE policy_anchor_id = ? AND subject_kind = 'account' AND subject_id = ?)",
+        )
+        .bind(&anchor)
+        .bind(account_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !live || !present {
+            continue;
+        }
+        let entries = effective_policy_entries_on(&mut tx, &anchor).await?;
+        let retained: Vec<AllowEntry> = entries
+            .into_iter()
+            .filter(|entry| {
+                !matches!(&entry.subject, PolicySubject::Account(account) if account == account_id)
+            })
+            .collect();
+        if retained.is_empty() {
+            // The guest entry was the only thing keeping an explicit boundary
+            // here; restoring inheritance preserves the parent reach that
+            // existed before the arrival grant.
+            restore_inheritance_on_with_reason(
+                &mut tx,
+                actor,
+                &anchor,
+                "retarget guest scope grant",
+                &mut act_alloc,
+            )
+            .await?;
+        } else {
+            replace_explicit_policy_on_with_reason(
+                &mut tx,
+                actor,
+                &anchor,
+                retained,
+                "retarget guest scope grant",
+                &mut act_alloc,
+            )
+            .await?;
+        }
+        wrote = true;
+    }
+    let mut entries = effective_policy_entries_on(&mut tx, record_id).await?;
+    let already = entries.iter().any(|entry| {
+        matches!(&entry.subject, PolicySubject::Account(account) if account == account_id)
+            && entry.capability >= capability
+    });
+    if !already {
+        entries.retain(
+            |entry| !matches!(&entry.subject, PolicySubject::Account(account) if account == account_id),
+        );
+        entries.push(AllowEntry::account(account_id, capability));
+        replace_explicit_policy_on_with_reason(
+            &mut tx,
+            actor,
+            record_id,
+            entries,
+            ARRIVAL_GRANT_REASON,
+            &mut act_alloc,
+        )
+        .await?;
+        wrote = true;
+    }
+    if wrote {
+        db.commit_authorization(tx).await?;
+    } else {
+        // A pure re-run of the arrival grant makes no change; roll back the
+        // read transaction exactly as `add_account_grant` does, so a repaired
+        // retry neither writes nor wakes authorization readers.
+        tx.rollback().await?;
+    }
     Ok(())
 }
 
@@ -1323,6 +1501,7 @@ pub async fn replace_explicit_policy_on(
     actor: &str,
     record_id: &str,
     entries: Vec<AllowEntry>,
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<()> {
     replace_explicit_policy_on_with_reason(
         tx,
@@ -1330,6 +1509,7 @@ pub async fn replace_explicit_policy_on(
         record_id,
         entries,
         "policy replacement through the engine API",
+        act_alloc,
     )
     .await?;
     Ok(())
@@ -1342,6 +1522,7 @@ pub(crate) async fn replace_explicit_policy_on_with_reason(
     record_id: &str,
     entries: Vec<AllowEntry>,
     reason: &str,
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<crate::policy::PolicyEventRow> {
     crate::policy::validate_authored_actor(actor)?;
     let entries = normalize_entries(entries)?;
@@ -1356,7 +1537,8 @@ pub(crate) async fn replace_explicit_policy_on_with_reason(
             "record '{record_id}' not found or is deleted"
         )));
     }
-    let event = crate::policy::append_replaced_in(tx, record_id, entries, actor, reason).await?;
+    let event =
+        crate::policy::append_replaced_in(tx, record_id, entries, actor, reason, act_alloc).await?;
     refresh_policy_anchor_subtree(tx, record_id).await?;
     Ok(event)
 }
@@ -1365,7 +1547,8 @@ pub(crate) async fn replace_explicit_policy_on_with_reason(
 /// every independently rooted tree must terminate at an explicit policy.
 pub async fn restore_inheritance(db: &Db, actor: &str, record_id: &str) -> Result<()> {
     let mut tx = begin_write(db.write_pool()).await?;
-    restore_inheritance_on(&mut tx, actor, record_id).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
+    restore_inheritance_on(&mut tx, actor, record_id, &mut act_alloc).await?;
     db.commit_authorization(tx).await?;
     Ok(())
 }
@@ -1377,12 +1560,14 @@ pub async fn restore_inheritance_on(
     tx: &mut Transaction<'_, Sqlite>,
     actor: &str,
     record_id: &str,
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<()> {
     restore_inheritance_on_with_reason(
         tx,
         actor,
         record_id,
         "inheritance restoration through the engine API",
+        act_alloc,
     )
     .await?;
     Ok(())
@@ -1394,6 +1579,7 @@ pub(crate) async fn restore_inheritance_on_with_reason(
     actor: &str,
     record_id: &str,
     reason: &str,
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<crate::policy::PolicyEventRow> {
     crate::policy::validate_authored_actor(actor)?;
     if record_id == ROOT_RECORD_ID {
@@ -1416,7 +1602,9 @@ pub(crate) async fn restore_inheritance_on_with_reason(
             "record '{record_id}' does not have an explicit policy"
         )));
     }
-    let event = crate::policy::append_inheritance_restored_in(tx, record_id, actor, reason).await?;
+    let event =
+        crate::policy::append_inheritance_restored_in(tx, record_id, actor, reason, act_alloc)
+            .await?;
     refresh_policy_anchor_subtree(tx, record_id).await?;
     Ok(event)
 }
@@ -1762,6 +1950,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn guest_caller_keeps_account_grants_without_the_members_baseline() {
+        let db = create_database(":memory:").await.unwrap();
+        create_account(&db, ALICE_ID, "acct_alice").await;
+        create_account(&db, BEA_ID, "acct_bea").await;
+        create(&db, TEAM_ID, ROOT_RECORD_ID, Some(ALICE_ID)).await;
+        replace_explicit_policy(
+            &db,
+            "test:policy",
+            TEAM_ID,
+            vec![AllowEntry::account("acct_bea", Capability::View)],
+        )
+        .await
+        .unwrap();
+
+        // The Caller seam: a default or member-folded caller carries the
+        // baseline, a guest-folded caller does not, and local keeps bypass.
+        let default_caller = crate::mcp::Caller::authenticated("acct_bea");
+        assert!(crate::mcp::tools::principal(&default_caller).is_member);
+        let member_caller = crate::mcp::Caller::authenticated("acct_bea").with_hosting_member(true);
+        assert!(crate::mcp::tools::principal(&member_caller).is_member);
+        let guest_caller = crate::mcp::Caller::authenticated("acct_bea").with_hosting_member(false);
+        assert!(!crate::mcp::tools::principal(&guest_caller).is_member);
+
+        assert_eq!(
+            effective_capability(
+                &db,
+                crate::mcp::tools::principal(&member_caller),
+                ROOT_RECORD_ID
+            )
+            .await
+            .unwrap(),
+            Capability::Edit,
+            "member footing matches the native:members baseline"
+        );
+        assert_eq!(
+            effective_capability(&db, crate::mcp::tools::principal(&guest_caller), TEAM_ID)
+                .await
+                .unwrap(),
+            Capability::View,
+            "guest footing resolves to the direct account grant only"
+        );
+        assert_eq!(
+            effective_capability(
+                &db,
+                crate::mcp::tools::principal(&guest_caller),
+                ROOT_RECORD_ID
+            )
+            .await
+            .unwrap(),
+            Capability::None,
+            "guest footing never matches the native:members baseline"
+        );
+    }
+
+    #[tokio::test]
     async fn replacement_inheritance_owner_floor_and_live_subjects_compose() {
         let db = create_database(":memory:").await.unwrap();
         create_account(&db, ALICE_ID, "acct_alice").await;
@@ -1967,6 +2210,7 @@ mod tests {
         .unwrap();
 
         let mut tx = begin_write(db.write_pool()).await.unwrap();
+        let mut act_alloc = crate::act::ActAllocation::new();
         require_capability_on(
             &mut tx,
             Principal::bound("acct_writer", false),
@@ -1984,6 +2228,7 @@ mod tests {
                 payload: json!({ "summary": "authorized atomically" }),
                 actor: Some("acct_writer".into()),
             },
+            &mut act_alloc,
         )
         .await
         .unwrap();

@@ -1273,6 +1273,7 @@ pub(super) async fn manage_mdx_modules(db: Db, caller: Caller, arguments: Value)
             let _permit =
                 mdx::try_admit().map_err(|failure| mdx_v2_engine_error(&module_id, failure))?;
             let mut tx = crate::db::begin_write(db.write_pool()).await?;
+            let mut act_alloc = crate::act::ActAllocation::new();
             require_record_in(&mut tx, &caller, TOOL, &module_id, Capability::Edit).await?;
             let predicate = identity_predicate("r", "Program", MODULE_KIND_VALUE_ID);
             let valid: bool = sqlx::query_scalar(&format!(
@@ -1435,17 +1436,21 @@ pub(super) async fn manage_mdx_modules(db: Db, caller: Caller, arguments: Value)
                     })?,
                     actor: Some(caller.actor().into()),
                 },
+                &mut act_alloc,
             )
             .await?;
             db.commit_content(tx).await?;
-            Ok(json!({
-                "status": "published", "module_id": module_id,
-                "publication_event_id": publication_event_id,
-                "local_event_seq": event.local_seq, "source_event_id": source_event_id,
-                "source_sha256": source_sha256, "release_sha256": release_sha256,
-                "dependency_closure_sha256": dependency_closure_sha256,
-                "release": { "release_core": release_core, "release_sha256": release_sha256 },
-            }))
+            Ok(echo_act(
+                json!({
+                    "status": "published", "module_id": module_id,
+                    "publication_event_id": publication_event_id,
+                    "local_event_seq": event.local_seq, "source_event_id": source_event_id,
+                    "source_sha256": source_sha256, "release_sha256": release_sha256,
+                    "dependency_closure_sha256": dependency_closure_sha256,
+                    "release": { "release_core": release_core, "release_sha256": release_sha256 },
+                }),
+                act_alloc.get(),
+            )?)
         }
         ManageMdxModulesArgs::Inspect {
             module_id,
@@ -1691,6 +1696,7 @@ pub(super) async fn update_release_status(
     replacement: Option<String>,
 ) -> Result<Value> {
     let mut tx = crate::db::begin_write(db.write_pool()).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
     require_record_in(
         &mut tx,
         caller,
@@ -1784,12 +1790,16 @@ pub(super) async fn update_release_status(
             })?,
             actor: Some(caller.actor().into()),
         },
+        &mut act_alloc,
     )
     .await?;
     db.commit_content(tx).await?;
-    Ok(json!({
-        "status": event_type.trim_start_matches("module.release_"),
-        "module_id": module_id, "publication_event_id": publication_event_id,
-        "replacement": replacement, "previous_seq": previous_seq,
-    }))
+    echo_act(
+        json!({
+            "status": event_type.trim_start_matches("module.release_"),
+            "module_id": module_id, "publication_event_id": publication_event_id,
+            "replacement": replacement, "previous_seq": previous_seq,
+        }),
+        act_alloc.get(),
+    )
 }

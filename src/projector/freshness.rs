@@ -225,6 +225,17 @@ pub(super) async fn project_unit_revision_recorded(
         .bind(&event.record_id)
         .execute(&mut *conn)
         .await?;
+    // A Unit revision is the fourth writer of `records.body`, so it must
+    // replace the record's body-mention rows exactly as `record.updated`
+    // does. The event's own sequence is the provenance: the backfill selects
+    // the latest `$.content.content`-bearing `unit.revision.recorded.v1`.
+    replace_record_mentions(
+        conn,
+        &event.record_id,
+        event.local_seq,
+        Some(payload.content.content.clone()),
+    )
+    .await?;
     if let Some(command) = payload.command.as_ref() {
         if command.operation != "revise_unit" {
             return Err(Error::engine(

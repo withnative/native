@@ -401,6 +401,7 @@ pub async fn seed_vocabularies(db: &Db) -> Result<()> {
     for (name, values) in SEED_VOCABULARIES {
         let vid = vocabulary_id(name);
         let mut tx = crate::db::begin_write(db.write_pool()).await?;
+        let mut act_alloc = crate::act::ActAllocation::new();
         let exists = sqlx::query("SELECT 1 FROM vocabularies WHERE id = ?")
             .bind(&vid)
             .fetch_optional(&mut *tx)
@@ -409,6 +410,7 @@ pub async fn seed_vocabularies(db: &Db) -> Result<()> {
             append_meta_in(
                 &mut tx,
                 MetaAppendSpec::with_payload(&vid, "vocabulary.created", json!({ "name": name })),
+                &mut act_alloc,
             )
             .await?;
         }
@@ -427,7 +429,14 @@ pub async fn seed_vocabularies(db: &Db) -> Result<()> {
                         .as_deref()
                         .is_none_or(|existing| existing.trim().is_empty())
                 }) {
-                    set_gloss_in(&mut tx, &value_id, Some(gloss), Some("engine:seed")).await?;
+                    set_gloss_in(
+                        &mut tx,
+                        &value_id,
+                        Some(gloss),
+                        Some("engine:seed"),
+                        &mut act_alloc,
+                    )
+                    .await?;
                 }
                 continue;
             }
@@ -448,6 +457,7 @@ pub async fn seed_vocabularies(db: &Db) -> Result<()> {
             append_meta_in(
                 &mut tx,
                 MetaAppendSpec::with_payload(&value_id, "vocab_value.proposed", payload),
+                &mut act_alloc,
             )
             .await?;
         }
@@ -459,6 +469,7 @@ pub async fn seed_vocabularies(db: &Db) -> Result<()> {
     // whole installation back.
     let manifest = core_kind_manifest()?;
     let mut tx = crate::db::begin_write(db.write_pool()).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
     let mut reconcile_proposed = HashSet::new();
     for record_type in SPINE_TYPES {
         let name = kind_vocabulary_name(record_type);
@@ -542,6 +553,7 @@ pub async fn seed_vocabularies(db: &Db) -> Result<()> {
             append_meta_in(
                 &mut tx,
                 MetaAppendSpec::with_payload(&vid, "vocabulary.created", json!({ "name": name })),
+                &mut act_alloc,
             )
             .await?;
         }
@@ -556,6 +568,7 @@ pub async fn seed_vocabularies(db: &Db) -> Result<()> {
                     &kind.value_id,
                     kind.metadata.clone(),
                     Some("engine:seed"),
+                    &mut act_alloc,
                 )
                 .await?;
                 set_gloss_in(
@@ -563,9 +576,11 @@ pub async fn seed_vocabularies(db: &Db) -> Result<()> {
                     &kind.value_id,
                     kind.gloss.as_deref(),
                     Some("engine:seed"),
+                    &mut act_alloc,
                 )
                 .await?;
-                promote_value_in(&mut tx, &kind.value_id, Some("engine:seed")).await?;
+                promote_value_in(&mut tx, &kind.value_id, Some("engine:seed"), &mut act_alloc)
+                    .await?;
                 continue;
             }
             let exists: bool =
@@ -586,6 +601,7 @@ pub async fn seed_vocabularies(db: &Db) -> Result<()> {
                 append_meta_in(
                     &mut tx,
                     MetaAppendSpec::with_payload(&kind.value_id, "vocab_value.proposed", payload),
+                    &mut act_alloc,
                 )
                 .await?;
             }
@@ -761,7 +777,8 @@ pub async fn create_vocabulary_as(
     actor: Option<&str>,
 ) -> Result<String> {
     let mut tx = crate::db::begin_write(db.write_pool()).await?;
-    let vid = create_vocabulary_in(&mut tx, name, id, actor).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
+    let vid = create_vocabulary_in(&mut tx, name, id, actor, &mut act_alloc).await?;
     tx.commit().await?;
     Ok(vid)
 }
@@ -771,6 +788,8 @@ pub(crate) async fn create_vocabulary_in(
     name: &str,
     id: Option<&str>,
     actor: Option<&str>,
+
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<String> {
     let vid = id.map(String::from).unwrap_or_else(|| vocabulary_id(name));
     if let Some(existing) = get_vocabulary_on(tx, &vid).await? {
@@ -792,6 +811,7 @@ pub(crate) async fn create_vocabulary_in(
         tx,
         MetaAppendSpec::with_payload(&vid, "vocabulary.created", json!({ "name": name }))
             .with_actor(actor),
+        act_alloc,
     )
     .await?;
     Ok(vid)
@@ -865,6 +885,7 @@ pub async fn propose_value_with_kind_metadata_as(
     actor: Option<&str>,
 ) -> Result<String> {
     let mut tx = crate::db::begin_write(db.write_pool()).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
     let id = propose_value_with_kind_metadata_in(
         &mut tx,
         vocabulary,
@@ -874,6 +895,7 @@ pub async fn propose_value_with_kind_metadata_as(
         terminality,
         kind_metadata,
         actor,
+        &mut act_alloc,
     )
     .await?;
     tx.commit().await?;
@@ -890,6 +912,8 @@ pub(crate) async fn propose_value_with_kind_metadata_in(
     terminality: VocabularyValueTerminality,
     kind_metadata: Option<KindMetadataV1>,
     actor: Option<&str>,
+
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<String> {
     if !ordinal.is_finite() {
         return Err(Error::engine("vocabulary value ordinal must be finite"));
@@ -968,6 +992,7 @@ pub(crate) async fn propose_value_with_kind_metadata_in(
             }),
         )
         .with_actor(actor),
+        act_alloc,
     )
     .await?;
     Ok(id)
@@ -980,7 +1005,8 @@ pub async fn set_value_metadata_as(
     actor: Option<&str>,
 ) -> Result<()> {
     let mut tx = crate::db::begin_write(db.write_pool()).await?;
-    set_value_metadata_in(&mut tx, id, metadata, actor).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
+    set_value_metadata_in(&mut tx, id, metadata, actor, &mut act_alloc).await?;
     tx.commit().await?;
     Ok(())
 }
@@ -990,6 +1016,8 @@ pub(crate) async fn set_value_metadata_in(
     id: &str,
     metadata: KindMetadataV1,
     actor: Option<&str>,
+
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<()> {
     metadata.validate()?;
     let value = get_value_on(tx, id).await?;
@@ -1012,6 +1040,7 @@ pub(crate) async fn set_value_metadata_in(
             json!({ "metadata": metadata }),
         )
         .with_actor(actor),
+        act_alloc,
     )
     .await?;
     Ok(())
@@ -1026,7 +1055,8 @@ pub async fn reorder_value(db: &Db, id: &str, ordinal: f64) -> Result<()> {
 
 pub async fn reorder_value_as(db: &Db, id: &str, ordinal: f64, actor: Option<&str>) -> Result<()> {
     let mut tx = crate::db::begin_write(db.write_pool()).await?;
-    reorder_value_in(&mut tx, id, ordinal, actor).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
+    reorder_value_in(&mut tx, id, ordinal, actor, &mut act_alloc).await?;
     tx.commit().await?;
     Ok(())
 }
@@ -1036,6 +1066,8 @@ pub(crate) async fn reorder_value_in(
     id: &str,
     ordinal: f64,
     actor: Option<&str>,
+
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<()> {
     if !ordinal.is_finite() {
         return Err(Error::engine("vocabulary value ordinal must be finite"));
@@ -1045,6 +1077,7 @@ pub(crate) async fn reorder_value_in(
         tx,
         MetaAppendSpec::with_payload(id, "vocab_value.reordered", json!({ "ordinal": ordinal }))
             .with_actor(actor),
+        act_alloc,
     )
     .await?;
     Ok(())
@@ -1073,7 +1106,8 @@ pub async fn set_gloss_as(
     actor: Option<&str>,
 ) -> Result<()> {
     let mut tx = crate::db::begin_write(db.write_pool()).await?;
-    set_gloss_in(&mut tx, id, gloss, actor).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
+    set_gloss_in(&mut tx, id, gloss, actor, &mut act_alloc).await?;
     tx.commit().await?;
     Ok(())
 }
@@ -1083,12 +1117,15 @@ pub(crate) async fn set_gloss_in(
     id: &str,
     gloss: Option<&str>,
     actor: Option<&str>,
+
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<()> {
     get_value_on(tx, id).await?;
     append_meta_in(
         tx,
         MetaAppendSpec::with_payload(id, "vocab_value.gloss_set", json!({ "gloss": gloss }))
             .with_actor(actor),
+        act_alloc,
     )
     .await?;
     Ok(())
@@ -1106,7 +1143,8 @@ pub async fn promote_value_as(db: &Db, id: &str, actor: Option<&str>) -> Result<
     // autocommit statements a concurrent delete could land between check and
     // append, committing an authoritative event against a value that is gone.
     let mut tx = crate::db::begin_write(db.write_pool()).await?;
-    promote_value_in(&mut tx, id, actor).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
+    promote_value_in(&mut tx, id, actor, &mut act_alloc).await?;
     tx.commit().await?;
     Ok(())
 }
@@ -1115,6 +1153,8 @@ pub(crate) async fn promote_value_in(
     tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
     id: &str,
     actor: Option<&str>,
+
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<()> {
     let value = get_value_on(tx, id).await?; // errors if missing
     let vocab = get_vocabulary_on(tx, &value.vocabulary_id).await?;
@@ -1135,6 +1175,7 @@ pub(crate) async fn promote_value_in(
     append_meta_in(
         tx,
         MetaAppendSpec::bare(id, "vocab_value.promoted").with_actor(actor),
+        act_alloc,
     )
     .await?;
     Ok(())
@@ -1161,7 +1202,9 @@ pub async fn deprecate_value_with_quarantine_count_as(
     actor: Option<&str>,
 ) -> Result<i64> {
     let mut tx = crate::db::begin_write(db.write_pool()).await?;
-    let records_quarantined = deprecate_value_with_quarantine_count_in(&mut tx, id, actor).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
+    let records_quarantined =
+        deprecate_value_with_quarantine_count_in(&mut tx, id, actor, &mut act_alloc).await?;
     tx.commit().await?;
     Ok(records_quarantined)
 }
@@ -1170,6 +1213,8 @@ pub(crate) async fn deprecate_value_with_quarantine_count_in(
     tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
     id: &str,
     actor: Option<&str>,
+
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<i64> {
     let value = get_value_on(tx, id).await?;
     if value.status == "deprecated" {
@@ -1207,6 +1252,7 @@ pub(crate) async fn deprecate_value_with_quarantine_count_in(
     append_meta_in(
         tx,
         MetaAppendSpec::bare(id, "vocab_value.deprecated").with_actor(actor),
+        act_alloc,
     )
     .await?;
     Ok(records_quarantined)
@@ -1227,7 +1273,8 @@ pub async fn alias_value_as(
     actor: Option<&str>,
 ) -> Result<()> {
     let mut tx = crate::db::begin_write(db.write_pool()).await?;
-    alias_value_in(&mut tx, id, canonical_id, actor).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
+    alias_value_in(&mut tx, id, canonical_id, actor, &mut act_alloc).await?;
     tx.commit().await?;
     Ok(())
 }
@@ -1237,6 +1284,8 @@ pub(crate) async fn alias_value_in(
     id: &str,
     canonical_id: &str,
     actor: Option<&str>,
+
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<()> {
     if id == canonical_id {
         return Err(Error::engine(format!(
@@ -1277,6 +1326,7 @@ pub(crate) async fn alias_value_in(
             json!({ "alias_of": canonical_id }),
         )
         .with_actor(actor),
+        act_alloc,
     )
     .await?;
     Ok(())
@@ -1395,7 +1445,8 @@ pub async fn delete_value(db: &Db, id: &str) -> Result<()> {
 
 pub async fn delete_value_as(db: &Db, id: &str, actor: Option<&str>) -> Result<()> {
     let mut tx = crate::db::begin_write(db.write_pool()).await?;
-    delete_value_in(&mut tx, id, actor).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
+    delete_value_in(&mut tx, id, actor, &mut act_alloc).await?;
     tx.commit().await?;
     Ok(())
 }
@@ -1404,6 +1455,8 @@ pub(crate) async fn delete_value_in(
     tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
     id: &str,
     actor: Option<&str>,
+
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<()> {
     let value = get_value_on(tx, id).await?;
     let vocab = get_vocabulary_on(tx, &value.vocabulary_id).await?;
@@ -1461,6 +1514,7 @@ pub(crate) async fn delete_value_in(
     append_meta_in(
         tx,
         MetaAppendSpec::bare(id, "vocab_value.deleted").with_actor(actor),
+        act_alloc,
     )
     .await?;
     Ok(())
@@ -1484,7 +1538,8 @@ pub async fn delete_vocabulary(db: &Db, id_or_name: &str) -> Result<()> {
 
 pub async fn delete_vocabulary_as(db: &Db, id_or_name: &str, actor: Option<&str>) -> Result<()> {
     let mut tx = crate::db::begin_write(db.write_pool()).await?;
-    delete_vocabulary_in(&mut tx, id_or_name, actor).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
+    delete_vocabulary_in(&mut tx, id_or_name, actor, &mut act_alloc).await?;
     tx.commit().await?;
     Ok(())
 }
@@ -1493,6 +1548,8 @@ pub(crate) async fn delete_vocabulary_in(
     tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
     id_or_name: &str,
     actor: Option<&str>,
+
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<()> {
     let Some(vocab) = get_vocabulary_on(tx, id_or_name).await? else {
         return Err(Error::engine(format!(
@@ -1548,6 +1605,7 @@ pub(crate) async fn delete_vocabulary_in(
     append_meta_in(
         tx,
         MetaAppendSpec::bare(&vocab.id, "vocabulary.deleted").with_actor(actor),
+        act_alloc,
     )
     .await?;
     Ok(())

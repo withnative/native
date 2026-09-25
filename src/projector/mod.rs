@@ -690,7 +690,7 @@ async fn replay_with_blob_source(
 
     for (blob_id, hydrate) in blob_ids {
         sqlx::query(
-            "INSERT INTO blobs (id, storage_tier, external_ref, created_at)
+            "INSERT OR IGNORE INTO blobs (id, storage_tier, external_ref, created_at)
              VALUES (?, 'external', 'replay-placeholder', '1970-01-01T00:00:00.000Z')",
         )
         .bind(&blob_id)
@@ -733,8 +733,8 @@ async fn replay_with_blob_source(
         sqlx::query(
             "INSERT INTO content_events
                 (seq,id,record_id,type,payload,actor,run_key,parent_key,intent,created_at,
-                 causal_envelope_version,causal_status)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                 causal_envelope_version,causal_status,act)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
         )
         .bind(event.local_seq)
         .bind(&event.id)
@@ -748,6 +748,7 @@ async fn replay_with_blob_source(
         .bind(&event.created_at)
         .bind(event.causal_envelope.version().as_i64())
         .bind(event.causal_envelope.status().as_str())
+        .bind(event.act)
         .execute(&mut *conn)
         .await?;
         for parent_event_id in event.causal_envelope.frontier().as_slice() {
@@ -772,8 +773,8 @@ async fn replay_with_blob_source(
         .unwrap_or(0);
     sqlx::query(
         "UPDATE content_event_causal_cutover
-            SET last_legacy_local_seq=?,
-                from_engine_schema=CASE WHEN ? > 0 THEN 45 ELSE NULL END
+            SET last_legacy_local_seq=MAX(last_legacy_local_seq, ?),
+                from_engine_schema=CASE WHEN MAX(last_legacy_local_seq, ?) > 0 THEN 45 ELSE NULL END
           WHERE singleton=1",
     )
     .bind(last_legacy_local_seq)
@@ -948,6 +949,63 @@ async fn apply_record_created(
             .await?;
         }
     }
+    replace_record_mentions(
+        conn,
+        &event.record_id,
+        event.local_seq,
+        fields.get("body").and_then(crate::record_body::coerce_body),
+    )
+    .await?;
+    Ok(())
+}
+
+/// Replace the current-state body-mention rows for one record (plan a9392df
+/// slice 2: evidence-only projection, read-time resolution in slice 3).
+///
+/// `record_mentions` is a pure function of the record's current body: every
+/// fold path deletes the source's rows first and then inserts the scan of the
+/// new body, so live folding, migration backfill and event replay converge on
+/// identical contents. The body is already the canonical stored text
+/// (`record_body::coerce_body`), so a non-string JSON body is scanned as the
+/// JSON text the `records.body` column holds. A missing, null or empty body
+/// leaves no rows. `source_event_seq` is the sequence of the event that
+/// supplied the current body — the provenance the backfill reconstructs as the
+/// latest body-carrying event.
+async fn replace_record_mentions(
+    conn: &mut SqliteConnection,
+    source_id: &str,
+    source_event_seq: i64,
+    body: Option<String>,
+) -> Result<()> {
+    sqlx::query("DELETE FROM record_mentions WHERE source_id = ?")
+        .bind(source_id)
+        .execute(&mut *conn)
+        .await?;
+    let Some(body) = body else {
+        return Ok(());
+    };
+    if body.is_empty() {
+        return Ok(());
+    }
+    for (occurrence_ix, occurrence) in crate::mentions::scan_body(&body).iter().enumerate() {
+        sqlx::query(
+            "INSERT INTO record_mentions
+               (source_id, occurrence_ix, source_event_seq, span_start, span_end,
+                authored_reference, lookup_key, form, parser_version)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(source_id)
+        .bind(occurrence_ix as i64)
+        .bind(source_event_seq)
+        .bind(occurrence.span_start as i64)
+        .bind(occurrence.span_end as i64)
+        .bind(&occurrence.authored_reference)
+        .bind(&occurrence.lookup_key)
+        .bind(occurrence.form.as_str())
+        .bind(crate::mentions::MENTION_PARSER_VERSION)
+        .execute(&mut *conn)
+        .await?;
+    }
     Ok(())
 }
 
@@ -991,6 +1049,25 @@ async fn apply_record_updated(
     push_json_arg(&mut args, &Value::String(event.created_at.clone()))?;
     push_json_arg(&mut args, &Value::String(event.record_id.clone()))?;
     sqlx::query_with(&sql, args).execute(&mut *conn).await?;
+    // Body-mention rows follow the body column only. An update that carries
+    // no `RecordFieldUpdate::Body` leaves `record_mentions` untouched: the
+    // rows still describe the current body and their `source_event_seq` still
+    // names the event that supplied it. A carried body — including an
+    // explicit null, an empty replacement, or a non-string JSON value the
+    // column stores as text — folds through the same delete-then-scan
+    // replacement as creation, so removal yields no rows.
+    if let Some(body) = fields.iter().find_map(|field| match field {
+        RecordFieldUpdate::Body(value) => Some(value),
+        _ => None,
+    }) {
+        replace_record_mentions(
+            conn,
+            &event.record_id,
+            event.local_seq,
+            crate::record_body::coerce_body(body),
+        )
+        .await?;
+    }
     if refresh_policy_anchor {
         crate::authorization::refresh_policy_anchor_subtree(conn, &event.record_id).await?;
     }
@@ -1012,6 +1089,12 @@ async fn apply_record_deleted(conn: &mut SqliteConnection, event: &EventRow) -> 
         .bind(&event.record_id)
         .execute(&mut *conn)
         .await?;
+    // A tombstone is a soft delete (`UPDATE records SET deleted_at=...`), so
+    // the `record_mentions` foreign key's `ON DELETE CASCADE` never fires.
+    // Delete the source's rows explicitly: a deleted record has no current
+    // body and the backfill excludes it, so any retained row would be a
+    // replay divergence.
+    replace_record_mentions(conn, &event.record_id, event.local_seq, None).await?;
     Ok(())
 }
 

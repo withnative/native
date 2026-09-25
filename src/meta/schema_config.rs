@@ -599,6 +599,7 @@ pub(crate) async fn append_prepared_user_schema_config_in(
     tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
     prepared: PreparedUserSchemaConfigWrite,
     actor: Option<&str>,
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<String> {
     let PreparedUserSchemaConfigWrite {
         id,
@@ -629,6 +630,7 @@ pub(crate) async fn append_prepared_user_schema_config_in(
             }),
         )
         .with_actor(actor),
+        act_alloc,
     )
     .await?;
     Ok(id)
@@ -664,7 +666,9 @@ pub async fn write_user_schema_config_as(
     // The check and the append share one write transaction, so a concurrent
     // pack seed cannot land between them.
     let mut tx = crate::db::begin_write(db.write_pool()).await?;
-    let id = append_prepared_user_schema_config_in(&mut tx, prepared, actor).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
+    let id =
+        append_prepared_user_schema_config_in(&mut tx, prepared, actor, &mut act_alloc).await?;
     tx.commit().await?;
     Ok(id)
 }
@@ -691,6 +695,7 @@ pub async fn seed_pack_schema_config(
     // (for example Message expectation requiredness) without rewriting user
     // records or pretending the pack row is immutable application data.
     let mut tx = crate::db::begin_write(db.write_pool()).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
     let existing = sqlx::query(
         "SELECT layer, name, data, version_lineage, applies_to_collection_id
            FROM schema_config WHERE id = ?",
@@ -740,6 +745,7 @@ pub async fn seed_pack_schema_config(
                     "applies_to_collection_id": &opts.applies_to_collection_id,
                 }),
             ),
+            &mut act_alloc,
         )
         .await?;
     }

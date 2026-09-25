@@ -542,6 +542,7 @@ async fn append_authorized(
     payload: DerivationEventPayload,
 ) -> Result<DerivationEventRow> {
     let mut tx = begin_write(db.write_pool()).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
     let event = append_authorized_in(
         &mut tx,
         principal,
@@ -552,6 +553,7 @@ async fn append_authorized(
         target,
         capability,
         payload,
+        &mut act_alloc,
     )
     .await?;
     tx.commit().await?;
@@ -569,6 +571,7 @@ async fn append_authorized_in(
     target: &DerivationTarget,
     capability: Capability,
     payload: DerivationEventPayload,
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<DerivationEventRow> {
     require_actor(principal, &actor)?;
     crate::authorization::require_capability_on(tx, principal, &target.record_id, capability)
@@ -581,11 +584,13 @@ async fn append_authorized_in(
     let event = append_derivation_event_in(
         tx,
         NewDerivationEvent::authored(idempotency_key, actor, run_key, reason, payload)?,
+        act_alloc,
     )
     .await?;
     Ok(event)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn confirm_revision_in(
     tx: &mut Transaction<'_, Sqlite>,
     principal: Principal<'_>,
@@ -594,6 +599,7 @@ pub(crate) async fn confirm_revision_in(
     run_key: Option<String>,
     reason: String,
     confirmation: RevisionConfirmed,
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<DerivationEventRow> {
     let target = confirmation.target.clone();
     append_authorized_in(
@@ -606,10 +612,12 @@ pub(crate) async fn confirm_revision_in(
         &target,
         Capability::Edit,
         DerivationEventPayload::RevisionConfirmed(confirmation),
+        act_alloc,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn retract_confirmation_in(
     tx: &mut Transaction<'_, Sqlite>,
     principal: Principal<'_>,
@@ -618,6 +626,7 @@ pub(crate) async fn retract_confirmation_in(
     run_key: Option<String>,
     reason: String,
     retraction: ConfirmationRetracted,
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<DerivationEventRow> {
     let target = retraction.target.clone();
     append_authorized_in(
@@ -630,6 +639,7 @@ pub(crate) async fn retract_confirmation_in(
         &target,
         Capability::Edit,
         DerivationEventPayload::ConfirmationRetracted(retraction),
+        act_alloc,
     )
     .await
 }

@@ -454,6 +454,7 @@ async fn comment_targets_enforce_root_bearer_and_body_invariants() {
         intent: None,
         created_at: "2026-08-10T12:00:00.000Z".into(),
         causal_envelope: native_ce::events::CausalEnvelopeV1::default(),
+        act: None,
     });
     let scratch = replay_db().await;
     let mut conn = crate::common::fixture_write_pool(&scratch)
@@ -762,6 +763,7 @@ async fn removing_a_citation_target_cannot_promote_it_into_a_comment() {
         intent: None,
         created_at: "2026-08-10T12:00:01.000Z".into(),
         causal_envelope: native_ce::events::CausalEnvelopeV1::default(),
+        act: None,
     });
     let scratch = replay_db().await;
     let scratch_pool = crate::common::fixture_write_pool(&scratch).await;

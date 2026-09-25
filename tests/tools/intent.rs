@@ -70,7 +70,9 @@ async fn set_intent_echoes_and_includes_its_pending_declaration_without_touches(
     .await;
 
     assert_eq!(result["accepted_intent"], intent);
-    assert_eq!(result["briefing_version"], 1);
+    // v2: a declaration's `touched_records` now folds DECLARED sources rather
+    // than touched records, so the response family version moved.
+    assert_eq!(result["briefing_version"], 2);
     assert_eq!(result["run_context"]["intent"], intent);
     assert_eq!(result["briefing"]["resume"], Value::Null);
     assert!(result["briefing"].get("divergence").is_none());
@@ -256,7 +258,7 @@ async fn close_run_is_explicit_caller_bound_and_idempotent() {
     .unwrap();
     assert_eq!(close_events, 1);
     let start_events: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM control_events WHERE type='agent_run.started.v1' AND run_key=?",
+        "SELECT count(*) FROM control_events WHERE type='agent_run.started.v2' AND run_key=?",
     )
     .bind(RUN)
     .fetch_one(db.pool())
@@ -582,11 +584,13 @@ async fn agent_key_minting_and_displaced_key_nudge_obey_agent_boundaries() {
             .as_str()
             .is_some_and(|note| note.contains("may have displaced"))));
 
+    // A full-key dashboard read alone no longer establishes retained run
+    // evidence. A declaration does, and remains eligible for the nudge.
     call(
         &registry,
         &db,
-        "get_dashboard",
-        json!({ "run_key": "scout-chair-j9e00t" }),
+        "set_intent",
+        json!({ "intent": "Earlier run", "run_key": "scout-chair-j9e00t" }),
     )
     .await;
     sqlx::query(
@@ -607,6 +611,16 @@ async fn agent_key_minting_and_displaced_key_nudge_obey_agent_boundaries() {
     assert!(notes.iter().any(|note| note
         .as_str()
         .is_some_and(|note| note.contains("scout-chair-j9e00t"))));
+
+    // The nudge is advisory on a disposable read. Bootstrap persists this
+    // run's issuance so the next call knows the key has been adopted.
+    call(
+        &registry,
+        &db,
+        "bootstrap",
+        json!({ "run_key": "scout-chair-j9e0t0" }),
+    )
+    .await;
 
     let second = call(
         &registry,
@@ -641,20 +655,21 @@ async fn agent_key_minting_and_displaced_key_nudge_obey_agent_boundaries() {
     call(
         &registry,
         &db,
-        "get_dashboard",
-        json!({ "run_key": "ranger-chair-j9e00t" }),
+        "set_intent",
+        json!({ "intent": "Earlier ranger run", "run_key": "ranger-chair-j9e00t" }),
     )
     .await;
     let failed_prior = registry
         .call_detailed(
             db.clone(),
             Caller::authenticated("acct:test"),
-            "get_dashboard",
-            json!({ "run_key": "ranger-chair-k9e00t", "unknown": true }),
+            "set_intent",
+            json!({ "intent": "Rejected ranger run", "run_key": "ranger-chair-k9e00t", "unknown": true }),
         )
         .await
         .unwrap();
     assert!(failed_prior.outcome.is_err());
+    db.drain_captures_for_tests().await;
     sqlx::query(
         "UPDATE read_log_calls
             SET ended_at = CASE run_key
@@ -684,7 +699,7 @@ async fn agent_key_minting_and_displaced_key_nudge_obey_agent_boundaries() {
     call(
         &registry,
         &db,
-        "get_dashboard",
+        "bootstrap",
         json!({ "run_key": "heron-chair-a748b2" }),
     )
     .await;
@@ -710,6 +725,30 @@ async fn agent_key_minting_and_displaced_key_nudge_obey_agent_boundaries() {
         .any(|note| note
             .as_str()
             .is_some_and(|note| note.contains("may have displaced"))));
+}
+
+#[tokio::test]
+async fn an_unissued_pure_read_key_is_not_a_resumable_prior_run() {
+    let db = create_database(":memory:").await.unwrap();
+    let registry = registry();
+    let prior = "heron-chair-c748b2";
+    let current = "heron-chair-d748b2";
+    call(&registry, &db, "get_dashboard", json!({ "run_key": prior })).await;
+    let retained: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM read_log_calls WHERE run_key=?")
+        .bind(prior)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(retained, 0);
+    let declared = call(
+        &registry,
+        &db,
+        "set_intent",
+        json!({ "intent": "New run", "run_key": current }),
+    )
+    .await;
+    assert_eq!(declared["briefing"]["resume"], Value::Null);
+    db.close().await;
 }
 
 #[tokio::test]
@@ -898,11 +937,12 @@ async fn briefing_is_bounded_agent_scoped_and_contains_no_raw_trace_content() {
     .await;
 
     // Persist the current run's lineage before set_intent, whose own call row
-    // is captured only after its briefing has been built.
+    // is captured only after its briefing has been built. Bootstrap is the
+    // retained run-issuance surface; a dashboard read is disposable.
     call(
         &registry,
         &db,
-        "get_dashboard",
+        "bootstrap",
         json!({ "run_key": current, "parent_key": prior }),
     )
     .await;
@@ -924,13 +964,18 @@ async fn briefing_is_bounded_agent_scoped_and_contains_no_raw_trace_content() {
     assert_eq!(resume_declarations["truncated"], true);
     assert_eq!(resume_declarations["items"][0]["intent"], "Prior 2");
     assert_eq!(resume_declarations["items"][9]["intent"], "Prior 11");
-    assert!(
-        resume_declarations["items"][9]["touched_records"]["total_count"]
-            .as_u64()
-            .unwrap()
-            >= 21
+    // Per-declaration lists fold DECLARED sources from content events, not
+    // touches: nothing here was declared, so every episode is empty even
+    // though the run-level touch list below stays at full strength.
+    assert_eq!(
+        resume_declarations["items"][9]["touched_records"]["total_count"],
+        0
     );
     let touched = &result["briefing"]["resume"]["touched_records"];
+    assert_eq!(
+        result["briefing"]["resume"]["touched_records_completeness"],
+        "retained_rows_only"
+    );
     assert!(touched["total_count"].as_u64().unwrap() >= 21);
     assert_eq!(touched["items"].as_array().unwrap().len(), 20);
     assert_eq!(touched["truncated"], true);
@@ -958,6 +1003,7 @@ async fn briefing_is_bounded_agent_scoped_and_contains_no_raw_trace_content() {
     for expected in [
         "Briefing availability: available",
         "Resume declarations: 10 returned of 12; producer window truncated",
+        "Resume touches cover retained rows only; omitted reads may have occurred.",
         "Resume touched records: 20 returned of",
         "Resume left non-terminal: 20 returned of",
         "Working-under end: \"rooted\" (complete rooted path)",
@@ -1425,11 +1471,14 @@ async fn briefing_omits_records_whose_access_was_revoked_after_touch_and_claim()
     let before_declarations = before_resume["declarations"]["items"].as_array().unwrap();
     let after_declarations = resume["declarations"]["items"].as_array().unwrap();
     assert_eq!(after_declarations.len(), before_declarations.len());
+    // Per-declaration lists fold declared sources, not touches, and this run
+    // declared nothing: both sides are empty, and revocation visibility for
+    // declarations is covered where declarations exist. The revoked record's
+    // absence from the briefing below still holds through the run-level
+    // touch list and the open claims, which stay touch- and claim-based.
     for (before, after) in before_declarations.iter().zip(after_declarations) {
-        assert_eq!(
-            after["touched_records"]["total_count"].as_u64().unwrap() + 1,
-            before["touched_records"]["total_count"].as_u64().unwrap()
-        );
+        assert_eq!(before["touched_records"]["total_count"], 0);
+        assert_eq!(after["touched_records"]["total_count"], 0);
     }
     assert_eq!(
         resumed["briefing"]["open_claims"]["total_count"]
@@ -1752,25 +1801,24 @@ async fn other_principal_claim(
     id
 }
 
-async fn touch(registry: &ToolRegistry, db: &Db, id: &str, run_key: &str) {
-    registry
-        .call(
-            db.clone(),
-            Caller::authenticated("acct:test"),
-            "get_record",
-            json!({ "ids": [id], "run_key": run_key }),
-        )
-        .await
-        .unwrap();
+async fn declare_overlap_source(registry: &ToolRegistry, db: &Db, id: &str, run_key: &str) {
+    declare_write(
+        registry,
+        db,
+        run_key,
+        "overlap basis",
+        json!([{ "record_id": id, "reason": "work basis" }]),
+    )
+    .await;
 }
 
 #[tokio::test]
-async fn overlapping_claims_names_a_touched_record_claimed_by_another_principal() {
+async fn overlapping_claims_names_a_declared_source_claimed_by_another_principal() {
     let db = create_database(":memory:").await.unwrap();
     let registry = registry();
 
     let held = other_principal_claim(&registry, &db, "Held elsewhere", OTHER_RUN).await;
-    touch(&registry, &db, &held, RUN).await;
+    declare_overlap_source(&registry, &db, &held, RUN).await;
 
     let result = call(
         &registry,
@@ -1851,7 +1899,7 @@ async fn overlapping_claims_caps_anchors_at_ten_and_flags_truncation() {
             .push(other_principal_claim(&registry, &db, &format!("Held {index}"), &run_key).await);
     }
     for id in &held_ids {
-        touch(&registry, &db, id, RUN).await;
+        declare_overlap_source(&registry, &db, id, RUN).await;
     }
 
     let result = call(
@@ -1882,4 +1930,895 @@ async fn overlapping_claims_caps_anchors_at_ten_and_flags_truncation() {
         rendered.contains("Overlapping claims: 10 returned of 12; producer window truncated"),
         "{rendered}"
     );
+}
+
+#[tokio::test]
+async fn set_intent_declared_model_confirmation_records_first_declaration() {
+    let db = create_database(":memory:").await.unwrap();
+    let registry = registry();
+    // An unrecognised string is still the claim that was made: stored
+    // exactly as given, never normalised or rejected against a list.
+    let model = "definitely-not-a-known-model-zzz";
+
+    let result = call(
+        &registry,
+        &db,
+        "set_intent",
+        json!({ "intent": "Declare under test.", "model": model, "run_key": RUN }),
+    )
+    .await;
+    assert_eq!(result["declared_model"]["declared"], model);
+    assert_eq!(result["declared_model"]["recorded"], model);
+    assert_eq!(result["declared_model"]["refused"], false);
+    let note = result["declared_model"]["note"].as_str().unwrap();
+    assert!(
+        note.contains("Recorded 'definitely-not-a-known-model-zzz'"),
+        "{note}"
+    );
+    // The honesty payload travels in the response itself.
+    assert!(note.contains("mid-run model switch"), "{note}");
+    assert!(note.contains("no launcher-independent source"), "{note}");
+    assert!(note.contains("grants no capability"), "{note}");
+    assert!(
+        note.contains("does not affect routing, permission, gating or rendering priority"),
+        "{note}"
+    );
+
+    let stored: Option<String> =
+        sqlx::query_scalar("SELECT reported_model FROM agent_runs WHERE run_key=?")
+            .bind(RUN)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(stored.as_deref(), Some(model));
+
+    // Repeating the recorded value is benign and confirms the same record.
+    let repeat = call(
+        &registry,
+        &db,
+        "set_intent",
+        json!({ "intent": "Declare again.", "model": model, "run_key": RUN }),
+    )
+    .await;
+    assert_eq!(repeat["declared_model"]["recorded"], model);
+    assert!(
+        repeat["declared_model"]["note"]
+            .as_str()
+            .unwrap()
+            .contains("already records declared model"),
+        "{}",
+        repeat["declared_model"]["note"]
+    );
+
+    // A differing second declaration is refused in the response — while the
+    // call itself still succeeds: the new intent lands (the reviewer's probe:
+    // "Aim two" replaces "Aim one") and the briefing is returned, but the
+    // recorded model is unchanged.
+    let diverged = registry
+        .call_detailed(
+            db.clone(),
+            Caller::authenticated("acct:test"),
+            "set_intent",
+            crate::common::with_test_reason(
+                "set_intent",
+                json!({ "intent": "Aim two, materially changed.", "model": "another-model", "run_key": RUN }),
+            ),
+        )
+        .await
+        .unwrap();
+    assert!(diverged.outcome.is_ok());
+    let body = diverged.outcome.unwrap();
+    assert_eq!(
+        body.structured["accepted_intent"],
+        "Aim two, materially changed."
+    );
+    assert_eq!(
+        body.structured["declared_model"]["declared"],
+        "another-model"
+    );
+    assert_eq!(
+        body.structured["declared_model"]["recorded"],
+        "definitely-not-a-known-model-zzz"
+    );
+    assert_eq!(body.structured["declared_model"]["refused"], true);
+    let refusal_note = body.structured["declared_model"]["note"].as_str().unwrap();
+    assert!(
+        refusal_note.contains("already records declared model 'definitely-not-a-known-model-zzz'"),
+        "{refusal_note}"
+    );
+    assert!(
+        refusal_note.contains("is refused and the recorded model is unchanged"),
+        "{refusal_note}"
+    );
+    assert_eq!(
+        diverged.run_context["intent"],
+        "Aim two, materially changed."
+    );
+    assert!(
+        body.structured["briefing"]["availability"]["status"] == "available",
+        "the briefing is still returned: {}",
+        body.structured["briefing"]["availability"]
+    );
+    let kept: Option<String> =
+        sqlx::query_scalar("SELECT reported_model FROM agent_runs WHERE run_key=?")
+            .bind(RUN)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(kept.as_deref(), Some(model));
+
+    // The text render carries the refusal without inventing more.
+    let refused_text = native_ce::mcp::render::render("set_intent", &body.structured).unwrap();
+    assert!(
+        refused_text.contains("The declaration of another-model was refused"),
+        "{refused_text}"
+    );
+    assert!(
+        refused_text.contains("Intent accepted: Aim two, materially changed."),
+        "{refused_text}"
+    );
+
+    // The operation description teaches the rule at the point of declaring.
+    let schema = &registry.get("set_intent").unwrap().input_schema;
+    assert_eq!(schema["properties"]["model"]["type"], "string");
+    assert!(schema["properties"]["model"]["description"]
+        .as_str()
+        .unwrap()
+        .contains("first declaration wins"));
+    let required = schema["required"].as_array().unwrap();
+    assert!(required.contains(&json!("intent")));
+    assert!(!required.contains(&json!("model")), "model stays optional");
+    let description = &registry.get("set_intent").unwrap().description;
+    assert!(
+        description.contains("first declaration wins"),
+        "{description}"
+    );
+    assert!(description.contains("grants nothing"), "{description}");
+
+    // The text render confirms what was recorded without inventing more.
+    let rendered = native_ce::mcp::render::render("set_intent", &result).unwrap();
+    assert!(
+        rendered.contains("Declared model recorded for this run: definitely-not-a-known-model-zzz"),
+        "{rendered}"
+    );
+    db.close().await;
+}
+
+#[tokio::test]
+async fn set_intent_declared_model_is_length_bounded_not_rejected() {
+    let db = create_database(":memory:").await.unwrap();
+    let registry = registry();
+    let long = format!("{}é", "m".repeat(300));
+
+    let result = call(
+        &registry,
+        &db,
+        "set_intent",
+        json!({ "intent": "Declare long.", "model": long, "run_key": RUN }),
+    )
+    .await;
+    // The declaration itself stands: length never rejects admission.
+    assert_eq!(result["declared_model"]["declared"], long);
+    let recorded = result["declared_model"]["recorded"].as_str().unwrap();
+    assert_eq!(recorded, "m".repeat(256));
+    assert!(recorded.is_char_boundary(recorded.len()));
+    db.close().await;
+}
+
+#[tokio::test]
+async fn declared_model_changes_no_routing_permission_gating_or_rendering_decision() {
+    let db = create_database(":memory:").await.unwrap();
+    let registry = registry();
+    let model = "ledger-model-a";
+    let intent = "Same declared aim on both runs.";
+
+    let with_model = call(
+        &registry,
+        &db,
+        "set_intent",
+        json!({ "intent": intent, "model": model, "run_key": RUN }),
+    )
+    .await;
+    let without_model = call(
+        &registry,
+        &db,
+        "set_intent",
+        json!({ "intent": intent, "run_key": OTHER_RUN }),
+    )
+    .await;
+    // The one sanctioned difference: the confirmation itself.
+    assert_eq!(with_model["declared_model"]["recorded"], model);
+    assert_eq!(without_model["declared_model"]["recorded"], Value::Null);
+    // Everything the run uses to decide is identical.
+    assert_eq!(
+        with_model["accepted_intent"],
+        without_model["accepted_intent"]
+    );
+    assert_eq!(
+        with_model["briefing_version"],
+        without_model["briefing_version"]
+    );
+    assert_eq!(
+        with_model["briefing"]["availability"],
+        without_model["briefing"]["availability"]
+    );
+
+    // Permission: a visible record reads identically from both runs; a
+    // record gated to another account refuses both runs with the same
+    // refusal. Neither decision consults the declared model.
+    let visible = call(
+        &registry,
+        &db,
+        "create_record",
+        json!({ "type": "Document", "name": "Visible to acct:test", "run_key": RUN }),
+    )
+    .await;
+    let mut reads = Vec::new();
+    for run in [RUN, OTHER_RUN] {
+        let seen = registry
+            .call(
+                db.clone(),
+                Caller::authenticated("acct:test"),
+                "get_record",
+                crate::common::with_test_reason(
+                    "get_record",
+                    json!({ "ids": [visible["id"]], "run_key": run }),
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(seen["records"][0]["status"], "found", "run {run}");
+        reads.push(seen["records"].clone());
+    }
+    assert_eq!(reads[0], reads[1], "model must not change a read");
+    let gated = native_ce::store::create_record(
+        &db,
+        json!({"type": "Document", "kind": "x-test-fixture", "name": "Gated record"}),
+    )
+    .await
+    .unwrap();
+    replace_explicit_policy(
+        &db,
+        "test:policy",
+        &gated,
+        vec![AllowEntry::account("acct:revoked", Capability::Manage)],
+    )
+    .await
+    .unwrap();
+    let mut refusals = Vec::new();
+    for run in [RUN, OTHER_RUN] {
+        let refused = registry
+            .call(
+                db.clone(),
+                Caller::authenticated("acct:test"),
+                "start_work",
+                crate::common::with_test_reason(
+                    "start_work",
+                    json!({ "record_id": gated, "run_key": run }),
+                ),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        refusals.push(refused);
+    }
+    assert!(refusals[0].contains("does not exist"), "{}", refusals[0]);
+    assert_eq!(refusals[0], refusals[1], "model must not change refusal");
+
+    // Gating: each run can claim its own work identically.
+    for (run, name) in [
+        (RUN, "Claimed under model"),
+        (OTHER_RUN, "Claimed without model"),
+    ] {
+        let record = call(
+            &registry,
+            &db,
+            "create_record",
+            json!({
+                "type": "WorkItem", "kind": "task",
+                "name": name, "lifecycle": "open", "run_key": run,
+            }),
+        )
+        .await;
+        let claimed = call(
+            &registry,
+            &db,
+            "start_work",
+            json!({ "record_id": record["id"], "run_key": run }),
+        )
+        .await;
+        assert_eq!(claimed["record_id"], record["id"], "run {run}");
+        assert_eq!(claimed["claimed"], true, "run {run}");
+    }
+
+    // Rendering: the model string reaches no other surface's text, and the
+    // set_intent texts differ only by the confirmation line.
+    for run in [RUN, OTHER_RUN] {
+        let dashboard = call(&registry, &db, "get_dashboard", json!({ "run_key": run })).await;
+        let text = native_ce::mcp::render::render("get_dashboard", &dashboard).unwrap();
+        assert!(
+            !text.contains(model),
+            "dashboard text for run {run}: {text}"
+        );
+    }
+    let with_text = native_ce::mcp::render::render("set_intent", &with_model).unwrap();
+    assert!(
+        with_text.contains("Declared model recorded for this run: ledger-model-a"),
+        "{with_text}"
+    );
+    let without_text = native_ce::mcp::render::render("set_intent", &without_model).unwrap();
+    assert!(
+        without_text.contains("Declared model: none recorded for this run."),
+        "{without_text}"
+    );
+    db.close().await;
+}
+
+#[tokio::test]
+async fn set_intent_bootstrap_names_declared_model_guidance() {
+    let db = create_database(":memory:").await.unwrap();
+    let registry = registry();
+    let bootstrap = registry
+        .call(
+            db.clone(),
+            Caller::local(),
+            "bootstrap",
+            crate::common::with_test_reason("bootstrap", json!({})),
+        )
+        .await
+        .unwrap();
+    db.drain_captures_for_tests().await;
+    let guidance = &bootstrap["intentful_sessions"]["declared_model"];
+    assert!(
+        guidance["how"]
+            .as_str()
+            .unwrap()
+            .contains("first set_intent"),
+        "{guidance}"
+    );
+    assert!(
+        guidance["why"]
+            .as_str()
+            .unwrap()
+            .contains("knows which model claimed it"),
+        "{guidance}"
+    );
+    assert!(
+        guidance["why"]
+            .as_str()
+            .unwrap()
+            .contains("evaluation ledger"),
+        "{guidance}"
+    );
+    assert!(
+        guidance["limits"]
+            .as_str()
+            .unwrap()
+            .contains("grants nothing"),
+        "{guidance}"
+    );
+    assert!(
+        guidance["limits"].as_str().unwrap().contains("per-run"),
+        "{guidance}"
+    );
+    assert!(
+        guidance["limits"]
+            .as_str()
+            .unwrap()
+            .contains("no launcher-independent source"),
+        "{guidance}"
+    );
+    let text = native_ce::mcp::render::render("bootstrap", &bootstrap).unwrap();
+    assert!(text.contains("self-declare its model"), "{text}");
+    db.close().await;
+}
+
+// ---------------------------------------------------------------------------
+// Declared source basis per episode (slice E): declarations fold
+// `native.source-basis.v1` envelopes on content events, not touch rows.
+// ---------------------------------------------------------------------------
+
+/// A `create_record` in `run` citing `sources`, returning the new id.
+async fn declare_write(
+    registry: &ToolRegistry,
+    db: &Db,
+    run: &str,
+    name: &str,
+    sources: Value,
+) -> String {
+    call(
+        registry,
+        db,
+        "create_record",
+        json!({
+            "type": "Document",
+            "kind": "note",
+            "name": name,
+            "body": format!("Work resting on {name}."),
+            "sources": sources,
+            "run_key": run,
+        }),
+    )
+    .await["id"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+async fn declare_intent(registry: &ToolRegistry, db: &Db, run: &str, intent: &str) -> Value {
+    call(
+        registry,
+        db,
+        "set_intent",
+        json!({ "intent": intent, "run_key": run }),
+    )
+    .await
+}
+
+fn episode_items(result: &Value) -> Vec<Value> {
+    result["briefing"]["this_run"]["declarations"]["items"]
+        .as_array()
+        .unwrap()
+        .clone()
+}
+
+fn episode_source_ids(episode: &Value) -> Vec<String> {
+    episode["touched_records"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["id"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn an_episode_folds_declared_sources_and_ignores_mere_touches() {
+    let db = create_database(":memory:").await.unwrap();
+    let registry = registry();
+    let run = "scout-chair-a748b2";
+
+    let source = declare_write(&registry, &db, run, "cited-source", json!([])).await;
+    let opened_only = call(
+        &registry,
+        &db,
+        "create_record",
+        json!({ "type": "Document", "kind": "note", "name": "opened-only", "run_key": run }),
+    )
+    .await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    declare_intent(&registry, &db, run, "First episode").await;
+    // Touched but never declared: opened after the declaration, so a
+    // touch-based fold would list it in this episode.
+    call(
+        &registry,
+        &db,
+        "get_record",
+        json!({ "ids": [opened_only], "run_key": run }),
+    )
+    .await;
+    declare_write(
+        &registry,
+        &db,
+        run,
+        "citing-write",
+        json!([{ "record_id": source, "reason": "the reading this rested on", "role": "primary" }]),
+    )
+    .await;
+    let result = declare_intent(&registry, &db, run, "Second episode").await;
+
+    let items = episode_items(&result);
+    // One durable declaration plus the pending one, which stays empty until
+    // a write under it declares sources.
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[1]["intent"], "Second episode");
+    assert_eq!(items[1]["touched_records"]["items"], json!([]));
+
+    let first = &items[0];
+    assert_eq!(first["intent"], "First episode");
+    let ids = episode_source_ids(first);
+    assert_eq!(ids, vec![source.clone()], "{first}");
+    let item = &first["touched_records"]["items"][0];
+    assert_eq!(item["name"], "cited-source");
+    assert_eq!(item["type"], "Document");
+    assert_eq!(item["reason"], "the reading this rested on");
+    assert_eq!(item["role"], "primary");
+    assert!(item["revision_event_id"].as_str().is_some(), "{item}");
+    assert_eq!(item["revision_supplied_by"], "engine");
+    assert!(
+        item.get("interactions").is_none(),
+        "touches were not consulted: {item}"
+    );
+    assert!(
+        !ids.contains(&opened_only),
+        "a touched-only record is not a declared source: {ids:?}"
+    );
+    db.close().await;
+}
+
+#[tokio::test]
+async fn declared_none_and_absent_writes_yield_no_source_items() {
+    let db = create_database(":memory:").await.unwrap();
+    let registry = registry();
+    let run = "scout-chair-a748b2";
+
+    declare_intent(&registry, &db, run, "None episode").await;
+    declare_write(&registry, &db, run, "rests-on-nothing", json!([])).await;
+    declare_intent(&registry, &db, run, "Silent episode").await;
+    call(
+        &registry,
+        &db,
+        "create_record",
+        json!({ "type": "Document", "kind": "note", "name": "says-nothing", "run_key": run }),
+    )
+    .await;
+    let result = declare_intent(&registry, &db, run, "Tail").await;
+
+    let items = episode_items(&result);
+    assert_eq!(items.len(), 3);
+    for episode in &items[0..2] {
+        assert_eq!(episode["touched_records"]["items"], json!([]), "{episode}");
+        assert_eq!(episode["touched_records"]["total_count"], 0, "{episode}");
+        assert_eq!(episode["touched_records"]["truncated"], false, "{episode}");
+    }
+    db.close().await;
+}
+
+/// Episodes are temporal windows between declaration response times. This
+/// fixture is built so both plausible shortcuts give the wrong answer:
+/// - `read_log_calls.seq` vs `content_events.seq` are unrelated counters,
+///   and the read burst below pushes every declaration's read-log seq far
+///   past the citing writes' content seqs, so any cross-tier seq comparison
+///   drops the writes out of their episodes;
+/// - both episodes declare the byte-identical intent text, so grouping by
+///   intent text merges the two episodes into one.
+/// Timestamps are pinned to distinct seconds so the correct temporal
+/// attribution is deterministic, not a same-millisecond coin flip.
+#[tokio::test]
+async fn episodes_hold_under_identical_intent_text_and_diverged_counters() {
+    let db = create_database(":memory:").await.unwrap();
+    let registry = registry();
+    let run = "scout-chair-a748b2";
+
+    let first_source = declare_write(&registry, &db, run, "first-source", json!([])).await;
+    let second_source = declare_write(&registry, &db, run, "second-source", json!([])).await;
+    // A read burst: six read-log rows, zero content events. Declaration seqs
+    // will run well ahead of content seqs from here on.
+    for _ in 0..6 {
+        call(
+            &registry,
+            &db,
+            "get_record",
+            json!({ "ids": [first_source], "run_key": run }),
+        )
+        .await;
+    }
+
+    declare_intent(&registry, &db, run, "Same aim").await;
+    let first_write = declare_write(
+        &registry,
+        &db,
+        run,
+        "first-citing",
+        json!([{ "record_id": first_source, "reason": "first reading" }]),
+    )
+    .await;
+    declare_intent(&registry, &db, run, "Same aim").await;
+    let second_write = declare_write(
+        &registry,
+        &db,
+        run,
+        "second-citing",
+        json!([{ "record_id": second_source, "reason": "second reading" }]),
+    )
+    .await;
+
+    // Pin the clocks: declaration responses and citing writes on distinct
+    // seconds, in wall order, so temporal windows are exact.
+    let pool = crate::common::fixture_write_pool(&db).await;
+    let decl_seqs: Vec<i64> = sqlx::query_scalar(
+        "SELECT seq FROM read_log_calls WHERE run_key = ? AND tool = 'set_intent' AND outcome = 'ok' ORDER BY seq",
+    )
+    .bind(run)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(decl_seqs.len(), 2);
+    for (seq, stamp) in decl_seqs
+        .iter()
+        .zip(["2026-09-01T00:00:01.000Z", "2026-09-01T00:00:03.000Z"])
+    {
+        sqlx::query("UPDATE read_log_calls SET started_at = ?, ended_at = ? WHERE seq = ?")
+            .bind(stamp)
+            .bind(stamp)
+            .bind(seq)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    // The log is append-only by trigger; a test-only rewrite drops and
+    // restores the guard around the surgical timestamp pins.
+    let guard: String = sqlx::query_scalar(
+        "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'content_events_no_update'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    sqlx::query("DROP TRIGGER content_events_no_update")
+        .execute(&pool)
+        .await
+        .unwrap();
+    for (record, stamp) in [
+        (first_write.as_str(), "2026-09-01T00:00:02.000Z"),
+        (second_write.as_str(), "2026-09-01T00:00:04.000Z"),
+    ] {
+        sqlx::query("UPDATE content_events SET created_at = ? WHERE record_id = ?")
+            .bind(stamp)
+            .bind(record)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    sqlx::query(&guard).execute(&pool).await.unwrap();
+    // The clocks above establish distinct temporal episodes. Read-log and
+    // content-event sequences are independent and cannot be compared.
+
+    let result = declare_intent(&registry, &db, run, "Same aim").await;
+    let items = episode_items(&result);
+    assert_eq!(items.len(), 3);
+    assert_eq!(items[0]["intent"], "Same aim");
+    assert_eq!(items[1]["intent"], "Same aim");
+    assert_eq!(
+        episode_source_ids(&items[0]),
+        vec![first_source.clone()],
+        "first episode must hold exactly its own declaration"
+    );
+    assert_eq!(
+        episode_source_ids(&items[1]),
+        vec![second_source.clone()],
+        "identical text must not merge episodes"
+    );
+    assert_eq!(items[2]["touched_records"]["items"], json!([]));
+    db.close().await;
+}
+
+/// The episode window is half-open: the lower edge is inclusive, the next
+/// declaration's `ended_at` is exclusive. A write stamped exactly on the
+/// current declaration's response time belongs to that episode; a write
+/// stamped exactly on the NEXT declaration's response time belongs only to
+/// the new episode, never to both.
+#[tokio::test]
+async fn an_exact_boundary_write_belongs_only_to_the_new_episode() {
+    let db = create_database(":memory:").await.unwrap();
+    let registry = registry();
+    let run = "scout-chair-a748b2";
+
+    let first_source = declare_write(&registry, &db, run, "boundary-source-a", json!([])).await;
+    let second_source = declare_write(&registry, &db, run, "boundary-source-b", json!([])).await;
+
+    declare_intent(&registry, &db, run, "Episode A").await;
+    let first_write = declare_write(
+        &registry,
+        &db,
+        run,
+        "boundary-citing-a",
+        json!([{ "record_id": first_source, "reason": "read before the boundary" }]),
+    )
+    .await;
+    declare_intent(&registry, &db, run, "Episode B").await;
+    let second_write = declare_write(
+        &registry,
+        &db,
+        run,
+        "boundary-citing-b",
+        json!([{ "record_id": second_source, "reason": "read exactly at the boundary" }]),
+    )
+    .await;
+
+    // Pin the clocks so the exact-equality case is deterministic: decl A and
+    // its write share one second; decl B and its write share the next.
+    let pool = crate::common::fixture_write_pool(&db).await;
+    let decl_seqs: Vec<i64> = sqlx::query_scalar(
+        "SELECT seq FROM read_log_calls WHERE run_key = ? AND tool = 'set_intent' AND outcome = 'ok' ORDER BY seq",
+    )
+    .bind(run)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(decl_seqs.len(), 2);
+    for (seq, stamp) in decl_seqs.iter().zip([
+        "2026-09-02T00:00:01.000Z", // Episode A's response time.
+        "2026-09-02T00:00:02.000Z", // Episode B's response time.
+    ]) {
+        sqlx::query("UPDATE read_log_calls SET started_at = ?, ended_at = ? WHERE seq = ?")
+            .bind(stamp)
+            .bind(stamp)
+            .bind(seq)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    // The log is append-only by trigger; a test-only rewrite drops and
+    // restores the guard around the surgical timestamp pins.
+    let guard: String = sqlx::query_scalar(
+        "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'content_events_no_update'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    sqlx::query("DROP TRIGGER content_events_no_update")
+        .execute(&pool)
+        .await
+        .unwrap();
+    for (record, stamp) in [
+        // Lower edge of A: inclusive, so this write is in A.
+        (first_write.as_str(), "2026-09-02T00:00:01.000Z"),
+        // Lower edge of B and upper edge of A: exclusive at A's end, so this
+        // write is in B only.
+        (second_write.as_str(), "2026-09-02T00:00:02.000Z"),
+    ] {
+        sqlx::query("UPDATE content_events SET created_at = ? WHERE record_id = ?")
+            .bind(stamp)
+            .bind(record)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    sqlx::query(&guard).execute(&pool).await.unwrap();
+
+    let result = declare_intent(&registry, &db, run, "Tail").await;
+    let items = episode_items(&result);
+    assert_eq!(items.len(), 3);
+    assert_eq!(items[0]["intent"], "Episode A");
+    assert_eq!(items[1]["intent"], "Episode B");
+    assert_eq!(
+        episode_source_ids(&items[0]),
+        vec![first_source.clone()],
+        "a write exactly on the lower edge belongs to the episode"
+    );
+    assert_eq!(
+        episode_source_ids(&items[1]),
+        vec![second_source.clone()],
+        "a write exactly on the next declaration's ended_at belongs only to the new episode"
+    );
+    // The boundary write must not be double-counted into the closed episode.
+    assert!(
+        !episode_source_ids(&items[0]).contains(&second_source),
+        "the boundary write leaked into the earlier episode"
+    );
+    db.close().await;
+}
+
+#[tokio::test]
+async fn a_hidden_declared_source_is_omitted_from_its_episode() {
+    let db = create_database(":memory:").await.unwrap();
+    let registry = registry();
+    let run = "scout-chair-a748b2";
+
+    // Created with no run and no owner: the only trace of these records in
+    // this run's briefing is the declaration itself, so the visibility
+    // assertion below isolates the declared-source fold rather than the
+    // touch surfaces. Ownership retains visibility past explicit policy, so
+    // the secret is store-created (ownerless) where an ordinary create would
+    // keep it visible to its author no matter the policy.
+    let secret = native_ce::store::create_record(
+        &db,
+        json!({ "type": "Document", "kind": "note", "name": "episode-secret" }),
+    )
+    .await
+    .unwrap();
+    replace_explicit_policy(
+        &db,
+        "test:policy",
+        &secret,
+        vec![AllowEntry::account("acct:test", Capability::Manage)],
+    )
+    .await
+    .unwrap();
+    let open = call(
+        &registry,
+        &db,
+        "create_record",
+        json!({ "type": "Document", "kind": "note", "name": "episode-open", "sources": [] }),
+    )
+    .await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    declare_intent(&registry, &db, run, "Filtered episode").await;
+    declare_write(
+        &registry,
+        &db,
+        run,
+        "filtered-citing",
+        json!([
+            { "record_id": secret, "reason": "the confidential reading" },
+            { "record_id": open, "reason": "the ordinary reading" },
+        ]),
+    )
+    .await;
+
+    replace_explicit_policy(
+        &db,
+        "test:policy",
+        &secret,
+        vec![AllowEntry::account("someone-else", Capability::Manage)],
+    )
+    .await
+    .unwrap();
+
+    let result = declare_intent(&registry, &db, run, "Tail").await;
+    let serialized = result.to_string();
+    assert!(
+        !serialized.contains(&secret),
+        "a hidden source must leak neither name nor existence"
+    );
+    assert!(serialized.contains(&open));
+    let items = episode_items(&result);
+    let episode = &items[0];
+    assert_eq!(episode_source_ids(episode), vec![open]);
+    // The hidden source is not even counted: its existence is undisclosed.
+    assert_eq!(episode["touched_records"]["total_count"], 1);
+    db.close().await;
+}
+
+#[tokio::test]
+async fn episode_sources_deduplicate_and_stay_bounded() {
+    let db = create_database(":memory:").await.unwrap();
+    let registry = registry();
+    let run = "scout-chair-a748b2";
+
+    declare_intent(&registry, &db, run, "Crowded episode").await;
+    let repeated = declare_write(&registry, &db, run, "repeated-source", json!([])).await;
+    declare_write(
+        &registry,
+        &db,
+        run,
+        "first-cite",
+        json!([{ "record_id": repeated, "reason": "first reading" }]),
+    )
+    .await;
+    declare_write(
+        &registry,
+        &db,
+        run,
+        "second-cite",
+        json!([{ "record_id": repeated, "reason": "second reading" }]),
+    )
+    .await;
+    for index in 0..20 {
+        let extra = declare_write(
+            &registry,
+            &db,
+            run,
+            &format!("extra-source-{index}"),
+            json!([]),
+        )
+        .await;
+        declare_write(
+            &registry,
+            &db,
+            run,
+            &format!("extra-cite-{index}"),
+            json!([{ "record_id": extra, "reason": "extra reading" }]),
+        )
+        .await;
+    }
+    let result = declare_intent(&registry, &db, run, "Tail").await;
+
+    let items = episode_items(&result);
+    let episode = &items[0];
+    let window = &episode["touched_records"];
+    // 22 citations of 21 distinct records: the twice-cited one counts once.
+    assert_eq!(window["total_count"], 21);
+    assert_eq!(window["truncated"], true);
+    assert_eq!(window["items"].as_array().unwrap().len(), 20);
+    let ids = episode_source_ids(episode);
+    let mut sorted = ids.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(sorted.len(), ids.len(), "no duplicate items: {ids:?}");
+    db.close().await;
 }

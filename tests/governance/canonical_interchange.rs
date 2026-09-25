@@ -380,7 +380,7 @@ async fn corruption_and_partial_input_are_rejected_before_destination_mutation()
     assert!(!partial_destination.exists());
 
     let mut unsupported: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    unsupported["manifest"]["revision"] = json!(3);
+    unsupported["manifest"]["revision"] = json!(99);
     let unsupported_destination = temp.path().join("unsupported.db");
     let error = import_canonical_interchange(
         &serde_json::to_vec(&unsupported).unwrap(),

@@ -762,6 +762,9 @@ pub(crate) async fn resolve_external<P: BindingPhysicalPort>(
         record_id,
         created,
         bindings_added: added,
+        // The portable port memoizes the act on its domain transaction; a
+        // true no-op that appended nothing leaves it unset.
+        act: AttachmentPhysicalPort::allocated_act(port),
     })
 }
 
@@ -784,7 +787,7 @@ pub(crate) async fn manage_bindings<P: BindingPhysicalPort>(
     intent: Option<&str>,
     request: ManageBindingsRequest,
 ) -> Result<ManageBindingsOutcome> {
-    match request {
+    let mut outcome = match request {
         ManageBindingsRequest::List { record_id } => {
             require_capability(port, principal, &record_id, Capability::View).await?;
             let bindings = port.public_bindings(&record_id).await?.into_iter().map(|row| json!({
@@ -991,5 +994,14 @@ pub(crate) async fn manage_bindings<P: BindingPhysicalPort>(
                 apply,
             )
         }
+    }?;
+    // The portable port memoizes the act on its domain transaction. A true
+    // no-op that appended nothing leaves it unset, so the key stays absent;
+    // `List` and an `apply:false` preview likewise never gain one.
+    if let Some(act) = AttachmentPhysicalPort::allocated_act(port) {
+        if let Some(object) = outcome.response.as_object_mut() {
+            object.insert("act".into(), json!(act));
+        }
     }
+    Ok(outcome)
 }

@@ -162,6 +162,11 @@ pub(crate) struct IsolatedProjection {
     relations: BTreeMap<&'static str, Vec<NormalizedRow>>,
     row_count: usize,
     encoded_bytes: usize,
+    /// Workspace content sequence observed inside the same backend snapshot
+    /// the projection rows were materialized from (E1 M1 slice A). Carried
+    /// through to every `QuerySqlResult` executed over this projection so
+    /// rows and stamp share one snapshot.
+    pub(crate) as_of_seq: i64,
 }
 
 impl IsolatedProjection {
@@ -228,6 +233,7 @@ impl IsolatedProjection {
 struct CoreProjection {
     connection: Arc<turso::core::Connection>,
     control: ExecutionControl,
+    as_of_seq: i64,
 }
 
 impl CoreProjection {
@@ -309,6 +315,7 @@ impl CoreProjection {
         Ok(Self {
             connection,
             control,
+            as_of_seq: projection.as_of_seq,
         })
     }
 
@@ -322,6 +329,20 @@ impl CoreProjection {
             sql_contract::QuerySqlProfile::TursoLocal,
             &request.sql,
         )?;
+        // I1 review: the `?N` set has to be exactly
+        // `1..=parameters.len()`; positional binding would otherwise
+        // shift gapped numbers silently.
+        sql_contract::check_positional_arguments(
+            sql_contract::QuerySqlProfile::TursoLocal,
+            &statement,
+            request.parameters.len(),
+        )?;
+        // NOTE: this wraps every classified statement as a subquery operand.
+        // The Turso validator admits SELECT only today, so this is total. If
+        // that parser ever admits EXPLAIN QUERY PLAN, a canonical
+        // "EXPLAIN QUERY PLAN ..." statement must bypass this wrapper (as
+        // src/query/sql.rs::cap_statement does for sqlite-local); wrapping it
+        // here would produce invalid SQL.
         let capped = format!(
             "SELECT * FROM ({statement}) LIMIT {}",
             sql_contract::MAX_ROWS + 1
@@ -393,7 +414,7 @@ impl CoreProjection {
             ));
         }
 
-        collect_rows(&mut statement, &columns)
+        collect_rows(&mut statement, &columns, self.as_of_seq)
     }
 }
 
@@ -420,9 +441,9 @@ fn control_error(control: &ExecutionControl) -> Error {
     sql_contract::categorized_error(
         QuerySqlErrorCategory::Timeout,
         if control.is_cancelled() {
-            "Turso query_sql was cancelled"
+            String::from("Turso query_sql was cancelled")
         } else {
-            "Turso query_sql exceeded its absolute deadline"
+            sql_contract::deadline_hint()
         },
     )
 }
@@ -430,6 +451,7 @@ fn control_error(control: &ExecutionControl) -> Error {
 fn collect_rows(
     statement: &mut turso::core::Statement,
     columns: &[String],
+    as_of_seq: i64,
 ) -> Result<QuerySqlResult> {
     let mut rows = Vec::new();
     let mut encoded_bytes = serde_json::to_vec(columns)?.len().saturating_add(2);
@@ -442,6 +464,8 @@ fn collect_rows(
                         row_count: rows.len(),
                         rows,
                         truncated: true,
+                        truncation_hint: Some(sql_contract::truncation_hint()),
+                        as_of_seq,
                     });
                 }
                 let row = statement
@@ -476,12 +500,20 @@ fn collect_rows(
                     row_count: rows.len(),
                     rows,
                     truncated: false,
+                    truncation_hint: None,
+                    as_of_seq,
                 })
             }
-            turso::core::StepResult::Interrupt | turso::core::StepResult::Busy => {
+            turso::core::StepResult::Interrupt => {
                 return Err(sql_contract::categorized_error(
                     QuerySqlErrorCategory::Timeout,
-                    "Turso core interrupted the query at its mandatory deadline",
+                    sql_contract::deadline_hint(),
+                ))
+            }
+            turso::core::StepResult::Busy => {
+                return Err(sql_contract::categorized_error(
+                    QuerySqlErrorCategory::Timeout,
+                    "Turso storage is busy holding a conflicting lock; retry the read",
                 ))
             }
         }
@@ -675,6 +707,26 @@ mod tests {
         assert_eq!(result.row_count, 1);
         assert_eq!(result.rows[0]["id"], "visible");
         assert!(!result.truncated);
+        assert_eq!(result.truncation_hint, None);
+    }
+
+    #[test]
+    fn truncated_results_carry_the_keyset_hint() {
+        let rows = (0..1001)
+            .map(|index| record(&format!("bulk:{index:04}"), "body"))
+            .collect::<Vec<_>>();
+        let result = execute(
+            projection_with_records(rows),
+            request("SELECT id FROM records ORDER BY id"),
+            ExecutionControl::with_timeout(Duration::from_secs(2)),
+        )
+        .unwrap();
+        assert!(result.truncated);
+        assert_eq!(result.row_count, sql_contract::MAX_ROWS);
+        assert_eq!(
+            result.truncation_hint,
+            Some(sql_contract::truncation_hint())
+        );
     }
 
     #[test]

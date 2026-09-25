@@ -297,7 +297,7 @@ impl OriginAdmissionV1 {
     }
 
     #[cfg(test)]
-    pub(super) fn test_fixture(
+    pub(crate) fn test_fixture(
         relationship_type_definition: &str,
         admission_class: &str,
         endpoint_role: &str,

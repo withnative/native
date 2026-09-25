@@ -91,6 +91,7 @@ async fn append_correction_fixture(db: &Db, record_id: &str) -> i64 {
         intent: None,
         created_at: created_at.into(),
         causal_envelope: native_ce::events::CausalEnvelopeV1::legacy_unknown(),
+        act: None,
     };
     native_ce::projector::project(&mut tx, &event)
         .await

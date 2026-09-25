@@ -787,6 +787,10 @@ pub struct CommitDurableOutputResult {
     pub execution: ExecutionDisposition,
     pub disclosure: DisclosureDecision,
     pub high_water: HistoryHighWater,
+    /// The act the commit (or the original command it replayed) allocated,
+    /// read back from its receipt event. `None` only when that event carries
+    /// no act, which a live append never does.
+    pub act: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

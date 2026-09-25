@@ -26,6 +26,7 @@ fn persistence_event(record_id: &str, value: &str) -> EventRow {
         intent: None,
         created_at: "2026-08-01T12:00:00.000Z".into(),
         causal_envelope: native_ce::events::CausalEnvelopeV1::default(),
+        act: None,
     }
 }
 
@@ -104,6 +105,7 @@ async fn raw_unfiled_creation_must_match_the_canonical_filing_shape() {
         parent_key: None,
         intent: None,
         causal_envelope: native_ce::events::CausalEnvelopeV1::default(),
+        act: None,
         created_at: "2026-08-01T12:00:00.000Z".into(),
     };
     let mut conn = crate::common::fixture_write_pool(&db)
@@ -134,6 +136,7 @@ async fn raw_unfiled_creation_must_match_the_canonical_filing_shape() {
         parent_key: None,
         intent: None,
         causal_envelope: native_ce::events::CausalEnvelopeV1::default(),
+        act: None,
         created_at: "2026-08-01T12:00:01.000Z".into(),
     };
     let error = native_ce::projector::project(&mut conn, &malformed)
@@ -320,6 +323,7 @@ async fn archived_leaf_scope_is_consistent_between_browse_and_search() {
     let hidden = fts::search(
         &db,
         "test-account",
+        true,
         "archived scope proof",
         &fts::FtsOptions {
             scope: Some(leaf.clone()),
@@ -333,6 +337,7 @@ async fn archived_leaf_scope_is_consistent_between_browse_and_search() {
     let visible = fts::search(
         &db,
         "test-account",
+        true,
         "archived scope proof",
         &fts::FtsOptions {
             scope: Some(leaf.clone()),

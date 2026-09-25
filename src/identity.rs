@@ -27,6 +27,7 @@ use crate::schema::UNFILED_RECORD_ID;
 use crate::store::{append_in, now_iso, AppendSpec};
 
 pub(crate) mod account;
+pub(crate) mod binding_audit;
 pub(crate) mod binding_plan;
 #[doc(hidden)]
 pub mod hosted;
@@ -194,6 +195,12 @@ pub struct MutationContext<'a> {
     pub run_key: Option<&'a str>,
     pub parent_key: Option<&'a str>,
     pub intent: Option<&'a str>,
+    /// Live catalog membership footing for the visibility gates. Required
+    /// (rather than defaulted) so a construction that forgets the footing
+    /// fails to compile instead of silently resolving as a member. System
+    /// actors pass `true`, preserving exact current behavior — and the
+    /// internal bypass below makes the value moot for them in any case.
+    pub is_member: bool,
     /// Reserved systems are available only to engine/hosting call sites.
     pub internal: bool,
     /// Set only by a gateway that actually performed/authorized the source read.
@@ -211,7 +218,7 @@ impl MutationContext<'_> {
     }
 
     fn principal(&self) -> Principal<'_> {
-        Principal::bound(self.actor, true)
+        Principal::bound(self.actor, self.is_member)
     }
 }
 
@@ -220,6 +227,10 @@ pub struct Resolution {
     pub record_id: String,
     pub created: bool,
     pub bindings_added: Vec<BindingClaim>,
+    /// The act this resolve allocated; absent on a true no-op that appended
+    /// nothing. `skip_serializing_if` keeps the wire shape omission-safe.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub act: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -229,6 +240,9 @@ pub struct ObservationResult {
     pub created: bool,
     pub provenance_attachment_id: Option<String>,
     pub provenance: ObservationProvenance,
+    /// The act this observation allocated; absent on a true no-op.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub act: Option<i64>,
 }
 
 /// Read-only projection of one governed binding mutation for the explicitly
@@ -415,11 +429,13 @@ pub async fn seed_database_identity(db: &Db) -> Result<String> {
         return Ok(existing);
     }
     let token = mint_database_id();
+    let mut act_alloc = crate::act::ActAllocation::new();
     insert_database_identity(
         &mut tx,
         &token,
         "engine:seed",
         "mint fresh database identity",
+        &mut act_alloc,
     )
     .await?;
     tx.commit().await?;
@@ -431,6 +447,7 @@ pub(crate) async fn insert_database_identity(
     token: &str,
     actor: &str,
     reason: &str,
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<()> {
     if !is_database_id(token) {
         return Err(Error::engine("invalid database identity token"));
@@ -445,14 +462,15 @@ pub(crate) async fn insert_database_identity(
     .await?;
     sqlx::query(
         "INSERT INTO database_identity_audit
-         (id, action, old_origin_db_id, new_origin_db_id, actor, reason, created_at)
-         VALUES (?, 'mint', NULL, ?, ?, ?, ?)",
+         (id, action, old_origin_db_id, new_origin_db_id, actor, reason, created_at, act)
+         VALUES (?, 'mint', NULL, ?, ?, ?, ?, ?)",
     )
     .bind(Uuid::new_v4().to_string())
     .bind(token)
     .bind(actor)
     .bind(reason)
     .bind(now)
+    .bind(act_alloc.get_or_allocate(&mut *tx).await?)
     .execute(&mut **tx)
     .await?;
     Ok(())
@@ -844,8 +862,8 @@ pub async fn rekey_database_offline(
             .bind(&new_id).bind(&now).execute(&mut source).await?;
         sqlx::query(
             "INSERT INTO database_identity_audit
-             (id,action,old_origin_db_id,new_origin_db_id,actor,reason,created_at)
-             VALUES(?,'rekey',?,?,?,?,?)",
+             (id,action,old_origin_db_id,new_origin_db_id,actor,reason,created_at,act)
+             VALUES(?,'rekey',?,?,?,?,?,?)",
         )
         .bind(Uuid::new_v4().to_string())
         .bind(&old_id)
@@ -853,6 +871,11 @@ pub async fn rekey_database_offline(
         .bind(actor)
         .bind(reason)
         .bind(now)
+        .bind(
+            crate::act::ActAllocation::new()
+                .get_or_allocate(&mut source)
+                .await?,
+        )
         .execute(&mut source)
         .await?;
         Ok(new_id)
@@ -1031,12 +1054,13 @@ async fn append_binding_audit(
     new_record_id: Option<&str>,
     old_canonical: Option<bool>,
     new_canonical: Option<bool>,
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<()> {
     sqlx::query(
         "INSERT INTO binding_audit
          (id, action, system, identifier, old_record_id, new_record_id,
-          old_canonical, new_canonical, actor, reason, run_key, parent_key, intent, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          old_canonical, new_canonical, actor, reason, run_key, parent_key, intent, created_at, act)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(Uuid::new_v4().to_string())
     .bind(action)
@@ -1052,6 +1076,7 @@ async fn append_binding_audit(
     .bind(context.parent_key)
     .bind(context.intent)
     .bind(now_iso())
+    .bind(act_alloc.get_or_allocate(&mut *tx).await?)
     .execute(&mut **tx)
     .await?;
     Ok(())
@@ -1063,6 +1088,7 @@ async fn add_binding_in(
     record_id: &str,
     claim: &BindingClaim,
     canonical: bool,
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<bool> {
     let existing = sqlx::query(
         "SELECT record_id, is_canonical FROM bindings WHERE system = ? AND identifier = ?",
@@ -1081,7 +1107,7 @@ async fn add_binding_in(
             ));
         }
         if canonical && !was_canonical {
-            return canonicalize_in(tx, context, record_id, claim).await;
+            return canonicalize_in(tx, context, record_id, claim, act_alloc).await;
         }
         return Ok(false);
     }
@@ -1115,6 +1141,7 @@ async fn add_binding_in(
                 Some(record_id),
                 Some(true),
                 Some(false),
+                act_alloc,
             )
             .await?;
         }
@@ -1137,6 +1164,7 @@ async fn add_binding_in(
         Some(record_id),
         None,
         Some(canonical),
+        act_alloc,
     )
     .await?;
     Ok(true)
@@ -1145,6 +1173,7 @@ async fn add_binding_in(
 /// Engine/hosting entry point for reserved systems inside an existing identity
 /// transaction.  Keeps account/email provisioning on the same governed writer
 /// and audit contract without nesting a second writer transaction.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn add_binding_internal_in(
     tx: &mut Transaction<'static, Sqlite>,
     actor: &str,
@@ -1153,6 +1182,7 @@ pub(crate) async fn add_binding_internal_in(
     system: &str,
     identifier: &str,
     canonical: bool,
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<bool> {
     let context = MutationContext {
         actor,
@@ -1160,6 +1190,7 @@ pub(crate) async fn add_binding_internal_in(
         run_key: None,
         parent_key: None,
         intent: None,
+        is_member: true,
         internal: true,
         source_read_authorized: false,
     };
@@ -1175,7 +1206,7 @@ pub(crate) async fn add_binding_internal_in(
     )
     .await?;
     require_record_shape(tx, record_id, &rule).await?;
-    add_binding_in(tx, &context, record_id, &claim, canonical).await
+    add_binding_in(tx, &context, record_id, &claim, canonical, act_alloc).await
 }
 
 async fn canonicalize_in(
@@ -1183,6 +1214,7 @@ async fn canonicalize_in(
     context: &MutationContext<'_>,
     record_id: &str,
     claim: &BindingClaim,
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<bool> {
     let target: Option<i64> = sqlx::query_scalar(
         "SELECT is_canonical FROM bindings WHERE record_id = ? AND system = ? AND identifier = ?",
@@ -1228,6 +1260,7 @@ async fn canonicalize_in(
             Some(record_id),
             Some(true),
             Some(false),
+            act_alloc,
         )
         .await?;
     }
@@ -1248,6 +1281,7 @@ async fn canonicalize_in(
         Some(record_id),
         Some(false),
         Some(true),
+        act_alloc,
     )
     .await?;
     Ok(true)
@@ -1265,6 +1299,7 @@ pub(crate) async fn resolve_external_in(
     context: &MutationContext<'_>,
     claims: &[BindingClaim],
     hints: &StubHints,
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<Resolution> {
     context.validate("resolve_external")?;
     if claims.is_empty() {
@@ -1351,6 +1386,7 @@ pub(crate) async fn resolve_external_in(
                 }),
                 actor: Some(context.actor.into()),
             },
+            act_alloc,
         )
         .await?;
         (record_id, true)
@@ -1370,7 +1406,7 @@ pub(crate) async fn resolve_external_in(
             continue;
         }
         enforce_operation_policy(&rule, BindingOperation::Add, context.internal)?;
-        if add_binding_in(tx, context, &record_id, &claim, true).await? {
+        if add_binding_in(tx, context, &record_id, &claim, true, act_alloc).await? {
             added.push(claim);
         }
     }
@@ -1378,6 +1414,7 @@ pub(crate) async fn resolve_external_in(
         record_id,
         created,
         bindings_added: added,
+        act: None,
     })
 }
 
@@ -1389,23 +1426,29 @@ pub async fn resolve_external(
 ) -> Result<Resolution> {
     context.validate("resolve_external")?;
     let mut tx = crate::db::begin_write(db.write_pool()).await?;
-    let result = resolve_external_in(db, &mut tx, context, claims, hints).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
+    let mut result =
+        resolve_external_in(db, &mut tx, context, claims, hints, &mut act_alloc).await?;
     if result.created || !result.bindings_added.is_empty() {
         tx.commit().await?;
     } else {
         tx.rollback().await?;
     }
+    // The act allocated by the appends above; absent when nothing was
+    // appended (a true no-op), which the serializer then omits.
+    result.act = act_alloc.get();
     Ok(result)
 }
 
 pub async fn list_bindings(
     db: &Db,
     actor: &str,
+    is_member: bool,
     record_id: &str,
 ) -> Result<Vec<serde_json::Value>> {
     authorization::require_capability(
         db,
-        Principal::bound(actor, true),
+        Principal::bound(actor, is_member),
         record_id,
         Capability::View,
     )
@@ -1439,6 +1482,7 @@ pub async fn list_bindings(
 pub async fn list_observations(
     db: &Db,
     actor: &str,
+    is_member: bool,
     record_id: &str,
     limit: i64,
 ) -> Result<Vec<serde_json::Value>> {
@@ -1449,7 +1493,7 @@ pub async fn list_observations(
     }
     authorization::require_capability(
         db,
-        Principal::bound(actor, true),
+        Principal::bound(actor, is_member),
         record_id,
         Capability::View,
     )
@@ -1500,6 +1544,7 @@ pub async fn list_observations(
 pub async fn find_visible_binding_record(
     db: &Db,
     actor: &str,
+    is_member: bool,
     claim: &BindingClaim,
 ) -> Result<Option<String>> {
     let identifier = normalize_identifier(&claim.system, &claim.identifier)?;
@@ -1517,7 +1562,7 @@ pub async fn find_visible_binding_record(
     };
     match authorization::require_capability(
         db,
-        Principal::bound(actor, true),
+        Principal::bound(actor, is_member),
         &record_id,
         Capability::View,
     )
@@ -1531,12 +1576,13 @@ pub async fn find_visible_binding_record(
 pub async fn latest_snapshot_observation(
     db: &Db,
     actor: &str,
+    is_member: bool,
     record_id: &str,
     claim: &BindingClaim,
 ) -> Result<Option<String>> {
     authorization::require_capability(
         db,
-        Principal::bound(actor, true),
+        Principal::bound(actor, is_member),
         record_id,
         Capability::View,
     )
@@ -1762,6 +1808,7 @@ async fn apply_add_binding_plan_in(
     tx: &mut Transaction<'static, Sqlite>,
     context: &MutationContext<'_>,
     plan: &AddBindingPlan,
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<()> {
     if !plan.changed {
         return Ok(());
@@ -1789,6 +1836,7 @@ async fn apply_add_binding_plan_in(
                 Some(&plan.record_id),
                 Some(true),
                 Some(false),
+                act_alloc,
             )
             .await?;
         }
@@ -1811,6 +1859,7 @@ async fn apply_add_binding_plan_in(
             Some(&plan.record_id),
             Some(false),
             Some(true),
+            act_alloc,
         )
         .await?;
     } else {
@@ -1832,6 +1881,7 @@ async fn apply_add_binding_plan_in(
             Some(&plan.record_id),
             None,
             Some(plan.requested_canonical),
+            act_alloc,
         )
         .await?;
     }
@@ -1903,6 +1953,7 @@ async fn apply_canonicalize_binding_plan_in(
     tx: &mut Transaction<'static, Sqlite>,
     context: &MutationContext<'_>,
     plan: &CanonicalizeBindingPlan,
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<()> {
     if !plan.changed {
         return Ok(());
@@ -1930,6 +1981,7 @@ async fn apply_canonicalize_binding_plan_in(
                 Some(&plan.record_id),
                 Some(true),
                 Some(false),
+                act_alloc,
             )
             .await?;
         }
@@ -1951,6 +2003,7 @@ async fn apply_canonicalize_binding_plan_in(
         Some(&plan.record_id),
         Some(false),
         Some(true),
+        act_alloc,
     )
     .await
 }
@@ -2027,6 +2080,7 @@ async fn apply_remove_binding_plan_in(
     tx: &mut Transaction<'static, Sqlite>,
     context: &MutationContext<'_>,
     plan: &RemoveBindingPlan,
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<()> {
     if !plan.changed {
         return Ok(());
@@ -2046,6 +2100,7 @@ async fn apply_remove_binding_plan_in(
         None,
         plan.was_canonical,
         None,
+        act_alloc,
     )
     .await
 }
@@ -2229,6 +2284,7 @@ async fn apply_reconcile_binding_plan_in(
     tx: &mut Transaction<'static, Sqlite>,
     context: &MutationContext<'_>,
     plan: &ReconcileBindingPlan,
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<()> {
     for binding in &plan.bindings {
         sqlx::query(
@@ -2249,6 +2305,7 @@ async fn apply_reconcile_binding_plan_in(
             Some(&plan.target_record_id),
             Some(binding.canonical),
             Some(binding.canonical),
+            act_alloc,
         )
         .await?;
     }
@@ -2557,7 +2614,9 @@ pub async fn add_binding(
     claim: &BindingClaim,
     canonical: bool,
 ) -> Result<bool> {
-    add_binding_if_revision(db, context, record_id, claim, canonical, None).await
+    add_binding_if_revision(db, context, record_id, claim, canonical, None)
+        .await
+        .map(|(changed, _)| changed)
 }
 
 pub(crate) async fn add_binding_if_revision(
@@ -2567,9 +2626,10 @@ pub(crate) async fn add_binding_if_revision(
     claim: &BindingClaim,
     canonical: bool,
     expected_state_revision: Option<&str>,
-) -> Result<bool> {
+) -> Result<(bool, Option<i64>)> {
     context.validate("manage_bindings")?;
     let mut tx = crate::db::begin_write(db.write_pool()).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
     let planned = plan_add_binding_in(
         &mut tx,
         context,
@@ -2580,13 +2640,13 @@ pub(crate) async fn add_binding_if_revision(
         false,
     )
     .await?;
-    apply_add_binding_plan_in(&mut tx, context, &planned.plan).await?;
+    apply_add_binding_plan_in(&mut tx, context, &planned.plan, &mut act_alloc).await?;
     if planned.plan.changed {
         tx.commit().await?
     } else {
         tx.rollback().await?
     }
-    Ok(planned.plan.changed)
+    Ok((planned.plan.changed, act_alloc.get()))
 }
 
 pub async fn canonicalize_binding(
@@ -2595,7 +2655,9 @@ pub async fn canonicalize_binding(
     record_id: &str,
     claim: &BindingClaim,
 ) -> Result<bool> {
-    canonicalize_binding_if_revision(db, context, record_id, claim, None).await
+    canonicalize_binding_if_revision(db, context, record_id, claim, None)
+        .await
+        .map(|(changed, _)| changed)
 }
 
 pub(crate) async fn canonicalize_binding_if_revision(
@@ -2604,9 +2666,10 @@ pub(crate) async fn canonicalize_binding_if_revision(
     record_id: &str,
     claim: &BindingClaim,
     expected_state_revision: Option<&str>,
-) -> Result<bool> {
+) -> Result<(bool, Option<i64>)> {
     context.validate("manage_bindings")?;
     let mut tx = crate::db::begin_write(db.write_pool()).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
     let planned = plan_canonicalize_binding_in(
         &mut tx,
         context,
@@ -2616,13 +2679,13 @@ pub(crate) async fn canonicalize_binding_if_revision(
         false,
     )
     .await?;
-    apply_canonicalize_binding_plan_in(&mut tx, context, &planned.plan).await?;
+    apply_canonicalize_binding_plan_in(&mut tx, context, &planned.plan, &mut act_alloc).await?;
     if planned.plan.changed {
         tx.commit().await?;
     } else {
         tx.rollback().await?;
     }
-    Ok(planned.plan.changed)
+    Ok((planned.plan.changed, act_alloc.get()))
 }
 
 pub async fn remove_binding(
@@ -2631,7 +2694,9 @@ pub async fn remove_binding(
     record_id: &str,
     claim: &BindingClaim,
 ) -> Result<bool> {
-    remove_binding_if_revision(db, context, record_id, claim, None).await
+    remove_binding_if_revision(db, context, record_id, claim, None)
+        .await
+        .map(|(changed, _)| changed)
 }
 
 pub(crate) async fn remove_binding_if_revision(
@@ -2640,9 +2705,10 @@ pub(crate) async fn remove_binding_if_revision(
     record_id: &str,
     claim: &BindingClaim,
     expected_state_revision: Option<&str>,
-) -> Result<bool> {
+) -> Result<(bool, Option<i64>)> {
     context.validate("manage_bindings")?;
     let mut tx = crate::db::begin_write(db.write_pool()).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
     let planned = plan_remove_binding_in(
         &mut tx,
         context,
@@ -2652,13 +2718,13 @@ pub(crate) async fn remove_binding_if_revision(
         false,
     )
     .await?;
-    apply_remove_binding_plan_in(&mut tx, context, &planned.plan).await?;
+    apply_remove_binding_plan_in(&mut tx, context, &planned.plan, &mut act_alloc).await?;
     if planned.plan.changed {
         tx.commit().await?;
     } else {
         tx.rollback().await?;
     }
-    Ok(planned.plan.changed)
+    Ok((planned.plan.changed, act_alloc.get()))
 }
 
 pub async fn reconcile_bindings(
@@ -2679,6 +2745,7 @@ pub async fn reconcile_bindings(
         None,
     )
     .await
+    .map(|(selected, _)| selected)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2690,7 +2757,7 @@ pub(crate) async fn reconcile_bindings_if_revision(
     claims: &[BindingClaim],
     apply: bool,
     expected_state_revision: Option<&str>,
-) -> Result<Vec<BindingClaim>> {
+) -> Result<(Vec<BindingClaim>, Option<i64>)> {
     if apply {
         context.validate("manage_bindings")?;
     }
@@ -2705,6 +2772,7 @@ pub(crate) async fn reconcile_bindings_if_revision(
         ));
     }
     let mut tx = crate::db::begin_write(db.write_pool()).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
     let planned = plan_reconcile_bindings_in(
         &mut tx,
         context,
@@ -2724,11 +2792,12 @@ pub(crate) async fn reconcile_bindings_if_revision(
         .collect::<Vec<_>>();
     if !apply {
         tx.rollback().await?;
-        return Ok(normalized);
+        // Preview appends nothing: a true no-op with no act.
+        return Ok((normalized, None));
     }
-    apply_reconcile_binding_plan_in(&mut tx, context, &planned.plan).await?;
+    apply_reconcile_binding_plan_in(&mut tx, context, &planned.plan, &mut act_alloc).await?;
     tx.commit().await?;
-    Ok(normalized)
+    Ok((normalized, act_alloc.get()))
 }
 
 struct Snapshot<'a> {
@@ -2858,7 +2927,9 @@ pub async fn observe_external(
         ));
     }
     let mut tx = crate::db::begin_write(db.write_pool()).await?;
-    let resolution = resolve_external_in(db, &mut tx, context, claims, hints).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
+    let resolution =
+        resolve_external_in(db, &mut tx, context, claims, hints, &mut act_alloc).await?;
     require_capability_in(&mut tx, context, &resolution.record_id, Capability::Manage).await?;
     let (source, source_rule) = rule_in(&mut tx, source, context.internal, None).await?;
     if !source_rule.authoritative_provenance {
@@ -2921,6 +2992,7 @@ pub async fn observe_external(
                     }),
                     actor: Some(context.actor.into()),
                 },
+                &mut act_alloc,
             )
             .await?;
             append_in(
@@ -2936,6 +3008,7 @@ pub async fn observe_external(
                     }),
                     actor: Some(context.actor.into()),
                 },
+                &mut act_alloc,
             )
             .await?;
             append_in(
@@ -2947,6 +3020,7 @@ pub async fn observe_external(
                     payload: json!({"key": BLOB_REF_FACET_KEY, "value": meta.id}),
                     actor: Some(context.actor.into()),
                 },
+                &mut act_alloc,
             )
             .await?;
             Some(attachment_id)
@@ -2987,13 +3061,19 @@ pub async fn observe_external(
         }
     };
     let observation_id = Uuid::new_v4().to_string();
+    // Allocate immediately before the observation INSERT so captured
+    // observations share the content-event act they are written with
+    // (the three attachment appends above already allocated it), while
+    // identity-only and retained observations allocate a visible act of
+    // their own when the transaction has not yet stamped one.
+    let act = act_alloc.get_or_allocate(&mut tx).await?;
     sqlx::query(
         "INSERT INTO external_observations
          (id, record_id, source_system, source_identifier, quality, as_of, observed_at,
           actor, reason, run_key, parent_key, intent, materialization_policy, display_name,
           source_revision, source_digest, freshness, retention_state, source_availability,
-          refresh_outcome, retained_from_observation_id, provenance_attachment_id, derived_render_id)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)",
+          refresh_outcome, retained_from_observation_id, provenance_attachment_id, derived_render_id, act)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)",
     )
     .bind(&observation_id)
     .bind(&resolution.record_id)
@@ -3017,6 +3097,7 @@ pub async fn observe_external(
     .bind(effective_provenance.refresh_outcome.as_str())
     .bind(&effective_provenance.retained_from_observation_id)
     .bind(&provenance_attachment_id)
+    .bind(act)
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -3026,6 +3107,9 @@ pub async fn observe_external(
         created: resolution.created,
         provenance_attachment_id,
         provenance: effective_provenance,
+        // The act this observation's appends allocated; absent on a true
+        // no-op.
+        act: act_alloc.get(),
     })
 }
 

@@ -55,8 +55,12 @@ mod facets;
 pub(crate) use facets::{
     active_vocabulary_value, assert_open_facet_key, assert_required_not_worsened,
     assess_facet_write, classify_facet_key, facet_set_spec, govern_facet_writes,
-    observation_write_response, parse_facet_write_value, required_violations,
+    governed_alias_target, governed_alias_warnings_for_sets, governed_relationship_admits_subject,
+    governed_relationship_guidance, index_warning_for_batch, observation_write_response,
+    parse_facet_write_value, push_receipt_warning, push_receipt_warnings, required_violations,
     FacetKeyClassification, FacetPredicateAssessment, FacetWrite, RequiredViolation,
+    GOVERNED_ALIAS_ISSUE, GOVERNED_RELATIONSHIP_FACET_DIFFERENCE, GOVERNED_RELATIONSHIP_ISSUE,
+    GOVERNED_RELATIONSHIP_SUGGESTED_OPERATION,
 };
 #[cfg(any(feature = "postgres", feature = "turso-local"))]
 pub(crate) use facets::{
@@ -271,7 +275,7 @@ fn validate_record_id(record_id: &str, authority: RecordIdAuthority) -> Result<(
                 }
             } else if !accepted_uuid(record_id) {
                 // The non-reserved branch is unused today — every id reaching
-                // `append_engine_provisioned_in` is one of the six reserved
+                // `append_engine_provisioned_in` is one of the seven reserved
                 // constants — so this is a no-op in practice, kept so no
                 // authority can mint a non-UUID id.
                 return Err(Error::engine(RECORD_ID_UUID_ERROR));
@@ -1548,6 +1552,7 @@ mod tests {
             causal_envelope: crate::events::CausalEnvelopeV1::complete(
                 crate::events::CausalFrontierV1::empty(),
             ),
+            act: None,
         }
     }
 

@@ -11,14 +11,20 @@ use std::str::FromStr;
 /// `NATIVE_CE_EXPERIMENTAL_EXECUTORS` is a comma-separated allowlist read once
 /// at process startup. Unset or empty means no experimental executors: the
 /// advertised catalogue is byte-identical to the stable-only surface. The only
-/// recognised value is [`EXPERIMENTAL_FRESHNESS_EXECUTOR`]; any other name
+/// recognised values are [`EXPERIMENTAL_FRESHNESS_EXECUTOR`] and
+/// [`EXPERIMENTAL_SQL_WRITE_EXECUTOR`]; any other name
 /// fails startup (fail closed), naming the variable and the offending value.
 pub const EXPERIMENTAL_EXECUTORS_ENV: &str = "NATIVE_CE_EXPERIMENTAL_EXECUTORS";
 
-/// The only experimental executor the allowlist recognises: the
+/// The only experimental executor the allowlist recognised before E4 M1: the
 /// feature-gated context-freshness development probe backed by the
 /// build-enabled legacy tool `experimental_freshness_agent_intent`.
 pub const EXPERIMENTAL_FRESHNESS_EXECUTOR: &str = "experimental_freshness";
+
+/// Preview-only SQL-selected record edits (E4 M1), backed by the
+/// build-enabled legacy tool `sql_write`. Direct calls always refuse without
+/// mutation; preview is plan-required and admitted only under this allowlist.
+pub const EXPERIMENTAL_SQL_WRITE_EXECUTOR: &str = "sql_write";
 
 /// Parsed value of [`EXPERIMENTAL_EXECUTORS_ENV`]. Prefer this over passing
 /// raw strings: parsing (and its fail-closed unknown-name refusal) happens
@@ -51,9 +57,9 @@ impl ExperimentalExecutors {
             if name.is_empty() {
                 continue;
             }
-            if name != EXPERIMENTAL_FRESHNESS_EXECUTOR {
+            if name != EXPERIMENTAL_FRESHNESS_EXECUTOR && name != EXPERIMENTAL_SQL_WRITE_EXECUTOR {
                 return Err(format!(
-                    "{EXPERIMENTAL_EXECUTORS_ENV} names an unrecognised experimental executor ({name}): only {EXPERIMENTAL_FRESHNESS_EXECUTOR} is recognised"
+                    "{EXPERIMENTAL_EXECUTORS_ENV} names an unrecognised experimental executor ({name}): only {EXPERIMENTAL_FRESHNESS_EXECUTOR} and {EXPERIMENTAL_SQL_WRITE_EXECUTOR} are recognised"
                 ));
             }
             names.insert(name.to_string());
@@ -138,6 +144,15 @@ mod tests {
             ExperimentalExecutors::from_env_value(Some(" experimental_freshness ,,".into()))
                 .unwrap();
         assert!(allowlisted.contains(EXPERIMENTAL_FRESHNESS_EXECUTOR));
+        assert!(!allowlisted.contains(EXPERIMENTAL_SQL_WRITE_EXECUTOR));
+        let sql_write = ExperimentalExecutors::from_env_value(Some("sql_write".into())).unwrap();
+        assert!(sql_write.contains(EXPERIMENTAL_SQL_WRITE_EXECUTOR));
+        assert!(!sql_write.contains(EXPERIMENTAL_FRESHNESS_EXECUTOR));
+        let both =
+            ExperimentalExecutors::from_env_value(Some("experimental_freshness, sql_write".into()))
+                .unwrap();
+        assert!(both.contains(EXPERIMENTAL_FRESHNESS_EXECUTOR));
+        assert!(both.contains(EXPERIMENTAL_SQL_WRITE_EXECUTOR));
         // Duplicates are tolerated.
         let duplicated = ExperimentalExecutors::from_env_value(Some(
             "experimental_freshness, experimental_freshness".into(),

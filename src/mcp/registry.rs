@@ -76,7 +76,18 @@ use crate::domain_transaction::request::{
 /// the same price each, so on the order of 8 KiB. Those do not fit, and should
 /// not be made to fit by arriving here again. Treat another approach to this ceiling as a signal to
 /// settle `cc34ddc` instead: what the tool surface may cost an agent's context.
-pub const FOCUSED_PROFILE_MAX_BYTES: usize = 69_632;
+///
+/// Raised from 68 KiB to 70 KiB on 20 Sep 2026 for the declared source basis
+/// (`native.source-basis.v1`). The `sources` argument must be advertised on
+/// `create_record` and singular `update_record`, and the guidance that makes it
+/// worth declaring is a sentence in each descriptor. The compact schema (357
+/// bytes) and the two sentences cost 980 bytes on the ordinary Focused
+/// projection (69,114 -> 70,094), which stood 518 bytes inside the old ceiling
+/// and so no longer fits. This raise is the same shape as #1074's: a required contract, not a
+/// discretionary widening, and it is deliberately the smallest whole-KiB step
+/// that clears both the ordinary and the federated-lens Focused projections.
+/// It does not answer `cc34ddc`; it records that this feature needed the room.
+pub const FOCUSED_PROFILE_MAX_BYTES: usize = 71_680;
 /// Raised from 192 KiB to 224 KiB on 3 Sep 2026, deliberately and as a stopgap.
 ///
 /// The federated-lens Complete projection reached 196,637 bytes against the
@@ -91,7 +102,12 @@ pub const FOCUSED_PROFILE_MAX_BYTES: usize = 69_632;
 /// tools earn their place in the Complete profile at all. That question is
 /// filed separately. Treat another approach to this ceiling as a signal to
 /// answer it rather than to raise the number again.
-pub const COMPLETE_PROFILE_MAX_BYTES: usize = 229_376;
+///
+/// The alpha tab tool makes the experimental opt-in Complete projection
+/// 232,810 bytes. That profile must still be able to advertise its tools, so
+/// the ceiling is 232 KiB, leaving 4,758 bytes. The broader surface decision
+/// remains open; this is the smallest whole-KiB limit with useful headroom.
+pub const COMPLETE_PROFILE_MAX_BYTES: usize = 237_568;
 
 /// Trusted workspace audience classification supplied by the transport.
 /// Agent-authored tool arguments cannot influence this value.
@@ -158,6 +174,15 @@ pub struct Caller {
     /// Routing context alone never populates this capability.
     hosted_activity_roster: Option<Vec<crate::query::principal::ActivityRosterMember>>,
     hosting_owner: bool,
+    /// Live catalog membership footing for the portable policy principal.
+    /// `None` means no catalog plane (standalone, stdio, local, and tests):
+    /// the historical member footing. `Some` is the host-folded role fact —
+    /// `false` for guests, who keep roster presence (attribution) without
+    /// the `native:members` baseline. Every setter that attaches hosting
+    /// context requires the flag, so a hosted caller always carries `Some`
+    /// and omitting it fails to compile at the construction site instead of
+    /// silently resolving as a member.
+    hosting_is_member: Option<bool>,
     trusted_audience: TrustedAudience,
     /// Request-scoped hosted discovery preference. Standalone callers leave
     /// this unset and inherit the registry's deployment profile.
@@ -165,6 +190,16 @@ pub struct Caller {
     run_key: Option<String>,
     parent_key: Option<String>,
     intent: Option<String>,
+    /// Self-asserted MCP client identity from this call's
+    /// `params._meta["io.modelcontextprotocol/clientInfo"]`, attached by the
+    /// protocol layer before dispatch. This is a CLIENT-ASSERTED FACT, not a
+    /// server observation: the client names itself and the server cannot
+    /// verify the claim. It must never influence authorization, routing, or
+    /// any attested identity — it is stamped once at run admission for later
+    /// correlation only. `None` is "the call carried no `clientInfo`", which
+    /// stays distinguishable from an empty string the client did send.
+    reported_mcp_client_name: Option<String>,
+    reported_mcp_client_version: Option<String>,
     /// Present only after a trusted host/UI ingress verifies an unforgeable
     /// human interaction token. Tool arguments can never populate it.
     verified_human_interaction: Option<crate::awareness::VerifiedHumanInteraction>,
@@ -180,6 +215,22 @@ pub struct Caller {
     /// Exact structured human attribution gesture verified at trusted ingress.
     /// Ordinary tool arguments and general human-interaction tokens cannot set it.
     verified_attribution_declaration: Option<crate::attribution::VerifiedAttributionDeclaration>,
+    /// Exact alpha-tab preview pin verified at the hosted HTTP ingress after
+    /// cookie-session plus trusted-Origin same-origin checks. Only the hosted
+    /// plain-JSON adapter mints this, for the `preview` action alone; the MCP
+    /// router, Bearer callers, and tool arguments have no representation for
+    /// it, so `manage_alpha_tabs preview` refuses without it at the tool
+    /// layer. `Channel` alone cannot carry this proof: Bearer HTTP calls are
+    /// `Channel::Web` too.
+    verified_alpha_tab_preview: Option<VerifiedAlphaTabPreview>,
+    /// Exact alpha-tab adopt pin verified at the hosted HTTP ingress after
+    /// cookie-session plus trusted-Origin same-origin checks. Only the hosted
+    /// plain-JSON adapter attaches this, for the `adopt` action alone; the
+    /// MCP router, Bearer callers, and tool arguments have no representation
+    /// for it, so `manage_alpha_tabs adopt` refuses without it at the tool
+    /// layer. Same pin shape as the preview proof, separate field so one
+    /// request's preview authority is never an adopt authority.
+    verified_alpha_tab_adopt: Option<VerifiedAlphaTabPreview>,
     /// Trusted policy evaluator authority. Ordinary authenticated agent calls
     /// never receive this bit and therefore cannot reroute obligations.
     policy_authority: bool,
@@ -209,6 +260,71 @@ pub struct HostedMembershipPlanExecution {
 pub(crate) struct VerifiedDelegatedService {
     pub(crate) endpoint_id: String,
     pub(crate) credential_id: String,
+}
+
+/// Host-verified alpha-tab pin authority (task `26ba75a`).
+///
+/// Binds the exact caller account to the exact pin: the full
+/// `(package, version, digest, artifact_id, source_revision,
+/// declaration_digest)` plus the canonical `needs`/`effects` the digest was
+/// recomputed over. It is the hosted-ingress proof — cookie-session plus
+/// trusted-Origin same-origin checks for this account and this pin — and it
+/// serves both actions that mint or consume server-stamped adoption
+/// authority: the tool refuses `preview` unless the caller carries one on
+/// the preview field, and refuses `adopt` unless the caller carries one on
+/// the adopt field, each matching the requested pin field-for-field. A
+/// receipt (id/nonce) can therefore never reach a Bearer or MCP caller:
+/// only the hosted plain-JSON adapter constructs this value, after
+/// cookie-session plus trusted-Origin checks, and no MCP argument has a
+/// representation for it. The two `Caller` fields keep the preview proof
+/// and the adopt proof distinct per request even though both bind the same
+/// pin shape.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerifiedAlphaTabPreview {
+    /// Authenticated account the hosted ingress verified the cookie for.
+    pub account_id: String,
+    pub package: String,
+    pub version: String,
+    pub digest: String,
+    pub artifact_id: String,
+    pub source_revision: String,
+    pub declaration_digest: String,
+    /// Canonical (sorted) needs the pin digest covers.
+    pub needs: Vec<String>,
+    /// Canonical (sorted) effects the pin digest covers.
+    pub effects: Vec<String>,
+}
+
+impl VerifiedAlphaTabPreview {
+    /// Build the attestation for one exact pin. Sorts `needs`/`effects`
+    /// into canonical order so the tool's field-for-field comparison holds
+    /// regardless of the author's declaration ordering.
+    #[allow(clippy::too_many_arguments)]
+    pub fn for_pin(
+        account_id: impl Into<String>,
+        package: impl Into<String>,
+        version: impl Into<String>,
+        digest: impl Into<String>,
+        artifact_id: impl Into<String>,
+        source_revision: impl Into<String>,
+        declaration_digest: impl Into<String>,
+        mut needs: Vec<String>,
+        mut effects: Vec<String>,
+    ) -> Self {
+        needs.sort();
+        effects.sort();
+        Self {
+            account_id: account_id.into(),
+            package: package.into(),
+            version: version.into(),
+            digest: digest.into(),
+            artifact_id: artifact_id.into(),
+            source_revision: source_revision.into(),
+            declaration_digest: declaration_digest.into(),
+            needs,
+            effects,
+        }
+    }
 }
 
 #[cfg(feature = "mcp-executor-prototype")]
@@ -276,16 +392,21 @@ impl Caller {
             hosting_database: None,
             hosted_activity_roster: None,
             hosting_owner: false,
+            hosting_is_member: None,
             trusted_audience: TrustedAudience::Solo,
             exposure_policy: None,
             run_key: None,
             parent_key: None,
             intent: None,
+            reported_mcp_client_name: None,
+            reported_mcp_client_version: None,
             verified_human_interaction: None,
             verified_provenance_interaction: None,
             verified_agent_executor: None,
             verified_delegated_service: None,
             verified_attribution_declaration: None,
+            verified_alpha_tab_preview: None,
+            verified_alpha_tab_adopt: None,
             policy_authority: false,
             write_plan_execution: None,
             #[cfg(feature = "mcp-executor-prototype")]
@@ -333,6 +454,14 @@ impl Caller {
 
     /// Attach both pieces of authenticated host routing context. The database
     /// id never becomes the portable credential or event actor.
+    ///
+    /// Test and development seam only: it folds member footing explicitly,
+    /// so tests that simulate a hosted caller keep the historical member
+    /// resolution without naming the flag. Production hosted paths must go
+    /// through `with_verified_hosted_activity` (which requires the flag) or
+    /// pair this with an explicit `with_hosting_member` — a hosted caller
+    /// that needs guest footing and forgets it is a bug this seam cannot
+    /// express, which is why it is documented test-only.
     #[doc(hidden)]
     pub fn with_hosting_context(
         mut self,
@@ -341,6 +470,7 @@ impl Caller {
     ) -> Self {
         self.hosting_principal = Some(principal.into());
         self.hosting_database = Some(database.into());
+        self.hosting_is_member = Some(true);
         self.trusted_audience = TrustedAudience::Unknown;
         self
     }
@@ -354,12 +484,20 @@ impl Caller {
     /// same current catalog snapshot. Each roster entry must have been mapped
     /// read-only to the portable identity in this exact workspace. Tool
     /// arguments must never reach this seam.
+    ///
+    /// `is_member` is the same snapshot's role fact for the caller: owners
+    /// and members resolve against the `native:members` baseline, guests
+    /// resolve to their own account grants only. It is a required parameter
+    /// (rather than a follow-up setter) so a hosted construction that
+    /// forgets the footing fails to compile instead of silently resolving
+    /// as a member.
     #[doc(hidden)]
     pub unsafe fn with_verified_hosted_activity(
         mut self,
         principal: impl Into<String>,
         database: impl Into<String>,
         roster: Vec<crate::query::principal::ActivityRosterMember>,
+        is_member: bool,
     ) -> Result<Self> {
         let principal = principal.into();
         let database = database.into();
@@ -374,6 +512,7 @@ impl Caller {
         self.hosting_principal = Some(principal);
         self.hosting_database = Some(database);
         self.hosted_activity_roster = Some(roster);
+        self.hosting_is_member = Some(is_member);
         self.trusted_audience = TrustedAudience::Unknown;
         Ok(self)
     }
@@ -392,6 +531,35 @@ impl Caller {
     pub fn with_hosting_owner(mut self, is_owner: bool) -> Self {
         self.hosting_owner = is_owner;
         self
+    }
+
+    /// Fold the actor's catalog role into policy footing for callers that
+    /// carry no verified activity roster (first-party web routes that
+    /// resolved the role through the catalog instead). Callers that attach
+    /// a roster pass the flag to `with_verified_hosted_activity` instead.
+    /// `principal()` and every direct caller-credential authorization site
+    /// read it instead of assuming membership.
+    #[doc(hidden)]
+    pub fn with_hosting_member(mut self, is_member: bool) -> Self {
+        self.hosting_is_member = Some(is_member);
+        self
+    }
+
+    /// Whether this caller matches the portable `members` policy subject.
+    /// `None` (no catalog plane: standalone, stdio, local, tests) keeps the
+    /// historical member footing. A hosted caller always carries an explicit
+    /// fold — omission fails to compile at the construction site — so this
+    /// `unwrap_or` is only reachable off the catalog plane.
+    pub fn is_host_member(&self) -> bool {
+        // Fail-open would be silent here, so debug builds refuse a hosted
+        // caller with no folded footing instead. `with_hosting_context` is
+        // the only setter that leaves `None` alongside a database, and it
+        // is a documented test seam; production hosted paths always fold.
+        debug_assert!(
+            self.hosting_database.is_none() || self.hosting_is_member.is_some(),
+            "hosted caller without folded membership footing"
+        );
+        self.hosting_is_member.unwrap_or(true)
     }
 
     #[doc(hidden)]
@@ -471,6 +639,15 @@ impl Caller {
         self.hosting_database.as_deref()
     }
 
+    /// Whether trusted ingress attached a catalog-verified activity roster to
+    /// this caller. Read slices that evaluate visibility through the narrow
+    /// query principal (rather than the ordinary policy principal) use this
+    /// to decline callers whose visible set could admit activity context
+    /// beyond the governed tool path.
+    pub(crate) fn has_hosted_activity_roster(&self) -> bool {
+        self.hosted_activity_roster.is_some()
+    }
+
     pub fn run_key(&self) -> Option<&str> {
         self.run_key.as_deref()
     }
@@ -481,6 +658,33 @@ impl Caller {
 
     pub fn intent(&self) -> Option<&str> {
         self.intent.as_deref()
+    }
+
+    /// Attach the self-asserted client identity the protocol layer read off
+    /// this call's `params._meta`. Only ever called with values that already
+    /// passed `validate_implementation` (or `None` when the call carried no
+    /// `clientInfo`). Client-asserted, never verified: see the field docs.
+    pub(crate) fn with_reported_mcp_client(
+        mut self,
+        name: Option<String>,
+        version: Option<String>,
+    ) -> Self {
+        self.reported_mcp_client_name = name;
+        self.reported_mcp_client_version = version;
+        self
+    }
+
+    /// The self-asserted identity to stamp if this call admits a run. The
+    /// model slot stays `None` here by construction: the model is the agent's
+    /// own declaration, carried by the `set_intent` `model` argument rather
+    /// than by the caller context, so the governed request wrapper attaches
+    /// it after the handler type-checks the arguments.
+    pub(crate) fn reported_run_identity(&self) -> crate::control::ReportedRunIdentity {
+        crate::control::ReportedRunIdentity {
+            client_name: self.reported_mcp_client_name.clone(),
+            client_version: self.reported_mcp_client_version.clone(),
+            model: None,
+        }
     }
 
     pub(crate) fn verified_human_interaction(
@@ -513,6 +717,42 @@ impl Caller {
         &self,
     ) -> Option<&crate::attribution::VerifiedAttributionDeclaration> {
         self.verified_attribution_declaration.as_ref()
+    }
+
+    pub(crate) fn verified_alpha_tab_preview(&self) -> Option<&VerifiedAlphaTabPreview> {
+        self.verified_alpha_tab_preview.as_ref()
+    }
+
+    /// Host ingress seam for alpha-tab sample-only preview authority.
+    ///
+    /// Call only after the hosted adapter has verified a cookie-authenticated
+    /// session plus a trusted-Origin same-origin POST for this exact preview
+    /// pin. There is deliberately no MCP argument for it, and the observed
+    /// [`Channel`] is never consulted: Bearer HTTP calls arrive as
+    /// `Channel::Web`, so channel alone cannot distinguish the shell from an
+    /// agent. The MCP router never calls this; without it the tool refuses.
+    #[doc(hidden)]
+    pub fn with_verified_alpha_tab_preview(mut self, preview: VerifiedAlphaTabPreview) -> Self {
+        self.verified_alpha_tab_preview = Some(preview);
+        self
+    }
+
+    pub(crate) fn verified_alpha_tab_adopt(&self) -> Option<&VerifiedAlphaTabPreview> {
+        self.verified_alpha_tab_adopt.as_ref()
+    }
+
+    /// Host ingress seam for alpha-tab adopt-confirm authority.
+    ///
+    /// Call only after the hosted adapter has verified a cookie-authenticated
+    /// session plus a trusted-Origin same-origin POST for this exact adopt
+    /// pin. There is deliberately no MCP argument for it, and the observed
+    /// [`Channel`] is never consulted: Bearer HTTP calls arrive as
+    /// `Channel::Web`, so channel alone cannot distinguish the shell from an
+    /// agent. The MCP router never calls this; without it the tool refuses.
+    #[doc(hidden)]
+    pub fn with_verified_alpha_tab_adopt(mut self, adopt: VerifiedAlphaTabPreview) -> Self {
+        self.verified_alpha_tab_adopt = Some(adopt);
+        self
     }
 
     /// Bind a signed UI declaration gesture to the complete canonical accepted
@@ -686,10 +926,14 @@ impl From<&Caller> for crate::query::QueryPrincipal {
                 crate::query::QueryPrincipal::activity_reader_unchecked(
                     caller.credential(),
                     roster.clone(),
+                    caller.is_host_member(),
                 )
             }
         } else {
-            crate::query::QueryPrincipal::authenticated(caller.credential())
+            crate::query::QueryPrincipal::authenticated(
+                caller.credential(),
+                caller.is_host_member(),
+            )
         }
     }
 }
@@ -733,6 +977,7 @@ mod query_principal_conversion_tests {
                 "catalog-alice",
                 "db-1",
                 vec![member],
+                true,
             )
         }
         .unwrap();
@@ -745,6 +990,7 @@ mod query_principal_conversion_tests {
                 "catalog-bea",
                 "db-1",
                 Vec::new(),
+                true,
             )
         }
         .is_err());
@@ -755,6 +1001,36 @@ mod query_principal_conversion_tests {
         let principal = QueryPrincipal::from(&Caller::authenticated("alice"));
         assert!(!principal.activity_read());
         assert!(!principal.trusted_local_bypass());
+    }
+
+    #[test]
+    fn membership_footing_is_explicit_or_absent_never_defaulted() {
+        // No catalog plane: the historical member footing.
+        assert!(Caller::authenticated("alice").is_host_member());
+        assert!(Caller::local().is_host_member());
+        // An explicit fold decides, either way.
+        assert!(Caller::authenticated("alice")
+            .with_hosting_member(true)
+            .is_host_member());
+        assert!(!Caller::authenticated("alice")
+            .with_hosting_member(false)
+            .is_host_member());
+        let member = unsafe {
+            crate::query::principal::ActivityRosterMember::verified_unchecked(
+                "alice",
+                "native:workspace-member:alice",
+            )
+        };
+        let verified = unsafe {
+            Caller::authenticated("alice").with_verified_hosted_activity(
+                "catalog-alice",
+                "db-1",
+                vec![member],
+                false,
+            )
+        }
+        .unwrap();
+        assert!(!verified.is_host_member());
     }
 }
 
@@ -824,6 +1100,7 @@ mod governed_pipeline_tests {
             _run_key: &'a str,
             _intent: &'a str,
             _authenticated_account: &'a str,
+            _reported: crate::control::ReportedRunIdentity,
         ) -> BoxFuture<'a, Result<()>> {
             Box::pin(async { Ok(()) })
         }
@@ -1185,9 +1462,10 @@ impl crate::domain_transaction::request::RequestLifecyclePort for SqliteRequestL
         run_key: &'a str,
         _intent: &'a str,
         authenticated_account: &'a str,
+        reported: crate::control::ReportedRunIdentity,
     ) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
-            crate::control::ensure_agent_run(self.db, run_key, authenticated_account)
+            crate::control::ensure_agent_run(self.db, run_key, authenticated_account, reported)
                 .await
                 .map(|_| ())
         })
@@ -1309,6 +1587,7 @@ impl crate::domain_transaction::request::RequestLifecyclePort for PostgresReques
         run_key: &'a str,
         intent: &'a str,
         _authenticated_account: &'a str,
+        _reported: crate::control::ReportedRunIdentity,
     ) -> BoxFuture<'a, Result<()>> {
         Box::pin(self.db.persist_intent(run_key, intent))
     }
@@ -1383,6 +1662,7 @@ impl crate::domain_transaction::request::RequestLifecyclePort for SuppressedRequ
         _run_key: &'a str,
         _intent: &'a str,
         _authenticated_account: &'a str,
+        _reported: crate::control::ReportedRunIdentity,
     ) -> BoxFuture<'a, Result<()>> {
         Box::pin(async { Err(Error::engine("run-context persistence is suppressed")) })
     }
@@ -1484,13 +1764,17 @@ async fn dispatch_with_request_port<
             // no-op when no hosted timing scope is installed.
             #[cfg(test)]
             {
-                let (outcome, handler_acquisitions) = crate::mcp::request_timing::handler(
-                    crate::db::with_write_pool_acquisition_counter(handler(
-                        engine, caller, arguments,
-                    )),
-                )
-                .await;
-                crate::db::publish_write_pool_acquisitions(handler_acquisitions);
+                let ((outcome, handler_write_acquisitions), handler_read_acquisitions) =
+                    crate::mcp::request_timing::handler(
+                        crate::db::with_read_pool_acquisition_counter(
+                            crate::db::with_write_pool_acquisition_counter(handler(
+                                engine, caller, arguments,
+                            )),
+                        ),
+                    )
+                    .await;
+                crate::db::publish_write_pool_acquisitions(handler_write_acquisitions);
+                crate::db::publish_read_pool_acquisitions(handler_read_acquisitions);
                 outcome
             }
             #[cfg(not(test))]
@@ -3055,6 +3339,12 @@ fn manage_memberships_schema() -> Value {
                 "type":"object", "required":["action","invitation_id","idempotency_key","reason"], "properties":{"action":{"const":"invitations_revoke"},"invitation_id":{"type":"string","minLength":1},"idempotency_key":{"type":"string","minLength":1,"maxLength":256},"reason":{"type":"string","minLength":1,"maxLength":2000}}, "additionalProperties":false
             },
             {
+                "type":"object", "required":["action","scope_record_id","capability","idempotency_key","reason"], "properties":{"action":{"const":"create_guest_link"},"scope_record_id":{"type":"string","minLength":1},"capability":{"enum":["view","edit"]},"ttl_seconds":{"type":"integer","minimum":1,"maximum":2592000},"max_redemptions":{"type":"integer","minimum":1,"maximum":1000},"idempotency_key":{"type":"string","minLength":1,"maxLength":256},"reason":{"type":"string","minLength":1,"maxLength":2000}}, "additionalProperties":false
+            },
+            {
+                "type":"object", "required":["action","invitation_id","idempotency_key","reason"], "properties":{"action":{"const":"revoke_guest_link"},"invitation_id":{"type":"string","minLength":1},"idempotency_key":{"type":"string","minLength":1,"maxLength":256},"reason":{"type":"string","minLength":1,"maxLength":2000}}, "additionalProperties":false
+            },
+            {
                 "type":"object",
                 "required":["action","member_id","role","reason"],
                 "properties":{
@@ -3116,6 +3406,48 @@ pub fn register_membership_tool_schema(registry: &mut ToolRegistry) -> Result<()
     })?;
     registry
         .mark_engine_operations_unavailable(ToolKind::ManageMemberships.name(), EngineKind::Sqlite)
+}
+
+const WORKSPACE_READ_DESCRIPTION: &str = "Hosted workspace directory. Use action=list for the caller's workspaces with name, id, short reference, and connect paths (MCP scoped path and workbench path), so an agent can name workspaces to a human and later switch by name. Read-only.";
+
+fn workspace_read_schema() -> Value {
+    serde_json::json!({
+        "type":"object",
+        "required":["action"],
+        "properties":{
+            "action":{"const":"list"}
+        },
+        "additionalProperties":false
+    })
+}
+
+/// Register the hosted descriptor against one narrow execution delegate.
+#[doc(hidden)]
+pub fn register_workspace_tool_with<F, Fut>(registry: &mut ToolRegistry, handler: F) -> Result<()>
+where
+    F: Fn(Db, Caller, Value) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<Value>> + Send + 'static,
+{
+    registry.register(
+        ToolKind::WorkspaceRead,
+        WORKSPACE_READ_DESCRIPTION,
+        workspace_read_schema(),
+        handler,
+    )
+}
+
+/// Register only the maximal-hosted descriptor for deterministic generators.
+///
+/// Generated registries are never dispatched; hosted composition must use a
+/// concrete handler through [`register_workspace_tool_with`].
+#[doc(hidden)]
+pub fn register_workspace_tool_schema(registry: &mut ToolRegistry) -> Result<()> {
+    register_workspace_tool_with(registry, |_db, _caller, _arguments| async {
+        Err(Error::engine(
+            "workspace_read schema-only delegate cannot be dispatched",
+        ))
+    })?;
+    registry.mark_engine_operations_unavailable(ToolKind::WorkspaceRead.name(), EngineKind::Sqlite)
 }
 
 /// Hosted external-source discovery. Only registered when the deployment
@@ -3495,7 +3827,9 @@ mod hosting_context_tests {
             let gate = gate.clone();
             tokio::spawn(async move {
                 crate::mcp::interactions::with_capture_test_gate(gate, async move {
-                    registry.call(db, Caller::local(), "ping", json!({})).await
+                    registry
+                        .call(db, Caller::local(), "ping", json!({"run_key":"new"}))
+                        .await
                 })
                 .await
             })
@@ -3558,7 +3892,7 @@ mod hosting_context_tests {
             async move {
                 super::super::interactions::with_capture_test_gate(
                     gate,
-                    registry.call(db, Caller::local(), "ping", json!({})),
+                    registry.call(db, Caller::local(), "ping", json!({"run_key":"new"})),
                 )
                 .await
             }
@@ -3603,7 +3937,12 @@ mod hosting_context_tests {
         );
 
         let next = registry
-            .call(db.clone(), Caller::local(), "ping", json!({}))
+            .call(
+                db.clone(),
+                Caller::local(),
+                "ping",
+                json!({"run_key":"new"}),
+            )
             .await
             .unwrap();
         assert_eq!(next["ok"], true);
@@ -3663,6 +4002,277 @@ mod hosting_context_tests {
         db.close().await;
     }
 
+    /// The admitting `set_intent` stamps the caller's self-asserted client
+    /// identity on the run's start event and `agent_runs` row in the same
+    /// transaction; a caller carrying nothing records NULLs.
+    #[tokio::test]
+    async fn set_intent_admission_stamps_reported_client_identity() {
+        let db = crate::db::create_database(":memory:").await.unwrap();
+        let mut registry = ToolRegistry::new();
+        crate::mcp::register_builtin_tools(&mut registry).unwrap();
+        crate::mcp::register_surface_tools(&mut registry).unwrap();
+        let run_key = "scout-chair-a748b2";
+        let caller = Caller::authenticated("acct:alice")
+            .with_reported_mcp_client(Some("hazel".into()), Some("2.1.0".into()));
+        assert_eq!(
+            caller.reported_run_identity().client_name.as_deref(),
+            Some("hazel"),
+            "Caller retains the attached client name",
+        );
+        assert_eq!(
+            caller.reported_run_identity().client_version.as_deref(),
+            Some("2.1.0"),
+            "Caller retains the attached client version",
+        );
+        registry
+            .call(
+                db.clone(),
+                caller,
+                "set_intent",
+                json!({"intent": "declare with identity", "run_key": run_key}),
+            )
+            .await
+            .unwrap();
+        let identity = crate::control::read_agent_run_reported_identity(&db, run_key)
+            .await
+            .unwrap()
+            .expect("admitted run reads back");
+        assert_eq!(identity.client_name.as_deref(), Some("hazel"));
+        assert_eq!(identity.client_version.as_deref(), Some("2.1.0"));
+        assert_eq!(identity.model, None);
+
+        let silent_run = "scout-chair-b748b2";
+        registry
+            .call(
+                db.clone(),
+                Caller::authenticated("acct:alice"),
+                "set_intent",
+                json!({"intent": "declare without identity", "run_key": silent_run}),
+            )
+            .await
+            .unwrap();
+        let silent = crate::control::read_agent_run_reported_identity(&db, silent_run)
+            .await
+            .unwrap()
+            .expect("admitted run reads back");
+        assert_eq!(silent, crate::control::ReportedRunIdentity::default());
+        db.close().await;
+    }
+
+    /// The `set_intent` `model` argument is the declared-model writer: the
+    /// admitting call stamps it and the response confirms what was recorded.
+    /// An identical repeat succeeds unchanged. A differing second declaration
+    /// is refused in the response — recorded stays put — while the call
+    /// itself still succeeds: the intent lands and the briefing is returned,
+    /// because an unverified value must never decide whether the declaration
+    /// succeeds.
+    #[tokio::test]
+    async fn set_intent_model_argument_writes_once_and_refuses_divergence() {
+        let db = crate::db::create_database(":memory:").await.unwrap();
+        let mut registry = ToolRegistry::new();
+        crate::mcp::register_builtin_tools(&mut registry).unwrap();
+        crate::mcp::register_surface_tools(&mut registry).unwrap();
+        let run_key = "scout-chair-a748b2";
+        let admission = registry
+            .call(
+                db.clone(),
+                Caller::authenticated("acct:alice"),
+                "set_intent",
+                json!({"intent": "declare with model", "model": "ledger-model-a", "run_key": run_key}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(admission["declared_model"]["declared"], "ledger-model-a");
+        assert_eq!(admission["declared_model"]["recorded"], "ledger-model-a");
+        assert_eq!(admission["declared_model"]["refused"], false);
+        let identity = crate::control::read_agent_run_reported_identity(&db, run_key)
+            .await
+            .unwrap()
+            .expect("admitted run reads back");
+        assert_eq!(identity.model.as_deref(), Some("ledger-model-a"));
+
+        let repeat = registry
+            .call(
+                db.clone(),
+                Caller::authenticated("acct:alice"),
+                "set_intent",
+                json!({"intent": "declare again", "model": "ledger-model-a", "run_key": run_key}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(repeat["declared_model"]["recorded"], "ledger-model-a");
+        assert_eq!(repeat["declared_model"]["refused"], false);
+
+        // The divergence is refused in the response, not as a failed call:
+        // the new intent still lands (run_context carries it) while the
+        // recorded model is unchanged.
+        let diverged = registry
+            .call_detailed(
+                db.clone(),
+                Caller::authenticated("acct:alice"),
+                "set_intent",
+                json!({"intent": "declare otherwise", "model": "ledger-model-b", "run_key": run_key}),
+            )
+            .await
+            .unwrap();
+        assert!(diverged.outcome.is_ok());
+        let body = diverged.outcome.unwrap();
+        assert_eq!(body.structured["accepted_intent"], "declare otherwise");
+        assert_eq!(
+            body.structured["declared_model"]["declared"],
+            "ledger-model-b"
+        );
+        assert_eq!(
+            body.structured["declared_model"]["recorded"],
+            "ledger-model-a"
+        );
+        assert_eq!(body.structured["declared_model"]["refused"], true);
+        assert_eq!(diverged.run_context["intent"], "declare otherwise");
+        let kept = crate::control::read_agent_run_reported_identity(&db, run_key)
+            .await
+            .unwrap()
+            .expect("admitted run reads back");
+        assert_eq!(kept.model.as_deref(), Some("ledger-model-a"));
+        db.close().await;
+    }
+
+    /// The admitted client is visible on BOTH surfaces a reader meets it on:
+    /// the `contribution.run` block an agent reads through `get_record`, and
+    /// the `run` block a person's run page reads through `get_event_context`.
+    /// The assurance rung travels with the value on both, and a run admitted
+    /// without `clientInfo` reports nothing at all — no empty object, and no
+    /// `reported_model` standing in for a writer that does not exist yet.
+    #[tokio::test]
+    async fn reported_client_reaches_the_run_block_on_both_surfaces() {
+        let db = crate::db::create_database(":memory:").await.unwrap();
+        let mut registry = ToolRegistry::new();
+        crate::mcp::register_builtin_tools(&mut registry).unwrap();
+        crate::mcp::register_surface_tools(&mut registry).unwrap();
+        let named =
+            || Caller::local().with_reported_mcp_client(Some("hazel".into()), Some("2.1.0".into()));
+
+        let run_key = "scout-chair-c748b2";
+        let record_id = "c0de0000-0000-4000-8000-000000000001";
+        registry
+            .call(
+                db.clone(),
+                named(),
+                "set_intent",
+                json!({"intent": "declare with a client", "run_key": run_key}),
+            )
+            .await
+            .unwrap();
+        registry
+            .call(
+                db.clone(),
+                named(),
+                "create_record",
+                json!({
+                    "id": record_id,
+                    "type": "Document",
+                    "kind": "note",
+                    "name": "written under a reported client",
+                    "body": "body",
+                    "reason": "test fixture",
+                    "run_key": run_key,
+                }),
+            )
+            .await
+            .unwrap();
+
+        let fetched = registry
+            .call(
+                db.clone(),
+                named(),
+                "get_record",
+                json!({"ids": [record_id]}),
+            )
+            .await
+            .unwrap();
+        let run = &fetched["records"][0]["contribution"]["run"];
+        assert_eq!(run["run_key"], json!(run_key));
+        assert_eq!(run["reported_mcp_client"]["name"], "hazel");
+        assert_eq!(run["reported_mcp_client"]["version"], "2.1.0");
+        assert_eq!(
+            run["reported_mcp_client"]["assurance"], "client_asserted",
+            "the client named itself; the claim cannot be read without that rung"
+        );
+        assert!(
+            run.get("reported_model").is_none(),
+            "no writer populates the model claim, so it must be absent, not stubbed"
+        );
+
+        let event_id: String = sqlx::query_scalar(
+            "SELECT id FROM content_events WHERE record_id = ? AND type = 'record.created'",
+        )
+        .bind(record_id)
+        .fetch_one(db.write_pool())
+        .await
+        .unwrap();
+        let context = registry
+            .call(
+                db.clone(),
+                named(),
+                "get_event_context",
+                json!({"event_id": event_id}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(context["run"]["run_key"], json!(run_key));
+        assert_eq!(context["run"]["reported_mcp_client"]["name"], "hazel");
+        assert_eq!(
+            context["run"]["reported_mcp_client"]["assurance"],
+            "client_asserted"
+        );
+
+        // A different run admitted by a caller carrying nothing: absence, not
+        // an empty object, on the same surfaces.
+        let silent_run = "scout-chair-d748b2";
+        let silent_record = "c0de0000-0000-4000-8000-000000000002";
+        registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "set_intent",
+                json!({"intent": "declare without a client", "run_key": silent_run}),
+            )
+            .await
+            .unwrap();
+        registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "create_record",
+                json!({
+                    "id": silent_record,
+                    "type": "Document",
+                    "kind": "note",
+                    "name": "written under an unreported client",
+                    "body": "body",
+                    "reason": "test fixture",
+                    "run_key": silent_run,
+                }),
+            )
+            .await
+            .unwrap();
+        let silent = registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "get_record",
+                json!({"ids": [silent_record]}),
+            )
+            .await
+            .unwrap();
+        assert!(
+            silent["records"][0]["contribution"]["run"]
+                .get("reported_mcp_client")
+                .is_none(),
+            "nothing was asserted, so no client key appears"
+        );
+        db.close().await;
+    }
+
     /// Declarations bypass the lossy queue entirely, so a shut-down (or full)
     /// queue cannot drop an acknowledged intent: the row lands and the
     /// ordinary capture afterwards is the one counted as refused.
@@ -3694,7 +4304,12 @@ mod hosting_context_tests {
         assert_eq!(row, 1);
 
         registry
-            .call(db.clone(), Caller::local(), "ping", json!({}))
+            .call(
+                db.clone(),
+                Caller::local(),
+                "ping",
+                json!({"run_key":"new"}),
+            )
             .await
             .unwrap();
         let stats = db.capture_stats();
@@ -3723,7 +4338,7 @@ mod hosting_context_tests {
             async move {
                 super::super::interactions::with_capture_test_gate(
                     gate,
-                    registry.call(db, Caller::local(), "ping", json!({})),
+                    registry.call(db, Caller::local(), "ping", json!({"run_key":"new"})),
                 )
                 .await
             }
@@ -3732,7 +4347,12 @@ mod hosting_context_tests {
             .await
             .expect("first capture entered its write transaction");
         registry
-            .call(db.clone(), Caller::local(), "ping", json!({}))
+            .call(
+                db.clone(),
+                Caller::local(),
+                "ping",
+                json!({"run_key":"new"}),
+            )
             .await
             .unwrap();
         db.close_in_background();
@@ -3773,7 +4393,7 @@ mod hosting_context_tests {
             async move {
                 super::super::interactions::with_capture_test_gate(
                     gate,
-                    registry.call(db, Caller::local(), "ping", json!({})),
+                    registry.call(db, Caller::local(), "ping", json!({"run_key":"new"})),
                 )
                 .await
             }
@@ -3825,7 +4445,7 @@ mod hosting_context_tests {
             async move {
                 super::super::interactions::with_capture_test_gate(
                     gate_a,
-                    registry.call(db, Caller::local(), "ping", json!({})),
+                    registry.call(db, Caller::local(), "ping", json!({"run_key":"new"})),
                 )
                 .await
             }
@@ -3836,7 +4456,12 @@ mod hosting_context_tests {
 
         let response = super::super::interactions::with_capture_pre_policy_gate(
             gate_b.clone(),
-            registry.call(db.clone(), Caller::local(), "ping", json!({})),
+            registry.call(
+                db.clone(),
+                Caller::local(),
+                "ping",
+                json!({"run_key":"new"}),
+            ),
         )
         .await
         .unwrap();
@@ -3886,13 +4511,13 @@ mod hosting_context_tests {
 }
 
 #[cfg(test)]
-mod handler_write_pool_acquisition_tests {
+mod handler_pool_acquisition_tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     /// Invoke one tool through the full serving path inside the acquisition
     /// sink. Returns the tool result and the handler-body write-pool
-    /// acquisition count published by dispatch. The sink starts at a
+    /// acquisition counts published by dispatch. The sinks start at a
     /// sentinel so a broken publish handoff fails loudly instead of
     /// reading as zero.
     async fn call_with_acquisition_sink(
@@ -3900,14 +4525,22 @@ mod handler_write_pool_acquisition_tests {
         db: Db,
         name: &str,
         arguments: Value,
-    ) -> (Result<Value>, u64) {
-        let sink = Arc::new(AtomicU64::new(u64::MAX));
-        let output = crate::db::with_write_pool_acquisition_sink(
-            Arc::clone(&sink),
-            registry.call(db, Caller::local(), name, arguments),
+    ) -> (Result<Value>, u64, u64) {
+        let write_sink = Arc::new(AtomicU64::new(u64::MAX));
+        let read_sink = Arc::new(AtomicU64::new(u64::MAX));
+        let output = crate::db::with_read_pool_acquisition_sink(
+            Arc::clone(&read_sink),
+            crate::db::with_write_pool_acquisition_sink(
+                Arc::clone(&write_sink),
+                registry.call(db, Caller::local(), name, arguments),
+            ),
         )
         .await;
-        (output, sink.load(Ordering::Relaxed))
+        (
+            output,
+            write_sink.load(Ordering::Relaxed),
+            read_sink.load(Ordering::Relaxed),
+        )
     }
 
     fn test_registry() -> ToolRegistry {
@@ -3923,7 +4556,7 @@ mod handler_write_pool_acquisition_tests {
     async fn create_record_handler_body_takes_write_pool_connections() {
         let db = crate::create_database(":memory:").await.unwrap();
         let registry = test_registry();
-        let (result, count) = call_with_acquisition_sink(
+        let (result, count, read_count) = call_with_acquisition_sink(
             &registry,
             db.clone(),
             "create_record",
@@ -3944,6 +4577,11 @@ mod handler_write_pool_acquisition_tests {
             count > 0,
             "create_record success path reported zero write-pool acquisitions"
         );
+        assert_ne!(
+            read_count,
+            u64::MAX,
+            "dispatch never published the handler-body read count"
+        );
         db.close().await;
     }
 
@@ -3958,7 +4596,7 @@ mod handler_write_pool_acquisition_tests {
     async fn quickstart_handler_body_takes_no_write_pool_connections() {
         let db = crate::create_database(":memory:").await.unwrap();
         let registry = test_registry();
-        let (result, count) =
+        let (result, count, read_count) =
             call_with_acquisition_sink(&registry, db.clone(), "quickstart", serde_json::json!({}))
                 .await;
         result.unwrap();
@@ -3969,6 +4607,10 @@ mod handler_write_pool_acquisition_tests {
         assert_eq!(
             count, 0,
             "quickstart handler body reported {count} write-pool acquisitions"
+        );
+        assert_eq!(
+            read_count, 0,
+            "quickstart handler body reported {read_count} read-pool acquisitions"
         );
         // Capture runs on the handle's background queue; drain before
         // asserting the row that proves the zero is exclusion, not absence.
@@ -4003,7 +4645,7 @@ mod handler_write_pool_acquisition_tests {
     async fn bootstrap_handler_body_takes_no_write_pool_connections() {
         let db = crate::create_database(":memory:").await.unwrap();
         let registry = test_registry();
-        let (result, count) =
+        let (result, count, read_count) =
             call_with_acquisition_sink(&registry, db.clone(), "bootstrap", serde_json::json!({}))
                 .await;
         result.unwrap();
@@ -4014,6 +4656,10 @@ mod handler_write_pool_acquisition_tests {
         assert_eq!(
             count, 0,
             "bootstrap handler body reported {count} write-pool acquisitions"
+        );
+        assert!(
+            read_count > 0,
+            "bootstrap handler body reported zero read-pool acquisitions"
         );
         db.drain_captures().await;
         let captured: i64 =
@@ -4046,11 +4692,11 @@ mod handler_write_pool_acquisition_tests {
     async fn get_structure_handler_body_takes_no_write_pool_connections() {
         let db = crate::create_database(":memory:").await.unwrap();
         let registry = test_registry();
-        let (result, count) = call_with_acquisition_sink(
+        let (result, count, read_count) = call_with_acquisition_sink(
             &registry,
             db.clone(),
             "get_structure",
-            serde_json::json!({ "root_id": crate::schema::ROOT_RECORD_ID }),
+            serde_json::json!({ "root_id": crate::schema::ROOT_RECORD_ID, "run_key": "new" }),
         )
         .await;
         result.unwrap();
@@ -4062,12 +4708,184 @@ mod handler_write_pool_acquisition_tests {
             count, 0,
             "get_structure handler body reported {count} write-pool acquisitions"
         );
+        assert!(
+            read_count > 0,
+            "get_structure handler body reported zero read-pool acquisitions"
+        );
         db.drain_captures().await;
         let captured: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM read_log_calls WHERE tool = 'get_structure'")
                 .fetch_one(db.write_pool())
                 .await
                 .unwrap();
+        assert_eq!(
+            captured, 1,
+            "capture did not write for this request, so the zero proves nothing about exclusion"
+        );
+        db.close().await;
+    }
+
+    /// Stage 3 (be83e6a): `get_history` performs no writes in-request, so its
+    /// handler body must take no write-pool connections. Before the migration
+    /// the non-record path took a write-pool acquisition per page fetch plus
+    /// one per event visibility/redaction check and per actor-name resolution,
+    /// and the record path opened a write-pool transaction. Both now read from
+    /// one physically read-only snapshot. Same capture-pipeline guard as
+    /// `bootstrap` above.
+    #[tokio::test]
+    async fn get_history_handler_body_takes_no_write_pool_connections() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let registry = test_registry();
+        let (result, count, read_count) = call_with_acquisition_sink(
+            &registry,
+            db.clone(),
+            "get_history",
+            serde_json::json!({"run_key":"new"}),
+        )
+        .await;
+        result.unwrap();
+        assert!(
+            count != u64::MAX,
+            "dispatch never published the handler-body count"
+        );
+        assert_eq!(
+            count, 0,
+            "get_history handler body reported {count} write-pool acquisitions"
+        );
+        assert!(
+            read_count > 0,
+            "get_history handler body reported zero read-pool acquisitions"
+        );
+        db.drain_captures().await;
+        let captured: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM read_log_calls WHERE tool = 'get_history'")
+                .fetch_one(db.write_pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            captured, 1,
+            "capture did not write for this request, so the zero proves nothing about exclusion"
+        );
+        db.close().await;
+    }
+
+    /// Stage 3 (be83e6a): `get_run_activity`'s discovery branch performs no
+    /// writes in-request, so its handler body must take no write-pool
+    /// connections. The `for_run` branch (ownership gate, recursive child-run
+    /// CTE, and visibility set) is the observed slow path; this exercises the
+    /// no-argument discovery branch, whose reads moved with it. Same
+    /// capture-pipeline guard as `bootstrap` above.
+    #[tokio::test]
+    async fn get_run_activity_handler_body_takes_no_write_pool_connections() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let registry = test_registry();
+        let (result, count, read_count) = call_with_acquisition_sink(
+            &registry,
+            db.clone(),
+            "get_run_activity",
+            serde_json::json!({"run_key":"new"}),
+        )
+        .await;
+        result.unwrap();
+        assert!(
+            count != u64::MAX,
+            "dispatch never published the handler-body count"
+        );
+        assert_eq!(
+            count, 0,
+            "get_run_activity handler body reported {count} write-pool acquisitions"
+        );
+        assert!(
+            read_count > 0,
+            "get_run_activity handler body reported zero read-pool acquisitions"
+        );
+        db.drain_captures().await;
+        let captured: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM read_log_calls WHERE tool = 'get_run_activity'",
+        )
+        .fetch_one(db.write_pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            captured, 1,
+            "capture did not write for this request, so the zero proves nothing about exclusion"
+        );
+        db.close().await;
+    }
+
+    /// Stage 3 (be83e6a): `get_run_activity`'s `overlap_evaluation` branch is
+    /// non-mutating too. Its retained-evidence query, its outcome classifier,
+    /// and its per-anchor authorization all read the physically read-only
+    /// pool, so the whole branch must take no write-pool connections. The
+    /// fixture keeps one valid notice so the `own` scope's `can_record_in_pool`
+    /// walk actually runs; the capture guard proves the zero is exclusion.
+    #[tokio::test]
+    async fn get_run_activity_overlap_branch_takes_no_write_pool_connections() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let caller = Caller::local();
+        let anchor = crate::store::create_record(
+            &db,
+            serde_json::json!({
+                "type": "Document",
+                "kind": "note",
+                "name": "overlap anchor"
+            }),
+        )
+        .await
+        .unwrap();
+        let emission = serde_json::json!({
+            "kind": "work_overlap_emission",
+            "version": 1,
+            "surface": "create",
+            "anchors": [{
+                "record_id": anchor,
+                "overlap_record_ids": [anchor],
+                "overlap_item_count": 1,
+                "overlap_total_count": 1,
+                "truncated": false
+            }]
+        });
+        sqlx::query(
+            "INSERT INTO read_log_calls
+                 (id,tool,run_key,actor,outcome,started_at,ended_at,result_annotation)
+             VALUES('overlap-notice','create_record','heron-river-c748b2',?,'ok',
+                    '2026-01-01T00:00:00Z','2026-01-01T00:00:00Z',?)",
+        )
+        .bind(caller.credential())
+        .bind(serde_json::to_string(&emission).unwrap())
+        .execute(db.write_pool())
+        .await
+        .unwrap();
+        let registry = test_registry();
+        let (result, count, read_count) = call_with_acquisition_sink(
+            &registry,
+            db.clone(),
+            "get_run_activity",
+            serde_json::json!({"overlap_evaluation": {"scope": "own"}, "run_key": "new"}),
+        )
+        .await;
+        let result = result.unwrap();
+        assert_eq!(result["view"], "work_overlap_evaluation");
+        assert_eq!(result["emissions"]["notice_bearing_call_count"], 1);
+        assert!(
+            count != u64::MAX,
+            "dispatch never published the handler-body count"
+        );
+        assert_eq!(
+            count, 0,
+            "get_run_activity overlap branch reported {count} write-pool acquisitions"
+        );
+        assert!(
+            read_count > 0,
+            "overlap branch reported zero read-pool acquisitions"
+        );
+        db.drain_captures().await;
+        let captured: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM read_log_calls WHERE tool = 'get_run_activity'",
+        )
+        .fetch_one(db.write_pool())
+        .await
+        .unwrap();
         assert_eq!(
             captured, 1,
             "capture did not write for this request, so the zero proves nothing about exclusion"
@@ -4341,16 +5159,12 @@ mod nested_write_pool_acquisition_tests {
     /// The same read through the acquisition sink, which counts acquisitions
     /// rather than simultaneous holds.
     ///
-    /// Two is the whole handler body: the read snapshot
-    /// (`lifecycle.rs` `get_record_from_lens`), and the display-reference
-    /// annotation that deliberately runs *after* `finish_read_snapshot` has
-    /// released it. The anchored comment fold is no longer a third. The exact
-    /// number is asserted on purpose — it is brittle against an unrelated
-    /// sequential read being added, and that is the point: a new pool read in
-    /// this handler should be looked at rather than absorbed, since whether
-    /// it nests is not visible from the count alone.
+    /// The live read snapshot and the later display-reference annotation both
+    /// use the physically read-only pool. Anchored comment enrichment stays
+    /// on that same snapshot, so the complete handler takes no write-pool
+    /// connection even when comments are requested.
     #[tokio::test]
-    async fn annotated_get_record_acquisition_count_is_the_snapshot_and_the_annotation() {
+    async fn annotated_get_record_uses_no_write_pool_connection() {
         let db = crate::create_database(":memory:").await.unwrap();
         let registry = test_registry();
         let caller = Caller::local();
@@ -4365,9 +5179,8 @@ mod nested_write_pool_acquisition_tests {
         .await;
         assert_anchored_comment_present(&output["records"][0]);
         assert_eq!(
-            count, 2,
-            "get_record with anchored comments took {count} write-pool connections, \
-             not the snapshot and the post-snapshot display-reference annotation"
+            count, 0,
+            "get_record with anchored comments took {count} write-pool connections"
         );
         db.close().await;
     }
@@ -4389,9 +5202,14 @@ mod nested_write_pool_acquisition_tests {
         // An `agent_runs` row for the holder, so liveness resolves to `open`
         // rather than `missing`. Both answers run the same query — this is
         // the one that proves it found the row it looked for.
-        crate::control::ensure_agent_run(&db, HOLDER_RUN_KEY, holder.credential())
-            .await
-            .unwrap();
+        crate::control::ensure_agent_run(
+            &db,
+            HOLDER_RUN_KEY,
+            holder.credential(),
+            crate::control::ReportedRunIdentity::default(),
+        )
+        .await
+        .unwrap();
         let subject = call(
             &registry,
             &db,
@@ -4509,9 +5327,14 @@ mod nested_write_pool_acquisition_tests {
         let db = crate::create_database(":memory:").await.unwrap();
         let registry = test_registry();
         let holder = Caller::local();
-        crate::control::ensure_agent_run(&db, HOLDER_RUN_KEY, holder.credential())
-            .await
-            .unwrap();
+        crate::control::ensure_agent_run(
+            &db,
+            HOLDER_RUN_KEY,
+            holder.credential(),
+            crate::control::ReportedRunIdentity::default(),
+        )
+        .await
+        .unwrap();
         let mut subjects = Vec::new();
         for index in 0..CONCURRENT_CALLS {
             subjects.push(

@@ -17,6 +17,13 @@ pub(crate) trait RecordLifecyclePhysicalPort {
     fn lock_live_record<'a>(&'a mut self, record_id: &'a str) -> BoxFuture<'a, Result<()>>;
     fn lock_content_log<'a>(&'a mut self) -> BoxFuture<'a, Result<()>>;
     fn append_content<'a>(&'a mut self, spec: AppendSpec) -> BoxFuture<'a, Result<String>>;
+
+    /// The act this transaction allocated, if it has appended anything
+    /// canonical yet. Lets the shared delete builder echo the coordinate of
+    /// the write it just performed on every backend.
+    fn allocated_act(&self) -> Option<i64> {
+        None
+    }
 }
 
 fn statement(
@@ -234,10 +241,14 @@ where
         .await?;
     }
     let (_, _, deleted_at) = record_state(port, record_id).await?;
-    Ok(json!({
+    let mut response = json!({
         "id": record_id,
         "deleted": true,
         "deleted_at": deleted_at,
         "previous_seq": previous_seq,
-    }))
+    });
+    if let Some(act) = port.allocated_act() {
+        response["act"] = act.into();
+    }
+    Ok(response)
 }

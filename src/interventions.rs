@@ -161,7 +161,7 @@ async fn sources_in(
         let source_record_id: String = row.try_get("source_record_id")?;
         let readable = authorization::effective_capability_on(
             tx,
-            Principal::bound(caller.credential(), true),
+            Principal::bound(caller.credential(), caller.is_host_member()),
             &source_record_id,
         )
         .await

@@ -57,16 +57,23 @@ pub struct QueryPrincipal {
     trusted_local_bypass: bool,
     activity_read: bool,
     activity_roster: Vec<ActivityRosterMember>,
+    /// Live catalog membership footing. Guests resolve without the
+    /// `native:members` baseline in every visibility relation built from
+    /// this principal. Required (rather than defaulted) so a construction
+    /// that forgets the footing fails to compile.
+    is_member: bool,
 }
 
 impl QueryPrincipal {
     /// An authenticated caller. Never carries the trusted-local bypass.
-    pub fn authenticated(credential: impl Into<String>) -> Self {
+    /// `is_member` is the caller's folded catalog footing.
+    pub fn authenticated(credential: impl Into<String>, is_member: bool) -> Self {
         QueryPrincipal {
             credential: credential.into(),
             trusted_local_bypass: false,
             activity_read: false,
             activity_roster: Vec::new(),
+            is_member,
         }
     }
 
@@ -84,6 +91,9 @@ impl QueryPrincipal {
             trusted_local_bypass: true,
             activity_read: true,
             activity_roster: Vec::new(),
+            // Moot under the bypass, which admits everything below; member
+            // footing keeps every other reader uniform.
+            is_member: true,
         }
     }
 
@@ -96,16 +106,22 @@ impl QueryPrincipal {
     /// membership proof. The standalone operator uses the separate
     /// trusted-local constructor. Agent-authored query arguments can never
     /// supply either this bit or these rows.
+    ///
+    /// `is_member` is the same snapshot's role fact: guests keep roster
+    /// presence (attribution) without the members baseline. Required so a
+    /// hosted construction that forgets the footing fails to compile.
     #[doc(hidden)]
     pub unsafe fn activity_reader_unchecked(
         credential: impl Into<String>,
         activity_roster: Vec<ActivityRosterMember>,
+        is_member: bool,
     ) -> Self {
         QueryPrincipal {
             credential: credential.into(),
             trusted_local_bypass: false,
             activity_read: true,
             activity_roster,
+            is_member,
         }
     }
 
@@ -126,6 +142,11 @@ impl QueryPrincipal {
     pub fn activity_roster(&self) -> &[ActivityRosterMember] {
         &self.activity_roster
     }
+
+    /// Live catalog membership footing for the members-baseline relations.
+    pub fn is_member(&self) -> bool {
+        self.is_member
+    }
 }
 
 impl From<&QueryPrincipal> for QueryPrincipal {
@@ -140,10 +161,18 @@ mod tests {
 
     #[test]
     fn authenticated_never_carries_the_bypass() {
-        let principal = QueryPrincipal::authenticated("alice");
+        let principal = QueryPrincipal::authenticated("alice", true);
         assert_eq!(principal.credential(), "alice");
         assert!(!principal.trusted_local_bypass());
         assert!(!principal.activity_read());
+        assert!(principal.is_member());
+    }
+
+    #[test]
+    fn guest_footing_is_explicit() {
+        let guest = QueryPrincipal::authenticated("guest", false);
+        assert!(!guest.is_member());
+        assert!(!guest.trusted_local_bypass());
     }
 
     #[test]

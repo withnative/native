@@ -21,7 +21,7 @@ use crate::store::{append_in, AppendSpec};
 
 use super::super::registry::{Caller, ToolRegistry};
 use super::super::ToolKind;
-use super::{parse_args, require_nonblank_reason, require_record_in, REASON_DESCRIPTION};
+use super::{echo_act, parse_args, require_nonblank_reason, require_record_in, REASON_DESCRIPTION};
 
 const TOOL: &str = "resolve_suggestions";
 const MAX_BATCH: usize = 100;
@@ -284,6 +284,7 @@ async fn mark_stale_in(
     tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
     caller: &Caller,
     causes: &[Value],
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<()> {
     validate_lifecycle_destination_in(tx, "stale").await?;
     for cause in causes {
@@ -308,6 +309,7 @@ async fn mark_stale_in(
                 payload,
                 actor: Some(caller.actor().into()),
             },
+            act_alloc,
         )
         .await?;
     }
@@ -403,6 +405,7 @@ async fn accept(
     dry_run: bool,
 ) -> Result<Value> {
     let mut tx = crate::db::begin_write(db.write_pool()).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
     let mut authorized_targets = Vec::with_capacity(ids.len());
     for id in &ids {
         let target: Option<String> = sqlx::query_scalar(
@@ -466,11 +469,12 @@ async fn accept(
             .map(|id| json!({ "suggestion_id": id, "code": "target_missing" }))
             .collect();
         if !dry_run {
-            mark_stale_in(&db, &mut tx, &caller, &causes).await?;
+            mark_stale_in(&db, &mut tx, &caller, &causes, &mut act_alloc).await?;
             db.commit_content(tx).await?;
         }
-        return Ok(
+        return echo_act(
             json!({ "status": if dry_run { "would_stale" } else { "stale" }, "target_id": target_id, "suggestion_ids": ids, "causes": causes }),
+            (!dry_run).then(|| act_alloc.get()).flatten(),
         );
     };
     if target.try_get::<Option<String>, _>("deleted_at")?.is_some() {
@@ -479,11 +483,12 @@ async fn accept(
             .map(|id| json!({ "suggestion_id": id, "code": "target_deleted" }))
             .collect();
         if !dry_run {
-            mark_stale_in(&db, &mut tx, &caller, &causes).await?;
+            mark_stale_in(&db, &mut tx, &caller, &causes, &mut act_alloc).await?;
             db.commit_content(tx).await?;
         }
-        return Ok(
+        return echo_act(
             json!({ "status": if dry_run { "would_stale" } else { "stale" }, "target_id": target_id, "suggestion_ids": ids, "causes": causes }),
+            (!dry_run).then(|| act_alloc.get()).flatten(),
         );
     }
 
@@ -492,19 +497,22 @@ async fn accept(
     let stale = stale_causes(&suggestions, &preconditions, target_body.as_deref());
     if !stale.is_empty() {
         if !dry_run {
-            mark_stale_in(&db, &mut tx, &caller, &stale).await?;
+            mark_stale_in(&db, &mut tx, &caller, &stale, &mut act_alloc).await?;
             db.commit_content(tx).await?;
         }
         let stale_ids: Vec<&str> = stale
             .iter()
             .filter_map(|cause| cause.get("suggestion_id").and_then(Value::as_str))
             .collect();
-        return Ok(json!({
+        return echo_act(
+            json!({
             "status": if dry_run { "would_stale" } else { "stale" },
             "target_id": target_id,
             "suggestion_ids": stale_ids,
             "causes": stale,
-        }));
+            }),
+            (!dry_run).then(|| act_alloc.get()).flatten(),
+        );
     }
 
     // Every world-state precondition passed against the same current target.
@@ -543,6 +551,7 @@ async fn accept(
             payload: json!({ "body": prospective, "reason": reason }),
             actor: Some(caller.actor().into()),
         },
+        &mut act_alloc,
     )
     .await?;
     for suggestion in &suggestions {
@@ -555,19 +564,24 @@ async fn accept(
                 payload: json!({ "lifecycle": "accepted" }),
                 actor: Some(caller.actor().into()),
             },
+            &mut act_alloc,
         )
         .await?;
     }
     db.commit_content(tx).await?;
-    Ok(json!({
+    echo_act(
+        json!({
         "status": "accepted",
         "target_id": target_id,
         "suggestion_ids": ids,
-    }))
+        }),
+        act_alloc.get(),
+    )
 }
 
 async fn reject(db: Db, caller: Caller, id: String, reason: String) -> Result<Value> {
     let mut tx = crate::db::begin_write(db.write_pool()).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
     let target: Option<String> = sqlx::query_scalar(
         "SELECT target_id FROM links WHERE source_id = ? AND relationship = 'part_of' LIMIT 1",
     )
@@ -602,14 +616,18 @@ async fn reject(db: Db, caller: Caller, id: String, reason: String) -> Result<Va
             }),
             actor: Some(caller.actor().into()),
         },
+        &mut act_alloc,
     )
     .await?;
     db.commit_content(tx).await?;
-    Ok(json!({
+    echo_act(
+        json!({
         "status": "rejected",
         "target_id": suggestion.target_id,
         "suggestion_ids": [id],
-    }))
+        }),
+        act_alloc.get(),
+    )
 }
 
 async fn resolve_suggestions(db: Db, caller: Caller, arguments: Value) -> Result<Value> {

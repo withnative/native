@@ -141,7 +141,15 @@
         },
         {
           "kind": "file",
+          "source": "src/act.rs"
+        },
+        {
+          "kind": "file",
           "source": "src/attribution.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/authoring.rs"
         },
         {
           "kind": "file",
@@ -217,6 +225,10 @@
         },
         {
           "kind": "file",
+          "source": "src/holding.rs"
+        },
+        {
+          "kind": "file",
           "source": "src/identity.rs"
         },
         {
@@ -246,6 +258,10 @@
         {
           "kind": "file",
           "source": "src/lib.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/mentions.rs"
         },
         {
           "kind": "file",
@@ -329,11 +345,31 @@
         },
         {
           "kind": "file",
+          "source": "src/surface_binding.rs"
+        },
+        {
+          "kind": "file",
           "source": "src/turso_local.rs"
         },
         {
           "kind": "file",
+          "source": "src/visible_set_cache.rs"
+        },
+        {
+          "kind": "file",
           "source": "src/wordlist.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/workspace_index.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/workspace_snapshot.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/write_contention.rs"
         },
         {
           "kind": "file",
@@ -354,6 +390,10 @@
         {
           "kind": "file",
           "source": "src/bin/mcp_stdio.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/bin/relationship_lint.rs"
         },
         {
           "kind": "file",
@@ -414,6 +454,14 @@
         {
           "kind": "tree",
           "source": "tests/tools"
+        },
+        {
+          "kind": "file",
+          "source": "experiments/alpha-tab-proof-packages/attention-cockpit.html"
+        },
+        {
+          "kind": "file",
+          "source": "experiments/alpha-tab-proof-packages/team-pulse.html"
         },
         {
           "kind": "file",
@@ -632,6 +680,10 @@
         {
           "kind": "file",
           "source": "docs/for-agents.md"
+        },
+        {
+          "kind": "file",
+          "source": "docs/inspectable-authoring.md"
         },
         {
           "kind": "file",

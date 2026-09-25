@@ -253,7 +253,7 @@ async fn real_infix_pass_agrees_with_the_contract_fixtures() {
         .unwrap();
     }
     for (query, expected, why) in FIXTURES {
-        let hits = fts::name_infix(&db, "test-account", query, &FtsOptions::default())
+        let hits = fts::name_infix(&db, "test-account", true, query, &FtsOptions::default())
             .await
             .unwrap();
         let mut got: Vec<String> = hits.into_iter().map(|h| h.name).collect();
@@ -293,7 +293,7 @@ async fn bm25_weights_name_hit_outranks_body_spam() {
     )
     .await
     .unwrap();
-    let hits = fts::search(&db, "test-account", "budget", &FtsOptions::default())
+    let hits = fts::search(&db, "test-account", true, "budget", &FtsOptions::default())
         .await
         .unwrap();
     let names: Vec<&str> = hits.iter().map(|h| h.name.as_str()).collect();
@@ -315,7 +315,7 @@ async fn bm25_weights_keep_body_only_matches() {
     )
     .await
     .unwrap();
-    let hits = fts::search(&db, "test-account", "venue", &FtsOptions::default())
+    let hits = fts::search(&db, "test-account", true, "venue", &FtsOptions::default())
         .await
         .unwrap();
     assert_eq!(hits.len(), 1);
@@ -353,10 +353,10 @@ async fn hidden_corpus_cannot_change_visible_ranking_or_pool_signal() {
     .await
     .unwrap();
     let opts = FtsOptions::default();
-    let before = fts::search(&db, "alice", "exclusivealpha", &opts)
+    let before = fts::search(&db, "alice", true, "exclusivealpha", &opts)
         .await
         .unwrap();
-    let count_before = fts::search_pool_count(&db, "alice", "exclusivealpha", &opts)
+    let count_before = fts::search_pool_count(&db, "alice", true, "exclusivealpha", &opts)
         .await
         .unwrap();
     assert_eq!(before.len(), 1);
@@ -382,10 +382,10 @@ async fn hidden_corpus_cannot_change_visible_ranking_or_pool_signal() {
     .await
     .unwrap();
 
-    let after = fts::search(&db, "alice", "exclusivealpha", &opts)
+    let after = fts::search(&db, "alice", true, "exclusivealpha", &opts)
         .await
         .unwrap();
-    let count_after = fts::search_pool_count(&db, "alice", "exclusivealpha", &opts)
+    let count_after = fts::search_pool_count(&db, "alice", true, "exclusivealpha", &opts)
         .await
         .unwrap();
     assert_eq!(count_after, 1);
@@ -393,7 +393,7 @@ async fn hidden_corpus_cannot_change_visible_ranking_or_pool_signal() {
     assert_eq!(after[0].id, before[0].id);
     assert_eq!(after[0].snippet, before[0].snippet);
     assert_eq!(after[0].score.to_bits(), before[0].score.to_bits());
-    let bea = fts::search(&db, "bea", "exclusivealpha", &opts)
+    let bea = fts::search(&db, "bea", true, "exclusivealpha", &opts)
         .await
         .unwrap();
     assert_eq!(bea.len(), 1);
@@ -542,7 +542,7 @@ async fn trusted_search_authorizes_derived_artifacts_through_one_live_bearer() {
     }
 
     let opts = FtsOptions::default();
-    let kindless_strict = fts::search(&db, "alice", "kindlessstrictterm", &opts)
+    let kindless_strict = fts::search(&db, "alice", true, "kindlessstrictterm", &opts)
         .await
         .unwrap();
     assert_eq!(kindless_strict.len(), 1);
@@ -550,7 +550,7 @@ async fn trusted_search_authorizes_derived_artifacts_through_one_live_bearer() {
         kindless_strict[0].id,
         "5ea4c000-0000-4000-8000-000000000001"
     );
-    let kindless_prefix = fts::name_prefix(&db, "alice", "kindlessprefix", &opts)
+    let kindless_prefix = fts::name_prefix(&db, "alice", true, "kindlessprefix", &opts)
         .await
         .unwrap();
     assert_eq!(kindless_prefix.len(), 1);
@@ -558,7 +558,7 @@ async fn trusted_search_authorizes_derived_artifacts_through_one_live_bearer() {
         kindless_prefix[0].id,
         "5ea4c000-0000-4000-8000-000000000001"
     );
-    let kindless_infix = fts::name_infix(&db, "alice", "kindless camel recall", &opts)
+    let kindless_infix = fts::name_infix(&db, "alice", true, "kindless camel recall", &opts)
         .await
         .unwrap();
     assert_eq!(kindless_infix.len(), 1);
@@ -580,17 +580,17 @@ async fn trusted_search_authorizes_derived_artifacts_through_one_live_bearer() {
             INFIX_VISIBLE_ARTIFACT,
         ),
     ] {
-        let strict = fts::search(&db, credential, "artifactstrictterm", &opts)
+        let strict = fts::search(&db, credential, true, "artifactstrictterm", &opts)
             .await
             .unwrap();
         assert_eq!(strict.len(), 1);
         assert_eq!(strict[0].id, strict_id);
-        let prefix = fts::name_prefix(&db, credential, "artifactprefix", &opts)
+        let prefix = fts::name_prefix(&db, credential, true, "artifactprefix", &opts)
             .await
             .unwrap();
         assert_eq!(prefix.len(), 1);
         assert_eq!(prefix[0].id, prefix_id);
-        let infix = fts::name_infix(&db, credential, "artifact camel recall", &opts)
+        let infix = fts::name_infix(&db, credential, true, "artifact camel recall", &opts)
             .await
             .unwrap();
         assert_eq!(infix.len(), 1);
@@ -668,10 +668,12 @@ async fn trusted_search_authorizes_derived_artifacts_through_one_live_bearer() {
     delete_record(&db, "5ea4c000-0000-4000-8000-000000000003")
         .await
         .unwrap();
-    assert!(fts::search(&db, "bea", "malformedartifactterm", &opts)
-        .await
-        .unwrap()
-        .is_empty());
+    assert!(
+        fts::search(&db, "bea", true, "malformedartifactterm", &opts)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -691,9 +693,15 @@ async fn trusted_search_slices_oversized_stored_name_body_and_snippet_before_mat
     .await
     .unwrap();
 
-    let hits = fts::search(&db, "test-account", "boundedterm", &FtsOptions::default())
-        .await
-        .unwrap();
+    let hits = fts::search(
+        &db,
+        "test-account",
+        true,
+        "boundedterm",
+        &FtsOptions::default(),
+    )
+    .await
+    .unwrap();
     assert_eq!(hits.len(), 1);
     assert!(hits[0].name.chars().count() <= 512);
     assert!(hits[0].snippet.chars().count() <= 2_048);
@@ -715,9 +723,15 @@ async fn trusted_snippet_tracks_a_match_beyond_the_bounded_rank_slice() {
     .await
     .unwrap();
 
-    let hits = fts::search(&db, "test-account", "latebodymatch", &FtsOptions::default())
-        .await
-        .unwrap();
+    let hits = fts::search(
+        &db,
+        "test-account",
+        true,
+        "latebodymatch",
+        &FtsOptions::default(),
+    )
+    .await
+    .unwrap();
     assert_eq!(hits.len(), 1);
     assert!(
         hits[0].snippet.contains("[latebodymatch]"),
@@ -742,7 +756,7 @@ async fn trusted_snippet_uses_the_fts_stemmed_match_not_literal_prefix_search() 
     .await
     .unwrap();
 
-    let hits = fts::search(&db, "test-account", "runs", &FtsOptions::default())
+    let hits = fts::search(&db, "test-account", true, "runs", &FtsOptions::default())
         .await
         .unwrap();
     assert_eq!(hits.len(), 1);

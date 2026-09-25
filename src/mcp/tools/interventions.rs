@@ -16,7 +16,7 @@ use crate::store::{append_in, append_with_event_id_in, AppendSpec};
 
 use super::super::registry::{Caller, ToolRegistry};
 use super::super::ToolKind;
-use super::{parse_args, require_nonblank_reason, require_record_in, REASON_DESCRIPTION};
+use super::{echo_act, parse_args, require_nonblank_reason, require_record_in, REASON_DESCRIPTION};
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields, tag = "action", rename_all = "snake_case")]
@@ -73,15 +73,17 @@ struct InterventionQueryCursor {
     before_raised_seq: i64,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_response(
     mut view: Value,
     action: &str,
     status: &str,
     replayed: bool,
+    act: Option<i64>,
     terminal_event: Value,
     transition: Value,
     delivery_event_id: Option<&str>,
-) -> Value {
+) -> Result<Value> {
     view["action"] = json!(action);
     view["write_receipt"] = json!({
         "status":status,
@@ -90,7 +92,7 @@ fn write_response(
         "transition":transition,
         "delivery_event_id":delivery_event_id,
     });
-    view
+    echo_act(view, act)
 }
 
 fn cancelled_transition(payload: &InterventionCancelledPayload) -> Value {
@@ -311,6 +313,7 @@ async fn cancel(
         ));
     }
     let mut tx = crate::db::begin_write(db.write_pool()).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
     let raised = raised_in(&mut tx, &intervention_id).await?;
     if target_account_in(&mut tx, &raised).await? != caller.credential() {
         return Err(Error::auth(
@@ -318,7 +321,7 @@ async fn cancel(
         ));
     }
     if let Some(row) = sqlx::query(
-        "SELECT id,record_id,seq,type,payload FROM content_events
+        "SELECT id,record_id,seq,type,payload,act FROM content_events
           WHERE type='intervention.cancelled.v1'
             AND json_extract(payload,'$.idempotency_key')=?
             AND json_extract(payload,'$.intervention_id')=? ORDER BY seq LIMIT 1",
@@ -338,6 +341,9 @@ async fn cancel(
                 "manage_interventions.cancel: idempotency_key was reused for different intent",
             ));
         }
+        // A keyed replay returns the original write's act: the caller must not
+        // be able to tell which call did the work.
+        let replayed_act: Option<i64> = row.try_get("act")?;
         let terminal_event = json!({
             "record_id":row.try_get::<String,_>("record_id")?,
             "event_id":row.try_get::<String,_>("id")?,
@@ -346,15 +352,16 @@ async fn cancel(
         });
         tx.rollback().await?;
         let view = intervention_view(&db, &caller, &intervention_id).await?;
-        return Ok(write_response(
+        return write_response(
             view,
             "cancel",
             "cancelled",
             true,
+            replayed_act,
             terminal_event,
             cancelled_transition(&payload),
             None,
-        ));
+        );
     }
     if raised.payload.disposition != "block_and_request_authority" {
         return Err(Error::engine(
@@ -392,15 +399,17 @@ async fn cancel(
             payload: serde_json::to_value(payload)?,
             actor: Some(caller.actor().into()),
         },
+        &mut act_alloc,
     )
     .await?;
     db.commit_content(tx).await?;
     let view = intervention_view(&db, &caller, &intervention_id).await?;
-    Ok(write_response(
+    write_response(
         view,
         "cancel",
         "cancelled",
         false,
+        act_alloc.get(),
         json!({
             "record_id":terminal_event.record_id,
             "event_id":terminal_event.id,
@@ -409,7 +418,7 @@ async fn cancel(
         }),
         transition,
         None,
-    ))
+    )
 }
 
 async fn resume_delivery(db: Db, caller: Caller, params: ResumeDeliveryParams) -> Result<Value> {
@@ -428,6 +437,7 @@ async fn resume_delivery(db: Db, caller: Caller, params: ResumeDeliveryParams) -
         ));
     }
     let mut tx = crate::db::begin_write(db.write_pool()).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
     let raised = raised_in(&mut tx, &intervention_id).await?;
     let target_account = target_account_in(&mut tx, &raised).await?;
     if target_account != caller.credential() {
@@ -436,7 +446,7 @@ async fn resume_delivery(db: Db, caller: Caller, params: ResumeDeliveryParams) -
         ));
     }
     if let Some(row) = sqlx::query(
-        "SELECT id,record_id,seq,type,payload FROM content_events
+        "SELECT id,record_id,seq,type,payload,act FROM content_events
           WHERE type='intervention.execution_resumed.v1'
             AND json_extract(payload,'$.idempotency_key')=?
             AND json_extract(payload,'$.intervention_id')=? ORDER BY seq LIMIT 1",
@@ -455,6 +465,8 @@ async fn resume_delivery(db: Db, caller: Caller, params: ResumeDeliveryParams) -
         {
             return Err(Error::engine("manage_interventions.resume_delivery: idempotency_key was reused for different intent"));
         }
+        // A keyed replay returns the original write's act.
+        let replayed_act: Option<i64> = row.try_get("act")?;
         let terminal_event = json!({
             "record_id":row.try_get::<String,_>("record_id")?,
             "event_id":row.try_get::<String,_>("id")?,
@@ -465,15 +477,16 @@ async fn resume_delivery(db: Db, caller: Caller, params: ResumeDeliveryParams) -
         let transition = resumed_transition(&payload);
         tx.rollback().await?;
         let view = intervention_view(&db, &caller, &intervention_id).await?;
-        return Ok(write_response(
+        return write_response(
             view,
             "resume_delivery",
             "resumed",
             true,
+            replayed_act,
             terminal_event,
             transition,
             Some(&delivery_event_id),
-        ));
+        );
     }
     if raised.payload.disposition != "block_and_request_authority" {
         return Err(Error::engine(
@@ -545,6 +558,7 @@ async fn resume_delivery(db: Db, caller: Caller, params: ResumeDeliveryParams) -
                 })?,
                 actor: Some(caller.actor().into()),
             },
+            &mut act_alloc,
         )
         .await?;
     }
@@ -641,6 +655,7 @@ async fn resume_delivery(db: Db, caller: Caller, params: ResumeDeliveryParams) -
             })?,
             actor: Some(caller.actor().into()),
         },
+        &mut act_alloc,
     )
     .await?;
     accounts.sort();
@@ -668,6 +683,7 @@ async fn resume_delivery(db: Db, caller: Caller, params: ResumeDeliveryParams) -
                 &mut tx,
                 caller.actor(),
                 &raised.message_id,
+                &mut act_alloc,
             )
             .await?;
         }
@@ -701,6 +717,7 @@ async fn resume_delivery(db: Db, caller: Caller, params: ResumeDeliveryParams) -
                     .into_iter()
                     .map(|account| AllowEntry::account(account, Capability::View))
                     .collect(),
+                &mut act_alloc,
             )
             .await?;
         }
@@ -714,6 +731,7 @@ async fn resume_delivery(db: Db, caller: Caller, params: ResumeDeliveryParams) -
                     .cloned()
                     .map(|account| AllowEntry::account(account, Capability::View))
                     .collect(),
+                &mut act_alloc,
             )
             .await?;
         }
@@ -724,6 +742,7 @@ async fn resume_delivery(db: Db, caller: Caller, params: ResumeDeliveryParams) -
         &accounts,
         "message.delivery.authorized.v1",
         &delivery_event_id,
+        &mut act_alloc,
     )
     .await?;
     if let Some(collection_id) = collection_origin {
@@ -737,6 +756,7 @@ async fn resume_delivery(db: Db, caller: Caller, params: ResumeDeliveryParams) -
             caller.actor(),
             &collection_id,
             &delivery_event_id,
+            &mut act_alloc,
         )
         .await?;
     }
@@ -762,15 +782,17 @@ async fn resume_delivery(db: Db, caller: Caller, params: ResumeDeliveryParams) -
             payload: serde_json::to_value(payload)?,
             actor: Some(caller.actor().into()),
         },
+        &mut act_alloc,
     )
     .await?;
     db.commit_content(tx).await?;
     let view = intervention_view(&db, &caller, &intervention_id).await?;
-    Ok(write_response(
+    write_response(
         view,
         "resume_delivery",
         "resumed",
         false,
+        act_alloc.get(),
         json!({
             "record_id":terminal_event.record_id,
             "event_id":terminal_event.id,
@@ -779,7 +801,7 @@ async fn resume_delivery(db: Db, caller: Caller, params: ResumeDeliveryParams) -
         }),
         transition,
         Some(&delivery_event_id),
-    ))
+    )
 }
 
 async fn manage_interventions(db: Db, caller: Caller, arguments: Value) -> Result<Value> {

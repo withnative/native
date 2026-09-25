@@ -22,10 +22,17 @@ pub struct FederatedRecordSnapshot {
 pub async fn capture_federated_record_snapshot(
     db: &Db,
     caller_identity: &str,
+    caller_is_member: bool,
     record_id: &str,
 ) -> Result<Option<FederatedRecordSnapshot>> {
-    capture_federated_record_snapshot_with_hook(db, caller_identity, record_id, || async { Ok(()) })
-        .await
+    capture_federated_record_snapshot_with_hook(
+        db,
+        caller_identity,
+        caller_is_member,
+        record_id,
+        || async { Ok(()) },
+    )
+    .await
 }
 
 /// Return the authorization revision used to invalidate a federated source or
@@ -57,6 +64,7 @@ pub async fn federated_engine_revision(db: &Db) -> Result<Value> {
 async fn capture_federated_record_snapshot_with_hook<F, Fut>(
     db: &Db,
     caller_identity: &str,
+    caller_is_member: bool,
     record_id: &str,
     after_selected_reads: F,
 ) -> Result<Option<FederatedRecordSnapshot>>
@@ -67,7 +75,7 @@ where
     let mut tx = db.write_pool().begin().await?;
     if crate::authorization::require_capability_on(
         &mut tx,
-        crate::authorization::Principal::bound(caller_identity, true),
+        crate::authorization::Principal::bound(caller_identity, caller_is_member),
         record_id,
         crate::authorization::Capability::View,
     )
@@ -162,6 +170,7 @@ mod tests {
         let captured = capture_federated_record_snapshot_with_hook(
             &db,
             "local",
+            true,
             record_id,
             move || async move {
                 crate::store::append(

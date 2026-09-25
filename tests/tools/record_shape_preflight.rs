@@ -672,3 +672,564 @@ async fn proposed_facets_bound_large_context_and_required_declarations_without_w
     assert!(serde_json::to_vec(&preview).unwrap().len() <= 65_536);
     assert_eq!(authoritative_heads(&db).await, before);
 }
+
+async fn write_db() -> Db {
+    let db = open_database(":memory:").await.unwrap();
+    apply_schema(&db).await.unwrap();
+    native_ce::meta::seed_vocabularies(&db).await.unwrap();
+    native_ce::meta::seed_recommended_pack_schema_config(&db)
+        .await
+        .unwrap();
+    native_ce::seed_content_tier(&db).await.unwrap();
+    native_ce::identity::seed_database_identity(&db)
+        .await
+        .unwrap();
+    db
+}
+
+async fn call_tool(
+    registry: &ToolRegistry,
+    db: &Db,
+    tool: &str,
+    args: Value,
+) -> native_ce::Result<Value> {
+    registry.call(db.clone(), Caller::local(), tool, args).await
+}
+
+fn assessment_by_key<'a>(preview: &'a Value, key: &str) -> &'a Value {
+    preview["proposed_facets"]["assessments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|assessment| assessment["key"] == key)
+        .unwrap_or_else(|| panic!("missing assessment for {key}: {preview}"))
+}
+
+fn has_issue(assessment: &Value, code: &str) -> bool {
+    assessment["issues"]
+        .as_array()
+        .is_some_and(|issues| issues.iter().any(|issue| issue == code))
+}
+
+fn has_warning_code(receipt: &Value, code: &str) -> bool {
+    receipt["warnings"]
+        .as_array()
+        .is_some_and(|warnings| warnings.iter().any(|warning| warning["code"] == code))
+}
+
+fn alias_warning(receipt: &Value) -> &Value {
+    receipt["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|warning| warning["code"] == "governed_relationship_alias")
+        .unwrap_or_else(|| panic!("missing alias warning: {receipt}"))
+}
+
+#[tokio::test]
+async fn governed_shadows_carry_stable_preflight_codes_and_actionable_details() {
+    let db = db().await;
+    let registry = registry();
+
+    let exact = call(
+        &registry,
+        &db,
+        json!({
+            "type": "WorkItem",
+            "kind": "task",
+            "facets": { "assigned_to": "someone" },
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(exact["proposed_facets"]["status"], "rejected");
+    let assessment = assessment_by_key(&exact, "assigned_to");
+    assert_eq!(assessment["status"], "rejected");
+    assert_eq!(assessment["declaration"], "governed_relationship");
+    assert!(has_issue(assessment, "governed_relationship_wrong_carrier"));
+    assert_eq!(assessment["relationship_type"], "assigned_to");
+    assert_eq!(
+        assessment["suggested_operation"],
+        "manage_relationships.assert"
+    );
+    assert_eq!(assessment["facet_key"], "assigned_to");
+    let guidance = assessment["guidance"].as_str().unwrap();
+    assert!(
+        guidance.contains("manage_relationships.assert"),
+        "{guidance}"
+    );
+    assert!(
+        guidance.contains("does not participate in relationship reads"),
+        "{guidance}"
+    );
+
+    let alias = call(
+        &registry,
+        &db,
+        json!({
+            "type": "WorkItem",
+            "kind": "task",
+            "facets": { "assignee": "someone" },
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(alias["proposed_facets"]["status"], "accepted");
+    let assessment = assessment_by_key(&alias, "assignee");
+    assert_eq!(assessment["status"], "accepted");
+    assert!(has_issue(assessment, "governed_relationship_alias"));
+    assert_eq!(assessment["relationship_type"], "assigned_to");
+    assert_eq!(
+        assessment["suggested_operation"],
+        "manage_relationships.assert"
+    );
+    assert_eq!(assessment["facet_key"], "assignee");
+
+    let silent = call(
+        &registry,
+        &db,
+        json!({
+            "type": "Document",
+            "kind": "note",
+            "facets": { "assignee": "someone" },
+        }),
+    )
+    .await
+    .unwrap();
+    let assessment = assessment_by_key(&silent, "assignee");
+    assert_eq!(assessment["status"], "accepted");
+    assert_eq!(assessment["issues"], json!([]));
+
+    let blocks = call(
+        &registry,
+        &db,
+        json!({
+            "type": "Document",
+            "kind": "note",
+            "facets": { "blocks": "something" },
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(blocks["proposed_facets"]["status"], "rejected");
+    let assessment = assessment_by_key(&blocks, "blocks");
+    assert_eq!(assessment["status"], "rejected");
+    assert!(has_issue(assessment, "governed_relationship_wrong_carrier"));
+    assert_eq!(assessment["relationship_type"], "blocks");
+}
+
+#[tokio::test]
+async fn governed_facet_writes_follow_the_assignment_conformance_matrix() {
+    let db = write_db().await;
+    let registry = registry();
+
+    // assignee on task warns.
+    let warned = call_tool(
+        &registry,
+        &db,
+        "create_record",
+        json!({
+            "type": "WorkItem",
+            "kind": "task",
+            "name": "warned task",
+            "facets": { "assignee": "someone" },
+            "reason": "prove assignee on a task warns",
+        }),
+    )
+    .await
+    .unwrap();
+    let warning = alias_warning(&warned);
+    assert_eq!(warning["facet_key"], "assignee");
+    assert_eq!(warning["relationship_type"], "assigned_to");
+    assert_eq!(
+        warning["suggested_operation"],
+        "manage_relationships.assert"
+    );
+    assert!(
+        warning["message"]
+            .as_str()
+            .unwrap()
+            .contains("did not establish the relationship"),
+        "{warning}"
+    );
+
+    // Exact assigned_to on task is refused.
+    let refused = call_tool(
+        &registry,
+        &db,
+        "create_record",
+        json!({
+            "type": "WorkItem",
+            "kind": "task",
+            "name": "refused task",
+            "facets": { "assigned_to": "someone" },
+            "reason": "prove exact assigned_to is refused",
+        }),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(refused.contains("manage_relationships.assert"), "{refused}");
+    assert!(refused.contains("assigned_to"), "{refused}");
+
+    // Every exact core-manifest name is refused on a task.
+    for relationship in [
+        "relates_to",
+        "depends_on",
+        "blocks",
+        "assigned_to",
+        "answerable_by",
+    ] {
+        let error = call_tool(
+            &registry,
+            &db,
+            "create_record",
+            json!({
+                "type": "WorkItem",
+                "kind": "task",
+                "name": format!("exact {relationship}"),
+                "facets": { relationship: "someone" },
+                "reason": "prove every exact governed name is refused",
+            }),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("manage_relationships.assert"), "{error}");
+    }
+
+    // assignee on a non-task is silent.
+    let silent = call_tool(
+        &registry,
+        &db,
+        "create_record",
+        json!({
+            "type": "Document",
+            "kind": "note",
+            "name": "silent note",
+            "facets": { "assignee": "someone" },
+            "reason": "prove assignee on a non-task stays silent",
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(!has_warning_code(&silent, "governed_relationship_alias"));
+
+    // Unsetting assignee is silent.
+    let task_id = warned["id"].as_str().unwrap().to_string();
+    let unset = call_tool(
+        &registry,
+        &db,
+        "update_record",
+        json!({
+            "id": task_id,
+            "facets": { "assignee": null },
+            "reason": "prove unsetting assignee stays silent",
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(!has_warning_code(&unset, "governed_relationship_alias"));
+
+    // Exact blocks on a non-task is refused.
+    let blocked = call_tool(
+        &registry,
+        &db,
+        "create_record",
+        json!({
+            "type": "Document",
+            "kind": "note",
+            "name": "blocked note",
+            "facets": { "blocks": "something" },
+            "reason": "prove exact blocks is refused everywhere",
+        }),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(blocked.contains("manage_relationships.assert"), "{blocked}");
+
+    // An unrelated open facet is silent.
+    let open = call_tool(
+        &registry,
+        &db,
+        "create_record",
+        json!({
+            "type": "Document",
+            "kind": "note",
+            "name": "open note",
+            "facets": { "triage": "honest" },
+            "reason": "prove unrelated facets stay silent",
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(!has_warning_code(&open, "governed_relationship_alias"));
+
+    // assignee on a task that already carries assigned_to still warns.
+    let task = call_tool(
+        &registry,
+        &db,
+        "create_record",
+        json!({
+            "type": "WorkItem",
+            "kind": "task",
+            "name": "already assigned",
+            "reason": "prove redundancy still warns",
+        }),
+    )
+    .await
+    .unwrap();
+    let person = call_tool(
+        &registry,
+        &db,
+        "create_record",
+        json!({
+            "type": "Entity",
+            "kind": "person",
+            "name": "assignee person",
+            "reason": "prove redundancy still warns",
+        }),
+    )
+    .await
+    .unwrap();
+    call_tool(
+        &registry,
+        &db,
+        "manage_relationships",
+        json!({
+            "action": "assert",
+            "relationship_type": "assigned_to",
+            "endpoints": [
+                { "role": "subject", "record_id": task["id"] },
+                { "role": "object", "record_id": person["id"] },
+            ],
+            "idempotency_key": "fce5d49-redundancy",
+        }),
+    )
+    .await
+    .unwrap();
+    let redundant = call_tool(
+        &registry,
+        &db,
+        "update_record",
+        json!({
+            "id": task["id"],
+            "facets": { "assignee": "someone else" },
+            "reason": "prove redundancy still warns",
+        }),
+    )
+    .await
+    .unwrap();
+    let warning = alias_warning(&redundant);
+    assert_eq!(warning["relationship_type"], "assigned_to");
+}
+
+#[tokio::test]
+async fn batch_update_warns_per_target_with_index_correlation() {
+    let db = write_db().await;
+    let registry = registry();
+    let task = call_tool(
+        &registry,
+        &db,
+        "create_record",
+        json!({
+            "type": "WorkItem",
+            "kind": "task",
+            "name": "batch task",
+            "reason": "prove batch alias warnings",
+        }),
+    )
+    .await
+    .unwrap();
+    let note = call_tool(
+        &registry,
+        &db,
+        "create_record",
+        json!({
+            "type": "Document",
+            "kind": "note",
+            "name": "batch note",
+            "reason": "prove batch alias warnings",
+        }),
+    )
+    .await
+    .unwrap();
+
+    // One cohort, two kinds: the task warns, the note stays silent.
+    let batch = call_tool(
+        &registry,
+        &db,
+        "update_record",
+        json!({
+            "ids": [task["id"], note["id"]],
+            "facets": { "assignee": "someone" },
+            "reason": "prove batch alias warnings",
+        }),
+    )
+    .await
+    .unwrap();
+    let warnings = batch["warnings"].as_array().unwrap();
+    assert_eq!(warnings.len(), 1, "{batch}");
+    assert_eq!(warnings[0]["code"], "governed_relationship_alias");
+    assert_eq!(warnings[0]["index"], 0);
+    assert_eq!(warnings[0]["id"], task["id"]);
+    assert_eq!(warnings[0]["relationship_type"], "assigned_to");
+
+    // Unsetting across the cohort stays silent and carries no array.
+    let unset = call_tool(
+        &registry,
+        &db,
+        "update_record",
+        json!({
+            "ids": [task["id"], note["id"]],
+            "facets": { "assignee": null },
+            "reason": "prove batch unsets stay silent",
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(unset.get("warnings").is_none(), "{unset}");
+
+    // Exact governed names refuse the whole batch before any write.
+    let refused = call_tool(
+        &registry,
+        &db,
+        "update_record",
+        json!({
+            "ids": [task["id"]],
+            "facets": { "assigned_to": "someone" },
+            "reason": "prove batch exact names refuse",
+        }),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(refused.contains("manage_relationships.assert"), "{refused}");
+}
+
+#[tokio::test]
+async fn create_many_propagates_alias_warnings_with_index() {
+    let db = write_db().await;
+    let registry = registry();
+    let batch = call_tool(
+        &registry,
+        &db,
+        "create_many",
+        json!({
+            "reason": "prove create_many propagates alias warnings",
+            "records": [
+                {
+                    "type": "WorkItem",
+                    "kind": "task",
+                    "name": "warned batch task",
+                    "facets": { "assignee": "someone" },
+                },
+                {
+                    "type": "Document",
+                    "kind": "note",
+                    "name": "silent batch note",
+                    "facets": { "assignee": "someone" },
+                },
+            ],
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(batch["ok"], true, "{batch}");
+    let warnings = batch["warnings"].as_array().unwrap();
+    assert_eq!(warnings.len(), 1, "{batch}");
+    assert_eq!(warnings[0]["code"], "governed_relationship_alias");
+    assert_eq!(warnings[0]["index"], 0);
+    assert_eq!(warnings[0]["relationship_type"], "assigned_to");
+
+    // Exact governed names fail the item without a warning.
+    let refused = call_tool(
+        &registry,
+        &db,
+        "create_many",
+        json!({
+            "reason": "prove create_many refuses exact names",
+            "records": [
+                {
+                    "type": "WorkItem",
+                    "kind": "task",
+                    "name": "refused batch task",
+                    "facets": { "assigned_to": "someone" },
+                },
+            ],
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(refused["ok"], false, "{refused}");
+    assert!(
+        refused["errors"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("manage_relationships.assert"),
+        "{refused}"
+    );
+}
+
+#[tokio::test]
+async fn declared_assignee_rejection_keeps_alias_metadata() {
+    // A workspace schema may declare the alias carrier itself. The preview
+    // must then report the declared rejection (type, vocabulary, resolution,
+    // status) exactly as for any other declared facet, with the alias issue
+    // and relationship details added — never replacing the schema verdict.
+    let db = write_db().await;
+    let registry = registry();
+    write_user_schema_config(
+        &db,
+        json!({ "shapes": { "WorkItem:task": { "facets": {
+            "assignee": { "type": "number" }
+        } } } }),
+        SchemaConfigOptions::default(),
+    )
+    .await
+    .unwrap();
+
+    let preview = call(
+        &registry,
+        &db,
+        json!({
+            "type": "WorkItem",
+            "kind": "task",
+            "facets": { "assignee": "bob" },
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(preview["proposed_facets"]["status"], "rejected");
+    let assessment = assessment_by_key(&preview, "assignee");
+    assert_eq!(assessment["status"], "rejected");
+    assert_eq!(assessment["declaration"], "declared");
+    assert_eq!(assessment["declared_type"], "number");
+    assert!(has_issue(assessment, "declared_type_mismatch"));
+    assert!(has_issue(assessment, "governed_relationship_alias"));
+    assert_eq!(assessment["relationship_type"], "assigned_to");
+    assert_eq!(
+        assessment["suggested_operation"],
+        "manage_relationships.assert"
+    );
+    assert_eq!(assessment["facet_key"], "assignee");
+
+    // The write path agrees: the declared predicate refuses the value.
+    let error = call_tool(
+        &registry,
+        &db,
+        "create_record",
+        json!({
+            "type": "WorkItem",
+            "kind": "task",
+            "name": "declared assignee task",
+            "facets": { "assignee": "bob" },
+            "reason": "prove declared assignee rejects on write",
+        }),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("JSON number"), "{error}");
+}

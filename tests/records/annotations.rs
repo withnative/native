@@ -68,6 +68,7 @@ async fn append_and_project(
         intent: intent.map(String::from),
         created_at: "2027-01-01T00:00:00.000Z".into(),
         causal_envelope: native_ce::events::CausalEnvelopeV1::legacy_unknown(),
+        act: None,
     };
     let mut conn = crate::common::fixture_write_pool(db)
         .await

@@ -18,6 +18,21 @@ pub enum DatabaseRouteError {
     NotFound,
     /// A valid account has no membership at all, normally a failed provision.
     Unprovisioned,
+    /// The caller's guest membership on this database has reached its access
+    /// deadline. It is deliberately its own variant rather than an
+    /// `Internal(Auth)` (a missing or expired *session*, which the guest can
+    /// repair by signing in again) or `NotFound` (a workspace the caller never
+    /// had): the credential is valid, the workspace exists, and the guest
+    /// accesses are simply over. The workbench renders it as "your guest
+    /// access has ended" rather than bouncing the visitor through sign-in.
+    GuestAccessEnded,
+    /// The account's recorded workspace selection is no longer usable (the
+    /// membership is gone, the workspace is not ready, or offboarding is in
+    /// flight). Legacy unscoped routing refuses rather than silently landing
+    /// the caller in a different workspace; the id names the stale selection
+    /// so the caller can re-select. It is the caller's own selection, so
+    /// naming it leaks nothing about other workspaces.
+    SelectedUnavailable { db_id: String },
     /// Routing cannot choose among multiple memberships.
     ///
     /// No longer produced by the legacy newest-membership resolver. The

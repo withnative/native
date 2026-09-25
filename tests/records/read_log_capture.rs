@@ -96,7 +96,7 @@ async fn touches_for_tool(
 fn every_local_registration_uses_the_exhaustive_tool_kind_path() {
     let registry = registry();
     let specs = registry.specs().collect::<Vec<_>>();
-    assert_eq!(specs.len(), ToolKind::ALL.len() - 4);
+    assert_eq!(specs.len(), ToolKind::ALL.len() - 7);
     assert!(
         specs.iter().all(|spec| spec.kind.is_some()),
         "a local tool used the custom/no-record registration escape hatch"
@@ -113,9 +113,12 @@ fn every_local_registration_uses_the_exhaustive_tool_kind_path() {
     );
     let hosted_only = HashSet::from([
         ToolKind::ManageMemberships,
+        ToolKind::WorkspaceRead,
         ToolKind::StandbyStatus,
         ToolKind::ReachRead,
         ToolKind::ReachConnect,
+        ToolKind::AuthorityActHead,
+        ToolKind::AuthorityActDelta,
     ]);
     let expected_local = exhaustive
         .difference(&hosted_only)
@@ -128,7 +131,7 @@ fn every_local_registration_uses_the_exhaustive_tool_kind_path() {
             .copied()
             .collect::<HashSet<_>>(),
         hosted_only,
-        "hosted membership management, reach, and standby-only status stay off the local registry"
+        "hosted membership management, workspace directory, reach, and standby-only status stay off the local registry"
     );
     for spec in &specs {
         assert_eq!(spec.name, spec.kind.unwrap().name());
@@ -168,7 +171,7 @@ fn focused_profile_routes_record_work_to_the_shape_preview() {
 }
 
 #[tokio::test]
-async fn success_error_and_zero_result_calls_are_raw_rows() {
+async fn mutations_keep_attempt_rows_while_pure_reads_leave_no_exhaust() {
     let db = create_database(":memory:").await.unwrap();
     let registry = registry();
 
@@ -181,7 +184,7 @@ async fn success_error_and_zero_result_calls_are_raw_rows() {
         "run_key": RUN_KEY,
         "parent_key": "pilot-river-b748b2",
     });
-    let create_result = call(&registry, &db, "create_record", create_arguments.clone()).await;
+    call(&registry, &db, "create_record", create_arguments.clone()).await;
 
     let row = sqlx::query(
         "SELECT tool, run_key, parent_key, actor, arguments, outcome, error_kind,
@@ -201,11 +204,8 @@ async fn success_error_and_zero_result_calls_are_raw_rows() {
     );
     assert_eq!(row.get::<String, _>("outcome"), "ok");
     assert_eq!(row.get::<Option<String>, _>("error_kind"), None);
-    assert_eq!(row.get::<i64, _>("result_count"), 1);
-    assert_eq!(
-        row.get::<i64, _>("result_bytes"),
-        serde_json::to_vec(&create_result).unwrap().len() as i64
-    );
+    assert_eq!(row.get::<Option<i64>, _>("result_count"), None);
+    assert_eq!(row.get::<Option<i64>, _>("result_bytes"), None);
     assert!(
         row.get::<String, _>("started_at") <= row.get::<String, _>("ended_at"),
         "the call interval must be ordered"
@@ -255,7 +255,7 @@ async fn success_error_and_zero_result_calls_are_raw_rows() {
     assert_eq!(error_row.get::<String, _>("outcome"), "error");
     assert_eq!(error_row.get::<String, _>("error_kind"), "engine");
     assert_eq!(error_row.get::<Option<i64>, _>("result_count"), None);
-    assert!(error_row.get::<i64, _>("result_bytes") > 0);
+    assert_eq!(error_row.get::<Option<i64>, _>("result_bytes"), None);
     let error_touches: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM read_log_touches t
           JOIN read_log_calls c ON c.seq = t.call_seq
@@ -271,38 +271,20 @@ async fn success_error_and_zero_result_calls_are_raw_rows() {
         let result = call(&registry, &db, "search", search_arguments.clone()).await;
         assert_eq!(result["hits"], json!([]));
     }
-    let search_rows = sqlx::query(
-        "SELECT arguments, result_count FROM read_log_calls
-          WHERE tool = 'search' ORDER BY seq",
-    )
-    .fetch_all(db.pool())
-    .await
-    .unwrap();
-    assert_eq!(search_rows.len(), 2, "per-call rows must never be folded");
-    for row in search_rows {
-        assert_eq!(row.get::<i64, _>("result_count"), 0);
-        assert_eq!(
-            serde_json::from_str::<Value>(&row.get::<String, _>("arguments")).unwrap(),
-            search_arguments
-        );
-    }
+    let search_rows = sqlx::query("SELECT seq FROM read_log_calls WHERE tool = 'search'")
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+    assert!(search_rows.is_empty(), "pure search calls are disposable");
 
     let guide_arguments = json!({ "topic": "about", "run_key": RUN_KEY });
     let guide = call(&registry, &db, "read_guide", guide_arguments.clone()).await;
     assert_eq!(guide["topic"], "about");
-    let guide_row = sqlx::query(
-        "SELECT arguments, outcome, result_count FROM read_log_calls
-          WHERE tool = 'read_guide'",
-    )
-    .fetch_one(db.pool())
-    .await
-    .unwrap();
-    assert_eq!(guide_row.get::<String, _>("outcome"), "ok");
-    assert_eq!(guide_row.get::<i64, _>("result_count"), 0);
-    assert_eq!(
-        serde_json::from_str::<Value>(&guide_row.get::<String, _>("arguments")).unwrap(),
-        guide_arguments
-    );
+    let guide_rows = sqlx::query("SELECT seq FROM read_log_calls WHERE tool = 'read_guide'")
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+    assert!(guide_rows.is_empty(), "guide reads are disposable");
     let guide_touches: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM read_log_touches t
           JOIN read_log_calls c ON c.seq = t.call_seq
@@ -387,8 +369,8 @@ async fn reach_read_log_never_persists_queries_or_unrecognized_arguments() {
         .await
         .is_err());
 
-    // Both the valid and the rejected reach calls capture (the latter with
-    // an error outcome); drain the direct dispatches above before reading.
+    // Reach reads are disposable, including failed reads. Both connect
+    // attempts keep bounded routing evidence and discard the private token.
     db.drain_captures_for_tests().await;
     let rows = sqlx::query(
         "SELECT tool, arguments, outcome FROM read_log_calls
@@ -397,7 +379,7 @@ async fn reach_read_log_never_persists_queries_or_unrecognized_arguments() {
     .fetch_all(db.pool())
     .await
     .unwrap();
-    assert_eq!(rows.len(), 4);
+    assert_eq!(rows.len(), 2);
     let captured = rows
         .iter()
         .map(|row| {
@@ -411,12 +393,6 @@ async fn reach_read_log_never_persists_queries_or_unrecognized_arguments() {
     assert_eq!(
         captured,
         vec![
-            (
-                "reach_read".into(),
-                json!({"action":"search_slack"}),
-                "ok".into()
-            ),
-            ("reach_read".into(), json!({}), "error".into()),
             (
                 "reach_connect".into(),
                 json!({"provider":"slack"}),
@@ -441,7 +417,7 @@ async fn reach_read_log_never_persists_queries_or_unrecognized_arguments() {
 }
 
 #[tokio::test]
-async fn extraction_distinguishes_opened_surfaced_and_mutated_with_rank() {
+async fn extraction_discards_read_touches_and_keeps_mutation_evidence_without_rank() {
     let db = create_database(":memory:").await.unwrap();
     let registry = registry();
     create(
@@ -480,34 +456,8 @@ async fn extraction_distinguishes_opened_surfaced_and_mutated_with_rank() {
         json!({ "ids": ["4ead1096-0000-4000-8000-000000000001"], "run_key": RUN_KEY }),
     )
     .await;
-    let actual = touches_for_tool(
-        &db,
-        "get_record",
-        "CASE touch.interaction WHEN 'opened' THEN 0 ELSE 1 END, touch.result_rank",
-    )
-    .await;
-    assert_eq!(
-        actual,
-        vec![
-            (
-                "4ead1096-0000-4000-8000-000000000001".into(),
-                "opened".into(),
-                None
-            ),
-            (
-                "4ead1096-0000-4000-8000-000000000004".into(),
-                "surfaced".into(),
-                Some(1)
-            ),
-            (
-                "4ead1096-0000-4000-8000-000000000005".into(),
-                "surfaced".into(),
-                Some(2)
-            ),
-            ("native:root".into(), "surfaced".into(), Some(3)),
-            ("native:unfiled".into(), "surfaced".into(), Some(4)),
-        ]
-    );
+    let actual = touches_for_tool(&db, "get_record", "dictionary.record_id").await;
+    assert!(actual.is_empty(), "pure get_record touches are disposable");
 
     call(
         &registry,
@@ -532,17 +482,17 @@ async fn extraction_distinguishes_opened_surfaced_and_mutated_with_rank() {
     let created_touches = touches_for_tool(
         &db,
         "create_record",
-        "CASE touch.interaction WHEN 'mutated' THEN 0 ELSE 1 END, touch.result_rank",
+        "CASE touch.interaction WHEN 'mutated' THEN 0 ELSE 1 END, dictionary.record_id",
     )
     .await;
     assert_eq!(
         created_touches,
         vec![
             ("4ead1096-0000-4000-8000-000000000006".into(), "mutated".into(), None),
-            ("native:root".into(), "surfaced".into(), Some(1)),
-            ("native:unfiled".into(), "surfaced".into(), Some(2)),
-            ("4ead1096-0000-4000-8000-000000000001".into(), "surfaced".into(), Some(3)),
-            ("4ead1096-0000-4000-8000-000000000004".into(), "surfaced".into(), Some(4)),
+            ("4ead1096-0000-4000-8000-000000000001".into(), "surfaced".into(), None),
+            ("4ead1096-0000-4000-8000-000000000004".into(), "surfaced".into(), None),
+            ("native:root".into(), "surfaced".into(), None),
+            ("native:unfiled".into(), "surfaced".into(), None),
         ],
         "create_record returns a flattened EnrichedRecord; visible ancestor/link endpoints must be surfaced"
     );
@@ -563,7 +513,7 @@ async fn extraction_distinguishes_opened_surfaced_and_mutated_with_rank() {
     let update_touches = touches_for_tool(
         &db,
         "update_record",
-        "CASE touch.interaction WHEN 'mutated' THEN 0 ELSE 1 END, touch.result_rank",
+        "CASE touch.interaction WHEN 'mutated' THEN 0 ELSE 1 END, dictionary.record_id",
     )
     .await;
     assert_eq!(
@@ -577,20 +527,20 @@ async fn extraction_distinguishes_opened_surfaced_and_mutated_with_rank() {
             (
                 "4ead1096-0000-4000-8000-000000000004".into(),
                 "surfaced".into(),
-                Some(1)
+                None
             ),
             (
                 "4ead1096-0000-4000-8000-000000000005".into(),
                 "surfaced".into(),
-                Some(2)
+                None
             ),
             (
                 "4ead1096-0000-4000-8000-000000000006".into(),
                 "surfaced".into(),
-                Some(3)
+                None
             ),
-            ("native:root".into(), "surfaced".into(), Some(4)),
-            ("native:unfiled".into(), "surfaced".into(), Some(5)),
+            ("native:root".into(), "surfaced".into(), None),
+            ("native:unfiled".into(), "surfaced".into(), None),
         ],
         "update_record returns a flattened EnrichedRecord; visible children must be surfaced"
     );

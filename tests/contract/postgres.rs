@@ -107,6 +107,7 @@ impl ContractHarness for PostgresHarness {
                 actor: "contract".into(),
                 reason: "Restrict the shared contract fixture to an editor.".into(),
                 created_at: chrono::Utc::now().to_rfc3339(),
+                act: None,
             })
             .await?;
         Ok(())

@@ -35,6 +35,9 @@ const CONTENT_OWNED_RELATIONSHIPS: &[&str] = &[
     "renders",
     "reply_to",
     "supersedes",
+    // Surface bindings (`native:root`/person -> artifact). Reserved internal
+    // producer added with the K3 resolver; see `crate::surface_binding`.
+    "surface_binding",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -177,6 +180,7 @@ pub(crate) fn migration_envelope(
 /// The only live constructor for the sealed definition. Endpoint
 /// authorization/non-disclosure is completed by the `manage_links` handler in
 /// the same transaction before entering this seam.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn mutate_from_manage_links_in(
     tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
     caller: &crate::mcp::registry::Caller,
@@ -185,6 +189,7 @@ pub(crate) async fn mutate_from_manage_links_in(
     token: &str,
     note: Option<String>,
     add: bool,
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<Value> {
     let draft = crate::provenance::reserve_action_attestation()?;
     let (receipt, outputs) = mutate_with_reserved_attestation_in(
@@ -197,6 +202,7 @@ pub(crate) async fn mutate_from_manage_links_in(
         add,
         "manage_links",
         &draft,
+        act_alloc,
     )
     .await?;
     crate::provenance::issue_action_attestation_outputs_in(tx, draft, &outputs).await?;
@@ -212,6 +218,7 @@ pub(crate) async fn mutate_from_manage_links_in(
 /// asserts and the batch that records the assertion share one attestation and
 /// `inspect_action_attestation` can answer "which canvas gesture asserted
 /// this link".
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn mutate_from_canvas_in(
     tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
     caller: &crate::mcp::registry::Caller,
@@ -220,6 +227,7 @@ pub(crate) async fn mutate_from_canvas_in(
     token: &str,
     note: Option<String>,
     draft: &crate::provenance::ActionAttestationDraft,
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<Value> {
     let (receipt, _) = mutate_with_reserved_attestation_in(
         tx,
@@ -231,6 +239,7 @@ pub(crate) async fn mutate_from_canvas_in(
         true,
         "manage_canvas",
         draft,
+        act_alloc,
     )
     .await?;
     Ok(receipt)
@@ -239,6 +248,7 @@ pub(crate) async fn mutate_from_canvas_in(
 /// Composite create_record entry point. The caller reserves one action
 /// identity for the whole command and finalizes it over every content and
 /// relationship output immediately before commit.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn mutate_from_create_record_in(
     tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
     caller: &crate::mcp::registry::Caller,
@@ -247,6 +257,7 @@ pub(crate) async fn mutate_from_create_record_in(
     token: &str,
     note: Option<String>,
     draft: &crate::provenance::ActionAttestationDraft,
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<Value> {
     let (receipt, _) = mutate_with_reserved_attestation_in(
         tx,
@@ -258,13 +269,45 @@ pub(crate) async fn mutate_from_create_record_in(
         true,
         "create_record",
         draft,
+        act_alloc,
+    )
+    .await?;
+    Ok(receipt)
+}
+
+/// Composite update_record entry point. Same reserved-identity contract as
+/// the create/canvas entry points, but attested as `update_record` so the
+/// provenance operation names the command that actually authorized the link
+/// (Edit source + View target, checked by the caller before entry).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn mutate_from_update_record_in(
+    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    caller: &crate::mcp::registry::Caller,
+    source_id: &str,
+    target_id: &str,
+    token: &str,
+    note: Option<String>,
+    draft: &crate::provenance::ActionAttestationDraft,
+    act_alloc: &mut crate::act::ActAllocation,
+) -> Result<Value> {
+    let (receipt, _) = mutate_with_reserved_attestation_in(
+        tx,
+        caller,
+        source_id,
+        target_id,
+        token,
+        note,
+        true,
+        "update_record",
+        draft,
+        act_alloc,
     )
     .await?;
     Ok(receipt)
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn mutate_with_reserved_attestation_in(
+pub(crate) async fn mutate_with_reserved_attestation_in(
     tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
     caller: &crate::mcp::registry::Caller,
     source_id: &str,
@@ -274,6 +317,7 @@ async fn mutate_with_reserved_attestation_in(
     add: bool,
     operation: &str,
     draft: &crate::provenance::ActionAttestationDraft,
+    act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<(Value, Vec<crate::provenance::ActionOutput>)> {
     let origin: String =
         sqlx::query_scalar("SELECT origin_db_id FROM database_identity WHERE singleton=1")
@@ -378,7 +422,7 @@ async fn mutate_with_reserved_attestation_in(
             occurred_at: now.clone(),
             ingested_at: now.clone(),
         };
-        super::append_relationship_event_in(tx, &spec).await?;
+        super::append_relationship_event_in(tx, &spec, act_alloc).await?;
         (relationship_id, assertion_id, vec![event_id])
     } else {
         let source = sqlx::query("SELECT type,kind FROM records WHERE id=? AND deleted_at IS NULL")
@@ -458,7 +502,7 @@ async fn mutate_with_reserved_attestation_in(
             command.relationship_event.event_id.clone(),
             command.assertion_event.event_id.clone(),
         ];
-        super::create_relationship_with_assertion_in(tx, &command).await?;
+        super::create_relationship_with_assertion_in(tx, &command, act_alloc).await?;
         (relationship_id, assertion_id, output_ids)
     };
     let outputs = output_ids

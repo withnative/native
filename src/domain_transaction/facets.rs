@@ -41,6 +41,14 @@ pub(crate) trait FacetObservationPort {
         spec: AppendSpec,
         control: &'a ExecutionControl,
     ) -> BoxFuture<'a, Result<i64>>;
+
+    /// The act this transaction allocated, if it has appended anything
+    /// canonical yet. The append above allocates exactly once per
+    /// transaction; this exposes the value so the write response can echo
+    /// the coordinate of the write it just performed.
+    fn allocated_act(&self) -> Option<i64> {
+        None
+    }
 }
 
 #[derive(Deserialize)]
@@ -98,7 +106,7 @@ fn caller_principal(caller: &Caller) -> Principal<'_> {
     if caller.is_trusted_local() && caller.hosting_database().is_none() {
         Principal::trusted_local()
     } else {
-        Principal::bound(caller.credential(), true)
+        Principal::bound(caller.credential(), caller.is_host_member())
     }
 }
 
@@ -122,11 +130,207 @@ fn require_nonblank_reason(tool: &str, reason: &str) -> Result<()> {
     Ok(())
 }
 
+/// Stable preflight issue code for an exact governed-relationship name used
+/// as a facet key. Human-readable text is presentation and may change; this
+/// code is API, like `spine_facet_wrong_carrier`.
+pub(crate) const GOVERNED_RELATIONSHIP_ISSUE: &str = "governed_relationship_wrong_carrier";
+/// Stable preflight issue and receipt-warning code for a listed alias (such
+/// as `assignee`) that shadows a governed relationship. Warns, never refuses.
+pub(crate) const GOVERNED_ALIAS_ISSUE: &str = "governed_relationship_alias";
+/// The one governed carrier for relationship shadows.
+pub(crate) const GOVERNED_RELATIONSHIP_SUGGESTED_OPERATION: &str = "manage_relationships.assert";
+/// Material behavioural difference between a facet and a governed
+/// relationship, surfaced in preflight details and write warnings.
+pub(crate) const GOVERNED_RELATIONSHIP_FACET_DIFFERENCE: &str = "A facet does not participate in relationship reads such as assigned-to-me, does not preserve the claimant, cannot be contested, and does not resolve its value to a person record.";
+
+/// The embedded core relationship manifest, parsed and validated once. The
+/// manifest is compiled into the binary, so a parse or validation failure is
+/// an impossible build-time defect: fail loudly rather than silently
+/// disabling the exact-name refusal and alias-warning protections.
+fn core_relationship_manifest() -> &'static crate::relationship::CoreRelationshipTypeManifest {
+    static MANIFEST: std::sync::OnceLock<crate::relationship::CoreRelationshipTypeManifest> =
+        std::sync::OnceLock::new();
+    MANIFEST.get_or_init(|| {
+        crate::relationship::core_relationship_type_manifest()
+            .expect("embedded core relationship manifest is valid")
+    })
+}
+
+fn governed_relationship_names() -> &'static [String] {
+    static NAMES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    NAMES.get_or_init(|| {
+        core_relationship_manifest()
+            .relationship_types
+            .iter()
+            .map(|definition| definition.relationship_type.clone())
+            .collect::<Vec<_>>()
+    })
+}
+
+/// Exact core-manifest relationship name for `key`, derived from
+/// `src/relationship/core_relationship_types.json` rather than a hardcoded
+/// list, so a new relationship type gets the protection without a code
+/// change. No fuzzy matching: substrings and edit-distance neighbours stay
+/// honest open facets.
+pub(crate) fn governed_relationship_type_for_key(key: &str) -> Option<String> {
+    governed_relationship_names()
+        .iter()
+        .find(|name| name.as_str() == key)
+        .cloned()
+}
+
+/// Evidence-led alias list. Initially only `assignee -> assigned_to`. Do not
+/// add `assigned` without measurement showing it in use as an assignment key
+/// (it could honestly be a boolean or a date), and apply the same evidence
+/// test to candidates such as `blocked_by` for `blocks`.
+pub(crate) fn governed_alias_target(key: &str) -> Option<&'static str> {
+    match key {
+        "assignee" => Some("assigned_to"),
+        _ => None,
+    }
+}
+
+/// Whether `relationship_type` admits `(record_type, kind)` as its subject.
+/// Derived from the core manifest's subject-endpoint allowlist, so a new
+/// relationship type's admission travels with its definition. Symmetric types
+/// check the participant role; directed types check the subject role.
+pub(crate) fn governed_relationship_admits_subject(
+    relationship_type: &str,
+    record_type: &str,
+    kind: Option<&str>,
+) -> bool {
+    let manifest = core_relationship_manifest();
+    let Some(definition) = manifest
+        .relationship_types
+        .iter()
+        .find(|definition| definition.relationship_type == relationship_type)
+    else {
+        return false;
+    };
+    let role = if definition.endpoint_semantics == crate::relationship::EndpointSemantics::Symmetric
+    {
+        "participant"
+    } else {
+        "subject"
+    };
+    let Some(rule) = definition
+        .endpoints
+        .iter()
+        .find(|endpoint| endpoint.role == role)
+    else {
+        return false;
+    };
+    let kind = kind.unwrap_or_default();
+    rule.allowed_record_kinds.iter().any(|allowed| {
+        (allowed.record_type == "*" || allowed.record_type == record_type)
+            && (allowed.kind == "*" || allowed.kind == kind)
+    })
+}
+
+/// Structured alias warning for a successful write. Returns `None` for unsets
+/// and for subject kinds the governed relationship does not admit.
+pub(crate) fn governed_alias_warning(
+    facet_key: &str,
+    record_type: &str,
+    kind: Option<&str>,
+    is_unset: bool,
+) -> Option<Value> {
+    if is_unset {
+        return None;
+    }
+    let relationship_type = governed_alias_target(facet_key)?;
+    if !governed_relationship_admits_subject(relationship_type, record_type, kind) {
+        return None;
+    }
+    Some(governed_alias_warning_value(facet_key, relationship_type))
+}
+
+pub(crate) fn governed_alias_warning_value(facet_key: &str, relationship_type: &str) -> Value {
+    json!({
+        "code": GOVERNED_ALIAS_ISSUE,
+        "facet_key": facet_key,
+        "relationship_type": relationship_type,
+        "suggested_operation": GOVERNED_RELATIONSHIP_SUGGESTED_OPERATION,
+        "message": format!(
+            "Facet '{facet_key}' shadows governed relationship '{relationship_type}': this write did not establish the relationship. Assert it with {op} instead. {diff}",
+            op = GOVERNED_RELATIONSHIP_SUGGESTED_OPERATION,
+            diff = GOVERNED_RELATIONSHIP_FACET_DIFFERENCE,
+        ),
+        "facet_behavior_difference": GOVERNED_RELATIONSHIP_FACET_DIFFERENCE,
+    })
+}
+
+pub(crate) fn governed_relationship_guidance(facet_key: &str, relationship_type: &str) -> String {
+    format!(
+        "Facet '{facet_key}' shadows governed relationship '{relationship_type}': governed relationships are asserted with {op}, never as facets. {diff}",
+        op = GOVERNED_RELATIONSHIP_SUGGESTED_OPERATION,
+        diff = GOVERNED_RELATIONSHIP_FACET_DIFFERENCE,
+    )
+}
+
+/// Alias warnings for one successful facet write batch. Exact governed names
+/// never reach here: `parse_facet_entry` refuses them before commit. Unsets
+/// are quiet, kinds the relationship does not admit are quiet, and an
+/// existing governed relationship does not suppress the warning — the
+/// redundancy is the problem, not only the absence.
+///
+/// Backend-neutral: it reads only the parsed writes and the admitted
+/// type/kind, so the SQLite, Postgres and Turso adapters share it.
+pub(crate) fn governed_alias_warnings_for_sets(
+    facets: &[FacetWrite],
+    record_type: &str,
+    kind: Option<&str>,
+) -> Vec<Value> {
+    facets
+        .iter()
+        .filter_map(|facet| governed_alias_warning(&facet.key, record_type, kind, false))
+        .collect()
+}
+
+/// Append one structured warning to a write receipt's `warnings` array,
+/// creating the array when absent. Mirrors the artifact-continuity precedent.
+/// Backend-neutral over the JSON receipt: every adapter's summary projection
+/// preserves a `warnings` array, and verbose shapes return the receipt as is.
+pub(crate) fn push_receipt_warning(result: &mut Value, warning: Value) -> Result<()> {
+    let object = result
+        .as_object_mut()
+        .ok_or_else(|| Error::engine("write receipt returned a non-object result"))?;
+    match object.get_mut("warnings") {
+        Some(Value::Array(warnings)) => warnings.push(warning),
+        Some(existing) => {
+            *existing = Value::Array(vec![existing.clone(), warning]);
+        }
+        None => {
+            object.insert("warnings".into(), Value::Array(vec![warning]));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn push_receipt_warnings(result: &mut Value, warnings: Vec<Value>) -> Result<()> {
+    for warning in warnings {
+        push_receipt_warning(result, warning)?;
+    }
+    Ok(())
+}
+
+/// Correlate one alias warning with its batch position, following the
+/// `create_many` precedent of index-tagged warnings. `id` names the target
+/// record; batch cohorts have no stable `ref` of their own.
+pub(crate) fn index_warning_for_batch(index: usize, id: &str, mut warning: Value) -> Value {
+    if let Some(object) = warning.as_object_mut() {
+        object.insert("index".into(), json!(index));
+        object.insert("id".into(), json!(id));
+    }
+    warning
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum FacetKeyClassification {
     Open,
     Spine { create_record_path: &'static str },
     EngineReserved,
+    GovernedRelationship { relationship_type: String },
 }
 
 pub(crate) fn classify_facet_key(key: &str) -> FacetKeyClassification {
@@ -137,6 +341,8 @@ pub(crate) fn classify_facet_key(key: &str) -> FacetKeyClassification {
         FacetKeyClassification::EngineReserved
     } else if let Some(create_record_path) = spine_facet_column(key) {
         FacetKeyClassification::Spine { create_record_path }
+    } else if let Some(relationship_type) = governed_relationship_type_for_key(key) {
+        FacetKeyClassification::GovernedRelationship { relationship_type }
     } else {
         FacetKeyClassification::Open
     }
@@ -163,6 +369,12 @@ pub(crate) fn assert_open_facet_key(tool: &str, key: &str) -> Result<()> {
     if let Some(column) = spine_facet_column(key) {
         return Err(Error::engine(format!(
             "{tool}: '{key}' is a spine facet — set it via the top-level '{column}' argument, not 'facets'"
+        )));
+    }
+    if let Some(relationship_type) = governed_relationship_type_for_key(key) {
+        return Err(Error::engine(format!(
+            "{tool}: facet '{key}' shadows governed relationship '{relationship_type}' — {guidance}",
+            guidance = governed_relationship_guidance(key, &relationship_type),
         )));
     }
     Ok(())
@@ -784,6 +996,7 @@ where
         &as_of,
         event_seq,
         previous_seq,
+        executor.allocated_act(),
     ))
 }
 
@@ -802,8 +1015,9 @@ pub(crate) fn observation_write_response(
     as_of: &str,
     event_seq: impl Into<Value>,
     previous_seq: impl Into<Value>,
+    act: Option<i64>,
 ) -> Value {
-    json!({
+    let mut response = json!({
         "status": status,
         "record_id": record_id,
         "key": key,
@@ -819,7 +1033,13 @@ pub(crate) fn observation_write_response(
         // never prose.
         "current_value_unchanged": true,
         "current_value_written_by": "update_record.facets",
-    })
+    });
+    // A write that appended nothing canonical allocates no act; omit the
+    // field rather than reporting null or the workspace's current act.
+    if let Some(act) = act {
+        response["act"] = act.into();
+    }
+    response
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2021,10 +2241,12 @@ mod tests {
             "2026-08-01T00:00:00.000Z",
             42,
             41,
+            Some(9),
         );
         assert_eq!(response["status"], "set");
         assert_eq!(response["event_seq"], 42);
         assert_eq!(response["previous_seq"], 41);
+        assert_eq!(response["act"], 9);
         assert_eq!(response["current_value_unchanged"], true);
         assert_eq!(response["current_value_written_by"], "update_record.facets");
 
@@ -2036,9 +2258,127 @@ mod tests {
             "2026-08-01T00:00:00.000Z",
             7,
             Option::<i64>::None,
+            Some(10),
         );
         assert_eq!(first["status"], "unset");
         assert_eq!(first["previous_seq"], Value::Null);
+        assert_eq!(first["act"], 10);
         assert_eq!(first["current_value_unchanged"], true);
+
+        // A write that allocated no act omits the field entirely: "no act"
+        // and "act unchanged" are different facts.
+        let noop = observation_write_response(
+            "set",
+            "rec-3",
+            "triage",
+            "2026-08-01T00:00:00.000Z",
+            43,
+            42,
+            None,
+        );
+        assert!(noop.get("act").is_none());
+    }
+
+    fn facet_write(key: &str) -> FacetWrite {
+        FacetWrite {
+            key: key.into(),
+            value: Value::String("someone".into()),
+            vocab_ref: None,
+        }
+    }
+
+    #[test]
+    fn exact_manifest_names_classify_as_governed_without_a_hardcoded_list() {
+        // Derived from the core manifest: every exact relationship name
+        // classifies as wrong-carrier, including ones this test never names.
+        let manifest = crate::relationship::core_relationship_type_manifest().unwrap();
+        assert!(!manifest.relationship_types.is_empty());
+        for definition in &manifest.relationship_types {
+            let key = definition.relationship_type.as_str();
+            assert!(
+                matches!(
+                    classify_facet_key(key),
+                    FacetKeyClassification::GovernedRelationship { .. }
+                ),
+                "{key} must classify as a governed relationship"
+            );
+            assert_eq!(
+                governed_relationship_type_for_key(key).as_deref(),
+                Some(key)
+            );
+            let error = assert_open_facet_key("create_record", key)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("manage_relationships.assert"), "{error}");
+        }
+        // Near-misses stay honest open facets: no fuzzy matching.
+        for key in [
+            "assignees",
+            "assigned",
+            "Assigned_to",
+            "ASSIGNED_TO",
+            "blocked_by",
+        ] {
+            assert_eq!(classify_facet_key(key), FacetKeyClassification::Open);
+            assert_open_facet_key("create_record", key).unwrap();
+        }
+    }
+
+    #[test]
+    fn alias_warnings_fire_only_for_admitted_subjects() {
+        // assignee warns on a task, the one admitted subject kind.
+        let warnings =
+            governed_alias_warnings_for_sets(&[facet_write("assignee")], "WorkItem", Some("task"));
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0]["code"], GOVERNED_ALIAS_ISSUE);
+        assert_eq!(warnings[0]["facet_key"], "assignee");
+        assert_eq!(warnings[0]["relationship_type"], "assigned_to");
+        assert_eq!(
+            warnings[0]["suggested_operation"],
+            GOVERNED_RELATIONSHIP_SUGGESTED_OPERATION
+        );
+        assert!(warnings[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("did not establish the relationship"));
+        // Silence on kinds the relationship does not admit, on unrelated
+        // keys, and on epic/task-adjacent non-task kinds.
+        for (record_type, kind) in [
+            ("Document", Some("note")),
+            ("WorkItem", Some("epic")),
+            ("WorkItem", None),
+            ("Entity", Some("person")),
+        ] {
+            assert!(
+                governed_alias_warnings_for_sets(&[facet_write("assignee")], record_type, kind)
+                    .is_empty(),
+                "assignee must stay silent on {record_type}:{kind:?}"
+            );
+        }
+        assert!(governed_alias_warnings_for_sets(
+            &[facet_write("triage")],
+            "WorkItem",
+            Some("task")
+        )
+        .is_empty());
+        // Unsets never warn.
+        assert!(governed_alias_warning("assignee", "WorkItem", Some("task"), true).is_none());
+    }
+
+    #[test]
+    fn receipt_warning_helpers_keep_absent_arrays_absent() {
+        let mut receipt = json!({"id": "rec-1"});
+        push_receipt_warnings(&mut receipt, Vec::new()).unwrap();
+        assert!(receipt.get("warnings").is_none());
+        push_receipt_warnings(
+            &mut receipt,
+            governed_alias_warnings_for_sets(&[facet_write("assignee")], "WorkItem", Some("task")),
+        )
+        .unwrap();
+        assert_eq!(receipt["warnings"].as_array().unwrap().len(), 1);
+        let indexed = index_warning_for_batch(3, "rec-9", receipt["warnings"][0].clone());
+        assert_eq!(indexed["index"], 3);
+        assert_eq!(indexed["id"], "rec-9");
+        assert_eq!(indexed["code"], GOVERNED_ALIAS_ISSUE);
     }
 }

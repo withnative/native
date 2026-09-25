@@ -14,7 +14,7 @@ use crate::error::{Error, Result};
 use super::super::registry::{Caller, ToolRegistry};
 use super::super::ToolKind;
 use super::{
-    parse_args, previous_record_seq_in, require_nonblank_reason, require_record_in,
+    echo_act, parse_args, previous_record_seq_in, require_nonblank_reason, require_record_in,
     REASON_DESCRIPTION,
 };
 
@@ -1103,6 +1103,7 @@ async fn execute_set_many(
     validate_set_many_count(&items)?;
     require_nonblank_reason(TOOL, &reason)?;
     let mut tx = crate::db::begin_write(db.write_pool()).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
     let mut seen = BTreeSet::new();
     let mut planned = Vec::with_capacity(items.len());
     let mut virtual_snapshots = BTreeMap::<String, PolicySnapshot>::new();
@@ -1182,6 +1183,7 @@ async fn execute_set_many(
                     &item.record_id,
                     entries,
                     &reason,
+                    &mut act_alloc,
                 )
                 .await?;
                 changed_count += 1;
@@ -1205,12 +1207,15 @@ async fn execute_set_many(
         outcomes.push(outcome);
     }
     db.commit_authorization(tx).await?;
-    Ok(json!({
+    echo_act(
+        json!({
         "ok":true,
         "item_count":outcomes.len(),
         "changed_count":changed_count,
         "outcomes":outcomes,
-    }))
+        }),
+        act_alloc.get(),
+    )
 }
 
 async fn execute_policy_mutation(
@@ -1286,6 +1291,7 @@ async fn execute_policy_mutation(
 
     require_nonblank_reason(TOOL, &reason)?;
     let mut tx = crate::db::begin_write(db.write_pool()).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
     mutation_policy_access(&mut tx, caller, &record_id).await?;
     let content_seq = previous_record_seq_in(&mut tx, &record_id).await?;
     assert_content_seq(&record_id, content_seq, expected_content_seq)?;
@@ -1331,6 +1337,7 @@ async fn execute_policy_mutation(
                 &record_id,
                 entries,
                 &reason,
+                &mut act_alloc,
             )
             .await?,
             boundary_created,
@@ -1344,6 +1351,7 @@ async fn execute_policy_mutation(
                 caller.actor(),
                 &record_id,
                 &reason,
+                &mut act_alloc,
             )
             .await?;
             let restored = policy_snapshot(&mut tx, &record_id).await?;
@@ -1361,7 +1369,7 @@ async fn execute_policy_mutation(
     };
     let result = mutation_result(&mut tx, &record_id, before, boundary_created, event).await?;
     db.commit_authorization(tx).await?;
-    Ok(result)
+    echo_act(result, act_alloc.get())
 }
 
 async fn manage_record_policy(db: Db, caller: Caller, arguments: Value) -> Result<Value> {

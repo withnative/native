@@ -477,6 +477,58 @@ async fn query_record_redacts_an_invisible_successor_but_counts_it() {
 }
 
 #[tokio::test]
+async fn search_redacts_an_invisible_successor_but_counts_it() {
+    let db = db().await;
+    let registry = registry();
+    let old = create(
+        &registry,
+        &db,
+        json!({ "type": "Document", "kind": "note", "name": "Bea searchable charter" }),
+    )
+    .await;
+    let hidden = create(
+        &registry,
+        &db,
+        json!({ "type": "Document", "kind": "note", "name": "Bea sealed revision" }),
+    )
+    .await;
+    link_supersedes(&registry, &db, &hidden, &old).await;
+    replace_explicit_policy(
+        &db,
+        "test:policy",
+        &hidden,
+        vec![AllowEntry::account("acct:alice", Capability::View)],
+    )
+    .await
+    .unwrap();
+
+    // Same counted-not-named rule as the bulk query path: the caller gets the
+    // degraded form — total_count with no nameable items — never a leak and
+    // never an error.
+    let payload = call_as(
+        &registry,
+        &db,
+        bea(),
+        "search",
+        json!({ "query": "Bea searchable charter" }),
+    )
+    .await;
+    let hit = payload["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|hit| hit["id"] == json!(old))
+        .expect("superseded record among hits")
+        .clone();
+    assert_eq!(hit["superseded_by"]["total_count"], 1);
+    assert_eq!(hit["superseded_by"]["items"], json!([]), "{hit:#}");
+
+    let text = render::render("search", &payload).unwrap();
+    assert!(!text.contains("Bea sealed revision"), "{text}");
+    assert!(!text.contains(&hidden), "{text}");
+}
+
+#[tokio::test]
 async fn invisible_head_does_not_hide_a_nameable_tail() {
     let db = db().await;
     let registry = registry();
@@ -630,4 +682,154 @@ async fn bootstrap_keeps_a_budget_capped_item_and_degrades_its_annotation() {
 
     let text = render::render("bootstrap", &payload).unwrap();
     assert!(text.contains("superseded by 3 records"), "{text}");
+}
+
+/// The batch loader resolves the whole page in one statement
+/// (`load_superseded_by_batch`: one `SELECT … IN (SELECT value FROM
+/// json_each(?))`, grouped in Rust), so every superseded row on a full page
+/// must come back annotated with its own successor — no row left behind, no
+/// row borrowing another's.
+#[tokio::test]
+async fn query_record_annotates_every_superseded_row_on_a_full_page() {
+    let db = db().await;
+    let registry = registry();
+    const PAIRS: usize = 12;
+    let mut expected = std::collections::HashMap::new();
+    for index in 0..PAIRS {
+        let successor_name = format!("Batch charter v2 #{index}");
+        let old = create(
+            &registry,
+            &db,
+            json!({ "type": "Document", "kind": "note", "name": format!("Batch charter v1 #{index}") }),
+        )
+        .await;
+        let new = create(
+            &registry,
+            &db,
+            json!({ "type": "Document", "kind": "note", "name": successor_name }),
+        )
+        .await;
+        link_supersedes(&registry, &db, &new, &old).await;
+        expected.insert(old, (new, successor_name));
+    }
+
+    let payload = call(
+        &registry,
+        &db,
+        "query_record",
+        json!({ "steps": [{ "step": "filter", "types": ["Document"] }], "limit": 500 }),
+    )
+    .await;
+    let rows = payload["records"].as_array().unwrap();
+    assert_eq!(rows.len(), PAIRS * 2);
+    for (old, (new, successor_name)) in &expected {
+        let row = rows
+            .iter()
+            .find(|row| row["id"] == json!(old))
+            .expect("superseded record in results")
+            .clone();
+        assert_eq!(row["superseded_by"]["total_count"], 1, "{row:#}");
+        assert_eq!(row["superseded_by"]["items"][0]["id"], json!(new));
+        assert_eq!(
+            row["superseded_by"]["items"][0]["name"],
+            json!(successor_name)
+        );
+    }
+}
+
+/// Payload cost of the default-on disclosure, measured — not assumed — on
+/// a large page: 100 superseded pairs, queried and searched. With no
+/// opt-out flag, the baseline is the same payload with the annotation
+/// keys stripped in-test, so the difference is exactly the disclosure
+/// bytes. The bound below is deliberately loose (half a kilobyte per
+/// annotated row); its job is to catch a regression that embeds bodies or
+/// unbounded history, not to pin exact bytes.
+#[tokio::test]
+async fn superseded_annotation_payload_overhead_is_bounded_on_a_large_page() {
+    let db = db().await;
+    let registry = registry();
+    const PAIRS: usize = 100;
+    for index in 0..PAIRS {
+        let old = create(
+            &registry,
+            &db,
+            json!({ "type": "Document", "kind": "note", "name": format!("Payload charter v1 #{index}") }),
+        )
+        .await;
+        let new = create(
+            &registry,
+            &db,
+            json!({ "type": "Document", "kind": "note", "name": format!("Payload charter v2 #{index}") }),
+        )
+        .await;
+        link_supersedes(&registry, &db, &new, &old).await;
+    }
+
+    fn strip_superseded_by(records: &mut [Value]) {
+        for record in records {
+            if let Some(object) = record.as_object_mut() {
+                object.remove("superseded_by");
+            }
+        }
+    }
+
+    let annotated = call(
+        &registry,
+        &db,
+        "query_record",
+        json!({ "steps": [{ "step": "filter", "types": ["Document"] }], "limit": 500 }),
+    )
+    .await;
+    let annotated_count = annotated["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row.get("superseded_by").is_some())
+        .count();
+    assert_eq!(annotated_count, PAIRS);
+    let mut bare = annotated.clone();
+    strip_superseded_by(
+        bare["records"]
+            .as_array_mut()
+            .expect("records are an array"),
+    );
+    let annotated_len = serde_json::to_string(&annotated).unwrap().len();
+    let bare_len = serde_json::to_string(&bare).unwrap().len();
+    let per_row = (annotated_len - bare_len) as f64 / PAIRS as f64;
+    eprintln!("query_record page: {PAIRS} annotated rows, stripped={bare_len}B annotated={annotated_len}B overhead={per_row:.1}B/row");
+    assert!(annotated_len > bare_len);
+    assert!(
+        per_row <= 512.0,
+        "per-row disclosure overhead blew past 512B: {per_row:.1}B"
+    );
+
+    let searched = call(
+        &registry,
+        &db,
+        "search",
+        json!({ "query": "Payload charter", "limit": 200 }),
+    )
+    .await;
+    let searched_count = searched["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|hit| hit.get("superseded_by").is_some())
+        .count();
+    assert_eq!(searched_count, PAIRS, "{searched:#}");
+    let mut bare_search = searched.clone();
+    strip_superseded_by(
+        bare_search["hits"]
+            .as_array_mut()
+            .expect("hits are an array"),
+    );
+    let searched_len = serde_json::to_string(&searched).unwrap().len();
+    let bare_search_len = serde_json::to_string(&bare_search).unwrap().len();
+    let search_per_row = (searched_len - bare_search_len) as f64 / PAIRS as f64;
+    eprintln!("search page: {PAIRS} annotated hits, stripped={bare_search_len}B annotated={searched_len}B overhead={search_per_row:.1}B/hit");
+    assert!(searched_len > bare_search_len);
+    assert!(
+        search_per_row <= 512.0,
+        "per-hit disclosure overhead blew past 512B: {search_per_row:.1}B"
+    );
 }

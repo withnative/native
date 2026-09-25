@@ -431,6 +431,7 @@ async fn bind_account(db: &Db, person: &str, account: &str) {
             run_key: None,
             parent_key: None,
             intent: None,
+            is_member: true,
             internal: true,
             source_read_authorized: false,
         },
@@ -544,6 +545,7 @@ async fn relationship_actions_are_atomic_idempotent_and_explainable() {
             run_key: None,
             parent_key: None,
             intent: None,
+            is_member: true,
             internal: true,
             source_read_authorized: false,
         },
@@ -597,6 +599,13 @@ async fn relationship_actions_are_atomic_idempotent_and_explainable() {
     )
     .await
     .unwrap();
+    // de24703: the first write returns the act it allocated, and a keyed
+    // replay returns that same act, so the two receipts are byte-identical
+    // and the caller cannot tell which call did the work.
+    assert!(
+        first["act"].is_i64(),
+        "first assert must return its act: {first}"
+    );
     assert_eq!(retry, first, "retry receipt must be byte-identical JSON");
     let conflict = call(
         &registry,

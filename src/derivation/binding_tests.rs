@@ -18,7 +18,10 @@ const BETA_NOTE_ID: &str = "b17d0000-0000-4000-8000-000000000012";
 
 async fn append(db: &Db, input: NewDerivationEvent) -> DerivationEventRow {
     let mut tx = begin_write(db.write_pool()).await.unwrap();
-    let event = append_derivation_event_in(&mut tx, input).await.unwrap();
+    let mut act_alloc = crate::act::ActAllocation::new();
+    let event = append_derivation_event_in(&mut tx, input, &mut act_alloc)
+        .await
+        .unwrap();
     tx.commit().await.unwrap();
     event
 }

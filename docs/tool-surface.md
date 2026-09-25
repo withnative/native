@@ -61,6 +61,11 @@ generated inventory to locate the operation.
 
 ## Work coordination
 
+The [inspectable authoring and reuse workflow](inspectable-authoring.md) joins
+revision-bound source declarations with direct concerns and treatment history.
+Its save and reuse-context operations preserve the distinction between source
+use and semantic correctness.
+
 `start_work` claims a record (`claim`, the default), inspects without writing
 (`preview`), or hands a claim back (`release`). Arguments: `record_id`
 (required); `action` (`claim` | `preview` | `release`); `agent_id`
@@ -78,8 +83,9 @@ refused with `claimed by another caller` and learns nothing. Claims never
 expire and are never auto-released.
 
 Visibility: a caller under the same account sees `work_state` as `visible`
-with the holder's `run_state` (`open` | `closed` | `missing` |
-`not_applicable`) and `holder_tier` (`this_run` | `another_run_of_this_agent`
+with the holder's `run_state` (`open` | `closed` | `silent` | `missing` |
+`not_applicable`; `silent` means observable but quiet past the horizon) and
+`holder_tier` (`this_run` | `another_run_of_this_agent`
 | `another_agent_of_yours`), plus the top-level `held_by*` fields. Any other
 principal sees `withheld` exactly as before.
 

@@ -9,6 +9,7 @@ license = "AGPL-3.0-only"
 publish = false
 
 [dependencies]
+native-artifact-runtime = { path = "../artifact-runtime" }
 # The HTML parser/DOM pair is deliberately pinned: sanitizer semantics are a
 # security contract, and a parser upgrade changes what survives
 # sanitization. These two dependencies are exclusive to this crate — they
@@ -33,6 +34,16 @@ reqwest = { version = "0.12", default-features = false, features = [
 ] }
 serde = { version = "=1.0.228", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order", "raw_value", "unbounded_depth"] }
+# Write-path script diagnostics (tier 1: undefined identifiers and manifest
+# checks as warnings). The parser and scope analysis are the exact pins the
+# artifact runtime already compiles (`swc_ecma_parser =15.0.2`); the resolver
+# is the `swc_ecma_transforms_base 16.0.0` already in Cargo.lock via mdxjs,
+# added here as a direct dependency at that same version. No second JS parser.
+swc_common = "=12.0.1"
+swc_ecma_ast = "=12.0.0"
+swc_ecma_parser = "=15.0.2"
+swc_ecma_transforms_base = "=16.0.0"
+swc_ecma_visit = "=12.0.0"
 sha2 = "0.10"
 url = "2"
 

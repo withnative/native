@@ -87,10 +87,20 @@ pub enum Assurance {
     EngineAttested,
     /// The server observed this about its own transport.
     ServerObserved,
+    /// The client software named itself (e.g. MCP `clientInfo`). The server
+    /// cannot verify the claim, so this is strictly weaker than
+    /// [`Assurance::ServerObserved`] and is explicitly NOT an attestation.
+    /// No consumer may gate behaviour on it.
+    ClientAsserted,
     /// Useful for grouping related calls; establishes no persistent identity.
     CorrelationOnly,
     /// Not established, or not disclosable to this viewer. One token for both.
     UnknownOrWithheld,
+    /// The model named itself (a declared model string). Weaker still than
+    /// [`Assurance::ClientAsserted`] — a self-description two removes from
+    /// anything the server observed — and the weakest rung in this enum.
+    /// Explicitly NOT an attestation. No consumer may gate behaviour on it.
+    SelfDeclared,
 }
 
 /// A hedged rendering hint. Never an attestation, never `executor.kind`.
@@ -144,6 +154,27 @@ pub struct ChannelFacts {
     pub display_inference: Option<DisplayInference>,
 }
 
+/// The client software that admitted this run, as the client named itself.
+///
+/// Self-asserted, never verified: an MCP `clientInfo` is whatever the client
+/// chose to send, so this is strictly weaker than anything the server observed
+/// and is explicitly NOT an attestation. The assurance rung travels with the
+/// value rather than sitting elsewhere in the envelope, so a reader can never
+/// receive the claim without its provenance.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReportedClient {
+    /// The client's self-chosen name. Always present when this object exists:
+    /// a version with no name is not a report this projection will carry.
+    pub name: String,
+    /// The client's self-chosen version. Absent when it sent a name only,
+    /// which stays distinguishable from having sent no version field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// Always [`Assurance::ClientAsserted`]; a stable rung on a value that
+    /// rides `run` next to a correlation-only handle.
+    pub assurance: Assurance,
+}
+
 /// Exact-run correlation. Two runs sharing `agent_key` are still two runs.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunCorrelation {
@@ -154,6 +185,13 @@ pub struct RunCorrelation {
     /// into one thread persona.
     pub agent_key: String,
     pub assurance: Assurance,
+    /// Run-level, self-asserted: the client software that admitted the run,
+    /// stamped once at run start. Present only when the run is disclosable to
+    /// this viewer AND the admitting call carried `clientInfo`; absent, never
+    /// an empty object, when there is nothing to report. This is not a
+    /// per-act fact and must never be repeated per act.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reported_mcp_client: Option<ReportedClient>,
 }
 
 /// The event that produced the body currently being read.
@@ -266,6 +304,84 @@ pub struct RawEventFact {
 pub struct RawContribution {
     pub current: RawEventFact,
     pub creation: Option<RawEventFact>,
+    /// Run-level self-asserted client, for the CURRENT run only. Gathered by
+    /// [`contribution_for_record_in`] through a request-scoped cache so a page
+    /// with many acts issues one `agent_runs` lookup per run, not one per act.
+    /// `None` covers both "the admitting call carried no `clientInfo`" and
+    /// "this viewer may not see the run".
+    pub reported_client: Option<ReportedClient>,
+}
+
+/// Per-request memo of admitted runs' self-asserted client identity.
+///
+/// The lookup is keyed by run key, not by act. A run page resolves many records
+/// through one request, and each record's contribution names the same run, so
+/// without this the `agent_runs` read runs once per act. The memo is built per
+/// request by its caller and threaded down; it is never shared across requests.
+#[derive(Debug, Default)]
+pub struct ReportedIdentityCache {
+    cached: std::collections::HashMap<String, Option<ReportedClient>>,
+    reads: usize,
+}
+
+impl ReportedIdentityCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Distinct `agent_runs` reads this request has issued. Exposed so a test
+    /// can prove the many-act path issues one lookup, not one per act.
+    pub fn reads(&self) -> usize {
+        self.reads
+    }
+
+    /// The reported client for `run_key`, from the memo when present.
+    async fn client_for(
+        &mut self,
+        tx: &mut Transaction<'_, Sqlite>,
+        run_key: &str,
+    ) -> Result<Option<ReportedClient>> {
+        if let Some(hit) = self.cached.get(run_key) {
+            return Ok(hit.clone());
+        }
+        let value = reported_client_for_run_in(tx, run_key).await?;
+        self.reads += 1;
+        self.cached.insert(run_key.to_string(), value.clone());
+        Ok(value)
+    }
+}
+
+/// The client claim for one run, read on the caller's open transaction.
+///
+/// The un-memoized primitive; callers hydrating many acts should go through
+/// [`ReportedIdentityCache`] instead so the read happens once per run.
+pub(crate) async fn reported_client_for_run_in(
+    tx: &mut Transaction<'_, Sqlite>,
+    run_key: &str,
+) -> Result<Option<ReportedClient>> {
+    Ok(
+        crate::control::read_agent_run_reported_identity_in(tx, run_key)
+            .await?
+            .and_then(reported_client_facts),
+    )
+}
+
+/// Project an admitted run's self-asserted identity down to the client claim.
+///
+/// The model claim is deliberately not projected here: it has no writer yet,
+/// and surfacing an always-absent field would teach readers to ignore it. When
+/// a writer lands, `reported_model` joins `RunCorrelation` as a sibling
+/// carrying [`Assurance::SelfDeclared`], and the cache value widens from
+/// [`ReportedClient`] to carry both claims — a small, clean addition, not a
+/// rewrite of the lookup.
+pub(crate) fn reported_client_facts(
+    identity: crate::control::ReportedRunIdentity,
+) -> Option<ReportedClient> {
+    identity.client_name.map(|name| ReportedClient {
+        name,
+        version: identity.client_version,
+        assurance: Assurance::ClientAsserted,
+    })
 }
 
 /// What this viewer is permitted to learn. Computed once, applied by
@@ -337,7 +453,14 @@ pub fn project(
         .run_key
         .as_deref()
         .filter(|_| disclosure.current_run_visible)
-        .map(run_correlation);
+        .map(|run_key| {
+            let mut correlation = run_correlation(run_key);
+            // The client claim is a property of the run, so it rides the run's
+            // own disclosure. A withheld run discloses no client either — and
+            // an absent run discloses nothing to redact.
+            correlation.reported_mcp_client = raw.reported_client.clone();
+            correlation
+        });
 
     let creation_run = raw
         .creation
@@ -428,6 +551,7 @@ fn run_correlation(run_key: &str) -> RunCorrelation {
         run_key: run_key.to_string(),
         agent_key: crate::runkey::agent_key_of(run_key).to_string(),
         assurance: Assurance::CorrelationOnly,
+        reported_mcp_client: None,
     }
 }
 
@@ -494,7 +618,14 @@ pub async fn raw_contribution_in(
         Some(row) => Some(event_fact_in(tx, &row).await?),
         None => None,
     };
-    Ok(Some(RawContribution { current, creation }))
+    Ok(Some(RawContribution {
+        current,
+        creation,
+        // Run-level and cache-dependent, so it is filled in by
+        // [`contribution_for_record_in`] once disclosure has decided whether
+        // the run is this viewer's to see.
+        reported_client: None,
+    }))
 }
 
 async fn event_fact_in(
@@ -766,15 +897,28 @@ pub async fn selection_context_in(
 }
 
 /// End-to-end: gather, disclose, and project one record's contribution.
+///
+/// `cache` is the request's shared per-run memo: a caller hydrating many acts
+/// passes one instance so the `agent_runs` read happens once per distinct run,
+/// not once per act. A one-off caller may pass a fresh
+/// [`ReportedIdentityCache::new`].
 pub async fn contribution_for_record_in(
     tx: &mut Transaction<'_, Sqlite>,
     caller: &Caller,
     record_id: &str,
+    cache: &mut ReportedIdentityCache,
 ) -> Result<Option<ContributionProvenance>> {
-    let Some(raw) = raw_contribution_in(tx, record_id).await? else {
+    let Some(mut raw) = raw_contribution_in(tx, record_id).await? else {
         return Ok(None);
     };
     let disclosure = viewer_disclosure_in(tx, caller, &raw).await?;
+    // Only look the run up when the viewer may see it at all: a withheld run
+    // must not cost a read, and its client claim is not this viewer's to learn.
+    if disclosure.current_run_visible {
+        if let Some(run_key) = raw.current.run_key.as_deref() {
+            raw.reported_client = cache.client_for(tx, run_key).await?;
+        }
+    }
     let alternative_set = alternative_set_context_in(tx, caller, record_id).await?;
     let selection = selection_context_in(tx, caller, record_id).await?;
     let context = ContributionContext {
@@ -829,6 +973,7 @@ mod tests {
                 Channel::Mcp,
             ),
             creation: None,
+            reported_client: None,
         };
         let projected = project(&raw, &visible(), ContributionContext::default());
         assert_eq!(
@@ -857,6 +1002,7 @@ mod tests {
                 Channel::Web,
             ),
             creation: None,
+            reported_client: None,
         };
         let projected = project(&raw, &visible(), ContributionContext::default());
         assert_eq!(projected.channel.kind, "web");
@@ -868,6 +1014,7 @@ mod tests {
         let raw = RawContribution {
             current: event("e1", None, "delegated_service", Channel::Webhook),
             creation: None,
+            reported_client: None,
         };
         let projected = project(&raw, &visible(), ContributionContext::default());
         assert_eq!(
@@ -890,6 +1037,7 @@ mod tests {
         let raw = RawContribution {
             current: event("e1", None, "human", Channel::Web),
             creation: None,
+            reported_client: None,
         };
         let projected = project(&raw, &visible(), ContributionContext::default());
         assert_eq!(projected.executor.kind.as_deref(), Some("human"));
@@ -909,6 +1057,7 @@ mod tests {
                 "agent",
                 Channel::Mcp,
             )),
+            reported_client: None,
         };
         let hidden = ViewerDisclosure {
             principal: None,
@@ -941,6 +1090,7 @@ mod tests {
                 Channel::Mcp,
             ),
             creation: None,
+            reported_client: None,
         };
         let hidden = ViewerDisclosure::default();
         let projected = project(&raw, &hidden, ContributionContext::default());
@@ -957,6 +1107,7 @@ mod tests {
                 "agent",
                 Channel::Mcp,
             )),
+            reported_client: None,
         };
         let projected = project(&raw, &visible(), ContributionContext::default());
         assert_eq!(projected.created_by.same_run, Some(false));
@@ -990,6 +1141,7 @@ mod tests {
                 attestation: None,
             },
             creation: None,
+            reported_client: None,
         };
         let projected = project(
             &raw,
@@ -1008,6 +1160,7 @@ mod tests {
         let raw = RawContribution {
             current: event("e1", Some("plover-archery-kt0gyr"), "agent", Channel::Mcp),
             creation: None,
+            reported_client: None,
         };
         let context = ContributionContext {
             mode: Some("option".into()),
@@ -1040,9 +1193,155 @@ mod tests {
                 "agent",
                 Channel::Mcp,
             )),
+            reported_client: None,
         };
         let projected = project(&raw, &visible(), ContributionContext::default());
         assert_eq!(projected.created_by.same_run, Some(true));
         assert_eq!(projected.created_by.event_id.as_deref(), Some("e1"));
+    }
+
+    fn reported() -> ReportedClient {
+        ReportedClient {
+            name: "hazel".into(),
+            version: Some("2.1.0".into()),
+            assurance: Assurance::ClientAsserted,
+        }
+    }
+
+    #[test]
+    fn the_client_claim_rides_the_run_with_its_own_assurance_rung() {
+        let raw = RawContribution {
+            current: event("e1", Some("plover-archery-kt0gyr"), "agent", Channel::Mcp),
+            creation: None,
+            reported_client: Some(reported()),
+        };
+        let projected = project(&raw, &visible(), ContributionContext::default());
+        let run = projected.run.expect("the run is disclosable");
+        assert_eq!(
+            run.assurance,
+            Assurance::CorrelationOnly,
+            "the run handle stays correlation-only; the client claim is its own rung"
+        );
+        let client = run.reported_mcp_client.expect("the client is reported");
+        assert_eq!(client.name, "hazel");
+        assert_eq!(client.version.as_deref(), Some("2.1.0"));
+        assert_eq!(
+            client.assurance,
+            Assurance::ClientAsserted,
+            "a client naming itself is never an attestation"
+        );
+    }
+
+    #[test]
+    fn a_withheld_run_withholds_the_client_claim_too() {
+        let raw = RawContribution {
+            current: event("e1", Some("plover-archery-kt0gyr"), "agent", Channel::Mcp),
+            creation: None,
+            // Gathered, but the viewer may not see the run. It must not leak
+            // through some other field: the client rides the run's disclosure.
+            reported_client: Some(reported()),
+        };
+        let hidden = ViewerDisclosure::default();
+        let projected = project(&raw, &hidden, ContributionContext::default());
+        assert!(
+            projected.run.is_none(),
+            "an undisclosable run carries no client claim either"
+        );
+    }
+
+    #[test]
+    fn versionless_client_stays_distinguishable_from_no_report() {
+        let raw = RawContribution {
+            current: event("e1", Some("plover-archery-kt0gyr"), "agent", Channel::Mcp),
+            creation: None,
+            reported_client: Some(ReportedClient {
+                name: "hazel".into(),
+                version: None,
+                assurance: Assurance::ClientAsserted,
+            }),
+        };
+        let projected = project(&raw, &visible(), ContributionContext::default());
+        let client = projected
+            .run
+            .and_then(|run| run.reported_mcp_client)
+            .expect("a name-only report is still a report");
+        assert_eq!(client.name, "hazel");
+        assert_eq!(client.version, None);
+    }
+
+    /// The memo is keyed by run, not by act: two contributions naming the same
+    /// run read `agent_runs` once, and a third naming a different run reads
+    /// once more. This is the property a many-act page depends on.
+    #[tokio::test]
+    async fn reported_identity_cache_reads_agent_runs_once_per_run() {
+        let db = crate::db::create_database(":memory:").await.unwrap();
+        let admit = |run_key: &'static str, name: &'static str| {
+            let db = db.clone();
+            async move {
+                crate::control::ensure_agent_run(
+                    &db,
+                    run_key,
+                    "acct:alice",
+                    crate::control::ReportedRunIdentity {
+                        client_name: Some(name.into()),
+                        client_version: Some("2.1.0".into()),
+                        model: None,
+                    },
+                )
+                .await
+                .unwrap();
+            }
+        };
+        admit("scout-chair-a748b2", "hazel").await;
+        admit("scout-chair-b748b2", "otter").await;
+
+        let mut cache = ReportedIdentityCache::new();
+        let mut tx = db.write_pool().begin().await.unwrap();
+        for _ in 0..3 {
+            let client = cache
+                .client_for(&mut tx, "scout-chair-a748b2")
+                .await
+                .unwrap()
+                .expect("hazel is reported");
+            assert_eq!(client.name, "hazel");
+        }
+        let other = cache
+            .client_for(&mut tx, "scout-chair-b748b2")
+            .await
+            .unwrap()
+            .expect("otter is reported");
+        assert_eq!(other.name, "otter");
+        assert_eq!(
+            cache.reads(),
+            2,
+            "three reads of one run and one of another must issue two lookups"
+        );
+        tx.rollback().await.unwrap();
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_run_admitted_without_client_info_reports_no_client() {
+        let db = crate::db::create_database(":memory:").await.unwrap();
+        crate::control::ensure_agent_run(
+            &db,
+            "scout-chair-a748b2",
+            "acct:alice",
+            crate::control::ReportedRunIdentity::default(),
+        )
+        .await
+        .unwrap();
+        let mut cache = ReportedIdentityCache::new();
+        let mut tx = db.write_pool().begin().await.unwrap();
+        assert!(
+            cache
+                .client_for(&mut tx, "scout-chair-a748b2")
+                .await
+                .unwrap()
+                .is_none(),
+            "nothing was asserted, so nothing is reported — not an empty object"
+        );
+        tx.rollback().await.unwrap();
+        db.close().await;
     }
 }
