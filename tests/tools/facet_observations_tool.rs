@@ -578,7 +578,13 @@ async fn supported_shape_and_vocabulary_guards_apply_in_observation_transaction(
     .unwrap();
     assert!(stored_ref.starts_with("rec:"), "{stored_ref}");
 
-    for key in ["lifecycle", "archived", "blob_ref", "canvas.promoted_from"] {
+    for key in [
+        "lifecycle",
+        "archived",
+        "blob_ref",
+        "canvas.promoted_from",
+        "retraction",
+    ] {
         let err = call_err(
             &registry,
             &db,

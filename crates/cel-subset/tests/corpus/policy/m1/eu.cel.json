@@ -1,0 +1,53 @@
+{
+  "namespace": "deal-desk",
+  "name": "eu",
+  "args": ["request_id"],
+  "inputs": [
+    {
+      "name": "request",
+      "cardinality": "one",
+      "sql": "SELECT r.id AS id, CASE WHEN COALESCE((SELECT value FROM facet_values WHERE record_id = r.id AND key = 'needs_eu_exception'), 'false') = 'true' THEN 1 ELSE 0 END AS needs_exception FROM records r WHERE r.id = ?1",
+      "params": ["request_id"],
+      "bools": ["needs_exception"]
+    },
+    {
+      "name": "cap",
+      "cardinality": "one",
+      "required_when": "request.needs_exception == true",
+      "unknown": "capability",
+      "sql": "SELECT r.id AS id, (SELECT value FROM facet_values WHERE record_id = r.id AND key = 'status') AS status, (SELECT value FROM facet_values WHERE record_id = r.id AND key = 'region') AS region FROM records r WHERE r.id = 'cap-eu'",
+      "params": []
+    }
+  ],
+  "clauses": [
+    {"id": "not_applicable", "when": "request.needs_exception == false", "result": "{\"decision\": \"allow\", \"role\": \"\", \"used\": [request.id]}"},
+    {"id": "eu_ok", "when": "cap.status == \"GA\" && cap.region == \"EU\"", "result": "{\"decision\": \"allow\", \"role\": \"\", \"used\": [request.id, cap.id]}"},
+    {"id": "eu_legal", "when": "true", "result": "{\"decision\": \"needs_approval\", \"role\": \"legal\", \"used\": [request.id, cap.id]}"}
+  ],
+  "examples": [
+    {
+      "name": "no exception needed",
+      "inputs": {"request": {"id": "r0", "needs_exception": false}, "cap": null},
+      "args": {"request_id": "r0"},
+      "expect": {"decision": "allow", "clause": "not_applicable", "used": ["r0"]}
+    },
+    {
+      "name": "ga eu capability",
+      "inputs": {"request": {"id": "r1", "needs_exception": true}, "cap": {"id": "cap-eu", "status": "GA", "region": "EU"}},
+      "args": {"request_id": "r1"},
+      "expect": {"decision": "allow", "clause": "eu_ok", "used": ["r1", "cap-eu"]}
+    },
+    {
+      "name": "beta needs legal",
+      "inputs": {"request": {"id": "r2", "needs_exception": true}, "cap": {"id": "cap-eu", "status": "Beta", "region": "EU"}},
+      "args": {"request_id": "r2"},
+      "expect": {"decision": "needs_approval", "clause": "eu_legal", "used": ["r2", "cap-eu"]}
+    },
+    {
+      "name": "missing capability is unknown",
+      "inputs": {"request": {"id": "r3", "needs_exception": true}, "cap": null},
+      "args": {"request_id": "r3"},
+      "expect": {"decision": "unknown", "clause": "unknown(capability)", "used": []}
+    }
+  ]
+}

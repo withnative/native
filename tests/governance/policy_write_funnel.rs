@@ -25,6 +25,34 @@ fn normalized(text: &str) -> String {
 
 fn without_query_sql_test_fixture_writes(relative: &Path, source: &str) -> String {
     let normalized_source = normalized(source);
+    if relative == Path::new("src/meta/workspace_rule_installation/tests.rs") {
+        // This separate module is admitted only under cfg(test). Its two exact
+        // deletes construct the content-free replay fixture; every other new
+        // policy mutation must still fail this guard.
+        let parent = normalized(
+            &fs::read_to_string(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("src/meta/workspace_rule_installation.rs"),
+            )
+            .unwrap(),
+        );
+        assert_eq!(parent.matches("mod tests;").count(), 1);
+        assert_eq!(parent.matches("#[cfg(test)] mod tests;").count(), 1);
+        let mut tests = normalized_source;
+        for fixture in [
+            "sqlx::query(\"DELETE FROM policy_entries\")",
+            "sqlx::query(\"DELETE FROM record_policies\")",
+        ] {
+            let fixture = normalized(fixture);
+            assert_eq!(
+                tests.matches(&fixture).count(),
+                1,
+                "workspace-rule replay must retain exactly this test-only fixture write"
+            );
+            tests = tests.replacen(&fixture, "", 1);
+        }
+        return tests;
+    }
     if relative != Path::new("src/turso_local.rs") {
         return normalized_source;
     }
@@ -34,6 +62,9 @@ fn without_query_sql_test_fixture_writes(relative: &Path, source: &str) -> Strin
     // ids inline: the record-id rule admits only canonical UUIDs, and the
     // fixture must reference the same records it creates. The expected text is
     // therefore the format template, which keeps this guard exact.
+    // The lifecycle two-principal fixture likewise seeds one hidden bearer
+    // and one shared task solely inside the test module. Its two exact writes
+    // are stripped here, so a new runtime policy write still fails the guard.
     // The conformance corpus seeds (`CONFORMANCE_TURSO_POLICY_SEED`) name
     // their `conf:` ids inline: Turso has no test-accessible policy write
     // path, so the SQLite runner's `replace_explicit_policy` grants are
@@ -71,6 +102,19 @@ fn without_query_sql_test_fixture_writes(relative: &Path, source: &str) -> Strin
              ('{PRIVATE_ALICE}','account','account:alice','allow','view'), \
              ('{PRIVATE_BOB}','account','account:bob','allow','view');",
         ),
+        (
+            "lifecycle two-principal record policy seed",
+            "INSERT INTO record_policies(record_id,created_at) VALUES \
+             ('{BEARER}','2026-01-01T00:00:00.000Z'), \
+             ('{TASK}','2026-01-01T00:00:00.000Z');",
+        ),
+        (
+            "lifecycle two-principal policy entry seed",
+            "INSERT INTO policy_entries(policy_anchor_id,subject_kind,subject_id,effect,capability) VALUES \
+             ('{BEARER}','account','account:owner','allow','view'), \
+             ('{TASK}','account','account:owner','allow','view'), \
+             ('{TASK}','account','account:viewer','allow','view');",
+        ),
     ];
     for (site, fixture) in fixtures {
         let fixture = normalized(fixture);
@@ -104,6 +148,9 @@ fn policy_projection_writes_are_confined_to_the_projector_and_explicit_exception
         // Narrow corruption fixtures embedded in module tests.
         ("src/authorization.rs", 1),
         ("src/query/sql.rs", 1),
+        // Grant revision regression fixture: an explicit policy insert and
+        // entry insert/delete distinguish user edits from cascade cleanup.
+        ("src/db.rs", 3),
         // The whats_changed before/after benchmark has one reusable viewable
         // policy fixture and one deliberately hidden malformed-row fixture;
         // each inserts one anchor and one entry. The exact four statement

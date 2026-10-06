@@ -1,0 +1,143 @@
+{
+  "schema": "native.alpha-tab-kit.limits.v1",
+  "note": "Every value the kit enforces. Leaves carry `rust` (a symbol the drift test reads directly), `rust_behaviour` (a literal the drift test probes at its boundary), `bootstrap_literal` (text inside the vendored bridge, whose digest the drift test checks), or `js_literal` (text in the demo shell, checked by the kit's own tests when run inside native-ce). Line numbers are as of the commit that last changed this file; symbols are the durable anchor. Guarded by src/mcp/tools/alpha_tab_kit_drift.rs.",
+  "digest": {
+    "version": { "value": "alpha-tab-digest.v1", "rust": "ALPHA_TAB_DIGEST_VERSION", "source": "src/mcp/tools/alpha_tabs.rs:73" }
+  },
+  "proposed_body_set": {
+    "effect": "records.body-set.v1",
+    "max_body_bytes": 524288,
+    "status": "provisional-raw-utf8-bound",
+    "source": "https://n8v.to/1127073 (rec:50127), accepted pure S2 contour https://n8v.to/ecf20fb",
+    "engine_mirror": "BODY_SET_MAX_BODY_BYTES; src/mcp/tools/alpha_tab_kit_drift.rs asserts exact parity",
+    "encoded_budget_status": "dedicated Body envelope 6 * raw cap + 64 KiB; engine encoded values and replay payloads 4 MiB; rollout and host compatibility require qualification",
+    "activation_requirements": "exact release qualification, reviewed declaration adoption, complete-source readback and mandatory Restorable Undo; a kit upgrade alone does not change installed host or app limits"
+  },
+  "install": {
+    "runtime": { "value": "native.html.v1", "rust": "native_artifact_html::html::RUNTIME_ID", "source": "crates/artifact-html/src/html.rs:38" },
+    "package_max_bytes": { "value": 128, "rust_behaviour": "require_package", "source": "src/mcp/tools/alpha_tabs.rs:1716" },
+    "package_label_max_bytes": { "value": 32, "rust_behaviour": "require_package", "source": "src/mcp/tools/alpha_tabs.rs:1725" },
+    "version_max_bytes": { "value": 32, "rust_behaviour": "require_version", "source": "src/mcp/tools/alpha_tabs.rs:1743" },
+    "version_part_max_digits": { "value": 8, "rust_behaviour": "require_version", "source": "src/mcp/tools/alpha_tabs.rs:1746" },
+    "reason_max_bytes": { "value": 1024, "rust_behaviour": "require_reason", "source": "src/mcp/tools/alpha_tabs.rs:1695" }
+  },
+  "declaration": {
+    "max_entries": { "value": 64, "rust_behaviour": "require_declaration", "source": "src/mcp/tools/alpha_tabs.rs:1795,1817" },
+    "name_max_bytes": { "value": 128, "rust_behaviour": "require_declaration", "source": "src/mcp/tools/alpha_tabs.rs:1807,1826" },
+    "sql_snapshot_need": { "value": "sql.snapshot.v1", "rust": "SQL_SNAPSHOT_NEED", "source": "src/mcp/tools/alpha_tabs.rs:117" },
+    "sql_snapshot_max_needs": { "value": 8, "rust": "SQL_SNAPSHOT_MAX_NEEDS", "source": "src/mcp/tools/alpha_tabs.rs:120" },
+    "sql_need_key_max_chars": { "value": 40, "rust": "SQL_SNAPSHOT_KEY_MAX_CHARS", "source": "src/mcp/tools/alpha_tabs.rs:121" },
+    "label_max_chars": { "value": 120, "rust": "SQL_SNAPSHOT_LABEL_MAX_CHARS", "source": "src/mcp/tools/alpha_tabs.rs:122" },
+    "sql_max_bytes": { "value": 4096, "rust": "SQL_SNAPSHOT_SQL_MAX_BYTES", "source": "src/mcp/tools/alpha_tabs.rs:123" },
+    "max_params": { "value": 8, "rust": "SQL_SNAPSHOT_MAX_PARAMS", "source": "src/mcp/tools/alpha_tabs.rs:133" },
+    "param_text_default_max_len": { "value": 256, "rust": "SQL_PARAM_TEXT_DEFAULT_MAX_LEN", "source": "src/mcp/tools/alpha_tabs.rs:134" },
+    "param_text_hard_cap": { "value": 1024, "rust": "SQL_PARAM_TEXT_HARD_CAP", "source": "src/mcp/tools/alpha_tabs.rs:135" },
+    "param_name_max_chars": { "value": 32, "rust_behaviour": "valid_sql_param_name", "source": "src/mcp/tools/alpha_tabs.rs:211" },
+    "param_types": { "value": ["text", "integer", "timestamp_ms"], "rust_behaviour": "SqlParamType::parse", "source": "src/mcp/tools/alpha_tabs.rs:170" },
+    "facet_set_effect": { "value": "records.facet-set.v1", "rust": "FACET_SET_EFFECT", "source": "src/mcp/tools/tab_effect_catalogue.rs:38" },
+    "facet_set_values_max": { "value": 64, "rust": "FACET_SET_VALUES_MAX", "source": "src/mcp/tools/alpha_tabs.rs:1874" },
+    "comment_create_effect": { "value": "comment.create.v1", "rust": "COMMENT_CREATE_EFFECT", "source": "src/mcp/tools/tab_effect_catalogue.rs:46" },
+    "comment_create_max_body_bytes": { "value": 4096, "rust": "COMMENT_CREATE_MAX_BODY_BYTES", "source": "src/mcp/tools/tab_effect_catalogue.rs:51" },
+    "comment_create_positions": { "value": ["reply", "root"], "rust": "COMMENT_CREATE_POSITIONS", "source": "src/mcp/tools/alpha_tabs.rs:2372" },
+    "message_react_effect": { "value": "message.react.v1", "rust": "MESSAGE_REACT_EFFECT", "source": "src/mcp/tools/tab_effect_catalogue.rs:57" },
+    "message_react_emoji": { "value": ["👍", "❤️", "😂", "🎉", "👀"], "rust": "MESSAGE_REACT_EMOJIS", "source": "src/mcp/tools/effect_bounds.rs" },
+    "title_set_effect": { "value": "records.title-set.v1", "rust": "TITLE_SET_EFFECT", "source": "src/mcp/tools/tab_effect_catalogue.rs" },
+    "host_need_names": { "value": ["attention.query.v1", "records.search.v1", "records.resolve_reference.v1", "canvas.scene.v1", "records.changes.v1", "artifact.render.v1"], "rust": "ATTENTION_QUERY_NEED, RECORDS_SEARCH_NEED, RECORDS_RESOLVE_REFERENCE_NEED, CANVAS_SCENE_NEED, RECORD_CHANGES_NEED, ARTIFACT_RENDER_NEED", "source": "src/mcp/tools/alpha_tabs.rs:92,99,104,120,143" }
+  },
+  "reads": {
+    "sql_snapshot_row_cap": { "value": 200, "rust": "SQL_SNAPSHOT_ROW_CAP", "source": "src/mcp/tools/alpha_tabs.rs:130" },
+    "search_query_max_chars": { "value": 200, "rust": "SEARCH_QUERY_MAX_CHARS", "source": "src/mcp/tools/alpha_tabs.rs:108" },
+    "search_limit_max": { "value": 30, "rust": "SEARCH_LIMIT_MAX", "source": "src/mcp/tools/alpha_tabs.rs:109" },
+    "reference_max_chars": { "value": 128, "rust": "REFERENCE_MAX_CHARS", "source": "src/mcp/tools/alpha_tabs.rs:112" },
+    "sql_result_fields": { "value": ["label", "columns", "rows", "row_count", "row_count_complete", "truncated", "truncation_hint", "now_ms_ms", "time_dependent", "assumed_order"], "rust": "SQL_NEED_RESULT_FIELDS", "source": "src/mcp/tools/alpha_tabs.rs:163" },
+    "canvas_scene_limit_max": { "value": 500, "rust": "CANVAS_SCENE_LIMIT_MAX", "source": "src/mcp/tools/alpha_tabs.rs:126" },
+    "canvas_id_max_chars": { "value": 128, "rust": "CANVAS_ID_MAX_CHARS", "source": "src/mcp/tools/alpha_tabs.rs:127" },
+    "canvas_scene_cursor_max_chars": { "value": 2048, "rust": "SceneCursor::MAX_CHARS", "source": "src/mcp/tools/canvas.rs" },
+    "canvas_scene_page_max_chars": { "value": 786432, "rust": "CANVAS_SCENE_PAGE_MAX_CHARS", "source": "src/mcp/tools/alpha_tabs.rs:133" },
+    "canvas_scene_field_max_bytes": { "value": 8192, "rust": "TAB_SCENE_FIELD_MAX_BYTES", "source": "src/mcp/tools/canvas.rs" },
+    "record_changes_limit_max": { "value": 50, "rust": "RECORD_CHANGES_LIMIT_MAX", "source": "src/mcp/tools/alpha_tabs.rs" },
+    "record_id_max_chars": { "value": 128, "rust": "RECORD_ID_MAX_CHARS", "source": "src/mcp/tools/alpha_tabs.rs" },
+    "record_changes_cursor_max_chars": { "value": 336, "rust": "RecordChangesCursor::MAX_CHARS", "source": "src/mcp/tools/alpha_tabs.rs" },
+    "record_changes_page_max_chars": { "value": 786432, "rust": "RECORD_CHANGES_PAGE_MAX_CHARS", "source": "src/mcp/tools/alpha_tabs.rs" },
+    "record_changes_value_max_chars": { "value": 256, "rust": "TAB_CHANGE_VALUE_MAX_CHARS", "source": "src/mcp/tools/history.rs" },
+    "record_changes_max_references": { "value": 256, "rust": "TAB_CHANGE_MAX_REFERENCES", "source": "src/mcp/tools/history.rs" },
+    "record_changes_max_payload_bytes": { "value": 8388608, "rust": "TAB_CHANGE_MAX_PAYLOAD_BYTES", "source": "src/mcp/tools/history.rs" },
+    "record_changes_field_max_chars": { "value": 256, "rust": "TAB_CHANGE_FIELD_MAX_CHARS", "source": "src/mcp/tools/history.rs" },
+    "record_changes_reason_max_chars": { "value": 1024, "rust": "TAB_CHANGE_REASON_MAX_CHARS", "source": "src/mcp/tools/history.rs" },
+    "artifact_render_result_max_chars": { "value": 786432, "rust": "ARTIFACT_RENDER_RESULT_MAX_CHARS", "source": "src/mcp/tools/alpha_tabs.rs" },
+    "on_request_host_needs": { "value": ["records.search.v1", "records.resolve_reference.v1", "canvas.scene.v1", "records.changes.v1", "artifact.render.v1"], "js_literal": "export const ON_REQUEST_NEEDS = Object.freeze({", "source": "experiments/demo-shell/public/lib/pendingTabs.js:727" },
+    "truncation_hint": { "value": "result truncated at 1000 rows: add ORDER BY over a unique key and page with a keyset predicate (WHERE key > ?N) rather than raising LIMIT", "rust": "native_query_contract::sql_contract::truncation_hint", "source": "crates/query-contract/src/sql_contract.rs:358" }
+  },
+  "sql": {
+    "max_sql_bytes": { "value": 65536, "rust": "MAX_SQL_BYTES", "source": "crates/query-contract/src/sql_contract.rs:18" },
+    "max_placeholder": { "value": 256, "rust": "MAX_PARAMETERS", "source": "crates/query-contract/src/sql_contract.rs:19" },
+    "max_rows": { "value": 1000, "rust": "MAX_ROWS", "source": "crates/query-contract/src/sql_contract.rs:21" },
+    "max_columns": { "value": 64, "rust": "MAX_COLUMNS", "source": "crates/query-contract/src/sql_contract.rs:22" },
+    "max_cell_encoded_bytes": { "value": 262144, "rust": "MAX_CELL_ENCODED_BYTES", "source": "crates/query-contract/src/sql_contract.rs:23" },
+    "max_result_encoded_bytes": { "value": 4194304, "rust": "MAX_RESULT_ENCODED_BYTES", "source": "crates/query-contract/src/sql_contract.rs:24" },
+    "deadline_ms": { "value": 2000, "rust": "QUERY_DEADLINE_MS", "source": "crates/query-contract/src/sql_contract.rs:25" },
+    "relations": { "value": ["records", "record_lifecycle_interpretations", "content_events", "body_blocks", "body_block_headings", "links", "body_task_items", "facet_values", "facet_observations", "bindings", "blobs", "vocabularies", "vocabulary_values", "vocabulary_value_json_nodes", "schema_config", "schema_config_json_nodes", "effective_relationships", "effective_relationship_endpoints", "agent_activity", "agent_activity_claims", "actors", "runs", "run_intents", "messages_awaiting_reply", "my_message_state", "my_mentions", "facet_times", "catalog_relations", "catalog_columns"], "rust": "LOGICAL_RELATIONS", "source": "crates/query-contract/src/sql_contract.rs:60" },
+
+    "portable_functions": { "value": ["abs", "avg", "coalesce", "count", "cume_dist", "dense_rank", "length", "lower", "max", "min", "now_ms", "ntile", "nullif", "percent_rank", "rank", "regexp", "replace", "round", "row_number", "substr", "sum", "trim", "upper", "utc_date_label", "like"], "rust": "PORTABLE_FUNCTIONS (+ like, admitted by authorize_strict)", "source": "crates/query-contract/src/sql_contract.rs:2695; src/query/sql.rs:1207" },
+    "dropped_functions": { "value": ["instr", "glob", "date", "datetime", "julianday", "strftime", "time", "unixepoch", "json_array_length", "json_type", "json_valid", "json_group_array", "json", "typeof", "group_concat", "total", "unicode", "substring", "floor", "ceil", "ceiling", "char_length", "character_length", "octet_length", "greatest", "least"], "rust": "portable_function_repair (plus every json_* name)", "source": "crates/query-contract/src/sql_contract.rs:2896" },
+    "forbidden_words": { "value": ["insert", "update", "delete", "merge", "create", "alter", "drop", "truncate", "grant", "revoke", "copy", "call", "do", "pragma", "attach", "detach", "vacuum", "reindex", "begin", "commit", "rollback", "savepoint", "release"], "rust_behaviour": "classify_single_read_statement FORBIDDEN", "source": "crates/query-contract/src/sql_contract.rs:2262" },
+    "clock_keywords": { "value": ["current_date", "current_time", "current_timestamp"], "rust_behaviour": "classify_single_read_statement", "source": "crates/query-contract/src/sql_contract.rs:4097" }
+  },
+  "html": {
+    "body_max_bytes": { "value": 524288, "rust": "native_artifact_html::html::BODY_LIMIT", "source": "crates/artifact-html/src/html.rs:59" },
+    "data_asset_max_bytes": { "value": 262144, "rust": "native_artifact_html::html::DATA_ASSET_EACH_LIMIT", "source": "crates/artifact-html/src/html.rs:60" },
+    "data_assets_total_max_bytes": { "value": 393216, "rust": "native_artifact_html::html::DATA_ASSET_TOTAL_LIMIT", "source": "crates/artifact-html/src/html.rs:61" },
+    "dom_node_max": { "value": 10000, "rust": "native_artifact_html::html::DOM_NODE_LIMIT", "source": "crates/artifact-html/src/html.rs:62" },
+    "css_rule_max": { "value": 5000, "rust": "native_artifact_html::html::CSS_RULE_LIMIT", "source": "crates/artifact-html/src/html.rs:63" },
+    "input_json_max_bytes": { "value": 16777216, "rust": "native_artifact_html::html::INPUT_JSON_LIMIT", "source": "crates/artifact-html/src/html.rs" },
+    "input_records_max": { "value": 20000, "rust": "native_artifact_html::html::INPUT_RECORD_LIMIT", "source": "crates/artifact-html/src/html.rs" },
+    "bridge_message_max_bytes": { "value": 16777216, "rust": "native_artifact_html::html::BRIDGE_MESSAGE_LIMIT", "source": "crates/artifact-html/src/html.rs" },
+    "forbidden_elements": { "value": ["base", "iframe", "frame", "fencedframe", "portal", "object", "embed"], "rust_behaviour": "native_artifact_html::html::validate", "source": "crates/artifact-html/src/html.rs:1299" },
+    "url_attributes": { "value": ["href", "src", "srcset", "poster", "action", "formaction", "xlink:href"], "rust_behaviour": "native_artifact_html::html::validate", "source": "crates/artifact-html/src/html.rs:1446" },
+    "data_mime_types": { "value": ["image/png", "image/jpeg", "image/webp", "image/avif", "font/woff2"], "rust_behaviour": "native_artifact_html::html::validate", "source": "crates/artifact-html/src/html.rs:1522" }
+  },
+  "bridge": {
+    "version": { "value": "native.html.bridge.v1", "rust": "native_artifact_html::html::BRIDGE_VERSION", "source": "crates/artifact-html/src/html.rs:40" },
+    "adapter_revision": { "value": 3, "rust": "native_artifact_html::html::ADAPTER_REVISION", "source": "crates/artifact-html/src/html.rs:39" },
+    "validator_version": { "value": 3, "rust": "native_artifact_html::html::descriptor() validator.version", "source": "crates/artifact-html/src/html.rs:1884" },
+    "bootstrap_sha256": { "value": "f4a0cfb3da85ea40b076914c776a2d73aca65428c1d28f8e9a492487ebc8d4aa", "rust": "native_artifact_html::html::bootstrap_digest", "source": "crates/artifact-html/src/html.rs:bootstrap_digest" },
+    "pending_read_cap": { "value": 8, "bootstrap_literal": "pendingReadCount>=8)refuseRead(\"busy\",\"too many reads in flight\")", "source": "crates/artifact-html/src/html.rs:174" },
+    "read_params_max_chars": { "value": 4096, "bootstrap_literal": "encoded.length>4096)refuseRead(\"too_large\",\"read params exceed bridge limit\")", "source": "crates/artifact-html/src/html.rs:174" },
+    "answer_max_chars": { "value": 1048576, "bootstrap_literal": "encoded.length>1048576?freezeObject({status:\"unavailable\",code:\"too_large\"})", "source": "crates/artifact-html/src/html.rs:175" },
+    "view_state_max_chars": { "value": 65536, "bootstrap_literal": "encoded.length>65536)refuseViewState(\"too_large\",\"view state exceeds bridge limit\")", "source": "crates/artifact-html/src/html.rs:164" },
+    "csp": { "value": "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; font-src data:; media-src 'none'; connect-src 'none'; worker-src 'none'; child-src 'none'; frame-src 'none'; object-src 'none'; manifest-src 'none'; form-action 'none'; base-uri 'none'; frame-ancestors {origin}; webrtc 'block'; sandbox allow-scripts", "rust": "native_artifact_html::html::content_security_policy", "source": "crates/artifact-html/src/html.rs:2320" }
+  },
+  "shell": {
+    "reads_in_flight": { "value": 4, "js_literal": "while (!failed && readInFlight.size < READ_IN_FLIGHT_MAX && readQueue.length > 0) {", "source": "experiments/demo-shell/public/views/pending.js:4114 pumpReads" },
+    "read_timeout_slot_grace_ms": { "value": 15000, "js_literal": "export const READ_TIMEOUT_SLOT_GRACE_MS = 15_000;", "source": "experiments/demo-shell/public/views/pending.js:788" },
+    "read_queue_max": { "value": 8, "js_literal": "export const READ_QUEUE_MAX = 8;", "source": "experiments/demo-shell/public/views/pending.js:777" },
+    "read_timeout_ms": { "value": 10000, "js_literal": "export const LIVE_RECHECK_TIMEOUT_MS = 10_000;", "source": "experiments/demo-shell/public/views/pending.js:391" },
+    "handshake_timeout_ms": { "value": 5000, "js_literal": "timer = window.setTimeout(() => fail(\"The live tab did not complete its handshake.\"), 5000);", "source": "experiments/demo-shell/public/views/pending.js:2954" },
+    "snapshot_row_cap": { "value": 200, "js_literal": "export const SQL_SNAPSHOT_ROW_CAP = 200;", "source": "experiments/demo-shell/public/lib/pendingTabs.js:54" },
+    "navigation_id_max_chars": { "value": 128, "js_literal": "id.length > 128", "source": "experiments/demo-shell/public/views/pending.js:3243 handleNavigation" }
+  },
+  "sample_input": {
+    "value": {
+      "version": "native.artifact-input.v1",
+      "mode": "sample",
+      "sample_preview": true,
+      "records": [
+        {
+          "id": "sample:attention-1",
+          "type": "Task",
+          "name": "Sample attention item 1",
+          "summary": "Host-owned preview fixture — not live data."
+        },
+        {
+          "id": "sample:attention-2",
+          "type": "Task",
+          "name": "Sample attention item 2",
+          "summary": "Host-owned preview fixture — not live data."
+        }
+      ],
+      "inputs": {}
+    },
+    "rust": "alpha_tab_sample_input",
+    "source": "src/mcp/tools/alpha_tabs.rs:1318"
+  }
+}

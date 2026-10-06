@@ -48,6 +48,23 @@ async fn call(
         .await
 }
 
+async fn call_caller(
+    registry: &ToolRegistry,
+    db: &Db,
+    caller: Caller,
+    tool: &str,
+    args: Value,
+) -> native_ce::Result<Value> {
+    registry
+        .call(
+            db.clone(),
+            caller,
+            tool,
+            crate::common::with_test_reason(tool, args),
+        )
+        .await
+}
+
 async fn install_people(db: &Db) {
     for (record_id, principal, account) in [
         (SENDER_PERSON, SENDER_PRINCIPAL, SENDER_ACCOUNT),
@@ -2168,5 +2185,308 @@ async fn addressed_send_into_a_collection_still_seals_to_its_audience() {
             .unwrap(),
         Capability::None,
         "addressing keeps sealing the Message to its audience, home or not"
+    );
+}
+
+#[tokio::test]
+async fn member_send_hides_unreadable_escalation_policy_source_ids() {
+    let db = create_database(":memory:").await.unwrap();
+    install_people(&db).await;
+    let registry = registry();
+    let source = call(
+        &registry,
+        &db,
+        SENDER_ACCOUNT,
+        "create_record",
+        json!({
+            "type":"Document",
+            "kind":"escalation-policy",
+            "name":"Workspace-wide escalation policy",
+            "body":serde_json::to_string(&json!({
+                "format":"native.escalation-policy.v1",
+                "issuer_principal_id":SENDER_PRINCIPAL,
+                "statements":[{
+                    "statement_id":"workspace-block",
+                    "kind":"hard_rule",
+                    "scope":{"action.destination_kind":["same_workspace"]},
+                    "when":{"all":[{"field":"action.operation","op":"eq","value":"send_message"}]},
+                    "effect":{"disposition":"block_and_request_authority"}
+                }]
+            })).unwrap()
+        }),
+    )
+    .await
+    .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let binding_id = "member-hidden-db-policy";
+    call(
+        &registry,
+        &db,
+        SENDER_ACCOUNT,
+        "manage_instructions",
+        json!({
+            "action":"create_binding",
+            "scope":"workspace",
+            "binding_id":binding_id,
+            "source_record_id":source,
+            "position":0,
+            "idempotency_key":"bind-hidden-db-policy",
+            "reason":"Bind a workspace-wide escalation policy for the redaction test."
+        }),
+    )
+    .await
+    .unwrap();
+
+    // The binding exists first (as it would if a member joined later, or the
+    // source's policy tightened afterwards), then only the owner keeps View.
+    // The member's evaluation must still fail closed without naming it.
+    replace_explicit_policy(
+        &db,
+        "test:policy",
+        &source,
+        vec![AllowEntry::account(SENDER_ACCOUNT, Capability::View)],
+    )
+    .await
+    .unwrap();
+
+    // A hosted sender with no owner footing is the member whose response must
+    // not name a policy source it cannot View.
+    let member = Caller::authenticated(THIRD_ACCOUNT)
+        .with_hosting_context("host-member", "database")
+        .with_hosting_owner(false);
+    let args = json!({
+        "action":"send",
+        "body":"Member note while the workspace policy applies.",
+        "preview":DISCLOSURE_PREVIEW,
+        "origin":{"type":"direct","participant_ids":[THIRD_PERSON,RECIPIENT_PERSON]},
+        "addressed_to":[RECIPIENT_PERSON],
+        "expectation":"reply",
+        "idempotency_key":"member-hidden-policy-send",
+        "reason":"Member sends while a workspace policy names a source it cannot view."
+    });
+
+    let fresh = call_caller(
+        &registry,
+        &db,
+        member.clone(),
+        "manage_messages",
+        args.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(fresh["delivery"]["status"], "blocked");
+    assert_eq!(
+        fresh["delivery"]["disposition"],
+        "block_and_request_authority"
+    );
+    let fresh_text = fresh.to_string();
+    assert!(
+        !fresh_text.contains(&source),
+        "fresh response named the hidden policy source: {fresh_text}"
+    );
+    assert!(
+        !fresh_text.contains(binding_id),
+        "fresh response named the hidden binding: {fresh_text}"
+    );
+    assert!(
+        fresh["delivery"]["policy_trace"]["conflicts"]
+            .to_string()
+            .contains("policy_source_unreadable"),
+        "the fail-closed conflict must survive redaction"
+    );
+
+    let mut owner_args = args.clone();
+    let retry = call_caller(&registry, &db, member, "manage_messages", args)
+        .await
+        .unwrap();
+    assert_eq!(retry["delivery"]["idempotent_retry"], true);
+    let retry_text = retry.to_string();
+    assert!(!retry_text.contains(&source), "{retry_text}");
+    assert!(!retry_text.contains(binding_id), "{retry_text}");
+    assert_eq!(
+        retry["delivery"]["policy_trace"], fresh["delivery"]["policy_trace"],
+        "a fresh response and its idempotent retry must redact identically"
+    );
+
+    // The resume guard digest is kept and is over the unredacted trace, so it
+    // is present and identical on both paths (see the residual note on
+    // `redact_trace_for_caller`).
+    let fresh_digest = fresh["delivery"]["evaluation_digest"]
+        .as_str()
+        .expect("the member's response carries the resume guard digest")
+        .to_string();
+    assert_eq!(
+        retry["delivery"]["evaluation_digest"].as_str(),
+        Some(fresh_digest.as_str()),
+        "the evaluation digest must be stable across fresh and retry"
+    );
+    assert_eq!(fresh_digest.len(), 64, "evaluation_digest is a sha256 hex");
+    assert!(fresh["delivery"]["action_digest"].is_string());
+
+    // Only the response is redacted: the persisted evaluation still names the
+    // source so an owner can repair the binding.
+    let message_id = fresh["id"].as_str().unwrap();
+    let persisted: String = sqlx::query_scalar(
+        "SELECT payload FROM content_events WHERE record_id=? AND type='message.send_evaluated.v1'",
+    )
+    .bind(message_id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert!(persisted.contains(&source), "{persisted}");
+    assert!(persisted.contains(binding_id), "{persisted}");
+    assert!(
+        persisted.contains(&fresh_digest),
+        "the returned digest is the persisted one: {persisted}"
+    );
+
+    // An owner keeps the full trace even when its own evaluation marks the
+    // source unreadable: owner footing suppresses redaction, not the
+    // fail-closed conflict.
+    owner_args["idempotency_key"] = json!("owner-hidden-policy-send");
+    let owner = Caller::authenticated(THIRD_ACCOUNT)
+        .with_hosting_context("host-owner", "database")
+        .with_hosting_owner(true);
+    let owned = call_caller(&registry, &db, owner, "manage_messages", owner_args)
+        .await
+        .unwrap();
+    assert_eq!(owned["delivery"]["status"], "blocked");
+    let owned_trace = owned["delivery"]["policy_trace"].to_string();
+    assert!(
+        owned_trace.contains(&source) && owned_trace.contains(binding_id),
+        "the owner must see the full trace: {owned_trace}"
+    );
+    assert!(
+        owned["delivery"]["policy_trace"]["conflicts"]
+            .to_string()
+            .contains("policy_source_unreadable"),
+        "the owner's unreadable-source trace still carries the fail-closed conflict: {owned_trace}"
+    );
+}
+
+#[tokio::test]
+async fn member_replay_hides_a_source_whose_view_was_revoked() {
+    let db = create_database(":memory:").await.unwrap();
+    install_people(&db).await;
+    let registry = registry();
+    let source = call(
+        &registry,
+        &db,
+        SENDER_ACCOUNT,
+        "create_record",
+        json!({
+            "type":"Document",
+            "kind":"escalation-policy",
+            "name":"Revocable workspace policy",
+            "body":serde_json::to_string(&json!({
+                "format":"native.escalation-policy.v1",
+                "issuer_principal_id":SENDER_PRINCIPAL,
+                "statements":[{
+                    "statement_id":"revocable-block",
+                    "kind":"hard_rule",
+                    "scope":{"action.destination_kind":["same_workspace"]},
+                    "when":{"all":[{"field":"action.operation","op":"eq","value":"send_message"}]},
+                    "effect":{"disposition":"block_and_request_authority"}
+                }]
+            })).unwrap()
+        }),
+    )
+    .await
+    .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let binding_id = "member-revocable-db-policy";
+    call(
+        &registry,
+        &db,
+        SENDER_ACCOUNT,
+        "manage_instructions",
+        json!({
+            "action":"create_binding",
+            "scope":"workspace",
+            "binding_id":binding_id,
+            "source_record_id":source,
+            "position":0,
+            "idempotency_key":"bind-revocable-db-policy",
+            "reason":"Bind a workspace-wide escalation policy for the revocation test."
+        }),
+    )
+    .await
+    .unwrap();
+
+    // The member may View the source for the first send...
+    replace_explicit_policy(
+        &db,
+        "test:policy",
+        &source,
+        vec![
+            AllowEntry::account(SENDER_ACCOUNT, Capability::View),
+            AllowEntry::account(THIRD_ACCOUNT, Capability::View),
+        ],
+    )
+    .await
+    .unwrap();
+
+    let member = Caller::authenticated(THIRD_ACCOUNT)
+        .with_hosting_context("host-member", "database")
+        .with_hosting_owner(false);
+    let args = json!({
+        "action":"send",
+        "body":"Member note before the revocation.",
+        "preview":DISCLOSURE_PREVIEW,
+        "origin":{"type":"direct","participant_ids":[THIRD_PERSON,RECIPIENT_PERSON]},
+        "addressed_to":[RECIPIENT_PERSON],
+        "expectation":"reply",
+        "idempotency_key":"member-revoked-policy-send",
+        "reason":"Member sends while it can still view the workspace policy source."
+    });
+
+    let fresh = call_caller(
+        &registry,
+        &db,
+        member.clone(),
+        "manage_messages",
+        args.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(fresh["delivery"]["status"], "blocked");
+    assert!(
+        fresh.to_string().contains(&source),
+        "the member may see a source it can still View"
+    );
+
+    // ...then the owner revokes that View. The retry returns the same persisted
+    // trace, re-checked against the member's current capability, so it must
+    // hide every identifier of the source even though the trace recorded it as
+    // readable when first sent. Fresh and retry may legitimately differ here:
+    // only the capability changed between them.
+    replace_explicit_policy(
+        &db,
+        "test:policy",
+        &source,
+        vec![AllowEntry::account(SENDER_ACCOUNT, Capability::View)],
+    )
+    .await
+    .unwrap();
+
+    let retry = call_caller(&registry, &db, member, "manage_messages", args)
+        .await
+        .unwrap();
+    assert_eq!(retry["delivery"]["idempotent_retry"], true);
+    assert_eq!(retry["delivery"]["status"], "blocked");
+    let retry_text = retry.to_string();
+    for hidden in [source.as_str(), binding_id, "revocable-block"] {
+        assert!(
+            !retry_text.contains(hidden),
+            "the replay named {hidden} after View was revoked: {retry_text}"
+        );
+    }
+    assert_ne!(
+        retry["delivery"]["policy_trace"], fresh["delivery"]["policy_trace"],
+        "a capability change between sends legitimately changes the redaction"
     );
 }

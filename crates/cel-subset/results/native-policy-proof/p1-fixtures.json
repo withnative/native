@@ -1,0 +1,1876 @@
+{
+  "actual_extrema": {
+    "body.semantic_error_prefix.cost.memory": {
+      "value": 1541,
+      "witness": {
+        "definition": {
+          "declarations": [
+            {
+              "kind": "Many",
+              "name": "rows"
+            },
+            {
+              "kind": "One",
+              "name": "one"
+            }
+          ],
+          "guards": [],
+          "input_metadata": [],
+          "source": {
+            "expression": "rows.exists(r,int('not-a-number')>0)"
+          }
+        },
+        "error_category": "FunctionError",
+        "family": "copy-error-prefix",
+        "fixture": "bad-numeric-parse",
+        "generator": null,
+        "index": 46,
+        "outcome": "semantic_error",
+        "replacement_execution": false,
+        "scenario": "default"
+      }
+    },
+    "body.semantic_error_prefix.cost.work": {
+      "value": 75002,
+      "witness": {
+        "definition": {
+          "declarations": [
+            {
+              "kind": "Many",
+              "name": "rows"
+            },
+            {
+              "kind": "One",
+              "name": "one"
+            }
+          ],
+          "guards": [],
+          "input_metadata": [],
+          "source": {
+            "expression": "rows.exists(r,int('not-a-number')>0)"
+          }
+        },
+        "error_category": "FunctionError",
+        "family": "copy-error-prefix",
+        "fixture": "bad-numeric-parse",
+        "generator": null,
+        "index": 46,
+        "outcome": "semantic_error",
+        "replacement_execution": false,
+        "scenario": "default"
+      }
+    },
+    "body.semantic_error_prefix.input_cost.memory": {
+      "value": 1249127,
+      "witness": {
+        "definition": {
+          "declarations": [
+            {
+              "kind": "Many",
+              "name": "rows"
+            },
+            {
+              "kind": "One",
+              "name": "one"
+            }
+          ],
+          "guards": [],
+          "input_metadata": [],
+          "source": {
+            "expression": "rows.all(r,uint(-1)>0u)"
+          }
+        },
+        "error_category": "FunctionError",
+        "family": "copy-error-prefix",
+        "fixture": "negative-uint-prefix",
+        "generator": null,
+        "index": 45,
+        "outcome": "semantic_error",
+        "replacement_execution": false,
+        "scenario": "default"
+      }
+    },
+    "body.semantic_error_prefix.input_cost.work": {
+      "value": 39523,
+      "witness": {
+        "definition": {
+          "declarations": [
+            {
+              "kind": "Many",
+              "name": "rows"
+            },
+            {
+              "kind": "One",
+              "name": "one"
+            }
+          ],
+          "guards": [],
+          "input_metadata": [],
+          "source": {
+            "expression": "rows.all(r,uint(-1)>0u)"
+          }
+        },
+        "error_category": "FunctionError",
+        "family": "copy-error-prefix",
+        "fixture": "negative-uint-prefix",
+        "generator": null,
+        "index": 45,
+        "outcome": "semantic_error",
+        "replacement_execution": false,
+        "scenario": "default"
+      }
+    },
+    "body.success.cost.memory": {
+      "value": 8233364,
+      "witness": {
+        "definition": {
+          "declarations": [
+            {
+              "kind": "Many",
+              "name": "rows"
+            }
+          ],
+          "guards": [],
+          "input_metadata": [],
+          "source": {
+            "expression": "rows.map(r,[r,r,r])"
+          }
+        },
+        "error_category": null,
+        "family": "heterogeneous",
+        "fixture": "cached-rows.map(r,[r,r,r])",
+        "generator": null,
+        "index": 192,
+        "outcome": "value",
+        "replacement_execution": false,
+        "scenario": "default"
+      }
+    },
+    "body.success.cost.work": {
+      "value": 4023130,
+      "witness": {
+        "definition": {
+          "declarations": [
+            {
+              "kind": "Many",
+              "name": "rows"
+            }
+          ],
+          "guards": [],
+          "input_metadata": [],
+          "source": {
+            "expression": "rows.map(r,r.body.matches('x'))"
+          }
+        },
+        "error_category": null,
+        "family": "total-B-text",
+        "fixture": "total-B-text-rows.map(r,r.body.matches('x'))",
+        "generator": null,
+        "index": 184,
+        "outcome": "value",
+        "replacement_execution": false,
+        "scenario": "5000-text-rows"
+      }
+    },
+    "body.success.input_cost.memory": {
+      "value": 2497912,
+      "witness": {
+        "definition": {
+          "declarations": [
+            {
+              "kind": "Many",
+              "name": "xs"
+            },
+            {
+              "kind": "Many",
+              "name": "ys"
+            }
+          ],
+          "guards": [],
+          "input_metadata": [],
+          "source": {
+            "expression": "xs.map(x,size(ys))"
+          }
+        },
+        "error_category": null,
+        "family": "cross-product-control",
+        "fixture": "linear-size-control",
+        "generator": null,
+        "index": 65,
+        "outcome": "value",
+        "replacement_execution": false,
+        "scenario": "default"
+      }
+    },
+    "body.success.input_cost.work": {
+      "value": 112556,
+      "witness": {
+        "definition": {
+          "declarations": [
+            {
+              "kind": "Scalar { kind: Bool, nullable: false }",
+              "name": "enabled"
+            },
+            {
+              "kind": "Many",
+              "name": "prefix0"
+            },
+            {
+              "kind": "Many",
+              "name": "prefix1"
+            },
+            {
+              "kind": "Many",
+              "name": "prefix2"
+            },
+            {
+              "kind": "Many",
+              "name": "prefix3"
+            },
+            {
+              "kind": "Many",
+              "name": "prefix4"
+            },
+            {
+              "kind": "Many",
+              "name": "prefix5"
+            },
+            {
+              "kind": "Many",
+              "name": "prefix6"
+            },
+            {
+              "kind": "Many",
+              "name": "prefix7"
+            },
+            {
+              "kind": "Many",
+              "name": "prefix8"
+            },
+            {
+              "kind": "Many",
+              "name": "prefix9"
+            },
+            {
+              "kind": "Many",
+              "name": "prefix10"
+            },
+            {
+              "kind": "Many",
+              "name": "prefix11"
+            },
+            {
+              "kind": "Many",
+              "name": "prefix12"
+            },
+            {
+              "kind": "Many",
+              "name": "prefix13"
+            },
+            {
+              "kind": "Many",
+              "name": "prefix14"
+            },
+            {
+              "kind": "One",
+              "name": "pending"
+            }
+          ],
+          "guards": [
+            {
+              "input": "pending",
+              "source": "enabled && prefix0.all(r,size(r) == 0) && prefix1.all(r,size(r) == 0) && prefix2.all(r,size(r) == 0) && prefix3.all(r,size(r) == 0) && prefix4.all(r,size(r) == 0) && prefix5.all(r,size(r) == 0) && prefix6.all(r,size(r) == 0) && prefix7.all(r,size(r) == 0) && prefix8.all(r,size(r) == 0) && prefix9.all(r,size(r) == 0) && prefix10.all(r,size(r) == 0) && prefix11.all(r,size(r) == 0) && prefix12.all(r,size(r) == 0) && prefix13.all(r,size(r) == 0) && prefix14.all(r,size(r) == 0)"
+            }
+          ],
+          "input_metadata": [],
+          "source": {
+            "expression": "true"
+          }
+        },
+        "error_category": null,
+        "family": "ordered-guard",
+        "fixture": "many-prefix-15-5000",
+        "generator": null,
+        "index": 82,
+        "outcome": "value",
+        "replacement_execution": true,
+        "scenario": "default"
+      }
+    },
+    "body.success.output.cached_bytes": {
+      "value": 4116670,
+      "witness": {
+        "definition": {
+          "declarations": [
+            {
+              "kind": "Many",
+              "name": "rows"
+            }
+          ],
+          "guards": [],
+          "input_metadata": [],
+          "source": {
+            "expression": "rows.map(r,[r,r,r])"
+          }
+        },
+        "error_category": null,
+        "family": "heterogeneous",
+        "fixture": "cached-rows.map(r,[r,r,r])",
+        "generator": null,
+        "index": 192,
+        "outcome": "value",
+        "replacement_execution": false,
+        "scenario": "default"
+      }
+    },
+    "body.success.output.cached_nodes": {
+      "value": 65001,
+      "witness": {
+        "definition": {
+          "declarations": [
+            {
+              "kind": "Many",
+              "name": "rows"
+            }
+          ],
+          "guards": [],
+          "input_metadata": [],
+          "source": {
+            "expression": "rows.map(r,[r,r,r])"
+          }
+        },
+        "error_category": null,
+        "family": "heterogeneous",
+        "fixture": "cached-rows.map(r,[r,r,r])",
+        "generator": null,
+        "index": 192,
+        "outcome": "value",
+        "replacement_execution": false,
+        "scenario": "default"
+      }
+    },
+    "body.success.output.depth": {
+      "value": 4,
+      "witness": {
+        "definition": {
+          "declarations": [
+            {
+              "kind": "One",
+              "name": "left"
+            },
+            {
+              "kind": "One",
+              "name": "right"
+            }
+          ],
+          "guards": [],
+          "input_metadata": [],
+          "source": {
+            "clauses": [
+              {
+                "id": "allow",
+                "result": "{'decision':'allow','reason':{'code':'within-policy','details':['capacity','region','term']},'used':['left','right']}",
+                "when": "left.f0 >= right.f0 && left.f1 >= right.f1 && left.f2 >= right.f2 && left.f3 >= right.f3 && left.f4 >= right.f4 && left.f5 >= right.f5 && left.f6 >= right.f6 && left.f7 >= right.f7 && left.f8 >= right.f8 && left.f9 >= right.f9 && left.f10 >= right.f10 && left.f11 >= right.f11 && left.f12 >= right.f12 && left.f13 >= right.f13 && left.f14 >= right.f14 && left.f15 >= right.f15 && left.f16 >= right.f16"
+              }
+            ]
+          }
+        },
+        "error_category": null,
+        "family": "wide",
+        "fixture": "wide-17",
+        "generator": null,
+        "index": 26,
+        "outcome": "value",
+        "replacement_execution": false,
+        "scenario": "default"
+      }
+    },
+    "guard.semantic_error_prefix.bound.memory": {
+      "value": 16,
+      "witness": {
+        "definition": {
+          "declarations": [
+            {
+              "kind": "Scalar { kind: Bool, nullable: false }",
+              "name": "enabled"
+            },
+            {
+              "kind": "Scalar { kind: Int, nullable: false }",
+              "name": "now_ms"
+            },
+            {
+              "kind": "One",
+              "name": "first"
+            },
+            {
+              "kind": "One",
+              "name": "pending"
+            },
+            {
+              "kind": "One",
+              "name": "future"
+            }
+          ],
+          "guards": [
+            {
+              "input": "pending",
+              "source": "1"
+            }
+          ],
+          "input_metadata": [],
+          "source": {
+            "expression": "true"
+          }
+        },
+        "error_category": null,
+        "family": "ordered-guard",
+        "fixture": "guard-nonbool",
+        "generator": null,
+        "guard_error_category": "NoSuchOverload",
+        "guard_input": "pending",
+        "guard_phase": "standalone",
+        "index": 79,
+        "outcome": "no_token_guard_error",
+        "replacement_execution": null,
+        "scenario": "default"
+      }
+    },
+    "guard.semantic_error_prefix.bound.work": {
+      "value": 3,
+      "witness": {
+        "definition": {
+          "declarations": [
+            {
+              "kind": "Scalar { kind: Bool, nullable: false }",
+              "name": "enabled"
+            },
+            {
+              "kind": "Scalar { kind: Int, nullable: false }",
+              "name": "now_ms"
+            },
+            {
+              "kind": "One",
+              "name": "first"
+            },
+            {
+              "kind": "One",
+              "name": "pending"
+            },
+            {
+              "kind": "One",
+              "name": "future"
+            }
+          ],
+          "guards": [
+            {
+              "input": "pending",
+              "source": "1"
+            }
+          ],
+          "input_metadata": [],
+          "source": {
+            "expression": "true"
+          }
+        },
+        "error_category": null,
+        "family": "ordered-guard",
+        "fixture": "guard-nonbool",
+        "generator": null,
+        "guard_error_category": "NoSuchOverload",
+        "guard_input": "pending",
+        "guard_phase": "standalone",
+        "index": 79,
+        "outcome": "no_token_guard_error",
+        "replacement_execution": null,
+        "scenario": "default"
+      }
+    },
+    "guard.semantic_error_prefix.cost.memory": {
+      "value": 16,
+      "witness": {
+        "definition": {
+          "declarations": [
+            {
+              "kind": "Scalar { kind: Bool, nullable: false }",
+              "name": "enabled"
+            },
+            {
+              "kind": "Scalar { kind: Int, nullable: false }",
+              "name": "now_ms"
+            },
+            {
+              "kind": "One",
+              "name": "first"
+            },
+            {
+              "kind": "One",
+              "name": "pending"
+            },
+            {
+              "kind": "One",
+              "name": "future"
+            }
+          ],
+          "guards": [
+            {
+              "input": "pending",
+              "source": "1"
+            }
+          ],
+          "input_metadata": [],
+          "source": {
+            "expression": "true"
+          }
+        },
+        "error_category": null,
+        "family": "ordered-guard",
+        "fixture": "guard-nonbool",
+        "generator": null,
+        "guard_error_category": "NoSuchOverload",
+        "guard_input": "pending",
+        "guard_phase": "standalone",
+        "index": 79,
+        "outcome": "no_token_guard_error",
+        "replacement_execution": null,
+        "scenario": "default"
+      }
+    },
+    "guard.semantic_error_prefix.cost.work": {
+      "value": 3,
+      "witness": {
+        "definition": {
+          "declarations": [
+            {
+              "kind": "Scalar { kind: Bool, nullable: false }",
+              "name": "enabled"
+            },
+            {
+              "kind": "Scalar { kind: Int, nullable: false }",
+              "name": "now_ms"
+            },
+            {
+              "kind": "One",
+              "name": "first"
+            },
+            {
+              "kind": "One",
+              "name": "pending"
+            },
+            {
+              "kind": "One",
+              "name": "future"
+            }
+          ],
+          "guards": [
+            {
+              "input": "pending",
+              "source": "1"
+            }
+          ],
+          "input_metadata": [],
+          "source": {
+            "expression": "true"
+          }
+        },
+        "error_category": null,
+        "family": "ordered-guard",
+        "fixture": "guard-nonbool",
+        "generator": null,
+        "guard_error_category": "NoSuchOverload",
+        "guard_input": "pending",
+        "guard_phase": "standalone",
+        "index": 79,
+        "outcome": "no_token_guard_error",
+        "replacement_execution": null,
+        "scenario": "default"
+      }
+    },
+    "guard.semantic_error_prefix.input_cost.memory": {
+      "value": 300,
+      "witness": {
+        "definition": {
+          "declarations": [
+            {
+              "kind": "Scalar { kind: Bool, nullable: false }",
+              "name": "enabled"
+            },
+            {
+              "kind": "Scalar { kind: Int, nullable: false }",
+              "name": "now_ms"
+            },
+            {
+              "kind": "One",
+              "name": "first"
+            },
+            {
+              "kind": "One",
+              "name": "pending"
+            },
+            {
+              "kind": "One",
+              "name": "future"
+            }
+          ],
+          "guards": [
+            {
+              "input": "pending",
+              "source": "1"
+            }
+          ],
+          "input_metadata": [],
+          "source": {
+            "expression": "true"
+          }
+        },
+        "error_category": null,
+        "family": "ordered-guard",
+        "fixture": "guard-nonbool",
+        "generator": null,
+        "guard_error_category": "NoSuchOverload",
+        "guard_input": "pending",
+        "guard_phase": "standalone",
+        "index": 79,
+        "outcome": "no_token_guard_error",
+        "replacement_execution": null,
+        "scenario": "default"
+      }
+    },
+    "guard.semantic_error_prefix.input_cost.work": {
+      "value": 12,
+      "witness": {
+        "definition": {
+          "declarations": [
+            {
+              "kind": "Scalar { kind: Bool, nullable: false }",
+              "name": "enabled"
+            },
+            {
+              "kind": "Scalar { kind: Int, nullable: false }",
+              "name": "now_ms"
+            },
+            {
+              "kind": "One",
+              "name": "first"
+            },
+            {
+              "kind": "One",
+              "name": "pending"
+            },
+            {
+              "kind": "One",
+              "name": "future"
+            }
+          ],
+          "guards": [
+            {
+              "input": "pending",
+              "source": "1"
+            }
+          ],
+          "input_metadata": [],
+          "source": {
+            "expression": "true"
+          }
+        },
+        "error_category": null,
+        "family": "ordered-guard",
+        "fixture": "guard-nonbool",
+        "generator": null,
+        "guard_error_category": "NoSuchOverload",
+        "guard_input": "pending",
+        "guard_phase": "standalone",
+        "index": 79,
+        "outcome": "no_token_guard_error",
+        "replacement_execution": null,
+        "scenario": "default"
+      }
+    },
+    "guard.success.bound.memory": {
+      "value": 29176,
+      "witness": {
+        "definition": {
+          "declarations": [
+            {
+              "kind": "Scalar { kind: Bool, nullable: false }",
+              "name": "enabled"
+            },
+            {
+              "kind": "Many",
+              "name": "prefix0"
+            },
+            {
+              "kind": "Many",
+              "name": "prefix1"
+            },
+            {
+              "kind": "Many",
+              "name": "prefix2"
+            },
+            {
+              "kind": "Many",
+              "name": "prefix3"
+            },
+            {
+              "kind": "Many",
+              "name": "prefix4"
+            },
+            {
+              "kind": "Many",
+              "name": "prefix5"
+            },
+            {
+              "kind": "Many",
+              "name": "prefix6"
+            },
+            {
+              "kind": "Many",
+              "name": "prefix7"
+            },
+            {
+              "kind": "Many",
+              "name": "prefix8"
+            },
+            {
+              "kind": "Many",
+              "name": "prefix9"
+            },
+            {
+              "kind": "Many",
+              "name": "prefix10"
+            },
+            {
+              "kind": "Many",
+              "name": "prefix11"
+            },
+            {
+              "kind": "Many",
+              "name": "prefix12"
+            },
+            {
+              "kind": "Many",
+              "name": "prefix13"
+            },
+            {
+              "kind": "Many",
+              "name": "prefix14"
+            },
+            {
+              "kind": "One",
+              "name": "pending"
+            }
+          ],
+          "guards": [
+            {
+              "input": "pending",
+              "source": "enabled && prefix0.all(r,size(r) == 0) && prefix1.all(r,size(r) == 0) && prefix2.all(r,size(r) == 0) && prefix3.all(r,size(r) == 0) && prefix4.all(r,size(r) == 0) && prefix5.all(r,size(r) == 0) && prefix6.all(r,size(r) == 0) && prefix7.all(r,size(r) == 0) && prefix8.all(r,size(r) == 0) && prefix9.all(r,size(r) == 0) && prefix10.all(r,size(r) == 0) && prefix11.all(r,size(r) == 0) && prefix12.all(r,size(r) == 0) && prefix13.all(r,size(r) == 0) && prefix14.all(r,size(r) == 0)"
+            }
+          ],
+          "input_metadata": [],
+          "source": {
+            "expression": "true"
+          }
+        },
+        "error_category": null,
+        "family": "ordered-guard",
+        "fixture": "many-prefix-15-5000",
+        "generator": null,
+        "guard_error_category": null,
+        "guard_input": "pending",
+        "guard_phase": "standalone",
+        "index": 82,
+        "outcome": "value",
+        "replacement_execution": true,
+        "scenario": "default"
+      }
+    },
+    "guard.success.bound.work": {
+      "value": 4584309,
+      "witness": {
+        "definition": {
+          "declarations": [
+            {
+              "kind": "Many",
+              "name": "rows"
+            },
+            {
+              "kind": "One",
+              "name": "pending"
+            }
+          ],
+          "guards": [
+            {
+              "input": "pending",
+              "source": "rows.all(r,r.body.matches('x'))"
+            }
+          ],
+          "input_metadata": [],
+          "source": {
+            "expression": "true"
+          }
+        },
+        "error_category": null,
+        "family": "ordered-guard",
+        "fixture": "total-B-regex-guard",
+        "generator": null,
+        "guard_error_category": null,
+        "guard_input": "pending",
+        "guard_phase": "standalone",
+        "index": 194,
+        "outcome": "value",
+        "replacement_execution": true,
+        "scenario": "5000-text-rows"
+      }
+    },
+    "guard.success.cost.memory": {
+      "value": 409,
+      "witness": {
+        "definition": {
+          "declarations": [
+            {
+              "kind": "Scalar { kind: Bool, nullable: false }",
+              "name": "enabled"
+            },
+            {
+              "kind": "Many",
+              "name": "prefix0"
+            },
+            {
+              "kind": "Many",
+              "name": "prefix1"
+            },
+            {
+              "kind": "Many",
+              "name": "prefix2"
+            },
+            {
+              "kind": "Many",
+              "name": "prefix3"
+            },
+            {
+              "kind": "Many",
+              "name": "prefix4"
+            },
+            {
+              "kind": "Many",
+              "name": "prefix5"
+            },
+            {
+              "kind": "Many",
+              "name": "prefix6"
+            },
+            {
+              "kind": "Many",
+              "name": "prefix7"
+            },
+            {
+              "kind": "Many",
+              "name": "prefix8"
+            },
+            {
+              "kind": "Many",
+              "name": "prefix9"
+            },
+            {
+              "kind": "Many",
+              "name": "prefix10"
+            },
+            {
+              "kind": "Many",
+              "name": "prefix11"
+            },
+            {
+              "kind": "Many",
+              "name": "prefix12"
+            },
+            {
+              "kind": "Many",
+              "name": "prefix13"
+            },
+            {
+              "kind": "Many",
+              "name": "prefix14"
+            },
+            {
+              "kind": "One",
+              "name": "pending"
+            }
+          ],
+          "guards": [
+            {
+              "input": "pending",
+              "source": "enabled && prefix0.all(r,size(r) == 0) && prefix1.all(r,size(r) == 0) && prefix2.all(r,size(r) == 0) && prefix3.all(r,size(r) == 0) && prefix4.all(r,size(r) == 0) && prefix5.all(r,size(r) == 0) && prefix6.all(r,size(r) == 0) && prefix7.all(r,size(r) == 0) && prefix8.all(r,size(r) == 0) && prefix9.all(r,size(r) == 0) && prefix10.all(r,size(r) == 0) && prefix11.all(r,size(r) == 0) && prefix12.all(r,size(r) == 0) && prefix13.all(r,size(r) == 0) && prefix14.all(r,size(r) == 0)"
+            }
+          ],
+          "input_metadata": [],
+          "source": {
+            "expression": "true"
+          }
+        },
+        "error_category": null,
+        "family": "ordered-guard",
+        "fixture": "many-prefix-15-5000",
+        "generator": null,
+        "guard_error_category": null,
+        "guard_input": "pending",
+        "guard_phase": "standalone",
+        "index": 82,
+        "outcome": "value",
+        "replacement_execution": true,
+        "scenario": "default"
+      }
+    },
+    "guard.success.cost.work": {
+      "value": 3995004,
+      "witness": {
+        "definition": {
+          "declarations": [
+            {
+              "kind": "Many",
+              "name": "rows"
+            },
+            {
+              "kind": "One",
+              "name": "pending"
+            }
+          ],
+          "guards": [
+            {
+              "input": "pending",
+              "source": "rows.all(r,r.body.matches('x'))"
+            }
+          ],
+          "input_metadata": [],
+          "source": {
+            "expression": "true"
+          }
+        },
+        "error_category": null,
+        "family": "ordered-guard",
+        "fixture": "total-B-regex-guard",
+        "generator": null,
+        "guard_error_category": null,
+        "guard_input": "pending",
+        "guard_phase": "standalone",
+        "index": 194,
+        "outcome": "value",
+        "replacement_execution": true,
+        "scenario": "5000-text-rows"
+      }
+    },
+    "guard.success.input_cost.memory": {
+      "value": 2401149,
+      "witness": {
+        "definition": {
+          "declarations": [
+            {
+              "kind": "Scalar { kind: Bool, nullable: false }",
+              "name": "enabled"
+            },
+            {
+              "kind": "Many",
+              "name": "prefix0"
+            },
+            {
+              "kind": "Many",
+              "name": "prefix1"
+            },
+            {
+              "kind": "Many",
+              "name": "prefix2"
+            },
+            {
+              "kind": "Many",
+              "name": "prefix3"
+            },
+            {
+              "kind": "Many",
+              "name": "prefix4"
+            },
+            {
+              "kind": "Many",
+              "name": "prefix5"
+            },
+            {
+              "kind": "Many",
+              "name": "prefix6"
+            },
+            {
+              "kind": "Many",
+              "name": "prefix7"
+            },
+            {
+              "kind": "Many",
+              "name": "prefix8"
+            },
+            {
+              "kind": "Many",
+              "name": "prefix9"
+            },
+            {
+              "kind": "Many",
+              "name": "prefix10"
+            },
+            {
+              "kind": "Many",
+              "name": "prefix11"
+            },
+            {
+              "kind": "Many",
+              "name": "prefix12"
+            },
+            {
+              "kind": "Many",
+              "name": "prefix13"
+            },
+            {
+              "kind": "Many",
+              "name": "prefix14"
+            },
+            {
+              "kind": "One",
+              "name": "pending"
+            }
+          ],
+          "guards": [
+            {
+              "input": "pending",
+              "source": "enabled && prefix0.all(r,size(r) == 0) && prefix1.all(r,size(r) == 0) && prefix2.all(r,size(r) == 0) && prefix3.all(r,size(r) == 0) && prefix4.all(r,size(r) == 0) && prefix5.all(r,size(r) == 0) && prefix6.all(r,size(r) == 0) && prefix7.all(r,size(r) == 0) && prefix8.all(r,size(r) == 0) && prefix9.all(r,size(r) == 0) && prefix10.all(r,size(r) == 0) && prefix11.all(r,size(r) == 0) && prefix12.all(r,size(r) == 0) && prefix13.all(r,size(r) == 0) && prefix14.all(r,size(r) == 0)"
+            }
+          ],
+          "input_metadata": [],
+          "source": {
+            "expression": "true"
+          }
+        },
+        "error_category": null,
+        "family": "ordered-guard",
+        "fixture": "many-prefix-15-5000",
+        "generator": null,
+        "guard_error_category": null,
+        "guard_input": "pending",
+        "guard_phase": "standalone",
+        "index": 82,
+        "outcome": "value",
+        "replacement_execution": true,
+        "scenario": "default"
+      }
+    },
+    "guard.success.input_cost.work": {
+      "value": 112550,
+      "witness": {
+        "definition": {
+          "declarations": [
+            {
+              "kind": "Scalar { kind: Bool, nullable: false }",
+              "name": "enabled"
+            },
+            {
+              "kind": "Many",
+              "name": "prefix0"
+            },
+            {
+              "kind": "Many",
+              "name": "prefix1"
+            },
+            {
+              "kind": "Many",
+              "name": "prefix2"
+            },
+            {
+              "kind": "Many",
+              "name": "prefix3"
+            },
+            {
+              "kind": "Many",
+              "name": "prefix4"
+            },
+            {
+              "kind": "Many",
+              "name": "prefix5"
+            },
+            {
+              "kind": "Many",
+              "name": "prefix6"
+            },
+            {
+              "kind": "Many",
+              "name": "prefix7"
+            },
+            {
+              "kind": "Many",
+              "name": "prefix8"
+            },
+            {
+              "kind": "Many",
+              "name": "prefix9"
+            },
+            {
+              "kind": "Many",
+              "name": "prefix10"
+            },
+            {
+              "kind": "Many",
+              "name": "prefix11"
+            },
+            {
+              "kind": "Many",
+              "name": "prefix12"
+            },
+            {
+              "kind": "Many",
+              "name": "prefix13"
+            },
+            {
+              "kind": "Many",
+              "name": "prefix14"
+            },
+            {
+              "kind": "One",
+              "name": "pending"
+            }
+          ],
+          "guards": [
+            {
+              "input": "pending",
+              "source": "enabled && prefix0.all(r,size(r) == 0) && prefix1.all(r,size(r) == 0) && prefix2.all(r,size(r) == 0) && prefix3.all(r,size(r) == 0) && prefix4.all(r,size(r) == 0) && prefix5.all(r,size(r) == 0) && prefix6.all(r,size(r) == 0) && prefix7.all(r,size(r) == 0) && prefix8.all(r,size(r) == 0) && prefix9.all(r,size(r) == 0) && prefix10.all(r,size(r) == 0) && prefix11.all(r,size(r) == 0) && prefix12.all(r,size(r) == 0) && prefix13.all(r,size(r) == 0) && prefix14.all(r,size(r) == 0)"
+            }
+          ],
+          "input_metadata": [],
+          "source": {
+            "expression": "true"
+          }
+        },
+        "error_category": null,
+        "family": "ordered-guard",
+        "fixture": "many-prefix-15-5000",
+        "generator": null,
+        "guard_error_category": null,
+        "guard_input": "pending",
+        "guard_phase": "standalone",
+        "index": 82,
+        "outcome": "value",
+        "replacement_execution": true,
+        "scenario": "default"
+      }
+    },
+    "native_aux.cells": {
+      "value": 9641,
+      "witness": {
+        "definition": {
+          "declarations": [
+            {
+              "kind": "One",
+              "name": "left"
+            },
+            {
+              "kind": "One",
+              "name": "right"
+            }
+          ],
+          "guards": [],
+          "input_metadata": [],
+          "source": {
+            "clauses": [
+              {
+                "id": "allow",
+                "result": "{'decision':'allow','reason':{'code':'within-policy','details':['capacity','region','term']},'used':['left','right']}",
+                "when": "left.f0 >= right.f0 && left.f1 >= right.f1 && left.f2 >= right.f2 && left.f3 >= right.f3 && left.f4 >= right.f4 && left.f5 >= right.f5 && left.f6 >= right.f6 && left.f7 >= right.f7 && left.f8 >= right.f8 && left.f9 >= right.f9 && left.f10 >= right.f10 && left.f11 >= right.f11 && left.f12 >= right.f12 && left.f13 >= right.f13 && left.f14 >= right.f14 && left.f15 >= right.f15 && left.f16 >= right.f16 && left.f17 >= right.f17 && left.f18 >= right.f18 && left.f19 >= right.f19 && left.f20 >= right.f20 && left.f21 >= right.f21 && left.f22 >= right.f22 && left.f23 >= right.f23 && left.f24 >= right.f24 && left.f25 >= right.f25 && left.f26 >= right.f26 && left.f27 >= right.f27 && left.f28 >= right.f28 && left.f29 >= right.f29 && left.f30 >= right.f30 && left.f31 >= right.f31 && left.f32 >= right.f32 && left.f33 >= right.f33 && left.f34 >= right.f34 && left.f35 >= right.f35 && left.f36 >= right.f36 && left.f37 >= right.f37 && left.f38 >= right.f38 && left.f39 >= right.f39"
+              }
+            ]
+          }
+        },
+        "fixture": "wide-40",
+        "generator": null,
+        "phase": "allow:When"
+      }
+    },
+    "native_aux.nodes": {
+      "value": 4531,
+      "witness": {
+        "definition": {
+          "declarations": [
+            {
+              "kind": "One",
+              "name": "left"
+            },
+            {
+              "kind": "One",
+              "name": "right"
+            }
+          ],
+          "guards": [],
+          "input_metadata": [],
+          "source": {
+            "clauses": [
+              {
+                "id": "allow",
+                "result": "{'decision':'allow','reason':{'code':'within-policy','details':['capacity','region','term']},'used':['left','right']}",
+                "when": "left.f0 >= right.f0 && left.f1 >= right.f1 && left.f2 >= right.f2 && left.f3 >= right.f3 && left.f4 >= right.f4 && left.f5 >= right.f5 && left.f6 >= right.f6 && left.f7 >= right.f7 && left.f8 >= right.f8 && left.f9 >= right.f9 && left.f10 >= right.f10 && left.f11 >= right.f11 && left.f12 >= right.f12 && left.f13 >= right.f13 && left.f14 >= right.f14 && left.f15 >= right.f15 && left.f16 >= right.f16 && left.f17 >= right.f17 && left.f18 >= right.f18 && left.f19 >= right.f19 && left.f20 >= right.f20 && left.f21 >= right.f21 && left.f22 >= right.f22 && left.f23 >= right.f23 && left.f24 >= right.f24 && left.f25 >= right.f25 && left.f26 >= right.f26 && left.f27 >= right.f27 && left.f28 >= right.f28 && left.f29 >= right.f29 && left.f30 >= right.f30 && left.f31 >= right.f31 && left.f32 >= right.f32 && left.f33 >= right.f33 && left.f34 >= right.f34 && left.f35 >= right.f35 && left.f36 >= right.f36 && left.f37 >= right.f37 && left.f38 >= right.f38 && left.f39 >= right.f39"
+              }
+            ]
+          }
+        },
+        "fixture": "wide-40",
+        "generator": null,
+        "phase": "allow:When"
+      }
+    },
+    "native_aux.shapes": {
+      "value": 644,
+      "witness": {
+        "definition": {
+          "declarations": [
+            {
+              "kind": "One",
+              "name": "left"
+            },
+            {
+              "kind": "One",
+              "name": "right"
+            }
+          ],
+          "guards": [],
+          "input_metadata": [],
+          "source": {
+            "clauses": [
+              {
+                "id": "allow",
+                "result": "{'decision':'allow','reason':{'code':'within-policy','details':['capacity','region','term']},'used':['left','right']}",
+                "when": "left.f0 >= right.f0 && left.f1 >= right.f1 && left.f2 >= right.f2 && left.f3 >= right.f3 && left.f4 >= right.f4 && left.f5 >= right.f5 && left.f6 >= right.f6 && left.f7 >= right.f7 && left.f8 >= right.f8 && left.f9 >= right.f9 && left.f10 >= right.f10 && left.f11 >= right.f11 && left.f12 >= right.f12 && left.f13 >= right.f13 && left.f14 >= right.f14 && left.f15 >= right.f15 && left.f16 >= right.f16 && left.f17 >= right.f17 && left.f18 >= right.f18 && left.f19 >= right.f19 && left.f20 >= right.f20 && left.f21 >= right.f21 && left.f22 >= right.f22 && left.f23 >= right.f23 && left.f24 >= right.f24 && left.f25 >= right.f25 && left.f26 >= right.f26 && left.f27 >= right.f27 && left.f28 >= right.f28 && left.f29 >= right.f29 && left.f30 >= right.f30 && left.f31 >= right.f31 && left.f32 >= right.f32 && left.f33 >= right.f33 && left.f34 >= right.f34 && left.f35 >= right.f35 && left.f36 >= right.f36 && left.f37 >= right.f37 && left.f38 >= right.f38 && left.f39 >= right.f39"
+              }
+            ]
+          }
+        },
+        "fixture": "wide-40",
+        "generator": null,
+        "phase": "allow:When"
+      }
+    },
+    "native_aux.visits": {
+      "value": 2700,
+      "witness": {
+        "definition": {
+          "declarations": [
+            {
+              "kind": "One",
+              "name": "left"
+            },
+            {
+              "kind": "One",
+              "name": "right"
+            }
+          ],
+          "guards": [],
+          "input_metadata": [],
+          "source": {
+            "clauses": [
+              {
+                "id": "allow",
+                "result": "{'decision':'allow','reason':{'code':'within-policy','details':['capacity','region','term']},'used':['left','right']}",
+                "when": "left.f0 >= right.f0 && left.f1 >= right.f1 && left.f2 >= right.f2 && left.f3 >= right.f3 && left.f4 >= right.f4 && left.f5 >= right.f5 && left.f6 >= right.f6 && left.f7 >= right.f7 && left.f8 >= right.f8 && left.f9 >= right.f9 && left.f10 >= right.f10 && left.f11 >= right.f11 && left.f12 >= right.f12 && left.f13 >= right.f13 && left.f14 >= right.f14 && left.f15 >= right.f15 && left.f16 >= right.f16 && left.f17 >= right.f17 && left.f18 >= right.f18 && left.f19 >= right.f19 && left.f20 >= right.f20 && left.f21 >= right.f21 && left.f22 >= right.f22 && left.f23 >= right.f23 && left.f24 >= right.f24 && left.f25 >= right.f25 && left.f26 >= right.f26 && left.f27 >= right.f27 && left.f28 >= right.f28 && left.f29 >= right.f29 && left.f30 >= right.f30 && left.f31 >= right.f31 && left.f32 >= right.f32 && left.f33 >= right.f33 && left.f34 >= right.f34 && left.f35 >= right.f35 && left.f36 >= right.f36 && left.f37 >= right.f37 && left.f38 >= right.f38 && left.f39 >= right.f39"
+              }
+            ]
+          }
+        },
+        "fixture": "wide-40",
+        "generator": null,
+        "phase": "allow:When"
+      }
+    }
+  },
+  "admitted_bound_maxima": {
+    "memory": 182473871,
+    "result_bytes": 49084168,
+    "work": 4612436
+  },
+  "auxiliary_limits": {
+    "cells": 1000000,
+    "nodes": 250000,
+    "shapes": 16384,
+    "visits": 1000000
+  },
+  "auxiliary_storage": {
+    "arc_edge_bytes": 8,
+    "ast_depth": 32,
+    "body_depth": 2,
+    "ceilings": {
+      "cells": 1000000,
+      "nodes": 250000,
+      "shapes": 16384,
+      "visits": 1000000
+    },
+    "kind_inline_bytes": 56,
+    "last_owner_drop_edge_payload_max": 4000000,
+    "node_inline_bytes": 48,
+    "node_inline_payload_max": 12000000,
+    "real_tokens": 1024,
+    "scope": "Inline payload models exclude allocator headers/capacity/alignment. Cells cumulatively bound traversal/memo/coefficient records with bounded Rust record sizes; Shapes also count clone/rebind/join operations and bound nested union slots. These are finite native auxiliary-control storage implications, not an allocator census or runtime H charge. Visits bound traversal work. Last-owner queues have at most2edges per constructed node; source/declaration/value validation imposes separate finite bounds.",
+    "shape_inline_bytes": 120,
+    "shape_inline_payload_model": 1966080,
+    "source_bytes": 8192,
+    "value_depth": 35
+  },
+  "by_family": {
+    "callable-semantic": {
+      "admitted_candidates": 41,
+      "body_error:FunctionError": 9,
+      "body_error:NoSuchOverload": 9,
+      "body_error:Overflow": 4,
+      "candidates": 41,
+      "expected:AdmitSemanticError(\"FunctionError\")": 9,
+      "expected:AdmitSemanticError(\"NoSuchOverload\")": 9,
+      "expected:AdmitSemanticError(\"Overflow\")": 4,
+      "expected:AdmitValue": 19,
+      "outcome:semantic_error": 22,
+      "outcome:value": 19
+    },
+    "callable-shape": {
+      "admitted_candidates": 51,
+      "body_error:NoSuchOverload": 14,
+      "candidates": 51,
+      "expected:AdmitSemanticError(\"NoSuchOverload\")": 14,
+      "expected:AdmitValue": 37,
+      "outcome:semantic_error": 14,
+      "outcome:value": 37
+    },
+    "canonical-many": {
+      "admitted_candidates": 16,
+      "candidates": 16,
+      "expected:AdmitValue": 16,
+      "outcome:value": 16
+    },
+    "copy-error-prefix": {
+      "admitted_candidates": 16,
+      "body_error:FunctionError": 2,
+      "body_error:UnexpectedType": 2,
+      "body_error:UnsupportedKeyType": 3,
+      "candidates": 16,
+      "expected:AdmitSemanticError(\"FunctionError\")": 2,
+      "expected:AdmitSemanticError(\"UnexpectedType\")": 2,
+      "expected:AdmitSemanticError(\"UnsupportedKeyType\")": 3,
+      "expected:AdmitValue": 9,
+      "outcome:semantic_error": 7,
+      "outcome:value": 9
+    },
+    "cross-product-control": {
+      "admitted_candidates": 1,
+      "candidates": 1,
+      "expected:AdmitValue": 1,
+      "outcome:value": 1
+    },
+    "cross-product-refusal": {
+      "candidates": 10,
+      "expected:Refuse(\"many-product-or-repeated-many-traversal\")": 10,
+      "rejected_candidates": 10,
+      "rejection_reason:cross_product": 10,
+      "rejection_stage:resource_product": 10
+    },
+    "heterogeneous": {
+      "admitted_candidates": 10,
+      "candidates": 10,
+      "expected:AdmitValue": 10,
+      "outcome:value": 10
+    },
+    "input-refusal": {
+      "admitted_candidates": 4,
+      "candidates": 4,
+      "expected:Refuse(\"external-scalar-kind-or-nonfinite\")": 3,
+      "expected:Refuse(\"total-serialized-input-bytes\")": 1,
+      "outcome:input_refusal": 4
+    },
+    "loop-control": {
+      "admitted_candidates": 7,
+      "candidates": 7,
+      "expected:AdmitValue": 7,
+      "outcome:value": 7
+    },
+    "m1-max-many": {
+      "admitted_candidates": 5,
+      "candidates": 5,
+      "expected:AdmitValue": 5,
+      "guard_value_executions": 2,
+      "outcome:value": 5
+    },
+    "m1-original": {
+      "admitted_candidates": 5,
+      "body_error:NoSuchKey": 1,
+      "body_error:NoSuchOverload": 3,
+      "candidates": 5,
+      "expected:AdmitValue": 12,
+      "expected:AdmitValueOrSemanticError": 5,
+      "guard_value_executions": 6,
+      "outcome:semantic_error": 4,
+      "outcome:value": 13
+    },
+    "map-key-equality": {
+      "admitted_candidates": 2,
+      "candidates": 2,
+      "expected:AdmitValue": 2,
+      "outcome:value": 2
+    },
+    "ordered-guard": {
+      "admitted_candidates": 6,
+      "candidates": 8,
+      "expected:AdmitSemanticError(\"guard-result-kind\")": 1,
+      "expected:AdmitValue": 5,
+      "expected:Refuse(\"guard-future-reference\")": 1,
+      "expected:Refuse(\"guard-self-reference\")": 1,
+      "guard_error:NoSuchOverload": 2,
+      "guard_value_executions": 10,
+      "outcome:no_token_guard_error": 1,
+      "outcome:value": 5,
+      "rejected_candidates": 2,
+      "rejection_reason:unpermitted_rejection": 2,
+      "rejection_stage:parser_shape_names_or_internal": 2
+    },
+    "temporal-boundary": {
+      "admitted_candidates": 2,
+      "body_error:FunctionError": 1,
+      "candidates": 2,
+      "expected:AdmitSemanticError(\"FunctionError\")": 1,
+      "expected:AdmitValue": 1,
+      "outcome:semantic_error": 1,
+      "outcome:value": 1
+    },
+    "text-boundary": {
+      "admitted_candidates": 5,
+      "candidates": 5,
+      "expected:AdmitValue": 3,
+      "expected:CandidateDependent(\"text-copy-multiplicity\")": 2,
+      "outcome:value": 5
+    },
+    "total-B-text": {
+      "admitted_candidates": 8,
+      "candidates": 8,
+      "expected:AdmitValue": 8,
+      "outcome:value": 8
+    },
+    "wide": {
+      "admitted_candidates": 4,
+      "candidates": 4,
+      "expected:AdmitValue": 4,
+      "outcome:value": 4
+    }
+  },
+  "counts": {
+    "admitted_candidates": 183,
+    "admitted_distinct": 168,
+    "candidates": 195,
+    "canonical_missing": 0,
+    "canonicalized": 195,
+    "distinct_candidates": 180,
+    "duplicate_candidates": 15,
+    "exercised_distinct": 165,
+    "failures": 0,
+    "false_refusals": 0,
+    "guard_failure_executions": 0,
+    "guard_semantic_error_executions": 2,
+    "guard_value_executions": 18,
+    "input_refusals": 4,
+    "no_token_guard_error": 1,
+    "no_token_required": 0,
+    "rejected_candidates": 12,
+    "rejected_distinct": 12,
+    "required_missing_events": 5,
+    "required_replacements": 5,
+    "semantic_error_distinct": 48,
+    "semantic_error_executions": 48,
+    "successful_distinct": 122,
+    "value_executions": 142
+  },
+  "execution": {
+    "arch": "x86_64",
+    "available_parallelism": 12,
+    "binary_sha256": "5ffa225d4907100a4967f2f60136806352a76c62e4d35cbd2745c77abd95e71e",
+    "command": {
+      "candidate": 18446744073709551615,
+      "mode": "fixtures",
+      "requested_successes": 0
+    },
+    "cpu": "model name\t: AMD EPYC 7232P 8-Core Processor",
+    "debug_assertions": true,
+    "elapsed_seconds": 28.62072425,
+    "execution_head_end": "b307a2c5954630eb58b69159495f8422ee6c800f",
+    "execution_head_start": "b307a2c5954630eb58b69159495f8422ee6c800f",
+    "memory": "MemTotal:       131768020 kB",
+    "os": "linux",
+    "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18)\nbinary: rustc\ncommit-hash: 88d9e12ae178fab0fb5cc050a94da85685d449ea\ncommit-date: 2026-08-18\nhost: x86_64-unknown-linux-gnu\nrelease: 1.98.0\nLLVM version: 22.1.8",
+    "scope": "Native wall time includes source check, input validation, proof diagnostics and runtime; not guest fuel or allocator high-water.",
+    "working_tree_end": "",
+    "working_tree_start": ""
+  },
+  "failures": [],
+  "generator": null,
+  "interim": true,
+  "limits": {
+    "guard_memory": 1048576,
+    "guard_work": 16000000,
+    "input_count": 16,
+    "memory": 402653184,
+    "string_bytes": 4096,
+    "work": 16000000
+  },
+  "m1_original_examples": [
+    {
+      "example": "allow under band",
+      "group": "bands",
+      "guard_observations": [],
+      "note": "Original expected decision/required/unknown gating is opaque adapter evidence. Raw clauses and prefix outcomes are reported independently.",
+      "opaque_adapter_expected": {
+        "clause": "bands_allow",
+        "decision": "allow",
+        "used": [
+          "d1"
+        ]
+      },
+      "raw_outcome": "value",
+      "raw_phase": {
+        "clause_index": 1,
+        "phase": "Result"
+      },
+      "replacement_execution": false
+    },
+    {
+      "example": "approval in band",
+      "group": "bands",
+      "guard_observations": [],
+      "note": "Original expected decision/required/unknown gating is opaque adapter evidence. Raw clauses and prefix outcomes are reported independently.",
+      "opaque_adapter_expected": {
+        "clause": "bands_approval",
+        "decision": "needs_approval",
+        "used": [
+          "d2"
+        ]
+      },
+      "raw_outcome": "value",
+      "raw_phase": {
+        "clause_index": 3,
+        "phase": "Result"
+      },
+      "replacement_execution": false
+    },
+    {
+      "example": "term shifts band",
+      "group": "bands",
+      "guard_observations": [],
+      "note": "Original expected decision/required/unknown gating is opaque adapter evidence. Raw clauses and prefix outcomes are reported independently.",
+      "opaque_adapter_expected": {
+        "clause": "term_bands_allow",
+        "decision": "allow",
+        "used": [
+          "d3"
+        ]
+      },
+      "raw_outcome": "value",
+      "raw_phase": {
+        "clause_index": 0,
+        "phase": "Result"
+      },
+      "replacement_execution": false
+    },
+    {
+      "example": "missing discount is unknown",
+      "group": "bands",
+      "guard_observations": [],
+      "note": "Original expected decision/required/unknown gating is opaque adapter evidence. Raw clauses and prefix outcomes are reported independently.",
+      "opaque_adapter_expected": {
+        "clause": "unknown(discount)",
+        "decision": "unknown",
+        "used": []
+      },
+      "raw_outcome": "semantic_error",
+      "raw_phase": {
+        "clause_index": 1,
+        "phase": "When"
+      },
+      "replacement_execution": false
+    },
+    {
+      "example": "seats available",
+      "group": "capacity",
+      "guard_observations": [],
+      "note": "Original expected decision/required/unknown gating is opaque adapter evidence. Raw clauses and prefix outcomes are reported independently.",
+      "opaque_adapter_expected": {
+        "clause": "seats_ok",
+        "decision": "allow",
+        "used": [
+          "tt",
+          "t1"
+        ]
+      },
+      "raw_outcome": "value",
+      "raw_phase": {
+        "clause_index": 0,
+        "phase": "Result"
+      },
+      "replacement_execution": false
+    },
+    {
+      "example": "sold out",
+      "group": "capacity",
+      "guard_observations": [],
+      "note": "Original expected decision/required/unknown gating is opaque adapter evidence. Raw clauses and prefix outcomes are reported independently.",
+      "opaque_adapter_expected": {
+        "clause": "sold_out",
+        "decision": "deny",
+        "used": [
+          "tt",
+          "t1",
+          "t2"
+        ]
+      },
+      "raw_outcome": "value",
+      "raw_phase": {
+        "clause_index": 1,
+        "phase": "Result"
+      },
+      "replacement_execution": false
+    },
+    {
+      "example": "missing capacity is unknown",
+      "group": "capacity",
+      "guard_observations": [],
+      "note": "Original expected decision/required/unknown gating is opaque adapter evidence. Raw clauses and prefix outcomes are reported independently.",
+      "opaque_adapter_expected": {
+        "clause": "unknown(capacity)",
+        "decision": "unknown",
+        "used": []
+      },
+      "raw_outcome": "semantic_error",
+      "raw_phase": {
+        "clause_index": 0,
+        "phase": "When"
+      },
+      "replacement_execution": false
+    },
+    {
+      "example": "no exception needed",
+      "group": "eu",
+      "guard_observations": [
+        {
+          "error": null,
+          "input": "cap",
+          "required": false
+        },
+        {
+          "error": null,
+          "input": "cap",
+          "required": false
+        }
+      ],
+      "note": "Original expected decision/required/unknown gating is opaque adapter evidence. Raw clauses and prefix outcomes are reported independently.",
+      "opaque_adapter_expected": {
+        "clause": "not_applicable",
+        "decision": "allow",
+        "used": [
+          "r0"
+        ]
+      },
+      "raw_outcome": "value",
+      "raw_phase": {
+        "clause_index": 0,
+        "phase": "Result"
+      },
+      "replacement_execution": false
+    },
+    {
+      "example": "ga eu capability",
+      "group": "eu",
+      "guard_observations": [
+        {
+          "error": null,
+          "input": "cap",
+          "required": true
+        }
+      ],
+      "note": "Original expected decision/required/unknown gating is opaque adapter evidence. Raw clauses and prefix outcomes are reported independently.",
+      "opaque_adapter_expected": {
+        "clause": "eu_ok",
+        "decision": "allow",
+        "used": [
+          "r1",
+          "cap-eu"
+        ]
+      },
+      "raw_outcome": "value",
+      "raw_phase": {
+        "clause_index": 1,
+        "phase": "Result"
+      },
+      "replacement_execution": false
+    },
+    {
+      "example": "beta needs legal",
+      "group": "eu",
+      "guard_observations": [
+        {
+          "error": null,
+          "input": "cap",
+          "required": true
+        }
+      ],
+      "note": "Original expected decision/required/unknown gating is opaque adapter evidence. Raw clauses and prefix outcomes are reported independently.",
+      "opaque_adapter_expected": {
+        "clause": "eu_legal",
+        "decision": "needs_approval",
+        "used": [
+          "r2",
+          "cap-eu"
+        ]
+      },
+      "raw_outcome": "value",
+      "raw_phase": {
+        "clause_index": 2,
+        "phase": "Result"
+      },
+      "replacement_execution": false
+    },
+    {
+      "example": "missing capability is unknown",
+      "group": "eu",
+      "guard_observations": [
+        {
+          "error": null,
+          "input": "cap",
+          "required": true
+        },
+        {
+          "error": null,
+          "input": "cap",
+          "required": true
+        }
+      ],
+      "note": "Original expected decision/required/unknown gating is opaque adapter evidence. Raw clauses and prefix outcomes are reported independently.",
+      "opaque_adapter_expected": {
+        "clause": "unknown(capability)",
+        "decision": "unknown",
+        "used": []
+      },
+      "raw_outcome": "semantic_error",
+      "raw_phase": {
+        "clause_index": 1,
+        "phase": "When"
+      },
+      "replacement_execution": true
+    },
+    {
+      "example": "approval overrides",
+      "group": "full-deal",
+      "guard_observations": [],
+      "note": "Original expected decision/required/unknown gating is opaque adapter evidence. Raw clauses and prefix outcomes are reported independently.",
+      "opaque_adapter_expected": {
+        "clause": "approval",
+        "decision": "allow",
+        "used": [
+          "a1",
+          "ap1"
+        ]
+      },
+      "raw_outcome": "value",
+      "raw_phase": {
+        "clause_index": 0,
+        "phase": "Result"
+      },
+      "replacement_execution": false
+    },
+    {
+      "example": "policy allow",
+      "group": "full-deal",
+      "guard_observations": [],
+      "note": "Original expected decision/required/unknown gating is opaque adapter evidence. Raw clauses and prefix outcomes are reported independently.",
+      "opaque_adapter_expected": {
+        "clause": "policy_allow",
+        "decision": "allow",
+        "used": [
+          "e2",
+          "p-seg"
+        ]
+      },
+      "raw_outcome": "value",
+      "raw_phase": {
+        "clause_index": 1,
+        "phase": "Result"
+      },
+      "replacement_execution": false
+    },
+    {
+      "example": "no policy is unknown",
+      "group": "full-deal",
+      "guard_observations": [],
+      "note": "Original expected decision/required/unknown gating is opaque adapter evidence. Raw clauses and prefix outcomes are reported independently.",
+      "opaque_adapter_expected": {
+        "clause": "unknown(policy)",
+        "decision": "unknown",
+        "used": []
+      },
+      "raw_outcome": "semantic_error",
+      "raw_phase": {
+        "clause_index": 1,
+        "phase": "When"
+      },
+      "replacement_execution": false
+    },
+    {
+      "example": "big total needs review",
+      "group": "sheet",
+      "guard_observations": [],
+      "note": "Original expected decision/required/unknown gating is opaque adapter evidence. Raw clauses and prefix outcomes are reported independently.",
+      "opaque_adapter_expected": {
+        "clause": "review",
+        "decision": "needs_review",
+        "used": [
+          "sh-big",
+          "l1",
+          "l2"
+        ]
+      },
+      "raw_outcome": "value",
+      "raw_phase": {
+        "clause_index": 0,
+        "phase": "Result"
+      },
+      "replacement_execution": false
+    },
+    {
+      "example": "small total ok",
+      "group": "sheet",
+      "guard_observations": [],
+      "note": "Original expected decision/required/unknown gating is opaque adapter evidence. Raw clauses and prefix outcomes are reported independently.",
+      "opaque_adapter_expected": {
+        "clause": "sheet_ok",
+        "decision": "ok",
+        "used": [
+          "sh-small",
+          "m1"
+        ]
+      },
+      "raw_outcome": "value",
+      "raw_phase": {
+        "clause_index": 1,
+        "phase": "Result"
+      },
+      "replacement_execution": false
+    },
+    {
+      "example": "missing rate is unknown",
+      "group": "sheet",
+      "guard_observations": [],
+      "note": "Original expected decision/required/unknown gating is opaque adapter evidence. Raw clauses and prefix outcomes are reported independently.",
+      "opaque_adapter_expected": {
+        "clause": "unknown(tax_rate)",
+        "decision": "unknown",
+        "used": []
+      },
+      "raw_outcome": "value",
+      "raw_phase": {
+        "clause_index": 1,
+        "phase": "Result"
+      },
+      "replacement_execution": false
+    }
+  ],
+  "mode": "mandatory-fixtures",
+  "note": "Counts use exact expanded-AST identity; this digest is reproducibility evidence, not the distinctness test. Full failure witnesses retained.",
+  "ordered_canonical_fnv1a64": "cbd77ab6b1fdffdf",
+  "policy_id": "cel-subset@1/p1"
+}

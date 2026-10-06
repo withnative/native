@@ -1456,3 +1456,38 @@ fn fingerprint_is_jcs_stable_and_excludes_receiver_ingest_time() {
     a.actor = "other".into();
     assert_ne!(a.fingerprint().unwrap(), fingerprint);
 }
+
+#[tokio::test]
+async fn relationship_history_is_deferred_but_append_only_operations_still_abort() {
+    use crate::conformance::{
+        format_report, run_conformance, run_conformance_with_profile, ConformanceProfile,
+    };
+
+    let db = crate::db::create_database(":memory:").await.unwrap();
+    // SQL-valid but semantically invalid historical payload, on a disposable fixture.
+    sqlx::query("INSERT INTO relationship_events (id,stream_kind,stream_id,stream_version,relationship_origin_db_id,relationship_id,type,payload,actor,issuer_origin_db_id,occurred_at,ingested_at) VALUES ('invalid-history','relationship','fixture',1,'ndb_00000000000000000000000000000000','fixture','relationship.created.v1','{}','fixture','ndb_00000000000000000000000000000000','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')")
+        .execute(db.write_pool()).await.unwrap();
+    for statement in [
+        "UPDATE relationship_events SET actor='tampered'",
+        "DELETE FROM relationship_events",
+    ] {
+        let err = sqlx::query(statement)
+            .execute(db.write_pool())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("append-only"), "{err}");
+    }
+    let core = run_conformance_with_profile(&db, ConformanceProfile::Core).await;
+    assert!(core.ok, "{}", format_report(&core));
+    let full = run_conformance(&db).await;
+    assert!(!full.ok);
+    assert!(
+        !full
+            .checks
+            .iter()
+            .find(|c| c.check == "relationship-event-log-state")
+            .unwrap()
+            .ok
+    );
+    db.close().await;
+}

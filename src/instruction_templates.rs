@@ -1266,6 +1266,7 @@ pub(crate) async fn provision_member_in(
         "member provisioning",
         Some(account_id),
         true,
+        false,
     )
     .await?;
     let after: (i64, i64, i64) = (

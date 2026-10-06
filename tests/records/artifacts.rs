@@ -730,8 +730,183 @@ async fn mdx_prospective_writes_are_validated_atomically_and_host_failures_stay_
     assert!(unsupported.get("plan").is_none());
 }
 
+/// A forced source counterfactual, not a reproduction of a historical flake.
+/// Every deliberate bypass below is enclosed by the shared exclusive lease.
+#[tokio::test]
+async fn html_mcp_configuration_leases_control_actual_launch_origins() {
+    let writer = crate::runtime_config_fixture::writer().await;
+    let (db, registry) = fixture().await;
+    let id = "a7710001-0000-4000-8000-000000000102";
+    html_artifact(&registry, &db, id, HTML_DOCUMENT).await;
+    let localhost = || {
+        native_ce::artifact_html::RuntimeConfig::new(
+            "http://localhost:8080",
+            "http://artifact.localhost:8080",
+        )
+        .unwrap()
+    };
+    native_ce::artifact_html::configure(localhost());
+    let original = call(&registry, &db, "render_artifact", json!({ "id": id })).await;
+    assert_eq!(original["status"], "rendered", "{original}");
+    assert_eq!(original["plan"]["kind"], "isolated_html");
+    assert!(
+        original["launch"]["url"]
+            .as_str()
+            .unwrap()
+            .starts_with("http://artifact.localhost:8080/"),
+        "{original}"
+    );
+
+    // Force the otherwise-unleased fixture overwrite before the real MCP call.
+    // No spawned requests or timing assumptions are involved in this ordering.
+    native_ce::artifact_html::configure(
+        native_ce::artifact_html::RuntimeConfig::new(
+            "https://workbench.test",
+            "https://artifacts.test",
+        )
+        .unwrap(),
+    );
+    let overwritten = call(&registry, &db, "render_artifact", json!({ "id": id })).await;
+    assert_eq!(overwritten["status"], "rendered", "{overwritten}");
+    assert_eq!(overwritten["plan"]["kind"], "isolated_html");
+    assert!(
+        overwritten["launch"]["url"]
+            .as_str()
+            .unwrap()
+            .starts_with("https://artifacts.test/"),
+        "{overwritten}"
+    );
+
+    native_ce::artifact_html::configure(localhost());
+    assert!(crate::runtime_config_fixture::try_reader().is_none());
+    assert!(crate::runtime_config_fixture::try_writer().is_none());
+    let protected = call(&registry, &db, "render_artifact", json!({ "id": id })).await;
+    assert_eq!(protected["status"], "rendered", "{protected}");
+    assert!(
+        protected["launch"]["url"]
+            .as_str()
+            .unwrap()
+            .starts_with("http://artifact.localhost:8080/"),
+        "{protected}"
+    );
+    drop(writer);
+
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
+    let restored = call(&registry, &db, "render_artifact", json!({ "id": id })).await;
+    assert_eq!(restored["status"], "rendered", "{restored}");
+    assert!(
+        restored["launch"]["url"]
+            .as_str()
+            .unwrap()
+            .starts_with("https://artifacts.test/"),
+        "{restored}"
+    );
+    assert_eq!(
+        restored["runtime"]["verification"],
+        unavailable_verification("not_configured")
+    );
+
+    // Exercise the same reader admission on an independent boundary while the
+    // real shared lease keeps render globals stable. Queued libtest writers
+    // cannot make this deterministic two-reader control fail or deadlock.
+    let overlap = crate::runtime_config_fixture::Boundary::isolated_for_overlap_control();
+    let first = overlap.reader().await;
+    let second = overlap.try_reader().expect("compatible readers overlap");
+    let (left, right) = tokio::join!(
+        call(&registry, &db, "render_artifact", json!({ "id": id })),
+        call(&registry, &db, "render_artifact", json!({ "id": id })),
+    );
+    for rendered in [left, right] {
+        assert_eq!(rendered["status"], "rendered", "{rendered}");
+        assert_eq!(rendered["plan"]["kind"], "isolated_html");
+        assert!(
+            rendered["launch"]["url"]
+                .as_str()
+                .unwrap()
+                .starts_with("https://artifacts.test/"),
+            "{rendered}"
+        );
+    }
+    drop((first, second));
+}
+
+#[tokio::test]
+async fn html_mcp_configuration_writer_unwind_restores_render_and_availability() {
+    let writer = crate::runtime_config_fixture::writer().await;
+    let (db, registry) = fixture().await;
+    let html_id = "a7710001-0000-4000-8000-000000000103";
+    let mdx_id = "a7710001-0000-4000-8000-000000000104";
+    html_artifact(&registry, &db, html_id, HTML_DOCUMENT).await;
+    let mdx_source = r#"export const nativeArtifact = { schema: "native.mdx.artifact.v2", inputs: {}, module_inputs: {}, capability_requests: [] }
+
+<Metric label="Current" value={1} />"#;
+    call(
+        &registry,
+        &db,
+        "create_record",
+        json!({
+            "id": mdx_id, "type": "Document", "kind": "artifact", "name": "Unwind control",
+            "body": mdx_source, "facets": { "runtime": "native.mdx.v2" },
+            "reason": "Observe deployment availability after fixture unwind."
+        }),
+    )
+    .await;
+    native_ce::artifact_html::configure(
+        native_ce::artifact_html::RuntimeConfig::new(
+            "http://localhost:8080",
+            "http://artifact.localhost:8080",
+        )
+        .unwrap(),
+    );
+    // Availability uses configured state only: this control starts no server
+    // and never invokes verification or sends a request to this endpoint.
+    native_ce::artifact_verify::configure(Some(
+        native_ce::artifact_verify::Config::new("http://127.0.0.1:1/v1/verify", VERIFIER_SECRET)
+            .unwrap(),
+    ));
+    native_ce::mcp::mdx_verification::configure(Some(Arc::new(FakeMdxIssuer)));
+    for id in [html_id, mdx_id] {
+        let rendered = call(&registry, &db, "render_artifact", json!({ "id": id })).await;
+        assert_eq!(rendered["status"], "rendered", "{rendered}");
+        assert_eq!(
+            rendered["runtime"]["verification"],
+            available_verification()
+        );
+    }
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let _writer = writer;
+        panic!("controlled fixture unwind");
+    }));
+    assert!(unwound.is_err());
+
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
+    let config = native_ce::artifact_html::configuration().unwrap();
+    assert_eq!(config.workbench_origin, "https://workbench.test");
+    assert_eq!(config.artifact_origin, "https://artifacts.test");
+    assert!(!native_ce::artifact_verify::configured());
+    assert!(!native_ce::mcp::mdx_verification::configured());
+    for id in [html_id, mdx_id] {
+        let rendered = call(&registry, &db, "render_artifact", json!({ "id": id })).await;
+        assert_eq!(rendered["status"], "rendered", "{rendered}");
+        assert_eq!(
+            rendered["runtime"]["verification"],
+            unavailable_verification("not_configured")
+        );
+        if id == html_id {
+            assert!(
+                rendered["launch"]["url"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("https://artifacts.test/"),
+                "{rendered}"
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn html_source_is_validated_prospectively_and_render_returns_only_an_isolated_launch() {
+    let _runtime_config = crate::runtime_config_fixture::writer().await;
     let (db, registry) = fixture().await;
     native_ce::artifact_html::configure(
         native_ce::artifact_html::RuntimeConfig::new(
@@ -1116,6 +1291,7 @@ export const nativeStyles = ".metric { color: rgb(1, 2, 3); }"
 
 #[tokio::test]
 async fn html_slides_receive_the_exact_bound_input_without_changing_collection_resolution() {
+    let _runtime_config = crate::runtime_config_fixture::writer().await;
     let (db, registry) = fixture().await;
     native_ce::artifact_html::configure(
         native_ce::artifact_html::RuntimeConfig::new(

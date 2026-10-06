@@ -28,6 +28,7 @@ use super::interactions::{
     CustomInteractionPolicy, ExposureProfile, Extractor, ResolvedToolExposure, ToolExposure,
     ToolKind,
 };
+use super::member_serving::MemberCopyGate;
 use super::{
     DeploymentAdmission, DeploymentMutationBarrier, DeploymentPersistenceLease, OperationAccess,
 };
@@ -107,7 +108,28 @@ pub const FOCUSED_PROFILE_MAX_BYTES: usize = 71_680;
 /// 232,810 bytes. That profile must still be able to advertise its tools, so
 /// the ceiling is 232 KiB, leaving 4,758 bytes. The broader surface decision
 /// remains open; this is the smallest whole-KiB limit with useful headroom.
-pub const COMPLETE_PROFILE_MAX_BYTES: usize = 237_568;
+///
+/// Raised from 232 KiB to 233 KiB on 26 Sep 2026 for the snapshot
+/// fence-moved opt-in (record 33a74e0): the `accept_fence_moved` catch_up
+/// flag and its sentence in the tool description cost ~327 bytes on the
+/// ordinary Complete projection (1,800 -> 2,127 for `get_workspace_snapshot`)
+/// and land the experimental opt-in Complete projection at 237,663 bytes,
+/// 95 bytes over the old ceiling. Same shape as the raises above: a required
+/// contract, not a discretionary widening, and the smallest whole-KiB step
+/// that clears it, leaving ~929 bytes. The broader surface decision — what
+/// the tool surface should be allowed to cost and which tools earn Complete —
+/// is still open; another approach to this ceiling is still a signal to
+/// answer it rather than to raise the number again.
+///
+/// Raised from 233 KiB to 234 KiB on 27 Sep 2026 for the alpha tab order
+/// action (task c5d3820): the `reorder` oneOf branch (tab_order, reason,
+/// idempotency_key) and its strip-order paragraph cost ~1,127 bytes on the
+/// `manage_alpha_tabs` descriptor (8,248 -> 9,375) and land the experimental
+/// opt-in Complete projection at 239,433 bytes, 841 bytes over the old
+/// ceiling. Same shape as the raises above: a required contract, not a
+/// discretionary widening, and the smallest whole-KiB step that clears it,
+/// leaving ~183 bytes. The broader surface decision is still open.
+pub const COMPLETE_PROFILE_MAX_BYTES: usize = 239_616;
 
 /// Trusted workspace audience classification supplied by the transport.
 /// Agent-authored tool arguments cannot influence this value.
@@ -163,6 +185,17 @@ pub struct Caller {
     /// Unforgeable compatibility boundary for trusted in-process callers.
     /// Public credential construction must never be able to enable it.
     trusted_local: bool,
+    /// Member-copy serving mode: the caller holds only the admitted E(m)
+    /// slice, so per-id visibility is "present in the slice", never the
+    /// engine policy/Unit fold (which reads tables a member file does not
+    /// contain). Set only by [`Caller::member_copy`].
+    member_copy: bool,
+    suppress_request_persistence: bool,
+    /// §3.3 rule 6 schema markers of the admitted generation, threaded from the
+    /// dispatch's member gate so a member handler can refine the global vs
+    /// collection-scoped applicability of a schema surface. Empty online and
+    /// for a complete member generation. Never caller input.
+    member_schema_incomplete_for: Vec<String>,
     /// Host-scoped routing identity. This is deliberately separate from the
     /// portable credential stamped on events and is absent for stdio callers.
     hosting_principal: Option<String>,
@@ -206,6 +239,25 @@ pub struct Caller {
     /// Rich verified interaction facts for generic provenance issuance. This is
     /// populated only by the signed ingress verifier, never by tool arguments.
     verified_provenance_interaction: Option<crate::provenance::VerifiedInteractionEvidence>,
+    /// Host-minted effect-gesture token plus the gesture kind the host
+    /// observed, attached only at trusted ingress (D7 §4B, slice G2). The
+    /// engine verifies it against the parsed invocation; tool arguments have
+    /// no representation for it. `None` is the ordinary path.
+    effect_gesture: Option<crate::awareness::EffectGestureAttestation>,
+    /// Server config bit, default off: when on, an effect invocation with no
+    /// effect-gesture attestation is refused `gesture_attestation_required`
+    /// (D7 §4C.4, slice G2). Off, a missing token changes nothing. The hosted
+    /// deployment switch (G4) sets this at ingress; a present token is always
+    /// verified regardless.
+    effect_gesture_enforcement: bool,
+    /// Narrows the bit above to the D7 G4 hosted scope: only invocations
+    /// carrying a package claim (or a reversal) are refused when the token
+    /// is missing; unguarded invocations without a token take the ordinary
+    /// path. A present-but-invalid token is still always refused. Set only
+    /// by the hosted ingress via
+    /// [`Caller::with_effect_gesture_enforcement_guarded_only`]; the plain
+    /// bool setter below always restores full (all-effects) enforcement.
+    effect_gesture_enforcement_guarded_only: bool,
     /// Server-verified executor/delegation identity. Asserted run keys are
     /// intentionally insufficient to populate agent provenance.
     verified_agent_executor: Option<crate::awareness::VerifiedAgentExecutor>,
@@ -231,6 +283,15 @@ pub struct Caller {
     /// layer. Same pin shape as the preview proof, separate field so one
     /// request's preview authority is never an adopt authority.
     verified_alpha_tab_adopt: Option<VerifiedAlphaTabPreview>,
+    /// Exact alpha-tab authored-adopt pin verified at the hosted HTTP
+    /// ingress after cookie-session plus trusted-Origin same-origin checks
+    /// (task `f1d80b0`). Only the hosted plain-JSON adapter attaches this,
+    /// for the `adopt_authored` action alone; the MCP router, Bearer
+    /// callers, and tool arguments have no representation for it, so
+    /// `manage_alpha_tabs adopt_authored` refuses without it at the tool
+    /// layer. Same pin shape as the other proofs, separate field so a
+    /// preview or adopt attestation is never an authored-adopt authority.
+    verified_alpha_tab_adopt_authored: Option<VerifiedAlphaTabPreview>,
     /// Trusted policy evaluator authority. Ordinary authenticated agent calls
     /// never receive this bit and therefore cannot reroute obligations.
     policy_authority: bool,
@@ -262,23 +323,25 @@ pub(crate) struct VerifiedDelegatedService {
     pub(crate) credential_id: String,
 }
 
-/// Host-verified alpha-tab pin authority (task `26ba75a`).
+/// Host-verified alpha-tab pin authority (task `26ba75a`, extended by
+/// task `f1d80b0` with the authored-adopt field).
 ///
 /// Binds the exact caller account to the exact pin: the full
 /// `(package, version, digest, artifact_id, source_revision,
 /// declaration_digest)` plus the canonical `needs`/`effects` the digest was
 /// recomputed over. It is the hosted-ingress proof — cookie-session plus
 /// trusted-Origin same-origin checks for this account and this pin — and it
-/// serves both actions that mint or consume server-stamped adoption
+/// serves the three actions that mint or consume server-stamped adoption
 /// authority: the tool refuses `preview` unless the caller carries one on
-/// the preview field, and refuses `adopt` unless the caller carries one on
-/// the adopt field, each matching the requested pin field-for-field. A
+/// the preview field, refuses `adopt` unless the caller carries one on the
+/// adopt field, and refuses `adopt_authored` unless the caller carries one
+/// on the authored field, each matching the requested pin field-for-field. A
 /// receipt (id/nonce) can therefore never reach a Bearer or MCP caller:
 /// only the hosted plain-JSON adapter constructs this value, after
 /// cookie-session plus trusted-Origin checks, and no MCP argument has a
-/// representation for it. The two `Caller` fields keep the preview proof
-/// and the adopt proof distinct per request even though both bind the same
-/// pin shape.
+/// representation for it. The three `Caller` fields keep the preview proof,
+/// the adopt proof, and the authored-adopt proof distinct per request even
+/// though all three bind the same pin shape.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VerifiedAlphaTabPreview {
     /// Authenticated account the hosted ingress verified the cookie for.
@@ -388,6 +451,9 @@ impl Caller {
             credential: identity.into(),
             channel: Channel::Unknown,
             trusted_local: false,
+            member_copy: false,
+            suppress_request_persistence: false,
+            member_schema_incomplete_for: Vec::new(),
             hosting_principal: None,
             hosting_database: None,
             hosted_activity_roster: None,
@@ -402,11 +468,15 @@ impl Caller {
             reported_mcp_client_version: None,
             verified_human_interaction: None,
             verified_provenance_interaction: None,
+            effect_gesture: None,
+            effect_gesture_enforcement: false,
+            effect_gesture_enforcement_guarded_only: false,
             verified_agent_executor: None,
             verified_delegated_service: None,
             verified_attribution_declaration: None,
             verified_alpha_tab_preview: None,
             verified_alpha_tab_adopt: None,
+            verified_alpha_tab_adopt_authored: None,
             policy_authority: false,
             write_plan_execution: None,
             #[cfg(feature = "mcp-executor-prototype")]
@@ -414,11 +484,57 @@ impl Caller {
         }
     }
 
+    /// Host-only request lifecycle suppression for a server-validated demo session.
+    /// This grants no authority and does not admit mutations. The hosting ingress
+    /// must independently qualify the operation before using this seam.
+    #[doc(hidden)]
+    pub fn with_suppressed_request_persistence(mut self) -> Self {
+        self.suppress_request_persistence = true;
+        self
+    }
+
     pub fn local() -> Self {
         let mut caller = Caller::authenticated("local");
         caller.trusted_local = true;
         caller.channel = Channel::Local;
         caller
+    }
+
+    /// A caller serving an admitted member copy: the account credential is
+    /// kept (caller-bound rows are scoped by it), and `member_copy` marks the
+    /// visibility predicate as slice membership rather than the engine policy
+    /// fold. It deliberately does **not** set `trusted_local`: that boundary
+    /// is for a full engine, and its bypass still walks `semantic_units`.
+    pub fn member_copy(identity: impl Into<String>) -> Self {
+        let mut caller = Caller::authenticated(identity);
+        caller.member_copy = true;
+        caller.channel = Channel::Local;
+        caller
+    }
+
+    pub fn is_member_copy(&self) -> bool {
+        self.member_copy
+    }
+
+    /// Single source of truth for member serving: the dispatch derives this
+    /// from the engine open mode, so a member-copy `Db` always yields a
+    /// member-marked caller and every other engine never does. `ReadLens`
+    /// derives the same predicate from the same `Db` open mode, so the lens
+    /// and caller branches cannot disagree.
+    pub(crate) fn set_member_copy(&mut self, member: bool) {
+        self.member_copy = member;
+    }
+
+    /// §3.3 rule 6 markers of the admitted generation. Set at dispatch from the
+    /// member gate only; empty for every online caller and for a complete
+    /// member generation. A handler reads this to refuse a schema surface where
+    /// a withheld row applies without probing hidden rows.
+    pub(crate) fn member_schema_incomplete_for(&self) -> &[String] {
+        &self.member_schema_incomplete_for
+    }
+
+    pub(crate) fn set_member_schema_incomplete_for(&mut self, markers: Vec<String>) {
+        self.member_schema_incomplete_for = markers;
     }
 
     /// Host ingress seam for the observed transport. Only a host that knows
@@ -755,6 +871,28 @@ impl Caller {
         self
     }
 
+    pub(crate) fn verified_alpha_tab_adopt_authored(&self) -> Option<&VerifiedAlphaTabPreview> {
+        self.verified_alpha_tab_adopt_authored.as_ref()
+    }
+
+    /// Host ingress seam for alpha-tab authored-adopt authority (task
+    /// `f1d80b0`).
+    ///
+    /// Call only after the hosted adapter has verified a cookie-authenticated
+    /// session plus a trusted-Origin same-origin POST for this exact pin.
+    /// There is deliberately no MCP argument for it, and the observed
+    /// [`Channel`] is never consulted: Bearer HTTP calls arrive as
+    /// `Channel::Web`, so channel alone cannot distinguish the shell from an
+    /// agent. The MCP router never calls this; without it the tool refuses.
+    #[doc(hidden)]
+    pub fn with_verified_alpha_tab_adopt_authored(
+        mut self,
+        adopt: VerifiedAlphaTabPreview,
+    ) -> Self {
+        self.verified_alpha_tab_adopt_authored = Some(adopt);
+        self
+    }
+
     /// Bind a signed UI declaration gesture to the complete canonical accepted
     /// `create_attribution` action. Native derives the closed declaration facts
     /// from that same argument object; callers cannot verify one action and
@@ -815,6 +953,61 @@ impl Caller {
             issuer.verify_for_provenance(token, self.credential(), action, message_ids)?;
         self.verified_provenance_interaction = Some(provenance);
         Ok(self.with_verified_human_interaction(attestation))
+    }
+
+    /// Attach a host-minted effect-gesture token and the completing gesture
+    /// kind the host observed (D7 §4B, slice G2). Only trusted ingress calls
+    /// this; tool arguments have no representation for it. The engine verifies
+    /// the token against the parsed invocation, never the body `gesture` field.
+    pub fn with_effect_gesture_token(
+        mut self,
+        issuer: &crate::awareness::HumanInteractionTokenIssuer,
+        token: impl Into<String>,
+        kind: crate::awareness::EffectGestureKind,
+    ) -> Self {
+        self.effect_gesture = Some(crate::awareness::EffectGestureAttestation::new(
+            issuer.clone(),
+            token,
+            kind,
+        ));
+        self
+    }
+
+    /// The effect-gesture attestation this caller arrived with, if any.
+    pub fn effect_gesture(&self) -> Option<&crate::awareness::EffectGestureAttestation> {
+        self.effect_gesture.as_ref()
+    }
+
+    /// Deployment switch for effect-gesture enforcement (D7 §4C.4, slice G2).
+    /// Default off: a missing token changes nothing. When on, a missing
+    /// token is refused for every effect invocation (the G2 primitive). This
+    /// setter always restores that full scope.
+    pub fn with_effect_gesture_enforcement(mut self, enforcement: bool) -> Self {
+        self.effect_gesture_enforcement = enforcement;
+        self.effect_gesture_enforcement_guarded_only = false;
+        self
+    }
+
+    /// Deployment switch for effect-gesture enforcement narrowed to the D7 G4
+    /// hosted scope: a missing token is refused only for invocations carrying
+    /// a package claim (or a reversal); unguarded invocations without a token
+    /// take the ordinary path, unchanged until G5. A present-but-invalid token
+    /// is still always refused. Both hosted ingress paths use this.
+    pub fn with_effect_gesture_enforcement_guarded_only(mut self) -> Self {
+        self.effect_gesture_enforcement = true;
+        self.effect_gesture_enforcement_guarded_only = true;
+        self
+    }
+
+    /// Whether a missing effect-gesture token is refused for this request.
+    pub fn effect_gesture_enforcement(&self) -> bool {
+        self.effect_gesture_enforcement
+    }
+
+    /// Whether missing-token refusal is narrowed to package-claimed (and
+    /// reversal) invocations. False restores the full G2 primitive.
+    pub fn effect_gesture_enforcement_guarded_only(&self) -> bool {
+        self.effect_gesture_enforcement_guarded_only
     }
 
     /// Host policy-evaluator seam. The policy version and reason remain durable
@@ -1004,6 +1197,27 @@ mod query_principal_conversion_tests {
     }
 
     #[test]
+    fn effect_gesture_attestation_is_attached_only_by_the_builder() {
+        let plain = Caller::authenticated("alice");
+        assert!(plain.effect_gesture().is_none());
+        let issuer = crate::awareness::HumanInteractionTokenIssuer::random("test-host");
+        let bound = plain.clone().with_effect_gesture_token(
+            &issuer,
+            "token-bytes",
+            crate::awareness::EffectGestureKind::Drop,
+        );
+        let attestation = bound
+            .effect_gesture()
+            .expect("builder attaches the attestation");
+        assert_eq!(
+            attestation.kind(),
+            crate::awareness::EffectGestureKind::Drop
+        );
+        // The embedded issuer is secret material: Debug redacts the token.
+        assert!(!format!("{attestation:?}").contains("token-bytes"));
+    }
+
+    #[test]
     fn membership_footing_is_explicit_or_absent_never_defaulted() {
         // No catalog plane: the historical member footing.
         assert!(Caller::authenticated("alice").is_host_member());
@@ -1101,6 +1315,7 @@ mod governed_pipeline_tests {
             _intent: &'a str,
             _authenticated_account: &'a str,
             _reported: crate::control::ReportedRunIdentity,
+            _channel: Channel,
         ) -> BoxFuture<'a, Result<()>> {
             Box::pin(async { Ok(()) })
         }
@@ -1463,11 +1678,18 @@ impl crate::domain_transaction::request::RequestLifecyclePort for SqliteRequestL
         _intent: &'a str,
         authenticated_account: &'a str,
         reported: crate::control::ReportedRunIdentity,
+        channel: Channel,
     ) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
-            crate::control::ensure_agent_run(self.db, run_key, authenticated_account, reported)
-                .await
-                .map(|_| ())
+            crate::control::ensure_agent_run_with_channel(
+                self.db,
+                run_key,
+                authenticated_account,
+                reported,
+                channel,
+            )
+            .await
+            .map(|_| ())
         })
     }
 
@@ -1481,8 +1703,9 @@ impl crate::domain_transaction::request::RequestLifecyclePort for SqliteRequestL
         capability: Option<&'a str>,
         future: BoxFuture<'a, Result<ToolResult>>,
     ) -> BoxFuture<'a, Result<ToolResult>> {
-        Box::pin(crate::storage_profile::with_operation(
-            self.db, operation, capability, future,
+        Box::pin(super::deployment_read_only::scope_deployment_persistence(
+            self.persistence_lease.clone(),
+            crate::storage_profile::with_operation(self.db, operation, capability, future),
         ))
     }
 
@@ -1588,6 +1811,7 @@ impl crate::domain_transaction::request::RequestLifecyclePort for PostgresReques
         intent: &'a str,
         _authenticated_account: &'a str,
         _reported: crate::control::ReportedRunIdentity,
+        _channel: Channel,
     ) -> BoxFuture<'a, Result<()>> {
         Box::pin(self.db.persist_intent(run_key, intent))
     }
@@ -1663,6 +1887,7 @@ impl crate::domain_transaction::request::RequestLifecyclePort for SuppressedRequ
         _intent: &'a str,
         _authenticated_account: &'a str,
         _reported: crate::control::ReportedRunIdentity,
+        _channel: Channel,
     ) -> BoxFuture<'a, Result<()>> {
         Box::pin(async { Err(Error::engine("run-context persistence is suppressed")) })
     }
@@ -1946,6 +2171,10 @@ pub struct ToolRegistry {
     /// Kept separate from the capability bit so tests and non-process callers
     /// can still exercise the fail-closed admission policy in isolation.
     standby_status: Option<crate::standby::StandbyStatusProvider>,
+    /// Member-copy dispatch gate (§2.3, §2.6, §6.1, §6.2). `None` for
+    /// owner/standby registries; `Some` narrows dispatch to the admitted
+    /// member surfaces and decorates every response.
+    member_copy: Option<MemberCopyGate>,
     /// Optional process-wide persistence boundary for hosted deployment
     /// transitions. Immutable standby remains a separate capability mode.
     deployment_mutation_barrier: Option<DeploymentMutationBarrier>,
@@ -2028,6 +2257,55 @@ fn annotate_record_urls_in_projection(
     }
 }
 
+/// Registry-private receipt disposition for the post-dispatch attestation
+/// wrapper. `Legacy` preserves the existing
+/// `lookup_authorized_command_attestation` attach-or-error behavior.
+/// `DomainOwned` is reserved for a later, separately reviewed classifier
+/// integration that will mark actual cited-source Comment/Unresolved
+/// invocations only; verified Other invocations retain `Legacy` semantics.
+///
+/// The disposition lives in a `tokio` task-local `Cell`, initialized afresh
+/// to `Legacy` per SQLite dispatch via [`with_fresh_receipt_scope`]. No
+/// caller flag, output sniffing, or public JSON marker selects it, and no
+/// handler opts in during this helper unit, so default behavior is unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum ReceiptDisposition {
+    #[default]
+    Legacy,
+    DomainOwned,
+}
+
+tokio::task_local! {
+    static RECEIPT_DISPOSITION: std::cell::Cell<ReceiptDisposition>;
+}
+
+/// Server-only seam for marking the current SQLite dispatch as domain-owned.
+///
+/// Safely no-ops outside a [`with_fresh_receipt_scope`] scope so arbitrary
+/// callers cannot poison later dispatches. Only the registry's dispatch path
+/// initializes the scope; a later classifier is the sole expected writer.
+pub(crate) fn note_invoke_domain_owned() {
+    let _ = RECEIPT_DISPOSITION.try_with(|cell| cell.set(ReceiptDisposition::DomainOwned));
+}
+
+/// Run `future` inside a fresh `Legacy` receipt scope and capture the final
+/// disposition before the scope ends. Nesting yields a fresh inner scope and
+/// restores the parent on exit; concurrent tasks never share a cell.
+async fn with_fresh_receipt_scope<F>(future: F) -> (F::Output, ReceiptDisposition)
+where
+    F: Future,
+{
+    RECEIPT_DISPOSITION
+        .scope(std::cell::Cell::new(ReceiptDisposition::Legacy), async {
+            let output = future.await;
+            let disposition = RECEIPT_DISPOSITION
+                .try_with(|cell| cell.get())
+                .unwrap_or_default();
+            (output, disposition)
+        })
+        .await
+}
+
 impl ToolRegistry {
     pub fn new() -> Self {
         ToolRegistry::default()
@@ -2050,6 +2328,47 @@ impl ToolRegistry {
 
     pub fn set_standby_read_only(&mut self, standby_read_only: bool) {
         self.standby_read_only = standby_read_only;
+    }
+
+    /// Install the member-copy serving gate. It does not set
+    /// `standby_read_only`: the member gate owns every refusal, and a member
+    /// copy is not the owner standby. Composition seam for C2b; exercised by
+    /// the member-serving tests in C2a.
+    #[cfg(test)]
+    pub(crate) fn set_member_copy_gate(
+        &mut self,
+        lifecycle: std::sync::Arc<
+            std::sync::Mutex<crate::member_copy_lifecycle::MemberCopyLifecycle>,
+        >,
+        scope_ref: String,
+        ordinal: i64,
+        schema_incomplete_for: Vec<String>,
+    ) {
+        self.member_copy = Some(MemberCopyGate::new(
+            lifecycle,
+            scope_ref,
+            ordinal,
+            schema_incomplete_for,
+        ));
+    }
+
+    /// Production composition seam (D1): install a fully-built member gate
+    /// (lifecycle, coordinates, actual admitted generation id and shared
+    /// lease state). Only [`crate::member_copy_serving`] calls this, after it
+    /// has validated admitted state; there is no public unchecked form.
+    pub(crate) fn set_member_copy_gate_instance(&mut self, gate: MemberCopyGate) {
+        self.member_copy = Some(gate);
+    }
+
+    /// Narrow composition seam for the serving driver (C4a): record the
+    /// admitted generation on the installed member gate so the `query_record`
+    /// page basis binds it. No-op without an installed gate; never touches
+    /// storage and never reads caller input.
+    #[allow(dead_code)]
+    pub(crate) fn set_member_copy_generation_id(&mut self, generation_id: String) {
+        if let Some(gate) = self.member_copy.take() {
+            self.member_copy = Some(gate.with_generation_id(generation_id));
+        }
     }
 
     pub fn set_standby_status_provider(&mut self, provider: crate::standby::StandbyStatusProvider) {
@@ -2580,6 +2899,18 @@ impl ToolRegistry {
             .map(|(_, access)| access)
     }
 
+    /// Server-owned classification for hosted HTTP transports: the registry
+    /// decides the deployment operation and read/mutation access from the
+    /// registered tool and parsed arguments, so a hosted boundary can admit
+    /// before authentication touches JWT redemption or identity repair.
+    pub fn registered_operation(
+        &self,
+        name: &str,
+        arguments: &Value,
+    ) -> Result<(DeploymentReadOnlyOperation, OperationAccess)> {
+        self.classify_registered_operation(name, arguments)
+    }
+
     /// Early no-write refusal used before renderer and request-envelope
     /// parsing. Dispatch repeats admission and retains the resulting lease.
     pub(crate) fn preflight_deployment_call(&self, name: &str, arguments: &Value) -> Result<()> {
@@ -2785,6 +3116,27 @@ impl ToolRegistry {
         .await
     }
 
+    /// Hosted plain-JSON dispatch reusing a barrier lease admitted before
+    /// authentication. The registry reuses (never re-admits) the exact lease,
+    /// so a freeze registered after admission drains rather than refuses.
+    pub async fn call_detailed_with_persistence(
+        &self,
+        db: Db,
+        caller: Caller,
+        name: &str,
+        arguments: Value,
+        persistence_lease: DeploymentPersistenceLease,
+    ) -> Result<ToolCallOutcome> {
+        self.call_engine_detailed_with_persistence(
+            EngineHandle::Sqlite(db),
+            caller,
+            name,
+            arguments,
+            persistence_lease,
+        )
+        .await
+    }
+
     /// Dispatch a read without persisting the constituent database's ordinary
     /// read-capture envelope.
     ///
@@ -2822,6 +3174,34 @@ impl ToolRegistry {
         persistence_lease: Option<DeploymentPersistenceLease>,
     ) -> BoxFuture<'a, Result<ToolCallOutcome>> {
         async move {
+            let mut caller = caller;
+            // One source of truth for member serving: the engine open mode.
+            // `ReadLens::member` derives from the same `Db`, so the caller
+            // flag and the lens flag cannot diverge. A member-copy `Db` always
+            // yields a member caller; every other engine never does.
+            let member_copy = engine
+                .sqlite()
+                .is_some_and(|db| db.open_mode() == crate::db::DatabaseOpenMode::MemberReadOnly);
+            caller.set_member_copy(member_copy);
+            // A member-copy `Db` with no validated, active gate is a raw
+            // SQLite path: refuse rather than serve under member lenses with
+            // no admitted coordinates. The lease is held for the whole
+            // handler plus response decoration, so the serving owner can drain
+            // every in-flight read before it deletes or replaces the
+            // generation. Dropping it at the end of this scope is the release.
+            let _member_lease = if let Some(gate) = self.member_copy.as_ref() {
+                gate.validate_binding(engine.sqlite(), &caller)?;
+                Some(gate.begin_read()?)
+            } else if member_copy {
+                return Err(Error::copy_unavailable());
+            } else {
+                None
+            };
+            if member_copy {
+                if let Some(gate) = &self.member_copy {
+                    caller.set_member_schema_incomplete_for(gate.schema_incomplete_for().to_vec());
+                }
+            }
             let exposure_policy = caller
                 .exposure_policy()
                 .cloned()
@@ -2830,7 +3210,20 @@ impl ToolRegistry {
             let Some(tool) = self.get(name) else {
                 return Err(Error::engine(format!("unknown tool: {name}")));
             };
+            if engine.sqlite().is_some_and(Db::is_enrolled) {
+                if tool.kind.is_some_and(ToolKind::issues_run_key) || arguments.get("run_key").and_then(Value::as_str).is_some_and(|raw| raw == crate::runkey::SENTINEL || raw.starts_with(crate::runkey::AGENT_KEY_SENTINEL_PREFIX)) {
+                    return Err(Error::engine("enrolled storage does not mint run context"));
+                }
+                if name == "update_record" {
+                    crate::db::enrolled::admit_body_arguments(&arguments)?;
+                } else if self.registered_operation_access(name, &arguments)? == OperationAccess::Mutation {
+                    return Err(Error::engine("enrolled storage supports only singular Document body updates; mutation not admitted"));
+                }
+            }
             self.admit_standby_call(name, &arguments)?;
+            if let Some(gate) = &self.member_copy {
+                gate.admit(tool.kind, name, &arguments)?;
+            }
             let deployment_admission = if self.standby_read_only {
                 None
             } else if let Some(lease) = &persistence_lease {
@@ -2838,7 +3231,15 @@ impl ToolRegistry {
             } else {
                 self.admit_deployment_call(name, &arguments)?
             };
-            let suppress_persistence = self.standby_read_only
+            // A member copy has no canonical request lifecycle: its admitted
+            // slice excludes the run-context/history/read-log/provenance
+            // tables, so persistence is suppressed AFTER the binding and lease
+            // are validated (never before), using the explicit suppressed port.
+            // `member_copy` is derived from the engine's open mode, not a
+            // caller flag, so canonical/standby behavior is unchanged.
+            let suppress_persistence = caller.suppress_request_persistence
+                || self.standby_read_only
+                || member_copy
                 || matches!(&deployment_admission, Some(DeploymentAdmission::FrozenRead));
             let engine_kind = engine.kind();
             let handler = tool.handlers.get(&engine_kind).ok_or_else(|| {
@@ -2858,46 +3259,71 @@ impl ToolRegistry {
                         db,
                         persistence_lease: match &deployment_admission {
                             Some(DeploymentAdmission::Writable(lease)) => Some(lease.clone()),
-                            Some(DeploymentAdmission::FrozenRead) | None => None,
+                            Some(DeploymentAdmission::FrozenRead) => None,
+                            None => super::deployment_read_only::current_job_lease(),
                         },
                     };
                     let suppressed_port = SuppressedRequestLifecycle {
-                        backend: "sqlite-standby",
+                        backend: if member_copy {
+                            "sqlite-member"
+                        } else {
+                            "sqlite-standby"
+                        },
                     };
                     let principal = caller.credential().to_string();
                     let lookup_arguments = arguments.clone();
-                    let mut dispatched = if suppress_persistence {
-                        dispatch_with_request_port(
-                            &suppressed_port,
-                            engine.clone(),
-                            caller,
-                            name,
-                            tool.kind,
-                            tool.extractor,
-                            arguments,
-                            false,
-                            self.public_origin(),
-                            bootstrap_exposure,
-                            &handler.call,
-                        )
-                        .await?
-                    } else {
-                        dispatch_with_request_port(
-                            &sqlite_port,
-                            engine.clone(),
-                            caller,
-                            name,
-                            tool.kind,
-                            tool.extractor,
-                            arguments,
-                            capture,
-                            self.public_origin(),
-                            bootstrap_exposure,
-                            &handler.call,
-                        )
-                        .await?
-                    };
-                    if !suppress_persistence && dispatched.outcome.is_ok() {
+                    let (dispatched_result, receipt_disposition) =
+                        with_fresh_receipt_scope(Box::pin(async {
+                            if suppress_persistence {
+                                dispatch_with_request_port(
+                                    &suppressed_port,
+                                    engine.clone(),
+                                    caller,
+                                    name,
+                                    tool.kind,
+                                    tool.extractor,
+                                    arguments,
+                                    false,
+                                    self.public_origin(),
+                                    bootstrap_exposure,
+                                    &handler.call,
+                                )
+                                .await
+                            } else {
+                                dispatch_with_request_port(
+                                    &sqlite_port,
+                                    engine.clone(),
+                                    caller,
+                                    name,
+                                    tool.kind,
+                                    tool.extractor,
+                                    arguments,
+                                    capture,
+                                    self.public_origin(),
+                                    bootstrap_exposure,
+                                    &handler.call,
+                                )
+                                .await
+                            }
+                        }))
+                        .await;
+                    let mut dispatched = dispatched_result?;
+                    // DomainOwned ONLY: remove the earlier domain-layer
+                    // receipt attachment from the outward object. Selected
+                    // by captured disposition alone — never by operation,
+                    // caller, or output status. Legacy issuance, storage,
+                    // and attach/conflict behavior stay byte-identical.
+                    if matches!(receipt_disposition, ReceiptDisposition::DomainOwned) {
+                        if let Ok(result) = &mut dispatched.outcome {
+                            if let Some(object) = result.structured.as_object_mut() {
+                                object.remove("action_attestation_ids");
+                            }
+                        }
+                    }
+                    if !suppress_persistence
+                        && matches!(receipt_disposition, ReceiptDisposition::Legacy)
+                        && dispatched.outcome.is_ok()
+                    {
                         // The handler has now authorized the caller and resolved
                         // its own durable idempotency result. Only at that point
                         // may the wrapper attach the original action receipt
@@ -2926,6 +3352,9 @@ impl ToolRegistry {
                     }
                     Box::pin(self.annotate_standby_status(name, &mut dispatched)).await;
                     self.annotate_record_urls(name, &mut dispatched);
+                    if let Some(gate) = &self.member_copy {
+                        gate.decorate(name, &lookup_arguments, &mut dispatched);
+                    }
                     Ok(dispatched)
                 }
                 #[cfg(feature = "turso-local")]
@@ -3031,11 +3460,24 @@ impl ToolRegistry {
                 )
                 .expect("read-only lifecycle admission cannot reject")
         });
-        if self.standby_read_only
+        // The metadata-error echo must suppress for a member engine too: its
+        // slice excludes the run-context/history/read-log/provenance tables.
+        // Derive from the engine's open mode, never a caller flag, so
+        // canonical/standby behavior is unchanged.
+        let member_copy = engine
+            .sqlite()
+            .is_some_and(|db| db.open_mode() == crate::db::DatabaseOpenMode::MemberReadOnly);
+        if caller.suppress_request_persistence
+            || self.standby_read_only
+            || member_copy
             || matches!(&deployment_admission, Some(DeploymentAdmission::FrozenRead))
         {
             let port = SuppressedRequestLifecycle {
-                backend: "sqlite-standby",
+                backend: if member_copy {
+                    "sqlite-member"
+                } else {
+                    "sqlite-standby"
+                },
             };
             return crate::domain_transaction::request::run_context_for(
                 &port,
@@ -3114,6 +3556,18 @@ pub(crate) async fn run_context_for(
     arguments: &Value,
     public_origin: Option<&str>,
 ) -> Value {
+    if caller.suppress_request_persistence {
+        let port = SuppressedRequestLifecycle {
+            backend: "sqlite-demo",
+        };
+        return crate::domain_transaction::request::run_context_for(
+            &port,
+            caller,
+            arguments,
+            public_origin,
+        )
+        .await;
+    }
     let port = SqliteRequestLifecycle {
         db,
         persistence_lease: None,
@@ -3807,6 +4261,83 @@ mod hosting_context_tests {
         let frozen = tokio::time::timeout(Duration::from_secs(2), freeze)
             .await
             .expect("freeze did not acquire after handler completion")
+            .unwrap();
+        drop(frozen);
+    }
+
+    #[tokio::test]
+    async fn pre_admitted_lease_reuses_through_freeze_intent() {
+        use crate::mcp::OperationAccess;
+
+        let db = crate::db::create_database(":memory:").await.unwrap();
+        let barrier = crate::mcp::DeploymentMutationBarrier::default();
+        let mut registry = ToolRegistry::new();
+        crate::mcp::register_builtin_tools(&mut registry).unwrap();
+        crate::mcp::register_surface_tools(&mut registry).unwrap();
+        registry.set_deployment_mutation_barrier(barrier.clone());
+
+        // Server-owned classification: reads stay reads, anything the
+        // authoritative disposition rejects is a mutation.
+        let (_, read_access) = registry.registered_operation("ping", &json!({})).unwrap();
+        assert_eq!(read_access, OperationAccess::Read);
+        let (operation, mutation_access) = registry
+            .registered_operation("create_record", &json!({"not":"parsed"}))
+            .unwrap();
+        assert_eq!(mutation_access, OperationAccess::Mutation);
+
+        // Admit before the freeze, as the plain-JSON transport now does
+        // before authentication.
+        let lease = match barrier.admit(&operation, mutation_access).unwrap() {
+            crate::mcp::DeploymentAdmission::Writable(lease) => lease,
+            crate::mcp::DeploymentAdmission::FrozenRead => {
+                panic!("open barrier refused a mutation")
+            }
+        };
+        let freeze = {
+            let barrier = barrier.clone();
+            tokio::spawn(async move { barrier.freeze().await })
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !barrier.is_read_only() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("freeze intent was not registered");
+
+        // A fresh dispatch re-admits and refuses.
+        let late = registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "create_record",
+                json!({"not":"parsed"}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(late.deployment_read_only_operation(), Some("create_record"));
+
+        // The held lease reuses through the same barrier: dispatch runs past
+        // the barrier and fails only on the (deliberately unparsable)
+        // arguments, never on the freeze.
+        let reused = registry
+            .call_detailed_with_persistence(
+                db.clone(),
+                Caller::local(),
+                "create_record",
+                json!({"not":"parsed"}),
+                lease.clone(),
+            )
+            .await
+            .unwrap()
+            .into_result()
+            .unwrap_err();
+        assert_eq!(reused.deployment_read_only_operation(), None);
+
+        drop(lease);
+        let frozen = tokio::time::timeout(Duration::from_secs(2), freeze)
+            .await
+            .expect("freeze did not acquire after lease drain")
             .unwrap();
         drop(frozen);
     }
@@ -5403,5 +5934,197 @@ mod nested_write_pool_acquisition_tests {
                 .expect("coordination call failed");
         }
         db.close().await;
+    }
+}
+
+#[cfg(test)]
+mod receipt_disposition_tests {
+    use std::cell::Cell;
+
+    use super::{note_invoke_domain_owned, with_fresh_receipt_scope, RECEIPT_DISPOSITION};
+
+    use super::ReceiptDisposition;
+
+    #[tokio::test]
+    async fn outside_scope_note_noops_and_fresh_scope_stays_legacy() {
+        note_invoke_domain_owned();
+        let (_, disposition) = with_fresh_receipt_scope(async { 1 }).await;
+        assert_eq!(disposition, ReceiptDisposition::Legacy);
+        note_invoke_domain_owned();
+        let (_, second) = with_fresh_receipt_scope(async { 2 }).await;
+        assert_eq!(second, ReceiptDisposition::Legacy);
+    }
+
+    #[tokio::test]
+    async fn default_scope_is_legacy_without_opt_in() {
+        let (value, disposition) = with_fresh_receipt_scope(async { 41 + 1 }).await;
+        assert_eq!(value, 42);
+        assert_eq!(disposition, ReceiptDisposition::Legacy);
+    }
+
+    #[tokio::test]
+    async fn nested_scope_is_fresh_and_restores_parent() {
+        // Parent Legacy -> inner marks DomainOwned -> parent restored Legacy.
+        // A leaked inner marker would leave the parent DomainOwned here.
+        RECEIPT_DISPOSITION
+            .scope(Cell::new(ReceiptDisposition::Legacy), async {
+                let parent = RECEIPT_DISPOSITION
+                    .try_with(|cell| cell.get())
+                    .unwrap_or_default();
+                assert_eq!(parent, ReceiptDisposition::Legacy);
+
+                let (_, inner) = with_fresh_receipt_scope(async {
+                    let fresh = RECEIPT_DISPOSITION
+                        .try_with(|cell| cell.get())
+                        .unwrap_or_default();
+                    assert_eq!(fresh, ReceiptDisposition::Legacy);
+                    note_invoke_domain_owned();
+                })
+                .await;
+                assert_eq!(inner, ReceiptDisposition::DomainOwned);
+
+                let restored = RECEIPT_DISPOSITION
+                    .try_with(|cell| cell.get())
+                    .unwrap_or_default();
+                assert_eq!(restored, ReceiptDisposition::Legacy);
+            })
+            .await;
+
+        // Parent DomainOwned -> inner stays Legacy -> parent restored DomainOwned.
+        // An inner scope that cleared or inherited state would fail either assert.
+        RECEIPT_DISPOSITION
+            .scope(Cell::new(ReceiptDisposition::Legacy), async {
+                note_invoke_domain_owned();
+                let parent_marked = RECEIPT_DISPOSITION
+                    .try_with(|cell| cell.get())
+                    .unwrap_or_default();
+                assert_eq!(parent_marked, ReceiptDisposition::DomainOwned);
+
+                let (_, inner) = with_fresh_receipt_scope(async {
+                    let fresh = RECEIPT_DISPOSITION
+                        .try_with(|cell| cell.get())
+                        .unwrap_or_default();
+                    assert_eq!(fresh, ReceiptDisposition::Legacy);
+                })
+                .await;
+                assert_eq!(inner, ReceiptDisposition::Legacy);
+
+                let restored = RECEIPT_DISPOSITION
+                    .try_with(|cell| cell.get())
+                    .unwrap_or_default();
+                assert_eq!(restored, ReceiptDisposition::DomainOwned);
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_scopes_stay_independent() {
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(8));
+        let mut handles = Vec::new();
+        for index in 0..8 {
+            let barrier = barrier.clone();
+            handles.push(tokio::spawn(async move {
+                let expected = if index % 2 == 0 {
+                    ReceiptDisposition::DomainOwned
+                } else {
+                    ReceiptDisposition::Legacy
+                };
+                let (_, disposition) = with_fresh_receipt_scope(async move {
+                    if index % 2 == 0 {
+                        note_invoke_domain_owned();
+                    }
+                    let marked = RECEIPT_DISPOSITION
+                        .try_with(|cell| cell.get())
+                        .unwrap_or_default();
+                    assert_eq!(marked, expected);
+                    barrier.wait().await;
+                    let overlapped = RECEIPT_DISPOSITION
+                        .try_with(|cell| cell.get())
+                        .unwrap_or_default();
+                    assert_eq!(overlapped, expected);
+                })
+                .await;
+                (index, disposition)
+            }));
+        }
+        for handle in handles {
+            let (index, disposition) = handle.await.expect("scope task panicked");
+            if index % 2 == 0 {
+                assert_eq!(disposition, ReceiptDisposition::DomainOwned);
+            } else {
+                assert_eq!(disposition, ReceiptDisposition::Legacy);
+            }
+        }
+        let (_, after) = with_fresh_receipt_scope(async {}).await;
+        assert_eq!(after, ReceiptDisposition::Legacy);
+    }
+
+    #[tokio::test]
+    async fn err_inside_scope_propagates_and_cleans_up() {
+        let (result, disposition) = with_fresh_receipt_scope(async {
+            note_invoke_domain_owned();
+            Err::<(), &str>("boom")
+        })
+        .await;
+        assert_eq!(result, Err("boom"));
+        assert_eq!(disposition, ReceiptDisposition::DomainOwned);
+
+        let (result, disposition) =
+            with_fresh_receipt_scope(async { Err::<(), &str>("boom") }).await;
+        assert_eq!(result, Err("boom"));
+        assert_eq!(disposition, ReceiptDisposition::Legacy);
+
+        let (_, fresh) = with_fresh_receipt_scope(async {}).await;
+        assert_eq!(fresh, ReceiptDisposition::Legacy);
+    }
+
+    #[tokio::test]
+    async fn cancelled_scope_does_not_leak() {
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let handle = tokio::spawn(async move {
+            with_fresh_receipt_scope(async move {
+                note_invoke_domain_owned();
+                let marked = RECEIPT_DISPOSITION
+                    .try_with(|cell| cell.get())
+                    .unwrap_or_default();
+                entered_tx
+                    .send(marked)
+                    .expect("handshake receiver must be live");
+                futures::future::pending::<()>().await;
+            })
+            .await
+        });
+        let marked = entered_rx
+            .await
+            .expect("scoped task must enter and mark before abort");
+        assert_eq!(marked, ReceiptDisposition::DomainOwned);
+        handle.abort();
+        let abort = handle.await.expect_err("aborted scope must not complete");
+        assert!(abort.is_cancelled());
+
+        let dropped = with_fresh_receipt_scope(async {
+            note_invoke_domain_owned();
+        });
+        drop(dropped);
+
+        RECEIPT_DISPOSITION
+            .scope(Cell::new(ReceiptDisposition::Legacy), async {
+                {
+                    let mut inner = Box::pin(with_fresh_receipt_scope(async {
+                        note_invoke_domain_owned();
+                        futures::future::pending::<()>().await;
+                    }));
+                    assert!(futures::poll!(&mut inner).is_pending());
+                }
+                let restored = RECEIPT_DISPOSITION
+                    .try_with(|cell| cell.get())
+                    .unwrap_or_default();
+                assert_eq!(restored, ReceiptDisposition::Legacy);
+            })
+            .await;
+
+        note_invoke_domain_owned();
+        let (_, fresh) = with_fresh_receipt_scope(async {}).await;
+        assert_eq!(fresh, ReceiptDisposition::Legacy);
     }
 }

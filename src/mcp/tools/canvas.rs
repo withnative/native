@@ -555,10 +555,277 @@ async fn get_scene(
         canvas_id,
         include_deleted,
         resolved_content_seq,
+        None,
     )
     .await?;
     tx.rollback().await?;
     Ok(output)
+}
+
+/// Where a scene page resumes: the `(z, object id)` sort key of the last
+/// object delivered. `get_scene` orders live objects by exactly this key, so
+/// a page is a keyset slice of the same order and needs no offset.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SceneCursor {
+    z: String,
+    id: String,
+}
+
+impl SceneCursor {
+    /// Longest cursor string [`SceneCursor::decode`] considers: hex over the
+    /// JSON pair of a maximal `z` and a maximal object id, with room for
+    /// escapes.
+    pub(crate) const MAX_CHARS: usize = 4 * 2 * (canvas::MAX_Z_BYTES + canvas::MAX_ID_BYTES);
+
+    fn encode(&self) -> String {
+        hex::encode(json!([self.z, self.id]).to_string())
+    }
+
+    /// The cursor a previous page handed out, or `None` for anything else.
+    pub(crate) fn decode(cursor: &str) -> Option<Self> {
+        if cursor.len() > Self::MAX_CHARS {
+            return None;
+        }
+        let bytes = hex::decode(cursor).ok()?;
+        let (z, id): (String, String) = serde_json::from_slice(&bytes).ok()?;
+        if z.is_empty()
+            || id.is_empty()
+            || z.len() > canvas::MAX_Z_BYTES
+            || id.len() > canvas::MAX_ID_BYTES
+        {
+            return None;
+        }
+        Some(Self { z, id })
+    }
+}
+
+/// A bounded page of live objects, for a caller that must not receive a
+/// whole 5,000-object scene at once.
+struct SceneWindow {
+    after: Option<SceneCursor>,
+    limit: usize,
+}
+
+/// The envelope version of a tab's scene page. It is not `get_scene`'s
+/// envelope: the tab shape seals every revision (see [`tab_scene_page_in`]).
+pub(crate) const TAB_SCENE_VERSION: &str = "canvas.scene.v1";
+
+/// The live scene, one bounded page at a time, shaped for the
+/// `canvas.scene.v1` declared tab read, on the caller's transaction.
+///
+/// The page is `get_scene` with a window: the same View check, the same
+/// load, the same redaction and connector resolution. Record faces are
+/// resolved for the page's cards alone, and `live_objects` counts the whole
+/// scene. Two things differ, and both are what make it fit for a tab:
+///
+/// * **No sequence reaches the tab.** `canvas_version`, each object's
+///   `versions.geometry`/`versions.content` and a visible card's
+///   `record.version` all carry the database-wide content sequence, which
+///   lets a reader count writes to records it cannot see (task `a5804e8`).
+///   Each is replaced by `seal(subject, value)`, an opaque token the caller
+///   supplies. Equal tokens mean unchanged; tokens cannot be ordered or
+///   subtracted. The canvas becomes `scene_token`, and `limits` and
+///   `resolved_content_seq` are dropped.
+/// * **The page fits the bridge.** The whole page, envelope included, is at
+///   most `max_chars` long as the frame bridge measures it ([`es_json_len`]).
+///   See [`shape_tab_objects`]: long text is cut to
+///   [`TAB_SCENE_FIELD_MAX_BYTES`] and named in `truncated_fields`, an
+///   object that still cannot fit becomes an `oversized` placeholder, and
+///   the page stops early, with `truncated: true` and a cursor after the last
+///   object it carries. It always carries at least one object, so paging
+///   always progresses.
+///
+/// `next_cursor` is the `(z, id)` sort key of the last object delivered,
+/// with no sequence in it.
+pub(crate) async fn tab_scene_page_in(
+    tx: &mut Transaction<'_, Sqlite>,
+    caller: &Caller,
+    canvas_id: &str,
+    after: Option<SceneCursor>,
+    limit: usize,
+    max_chars: usize,
+    seal: &(dyn Fn(&str, &str) -> String + Sync),
+) -> Result<Value> {
+    let scene = get_scene_in(
+        tx,
+        None,
+        caller,
+        canvas_id,
+        false,
+        None,
+        Some(SceneWindow { after, limit }),
+    )
+    .await?;
+    let envelope = |objects: Vec<Value>, next_cursor: Option<String>| {
+        json!({
+            "version": TAB_SCENE_VERSION,
+            "canvas_id": canvas_id,
+            "scene_token": seal_revision(&scene["canvas_version"], "scene", seal),
+            "objects": objects,
+            "live_objects": scene["live_objects"],
+            "limit": limit,
+            "truncated": next_cursor.is_some(),
+            "next_cursor": next_cursor,
+        })
+    };
+    // Charge the envelope first, with the longest cursor it could carry, so
+    // the objects get exactly what is left of the page.
+    let envelope_chars = es_json_len(&envelope(
+        Vec::new(),
+        Some("f".repeat(SceneCursor::MAX_CHARS)),
+    ));
+    let (objects, stopped_early) = shape_tab_objects(
+        scene["objects"].as_array().cloned().unwrap_or_default(),
+        max_chars.saturating_sub(envelope_chars),
+        seal,
+    )?;
+    let next_cursor = if stopped_early {
+        objects.last().map(|last| {
+            SceneCursor {
+                z: last["z"].as_str().unwrap_or_default().to_owned(),
+                id: last["id"].as_str().unwrap_or_default().to_owned(),
+            }
+            .encode()
+        })
+    } else {
+        scene["next_cursor"].as_str().map(str::to_owned)
+    };
+    Ok(envelope(objects, next_cursor))
+}
+
+/// The length of `value` as the frame bridge measures an answer:
+/// `JSON.stringify(value).length`, in UTF-16 code units.
+///
+/// RFC 8785 serialises exactly as ECMAScript's `JSON.stringify` does, with
+/// the same number formatting (`1e20` is `100000000000000000000`, where
+/// `serde_json` writes `1e+20`) and the
+/// same string escaping. It only reorders object keys, which changes no
+/// length. `serde_json` differs on numbers, so it must not be used here.
+pub(crate) fn es_json_len(value: &Value) -> usize {
+    String::from_utf8(crate::canonical_json::canonical_json(value))
+        .expect("RFC 8785 output is UTF-8")
+        .encode_utf16()
+        .count()
+}
+
+/// Longest text a tab page carries in one field: a card's record `name` or
+/// `summary`, or any top-level string prop. It equals the note text limit,
+/// so no prop a client can write is ever cut; a record's summary can be.
+pub(crate) const TAB_SCENE_FIELD_MAX_BYTES: usize = canvas::MAX_NOTE_TEXT_BYTES;
+
+fn seal_revision(
+    value: &Value,
+    subject: &str,
+    seal: &(dyn Fn(&str, &str) -> String + Sync),
+) -> Value {
+    value
+        .as_str()
+        .map_or(Value::Null, |revision| json!(seal(subject, revision)))
+}
+
+/// Cut `value`, if it is a string longer than `max_bytes`, at the last UTF-8
+/// boundary within it. True if it was cut.
+fn bound_text(value: &mut Value, max_bytes: usize) -> bool {
+    let Some(text) = value.as_str() else {
+        return false;
+    };
+    if text.len() <= max_bytes {
+        return false;
+    }
+    let mut end = max_bytes;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    *value = Value::String(text[..end].to_owned());
+    true
+}
+
+/// What a tab receives for an object that cannot fit a page on its own:
+/// where it is and what it is, so it can be drawn and paging can pass it,
+/// but none of its content.
+fn oversized_placeholder(object: &Value) -> Value {
+    let mut placeholder = Map::new();
+    for key in [
+        "id", "kind", "x", "y", "w", "h", "z", "parent", "versions", "deleted",
+    ] {
+        if let Some(value) = object.get(key) {
+            placeholder.insert(key.into(), value.clone());
+        }
+    }
+    placeholder.insert("oversized".into(), Value::Bool(true));
+    Value::Object(placeholder)
+}
+
+/// Shape one window of redacted scene objects for a tab, in order, and say
+/// whether the byte budget stopped the page before the window's end.
+///
+/// For each object: every revision is sealed; a card's record `name` and
+/// `summary`, and every top-level string prop, are cut to
+/// [`TAB_SCENE_FIELD_MAX_BYTES`] and the cut fields listed, by path, in the
+/// object's `truncated_fields` (absent when nothing was cut). Lengths are
+/// the bridge's own, from [`es_json_len`]. An object that still exceeds
+/// `max_chars` on its own becomes an [`oversized_placeholder`]. Objects are
+/// then taken while the array holding them stays within `max_chars`, and
+/// never fewer than one.
+fn shape_tab_objects(
+    window: Vec<Value>,
+    max_chars: usize,
+    seal: &(dyn Fn(&str, &str) -> String + Sync),
+) -> Result<(Vec<Value>, bool)> {
+    let mut objects: Vec<Value> = Vec::new();
+    let mut spent = 0usize;
+    for mut object in window {
+        let id = object["id"].as_str().unwrap_or_default().to_owned();
+        let mut cut: Vec<String> = Vec::new();
+        if let Some(versions) = object.get_mut("versions").and_then(Value::as_object_mut) {
+            for group in ["geometry", "content"] {
+                if let Some(version) = versions.get_mut(group) {
+                    *version = seal_revision(version, &format!("object:{id}:{group}"), seal);
+                }
+            }
+        }
+        if let Some(record) = object.get_mut("record").and_then(Value::as_object_mut) {
+            let record_id = record
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            if let Some(version) = record.get_mut("version") {
+                *version = seal_revision(version, &format!("record:{record_id}"), seal);
+            }
+            for field in ["name", "summary"] {
+                if record
+                    .get_mut(field)
+                    .is_some_and(|value| bound_text(value, TAB_SCENE_FIELD_MAX_BYTES))
+                {
+                    cut.push(format!("record.{field}"));
+                }
+            }
+        }
+        if let Some(props) = object.get_mut("props").and_then(Value::as_object_mut) {
+            for (key, value) in props.iter_mut() {
+                if bound_text(value, TAB_SCENE_FIELD_MAX_BYTES) {
+                    cut.push(format!("props.{key}"));
+                }
+            }
+        }
+        if !cut.is_empty() {
+            object["truncated_fields"] = json!(cut);
+        }
+        // Each object costs its own length plus one separator; the array's
+        // brackets are the one extra character this over-counts.
+        let mut size = es_json_len(&object) + 1;
+        if size > max_chars {
+            object = oversized_placeholder(&object);
+            size = es_json_len(&object) + 1;
+        }
+        if !objects.is_empty() && spent + size > max_chars {
+            return Ok((objects, true));
+        }
+        spent += size;
+        objects.push(object);
+    }
+    Ok((objects, false))
 }
 
 /// The scene read against an existing transaction. The public `get_scene`
@@ -572,6 +839,7 @@ async fn get_scene_in(
     canvas_id: &str,
     include_deleted: bool,
     resolved_content_seq: Option<i64>,
+    window: Option<SceneWindow>,
 ) -> Result<Value> {
     require_canvas_in(&mut *tx, caller, READ_TOOL, canvas_id, Capability::View).await?;
     let (objects, version) = match scene_source {
@@ -587,15 +855,6 @@ async fn get_scene_in(
             (objects, version)
         }
     };
-    let mut values: Vec<Value> = objects.iter().map(SceneObject::to_value).collect();
-    let referenced = referenced_record_ids(&values, &[]);
-    let visible = visible_ids_preloaded_in(&mut *tx, caller, &referenced).await?;
-    let mut faces = HashMap::new();
-    for id in &visible {
-        if let Some(face) = record_face(&mut *tx, id).await? {
-            faces.insert(id.clone(), face);
-        }
-    }
     // Built from the unredacted scene: after redaction a withheld card reads
     // "withheld" and could no longer resolve its own endpoint.
     let cards: HashMap<String, String> = objects
@@ -609,15 +868,50 @@ async fn get_scene_in(
                 .map(|record| (object.id.clone(), record.to_owned()))
         })
         .collect();
+    let live = objects.iter().filter(|object| !object.deleted).count();
+    // A window slices the same order the load returned. Everything above
+    // stays whole-scene: a connector on this page may join cards on others,
+    // and must resolve exactly as it would in the unwindowed scene.
+    let (page, next_cursor) = match &window {
+        None => (&objects[..], None),
+        Some(window) => {
+            let start = window.after.as_ref().map_or(0, |after| {
+                objects.partition_point(|object| {
+                    (object.z.as_str(), object.id.as_str()) <= (after.z.as_str(), after.id.as_str())
+                })
+            });
+            let end = objects.len().min(start + window.limit);
+            let page = &objects[start..end];
+            let next = page
+                .last()
+                .filter(|_| end < objects.len())
+                .map(|last| SceneCursor {
+                    z: last.z.clone(),
+                    id: last.id.clone(),
+                });
+            (page, next)
+        }
+    };
+    let mut values: Vec<Value> = page.iter().map(SceneObject::to_value).collect();
+    let referenced: Vec<String> = cards
+        .values()
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let visible = visible_ids_preloaded_in(&mut *tx, caller, &referenced).await?;
+    let on_page = referenced_record_ids(&values, &[]);
+    let mut faces = HashMap::new();
+    for id in on_page.iter().filter(|id| visible.contains(*id)) {
+        if let Some(face) = record_face(&mut *tx, id).await? {
+            faces.insert(id.clone(), face);
+        }
+    }
     for object in &mut values {
         redact_object(object, &visible, &faces);
     }
     resolve_connector_semantics(&mut *tx, &mut values, &cards, &visible).await?;
-    let live = values
-        .iter()
-        .filter(|object| object.get("deleted") == Some(&Value::Bool(false)))
-        .count();
-    Ok(json!({
+    let mut output = json!({
         "action": "get_scene",
         "version": SCENE_VERSION,
         "canvas_id": canvas_id,
@@ -631,7 +925,13 @@ async fn get_scene_in(
             "batch_bytes": canvas::MAX_BATCH_CANONICAL_BYTES,
             "live_objects": canvas::MAX_LIVE_OBJECTS,
         },
-    }))
+    });
+    if let Some(window) = window {
+        output["limit"] = json!(window.limit);
+        output["truncated"] = json!(next_cursor.is_some());
+        output["next_cursor"] = json!(next_cursor.as_ref().map(SceneCursor::encode));
+    }
+    Ok(output)
 }
 
 async fn changes(
@@ -788,7 +1088,7 @@ async fn export_bundle_in(
 ) -> Result<Value> {
     // The scene first: its inner require authenticates the canvas with the
     // same non-existent-record refusal `get_scene` gives.
-    let scene_envelope = get_scene_in(&mut *tx, None, caller, canvas_id, true, None).await?;
+    let scene_envelope = get_scene_in(&mut *tx, None, caller, canvas_id, true, None, None).await?;
     let objects = scene_envelope
         .get("objects")
         .and_then(Value::as_array)
@@ -2545,6 +2845,7 @@ async fn promote(
                 "attestation_id": draft.id(),
             }),
             vocab_ref: None,
+            time_type: None,
         };
         append_in(
             &db,
@@ -2969,4 +3270,111 @@ pub fn register_canvas_tools(registry: &mut ToolRegistry) -> Result<()> {
         manage_canvas,
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tab_page_tests {
+    //! The tab page's byte bounds, without a database.
+
+    use super::{es_json_len, shape_tab_objects, TAB_SCENE_FIELD_MAX_BYTES};
+    use serde_json::{json, Value};
+
+    fn seal(subject: &str, value: &str) -> String {
+        format!("t:{subject}:{value}")
+    }
+
+    fn note(id: &str, text: &str) -> Value {
+        json!({
+            "id": id, "kind": "note", "x": 1.0, "y": 2.0, "w": 3.0, "h": 4.0,
+            "z": format!("a{id}"), "parent": null, "deleted": false,
+            "props": { "text": text, "color": "yellow" },
+            "versions": { "geometry": "canvas:7", "content": "canvas:8" },
+        })
+    }
+
+    #[test]
+    fn long_text_is_cut_on_a_char_boundary_and_named() {
+        let mut card = note("c1", "short");
+        card["kind"] = json!("record_card");
+        card["props"] = json!({ "record_id": "r1" });
+        card["record"] = json!({
+            "id": "r1", "name": "é".repeat(TAB_SCENE_FIELD_MAX_BYTES),
+            "summary": "s".repeat(1_100_000), "version": "rec:9",
+        });
+        let (objects, stopped) = shape_tab_objects(vec![card], 768 * 1024, &seal).unwrap();
+        assert!(!stopped);
+        let card = &objects[0];
+        assert_eq!(
+            card["truncated_fields"],
+            json!(["record.name", "record.summary"])
+        );
+        let name = card["record"]["name"].as_str().unwrap();
+        assert!(name.len() <= TAB_SCENE_FIELD_MAX_BYTES && name.chars().all(|c| c == 'é'));
+        assert_eq!(
+            card["record"]["summary"].as_str().unwrap().len(),
+            TAB_SCENE_FIELD_MAX_BYTES
+        );
+        assert_eq!(card["record"]["version"], "t:record:r1:rec:9");
+        assert_eq!(
+            card["versions"]["geometry"],
+            "t:object:c1:geometry:canvas:7"
+        );
+        // Nothing cut, nothing named.
+        let (plain, _) = shape_tab_objects(vec![note("n1", "hi")], 1024, &seal).unwrap();
+        assert!(plain[0].get("truncated_fields").is_none());
+    }
+
+    #[test]
+    fn lengths_are_the_bridges_with_ecmascript_numbers_and_utf16_units() {
+        // `JSON.stringify(1e20)` is "100000000000000000000"; serde_json
+        // writes "1e+20". Past 1e21 ECMAScript switches to exponent form.
+        assert_eq!(es_json_len(&json!(1e20)), 21);
+        assert_eq!(serde_json::to_string(&json!(1e20)).unwrap(), "1e+20");
+        assert_eq!(es_json_len(&json!(1e21)), "1e+21".len());
+        assert_eq!(es_json_len(&json!(0.1)), 3);
+        // One UTF-16 unit per BMP character, two for an astral one, and
+        // escapes as JSON.stringify writes them.
+        assert_eq!(es_json_len(&json!("é")), 3);
+        assert_eq!(es_json_len(&json!("😀")), 4);
+        assert_eq!(es_json_len(&json!("a\"b\n")), 8);
+    }
+
+    #[test]
+    fn a_stroke_of_huge_coordinates_is_measured_as_the_bridge_measures_it() {
+        let mut stroke = note("s1", "");
+        stroke["kind"] = json!("stroke");
+        stroke["props"] = json!({ "points": vec![json!([1e20, 1e20]); 2000] });
+        let serde_len = serde_json::to_vec(&stroke).unwrap().len();
+        let es_len = es_json_len(&stroke);
+        assert!(
+            es_len > 90_000 && serde_len < 30_000,
+            "{es_len} vs {serde_len}"
+        );
+        // A budget serde_json would think it fits is one it does not fit.
+        let (objects, _) = shape_tab_objects(vec![stroke], 60_000, &seal).unwrap();
+        assert_eq!(objects[0]["oversized"], true);
+    }
+
+    #[test]
+    fn an_object_too_large_alone_becomes_a_placeholder_and_paging_moves_on() {
+        // A budget smaller than one ordinary object: the first becomes a
+        // bounded placeholder, and the page stops so the cursor advances.
+        let budget = 300;
+        let window = vec![note("n1", &"x".repeat(2000)), note("n2", "small")];
+        let (objects, stopped) = shape_tab_objects(window, budget, &seal).unwrap();
+        assert!(stopped);
+        assert_eq!(objects.len(), 1);
+        let placeholder = &objects[0];
+        assert_eq!(placeholder["oversized"], true);
+        assert_eq!(placeholder["id"], "n1");
+        assert_eq!(placeholder["z"], "an1");
+        assert_eq!(placeholder["x"], 1.0);
+        assert!(placeholder.get("props").is_none());
+        assert!(serde_json::to_vec(placeholder).unwrap().len() < budget);
+        // The next window starts after it and carries the next object.
+        let (next, stopped) = shape_tab_objects(vec![note("n2", "small")], budget, &seal).unwrap();
+        assert!(!stopped);
+        assert_eq!(next[0]["id"], "n2");
+        assert!(next[0].get("oversized").is_none());
+    }
 }

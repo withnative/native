@@ -29,7 +29,7 @@ use std::collections::HashSet;
 
 use futures::TryStreamExt;
 use serde::Serialize;
-use sqlx::Row;
+use sqlx::{Row, SqliteConnection};
 
 use super::{tree, NOT_ARCHIVED};
 use crate::db::Db;
@@ -108,6 +108,10 @@ pub struct FtsOptions {
     /// Restrict to these record types (empty = all). Applied inside the match
     /// query, so ranked results and pool counts agree with the restriction.
     pub types: Vec<String>,
+    /// Member-copy serving (contract c323277 §2.3(a)): every row in the slice
+    /// is E(m), so lexical visibility is slice presence and the policy/Unit
+    /// view predicate is replaced. False for every online caller.
+    pub member: bool,
 }
 
 /// Split free text into FTS5-safe quoted terms: each token is double-quoted
@@ -172,8 +176,11 @@ struct SearchPrincipal<'a> {
     is_member: bool,
 }
 
+/// Match stream and parent redaction over the caller's connection, so one
+/// search reads one snapshot. Pool callers acquire the connection; declared
+/// tab reads pass their gate transaction's.
 async fn run_match(
-    db: &Db,
+    conn: &mut SqliteConnection,
     principal: SearchPrincipal<'_>,
     index_sql: &str, // the FROM/MATCH fragment, index-specific
     match_expr: &str,
@@ -184,7 +191,8 @@ async fn run_match(
     let limit = effective_limit(opts.limit)?;
     let scope_ids = match &opts.scope {
         Some(root) => Some(
-            tree::subtree_ids_with_hidden(db, root, false, false, opts.include_archived).await?,
+            tree::subtree_ids_with_hidden_in(conn, root, false, false, opts.include_archived)
+                .await?,
         ),
         None => None,
     };
@@ -209,8 +217,18 @@ async fn run_match(
         let (filter, bind) = set_filter("r.type", &opts.types)?;
         (filter, Some(bind))
     };
-    let not_hidden = super::not_hidden_predicate("r");
-    let view_filter = view_predicate("r");
+    let not_hidden = if opts.member {
+        super::member_not_hidden_predicate("r")
+    } else {
+        super::not_hidden_predicate("r")
+    };
+    // A member copy holds only E(m): lexical visibility is slice presence, so
+    // the policy/Unit view predicate (and its four binds) is replaced.
+    let view_filter = if opts.member {
+        "1".to_string()
+    } else {
+        view_predicate("r")
+    };
     let sql = format!(
         "{index_sql}
           AND r.deleted_at IS NULL
@@ -222,19 +240,21 @@ async fn run_match(
           ORDER BY r.id
           LIMIT ?"
     );
-    let mut query = sqlx::query(&sql)
-        .bind(match_expr)
-        .bind(principal.trusted_local_bypass)
-        .bind(principal.credential)
-        .bind(principal.is_member)
-        .bind(principal.credential);
+    let mut query = sqlx::query(&sql).bind(match_expr);
+    if !opts.member {
+        query = query
+            .bind(principal.trusted_local_bypass)
+            .bind(principal.credential)
+            .bind(principal.is_member)
+            .bind(principal.credential);
+    }
     if let Some(bind) = &scope_bind {
         query = query.bind(bind);
     }
     if let Some(bind) = &type_bind {
         query = query.bind(bind);
     }
-    let mut stream = query.bind(TRUSTED_CANDIDATE_CAP).fetch(db.write_pool());
+    let mut stream = query.bind(TRUSTED_CANDIDATE_CAP).fetch(&mut *conn);
     let mut hits = Vec::new();
     let mut candidate_bytes = 0_usize;
     while let Some(row) = stream.try_next().await? {
@@ -273,14 +293,22 @@ async fn run_match(
         });
     }
     drop(stream);
-    redact_parent_ids(
-        db,
-        principal.credential,
-        principal.trusted_local_bypass,
-        principal.is_member,
-        &mut hits,
-    )
-    .await?;
+    if opts.member {
+        // A member parent is either present in the slice or already nulled by
+        // the producer, so the raw home is the answer.
+        for hit in &mut hits {
+            hit.home_id = hit.raw_home_id.clone();
+        }
+    } else {
+        redact_parent_ids(
+            conn,
+            principal.credential,
+            principal.trusted_local_bypass,
+            principal.is_member,
+            &mut hits,
+        )
+        .await?;
+    }
     hits.sort_by(|left, right| {
         left.score
             .total_cmp(&right.score)
@@ -373,8 +401,11 @@ pub(crate) fn view_predicate(alias: &str) -> String {
 /// Resolve only those IDs that are independently public to this caller. This
 /// is intentionally a second authorization check: visibility of a child never
 /// implies that its structural parent identifier may be surfaced.
+/// Parent/home visibility filter over the caller's connection, so one
+/// search reads one snapshot. Pool callers acquire the connection; declared
+/// tab reads pass their gate transaction's.
 pub(crate) async fn independently_visible_ids(
-    db: &Db,
+    conn: &mut SqliteConnection,
     credential: &str,
     trusted_local_bypass: bool,
     is_member: bool,
@@ -402,13 +433,15 @@ pub(crate) async fn independently_visible_ids(
             .bind(credential)
             .bind(is_member)
             .bind(credential);
-        visible.extend(query.fetch_all(db.write_pool()).await?);
+        visible.extend(query.fetch_all(&mut *conn).await?);
     }
     Ok(visible)
 }
 
+/// Parent redaction over the caller's connection. Pool callers acquire the
+/// connection; declared tab reads pass their gate transaction's.
 async fn redact_parent_ids(
-    db: &Db,
+    conn: &mut SqliteConnection,
     credential: &str,
     trusted_local_bypass: bool,
     is_member: bool,
@@ -418,9 +451,14 @@ async fn redact_parent_ids(
         .iter()
         .filter_map(|hit| hit.raw_home_id.clone())
         .collect();
-    let visible =
-        independently_visible_ids(db, credential, trusted_local_bypass, is_member, &parent_ids)
-            .await?;
+    let visible = independently_visible_ids(
+        conn,
+        credential,
+        trusted_local_bypass,
+        is_member,
+        &parent_ids,
+    )
+    .await?;
     for hit in hits {
         hit.home_id = hit
             .raw_home_id
@@ -471,6 +509,29 @@ pub(crate) async fn search_with_policy_bypass(
     input: &str,
     opts: &FtsOptions,
 ) -> Result<Vec<SearchHit>> {
+    let mut conn = db.write_pool().acquire().await?;
+    search_with_policy_bypass_in(
+        &mut conn,
+        credential,
+        trusted_local_bypass,
+        is_member,
+        input,
+        opts,
+    )
+    .await
+}
+
+/// Snapshot-scoped form of [`search_with_policy_bypass`]: the match and the
+/// parent redaction share the caller's connection. Declared tab reads use
+/// this; existing callers keep the pool form.
+pub(crate) async fn search_with_policy_bypass_in(
+    conn: &mut SqliteConnection,
+    credential: &str,
+    trusted_local_bypass: bool,
+    is_member: bool,
+    input: &str,
+    opts: &FtsOptions,
+) -> Result<Vec<SearchHit>> {
     let Some(match_expr) = quoted_terms(input) else {
         return Ok(Vec::new());
     };
@@ -486,7 +547,7 @@ pub(crate) async fn search_with_policy_bypass(
     );
     let rank_terms = tokenize(input);
     run_match(
-        db,
+        conn,
         SearchPrincipal {
             credential,
             trusted_local_bypass,
@@ -552,8 +613,16 @@ pub(crate) async fn search_pool_count_with_policy_bypass(
         let (filter, bind) = set_filter("r.type", &opts.types)?;
         (filter, Some(bind))
     };
-    let not_hidden = super::not_hidden_predicate("r");
-    let view_filter = view_predicate("r");
+    let not_hidden = if opts.member {
+        super::member_not_hidden_predicate("r")
+    } else {
+        super::not_hidden_predicate("r")
+    };
+    let view_filter = if opts.member {
+        "1".to_string()
+    } else {
+        view_predicate("r")
+    };
     let sql = format!(
         "SELECT COUNT(*) AS n
           FROM records_fts
@@ -566,12 +635,14 @@ pub(crate) async fn search_pool_count_with_policy_bypass(
             {scope_filter}
             {type_filter}"
     );
-    let mut query = sqlx::query(&sql)
-        .bind(&match_expr)
-        .bind(trusted_local_bypass)
-        .bind(credential)
-        .bind(is_member)
-        .bind(credential);
+    let mut query = sqlx::query(&sql).bind(&match_expr);
+    if !opts.member {
+        query = query
+            .bind(trusted_local_bypass)
+            .bind(credential)
+            .bind(is_member)
+            .bind(credential);
+    }
     if let Some(bind) = &scope_bind {
         query = query.bind(bind);
     }
@@ -602,6 +673,29 @@ pub(crate) async fn name_prefix_with_policy_bypass(
     input: &str,
     opts: &FtsOptions,
 ) -> Result<Vec<SearchHit>> {
+    let mut conn = db.write_pool().acquire().await?;
+    name_prefix_with_policy_bypass_in(
+        &mut conn,
+        credential,
+        trusted_local_bypass,
+        is_member,
+        input,
+        opts,
+    )
+    .await
+}
+
+/// Snapshot-scoped form of [`name_prefix_with_policy_bypass`]: the match
+/// and the parent redaction share the caller's connection. Declared tab
+/// reads use this; existing callers keep the pool form.
+pub(crate) async fn name_prefix_with_policy_bypass_in(
+    conn: &mut SqliteConnection,
+    credential: &str,
+    trusted_local_bypass: bool,
+    is_member: bool,
+    input: &str,
+    opts: &FtsOptions,
+) -> Result<Vec<SearchHit>> {
     let Some(terms) = quoted_terms(input) else {
         return Ok(Vec::new());
     };
@@ -616,7 +710,7 @@ pub(crate) async fn name_prefix_with_policy_bypass(
     );
     let rank_terms = tokenize(input);
     run_match(
-        db,
+        conn,
         SearchPrincipal {
             credential,
             trusted_local_bypass,
@@ -664,6 +758,29 @@ pub(crate) async fn name_infix_with_policy_bypass(
     input: &str,
     opts: &FtsOptions,
 ) -> Result<Vec<SearchHit>> {
+    let mut conn = db.write_pool().acquire().await?;
+    name_infix_with_policy_bypass_in(
+        &mut conn,
+        credential,
+        trusted_local_bypass,
+        is_member,
+        input,
+        opts,
+    )
+    .await
+}
+
+/// Snapshot-scoped form of [`name_infix_with_policy_bypass`]: the LIKE pass
+/// and the parent redaction share the caller's connection. Declared tab
+/// reads use this; existing callers keep the pool form.
+pub(crate) async fn name_infix_with_policy_bypass_in(
+    conn: &mut SqliteConnection,
+    credential: &str,
+    trusted_local_bypass: bool,
+    is_member: bool,
+    input: &str,
+    opts: &FtsOptions,
+) -> Result<Vec<SearchHit>> {
     let tokens = tokenize(input);
     if tokens.is_empty() {
         return Ok(Vec::new());
@@ -671,7 +788,8 @@ pub(crate) async fn name_infix_with_policy_bypass(
     let limit = effective_limit(opts.limit)?;
     let scope_ids = match &opts.scope {
         Some(root) => Some(
-            tree::subtree_ids_with_hidden(db, root, false, false, opts.include_archived).await?,
+            tree::subtree_ids_with_hidden_in(conn, root, false, false, opts.include_archived)
+                .await?,
         ),
         None => None,
     };
@@ -697,8 +815,16 @@ pub(crate) async fn name_infix_with_policy_bypass(
         (filter, Some(bind))
     };
     let predicates = vec!["r.name LIKE ? ESCAPE '\\'"; tokens.len()].join(" AND ");
-    let not_hidden = super::not_hidden_predicate("r");
-    let view_filter = view_predicate("r");
+    let not_hidden = if opts.member {
+        super::member_not_hidden_predicate("r")
+    } else {
+        super::not_hidden_predicate("r")
+    };
+    let view_filter = if opts.member {
+        "1".to_string()
+    } else {
+        view_predicate("r")
+    };
     let sql = format!(
         "SELECT r.id, r.type, r.kind,
                 substr(r.name, 1, {TRUSTED_NAME_CHARS}) AS name, r.home_id,
@@ -723,18 +849,20 @@ pub(crate) async fn name_infix_with_policy_bypass(
             .replace('_', "\\_");
         query = query.bind(format!("%{escaped}%"));
     }
-    query = query
-        .bind(trusted_local_bypass)
-        .bind(credential)
-        .bind(is_member)
-        .bind(credential);
+    if !opts.member {
+        query = query
+            .bind(trusted_local_bypass)
+            .bind(credential)
+            .bind(is_member)
+            .bind(credential);
+    }
     if let Some(bind) = scope_bind {
         query = query.bind(bind);
     }
     if let Some(bind) = type_bind {
         query = query.bind(bind);
     }
-    let rows = query.bind(limit).fetch_all(db.write_pool()).await?;
+    let rows = query.bind(limit).fetch_all(&mut *conn).await?;
     let mut hits = rows
         .iter()
         .map(|row| {
@@ -751,6 +879,12 @@ pub(crate) async fn name_infix_with_policy_bypass(
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    redact_parent_ids(db, credential, trusted_local_bypass, is_member, &mut hits).await?;
+    if opts.member {
+        for hit in &mut hits {
+            hit.home_id = hit.raw_home_id.clone();
+        }
+    } else {
+        redact_parent_ids(conn, credential, trusted_local_bypass, is_member, &mut hits).await?;
+    }
     Ok(hits)
 }

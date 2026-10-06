@@ -117,29 +117,36 @@ impl StdioServer {
     /// Dispatch one message. `None` means no response goes out (notification,
     /// or a stray response message we ignore per JSON-RPC).
     async fn handle_message(&self, message: Value) -> Option<Value> {
-        // Presence of per-request protocol metadata selects the modern,
-        // stateless era. Both dispatchers are shared with hosted HTTP; this
-        // wrapper contributes only stdio framing.
-        let outcome = if protocol::is_modern_request(&message) {
-            protocol::handle_modern_engine_message(
-                self.registry.clone(),
-                self.engine.clone(),
-                self.caller.clone(),
-                message,
-            )
-            .await
-        } else {
-            protocol::handle_legacy_engine_message(
-                self.registry.clone(),
-                self.engine.clone(),
-                self.caller.clone(),
-                message,
-            )
-            .await
-        };
-        match outcome {
-            RpcOutcome::Notification => None,
-            RpcOutcome::Response { body, .. } => Some(body),
-        }
+        dispatch_engine_message(
+            self.registry.clone(),
+            self.engine.clone(),
+            self.caller.clone(),
+            message,
+        )
+        .await
+    }
+}
+
+/// Shared modern/legacy dispatch with the transport's framing peeled off.
+///
+/// Presence of per-request protocol metadata selects the modern, stateless
+/// era. Both dispatchers are shared with hosted HTTP; this function is the
+/// single framing contribution every stdio-shaped transport reuses (the fixed
+/// [`StdioServer`] and the dynamic member session), so render/framing cannot
+/// drift between them.
+pub(crate) async fn dispatch_engine_message(
+    registry: Arc<ToolRegistry>,
+    engine: EngineHandle,
+    caller: Caller,
+    message: Value,
+) -> Option<Value> {
+    let outcome = if protocol::is_modern_request(&message) {
+        protocol::handle_modern_engine_message(registry, engine, caller, message).await
+    } else {
+        protocol::handle_legacy_engine_message(registry, engine, caller, message).await
+    };
+    match outcome {
+        RpcOutcome::Notification => None,
+        RpcOutcome::Response { body, .. } => Some(body),
     }
 }

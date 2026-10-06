@@ -439,16 +439,33 @@ async fn reports_not_panics_when_the_event_log_carries_undecodable_values() {
     // code, never a crash (a bare `Row::get` here panicked on decode).
     let client = db_with(&doctored(
         "seq                     INTEGER PRIMARY KEY AUTOINCREMENT,",
-        "seq                     TEXT,",
+        "seq                     TEXT PRIMARY KEY,",
     ))
     .await;
+    // The corrupt legacy sequence cannot populate the current integer metadata
+    // key. Bypass only that trigger while constructing this corruption fixture.
+    let mut tx = crate::common::fixture_write_pool(&client)
+        .await
+        .begin()
+        .await
+        .unwrap();
+    sqlx::query("DROP TRIGGER content_event_claim_meta_insert")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
     sqlx::query(
         "INSERT INTO content_events (seq, id, record_id, type, payload, actor, created_at, causal_envelope_version, causal_status)
           VALUES ('not-a-number', 'e1', 'r1', 'record.created', '{}', NULL, '2026-01-01T00:00:00.000Z', 1, 'legacy_unknown')",
     )
-    .execute(&crate::common::fixture_write_pool(&client).await)
+    .execute(&mut *tx)
     .await
     .unwrap();
+    let trigger = DDL_STATEMENTS
+        .iter()
+        .find(|sql| sql.starts_with("CREATE TRIGGER content_event_claim_meta_insert"))
+        .unwrap();
+    sqlx::query(trigger).execute(&mut *tx).await.unwrap();
+    tx.commit().await.unwrap();
     let report = run_conformance(&client).await;
     assert!(!report.ok);
     let drift = check(&report, "rebuild-and-diff");

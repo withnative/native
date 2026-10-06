@@ -1,4 +1,4 @@
-//! Exact Turso 0.7.2 parser admission for caller SQL.
+//! Exact Turso 0.8.0 parser admission for caller SQL.
 
 use std::collections::BTreeSet;
 
@@ -49,7 +49,44 @@ pub(crate) fn validate(sql: &str) -> Result<()> {
             "Turso query_sql accepts one SELECT statement only",
         ));
     };
+    // I3 (AST design): shared determinism rules on the already-parsed AST.
+    check_determinism_rules(&select)?;
     validate_select(&select, &[])
+}
+
+/// Parse one SELECT the way the Turso profile does (single statement).
+/// Test-only, for the rules-agreement differential: a parse failure fails
+/// closed here (this parser IS the Turso engine's), unlike the SQLite
+/// path's fail-open to its engine gate.
+#[cfg(test)]
+pub(crate) fn parse_for_rules(sql: &str) -> Result<Select> {
+    let mut parser = Parser::new(sql.as_bytes());
+    let cmd = parser
+        .next()
+        .transpose()
+        .map_err(|error| reject(QuerySqlErrorCategory::SyntaxOrType, error.to_string()))?
+        .ok_or_else(|| reject(QuerySqlErrorCategory::UnsafeStatement, "empty SQL"))?;
+    if parser.next().is_some() {
+        return Err(reject(
+            QuerySqlErrorCategory::UnsafeStatement,
+            "a single statement only",
+        ));
+    }
+    let Cmd::Stmt(Stmt::Select(select)) = cmd else {
+        return Err(reject(
+            QuerySqlErrorCategory::UnsafeStatement,
+            "Turso query_sql accepts one SELECT statement only",
+        ));
+    };
+    Ok(select)
+}
+
+/// Shared I3 determinism rules on an already-parsed statement, sans the
+/// Turso relation/function gates below.
+pub(crate) fn check_determinism_rules(select: &Select) -> Result<()> {
+    super::turso_ast_rules::check_limit_order(select)?;
+    super::turso_ast_rules::check_group_columns(select)?;
+    Ok(())
 }
 
 fn validate_select(select: &Select, outer: &[BTreeSet<String>]) -> Result<()> {
@@ -72,10 +109,13 @@ fn validate_with(with: &With, scopes: &mut Vec<BTreeSet<String>>) -> Result<()> 
     let mut local = BTreeSet::new();
     for cte in &with.ctes {
         let name = checked_name(&cte.tbl_name)?;
-        if is_logical_relation(name) || !local.insert(name.to_ascii_lowercase()) {
+        // Only relations this profile serves are reserved. A relation outside
+        // it has no table here to shadow, and reserving every catalog name
+        // would break a working statement each time a relation is added.
+        if is_turso_relation(name) || !local.insert(name.to_ascii_lowercase()) {
             return Err(reject(
                 QuerySqlErrorCategory::UnauthorizedRelation,
-                "CTE names cannot collide with logical relations or each other",
+                "CTE names cannot collide with this profile's logical relations or each other",
             ));
         }
         for column in &cte.columns {
@@ -185,6 +225,17 @@ fn validate_table(table: &SelectTable, scopes: &[BTreeSet<String>]) -> Result<()
                     None => base,
                 };
                 return Err(reject(QuerySqlErrorCategory::UnauthorizedRelation, detail));
+            }
+            // Refuse a reference to a relation this profile does not serve by
+            // name, not by dependency: a statement reading no column of it
+            // never enters the dependency set the later profile gate checks.
+            if !in_scope && !is_turso_relation(relation) {
+                return Err(reject(
+                    QuerySqlErrorCategory::UnauthorizedRelation,
+                    format!(
+                        "query_sql relation '{relation}' is unavailable in profile turso-local"
+                    ),
+                ));
             }
             if let Some(alias) = alias {
                 checked_name(alias.name())?;
@@ -358,13 +409,31 @@ fn validate_expr(expr: &Expr, scopes: &[BTreeSet<String>]) -> Result<()> {
 
 fn validate_function(name: &Name) -> Result<()> {
     let name = checked_name(name)?;
-    // I2: the portable subset lives in the shared contract table; the
-    // classifier already rejected dropped names with their repair, so the
-    // repair branch below is defence in depth with the identical message.
-    // `like` keeps its function-form admission; Postgres spells it `~~`.
-    if sql_contract::is_portable_function(name) || name.eq_ignore_ascii_case("like") {
+    // Per-engine scope is the shared registry's single source
+    // (`function_supported_on`), so this gate cannot drift from the contract
+    // metadata. `like` is not a registry row and keeps its function-form
+    // admission (Postgres spells it `~~`).
+    if name.eq_ignore_ascii_case("like") {
         return Ok(());
     }
+    if sql_contract::function_decl(name).is_some() {
+        if sql_contract::function_supported_on(name, sql_contract::QuerySqlProfile::TursoLocal) {
+            return Ok(());
+        }
+        // Plain caller advice only. The engine-internal reason the six
+        // window rows are scoped off TursoLocal (exact 0.8.0 resolves the
+        // names but compiles every window program as non-read-only, refused
+        // by the isolated query-only projection) lives in the evidence and
+        // tests, not in the user-facing repair.
+        return Err(reject(
+            QuerySqlErrorCategory::UnsafeStatement,
+            format!(
+                "function '{name}' is unavailable on turso-local; run it on SQLite-local or compute it in the caller"
+            ),
+        ));
+    }
+    // I2: dropped names carry a shared repair (defence in depth behind the
+    // classifier, which reports the identical message first).
     if let Some(detail) = sql_contract::unavailable_function_detail(name) {
         return Err(reject(QuerySqlErrorCategory::UnsafeStatement, detail));
     }
@@ -501,6 +570,13 @@ fn is_logical_relation(name: &str) -> bool {
         .any(|relation| relation.name.eq_ignore_ascii_case(name))
 }
 
+fn is_turso_relation(name: &str) -> bool {
+    let profile = sql_contract::QuerySqlProfile::TursoLocal.contract().id;
+    sql_contract::LOGICAL_RELATIONS.iter().any(|relation| {
+        relation.name.eq_ignore_ascii_case(name) && relation.profiles.contains(&profile)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -509,6 +585,131 @@ mod tests {
     fn accepts_nested_read_only_logical_queries() {
         validate("WITH visible AS (SELECT id FROM records) SELECT count(*) AS n FROM visible WHERE id IN (SELECT record_id FROM facet_values)").unwrap();
         validate("SELECT ID FROM RECORDS").unwrap();
+    }
+
+    #[test]
+    fn shared_rules_wiring_and_repair_wording() {
+        // What this checks, honestly: (1) the SQLite and Turso entry
+        // points stay wired to the same shared rules — `check_statement`
+        // versus `parse_for_rules` + `check_determinism_rules` agree on
+        // every comparable statement, so a future per-profile wiring
+        // divergence fails loudly; (2) every rejection over the corpus
+        // names an intended repair (LIMIT needs ORDER BY, GROUP BY needs
+        // keys). What it does NOT check: rule semantics themselves. Both
+        // arms call the same `check_limit_order` + `check_group_columns`,
+        // so agreement is true by construction and cannot catch
+        // rule-logic classes (false admits/rejects live in the shared
+        // rules both arms call — those are pinned by the
+        // `turso_ast_rules` unit tests, not here). Parse failures differ
+        // by design (SQLite fail-opens to its engine gate; this parser IS
+        // the Turso engine's, so it fail-closes) and are skipped here.
+        // Universe: the shared conformance corpus plus the 75 distinct
+        // logged census statements.
+        use super::super::sql_contract::{classify_single_read_statement, QuerySqlProfile};
+        let census: Vec<String> =
+            serde_json::from_str(include_str!("sql_census_fixture.json")).unwrap();
+        let corpus = super::super::sql_conformance::corpus();
+        let mut compared = 0;
+        for sql in corpus
+            .iter()
+            .map(|case| case.sql)
+            .chain(census.iter().map(String::as_str))
+        {
+            if classify_single_read_statement(QuerySqlProfile::SqliteLocal, sql).is_err()
+                || classify_single_read_statement(QuerySqlProfile::TursoLocal, sql).is_err()
+            {
+                continue;
+            }
+            let Ok(parsed) = parse_for_rules(sql) else {
+                continue;
+            };
+            let sqlite = super::super::turso_ast_rules::check_statement(sql).is_ok();
+            let turso = check_determinism_rules(&parsed);
+            assert_eq!(
+                sqlite,
+                turso.is_ok(),
+                "shared rules wiring diverged across profiles: {sql}"
+            );
+            if let Err(error) = turso {
+                let message = error.to_string();
+                assert!(
+                    message.contains("ORDER BY") || message.contains("GROUP BY"),
+                    "unintended rule rejection: {sql}: {message}"
+                );
+            }
+            compared += 1;
+        }
+        assert!(compared > 0, "wiring check ran on nothing");
+        println!("rules wiring: {compared} statements compared");
+    }
+
+    #[test]
+    fn determinism_rules_reject_and_admit() {
+        // I3 (AST design): LIMIT needs ORDER BY and bare GROUP BY columns
+        // fail; NULLS ordering and division are native here, never rejected.
+        for sql in [
+            "SELECT id FROM records ORDER BY id LIMIT 5",
+            "SELECT kind, count(*) FROM records GROUP BY kind",
+            "SELECT id FROM records ORDER BY id",
+            "SELECT 1 / 0 FROM records",
+            "SELECT created_at_ms / 604800000 AS week, count(*) AS n FROM records GROUP BY week ORDER BY week",
+            "SELECT created_at_ms / 604800000 AS week, count(*) AS n FROM records GROUP BY 1 ORDER BY 1",
+            "SELECT kind, count(*) AS n FROM records GROUP BY kind HAVING n > 0",
+            // Correlated unqualified outer refs resolve outside, where
+            // GROUP BY fixes their value.
+            "SELECT (SELECT count(*) + kind FROM facet_values) FROM records GROUP BY kind",
+            "SELECT kind, count(*) FROM records GROUP BY kind HAVING count(*) > (SELECT count(*) + kind FROM facet_values)",
+            // Qualification spelling never decides grouping.
+            "SELECT records.kind, count(*) FROM records GROUP BY kind",
+            "SELECT kind, count(*) FROM records GROUP BY records.kind",
+            "SELECT r.kind, count(*) FROM records r GROUP BY kind",
+            // ORDER BY under grouping: keys, aggregates, aliases, ordinals.
+            "SELECT kind, count(*) FROM records GROUP BY kind ORDER BY kind",
+            "SELECT kind, count(*) AS n FROM records GROUP BY kind ORDER BY n DESC",
+            // Qualified outer group key admits.
+            "SELECT kind, (SELECT count(*) + t.kind FROM facet_values) FROM records t GROUP BY kind",
+        ] {
+            validate(sql).unwrap_or_else(|error| panic!("{sql}: {error}"));
+        }
+        for (sql, repair) in [
+            (
+                "SELECT id FROM records LIMIT 5",
+                "add ORDER BY over a unique key",
+            ),
+            (
+                "SELECT kind, count(*) FROM records GROUP BY type",
+                "must appear in GROUP BY or inside an aggregate",
+            ),
+            // Genuinely bare inner column (not an outer group key).
+            (
+                "SELECT (SELECT count(*) + other FROM facet_values) FROM records GROUP BY kind",
+                "must appear in GROUP BY or inside an aggregate",
+            ),
+            // ORDER BY on a non-grouped column fails with the same repair.
+            (
+                "SELECT kind, count(*) FROM records GROUP BY kind ORDER BY created_at_ms",
+                "must appear in GROUP BY or inside an aggregate",
+            ),
+            // Self-join: the other alias's column is not grouped.
+            (
+                "SELECT b.kind, count(*) FROM records a JOIN records b ON a.id = b.id GROUP BY a.kind",
+                "must appear in GROUP BY or inside an aggregate",
+            ),
+            // Shadowed inner reference (SQLite binds innermost): qualify
+            // the outer table or group it.
+            (
+                "SELECT (SELECT count(*) + kind FROM records) FROM records GROUP BY kind",
+                "may resolve to the subquery's own FROM",
+            ),
+            // Qualified outer non-key: the repair points at the enclosing query.
+            (
+                "SELECT kind, (SELECT count(*) + t.name FROM facet_values) FROM records t GROUP BY kind",
+                "belongs to an enclosing query that groups by other columns",
+            ),
+        ] {
+            let error = validate(sql).unwrap_err().to_string();
+            assert!(error.contains(repair), "{sql}: missing repair: {error}");
+        }
     }
 
     #[test]
@@ -530,6 +731,62 @@ mod tests {
         }
     }
 
+    /// Relations outside the turso-local profile are refused by name, so a
+    /// statement that reads none of their columns cannot slip past the
+    /// dependency-based profile gate. Their names stay free for CTEs, nested
+    /// or at top level, while names this profile serves stay reserved.
+    #[test]
+    fn relations_outside_the_profile_are_refused_by_name_and_free_for_ctes() {
+        for sql in [
+            "SELECT config_id FROM schema_config_json_nodes",
+            "SELECT count(*) AS n FROM schema_config_json_nodes",
+            "SELECT count(*) AS n FROM schema_config_json_nodes WHERE 0",
+            "SELECT * FROM schema_config_json_nodes WHERE 0 ORDER BY ordinal LIMIT 0",
+            "SELECT EXISTS(SELECT 1 FROM schema_config_json_nodes) AS n",
+            "SELECT ordinal FROM effective_relationship_endpoints",
+            "SELECT count(*) AS n FROM effective_relationship_endpoints",
+            "SELECT count(*) AS n FROM actors",
+            "SELECT count(*) AS n FROM actors a1, actors a2",
+            "SELECT actor FROM actors",
+            "SELECT e.id FROM content_events e JOIN actors a USING (actor)",
+            "SELECT count(*) AS n FROM agent_activity",
+            "SELECT id FROM records WHERE EXISTS (SELECT 1 FROM messages_awaiting_reply)",
+            "SELECT id FROM records WHERE EXISTS (WITH other(x) AS (VALUES(1)) SELECT 1 FROM actors)",
+            "SELECT run_key FROM runs",
+            "SELECT count(*) AS n FROM runs",
+            "SELECT count(*) AS n FROM run_intents",
+            "SELECT r.run_key, i.intent FROM runs r JOIN run_intents i USING (run_key)",
+            "SELECT unread FROM my_message_state",
+            "SELECT count(*) AS n FROM my_message_state",
+            "SELECT count(*) AS n FROM my_mentions",
+            "SELECT count(*) AS n FROM vocabulary_value_json_nodes",
+            "SELECT value_id, ordinal FROM vocabulary_value_json_nodes ORDER BY value_id, ordinal",
+        ] {
+            let error = validate(sql).expect_err(sql).to_string();
+            assert!(
+                error.contains("is unavailable in profile turso-local"),
+                "{sql}: {error}"
+            );
+        }
+        for sql in [
+            "WITH schema_config_json_nodes AS (SELECT 1 AS x) SELECT x FROM schema_config_json_nodes",
+            "SELECT 'effective_relationship_endpoints' AS v",
+            "WITH effective_relationship_endpoints AS (SELECT 1 AS x) SELECT x FROM effective_relationship_endpoints",
+            "SELECT 'schema_config_json_nodes' AS v",
+            "SELECT id FROM records -- schema_config_json_nodes",
+            "WITH actors AS (SELECT id FROM records) SELECT id FROM actors",
+            "WITH agent_activity AS (SELECT id FROM records) SELECT id FROM agent_activity",
+            "SELECT id FROM records WHERE EXISTS (WITH actors(x) AS (VALUES(1)), tally AS (SELECT count(*) AS n FROM actors) SELECT n FROM tally)",
+            "WITH runs AS (SELECT id FROM records) SELECT id FROM runs",
+            "WITH run_intents AS (SELECT id FROM records) SELECT id FROM run_intents",
+            "WITH my_message_state AS (SELECT id FROM records) SELECT id FROM my_message_state",
+            "WITH my_mentions AS (SELECT id FROM records) SELECT id FROM my_mentions",
+        ] {
+            validate(sql).unwrap_or_else(|error| panic!("{sql}: {error}"));
+        }
+        assert!(validate("WITH links AS (SELECT 1 AS x) SELECT x FROM links").is_err());
+    }
+
     #[test]
     fn widened_functions_validate_and_dropped_ones_name_the_repair() {
         // I2: the classifier rejects dropped names first with the shared
@@ -544,7 +801,6 @@ mod tests {
             "SELECT coalesce(name, 'z'), nullif(name, 'z') FROM records",
             "SELECT abs(id), length(name), round(1.5) FROM records",
             "SELECT avg(id), count(*), sum(id), min(id), max(id) FROM records",
-            "SELECT rank() OVER (ORDER BY id) FROM records",
             "SELECT CASE WHEN id = 1 THEN 'one' ELSE 'other' END FROM records",
             "SELECT CAST(id AS TEXT) FROM records",
             "SELECT id FROM records WHERE name LIKE 'conf:%'",
@@ -574,6 +830,14 @@ mod tests {
             ("SELECT floor(value) FROM records", "CAST(x AS INTEGER)"),
             ("SELECT char_length(name) FROM records", "use length"),
             ("SELECT greatest(a, b) FROM records", "CASE"),
+            ("SELECT max(a, b) FROM records", "CASE"),
+            ("SELECT min(a, b) FROM records", "CASE"),
+            ("SELECT max(a, b, c) FROM records", "CASE"),
+            ("SELECT min(a, b, c) FROM records", "CASE"),
+            (
+                "SELECT id, max(length(name), 5) AS m FROM records WHERE id = ?1",
+                "CASE",
+            ),
             (
                 "SELECT round(avg(id), 2) FROM records",
                 "catalog numeric type",
@@ -581,6 +845,20 @@ mod tests {
             // I2 review: quoting the name bypasses nothing — the shared
             // classifier runs the same dropped-name and arity checks on
             // quoted calls before the AST walk.
+            // The six registry window rows are scoped off TursoLocal, so
+            // these fail closed with plain per-engine advice.
+            (
+                "SELECT rank() OVER (ORDER BY id) FROM records",
+                "unavailable on turso-local",
+            ),
+            (
+                "SELECT row_number() OVER (ORDER BY id) FROM records",
+                "unavailable on turso-local",
+            ),
+            (
+                "SELECT dense_rank() OVER (ORDER BY id) FROM records",
+                "unavailable on turso-local",
+            ),
             (
                 "SELECT \"round\"(1.5, 2) FROM records",
                 "catalog numeric type",
@@ -647,6 +925,33 @@ mod tests {
     }
 
     #[test]
+    fn refuses_window_functions_with_the_per_engine_scope() {
+        // The six window rows are scoped off TursoLocal by the shared
+        // registry; the validator fails closed with plain caller advice.
+        // Exact-0.8.0 reason (engine-internal, evidence only): the engine
+        // resolves the names but compiles every window program as
+        // non-read-only, refused by the isolated query-only projection.
+        for sql in [
+            "SELECT rank() OVER (ORDER BY id) FROM records",
+            "SELECT row_number() OVER (ORDER BY id) FROM records",
+            "SELECT dense_rank() OVER (ORDER BY id) FROM records",
+            "SELECT ntile(2) OVER (ORDER BY id) FROM records",
+            "SELECT cume_dist() OVER (ORDER BY id) FROM records",
+            "SELECT percent_rank() OVER (ORDER BY id) FROM records",
+            "SELECT RANK() OVER (PARTITION BY type ORDER BY id) FROM records",
+        ] {
+            let error = validate(sql).unwrap_err().to_string();
+            assert!(
+                error.contains("unavailable on turso-local") && error.contains("SQLite-local"),
+                "{sql}: missing per-engine refusal: {error}"
+            );
+        }
+        // Non-window rankings stay admitted.
+        validate("SELECT id FROM records ORDER BY id").unwrap();
+        validate("SELECT count(*) AS n FROM records").unwrap();
+    }
+
+    #[test]
     fn blocked_probes_name_the_catalog_fix() {
         let rendered = |sql: &str| validate(sql).unwrap_err().to_string();
         let probe = rendered("SELECT * FROM sqlite_master");
@@ -657,6 +962,10 @@ mod tests {
         // effective_relationships is sqlite-only: Turso falls through to
         // the profile-filtered list instead of mis-pointing at it.
         assert!(!mapped.contains("effective_relationships"), "{mapped}");
+        assert!(
+            !mapped.contains("effective_relationship_endpoints"),
+            "{mapped}"
+        );
         assert!(
             mapped.contains("Queryable relations on turso-local:"),
             "{mapped}"

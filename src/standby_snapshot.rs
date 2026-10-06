@@ -60,6 +60,10 @@ pub struct StandbyConsumerIdentity {
 pub enum StandbyConsumerPlatform {
     #[serde(rename = "linux-x86_64")]
     LinuxX8664,
+    #[serde(rename = "macos-arm64")]
+    MacosArm64,
+    #[serde(rename = "macos-x64")]
+    MacosX64,
 }
 
 /// Identity observed by the installer from the installed executable and its
@@ -692,6 +696,64 @@ mod tests {
         observed.artifact_sha256 = "b".repeat(64);
         observed.engine_schema_version += 1;
         assert!(declaration.validate_observed_installed(&observed).is_err());
+    }
+
+    #[test]
+    fn consumer_platform_strings_round_trip_and_reject_unknown() {
+        for (platform, expected) in [
+            (StandbyConsumerPlatform::LinuxX8664, "linux-x86_64"),
+            (StandbyConsumerPlatform::MacosArm64, "macos-arm64"),
+            (StandbyConsumerPlatform::MacosX64, "macos-x64"),
+        ] {
+            let encoded = serde_json::to_value(platform).unwrap();
+            assert_eq!(encoded, serde_json::json!(expected));
+            let decoded: StandbyConsumerPlatform = serde_json::from_value(encoded).unwrap();
+            assert_eq!(decoded, platform);
+        }
+        assert!(
+            serde_json::from_value::<StandbyConsumerPlatform>(serde_json::json!("windows-x86_64"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn observed_platform_mismatch_is_refused_but_matching_macos_passes() {
+        let declaration = StandbyConsumerIdentity {
+            contract: STANDBY_CONSUMER_CONTRACT.into(),
+            version: 1,
+            platform: StandbyConsumerPlatform::MacosArm64,
+            source_sha: "a".repeat(40),
+            artifact_sha256: "b".repeat(64),
+            engine_schema_version: 45,
+            ddl_sha256: "c".repeat(64),
+        };
+        let matching = ObservedInstalledConsumerIdentity {
+            platform: StandbyConsumerPlatform::MacosArm64,
+            source_sha: "a".repeat(40),
+            artifact_sha256: "b".repeat(64),
+            engine_schema_version: 45,
+            ddl_sha256: "c".repeat(64),
+        };
+        declaration.validate_observed_installed(&matching).unwrap();
+        let mismatched = ObservedInstalledConsumerIdentity {
+            platform: StandbyConsumerPlatform::LinuxX8664,
+            ..matching.clone()
+        };
+        assert!(declaration
+            .validate_observed_installed(&mismatched)
+            .is_err());
+        let wrong_schema = ObservedInstalledConsumerIdentity {
+            engine_schema_version: 46,
+            ..matching.clone()
+        };
+        assert!(declaration
+            .validate_observed_installed(&wrong_schema)
+            .is_err());
+        let wrong_ddl = ObservedInstalledConsumerIdentity {
+            ddl_sha256: "d".repeat(64),
+            ..matching
+        };
+        assert!(declaration.validate_observed_installed(&wrong_ddl).is_err());
     }
 
     #[test]

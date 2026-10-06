@@ -279,14 +279,45 @@ pub const PERSISTENCE_VALUES: [&str; 2] = ["enduring", "occurrent"];
 /// interop floor, 3057bba); reserved keys are NOT user-configurable at all, in
 /// either direction, because the engine itself writes and hard-dispatches on them
 /// (`archive_record` owns `archived`; the attachment tools own `blob_ref`;
-/// `manage_canvas.promote` owns `canvas.promoted_from`).
+/// `manage_canvas.promote` owns `canvas.promoted_from`; `archive_record` owns
+/// `retraction` when a comment's author retracts it).
 /// Enforced at the schema_config write path (`crate::meta::schema_config`) and
-/// at every caller-supplied facet seam. The DDL fingerprint does not include
+/// at every caller-supplied facet seam through
+/// `crate::domain_transaction::assert_open_facet_key` and
+/// `crate::domain_transaction::classify_facet_key`, which both read this one
+/// constant. The DDL fingerprint does not include
 /// this Rust contract constant, so extending the set is not a schema re-freeze.
-pub const ENGINE_RESERVED_FACET_KEYS: [&str; 3] = [
+pub const RETRACTION_FACET_KEY: &str = "retraction";
+
+pub const ENGINE_RESERVED_FACET_KEYS: [&str; 4] = [
     "archived",
     "blob_ref",
     crate::canvas::PROMOTED_FROM_FACET_KEY,
+    RETRACTION_FACET_KEY,
+];
+
+/// Owning-tool guidance per engine-reserved key, beside the constant so the
+/// two cannot drift apart without a failing test. Each fragment completes the
+/// refusal `"{tool}: facet '{key}' is engine-reserved — {guidance}"`; the
+/// three pre-retraction fragments reproduce their historical messages
+/// byte-identically.
+pub const ENGINE_RESERVED_FACET_GUIDANCE: [(&str, &str); 4] = [
+    (
+        "archived",
+        "archive and restore via the archive_record tool",
+    ),
+    (
+        "blob_ref",
+        "create attachment bindings via the attach_text or attach_from_url tool",
+    ),
+    (
+        crate::canvas::PROMOTED_FROM_FACET_KEY,
+        "it records that a record was promoted from a canvas, and only manage_canvas.promote writes it",
+    ),
+    (
+        RETRACTION_FACET_KEY,
+        "only archive_record writes it, when a comment's author retracts it",
+    ),
 ];
 
 /// The `archived` reserved facet.
@@ -304,12 +335,14 @@ pub const ARCHIVED_FACET_KEY: &str = "archived";
 /// (new hard-shaped data lands as a new substrate primitive, not a new top-level
 /// type) and still conform; conformance requires presence, never absence, of
 /// tables.
-pub const REQUIRED_TABLES: [&str; 125] = [
+pub const REQUIRED_TABLES: [&str; 133] = [
     // Substrate primitives
     "content_events",
     "content_event_causal_frontier",
     "content_event_causal_cutover",
     "content_event_sources",
+    "content_event_claim_meta",
+    "content_event_reaction_meta",
     "replicated_message_provenance",
     "destination_message_ingest",
     "replicated_message_references",
@@ -358,6 +391,7 @@ pub const REQUIRED_TABLES: [&str; 125] = [
     "links",
     "facet_values",
     "facet_observations",
+    "facet_times",
     "annotation_targets",
     "message_audience_state",
     "message_audiences",
@@ -374,6 +408,8 @@ pub const REQUIRED_TABLES: [&str; 125] = [
     "member_destinations",
     "message_mentions",
     "record_mentions",
+    "body_task_items",
+    "body_blocks",
     "notification_candidate_events",
     "notification_candidates",
     "module_releases",
@@ -418,6 +454,7 @@ pub const REQUIRED_TABLES: [&str; 125] = [
     "member_obligation_progress",
     "seeded_instruction_sources",
     "alpha_tab_installs",
+    "alpha_tab_orders",
     "control_event_applications",
     "storage_portability_policy",
     // The meta tier's own authoritative log (ba9f97e). It sits with the logs
@@ -434,7 +471,9 @@ pub const REQUIRED_TABLES: [&str; 125] = [
     // System / meta tier (982f4b2) — projections of `meta_events` since ba9f97e.
     "vocabularies",
     "vocabulary_values",
+    "vocabulary_value_json_nodes",
     "schema_config",
+    "workspace_rule_installations",
     "jobs",
     // The read log (fbfaf25 §2.2). Required as PRESENCE, like everything else
     // here: a fresh/standard schema must create both tables, and structural
@@ -695,14 +734,275 @@ pub fn ddl_sha256() -> String {
     hex::encode(Sha256::digest(canonical_ddl().as_bytes()))
 }
 
+/// Rewrite the fresh `alpha_tab_installs` CREATE to its pre-72 shape for a
+/// historical version: the two-value adoption CHECK and no request column
+/// (task `f1d80b0`). Shared by `historical()` below and the 64→65 twin
+/// test, so the transition text and the version gate cannot drift apart.
+#[cfg(any(test, feature = "turso-local"))]
+pub(crate) fn alpha_tab_installs_create_for_version(statement: &str, version: i64) -> String {
+    let mut statement = statement.to_owned();
+    if statement.starts_with("CREATE TABLE alpha_tab_installs (") {
+        if version < 79 {
+            statement = statement.replace(
+                "     body_read_admission_event_id TEXT REFERENCES control_events(id),\n",
+                "",
+            );
+        }
+        if version < 78 {
+            statement = statement.replace(
+                "     adoption_provenance       TEXT CHECK (adoption_provenance IS NULL OR (json_valid(adoption_provenance) AND json_type(adoption_provenance) = 'object')),\n", "");
+        }
+        if version < 72 {
+            statement = statement.replace(
+                "     adoption                  TEXT NOT NULL CHECK (adoption IN ('caller_asserted','shell_adopt.v1','shell_auto.v1')),\n     request                   TEXT CHECK (request IS NULL OR (length(trim(request)) > 0 AND length(request) <= 500)),\n",
+                "     adoption                  TEXT NOT NULL CHECK (adoption IN ('caller_asserted','shell_adopt.v1')),\n");
+        }
+    }
+    statement
+}
+
 /// The current build's pinned DDL fingerprint.
 ///
 /// This is an integrity gate for the schema compiled into this binary. It does
 /// not record or imply support for any historical engine schema. A future
 /// support baseline must deliberately add its own fixture and fingerprint as
 /// part of the activation checklist in `docs/schema-migrations.md`.
+// Measured from this tree's whole production modules with pinned Rust 1.98.0:
+// 358 statements, with independent canonical-byte SHA agreement and the same
+// DDL output from the schema-measurement harness.
 pub const FROZEN_DDL_SHA256: &str =
+    "0209d608f9d5b9bd88bde3b8da411057cfc7396149ba5f4918b0921207a10a9c";
+
+/// Engine81 DDL before the facet-value node table. Measured from exact
+/// ce3f5694's whole production modules with pinned Rust 1.98.0:
+/// 357 statements / 150715 bytes, independently canonical-byte hashed.
+pub const FROZEN_DDL_SHA256_PRE_82: &str =
+    "be2bb309ab44f48c5196b31b0bb1f263da29d6340adf7cfcf44557dcecd10bfd";
+
+/// Genuine workspace80 DDL on immutable main
+/// `37524cedb45f5dccb63b4e33dd364092ad91ff68`, before config JSON nodes.
+/// Its whole production canonical functions reproduce that tree's frozen pin:
+/// 356 statements / 150015 bytes, independently byte-hashed with Rust 1.98.0.
+pub const FROZEN_DDL_SHA256_PRE_81: &str =
+    "ef05dfa0101e252ac9ac9881585a5237424916be174f5b151d4341d8c0c32aa2";
+
+/// Released schema79 before workspace installations.
+pub const FROZEN_DDL_SHA256_PRE_80: &str =
+    "b4d9d0b25b4250c0b8899588e4300b6391c976f2e0571be31948825ad272b78c";
+
+/// Released main269 v78 DDL before the inert reader pointer.
+pub const FROZEN_DDL_SHA256_PRE_79: &str =
+    "2b66cc4b90773c5cca5b2e903cad6c4c6831a0c36311e8fbd51707b444397383";
+
+/// Released v77 DDL before alpha-tab adoption provenance.
+pub const FROZEN_DDL_SHA256_PRE_78: &str =
+    "cf9d8a6339085d67227151491e689891c7101424b48e15db71c70bc1da8d9df7";
+
+/// Released v76 DDL before reaction metadata.
+pub const FROZEN_DDL_SHA256_PRE_77: &str =
+    "5997fc823b1dcb1d4cd6019d8acbcca1680519a25283153990c89482861f4da2";
+
+/// Released v75 DDL before the vocabulary metadata node projection.
+pub const FROZEN_DDL_SHA256_PRE_76: &str =
+    "6da89d4400a191823c5270b1b6062de15b581a76ec64db064353e8a2794c01ee";
+
+/// The released v74 DDL before the v75 block projection.
+pub const FROZEN_DDL_SHA256_PRE_75: &str =
+    "300a47089fa7b4651fd08d1915c151af36ba9449ca25ba527877dfc8f85b4840";
+
+/// The released v73 DDL before the v74 body-task projection.
+pub const FROZEN_DDL_SHA256_PRE_74: &str =
+    "8c31ffbbaa7840f888811dabd583e709ffe715544d1a4880b6d88ee6a4cb5877";
+
+/// The engine-72 fingerprint, superseded by the 72→73 currency-counts edge
+/// (E3 M1). `historical(72)` must reproduce it exactly, proving the <73
+/// currency strip rule; it is main `8eb9b2861`'s own frozen value.
+pub const FROZEN_DDL_SHA256_PRE_73: &str =
+    "195c6b0bcf6fea48f8f36839f969c9ab6f08a8549ed3f4c788b68ffd3e088434";
+
+/// The engine-71 fingerprint, superseded by the 71→72 alpha-tab request +
+/// shell-auto edge (task f1d80b0). `historical(71)` must reproduce it
+/// exactly, proving the <72 adoption/request rewrite rule; it is main
+/// `17f35ed1a`'s own frozen value.
+pub const FROZEN_DDL_SHA256_PRE_72: &str =
+    "718b9646db781f58a97c0753e14ea59d6d5f54603fcde628d0852322bd4afa5d";
+
+/// The engine-70 fingerprint, superseded by the 70→71 field-change index
+/// (task 68b48e5, `records.changes.v1`). `historical(70)` must reproduce it
+/// exactly, proving the <71 strip rule; it is main `2e03ecc05`'s own frozen
+/// value.
+pub const FROZEN_DDL_SHA256_PRE_71: &str =
+    "3ed621c8f78c08bc2b8d82c81fe94ee386f3f4810ec992c2810f300da3381a96";
+
+/// The engine-69 fingerprint, superseded by the 69→70 `facet_times` edge
+/// (task fef3469, D2 slice T2). `historical(69)` must reproduce it exactly,
+/// proving the <70 strip rule; it is main `ad13d26b1`'s own frozen value.
+pub const FROZEN_DDL_SHA256_PRE_70: &str =
+    "93901e242e1204bbb8a55769529645b0326bc39ac5c42d96b7c7c1bb2135095e";
+
+/// The engine-68 fingerprint, superseded by the 68→69 content-event
+/// claim-metadata edge (task 73e5b92). `historical(68)` must reproduce it
+/// exactly, proving the <69 strip rule.
+pub const FROZEN_DDL_SHA256_PRE_69: &str =
+    "d10a336345d4696f2fddaab5722335965a7423e747b94c61040929d1b41fb873";
+
+/// The engine-67 fingerprint, superseded by the 67→68 alpha-tab order edge
+/// (task c5d3820). `historical(67)` must reproduce it exactly, proving the
+/// <68 strip rule.
+pub const FROZEN_DDL_SHA256_PRE_68: &str =
+    "68de57432c76536f4501307fff044acb68502f066577fd64e1ce75b421d0061d";
+
+/// The engine-66 fingerprint, superseded by the 66→67 archived-projection
+/// edge (E3 M1 slice 1). `historical(66)` must reproduce it exactly, proving
+/// the <67 strip rule.
+pub const FROZEN_DDL_SHA256_PRE_67: &str =
+    "2cbc18dc616e65fbe70f1501101de5861a01942972037f577f0a7dc8aa0514d5";
+
+/// The engine-65 fingerprint, superseded by the 65→66 grant-revision edge.
+/// `historical(65)` must reproduce it exactly, proving the <66 strip rule.
+pub const FROZEN_DDL_SHA256_PRE_66: &str =
     "3284d80259000f4c8ab4c88ad7ec06175561b6d526462aaf893235a8f3201111";
+
+/// Existing historical reconstruction shared by reproducibility and allocated
+/// measurement tests. This does not authorize or freeze an unmeasured history.
+#[cfg(test)]
+pub(crate) fn historical_ddl_for_test(version: i64) -> String {
+    let mut statements = Vec::new();
+    for statement in DDL_STATEMENTS {
+        if version < 80 && statement.contains("workspace_rule_installations") {
+            continue;
+        }
+        if version < 59
+            && (statement.starts_with("CREATE TABLE record_mentions")
+                || statement.starts_with("CREATE INDEX idx_record_mentions_"))
+        {
+            continue;
+        }
+        if version < 62
+            && (statement.contains("idx_external_observations_act")
+                || statement.contains("idx_awareness_command_intents_act"))
+        {
+            continue;
+        }
+        if version < 61
+            && (statement.contains("idx_content_events_act")
+                || statement.contains("idx_policy_events_act")
+                || statement.contains("idx_awareness_events_act")
+                || statement.contains("idx_notification_candidate_events_act")
+                || statement.contains("idx_binding_audit_act")
+                || statement.contains("idx_database_identity_audit_act")
+                || statement.contains("idx_meta_events_act")
+                || statement.contains("idx_control_events_act")
+                || statement.contains("idx_derivation_events_act")
+                || statement.contains("idx_relationship_events_act")
+                || statement.contains("binding_systems_no_insert")
+                || statement.contains("binding_systems_no_update")
+                || statement.contains("binding_systems_no_delete"))
+        {
+            continue;
+        }
+        if version < 60 && statement.contains("idx_provenance_validity_act") {
+            continue;
+        }
+        if version < 65
+            && (statement.starts_with("CREATE TABLE alpha_tab_installs")
+                || statement.starts_with("CREATE INDEX idx_alpha_tab_installs_"))
+        {
+            continue;
+        }
+        if version < 68 && statement.starts_with("CREATE TABLE alpha_tab_orders") {
+            continue;
+        }
+        if version < 69
+            && (statement.starts_with("CREATE TABLE content_event_claim_meta")
+                || statement.starts_with("CREATE TRIGGER content_event_claim_meta_insert"))
+        {
+            continue;
+        }
+        if version < 74
+            && (statement.starts_with("CREATE TABLE body_task_items")
+                || statement.starts_with("CREATE INDEX idx_body_task_items_"))
+        {
+            continue;
+        }
+        if version < 77
+            && (statement.starts_with("CREATE TABLE content_event_reaction_meta")
+                || statement.starts_with("CREATE INDEX idx_content_event_reaction_meta_")
+                || statement.starts_with("CREATE TRIGGER content_event_reaction_meta_insert"))
+        {
+            continue;
+        }
+        if version < 75 && statement.starts_with("CREATE TABLE body_blocks") {
+            continue;
+        }
+        if version < 81 && statement.starts_with("CREATE TABLE schema_config_json_nodes") {
+            continue;
+        }
+        if version < 82 && statement.starts_with("CREATE TABLE facet_value_json_nodes") {
+            continue;
+        }
+        if version < 76 && statement.starts_with("CREATE TABLE vocabulary_value_json_nodes") {
+            continue;
+        }
+        if version < 70
+            && (statement.starts_with("CREATE TABLE facet_times")
+                || statement.starts_with("CREATE INDEX idx_facet_times_"))
+        {
+            continue;
+        }
+        if version < 71 && statement.starts_with("CREATE INDEX idx_content_events_record_changes ")
+        {
+            continue;
+        }
+        if version < 66
+            && (statement.starts_with("CREATE TABLE IF NOT EXISTS authorization_grant_revision")
+                || statement.starts_with("INSERT OR IGNORE INTO authorization_grant_revision")
+                || statement.starts_with("CREATE TRIGGER IF NOT EXISTS authorization_grant_"))
+        {
+            continue;
+        }
+        let mut statement = statement.to_owned();
+        if version < 67 && statement.starts_with("CREATE TABLE records (") {
+            statement = statement.replace(
+                "     archived      INTEGER NOT NULL DEFAULT 0 CHECK (archived IN (0,1)),\n",
+                "",
+            );
+        }
+        if version < 73 && statement.starts_with("CREATE TABLE records (") {
+            statement = statement.replace(
+                "      -- E3 M1 currency counts (v73): caller-independent currency. is_current\n      -- is tri-state: 1 iff zero live incoming `supersedes`, NULL when >=1\n      -- live incoming leaves whole/partial scope unknown. 0 is reserved for\n      -- a future explicit whole-record assertion and is never written here\n      -- (the CHECK admits it so that assertion needs no migration).\n      -- DEFAULT 1 because a created record has no incoming links yet;\n      -- creation omits both columns so defaults apply. successor_count is\n      -- the live incoming `supersedes` count (deleted source excluded); it\n      -- may include an invisible successor but never stores/displays names.\n",
+                "",
+            );
+            statement = statement.replace(
+                "      is_current      INTEGER NULL DEFAULT 1 CHECK (is_current IS NULL OR is_current IN (0,1)),\n      successor_count INTEGER NOT NULL DEFAULT 0 CHECK (successor_count >= 0),\n",
+                "",
+            );
+        }
+        // Engine 72 (task f1d80b0) widens the alpha-tab adoption
+        // CHECK to shell_auto.v1 and adds the nullable display-only
+        // request column: pre-72 shapes carry the two-value CHECK
+        // and no request column.
+        if statement.starts_with("CREATE TABLE alpha_tab_installs (") {
+            statement = alpha_tab_installs_create_for_version(&statement, version);
+        }
+        if version < 62
+            && (statement.starts_with("CREATE TABLE external_observations")
+                || statement.starts_with("CREATE TABLE awareness_command_intents"))
+        {
+            statement = statement.replace("     act            INTEGER,\n", "");
+        }
+        if version < 60
+            && statement.starts_with("CREATE TABLE provenance_attestation_validity_events")
+        {
+            statement = statement.replace("     act            INTEGER,\n", "");
+        }
+        if statement.starts_with("PRAGMA user_version") {
+            statement = format!("PRAGMA user_version = {version}");
+        }
+        statements.push(statement);
+    }
+    statements.join("\n;\n")
+}
 
 #[cfg(test)]
 mod tests {
@@ -716,64 +1016,7 @@ mod tests {
     #[test]
     fn merged_historical_ddl_fingerprints_are_reproducible() {
         fn historical(version: i64) -> String {
-            let mut statements = Vec::new();
-            for statement in DDL_STATEMENTS {
-                if version < 59
-                    && (statement.starts_with("CREATE TABLE record_mentions")
-                        || statement.starts_with("CREATE INDEX idx_record_mentions_"))
-                {
-                    continue;
-                }
-                if version < 62
-                    && (statement.contains("idx_external_observations_act")
-                        || statement.contains("idx_awareness_command_intents_act"))
-                {
-                    continue;
-                }
-                if version < 61
-                    && (statement.contains("idx_content_events_act")
-                        || statement.contains("idx_policy_events_act")
-                        || statement.contains("idx_awareness_events_act")
-                        || statement.contains("idx_notification_candidate_events_act")
-                        || statement.contains("idx_binding_audit_act")
-                        || statement.contains("idx_database_identity_audit_act")
-                        || statement.contains("idx_meta_events_act")
-                        || statement.contains("idx_control_events_act")
-                        || statement.contains("idx_derivation_events_act")
-                        || statement.contains("idx_relationship_events_act")
-                        || statement.contains("binding_systems_no_insert")
-                        || statement.contains("binding_systems_no_update")
-                        || statement.contains("binding_systems_no_delete"))
-                {
-                    continue;
-                }
-                if version < 60 && statement.contains("idx_provenance_validity_act") {
-                    continue;
-                }
-                if version < 65
-                    && (statement.starts_with("CREATE TABLE alpha_tab_installs")
-                        || statement.starts_with("CREATE INDEX idx_alpha_tab_installs_"))
-                {
-                    continue;
-                }
-                let mut statement = statement.to_owned();
-                if version < 62
-                    && (statement.starts_with("CREATE TABLE external_observations")
-                        || statement.starts_with("CREATE TABLE awareness_command_intents"))
-                {
-                    statement = statement.replace("     act            INTEGER,\n", "");
-                }
-                if version < 60
-                    && statement.starts_with("CREATE TABLE provenance_attestation_validity_events")
-                {
-                    statement = statement.replace("     act            INTEGER,\n", "");
-                }
-                if statement.starts_with("PRAGMA user_version") {
-                    statement = format!("PRAGMA user_version = {version}");
-                }
-                statements.push(statement);
-            }
-            hex::encode(Sha256::digest(statements.join("\n;\n").as_bytes()))
+            hex::encode(Sha256::digest(historical_ddl_for_test(version).as_bytes()))
         }
 
         assert_eq!(
@@ -786,6 +1029,22 @@ mod tests {
                 historical(63),
                 historical(64),
                 historical(65),
+                historical(66),
+                historical(67),
+                historical(68),
+                historical(69),
+                historical(70),
+                historical(71),
+                historical(72),
+                historical(73),
+                historical(74),
+                historical(75),
+                historical(76),
+                historical(77),
+                historical(78),
+                historical(79),
+                historical(80),
+                historical(81),
             ],
             [
                 "b418f5ea746c5e791df9ec07041dbb4fdd3a5098b828de3dc3e983a456a9c755",
@@ -798,7 +1057,40 @@ mod tests {
                 // the 64→65 alpha projection, reproducing main64's frozen
                 // fingerprint exactly.
                 "77f1fef8c81f424154e65afd978d39ebd69e5c7ab04ce97bd2aaf11f1ab896df",
-                FROZEN_DDL_SHA256,
+                FROZEN_DDL_SHA256_PRE_66,
+                FROZEN_DDL_SHA256_PRE_67,
+                // Engine 67 is the pre-68 DDL: historical(67) strips the
+                // 67→68 alpha-tab order table (task c5d3820), reproducing
+                // the pre-68 fingerprint exactly.
+                FROZEN_DDL_SHA256_PRE_68,
+                // Engine 68 is the pre-69 DDL: historical(68) strips the
+                // 68→69 claim-metadata table and trigger (task 73e5b92),
+                // reproducing the pre-69 fingerprint exactly.
+                FROZEN_DDL_SHA256_PRE_69,
+                // Engine 69 is the pre-70 DDL: historical(69) strips the
+                // 69→70 facet_times table and its indexes (task fef3469).
+                FROZEN_DDL_SHA256_PRE_70,
+                // Engine 70 is the pre-71 DDL: historical(70) strips the
+                // 70→71 field-change index (task 68b48e5).
+                FROZEN_DDL_SHA256_PRE_71,
+                // Engine 71 is the pre-72 DDL: historical(71) restores the
+                // two-value alpha-tab adoption CHECK and drops the request
+                // column (task f1d80b0), reproducing the pre-72 fingerprint
+                // exactly.
+                FROZEN_DDL_SHA256_PRE_72,
+                // Engine 72 is the pre-73 DDL: historical(72) strips the
+                // 72→73 currency-counts columns (E3 M1), reproducing the
+                // pre-73 fingerprint exactly.
+                FROZEN_DDL_SHA256_PRE_73,
+                FROZEN_DDL_SHA256_PRE_74,
+                FROZEN_DDL_SHA256_PRE_75,
+                FROZEN_DDL_SHA256_PRE_76,
+                FROZEN_DDL_SHA256_PRE_77,
+                FROZEN_DDL_SHA256_PRE_78,
+                FROZEN_DDL_SHA256_PRE_79,
+                FROZEN_DDL_SHA256_PRE_80,
+                FROZEN_DDL_SHA256_PRE_81,
+                FROZEN_DDL_SHA256_PRE_82,
             ]
         );
     }

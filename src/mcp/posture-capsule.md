@@ -44,6 +44,7 @@ Useful shared context can only be reliably discovered by later inhabitants when 
 - Native reflects durable recorded state, not omniscience. It may be incomplete or stale.
 - External reach exists only through currently available tools.
 - Do not assume an exploratory read has become durable shared context.
+- For relational read questions, use `query_sql` over caller-visible logical relations with bounded results; start from the `sql_read` descriptor's catalog card.
 
 ### Rendered artifact context
 

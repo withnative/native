@@ -1,0 +1,21 @@
+{
+  "family": "native.standard.document",
+  "version": 1,
+  "interpreter": "native.defn/3",
+  "primary_type": "Document",
+  "kinds": [
+    {
+      "token": "note",
+      "description": "An ordinary authored prose or capture document. Each note is distinct; matching titles or content do not make two notes the same.",
+      "maturity": "current",
+      "identity": { "mode": "record" },
+      "fields": [
+        { "name": "title", "type": "text", "required": true, "description": "Short human title." },
+        { "name": "body", "type": "text", "required": false, "description": "The prose, as Markdown." }
+      ],
+      "links": [
+        { "predicate": "relates_to", "target": { "primary_type": "Document", "kind": "note" }, "direction": "either", "cardinality": "many" }
+      ]
+    }
+  ]
+}

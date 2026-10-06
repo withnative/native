@@ -7,7 +7,7 @@
   "candidate_surfaces": {
     "stable": {
       "ordinary": {
-        "descriptor_bytes": 43163,
+        "descriptor_bytes": 43360,
         "descriptors": [
           {
             "name": "bootstrap",
@@ -138,6 +138,7 @@
                   "enum": [
                     "manage_instructions.compare_seeded_default",
                     "manage_instructions.list",
+                    "manage_instructions.resolve",
                     "manage_onboarding.list_programmes",
                     "manage_onboarding.preview_generation",
                     "quickstart",
@@ -1637,6 +1638,7 @@
                 "operation": {
                   "type": "string",
                   "enum": [
+                    "manage_alpha_tabs.admit_reveal_target",
                     "manage_alpha_tabs.inspect",
                     "manage_alpha_tabs.list",
                     "manage_alpha_tabs.live_read",
@@ -1729,10 +1731,14 @@
                     "advance_artifact_port_pin",
                     "instantiate_artifact",
                     "manage_alpha_tabs.adopt",
+                    "manage_alpha_tabs.adopt_authored",
                     "manage_alpha_tabs.disable",
                     "manage_alpha_tabs.install",
+                    "manage_alpha_tabs.live_unsubscribe",
                     "manage_alpha_tabs.remove",
+                    "manage_alpha_tabs.reorder",
                     "manage_alpha_tabs.restore",
+                    "manage_alpha_tabs.update",
                     "manage_artifact_inputs.bind",
                     "manage_artifact_inputs.bind_many",
                     "manage_artifact_inputs.unbind",
@@ -2426,7 +2432,7 @@
         ]
       },
       "lens": {
-        "descriptor_bytes": 49410,
+        "descriptor_bytes": 49607,
         "descriptors": [
           {
             "name": "bootstrap",
@@ -2567,6 +2573,7 @@
                   "enum": [
                     "manage_instructions.compare_seeded_default",
                     "manage_instructions.list",
+                    "manage_instructions.resolve",
                     "manage_onboarding.list_programmes",
                     "manage_onboarding.preview_generation",
                     "quickstart",
@@ -4259,6 +4266,7 @@
                 "operation": {
                   "type": "string",
                   "enum": [
+                    "manage_alpha_tabs.admit_reveal_target",
                     "manage_alpha_tabs.inspect",
                     "manage_alpha_tabs.list",
                     "manage_alpha_tabs.live_read",
@@ -4367,10 +4375,14 @@
                     "advance_artifact_port_pin",
                     "instantiate_artifact",
                     "manage_alpha_tabs.adopt",
+                    "manage_alpha_tabs.adopt_authored",
                     "manage_alpha_tabs.disable",
                     "manage_alpha_tabs.install",
+                    "manage_alpha_tabs.live_unsubscribe",
                     "manage_alpha_tabs.remove",
+                    "manage_alpha_tabs.reorder",
                     "manage_alpha_tabs.restore",
+                    "manage_alpha_tabs.update",
                     "manage_artifact_inputs.bind",
                     "manage_artifact_inputs.bind_many",
                     "manage_artifact_inputs.unbind",
@@ -5070,7 +5082,7 @@
     },
     "build_enabled_experimental": {
       "ordinary": {
-        "descriptor_bytes": 46253,
+        "descriptor_bytes": 46450,
         "descriptors": [
           {
             "name": "bootstrap",
@@ -5202,6 +5214,7 @@
                   "enum": [
                     "manage_instructions.compare_seeded_default",
                     "manage_instructions.list",
+                    "manage_instructions.resolve",
                     "manage_onboarding.list_programmes",
                     "manage_onboarding.preview_generation",
                     "quickstart",
@@ -6701,6 +6714,7 @@
                 "operation": {
                   "type": "string",
                   "enum": [
+                    "manage_alpha_tabs.admit_reveal_target",
                     "manage_alpha_tabs.inspect",
                     "manage_alpha_tabs.list",
                     "manage_alpha_tabs.live_read",
@@ -6793,10 +6807,14 @@
                     "advance_artifact_port_pin",
                     "instantiate_artifact",
                     "manage_alpha_tabs.adopt",
+                    "manage_alpha_tabs.adopt_authored",
                     "manage_alpha_tabs.disable",
                     "manage_alpha_tabs.install",
+                    "manage_alpha_tabs.live_unsubscribe",
                     "manage_alpha_tabs.remove",
+                    "manage_alpha_tabs.reorder",
                     "manage_alpha_tabs.restore",
+                    "manage_alpha_tabs.update",
                     "manage_artifact_inputs.bind",
                     "manage_artifact_inputs.bind_many",
                     "manage_artifact_inputs.unbind",
@@ -7665,7 +7683,7 @@
         ]
       },
       "lens": {
-        "descriptor_bytes": 53032,
+        "descriptor_bytes": 53229,
         "descriptors": [
           {
             "name": "bootstrap",
@@ -7807,6 +7825,7 @@
                   "enum": [
                     "manage_instructions.compare_seeded_default",
                     "manage_instructions.list",
+                    "manage_instructions.resolve",
                     "manage_onboarding.list_programmes",
                     "manage_onboarding.preview_generation",
                     "quickstart",
@@ -9499,6 +9518,7 @@
                 "operation": {
                   "type": "string",
                   "enum": [
+                    "manage_alpha_tabs.admit_reveal_target",
                     "manage_alpha_tabs.inspect",
                     "manage_alpha_tabs.list",
                     "manage_alpha_tabs.live_read",
@@ -9607,10 +9627,14 @@
                     "advance_artifact_port_pin",
                     "instantiate_artifact",
                     "manage_alpha_tabs.adopt",
+                    "manage_alpha_tabs.adopt_authored",
                     "manage_alpha_tabs.disable",
                     "manage_alpha_tabs.install",
+                    "manage_alpha_tabs.live_unsubscribe",
                     "manage_alpha_tabs.remove",
+                    "manage_alpha_tabs.reorder",
                     "manage_alpha_tabs.restore",
+                    "manage_alpha_tabs.update",
                     "manage_artifact_inputs.bind",
                     "manage_artifact_inputs.bind_many",
                     "manage_artifact_inputs.unbind",
@@ -11079,6 +11103,18 @@
     },
     {
       "legacy_tool": "manage_instructions",
+      "legacy_action": "resolve",
+      "stability": "stable",
+      "availability": [
+        "ordinary",
+        "lens"
+      ],
+      "candidate_executor": "guidance_read",
+      "candidate_operation": "manage_instructions.resolve",
+      "candidate_plan_policy": "direct"
+    },
+    {
+      "legacy_tool": "manage_instructions",
       "legacy_action": "retarget_binding",
       "stability": "stable",
       "availability": [
@@ -11967,6 +12003,18 @@
     },
     {
       "legacy_tool": "manage_alpha_tabs",
+      "legacy_action": "admit_reveal_target",
+      "stability": "stable",
+      "availability": [
+        "ordinary",
+        "lens"
+      ],
+      "candidate_executor": "artifacts_read",
+      "candidate_operation": "manage_alpha_tabs.admit_reveal_target",
+      "candidate_plan_policy": "direct"
+    },
+    {
+      "legacy_tool": "manage_alpha_tabs",
       "legacy_action": "adopt",
       "stability": "stable",
       "availability": [
@@ -11975,6 +12023,18 @@
       ],
       "candidate_executor": "artifacts_write",
       "candidate_operation": "manage_alpha_tabs.adopt",
+      "candidate_plan_policy": "direct"
+    },
+    {
+      "legacy_tool": "manage_alpha_tabs",
+      "legacy_action": "adopt_authored",
+      "stability": "stable",
+      "availability": [
+        "ordinary",
+        "lens"
+      ],
+      "candidate_executor": "artifacts_write",
+      "candidate_operation": "manage_alpha_tabs.adopt_authored",
       "candidate_plan_policy": "direct"
     },
     {
@@ -12051,6 +12111,18 @@
     },
     {
       "legacy_tool": "manage_alpha_tabs",
+      "legacy_action": "live_unsubscribe",
+      "stability": "stable",
+      "availability": [
+        "ordinary",
+        "lens"
+      ],
+      "candidate_executor": "artifacts_write",
+      "candidate_operation": "manage_alpha_tabs.live_unsubscribe",
+      "candidate_plan_policy": "direct"
+    },
+    {
+      "legacy_tool": "manage_alpha_tabs",
       "legacy_action": "preview",
       "stability": "stable",
       "availability": [
@@ -12075,6 +12147,18 @@
     },
     {
       "legacy_tool": "manage_alpha_tabs",
+      "legacy_action": "reorder",
+      "stability": "stable",
+      "availability": [
+        "ordinary",
+        "lens"
+      ],
+      "candidate_executor": "artifacts_write",
+      "candidate_operation": "manage_alpha_tabs.reorder",
+      "candidate_plan_policy": "direct"
+    },
+    {
+      "legacy_tool": "manage_alpha_tabs",
       "legacy_action": "restore",
       "stability": "stable",
       "availability": [
@@ -12083,6 +12167,18 @@
       ],
       "candidate_executor": "artifacts_write",
       "candidate_operation": "manage_alpha_tabs.restore",
+      "candidate_plan_policy": "direct"
+    },
+    {
+      "legacy_tool": "manage_alpha_tabs",
+      "legacy_action": "update",
+      "stability": "stable",
+      "availability": [
+        "ordinary",
+        "lens"
+      ],
+      "candidate_executor": "artifacts_write",
+      "candidate_operation": "manage_alpha_tabs.update",
       "candidate_plan_policy": "direct"
     },
     {

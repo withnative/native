@@ -26,6 +26,35 @@ pub use native_query_contract::events::ContentInvalidation;
 const MAX_PAGE: i64 = 1000;
 const PUBLIC_HISTORY_FILTER: &str = "type NOT IN ('reconciliation.recorded.v1','unit.superseded.v1','receipt.dependency_audited.v1')";
 
+/// Event types public history never shows anyone: the one list
+/// `event_is_visible_in` refuses and [`PUBLIC_HISTORY_FILTER`] and
+/// [`FIELD_CHANGE_ROWS_PREDICATE`] are held to.
+pub(crate) const HISTORY_HIDDEN_EVENT_TYPES: [&str; 3] = [
+    "reconciliation.recorded.v1",
+    "unit.superseded.v1",
+    "receipt.dependency_audited.v1",
+];
+
+/// The event types the `records.changes.v1` tab read leaves out, as the SQL
+/// term: [`HISTORY_HIDDEN_EVENT_TYPES`] plus `occurrence.bound.v1`, in
+/// sorted order. Occurrence bindings carry no field or body change, and
+/// whether a viewer may see one is a per-event authorization check on
+/// another record that SQL cannot express. With these gone, every rule that
+/// hides one of a visible record's events from a viewer is this one fixed
+/// predicate (the only other rule, a hidden acknowledgement record, refuses
+/// the whole record up front), so rows the viewer cannot see are never
+/// examined and cannot be counted against a budget.
+///
+/// It must match the partial index [`FIELD_CHANGE_ROWS_INDEX`]'s `WHERE`
+/// byte for byte: SQLite only uses a partial index when the query states its
+/// predicate. It stays a literal because that index DDL is one; the tests
+/// below derive both this and [`PUBLIC_HISTORY_FILTER`] from
+/// [`HISTORY_HIDDEN_EVENT_TYPES`] and hold them equal.
+pub(crate) const FIELD_CHANGE_ROWS_PREDICATE: &str = "type NOT IN ('occurrence.bound.v1','receipt.dependency_audited.v1','reconciliation.recorded.v1','unit.superseded.v1')";
+
+/// The partial index over one record's field-change rows (engine 71).
+pub(crate) const FIELD_CHANGE_ROWS_INDEX: &str = "idx_content_events_record_changes";
+
 /// Default and maximum caller-visible page sizes for `whats_changed`.
 /// The tool reads the raw log in chunks capped at the same maximum, but hidden
 /// and filter-rejected rows never occupy caller-visible page slots.
@@ -97,6 +126,52 @@ pub(crate) async fn content_invalidations_on(
                 record_id: row.try_get("record_id")?,
                 event_type: row.try_get("type")?,
                 created_at: row.try_get("created_at")?,
+            })
+        })
+        .collect()
+}
+
+/// Internal tail row. `act` groups committed content rows by their write
+/// transaction; the public invalidation DTO deliberately omits it.
+pub(crate) struct ContentInvalidationWithAct {
+    pub envelope: ContentInvalidation,
+    pub act: Option<i64>,
+}
+
+pub(crate) async fn content_invalidations_with_act_on(
+    pool: &sqlx::SqlitePool,
+    after: i64,
+    fence: i64,
+    limit: i64,
+) -> Result<Vec<ContentInvalidationWithAct>> {
+    if limit <= 0 {
+        return Err(contract_violation("realtime page limit must be positive"));
+    }
+    let rows = sqlx::query(
+        "SELECT seq, id, record_id,
+                CASE WHEN type='receipt.committed.v1' THEN 'record.updated' ELSE type END AS type,
+                created_at, act
+           FROM content_events
+          WHERE seq > ? AND seq <= ?
+          ORDER BY seq
+          LIMIT ?",
+    )
+    .bind(after)
+    .bind(fence)
+    .bind(limit.min(MAX_PAGE))
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter()
+        .map(|row| {
+            Ok(ContentInvalidationWithAct {
+                envelope: ContentInvalidation {
+                    local_seq: row.try_get("seq")?,
+                    id: row.try_get("id")?,
+                    record_id: row.try_get("record_id")?,
+                    event_type: row.try_get("type")?,
+                    created_at: row.try_get("created_at")?,
+                },
+                act: row.try_get("act")?,
             })
         })
         .collect()
@@ -265,20 +340,27 @@ pub(crate) fn event_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<EventRow> 
 }
 
 fn public_event_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<EventRow> {
-    let mut event = event_from_row(row)?;
+    let event = event_from_row(row)?;
     if event.event_type == "receipt.committed.v1" {
-        let raw = event
-            .payload
-            .as_deref()
-            .ok_or_else(|| contract_violation("aggregate Receipt payload is missing"))?;
-        let payload: serde_json::Value = serde_json::from_str(raw)?;
-        let body = payload
-            .get("body")
-            .cloned()
-            .ok_or_else(|| contract_violation("aggregate Receipt body is missing"))?;
-        event.event_type = "record.updated".into();
-        event.payload = Some(serde_json::to_string(&serde_json::json!({ "body": body }))?);
+        return publicize_receipt(event);
     }
+    Ok(event)
+}
+
+/// A Receipt as public history shows it: a `record.updated` carrying only
+/// the body it wrote.
+fn publicize_receipt(mut event: EventRow) -> Result<EventRow> {
+    let raw = event
+        .payload
+        .as_deref()
+        .ok_or_else(|| contract_violation("aggregate Receipt payload is missing"))?;
+    let payload: serde_json::Value = serde_json::from_str(raw)?;
+    let body = payload
+        .get("body")
+        .cloned()
+        .ok_or_else(|| contract_violation("aggregate Receipt body is missing"))?;
+    event.event_type = "record.updated".into();
+    event.payload = Some(serde_json::to_string(&serde_json::json!({ "body": body }))?);
     Ok(event)
 }
 
@@ -713,6 +795,122 @@ pub(crate) async fn events_for_record_ordered_in(
         events,
         next_after_seq,
     })
+}
+
+/// One row of a record's field-change stream, as
+/// [`field_change_rows_in`] reads it.
+pub(crate) struct FieldChangeRow {
+    /// The public form of the event: a Receipt reads as `record.updated`.
+    /// Its causal envelope is not read, and is always `legacy_unknown` here.
+    pub(crate) event: EventRow,
+    /// The payload is larger than the caller's cap, so neither it nor any
+    /// column stored after it (`actor`, `run_key`, `parent_key`, `intent`,
+    /// `created_at`, `act`) was read: those read as empty, and
+    /// `created_at` as `""`.
+    pub(crate) withheld: bool,
+}
+
+/// Up to `limit` of one record's events older than `before_seq` (all of
+/// them when `None`), newest first, leaving out
+/// [`FIELD_CHANGE_EXCLUDED_EVENT_TYPES`], for the `records.changes.v1` tab
+/// read.
+///
+/// The statement walks the partial index [`FIELD_CHANGE_ROWS_INDEX`], which
+/// holds exactly those rows, so it examines only rows it returns: no hidden
+/// row costs anything or shows in a budget. It does not aggregate the
+/// causal frontier, whose size is unbounded. A payload is read only for
+/// `payload_types` (every type when `None`) and only up to
+/// `max_payload_bytes`; a row over that is `withheld`, with only its id, type
+/// and position read.
+///
+/// Sizes come from `octet_length(payload)`, which SQLite (3.43 and later;
+/// the bundled build is 3.46) answers from the record header without reading
+/// the value. `length(CAST(payload AS BLOB))` would read it all, and so
+/// would reading any column stored after `payload`, which is why every such
+/// column is read only for a row under the cap.
+pub(crate) async fn field_change_rows_in(
+    tx: &mut Transaction<'_, Sqlite>,
+    record_id: &str,
+    before_seq: Option<i64>,
+    limit: i64,
+    payload_types: Option<&[&str]>,
+    max_payload_bytes: i64,
+) -> Result<Vec<FieldChangeRow>> {
+    if limit <= 0 {
+        return Err(contract_violation("events window limit must be positive"));
+    }
+    let wanted = match payload_types {
+        None => "1".to_string(),
+        Some(types) => {
+            let listed = types
+                .iter()
+                .map(|event_type| {
+                    debug_assert!(event_type
+                        .bytes()
+                        .all(|b| b.is_ascii_graphic() && b != b'\''));
+                    format!("'{event_type}'")
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("type IN ({listed})")
+        }
+    };
+    // `payload` is stored before every column this reads after it, so a
+    // row's later columns sit past its payload bytes, in the payload's
+    // overflow chain. For a row over the cap, only the columns stored ahead
+    // of `payload` are read; everything after it stays unread.
+    let fits = "coalesce(octet_length(payload), 0) <= ?1";
+    let rows = sqlx::query(&format!(
+        "SELECT seq, id, record_id, type,
+                NOT ({fits}) AS withheld,
+                CASE WHEN {fits} AND {wanted} THEN payload END AS payload,
+                CASE WHEN {fits} THEN actor END AS actor,
+                CASE WHEN {fits} THEN run_key END AS run_key,
+                CASE WHEN {fits} THEN parent_key END AS parent_key,
+                CASE WHEN {fits} THEN intent END AS intent,
+                CASE WHEN {fits} THEN created_at END AS created_at,
+                CASE WHEN {fits} THEN act END AS act
+           FROM content_events INDEXED BY {FIELD_CHANGE_ROWS_INDEX}
+          WHERE record_id = ?2 AND seq < ?3 AND {FIELD_CHANGE_ROWS_PREDICATE}
+          ORDER BY seq DESC LIMIT ?4"
+    ))
+    .bind(max_payload_bytes)
+    .bind(record_id)
+    .bind(before_seq.unwrap_or(i64::MAX))
+    .bind(limit.min(MAX_PAGE))
+    .fetch_all(&mut **tx)
+    .await?;
+    rows.iter()
+        .map(|row| {
+            let withheld: bool = row.try_get("withheld")?;
+            let mut event = EventRow {
+                local_seq: row.try_get("seq")?,
+                id: row.try_get("id")?,
+                record_id: row.try_get("record_id")?,
+                event_type: row.try_get("type")?,
+                payload: row.try_get("payload")?,
+                actor: row.try_get("actor")?,
+                run_key: row.try_get("run_key")?,
+                parent_key: row.try_get("parent_key")?,
+                intent: row.try_get("intent")?,
+                created_at: row
+                    .try_get::<Option<String>, _>("created_at")?
+                    .unwrap_or_default(),
+                causal_envelope: CausalEnvelopeV1::legacy_unknown(),
+                act: row.try_get("act")?,
+            };
+            if event.event_type == "receipt.committed.v1" {
+                event = match event.payload {
+                    Some(_) => publicize_receipt(event)?,
+                    None => EventRow {
+                        event_type: "record.updated".into(),
+                        ..event
+                    },
+                };
+            }
+            Ok(FieldChangeRow { event, withheld })
+        })
+        .collect()
 }
 
 /// A page of the whole log.
@@ -1383,5 +1581,187 @@ mod change_window_snapshot_tests {
         keys.sort_unstable();
         assert_eq!(keys, ["created_at", "id", "local_seq", "record_id", "type"]);
         assert_eq!(object["type"], "record.updated");
+    }
+}
+
+/// The SQL filters derived from [`HISTORY_HIDDEN_EVENT_TYPES`], so a type
+/// added to the list without the literals (or the reverse) fails here.
+#[cfg(test)]
+pub(crate) mod visibility_predicates {
+    use super::HISTORY_HIDDEN_EVENT_TYPES;
+
+    pub(crate) fn not_in(types: &[&str]) -> String {
+        let listed = types
+            .iter()
+            .map(|event_type| format!("'{event_type}'"))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!("type NOT IN ({listed})")
+    }
+
+    /// The types `records.changes.v1` leaves out: the hidden list plus
+    /// occurrence bindings, sorted.
+    pub(crate) fn field_change_excluded_types() -> Vec<&'static str> {
+        let mut types: Vec<&'static str> = HISTORY_HIDDEN_EVENT_TYPES.to_vec();
+        types.push("occurrence.bound.v1");
+        types.sort_unstable();
+        types.dedup();
+        types
+    }
+
+    #[test]
+    fn every_visibility_filter_derives_from_the_one_hidden_list() {
+        assert_eq!(
+            super::PUBLIC_HISTORY_FILTER,
+            not_in(&HISTORY_HIDDEN_EVENT_TYPES)
+        );
+        assert_eq!(
+            super::FIELD_CHANGE_ROWS_PREDICATE,
+            not_in(&field_change_excluded_types())
+        );
+        assert_eq!(
+            field_change_excluded_types().len(),
+            HISTORY_HIDDEN_EVENT_TYPES.len() + 1
+        );
+    }
+}
+
+/// `field_change_rows_in` withholds an over-cap payload without reading it.
+///
+/// Measured as bytes the connection's own SQLite worker thread reads from
+/// the file (`rchar` in `/proc/self/task/<tid>/io`), because SQLite reads a
+/// long overflow chain straight from the file, past its page cache, so
+/// cache-miss counts cannot see payload reads. Each measuring connection is
+/// fresh, with an empty page cache, and its worker thread is named so no
+/// other test's reads are counted.
+#[cfg(all(test, target_os = "linux"))]
+mod field_change_rows_io_tests {
+    use std::str::FromStr;
+
+    use sqlx::sqlite::SqliteConnectOptions;
+    use sqlx::{Connection, SqliteConnection};
+
+    const RECORD: &str = "0e5c0a4e-7d1b-4c5e-9f3a-1b2c3d4e5f61";
+
+    /// Bytes read so far by the thread named `name` in this process.
+    fn thread_bytes_read(name: &str) -> u64 {
+        for task in std::fs::read_dir("/proc/self/task").unwrap() {
+            let task = task.unwrap().path();
+            let Ok(comm) = std::fs::read_to_string(task.join("comm")) else {
+                continue;
+            };
+            if comm.trim_end() != name {
+                continue;
+            }
+            let io = std::fs::read_to_string(task.join("io")).unwrap();
+            return io
+                .lines()
+                .find_map(|line| line.strip_prefix("rchar: "))
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+        }
+        panic!("no thread named {name}");
+    }
+
+    /// A fresh connection to the file, whose worker thread is `name`, with
+    /// the schema already loaded.
+    async fn cold(path: &std::path::Path, name: &'static str) -> SqliteConnection {
+        let options = SqliteConnectOptions::from_str(&format!("sqlite:{}", path.display()))
+            .unwrap()
+            .thread_name(move |_| name.to_string());
+        let mut connection = SqliteConnection::connect_with(&options).await.unwrap();
+        sqlx::query("SELECT count(*) FROM sqlite_master")
+            .fetch_one(&mut connection)
+            .await
+            .unwrap();
+        connection
+    }
+
+    #[tokio::test]
+    async fn an_over_cap_payload_is_withheld_without_reading_it() {
+        let version: String = {
+            let db = crate::create_database(":memory:").await.unwrap();
+            sqlx::query_scalar("SELECT sqlite_version()")
+                .fetch_one(db.write_pool())
+                .await
+                .unwrap()
+        };
+        let (major, minor) = {
+            let mut parts = version.split('.').map(|part| part.parse::<u32>().unwrap());
+            (parts.next().unwrap(), parts.next().unwrap())
+        };
+        assert!(
+            (major, minor) >= (3, 43),
+            "octet_length needs SQLite 3.43: {version}"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oversized-payload.db");
+        let payload_bytes: u64 = 16 * 1024 * 1024;
+        {
+            let db = crate::create_database(&path.to_string_lossy())
+                .await
+                .unwrap();
+            crate::store::create_record(
+                &db,
+                serde_json::json!({
+                    "id": RECORD, "type": "Document", "kind": "note", "name": "Big",
+                }),
+            )
+            .await
+            .unwrap();
+            crate::store::append(
+                &db,
+                crate::store::AppendSpec {
+                    record_id: RECORD.into(),
+                    event_type: "record.updated".into(),
+                    payload: serde_json::json!({"unread": "x".repeat(payload_bytes as usize)}),
+                    actor: None,
+                },
+            )
+            .await
+            .unwrap();
+            db.close().await;
+        }
+
+        // Reading the size the old way reads the whole payload, which shows
+        // the measure sees payload reads.
+        let mut connection = cold(&path, "rc-io-control").await;
+        let before = thread_bytes_read("rc-io-control");
+        let size: i64 = sqlx::query_scalar(
+            "SELECT length(CAST(payload AS BLOB)) FROM content_events
+              WHERE record_id = ? ORDER BY seq DESC LIMIT 1",
+        )
+        .bind(RECORD)
+        .fetch_one(&mut connection)
+        .await
+        .unwrap();
+        let read_all = thread_bytes_read("rc-io-control") - before;
+        connection.close().await.unwrap();
+        assert!(size as u64 > payload_bytes);
+        assert!(read_all >= payload_bytes, "{read_all} bytes read");
+
+        // The field-change read under a 1 MiB cap withholds it, reading only
+        // a few pages.
+        let mut connection = cold(&path, "rc-io-probe").await;
+        let before = thread_bytes_read("rc-io-probe");
+        let mut tx = connection.begin().await.unwrap();
+        let rows = super::field_change_rows_in(&mut tx, RECORD, None, 16, None, 1024 * 1024)
+            .await
+            .unwrap();
+        tx.rollback().await.unwrap();
+        let read = thread_bytes_read("rc-io-probe") - before;
+        connection.close().await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].withheld && rows[0].event.payload.is_none());
+        assert_eq!(rows[0].event.created_at, "");
+        assert!(!rows[1].withheld && rows[1].event.payload.is_some());
+        assert!(!rows[1].event.created_at.is_empty());
+        assert!(
+            read < 256 * 1024,
+            "{read} bytes read for a {payload_bytes}-byte payload"
+        );
     }
 }

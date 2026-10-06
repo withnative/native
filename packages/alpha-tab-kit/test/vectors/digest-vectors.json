@@ -1,0 +1,333 @@
+{
+  "note": "Shared by packages/alpha-tab-kit/test/digest.test.mjs and src/mcp/tools/alpha_tab_kit_drift.rs: both compute each expected value independently.",
+  "bundle": [
+    {
+      "name": "host fixture (alpha_tab_digest_vectors, alpha_tabs.rs:5397)",
+      "body": "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Fixture</title></head><body><main><h1>Fixture</h1></main></body></html>",
+      "bundle_sha256": "44a905b57d7957f3d8411ac4ce8fcedd5dcd202454cfbed87ec84cfda75efda0"
+    }
+  ],
+  "declaration": [
+    {
+      "name": "host fixture (alpha_tabs.rs:5406)",
+      "declaration": {
+        "needs": [
+          "attention.query.v1"
+        ],
+        "effects": [
+          "task.triage-set.v1"
+        ]
+      },
+      "declaration_digest": "9c6045ec2a73034d6e1a55463fec891dc38db088202f556a0e89bee7ae7bcb15"
+    },
+    {
+      "name": "slack-workspace 0.1.0 as installed 28 Sep 2026 (server-confirmed; e8921807f)",
+      "declaration": {
+        "needs": [
+          {
+            "need": "sql.snapshot.v1",
+            "key": "slack.viewer",
+            "label": "Your person record and account ID, from your own account binding",
+            "sql": "SELECT r.id, r.name, b.identifier AS account FROM bindings b JOIN records r ON r.id = b.record_id WHERE b.system = 'account' ORDER BY b.is_canonical DESC, r.id LIMIT 1"
+          },
+          {
+            "need": "sql.snapshot.v1",
+            "key": "slack.posts",
+            "label": "Last 800 events grouped by agent run and record (200 newest groups), with record type, status and folder",
+            "sql": "SELECT g.run_key, g.record_id, g.actor, g.events, g.created, g.links, g.facets, g.first_seq, g.last_seq, g.first_at, g.last_at, r.type, r.kind, r.name, r.lifecycle, r.home_id, h.name AS home_name, h.kind AS home_kind, (SELECT l.target_id FROM links l WHERE l.source_id = r.id AND l.relationship = 'part_of' ORDER BY l.target_id LIMIT 1) AS part_of_id FROM (SELECT x.run_key, x.record_id, MAX(x.actor) AS actor, COUNT(*) AS events, SUM(CASE WHEN x.type = 'record.created' THEN 1 ELSE 0 END) AS created, SUM(CASE WHEN x.type LIKE 'link.%' THEN 1 ELSE 0 END) AS links, SUM(CASE WHEN x.type LIKE 'facet.%' THEN 1 ELSE 0 END) AS facets, MIN(x.local_seq) AS first_seq, MAX(x.local_seq) AS last_seq, MIN(x.created_at) AS first_at, MAX(x.created_at) AS last_at FROM (SELECT e.local_seq, e.run_key, e.record_id, e.type, e.actor, e.created_at FROM content_events e ORDER BY e.local_seq DESC LIMIT 800) x GROUP BY x.run_key, x.record_id) g JOIN records r ON r.id = g.record_id LEFT JOIN records h ON h.id = r.home_id WHERE r.deleted_at IS NULL ORDER BY g.last_seq DESC LIMIT 200"
+          },
+          {
+            "need": "sql.snapshot.v1",
+            "key": "slack.comments",
+            "label": "200 newest comments you can see: title, first 360 characters, author run, and the record each is on",
+            "sql": "SELECT c.id, c.name, substr(c.body, 1, 360) AS preview, c.created_at, (SELECT e.actor FROM content_events e WHERE e.record_id = c.id ORDER BY e.local_seq LIMIT 1) AS actor, (SELECT e.run_key FROM content_events e WHERE e.record_id = c.id ORDER BY e.local_seq LIMIT 1) AS run_key, t.id AS target_id, t.type AS target_type, t.kind AS target_kind, t.name AS target_name, t.lifecycle AS target_lifecycle, t.home_id AS target_home_id, (SELECT h.name FROM records h WHERE h.id = t.home_id) AS target_home_name FROM records c JOIN links l ON l.source_id = c.id AND l.relationship = 'part_of' JOIN records t ON t.id = l.target_id WHERE c.type = 'Annotation' AND c.kind = 'comment' AND c.deleted_at IS NULL AND t.deleted_at IS NULL ORDER BY c.created_at DESC, c.id LIMIT 200"
+          },
+          {
+            "need": "sql.snapshot.v1",
+            "key": "slack.dms",
+            "label": "Up to 200 messages you sent or that are addressed to you, first 360 characters each; others' messages excluded",
+            "sql": "SELECT m.id, m.name, substr(m.body, 1, 360) AS preview, m.created_at, (SELECT e.actor FROM content_events e WHERE e.record_id = m.id ORDER BY e.local_seq LIMIT 1) AS actor, (SELECT e.run_key FROM content_events e WHERE e.record_id = m.id ORDER BY e.local_seq LIMIT 1) AS run_key, (SELECT f.value FROM facet_values f WHERE f.record_id = m.id AND f.key = 'expectation') AS expectation, (SELECT l.target_id FROM links l WHERE l.source_id = m.id AND l.relationship = 'addressed_to' ORDER BY l.target_id LIMIT 1) AS to_id, (SELECT p.name FROM links l JOIN records p ON p.id = l.target_id WHERE l.source_id = m.id AND l.relationship = 'addressed_to' ORDER BY p.id LIMIT 1) AS to_name, (SELECT l.target_id FROM links l WHERE l.source_id = m.id AND l.relationship = 'reply_to' ORDER BY l.target_id LIMIT 1) AS reply_to_id, (SELECT COUNT(*) FROM messages_awaiting_reply w WHERE w.message_id = m.id) AS awaiting, (SELECT COUNT(*) FROM content_events e WHERE e.record_id = m.id AND e.type = 'message.reaction.added.v1') - (SELECT COUNT(*) FROM content_events e WHERE e.record_id = m.id AND e.type = 'message.reaction.removed.v1') AS reactions, CASE WHEN (SELECT e.actor FROM content_events e WHERE e.record_id = m.id ORDER BY e.local_seq LIMIT 1) IN (SELECT b.identifier FROM bindings b WHERE b.system = 'account') THEN 1 ELSE 0 END AS from_viewer, CASE WHEN EXISTS (SELECT 1 FROM links l JOIN bindings b ON b.record_id = l.target_id AND b.system = 'account' WHERE l.source_id = m.id AND l.relationship = 'addressed_to') THEN 1 ELSE 0 END AS to_viewer FROM records m WHERE m.type = 'Message' AND m.deleted_at IS NULL AND ((SELECT e.actor FROM content_events e WHERE e.record_id = m.id ORDER BY e.local_seq LIMIT 1) IN (SELECT b.identifier FROM bindings b WHERE b.system = 'account') OR EXISTS (SELECT 1 FROM links l JOIN bindings b ON b.record_id = l.target_id AND b.system = 'account' WHERE l.source_id = m.id AND l.relationship = 'addressed_to')) ORDER BY m.created_at DESC, m.id LIMIT 200"
+          },
+          {
+            "need": "sql.snapshot.v1",
+            "key": "slack.agents",
+            "label": "Agent runs behind those 800 events, with declared intent and presence for runs seen in the last 24 hours",
+            "sql": "SELECT g.run_key, g.events, g.records, g.first_at, g.last_at, (SELECT substr(a.declared_intent, 1, 280) FROM agent_activity a WHERE a.run_key = g.run_key ORDER BY a.activity_id LIMIT 1) AS intent, (SELECT a.appears_active FROM agent_activity a WHERE a.run_key = g.run_key ORDER BY a.activity_id LIMIT 1) AS appears_active, (SELECT a.started_at FROM agent_activity a WHERE a.run_key = g.run_key ORDER BY a.activity_id LIMIT 1) AS started_at, (SELECT a.last_observed_activity_at FROM agent_activity a WHERE a.run_key = g.run_key ORDER BY a.activity_id LIMIT 1) AS last_seen_at FROM (SELECT x.run_key, COUNT(*) AS events, COUNT(DISTINCT x.record_id) AS records, MIN(x.created_at) AS first_at, MAX(x.created_at) AS last_at FROM (SELECT e.local_seq, e.run_key, e.record_id, e.created_at FROM content_events e ORDER BY e.local_seq DESC LIMIT 800) x WHERE x.run_key IS NOT NULL GROUP BY x.run_key) g ORDER BY g.last_at DESC, g.run_key LIMIT 200"
+          },
+          {
+            "need": "sql.snapshot.v1",
+            "key": "slack.body",
+            "label": "The full body of one comment, message, work item, decision, document or outcome, read when you open it",
+            "sql": "SELECT id, body FROM records WHERE id = ?1 AND deleted_at IS NULL AND type IN ('Annotation', 'Message', 'WorkItem', 'Resolution', 'Document', 'Outcome')",
+            "params": [
+              {
+                "name": "id",
+                "type": "text",
+                "max_len": 64
+              }
+            ]
+          },
+          {
+            "need": "sql.snapshot.v1",
+            "key": "slack.thread",
+            "label": "Up to 50 comments on one record and replies to them, with full bodies, read when you open its thread",
+            "sql": "SELECT c.id, c.name, c.body, c.created_at, (SELECT e.actor FROM content_events e WHERE e.record_id = c.id ORDER BY e.local_seq LIMIT 1) AS actor, (SELECT e.run_key FROM content_events e WHERE e.record_id = c.id ORDER BY e.local_seq LIMIT 1) AS run_key, l.target_id AS parent_id FROM records c JOIN links l ON l.source_id = c.id AND l.relationship = 'part_of' WHERE c.type = 'Annotation' AND c.kind = 'comment' AND c.deleted_at IS NULL AND (l.target_id = ?1 OR l.target_id IN (SELECT l2.source_id FROM links l2 WHERE l2.target_id = ?1 AND l2.relationship = 'part_of')) ORDER BY c.created_at, c.id LIMIT 50",
+            "params": [
+              {
+                "name": "id",
+                "type": "text",
+                "max_len": 64
+              }
+            ]
+          },
+          {
+            "need": "sql.snapshot.v1",
+            "key": "slack.unfurl",
+            "label": "Up to two records whose ID starts with a linked short reference: title, type, status and folder",
+            "sql": "SELECT r.id, r.type, r.kind, r.name, r.lifecycle, (SELECT h.name FROM records h WHERE h.id = r.home_id) AS home_name FROM records r WHERE r.id >= ?1 AND r.id < ?1 || 'g' AND r.deleted_at IS NULL ORDER BY r.id LIMIT 2",
+            "params": [
+              {
+                "name": "ref",
+                "type": "text",
+                "max_len": 36
+              }
+            ]
+          }
+        ],
+        "effects": []
+      },
+      "declaration_digest": "3e78e51d165ed4714624234fb9f1f111561e0a8e1b95f056de171e596ba74922"
+    },
+    {
+      "name": "slack-workspace 0.1.0, needs in reverse order (same consent)",
+      "declaration": {
+        "effects": [],
+        "needs": [
+          {
+            "need": "sql.snapshot.v1",
+            "key": "slack.unfurl",
+            "label": "Up to two records whose ID starts with a linked short reference: title, type, status and folder",
+            "sql": "SELECT r.id, r.type, r.kind, r.name, r.lifecycle, (SELECT h.name FROM records h WHERE h.id = r.home_id) AS home_name FROM records r WHERE r.id >= ?1 AND r.id < ?1 || 'g' AND r.deleted_at IS NULL ORDER BY r.id LIMIT 2",
+            "params": [
+              {
+                "name": "ref",
+                "type": "text",
+                "max_len": 36
+              }
+            ]
+          },
+          {
+            "need": "sql.snapshot.v1",
+            "key": "slack.thread",
+            "label": "Up to 50 comments on one record and replies to them, with full bodies, read when you open its thread",
+            "sql": "SELECT c.id, c.name, c.body, c.created_at, (SELECT e.actor FROM content_events e WHERE e.record_id = c.id ORDER BY e.local_seq LIMIT 1) AS actor, (SELECT e.run_key FROM content_events e WHERE e.record_id = c.id ORDER BY e.local_seq LIMIT 1) AS run_key, l.target_id AS parent_id FROM records c JOIN links l ON l.source_id = c.id AND l.relationship = 'part_of' WHERE c.type = 'Annotation' AND c.kind = 'comment' AND c.deleted_at IS NULL AND (l.target_id = ?1 OR l.target_id IN (SELECT l2.source_id FROM links l2 WHERE l2.target_id = ?1 AND l2.relationship = 'part_of')) ORDER BY c.created_at, c.id LIMIT 50",
+            "params": [
+              {
+                "name": "id",
+                "type": "text",
+                "max_len": 64
+              }
+            ]
+          },
+          {
+            "need": "sql.snapshot.v1",
+            "key": "slack.body",
+            "label": "The full body of one comment, message, work item, decision, document or outcome, read when you open it",
+            "sql": "SELECT id, body FROM records WHERE id = ?1 AND deleted_at IS NULL AND type IN ('Annotation', 'Message', 'WorkItem', 'Resolution', 'Document', 'Outcome')",
+            "params": [
+              {
+                "name": "id",
+                "type": "text",
+                "max_len": 64
+              }
+            ]
+          },
+          {
+            "need": "sql.snapshot.v1",
+            "key": "slack.agents",
+            "label": "Agent runs behind those 800 events, with declared intent and presence for runs seen in the last 24 hours",
+            "sql": "SELECT g.run_key, g.events, g.records, g.first_at, g.last_at, (SELECT substr(a.declared_intent, 1, 280) FROM agent_activity a WHERE a.run_key = g.run_key ORDER BY a.activity_id LIMIT 1) AS intent, (SELECT a.appears_active FROM agent_activity a WHERE a.run_key = g.run_key ORDER BY a.activity_id LIMIT 1) AS appears_active, (SELECT a.started_at FROM agent_activity a WHERE a.run_key = g.run_key ORDER BY a.activity_id LIMIT 1) AS started_at, (SELECT a.last_observed_activity_at FROM agent_activity a WHERE a.run_key = g.run_key ORDER BY a.activity_id LIMIT 1) AS last_seen_at FROM (SELECT x.run_key, COUNT(*) AS events, COUNT(DISTINCT x.record_id) AS records, MIN(x.created_at) AS first_at, MAX(x.created_at) AS last_at FROM (SELECT e.local_seq, e.run_key, e.record_id, e.created_at FROM content_events e ORDER BY e.local_seq DESC LIMIT 800) x WHERE x.run_key IS NOT NULL GROUP BY x.run_key) g ORDER BY g.last_at DESC, g.run_key LIMIT 200"
+          },
+          {
+            "need": "sql.snapshot.v1",
+            "key": "slack.dms",
+            "label": "Up to 200 messages you sent or that are addressed to you, first 360 characters each; others' messages excluded",
+            "sql": "SELECT m.id, m.name, substr(m.body, 1, 360) AS preview, m.created_at, (SELECT e.actor FROM content_events e WHERE e.record_id = m.id ORDER BY e.local_seq LIMIT 1) AS actor, (SELECT e.run_key FROM content_events e WHERE e.record_id = m.id ORDER BY e.local_seq LIMIT 1) AS run_key, (SELECT f.value FROM facet_values f WHERE f.record_id = m.id AND f.key = 'expectation') AS expectation, (SELECT l.target_id FROM links l WHERE l.source_id = m.id AND l.relationship = 'addressed_to' ORDER BY l.target_id LIMIT 1) AS to_id, (SELECT p.name FROM links l JOIN records p ON p.id = l.target_id WHERE l.source_id = m.id AND l.relationship = 'addressed_to' ORDER BY p.id LIMIT 1) AS to_name, (SELECT l.target_id FROM links l WHERE l.source_id = m.id AND l.relationship = 'reply_to' ORDER BY l.target_id LIMIT 1) AS reply_to_id, (SELECT COUNT(*) FROM messages_awaiting_reply w WHERE w.message_id = m.id) AS awaiting, (SELECT COUNT(*) FROM content_events e WHERE e.record_id = m.id AND e.type = 'message.reaction.added.v1') - (SELECT COUNT(*) FROM content_events e WHERE e.record_id = m.id AND e.type = 'message.reaction.removed.v1') AS reactions, CASE WHEN (SELECT e.actor FROM content_events e WHERE e.record_id = m.id ORDER BY e.local_seq LIMIT 1) IN (SELECT b.identifier FROM bindings b WHERE b.system = 'account') THEN 1 ELSE 0 END AS from_viewer, CASE WHEN EXISTS (SELECT 1 FROM links l JOIN bindings b ON b.record_id = l.target_id AND b.system = 'account' WHERE l.source_id = m.id AND l.relationship = 'addressed_to') THEN 1 ELSE 0 END AS to_viewer FROM records m WHERE m.type = 'Message' AND m.deleted_at IS NULL AND ((SELECT e.actor FROM content_events e WHERE e.record_id = m.id ORDER BY e.local_seq LIMIT 1) IN (SELECT b.identifier FROM bindings b WHERE b.system = 'account') OR EXISTS (SELECT 1 FROM links l JOIN bindings b ON b.record_id = l.target_id AND b.system = 'account' WHERE l.source_id = m.id AND l.relationship = 'addressed_to')) ORDER BY m.created_at DESC, m.id LIMIT 200"
+          },
+          {
+            "need": "sql.snapshot.v1",
+            "key": "slack.comments",
+            "label": "200 newest comments you can see: title, first 360 characters, author run, and the record each is on",
+            "sql": "SELECT c.id, c.name, substr(c.body, 1, 360) AS preview, c.created_at, (SELECT e.actor FROM content_events e WHERE e.record_id = c.id ORDER BY e.local_seq LIMIT 1) AS actor, (SELECT e.run_key FROM content_events e WHERE e.record_id = c.id ORDER BY e.local_seq LIMIT 1) AS run_key, t.id AS target_id, t.type AS target_type, t.kind AS target_kind, t.name AS target_name, t.lifecycle AS target_lifecycle, t.home_id AS target_home_id, (SELECT h.name FROM records h WHERE h.id = t.home_id) AS target_home_name FROM records c JOIN links l ON l.source_id = c.id AND l.relationship = 'part_of' JOIN records t ON t.id = l.target_id WHERE c.type = 'Annotation' AND c.kind = 'comment' AND c.deleted_at IS NULL AND t.deleted_at IS NULL ORDER BY c.created_at DESC, c.id LIMIT 200"
+          },
+          {
+            "need": "sql.snapshot.v1",
+            "key": "slack.posts",
+            "label": "Last 800 events grouped by agent run and record (200 newest groups), with record type, status and folder",
+            "sql": "SELECT g.run_key, g.record_id, g.actor, g.events, g.created, g.links, g.facets, g.first_seq, g.last_seq, g.first_at, g.last_at, r.type, r.kind, r.name, r.lifecycle, r.home_id, h.name AS home_name, h.kind AS home_kind, (SELECT l.target_id FROM links l WHERE l.source_id = r.id AND l.relationship = 'part_of' ORDER BY l.target_id LIMIT 1) AS part_of_id FROM (SELECT x.run_key, x.record_id, MAX(x.actor) AS actor, COUNT(*) AS events, SUM(CASE WHEN x.type = 'record.created' THEN 1 ELSE 0 END) AS created, SUM(CASE WHEN x.type LIKE 'link.%' THEN 1 ELSE 0 END) AS links, SUM(CASE WHEN x.type LIKE 'facet.%' THEN 1 ELSE 0 END) AS facets, MIN(x.local_seq) AS first_seq, MAX(x.local_seq) AS last_seq, MIN(x.created_at) AS first_at, MAX(x.created_at) AS last_at FROM (SELECT e.local_seq, e.run_key, e.record_id, e.type, e.actor, e.created_at FROM content_events e ORDER BY e.local_seq DESC LIMIT 800) x GROUP BY x.run_key, x.record_id) g JOIN records r ON r.id = g.record_id LEFT JOIN records h ON h.id = r.home_id WHERE r.deleted_at IS NULL ORDER BY g.last_seq DESC LIMIT 200"
+          },
+          {
+            "need": "sql.snapshot.v1",
+            "key": "slack.viewer",
+            "label": "Your person record and account ID, from your own account binding",
+            "sql": "SELECT r.id, r.name, b.identifier AS account FROM bindings b JOIN records r ON r.id = b.record_id WHERE b.system = 'account' ORDER BY b.is_canonical DESC, r.id LIMIT 1"
+          }
+        ]
+      },
+      "declaration_digest": "3e78e51d165ed4714624234fb9f1f111561e0a8e1b95f056de171e596ba74922"
+    },
+    {
+      "name": "facet-set bound (records.facet-set.v1 object, 81372d1 slice)",
+      "declaration": {
+        "needs": [
+          {
+            "need": "sql.snapshot.v1",
+            "key": "grid.items",
+            "label": "Grid rows",
+            "sql": "SELECT id FROM records ORDER BY id LIMIT 200"
+          }
+        ],
+        "effects": [
+          {
+            "effect": "records.facet-set.v1",
+            "key": "priority",
+            "values": [
+              "high",
+              "low"
+            ],
+            "target": {
+              "need": "grid.items"
+            }
+          }
+        ]
+      },
+      "declaration_digest": "7eddf1c091d661988ade18b9feb7930c21d6fb23341df5914e2fb923ea10940b"
+    },
+    {
+      "name": "comment.create bound (comment.create.v1 object, b9fb9fd family1)",
+      "declaration": {
+        "needs": [
+          {
+            "need": "sql.snapshot.v1",
+            "key": "grid.items",
+            "label": "Grid rows",
+            "sql": "SELECT id FROM records ORDER BY id LIMIT 200"
+          }
+        ],
+        "effects": [
+          {
+            "effect": "comment.create.v1",
+            "positions": [
+              "root"
+            ],
+            "max_body_bytes": 100,
+            "target": {
+              "need": "grid.items"
+            }
+          }
+        ]
+      },
+      "declaration_digest": "7156ae2f6b0895c63febff43c77d95c0203c1b69d1f905e71afc9d1390a4a3c2"
+    },
+    {
+      "name": "message.react bound (message.react.v1 object, 07ae879 I1)",
+      "declaration": {
+        "needs": [
+          {
+            "need": "sql.snapshot.v1",
+            "key": "grid.items",
+            "label": "Grid rows",
+            "sql": "SELECT id FROM records ORDER BY id LIMIT 200"
+          }
+        ],
+        "effects": [
+          {
+            "effect": "message.react.v1",
+            "emoji": [
+              "👍"
+            ],
+            "target": {
+              "need": "grid.items"
+            }
+          }
+        ]
+      },
+      "declaration_digest": "ce0bb81b9de97da63f34fcbb58fc81f7789eb9730f8c2589e12b03edc28d6ce0"
+    },
+    {
+      "name": "records.title-set bound (records.title-set.v1 object, da148be)",
+      "declaration": {
+        "needs": [
+          {
+            "need": "sql.snapshot.v1",
+            "key": "grid.items",
+            "label": "Grid rows",
+            "sql": "SELECT id FROM records ORDER BY id LIMIT 200"
+          }
+        ],
+        "effects": [
+          {
+            "effect": "records.title-set.v1",
+            "target": {
+              "need": "grid.items"
+            }
+          }
+        ]
+      },
+      "declaration_digest": "3cae8be4cca6e6c63626909639bbf9bbae12b121bfb10c24ce6aad1cb7cfa554"
+    },
+    {
+      "name": "mixed facet-set + comment.create (cross-kind global hex order, b9fb9fd family1)",
+      "declaration": {
+        "needs": [
+          {
+            "need": "sql.snapshot.v1",
+            "key": "grid.items",
+            "label": "Grid rows",
+            "sql": "SELECT id FROM records ORDER BY id LIMIT 200"
+          }
+        ],
+        "effects": [
+          {
+            "effect": "records.facet-set.v1",
+            "key": "priority",
+            "values": [
+              "high",
+              "low"
+            ],
+            "target": {
+              "need": "grid.items"
+            }
+          },
+          {
+            "effect": "comment.create.v1",
+            "positions": [
+              "root"
+            ],
+            "max_body_bytes": 100,
+            "target": {
+              "need": "grid.items"
+            }
+          }
+        ]
+      },
+      "declaration_digest": "5735f407f65cfd97242297d29f4ea60e4c6c317450b9be479abe62de874594ee"
+    }
+  ],
+  "digest": [
+    {
+      "name": "host fixture (alpha_tabs.rs:5411)",
+      "bundle_sha256": "44a905b57d7957f3d8411ac4ce8fcedd5dcd202454cfbed87ec84cfda75efda0",
+      "declaration_digest": "9c6045ec2a73034d6e1a55463fec891dc38db088202f556a0e89bee7ae7bcb15",
+      "runtime": "native.html.v1",
+      "digest": "sha256:abd4e377416d6cecec1afff72b4281ee5ffde53d8649b6a7b9530a94dc3b0f40"
+    },
+    {
+      "name": "slack-workspace 0.1.0 install digest (README-slack-workspace.md, installed pin)",
+      "bundle_sha256": "dc681ac3b91f41b67e988866b0d168e1524d52e7505310ac09b94e8a4a28887a",
+      "declaration_digest": "3e78e51d165ed4714624234fb9f1f111561e0a8e1b95f056de171e596ba74922",
+      "runtime": "native.html.v1",
+      "digest": "sha256:e6856cb7f71098710fe43e470306d8e25ac4cbd52d59de9ac3477b80e333067f"
+    }
+  ]
+}

@@ -38,6 +38,7 @@ async fn validate_lifecycle_destination_in(
         key: "lifecycle".into(),
         value: Value::String(destination.into()),
         vocab_ref: None,
+        time_type: None,
     }];
     super::lifecycle::assert_facet_value_predicates_in(
         tx,

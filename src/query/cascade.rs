@@ -315,7 +315,27 @@ async fn schema_config_rows_with_layer<E: DomainStatementExecutor>(
     executor: &mut E,
     layer: Option<&str>,
 ) -> Result<Vec<SchemaConfigRow>> {
-    let statement = if layer.is_some() {
+    schema_config_rows_with_scope(executor, layer, false).await
+}
+
+/// Writer-profile loader: exclude discovery-only anchored declarations BEFORE
+/// parsing JSON. Existing read/discovery loaders retain their original scope.
+pub(crate) async fn global_schema_config_rows_with<E: DomainStatementExecutor>(
+    executor: &mut E,
+) -> Result<Vec<SchemaConfigRow>> {
+    schema_config_rows_with_scope(executor, None, true).await
+}
+
+async fn schema_config_rows_with_scope<E: DomainStatementExecutor>(
+    executor: &mut E,
+    layer: Option<&str>,
+    global_only: bool,
+) -> Result<Vec<SchemaConfigRow>> {
+    let statement = if global_only {
+        StatementTemplate::new(StatementKind::Select, "schema_config", &[
+            "SELECT id, layer, name, data, applies_to_collection_id, version_lineage, created_at FROM {{relation}} WHERE applies_to_collection_id IS NULL ORDER BY CASE layer WHEN 'pack' THEN 0 ELSE 1 END, created_at, id",
+        ])
+    } else if layer.is_some() {
         StatementTemplate::new(
             StatementKind::Select,
             "schema_config",

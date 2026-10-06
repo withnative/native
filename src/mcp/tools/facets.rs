@@ -54,8 +54,26 @@ async fn visible_schema_rows(
     db: &Db,
     caller: &Caller,
 ) -> Result<Vec<crate::query::cascade::SchemaConfigRow>> {
+    // A member copy ships only schema rows for visible collections
+    // (caller-independent global rows plus E(m)-anchored rows), so the
+    // online per-bearer policy filter — which reads tables the copy does not
+    // carry — must not run. Reading the shipped rows is the slice's scoped
+    // schema set (contract c323277 rev 9 §2.3(a)).
+    if caller.is_member_copy() {
+        return cascade::schema_config_rows(db, None).await;
+    }
     let principal = (!super::is_legacy_local(caller)).then(|| super::principal(caller));
     cascade::schema_config_rows_for_principal(db, principal).await
+}
+
+/// Member slice presence: hidden, deleted and never-existed are one answer.
+async fn member_record_present(db: &Db, record_id: &str) -> Result<bool> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM records WHERE id = ? AND deleted_at IS NULL)",
+    )
+    .bind(record_id)
+    .fetch_one(db.write_pool())
+    .await?)
 }
 
 /// M4 slice 1: index-backed `resolve_facets` record response.
@@ -81,6 +99,12 @@ async fn indexed_record_response(
     caller: &Caller,
     record_id: &str,
 ) -> Result<Option<Value>> {
+    // The index fast path and its read-pool policy checks read tables the
+    // member copy does not carry; a member copy takes the governed path, whose
+    // member branches use slice presence and the shipped schema rows.
+    if caller.is_member_copy() {
+        return Ok(None);
+    }
     let Ok(Some(extract)) = db.indexed_facets_record(record_id).await else {
         return Ok(None);
     };
@@ -177,11 +201,12 @@ async fn indexed_record_response(
     }
     let mut values = Vec::with_capacity(values_src.len());
     for facet in values_src {
-        let object_typed = value_shapes
-            .get(&facet.key)
-            .and_then(|shape| shape.get("type"))
-            .and_then(Value::as_str)
-            == Some("object");
+        let object_typed = crate::domain_transaction::declared_type_is_json_object(
+            value_shapes
+                .get(&facet.key)
+                .and_then(|shape| shape.get("type"))
+                .and_then(Value::as_str),
+        );
         let value = facet.value.clone().map(|stored| {
             if object_typed {
                 serde_json::from_str::<Value>(&stored)
@@ -285,7 +310,12 @@ async fn governed_record_response(
     rows: &[crate::query::cascade::SchemaConfigRow],
     record_id: &str,
 ) -> Result<Value> {
-    if !can_record(db, caller, record_id, Capability::View).await? {
+    let visible = if caller.is_member_copy() {
+        member_record_present(db, record_id).await?
+    } else {
+        can_record(db, caller, record_id, Capability::View).await?
+    };
+    if !visible {
         return Err(Error::engine(format!("record {record_id} does not exist")));
     }
     let Some(record) = read::get_record(db, record_id).await? else {
@@ -299,10 +329,15 @@ async fn governed_record_response(
     let record_type = record.record.record_type.clone();
     let kind = record.record.kind.clone();
     let owner = match record.record.owner_id.as_deref() {
-        Some(owner) if can_record(db, caller, owner, Capability::View).await? => {
-            Some(owner.to_string())
+        Some(owner) => {
+            let visible = if caller.is_member_copy() {
+                member_record_present(db, owner).await?
+            } else {
+                can_record(db, caller, owner, Capability::View).await?
+            };
+            visible.then(|| owner.to_string())
         }
-        _ => None,
+        None => None,
     };
     let response = json!({
         "record_id": record_id,
@@ -329,6 +364,12 @@ async fn resolve_facets(db: Db, caller: Caller, arguments: Value) -> Result<Valu
     let args: ResolveFacetsArgs = parse_args("resolve_facets", arguments)?;
     match (args.record_id, args.record_type) {
         (Some(record_id), None) => {
+            if crate::mcp::member_serving::member_schema_incomplete_applies(&caller, &record_id) {
+                return Err(Error::unavailable_offline(
+                    "resolve_facets",
+                    "schema_incomplete",
+                ));
+            }
             // M4 fast path first: read-pool only, byte-identical on hit.
             // Any miss falls through to the governed path below, unchanged.
             if let Some(fast) = indexed_record_response(&db, &caller, &record_id).await? {
@@ -371,14 +412,28 @@ async fn suggest_facet_values(db: Db, caller: Caller, arguments: Value) -> Resul
     let args: SuggestFacetValuesArgs = parse_args("suggest_facet_values", arguments)?;
     let (record_type, kind, bearer_id) = match (args.record_id, args.record_type) {
         (Some(record_id), None) => {
-            require_record(
-                &db,
-                &caller,
-                "suggest_facet_values",
-                &record_id,
-                Capability::View,
-            )
-            .await?;
+            if crate::mcp::member_serving::member_schema_incomplete_applies(&caller, &record_id) {
+                return Err(Error::unavailable_offline(
+                    "suggest_facet_values",
+                    "schema_incomplete",
+                ));
+            }
+            if caller.is_member_copy() {
+                if !member_record_present(&db, &record_id).await? {
+                    return Err(Error::engine(format!(
+                        "suggest_facet_values: record {record_id} does not exist"
+                    )));
+                }
+            } else {
+                require_record(
+                    &db,
+                    &caller,
+                    "suggest_facet_values",
+                    &record_id,
+                    Capability::View,
+                )
+                .await?;
+            }
             let Some(record) = read::get_record(&db, &record_id).await? else {
                 return Err(Error::engine(format!("record {record_id} does not exist")));
             };

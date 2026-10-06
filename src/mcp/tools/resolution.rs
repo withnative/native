@@ -232,6 +232,12 @@ async fn resolve_many_in(
 
     let mut visible_by_name: BTreeMap<String, Vec<IdentityMatch>> = BTreeMap::new();
     let mut authorization_memo = BearerTargetMemo::default();
+    // Contract c323277 rev 8 §2.3(a): on a member copy every shipped row is
+    // E(m) by producer attestation (§3.4), so slice presence replaces the
+    // authorization fold. The eligibility check below still runs on the
+    // slice (shipped tables only); hidden names simply miss and become
+    // `not_found`, indistinguishable from deleted or never-existed (R1).
+    let member = caller.is_member_copy();
     for row in rows {
         let id: String = row.try_get("id")?;
         // This is the same ordinary-record admission seam used by get_record:
@@ -240,7 +246,9 @@ async fn resolve_many_in(
         if !crate::query::read::ordinary_record_read_eligible_live_in(snapshot, &id).await? {
             continue;
         }
-        let visible = {
+        let visible = if member {
+            true
+        } else {
             let mut executor = BorrowedSqliteStatementExecutor::new(snapshot);
             crate::authorization::allows_record_memoized(
                 &mut executor,

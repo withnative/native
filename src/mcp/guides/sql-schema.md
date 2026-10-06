@@ -6,9 +6,9 @@ This is native-ce's exact ordered SQLite DDL contract for a fresh database. It i
 
 ## Contract identity
 
-- Engine schema version: `65`
-- Ordered DDL statements: `321`
-- Frozen DDL SHA-256: `3284d80259000f4c8ab4c88ad7ec06175561b6d526462aaf893235a8f3201111`
+- Engine schema version: `82`
+- Ordered DDL statements: `358`
+- Frozen DDL SHA-256: `0209d608f9d5b9bd88bde3b8da411057cfc7396149ba5f4918b0921207a10a9c`
 
 The fingerprint is SHA-256 over the canonical statement sequence joined by `\n;\n`. Generation fails before writing if the compiled sequence and frozen pin disagree.
 
@@ -36,11 +36,107 @@ CREATE INDEX idx_content_events_run ON content_events(run_key, seq)
 ;
 CREATE INDEX idx_content_events_act ON content_events(act) WHERE act IS NOT NULL
 ;
+CREATE INDEX idx_content_events_record_changes ON content_events(record_id, seq) WHERE type NOT IN ('occurrence.bound.v1','receipt.dependency_audited.v1','reconciliation.recorded.v1','unit.superseded.v1')
+;
 CREATE TRIGGER content_events_no_update BEFORE UPDATE ON content_events
        BEGIN SELECT RAISE(ABORT, 'content_events is append-only'); END
 ;
 CREATE TRIGGER content_events_no_delete BEFORE DELETE ON content_events
        BEGIN SELECT RAISE(ABORT, 'content_events is append-only'); END
+;
+CREATE TABLE content_event_claim_meta (
+     event_seq          INTEGER PRIMARY KEY REFERENCES content_events(seq) ON DELETE CASCADE,
+     has_claimed_by     INTEGER NOT NULL CHECK (has_claimed_by IN (0,1)),
+     has_claimed_run    INTEGER NOT NULL CHECK (has_claimed_run IN (0,1)),
+     has_released_from  INTEGER NOT NULL CHECK (has_released_from IN (0,1)),
+     claim_class        TEXT NOT NULL CHECK (claim_class IN ('claim','release','other'))
+    )
+;
+CREATE TRIGGER content_event_claim_meta_insert AFTER INSERT ON content_events
+     BEGIN
+      INSERT INTO content_event_claim_meta(event_seq, has_claimed_by, has_claimed_run, has_released_from, claim_class)
+      VALUES (
+       NEW.seq,
+       (NEW.payload -> 'claimed_by_account') IS NOT NULL,
+       (NEW.payload -> 'claimed_run_key') IS NOT NULL,
+       (NEW.payload -> 'released_from_run_key') IS NOT NULL,
+       CASE WHEN (NEW.payload -> 'claimed_by_account') LIKE '"%"'
+                 AND (NEW.payload -> 'claimed_run_key') LIKE '"%"' THEN 'claim'
+            WHEN (NEW.payload -> 'claimed_by_account') = 'null'
+                 AND (NEW.payload -> 'claimed_run_key') = 'null' THEN 'release'
+            ELSE 'other' END
+      );
+     END
+;
+CREATE TABLE content_event_reaction_meta (
+     event_seq       INTEGER PRIMARY KEY REFERENCES content_events(seq) ON DELETE CASCADE,
+     record_id       TEXT NOT NULL,
+     actor           TEXT NOT NULL,
+     legacy_emoji    TEXT,
+     emoji           TEXT NOT NULL,
+     executor_kind   TEXT NOT NULL,
+     reaction_class  TEXT NOT NULL CHECK (reaction_class IN ('added','removed')),
+     created_at      TEXT NOT NULL
+    )
+;
+CREATE INDEX idx_content_event_reaction_meta_record ON content_event_reaction_meta(record_id, event_seq)
+;
+CREATE TRIGGER content_event_reaction_meta_insert AFTER INSERT ON content_events
+     WHEN NEW.type IN ('message.reaction.added.v1','message.reaction.removed.v1')
+     BEGIN
+      SELECT CASE WHEN json_valid(NEW.payload) IS NOT 1
+       THEN RAISE(ABORT, 'invalid Message reaction JSON') END;
+      SELECT CASE WHEN (
+       (json_type(NEW.payload) = 'object' OR (json_type(NEW.payload) = 'array' AND json_array_length(NEW.payload) IN (9,10)))
+       AND json_type(NEW.payload,format_path) = 'text'
+       AND json_extract(NEW.payload,format_path) = 'native.message-reaction.v1'
+       AND json_type(NEW.payload,emoji_path) = 'text'
+       AND json_extract(NEW.payload,emoji_path) IN ('👍','❤️','😂','🎉','👀')
+       AND json_type(NEW.payload,idempotency_key_path) = 'text'
+       AND trim(json_extract(NEW.payload,idempotency_key_path),char(9,10,11,12,13,32,133,160,5760,8192,8193,8194,8195,8196,8197,8198,8199,8200,8201,8202,8232,8233,8239,8287,12288)) <> ''
+       AND json_type(NEW.payload,reason_path) = 'text'
+       AND trim(json_extract(NEW.payload,reason_path),char(9,10,11,12,13,32,133,160,5760,8192,8193,8194,8195,8196,8197,8198,8199,8200,8201,8202,8232,8233,8239,8287,12288)) <> ''
+       AND json_type(NEW.payload,command_path) = 'text'
+       AND json_extract(NEW.payload,command_path) IN ('add_reaction','remove_reaction','satisfy_acknowledgement_expectation_with_reaction')
+       AND json_type(NEW.payload,changed_path) IN ('true','false')
+       AND json_type(NEW.payload,actor_account_id_path) = 'text'
+       AND trim(json_extract(NEW.payload,actor_account_id_path),char(9,10,11,12,13,32,133,160,5760,8192,8193,8194,8195,8196,8197,8198,8199,8200,8201,8202,8232,8233,8239,8287,12288)) <> ''
+       AND json_extract(NEW.payload,actor_account_id_path) = NEW.actor
+       AND json_type(NEW.payload,executor_kind_path) = 'text'
+       AND json_extract(NEW.payload,executor_kind_path) IN ('human_attested','agent','delegated_service','local','authenticated_principal')
+       AND (json_type(NEW.payload) = 'array' OR NOT EXISTS (SELECT 1 FROM json_each(NEW.payload)
+         WHERE key NOT IN ('format','emoji','idempotency_key','command','changed','actor_account_id','executor_kind','executor_ref','reason','origin')))
+       AND (json_type(NEW.payload) = 'array' OR NOT EXISTS (SELECT 1 FROM json_each(NEW.payload) GROUP BY key HAVING count(*) > 1))
+      ) IS NOT 1 THEN RAISE(ABORT, 'invalid Message reaction payload') END
+      FROM (SELECT CASE WHEN json_type(NEW.payload) = 'array' THEN '$[0]' ELSE '$.format' END AS format_path,
+       CASE WHEN json_type(NEW.payload) = 'array' THEN '$[1]' ELSE '$.emoji' END AS emoji_path,
+       CASE WHEN json_type(NEW.payload) = 'array' THEN '$[2]' ELSE '$.idempotency_key' END AS idempotency_key_path,
+       CASE WHEN json_type(NEW.payload) = 'array' THEN '$[3]' ELSE '$.command' END AS command_path,
+       CASE WHEN json_type(NEW.payload) = 'array' THEN '$[4]' ELSE '$.changed' END AS changed_path,
+       CASE WHEN json_type(NEW.payload) = 'array' THEN '$[5]' ELSE '$.actor_account_id' END AS actor_account_id_path,
+       CASE WHEN json_type(NEW.payload) = 'array' THEN '$[6]' ELSE '$.executor_kind' END AS executor_kind_path,
+       CASE WHEN json_type(NEW.payload) = 'array' THEN '$[7]' ELSE '$.executor_ref' END AS executor_ref_path,
+       CASE WHEN json_type(NEW.payload) = 'array' THEN '$[8]' ELSE '$.reason' END AS reason_path);
+      SELECT CASE WHEN json_extract(NEW.payload,executor_kind_path) IN ('human_attested','agent','delegated_service')
+       AND (json_type(NEW.payload,executor_ref_path) = 'text'
+        AND trim(json_extract(NEW.payload,executor_ref_path),char(9,10,11,12,13,32,133,160,5760,8192,8193,8194,8195,8196,8197,8198,8199,8200,8201,8202,8232,8233,8239,8287,12288)) <> '') IS NOT 1
+       THEN RAISE(ABORT, 'attested Message reaction executors require a nonblank executor_ref')
+       WHEN json_extract(NEW.payload,executor_kind_path) IN ('local','authenticated_principal')
+        AND (json_type(NEW.payload,executor_ref_path) IS NULL OR json_type(NEW.payload,executor_ref_path) = 'null') IS NOT 1
+       THEN RAISE(ABORT, 'unattested Message reaction executors cannot carry executor_ref') END
+      FROM (SELECT CASE WHEN json_type(NEW.payload) = 'array' THEN '$[6]' ELSE '$.executor_kind' END AS executor_kind_path,
+       CASE WHEN json_type(NEW.payload) = 'array' THEN '$[7]' ELSE '$.executor_ref' END AS executor_ref_path);
+      SELECT CASE WHEN (json_extract(NEW.payload,command_path) <> 'satisfy_acknowledgement_expectation_with_reaction'
+       OR json_extract(NEW.payload,emoji_path) = '👍') IS NOT 1
+       THEN RAISE(ABORT, 'acknowledgement reactions must use 👍') END
+      FROM (SELECT CASE WHEN json_type(NEW.payload) = 'array' THEN '$[3]' ELSE '$.command' END AS command_path,
+       CASE WHEN json_type(NEW.payload) = 'array' THEN '$[1]' ELSE '$.emoji' END AS emoji_path);
+      INSERT INTO content_event_reaction_meta(event_seq,record_id,actor,legacy_emoji,emoji,executor_kind,reaction_class,created_at)
+      VALUES (NEW.seq,NEW.record_id,NEW.actor,json_extract(NEW.payload,'$.emoji'),
+       json_extract(NEW.payload,CASE WHEN json_type(NEW.payload)='array' THEN '$[1]' ELSE '$.emoji' END),
+       json_extract(NEW.payload,CASE WHEN json_type(NEW.payload)='array' THEN '$[6]' ELSE '$.executor_kind' END),
+       CASE NEW.type WHEN 'message.reaction.added.v1' THEN 'added' ELSE 'removed' END,NEW.created_at);
+     END
 ;
 CREATE TABLE content_event_causal_frontier (
      event_id        TEXT NOT NULL REFERENCES content_events(id) ON DELETE CASCADE,
@@ -197,6 +293,18 @@ CREATE TABLE records (
      created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
      updated_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
      deleted_at    TEXT,
+     archived      INTEGER NOT NULL DEFAULT 0 CHECK (archived IN (0,1)),
+      -- E3 M1 currency counts (v73): caller-independent currency. is_current
+      -- is tri-state: 1 iff zero live incoming `supersedes`, NULL when >=1
+      -- live incoming leaves whole/partial scope unknown. 0 is reserved for
+      -- a future explicit whole-record assertion and is never written here
+      -- (the CHECK admits it so that assertion needs no migration).
+      -- DEFAULT 1 because a created record has no incoming links yet;
+      -- creation omits both columns so defaults apply. successor_count is
+      -- the live incoming `supersedes` count (deleted source excluded); it
+      -- may include an invisible successor but never stores/displays names.
+      is_current      INTEGER NULL DEFAULT 1 CHECK (is_current IS NULL OR is_current IN (0,1)),
+      successor_count INTEGER NOT NULL DEFAULT 0 CHECK (successor_count >= 0),
 
      CHECK (type IN ('Document','Program','WorkItem','Outcome','Entity','Collection','Resolution','Conversation','Message','Annotation')),
      CHECK ((claimed_by_account IS NULL AND claimed_run_key IS NULL AND claimed_at IS NULL)
@@ -521,6 +629,35 @@ CREATE INDEX idx_record_mentions_lookup
 CREATE INDEX idx_record_mentions_source
         ON record_mentions(source_id)
 ;
+CREATE TABLE body_task_items (
+      record_id          TEXT NOT NULL REFERENCES records(id) ON DELETE CASCADE,
+      item_index         INTEGER NOT NULL,
+      source_event_seq   INTEGER NOT NULL REFERENCES content_events(seq),
+      marker             TEXT NOT NULL CHECK (marker IN ('-', '*', '+', 'ordered')),
+      checked            INTEGER NOT NULL CHECK (checked IN (0,1)),
+      in_quote           INTEGER NOT NULL CHECK (in_quote IN (0,1)),
+      start_offset       INTEGER NOT NULL CHECK (start_offset >= 0),
+      end_offset         INTEGER NOT NULL CHECK (end_offset >= 0),
+      PRIMARY KEY (record_id, item_index)
+    )
+;
+CREATE INDEX idx_body_task_items_record
+        ON body_task_items(record_id)
+;
+CREATE TABLE body_blocks (
+      record_id          TEXT NOT NULL REFERENCES records(id) ON DELETE CASCADE,
+      block_index        INTEGER NOT NULL CHECK (block_index >= 0),
+      chunk_index        INTEGER NOT NULL CHECK (chunk_index >= 0),
+      chunk_count        INTEGER NOT NULL CHECK (chunk_count > 0 AND chunk_index < chunk_count),
+      source_event_seq   INTEGER NOT NULL REFERENCES content_events(seq),
+      heading_path       TEXT NOT NULL CHECK (json_valid(heading_path) AND json_type(heading_path) = 'array'),
+      block_kind         TEXT NOT NULL CHECK (block_kind IN ('heading','paragraph','code','blockquote','list','table','html','thematic_break','definition','footnote_definition','other','interstitial','opaque')),
+      text               TEXT NOT NULL CHECK (length(CAST(text AS BLOB)) BETWEEN 1 AND 32768),
+      start_offset       INTEGER NOT NULL CHECK (start_offset >= 0),
+      end_offset         INTEGER NOT NULL CHECK (end_offset > start_offset),
+      PRIMARY KEY (record_id, block_index, chunk_index)
+    )
+;
 CREATE TABLE notification_candidate_events (
      seq                INTEGER PRIMARY KEY AUTOINCREMENT,
      id                 TEXT NOT NULL UNIQUE,
@@ -701,6 +838,28 @@ CREATE TABLE facet_observations (
 CREATE INDEX idx_facet_observations_series ON facet_observations(record_id, key, as_of)
 ;
 CREATE INDEX idx_facet_observations_key ON facet_observations(key, as_of)
+;
+CREATE TABLE facet_times (
+     record_id    TEXT NOT NULL REFERENCES records(id) ON DELETE CASCADE,
+     key          TEXT NOT NULL,
+     kind         TEXT NOT NULL CHECK (kind IN ('date','instant','zoned','when')),
+     all_day      INTEGER NOT NULL CHECK (all_day IN (0,1)),
+     start_date   TEXT,
+     end_date     TEXT,
+     start_ms     INTEGER,
+     end_ms       INTEGER,
+     tz           TEXT,
+     tzdb_version TEXT,
+     PRIMARY KEY (record_id, key),
+     CHECK ((all_day = 1 AND start_date IS NOT NULL AND end_date > start_date
+             AND start_ms IS NULL AND end_ms IS NULL)
+         OR (all_day = 0 AND start_ms IS NOT NULL AND end_ms >= start_ms
+             AND start_date IS NULL AND end_date IS NULL))
+    )
+;
+CREATE INDEX idx_facet_times_timed ON facet_times(start_ms, end_ms) WHERE all_day = 0
+;
+CREATE INDEX idx_facet_times_all_day ON facet_times(start_date, end_date) WHERE all_day = 1
 ;
 CREATE TABLE bindings (
      record_id     TEXT NOT NULL REFERENCES records(id) ON DELETE CASCADE,
@@ -960,6 +1119,22 @@ CREATE TABLE vocabulary_values (
      UNIQUE (vocabulary_id, value)
    )
 ;
+CREATE TABLE vocabulary_value_json_nodes (
+     value_id       TEXT NOT NULL REFERENCES vocabulary_values(id) ON DELETE CASCADE,
+     ordinal        INTEGER NOT NULL CHECK (ordinal >= 0),
+     path           TEXT NOT NULL,
+     parent_path    TEXT,
+     parent_ordinal INTEGER CHECK (parent_ordinal >= 0),
+     member_key     TEXT,
+     array_index    INTEGER CHECK (array_index >= 0),
+     depth          INTEGER NOT NULL CHECK (depth >= 0),
+     node_type      TEXT NOT NULL CHECK (node_type IN ('object','array','string','number','boolean','null')),
+     text_value     TEXT,
+     number_text    TEXT,
+     bool_value     INTEGER CHECK (bool_value IN (0,1)),
+     PRIMARY KEY (value_id, ordinal)
+   )
+;
 CREATE TABLE schema_config (
      id                       TEXT PRIMARY KEY,
      layer                    TEXT NOT NULL CHECK (layer IN ('pack','user')),
@@ -968,6 +1143,38 @@ CREATE TABLE schema_config (
      applies_to_collection_id TEXT REFERENCES records(id) ON DELETE CASCADE,
      version_lineage          TEXT,
      created_at               TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+   )
+;
+CREATE TABLE schema_config_json_nodes (
+     config_id      TEXT NOT NULL REFERENCES schema_config(id) ON DELETE CASCADE,
+     ordinal        INTEGER NOT NULL CHECK (ordinal >= 0),
+     path           TEXT NOT NULL,
+     parent_path    TEXT,
+     parent_ordinal INTEGER CHECK (parent_ordinal >= 0),
+     member_key     TEXT,
+     array_index    INTEGER CHECK (array_index >= 0),
+     depth          INTEGER NOT NULL CHECK (depth >= 0),
+     node_type      TEXT NOT NULL CHECK (node_type IN ('object','array','string','number','boolean','null')),
+     text_value     TEXT,
+     number_text    TEXT,
+     bool_value     INTEGER CHECK (bool_value IN (0,1)),
+     PRIMARY KEY (config_id, ordinal)
+   )
+;
+CREATE TABLE facet_value_json_nodes (
+     facet_id       TEXT NOT NULL REFERENCES facet_values(id) ON DELETE CASCADE,
+     ordinal        INTEGER NOT NULL CHECK (ordinal >= 0),
+     path           TEXT NOT NULL,
+     parent_path    TEXT,
+     parent_ordinal INTEGER CHECK (parent_ordinal >= 0),
+     member_key     TEXT,
+     array_index    INTEGER CHECK (array_index >= 0),
+     depth          INTEGER NOT NULL CHECK (depth >= 0),
+     node_type      TEXT NOT NULL CHECK (node_type IN ('object','array','string','number','boolean','null')),
+     text_value     TEXT,
+     number_text    TEXT,
+     bool_value     INTEGER CHECK (bool_value IN (0,1)),
+     PRIMARY KEY (facet_id, ordinal)
    )
 ;
 CREATE TABLE jobs (
@@ -1252,15 +1459,26 @@ CREATE TABLE alpha_tab_installs (
      consented_source_revision TEXT NOT NULL CHECK (length(trim(consented_source_revision)) > 0),
      declaration_digest        TEXT NOT NULL CHECK (length(declaration_digest) = 64),
      consented_declaration     TEXT NOT NULL CHECK (json_valid(consented_declaration) AND json_type(consented_declaration) = 'object'),
-     adoption                  TEXT NOT NULL CHECK (adoption IN ('caller_asserted','shell_adopt.v1')),
+     adoption                  TEXT NOT NULL CHECK (adoption IN ('caller_asserted','shell_adopt.v1','shell_auto.v1')),
+     request                   TEXT CHECK (request IS NULL OR (length(trim(request)) > 0 AND length(request) <= 500)),
      status                    TEXT NOT NULL CHECK (status IN ('installed','disabled','removed')),
      event_id                  TEXT NOT NULL UNIQUE REFERENCES control_events(id),
      event_seq                 INTEGER NOT NULL UNIQUE REFERENCES control_events(seq),
      updated_at                TEXT NOT NULL,
+     adoption_provenance       TEXT CHECK (adoption_provenance IS NULL OR (json_valid(adoption_provenance) AND json_type(adoption_provenance) = 'object')),
+     body_read_admission_event_id TEXT REFERENCES control_events(id),
      PRIMARY KEY (account_id, package)
     )
 ;
 CREATE INDEX idx_alpha_tab_installs_artifact ON alpha_tab_installs(artifact_id)
+;
+CREATE TABLE alpha_tab_orders (
+     account_id TEXT NOT NULL PRIMARY KEY CHECK (length(trim(account_id)) > 0),
+     tab_order  TEXT NOT NULL CHECK (json_valid(tab_order) AND json_type(tab_order) = 'array'),
+     event_id   TEXT NOT NULL UNIQUE REFERENCES control_events(id),
+     event_seq  INTEGER NOT NULL UNIQUE REFERENCES control_events(seq),
+     updated_at TEXT NOT NULL
+    )
 ;
 CREATE TABLE derivation_events (
      seq             INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2443,5 +2661,116 @@ CREATE TRIGGER engine_migration_drills_no_update BEFORE UPDATE ON engine_migrati
 CREATE TRIGGER engine_migration_drills_no_delete BEFORE DELETE ON engine_migration_drills
        BEGIN SELECT RAISE(ABORT, 'engine_migration_drills is append-only'); END
 ;
-PRAGMA user_version = 65;
+CREATE TABLE IF NOT EXISTS authorization_grant_revision (
+     id     INTEGER PRIMARY KEY CHECK (id = 1),
+     epoch  INTEGER NOT NULL
+   )
+;
+INSERT OR IGNORE INTO authorization_grant_revision (id, epoch) VALUES (1, 0)
+;
+CREATE TRIGGER IF NOT EXISTS authorization_grant_record_policies_insert AFTER INSERT ON record_policies
+       BEGIN UPDATE authorization_grant_revision SET epoch = epoch + 1 WHERE id = 1; END
+;
+CREATE TRIGGER IF NOT EXISTS authorization_grant_record_policies_delete AFTER DELETE ON record_policies
+       WHEN EXISTS (SELECT 1 FROM records WHERE id = OLD.record_id)
+       BEGIN UPDATE authorization_grant_revision SET epoch = epoch + 1 WHERE id = 1; END
+;
+CREATE TRIGGER IF NOT EXISTS authorization_grant_record_policies_update AFTER UPDATE ON record_policies
+       WHEN OLD.record_id IS NOT NEW.record_id
+       BEGIN UPDATE authorization_grant_revision SET epoch = epoch + 1 WHERE id = 1; END
+;
+CREATE TRIGGER IF NOT EXISTS authorization_grant_policy_entries_insert AFTER INSERT ON policy_entries
+       BEGIN UPDATE authorization_grant_revision SET epoch = epoch + 1 WHERE id = 1; END
+;
+CREATE TRIGGER IF NOT EXISTS authorization_grant_policy_entries_delete AFTER DELETE ON policy_entries
+       WHEN EXISTS (SELECT 1 FROM records WHERE id = OLD.policy_anchor_id)
+       BEGIN UPDATE authorization_grant_revision SET epoch = epoch + 1 WHERE id = 1; END
+;
+CREATE TRIGGER IF NOT EXISTS authorization_grant_policy_entries_update AFTER UPDATE ON policy_entries
+       WHEN OLD.policy_anchor_id IS NOT NEW.policy_anchor_id
+         OR OLD.subject_kind IS NOT NEW.subject_kind
+         OR OLD.subject_id IS NOT NEW.subject_id
+         OR OLD.effect IS NOT NEW.effect
+         OR OLD.capability IS NOT NEW.capability
+       BEGIN UPDATE authorization_grant_revision SET epoch = epoch + 1 WHERE id = 1; END
+;
+CREATE TRIGGER IF NOT EXISTS authorization_grant_bindings_insert AFTER INSERT ON bindings
+       WHEN NEW.system = 'account'
+       BEGIN UPDATE authorization_grant_revision SET epoch = epoch + 1 WHERE id = 1; END
+;
+CREATE TRIGGER IF NOT EXISTS authorization_grant_bindings_delete AFTER DELETE ON bindings
+       WHEN OLD.system = 'account'
+       BEGIN UPDATE authorization_grant_revision SET epoch = epoch + 1 WHERE id = 1; END
+;
+CREATE TRIGGER IF NOT EXISTS authorization_grant_bindings_update AFTER UPDATE ON bindings
+       WHEN (OLD.system = 'account' OR NEW.system = 'account')
+        AND (OLD.record_id IS NOT NEW.record_id
+          OR OLD.system IS NOT NEW.system
+          OR OLD.identifier IS NOT NEW.identifier
+          OR OLD.is_canonical IS NOT NEW.is_canonical)
+       BEGIN UPDATE authorization_grant_revision SET epoch = epoch + 1 WHERE id = 1; END
+;
+CREATE TRIGGER IF NOT EXISTS authorization_grant_records_update
+       AFTER UPDATE OF owner_id, policy_anchor_id, deleted_at, type, kind ON records
+       WHEN OLD.owner_id IS NOT NEW.owner_id
+         OR OLD.policy_anchor_id IS NOT NEW.policy_anchor_id
+         OR OLD.type IS NOT NEW.type
+         OR OLD.kind IS NOT NEW.kind
+         OR (OLD.deleted_at IS NOT NEW.deleted_at
+           AND (EXISTS (SELECT 1 FROM links JOIN records src ON src.id = links.source_id WHERE links.target_id = OLD.id AND links.relationship = 'part_of' AND src.deleted_at IS NULL AND (src.type = 'Annotation' OR (src.type = 'Document' AND src.kind = 'attachment')))
+             OR EXISTS (SELECT 1 FROM semantic_units JOIN records u ON u.id = semantic_units.unit_id WHERE semantic_units.authority_bearer_record_id = OLD.id AND u.deleted_at IS NULL)))
+       BEGIN UPDATE authorization_grant_revision SET epoch = epoch + 1 WHERE id = 1; END
+;
+CREATE TRIGGER IF NOT EXISTS authorization_grant_records_delete BEFORE DELETE ON records
+       WHEN EXISTS (SELECT 1 FROM links JOIN records src ON src.id = links.source_id WHERE links.target_id = OLD.id AND links.relationship = 'part_of' AND src.deleted_at IS NULL AND (src.type = 'Annotation' OR (src.type = 'Document' AND src.kind = 'attachment')))
+         OR EXISTS (SELECT 1 FROM semantic_units JOIN records u ON u.id = semantic_units.unit_id WHERE semantic_units.authority_bearer_record_id = OLD.id AND u.deleted_at IS NULL)
+       BEGIN UPDATE authorization_grant_revision SET epoch = epoch + 1 WHERE id = 1; END
+;
+CREATE TRIGGER IF NOT EXISTS authorization_grant_links_insert AFTER INSERT ON links
+       WHEN NEW.relationship = 'part_of'
+        AND EXISTS (SELECT 1 FROM records WHERE id = NEW.source_id AND deleted_at IS NULL AND (type = 'Annotation' OR (type = 'Document' AND kind = 'attachment')))
+        AND (SELECT COUNT(*) FROM links WHERE source_id = NEW.source_id AND relationship = 'part_of') > 1
+       BEGIN UPDATE authorization_grant_revision SET epoch = epoch + 1 WHERE id = 1; END
+;
+CREATE TRIGGER IF NOT EXISTS authorization_grant_links_delete AFTER DELETE ON links
+       WHEN OLD.relationship = 'part_of'
+        AND EXISTS (SELECT 1 FROM records WHERE id = OLD.source_id AND deleted_at IS NULL AND (type = 'Annotation' OR (type = 'Document' AND kind = 'attachment')))
+        AND (SELECT COUNT(*) FROM links WHERE source_id = OLD.source_id AND relationship = 'part_of') = 0
+       BEGIN UPDATE authorization_grant_revision SET epoch = epoch + 1 WHERE id = 1; END
+;
+CREATE TRIGGER IF NOT EXISTS authorization_grant_links_update AFTER UPDATE ON links
+       WHEN (OLD.relationship = 'part_of' OR NEW.relationship = 'part_of')
+        AND (OLD.source_id IS NOT NEW.source_id
+          OR OLD.target_id IS NOT NEW.target_id
+          OR OLD.relationship IS NOT NEW.relationship)
+        AND (EXISTS (SELECT 1 FROM records WHERE id = OLD.source_id AND deleted_at IS NULL AND (type = 'Annotation' OR (type = 'Document' AND kind = 'attachment')))
+          OR EXISTS (SELECT 1 FROM records WHERE id = NEW.source_id AND deleted_at IS NULL AND (type = 'Annotation' OR (type = 'Document' AND kind = 'attachment'))))
+       BEGIN UPDATE authorization_grant_revision SET epoch = epoch + 1 WHERE id = 1; END
+;
+CREATE TRIGGER IF NOT EXISTS authorization_grant_semantic_units_write AFTER INSERT ON semantic_units
+       BEGIN UPDATE authorization_grant_revision SET epoch = epoch + 1 WHERE id = 1; END
+;
+CREATE TRIGGER IF NOT EXISTS authorization_grant_semantic_units_delete AFTER DELETE ON semantic_units
+       BEGIN UPDATE authorization_grant_revision SET epoch = epoch + 1 WHERE id = 1; END
+;
+CREATE TRIGGER IF NOT EXISTS authorization_grant_semantic_units_update AFTER UPDATE OF authority_bearer_record_id ON semantic_units
+       WHEN OLD.authority_bearer_record_id IS NOT NEW.authority_bearer_record_id
+       BEGIN UPDATE authorization_grant_revision SET epoch = epoch + 1 WHERE id = 1; END
+;
+CREATE TABLE workspace_rule_installations (
+     root             TEXT NOT NULL CHECK (root = 'native:root'),
+     namespace        TEXT NOT NULL,
+     name             TEXT NOT NULL,
+     snapshot_json    TEXT NOT NULL CHECK (json_valid(snapshot_json)),
+     snapshot_digest  TEXT NOT NULL CHECK (length(snapshot_digest) = 64),
+     event_seq        INTEGER NOT NULL CHECK (event_seq > 0),
+     actor            TEXT NOT NULL CHECK (length(actor) > 0),
+     created_at       TEXT NOT NULL,
+     PRIMARY KEY (root, namespace, name)
+   )
+;
+CREATE INDEX idx_workspace_rule_installations_root
+       ON workspace_rule_installations(root, namespace, name)
+;
+PRAGMA user_version = 82;
 ```

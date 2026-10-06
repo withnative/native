@@ -2407,13 +2407,53 @@ async fn query_sql_requires_value_for_every_parameter_tag() {
             json!({ "sql": "SELECT ?1", "parameters": [{ "type": tag }] }),
         )
         .await;
+        // Indexed repair (Native b0b7419): the missing field names its slot.
         assert!(
             err.starts_with(
-                "query_sql [invalid_arguments]: invalid arguments for query_sql: missing field `value`"
-            ),
+                "query_sql [invalid_arguments]: invalid arguments for query_sql: parameters[0]:"
+            ) && err.contains("missing field `value`"),
             "{tag}: {err}"
         );
     }
+}
+
+#[tokio::test]
+async fn query_sql_accepts_bare_scalar_positional_parameters() {
+    let db = db().await;
+    let registry = registry();
+    let out = call(
+        &registry,
+        &db,
+        "query_sql",
+        json!({
+            "sql": "SELECT ?1 AS text_value, ?2 AS integer_value, ?3 AS real_value, ?4 AS boolean_value, ?5 AS null_value",
+            "parameters": ["hello", 41, 1.5, true, null]
+        }),
+    )
+    .await;
+    assert_eq!(out["row_count"], 1);
+    assert_eq!(out["rows"][0]["text_value"], json!("hello"));
+    assert_eq!(out["rows"][0]["integer_value"], json!(41));
+    assert_eq!(out["rows"][0]["real_value"], json!(1.5));
+    // SQLite has no boolean storage: bound booleans present as 0/1, the same
+    // as the typed {"type": "boolean"} form.
+    assert_eq!(out["rows"][0]["boolean_value"], json!(1));
+    assert_eq!(out["rows"][0]["null_value"], Value::Null);
+}
+
+#[tokio::test]
+async fn query_sql_malformed_parameter_names_shape_and_index() {
+    let db = db().await;
+    let registry = registry();
+    let err = call_err(
+        &registry,
+        &db,
+        "query_sql",
+        json!({ "sql": "SELECT ?1, ?2", "parameters": ["ok", ["nested"]] }),
+    )
+    .await;
+    assert!(err.contains("parameters[1]"), "{err}");
+    assert!(err.contains("each parameter must be"), "{err}");
 }
 
 #[tokio::test]

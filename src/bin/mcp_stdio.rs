@@ -19,11 +19,14 @@ use std::sync::Arc;
 use native_ce::db::DatabaseOpenMode;
 use native_ce::export::{ExportCoordinator, LocalSnapshotSource};
 use native_ce::identity::resolve_stdio_account_identity;
+use native_ce::mcp::standby_stdio::{
+    resolve_standby_account_identity, StandbySessionConfig, StandbyStdioSession,
+};
 use native_ce::mcp::{
     register_allowlisted_experimental_tools, register_build_enabled_experimental_tools,
-    register_builtin_tools, register_snapshot_tool, register_standby_status_tool,
-    register_surface_tools, Caller, ExperimentalExecutors, ExposureProfile, McpSurfaceMode,
-    StatusOnlyStdioServer, StdioServer, ToolRegistry, EXPERIMENTAL_EXECUTORS_ENV,
+    register_builtin_tools, register_snapshot_tool, register_surface_tools, Caller,
+    ExperimentalExecutors, ExposureProfile, McpSurfaceMode, StatusOnlyStdioServer, StdioServer,
+    ToolRegistry, EXPERIMENTAL_EXECUTORS_ENV,
 };
 #[cfg(feature = "mcp-executor-prototype")]
 use native_ce::mcp::{ExecutorPrototypeStdioServer, ExecutorTelemetryContext};
@@ -36,7 +39,6 @@ use native_ce::standby::{
 };
 #[cfg(feature = "turso-local")]
 use native_ce::turso_local::{register_turso_local_tools, TursoLocalRuntimeConfig};
-use sqlx::Row;
 
 /// Machine-readable identity used by the release packager and installer. It
 /// deliberately comes from the compiled binary itself, rather than from a
@@ -66,9 +68,10 @@ fn print_standby_identity() -> ExitCode {
 }
 
 const USAGE: &str =
-    "usage: mcp-stdio [--account <token>] <path-to.db> | mcp-stdio --standby [--account <token>] <path-to-standby-config.json>   (or set exactly one applicable controller: NATIVE_CE_DB, NATIVE_CE_STANDBY_CONFIG, NATIVE_CE_STORAGE_TARGET_CONFIG, NATIVE_CE_POSTGRES_CONFIG, NATIVE_CE_TURSO_LOCAL_CONFIG; Postgres and Turso-local are trusted-local and reject NATIVE_CE_ACCOUNT)";
+    "usage: mcp-stdio [--account <token>] <path-to.db> | mcp-stdio --standby [--account <token>] <path-to-standby-config.json> | mcp-stdio --member-copy <path-to-member-copy-config.json>   (or set exactly one applicable controller: NATIVE_CE_DB, NATIVE_CE_STANDBY_CONFIG, NATIVE_CE_MEMBER_COPY_CONFIG, NATIVE_CE_STORAGE_TARGET_CONFIG, NATIVE_CE_POSTGRES_CONFIG, NATIVE_CE_TURSO_LOCAL_CONFIG; Postgres and Turso-local are trusted-local and reject NATIVE_CE_ACCOUNT; member-copy derives its account from the authenticated owner binding and rejects --account/NATIVE_CE_ACCOUNT)";
 const ENV_MCP_SURFACE: &str = "NATIVE_CE_MCP_SURFACE";
 const ENV_STANDBY_REFRESH_CONFIG: &str = "NATIVE_CE_STANDBY_REFRESH_CONFIG";
+const ENV_MEMBER_COPY_CONFIG: &str = "NATIVE_CE_MEMBER_COPY_CONFIG";
 
 struct BackgroundRefresh {
     shutdown: tokio::sync::watch::Sender<bool>,
@@ -134,6 +137,9 @@ struct Cli {
     path: String,
     account: Option<String>,
     open_mode: DatabaseOpenMode,
+    /// `Some(config path)` selects the member-copy controller. Exclusive with
+    /// every other storage controller; the account is never caller-supplied.
+    member_copy_config: Option<String>,
 }
 
 fn parse_cli(
@@ -142,16 +148,22 @@ fn parse_cli(
     standby_config_env: Option<String>,
     account_env: Option<String>,
     controlled_target: Option<String>,
+    member_copy_config_env: Option<String>,
 ) -> std::result::Result<Option<Cli>, String> {
     let mut args = args.into_iter();
     let mut path = None;
     let mut account = None;
     let mut standby = false;
+    let mut member_copy = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-h" | "--help" => return Ok(None),
             "--standby" if standby => return Err("--standby may only be supplied once".into()),
             "--standby" => standby = true,
+            "--member-copy" if member_copy => {
+                return Err("--member-copy may only be supplied once".into())
+            }
+            "--member-copy" => member_copy = true,
             "--account" => {
                 if account.is_some() {
                     return Err("--account may only be supplied once".into());
@@ -168,6 +180,41 @@ fn parse_cli(
     }
     let db_env = db_env.filter(|value| !value.is_empty());
     let standby_config_env = standby_config_env.filter(|value| !value.is_empty());
+    let member_copy_config_env = member_copy_config_env.filter(|value| !value.is_empty());
+    if standby && member_copy {
+        return Err("--standby and --member-copy are mutually exclusive".into());
+    }
+    if member_copy {
+        // A member copy is a controller, not a storage target: reject every
+        // other controller and any caller-supplied account.
+        if db_env.is_some() || controlled_target.is_some() {
+            return Err("member-copy startup accepts only a member-copy config, not NATIVE_CE_DB or NATIVE_CE_STORAGE_TARGET_CONFIG".into());
+        }
+        if standby_config_env.is_some() {
+            return Err("member-copy is exclusive with NATIVE_CE_STANDBY_CONFIG".into());
+        }
+        if path.is_some() && member_copy_config_env.is_some() {
+            return Err("member-copy config is selected twice; use either the positional path or NATIVE_CE_MEMBER_COPY_CONFIG".into());
+        }
+        if account.is_some()
+            || account_env
+                .as_deref()
+                .is_some_and(|value| !value.is_empty())
+        {
+            return Err("member-copy derives its account from the authenticated owner binding and rejects --account/NATIVE_CE_ACCOUNT".into());
+        }
+        let config = path
+            .or(member_copy_config_env)
+            .ok_or_else(|| "member-copy config path is required".to_string())?;
+        return Ok(Some(Cli {
+            path: config.clone(),
+            account: None,
+            open_mode: DatabaseOpenMode::ReadWrite,
+            member_copy_config: Some(config),
+        }));
+    } else if member_copy_config_env.is_some() {
+        return Err("NATIVE_CE_MEMBER_COPY_CONFIG requires --member-copy".into());
+    }
     if standby {
         if db_env.is_some() || controlled_target.is_some() {
             return Err("standby startup accepts only a standby runtime config, not NATIVE_CE_DB or NATIVE_CE_STORAGE_TARGET_CONFIG".into());
@@ -204,85 +251,42 @@ fn parse_cli(
         } else {
             DatabaseOpenMode::ReadWrite
         },
+        member_copy_config: None,
     }))
+}
+
+/// Pure controller-exclusivity predicate for member-copy: is the member-copy
+/// controller selected together with any other storage controller? Shared by
+/// `main` and directly by tests, so the flag+env combinations are proven
+/// without a subprocess or process-env races.
+fn member_copy_controller_conflict(
+    member_copy_requested: bool,
+    db_env: Option<&str>,
+    standby_config_env: Option<&str>,
+    controlled_target: Option<&str>,
+    postgres_config: Option<&str>,
+    turso_config: Option<&str>,
+) -> bool {
+    let non_empty = |value: Option<&str>| value.is_some_and(|value| !value.trim().is_empty());
+    member_copy_requested
+        && (non_empty(db_env)
+            || non_empty(standby_config_env)
+            || non_empty(controlled_target)
+            || non_empty(postgres_config)
+            || non_empty(turso_config))
 }
 
 fn sqlite_surface(configured: McpSurfaceMode, open_mode: DatabaseOpenMode) -> McpSurfaceMode {
     match open_mode {
         DatabaseOpenMode::ReadWrite => configured,
-        // The executor constructor opens its plan-store sidecar and telemetry
-        // machinery. Standby startup must not construct either.
-        DatabaseOpenMode::StandbyReadOnly => McpSurfaceMode::Legacy,
-    }
-}
-
-async fn resolve_standby_account_identity(
-    db: &native_ce::Db,
-    selected_account: Option<&str>,
-) -> native_ce::Result<String> {
-    let rows = sqlx::query(
-        "SELECT bindings.record_id, bindings.identifier,
-                records.type, records.kind, records.deleted_at
-         FROM bindings
-         LEFT JOIN records ON records.id = bindings.record_id
-         WHERE bindings.system = 'account' AND bindings.is_canonical = 1
-         ORDER BY bindings.identifier",
-    )
-    .fetch_all(db.pool())
-    .await?;
-
-    let mut accounts = Vec::with_capacity(rows.len());
-    let mut record_ids = std::collections::HashSet::with_capacity(rows.len());
-    for row in rows {
-        let record_id = row.try_get::<String, _>("record_id")?;
-        let account = row.try_get::<String, _>("identifier")?;
-        let record_type = row.try_get::<Option<String>, _>("type")?;
-        let kind = row.try_get::<Option<String>, _>("kind")?;
-        let deleted_at = row.try_get::<Option<String>, _>("deleted_at")?;
-        let token_is_valid = account.len() == 37
-            && account.starts_with("acct_")
-            && account[5..]
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
-        if !token_is_valid
-            || record_type.as_deref() != Some("Entity")
-            || kind.as_deref() != Some("person")
-            || deleted_at.is_some()
-            || !record_ids.insert(record_id)
-        {
-            return Err(native_ce::Error::engine(
-                "standby account bindings do not form a valid canonical identity set",
-            ));
-        }
-        accounts.push(account);
-    }
-
-    match selected_account {
-        Some(selected) if accounts.iter().any(|account| account == selected) => {
-            Ok(selected.to_string())
-        }
-        Some(selected) => {
-            let detail = if selected.len() == 37
-                && selected.starts_with("acct_")
-                && selected[5..]
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-            {
-                "selected account is not available"
-            } else {
-                "selected account token is malformed"
-            };
-            Err(native_ce::Error::engine(format!(
-                "standby account selection failed: {detail}"
-            )))
-        }
-        None if accounts.len() == 1 => Ok(accounts.remove(0)),
-        None if accounts.is_empty() => Err(native_ce::Error::engine(
-            "standby account selection failed: no canonical account is present",
-        )),
-        None => Err(native_ce::Error::engine(
-            "standby account selection failed: multiple accounts are present; pass --account <token> or set NATIVE_CE_ACCOUNT",
-        )),
+        // Standby keeps the configured surface. An Executor surface over a
+        // verified standby engine selects `new_standby_read_only`, which
+        // constructs no plan store or telemetry; an explicit Legacy surface
+        // serves the native surface unchanged.
+        DatabaseOpenMode::StandbyReadOnly => configured,
+        // A member copy is a read-only local surface; keep the configured
+        // surface as standby does.
+        DatabaseOpenMode::MemberReadOnly => configured,
     }
 }
 
@@ -358,7 +362,7 @@ async fn main() -> ExitCode {
         }
     };
     #[cfg(not(feature = "mcp-executor-prototype"))]
-    if surface == McpSurfaceMode::Executor && !standby_requested {
+    if surface == McpSurfaceMode::Executor {
         eprintln!(
             "mcp-stdio: executor MCP surface is not included in this build; controlled rollback requires {ENV_MCP_SURFACE}=legacy and a restart"
         );
@@ -396,6 +400,26 @@ async fn main() -> ExitCode {
     let turso_config = std::env::var("NATIVE_CE_TURSO_LOCAL_CONFIG")
         .ok()
         .filter(|value| !value.trim().is_empty());
+    let member_copy_config = std::env::var(ENV_MEMBER_COPY_CONFIG)
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    // The flag as well as the env selects the controller, so exclusivity must
+    // see both (the parser alone never sees the Postgres/Turso env).
+    let member_copy_requested =
+        member_copy_config.is_some() || args.iter().any(|argument| argument == "--member-copy");
+    if member_copy_controller_conflict(
+        member_copy_requested,
+        db_env.as_deref(),
+        standby_config_env.as_deref(),
+        controlled_target_config.as_deref(),
+        postgres_config.as_deref(),
+        turso_config.as_deref(),
+    ) {
+        eprintln!(
+            "mcp-stdio: --member-copy/NATIVE_CE_MEMBER_COPY_CONFIG is the sole storage controller\n{USAGE}"
+        );
+        return ExitCode::from(2);
+    }
     if standby_refresh_config.is_some() && !standby_requested {
         eprintln!("mcp-stdio: {ENV_STANDBY_REFRESH_CONFIG} requires --standby\n{USAGE}");
         return ExitCode::from(2);
@@ -491,6 +515,7 @@ async fn main() -> ExitCode {
         standby_config_env,
         account_env,
         controlled_target,
+        member_copy_config,
     ) {
         Ok(Some(cli)) => cli,
         Ok(None) => {
@@ -503,119 +528,27 @@ async fn main() -> ExitCode {
         }
     };
     let Cli {
-        mut path,
+        path,
         account: selected_account,
         open_mode,
+        member_copy_config,
     } = cli;
-    let mut activated_generation = None;
-    let mut background_refresh = None;
-    let mut standby_status_provider = None;
+    // Member-copy is a controller: route before any SQLite/standby/executor
+    // path. The selected MCP surface profile is propagated into the runtime so
+    // its no-held surface and every newly gated registry share it.
+    if let Some(config_path) = member_copy_config {
+        return run_member_copy(&config_path, profile).await;
+    }
     if open_mode == DatabaseOpenMode::StandbyReadOnly {
-        let bytes = match std::fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                eprintln!("mcp-stdio: cannot read standby runtime config: {error}");
-                return ExitCode::FAILURE;
-            }
-        };
-        let config = match StandbyRuntimeConfig::from_json(&bytes) {
-            Ok(config) => config,
-            Err(error) => {
-                eprintln!("mcp-stdio: {error}");
-                return ExitCode::FAILURE;
-            }
-        };
-        let store = match GenerationStore::open(
-            &config.replica_root,
-            &config.hosted_route_database_id,
-            Some(config.origin_database_id.clone()),
-        ) {
-            Ok(store) => store,
-            Err(error) => {
-                eprintln!("mcp-stdio: cannot open standby generation store: {error}");
-                return ExitCode::FAILURE;
-            }
-        };
-        let observed = match observe_installed_consumer_identity() {
-            Ok(observed) => observed,
-            Err(error) => {
-                eprintln!("mcp-stdio: standby consumer identity unavailable: {error}");
-                let provider = StandbyStatusProvider::for_status_only_reason(
-                    config,
-                    store,
-                    None,
-                    StandbyStatusOnly {
-                        reason: "installed_consumer_identity_unavailable".into(),
-                        candidate_count: 0,
-                        unusable_candidate_count: 0,
-                    },
-                    standby_refresh_config.is_some(),
-                    false,
-                );
-                return serve_status_only(provider).await;
-            }
-        };
-        match store.activate_for_startup(&observed).await {
-            Ok(StandbyStartupOutcome::Serving(active)) => {
-                let refresh_configured = standby_refresh_config.is_some();
-                let mut refresh_available = refresh_configured;
-                if let Some(refresh_config_path) = standby_refresh_config.as_deref() {
-                    match start_background_refresh(&config, &observed, refresh_config_path).await {
-                        Ok(refresh) => background_refresh = refresh,
-                        Err(error) => {
-                            refresh_available = false;
-                            eprintln!("mcp-stdio: standby refresh is unavailable: {error}");
-                        }
-                    }
-                }
-                if let Some(reason) = active.startup_reason {
-                    eprintln!("mcp-stdio: standby startup recovered with reason {reason:?}");
-                }
-                for warning in &active.retention_warnings {
-                    eprintln!("mcp-stdio: standby retention warning: {warning}");
-                }
-                path = active
-                    .generation
-                    .snapshot_path
-                    .to_string_lossy()
-                    .into_owned();
-                standby_status_provider = Some(StandbyStatusProvider::for_serving(
-                    config.clone(),
-                    store.clone(),
-                    observed.clone(),
-                    &active,
-                    refresh_configured,
-                    refresh_available,
-                ));
-                activated_generation = Some(active);
-            }
-            Ok(StandbyStartupOutcome::StatusOnly(status)) => {
-                let refresh_configured = standby_refresh_config.is_some();
-                let mut refresh_available = refresh_configured;
-                if let Some(refresh_config_path) = standby_refresh_config.as_deref() {
-                    match start_background_refresh(&config, &observed, refresh_config_path).await {
-                        Ok(refresh) => background_refresh = refresh,
-                        Err(error) => {
-                            refresh_available = false;
-                            eprintln!("mcp-stdio: standby refresh is unavailable: {error}");
-                        }
-                    }
-                }
-                let provider = StandbyStatusProvider::for_status_only(
-                    config,
-                    store,
-                    Some(observed),
-                    status,
-                    refresh_configured,
-                    refresh_available,
-                );
-                return serve_status_only_with_refresh(provider, background_refresh).await;
-            }
-            Err(error) => {
-                eprintln!("mcp-stdio: standby startup recovery failed: {error}");
-                return ExitCode::FAILURE;
-            }
-        }
+        return run_connected_standby(
+            &path,
+            selected_account,
+            surface,
+            profile,
+            experimental_executors,
+            standby_refresh_config.as_deref(),
+        )
+        .await;
     }
     let open = async {
         let db = match open_mode {
@@ -626,6 +559,9 @@ async fn main() -> ExitCode {
                 native_ce::create_database(&path).await?
             }
             DatabaseOpenMode::ReadWrite => native_ce::open_existing_database(&path).await?,
+            DatabaseOpenMode::MemberReadOnly => {
+                native_ce::db::open_member_database_read_only(&path).await?
+            }
         };
         Ok::<_, native_ce::Error>(db)
     };
@@ -636,6 +572,9 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // Advisors S4: when NATIVE_ADVISORS_DIR is set, load installs and register
+    // the active advisors on this handle. Unset means today's empty registry.
+    native_ce::mcp::advisors::startup::apply_from_env(&db);
 
     let account_result = match open_mode {
         DatabaseOpenMode::ReadWrite => {
@@ -643,6 +582,9 @@ async fn main() -> ExitCode {
         }
         DatabaseOpenMode::StandbyReadOnly => {
             resolve_standby_account_identity(&db, selected_account.as_deref()).await
+        }
+        DatabaseOpenMode::MemberReadOnly => {
+            resolve_stdio_account_identity(&db, selected_account.as_deref()).await
         }
     };
     let account = match account_result {
@@ -656,21 +598,11 @@ async fn main() -> ExitCode {
 
     let exports = ExportCoordinator::new();
     let mut registry = ToolRegistry::new();
-    if let Some(provider) = standby_status_provider.as_ref() {
-        registry.set_standby_status_provider(provider.clone());
-    } else {
-        registry.set_standby_read_only(open_mode == DatabaseOpenMode::StandbyReadOnly);
-    }
+    registry.set_standby_read_only(open_mode == DatabaseOpenMode::StandbyReadOnly);
     registry.set_exposure_profile(profile);
     if let Err(err) = register_stdio_tools(&mut registry, &exports, &experimental_executors) {
         eprintln!("mcp-stdio: {err}");
         return ExitCode::FAILURE;
-    }
-    if let Some(provider) = standby_status_provider {
-        if let Err(err) = register_standby_status_tool(&mut registry, provider) {
-            eprintln!("mcp-stdio: {err}");
-            return ExitCode::FAILURE;
-        }
     }
     if let Err(err) = registry.validate_profile_budgets() {
         eprintln!("mcp-stdio: {err}");
@@ -687,23 +619,38 @@ async fn main() -> ExitCode {
         McpSurfaceMode::Executor => {
             #[cfg(feature = "mcp-executor-prototype")]
             {
-                match ExecutorTelemetryContext::structured_log() {
-                    Ok(telemetry) => {
-                        match ExecutorPrototypeStdioServer::new_with_telemetry_and_experimental(
-                            registry,
-                            db.clone(),
-                            caller,
-                            None,
-                            telemetry,
-                            experimental_executors,
-                        )
-                        .await
-                        {
-                            Ok(server) => server.serve_stdio().await,
-                            Err(error) => Err(error),
-                        }
+                if open_mode == DatabaseOpenMode::StandbyReadOnly {
+                    // A verified standby engine has no plan store, sidecar,
+                    // expiry, telemetry, or trace file to construct.
+                    match ExecutorPrototypeStdioServer::new_standby_read_only(
+                        registry,
+                        db.clone(),
+                        caller,
+                    )
+                    .await
+                    {
+                        Ok(server) => server.serve_stdio().await,
+                        Err(error) => Err(error),
                     }
-                    Err(error) => Err(error),
+                } else {
+                    match ExecutorTelemetryContext::structured_log() {
+                        Ok(telemetry) => {
+                            match ExecutorPrototypeStdioServer::new_with_telemetry_and_experimental(
+                                registry,
+                                db.clone(),
+                                caller,
+                                None,
+                                telemetry,
+                                experimental_executors,
+                            )
+                            .await
+                            {
+                                Ok(server) => server.serve_stdio().await,
+                                Err(error) => Err(error),
+                            }
+                        }
+                        Err(error) => Err(error),
+                    }
                 }
             }
             #[cfg(not(feature = "mcp-executor-prototype"))]
@@ -712,14 +659,162 @@ async fn main() -> ExitCode {
     };
     exports.drain().await;
     db.close().await;
-    drop(activated_generation);
+    match outcome {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("mcp-stdio: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run_connected_standby(
+    path: &str,
+    selected_account: Option<String>,
+    surface: McpSurfaceMode,
+    profile: ExposureProfile,
+    experimental: ExperimentalExecutors,
+    refresh_config_path: Option<&str>,
+) -> ExitCode {
+    use tracing_subscriber::prelude::*;
+    // Keep protocol stdout untouched and emit only aggregate verification.
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(std::io::stderr)
+                .with_ansi(false)
+                .with_filter(tracing_subscriber::filter::filter_fn(|metadata| {
+                    metadata.target() == "native_ce::standby::verification"
+                })),
+        )
+        .init();
+    native_ce::standby::enable_bounded_verification_diagnostics();
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!("mcp-stdio: cannot read standby runtime config: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let config = match StandbyRuntimeConfig::from_json(&bytes) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("mcp-stdio: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let store = match GenerationStore::open(
+        &config.replica_root,
+        &config.hosted_route_database_id,
+        Some(config.origin_database_id.clone()),
+    ) {
+        Ok(store) => store,
+        Err(error) => {
+            eprintln!("mcp-stdio: cannot open standby generation store: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let observed = match observe_installed_consumer_identity() {
+        Ok(observed) => observed,
+        Err(error) => {
+            eprintln!("mcp-stdio: standby consumer identity unavailable: {error}");
+            let provider = StandbyStatusProvider::for_status_only_reason(
+                config,
+                store,
+                None,
+                StandbyStatusOnly {
+                    reason: "installed_consumer_identity_unavailable".into(),
+                    candidate_count: 0,
+                    unusable_candidate_count: 0,
+                },
+                refresh_config_path.is_some(),
+                false,
+            );
+            return serve_status_only(provider).await;
+        }
+    };
+
+    let startup = match store.activate_for_startup(&observed).await {
+        Ok(startup) => startup,
+        Err(_) => {
+            eprintln!("mcp-stdio: standby startup recovery failed");
+            return ExitCode::FAILURE;
+        }
+    };
+    let refresh_configured = refresh_config_path.is_some();
+    let mut refresh_available = refresh_configured;
+    let mut background_refresh = None;
+    if let Some(refresh_config_path) = refresh_config_path {
+        match start_background_refresh(&config, &observed, refresh_config_path).await {
+            Ok(refresh) => background_refresh = refresh,
+            Err(_) => {
+                refresh_available = false;
+                eprintln!("mcp-stdio: standby refresh is unavailable");
+            }
+        }
+    }
+    let status = match &startup {
+        StandbyStartupOutcome::Serving(_) => StandbyStatusOnly {
+            reason: "startup_readiness_pending".into(),
+            candidate_count: 0,
+            unusable_candidate_count: 0,
+        },
+        StandbyStartupOutcome::StatusOnly(status) => StandbyStatusOnly {
+            reason: status.reason.into(),
+            candidate_count: status.candidate_count,
+            unusable_candidate_count: status.unusable_candidate_count,
+        },
+    };
+    let provider = StandbyStatusProvider::for_status_only_reason(
+        config.clone(),
+        store.clone(),
+        Some(observed.clone()),
+        status,
+        refresh_configured,
+        refresh_available,
+    );
+    let session = match StandbyStdioSession::new(
+        StandbySessionConfig {
+            runtime: config,
+            store,
+            observed,
+            surface,
+            profile,
+            experimental,
+            selected_account,
+            refresh_configured,
+            refresh_available,
+        },
+        provider,
+    ) {
+        Ok(session) => Arc::new(session),
+        Err(_) => {
+            eprintln!("mcp-stdio: standby catalogue unavailable");
+            if let Some(refresh) = background_refresh {
+                refresh.stop().await;
+            }
+            return ExitCode::FAILURE;
+        }
+    };
+    if let StandbyStartupOutcome::Serving(active) = startup {
+        if active.startup_reason.is_some() {
+            eprintln!("mcp-stdio: standby startup recovered with a fallback");
+        }
+        if !active.retention_warnings.is_empty() {
+            eprintln!("mcp-stdio: standby retention warnings present");
+        }
+        if session.install_startup(*active).await.is_err() {
+            eprintln!("mcp-stdio: standby startup readiness unavailable; retaining status-only");
+        }
+    }
+    let outcome = session.serve_stdio().await;
     if let Some(refresh) = background_refresh {
         refresh.stop().await;
     }
     match outcome {
         Ok(()) => ExitCode::SUCCESS,
-        Err(err) => {
-            eprintln!("mcp-stdio: {err}");
+        Err(_) => {
+            eprintln!("mcp-stdio: standby transport failed");
             ExitCode::FAILURE
         }
     }
@@ -730,25 +825,6 @@ async fn serve_status_only(provider: StandbyStatusProvider) -> ExitCode {
         .serve_stdio()
         .await
     {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(error) => {
-            eprintln!("mcp-stdio: {error}");
-            ExitCode::FAILURE
-        }
-    }
-}
-
-async fn serve_status_only_with_refresh(
-    provider: StandbyStatusProvider,
-    refresh: Option<BackgroundRefresh>,
-) -> ExitCode {
-    let outcome = StatusOnlyStdioServer::with_provider(provider)
-        .serve_stdio()
-        .await;
-    if let Some(refresh) = refresh {
-        refresh.stop().await;
-    }
-    match outcome {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("mcp-stdio: {error}");
@@ -832,6 +908,84 @@ async fn run_manual_standby_refresh(args: &[String]) -> ExitCode {
         }
         Err(_) => {
             eprintln!("mcp-stdio: standby manual refresh failed; see refresh state");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Serve the local MCP surface from a dynamically admitted member copy.
+///
+/// The account is never caller-supplied: `MemberServedSnapshot::from_serving`
+/// derives it from the owner's authenticated binding. The runtime owns the
+/// serialized driver and a serialized background refresh and publishes the
+/// owner-derived snapshot only under validated receipt eligibility. The
+/// selected MCP surface `profile` is propagated into the runtime so its
+/// no-held surface and every newly gated registry share it.
+async fn run_member_copy(config_path: &str, profile: ExposureProfile) -> ExitCode {
+    let bytes = match std::fs::read(config_path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!("mcp-stdio: cannot read member-copy config: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let config = match native_ce::member_copy_driver::MemberCopyDeviceConfig::from_json(&bytes) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("mcp-stdio: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let observed = match observe_installed_consumer_identity() {
+        Ok(observed) => observed,
+        Err(error) => {
+            eprintln!("mcp-stdio: member-copy consumer identity unavailable: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let consumer = native_ce::standby_snapshot::StandbyConsumerIdentity {
+        contract: native_ce::standby_snapshot::STANDBY_CONSUMER_CONTRACT.to_owned(),
+        version: 1,
+        platform: observed.platform,
+        source_sha: observed.source_sha,
+        artifact_sha256: observed.artifact_sha256,
+        engine_schema_version: observed.engine_schema_version,
+        ddl_sha256: observed.ddl_sha256,
+    };
+    let client_config = match native_ce::member_copy_client::MemberCopyClientConfig::new(
+        &config.hosted_origin,
+        &config.hosted_route_database_id,
+        consumer.clone(),
+    ) {
+        Ok(client_config) => client_config,
+        Err(error) => {
+            eprintln!("mcp-stdio: member-copy client config: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let transport = match native_ce::member_copy_client::ReqwestMemberCopyClient::new(client_config)
+    {
+        Ok(client) => Arc::new(client),
+        Err(error) => {
+            eprintln!("mcp-stdio: member-copy transport: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let driver =
+        match native_ce::member_copy_driver::MemberCopyDriver::new(config, consumer, transport)
+            .await
+        {
+            Ok(driver) => driver,
+            Err(error) => {
+                eprintln!("mcp-stdio: member-copy driver: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+    let mut runtime = native_ce::member_copy_runtime::MemberCopyRuntime::new(driver, profile);
+    match runtime.run_stdio().await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("mcp-stdio: {error}");
             ExitCode::FAILURE
         }
     }
@@ -983,6 +1137,7 @@ mod tests {
             path: "native.db".into(),
             account: Some("acct_cli".into()),
             open_mode: DatabaseOpenMode::ReadWrite,
+            member_copy_config: None,
         };
         assert_eq!(
             parse_cli(
@@ -990,7 +1145,8 @@ mod tests {
                 None,
                 None,
                 None,
-                None
+                None,
+                None,
             )
             .unwrap(),
             Some(expected)
@@ -1001,13 +1157,15 @@ mod tests {
                 None,
                 None,
                 None,
-                None
+                None,
+                None,
             )
             .unwrap(),
             Some(Cli {
                 path: "native.db".into(),
                 account: Some("acct_cli".into()),
                 open_mode: DatabaseOpenMode::ReadWrite,
+                member_copy_config: None,
             })
         );
     }
@@ -1019,6 +1177,7 @@ mod tests {
             Some("env.db".into()),
             None,
             Some("acct_env".into()),
+            None,
             None,
         )
         .unwrap()
@@ -1036,20 +1195,23 @@ mod tests {
                 None,
                 Some("acct_env".into()),
                 None,
+                None,
             )
             .unwrap(),
             Some(Cli {
                 path: "env.db".into(),
                 account: Some("acct_env".into()),
                 open_mode: DatabaseOpenMode::ReadWrite,
+                member_copy_config: None,
             })
         );
     }
 
     #[test]
-    fn standby_is_explicit_and_never_selects_the_executor_surface() {
+    fn standby_keeps_the_configured_surface_and_is_explicit() {
         let cli = parse_cli(
             strings(&["--standby", "standby.json"]),
+            None,
             None,
             None,
             None,
@@ -1058,12 +1220,23 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(cli.open_mode, DatabaseOpenMode::StandbyReadOnly);
+        // Standby honours the configured surface: Executor selects the
+        // standby read-only executor constructor, Legacy serves native Legacy.
         assert_eq!(
             sqlite_surface(McpSurfaceMode::Executor, cli.open_mode),
+            McpSurfaceMode::Executor
+        );
+        assert_eq!(
+            sqlite_surface(McpSurfaceMode::Legacy, cli.open_mode),
             McpSurfaceMode::Legacy
+        );
+        assert_eq!(
+            sqlite_surface(McpSurfaceMode::Executor, DatabaseOpenMode::ReadWrite),
+            McpSurfaceMode::Executor
         );
         assert!(parse_cli(
             strings(&["--standby", "--standby", "native.db"]),
+            None,
             None,
             None,
             None,
@@ -1076,6 +1249,7 @@ mod tests {
             Some("standby.json".into()),
             None,
             None,
+            None,
         )
         .unwrap()
         .unwrap();
@@ -1084,22 +1258,24 @@ mod tests {
 
     #[test]
     fn invalid_cli_shapes_are_refused() {
-        assert!(parse_cli(Vec::new(), None, None, None, None).is_err());
+        assert!(parse_cli(Vec::new(), None, None, None, None, None).is_err());
         assert!(parse_cli(
             strings(&["--account"]),
             Some("env.db".into()),
             None,
             None,
-            None
+            None,
+            None,
         )
         .is_err());
-        assert!(parse_cli(strings(&["one.db", "two.db"]), None, None, None, None).is_err());
+        assert!(parse_cli(strings(&["one.db", "two.db"]), None, None, None, None, None).is_err());
         assert!(parse_cli(
             strings(&["--unknown"]),
             Some("env.db".into()),
             None,
             None,
-            None
+            None,
+            None,
         )
         .is_err());
         assert!(parse_cli(
@@ -1107,9 +1283,214 @@ mod tests {
             None,
             None,
             None,
-            Some("controlled.db".into())
+            Some("controlled.db".into()),
+            None,
         )
         .is_err());
+    }
+
+    #[test]
+    fn member_copy_parses_config_and_is_exclusive() {
+        let cli = parse_cli(
+            strings(&["--member-copy", "member.json"]),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(cli.member_copy_config.as_deref(), Some("member.json"));
+        assert_eq!(cli.path, "member.json");
+        assert!(cli.account.is_none());
+
+        let from_env = parse_cli(
+            strings(&["--member-copy"]),
+            None,
+            None,
+            None,
+            None,
+            Some("member-env.json".into()),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            from_env.member_copy_config.as_deref(),
+            Some("member-env.json")
+        );
+
+        // Mutually exclusive in both directions with every other controller.
+        assert!(parse_cli(
+            strings(&["--member-copy", "--standby", "member.json"]),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .is_err());
+        assert!(parse_cli(
+            strings(&["--member-copy", "member.json", "extra.db"]),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .is_err());
+        assert!(parse_cli(
+            strings(&["--member-copy", "member.json"]),
+            Some("env.db".into()),
+            None,
+            None,
+            None,
+            None,
+        )
+        .is_err());
+        assert!(parse_cli(
+            strings(&["--member-copy", "member.json"]),
+            None,
+            Some("standby.json".into()),
+            None,
+            None,
+            None,
+        )
+        .is_err());
+        assert!(parse_cli(
+            strings(&["--member-copy", "member.json"]),
+            None,
+            None,
+            None,
+            Some("controlled.db".into()),
+            None,
+        )
+        .is_err());
+        assert!(parse_cli(
+            strings(&["--standby", "standby.json"]),
+            None,
+            None,
+            None,
+            None,
+            Some("member.json".into()),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn member_copy_rejects_account_substitution() {
+        assert!(parse_cli(
+            strings(&["--member-copy", "member.json", "--account", "acct_x"]),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .is_err());
+        assert!(parse_cli(
+            strings(&["--member-copy", "member.json"]),
+            None,
+            None,
+            Some("acct_env".into()),
+            None,
+            None,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn member_copy_requires_exactly_one_config() {
+        assert!(parse_cli(strings(&["--member-copy"]), None, None, None, None, None).is_err());
+        assert!(parse_cli(
+            strings(&["--member-copy", "member.json"]),
+            None,
+            None,
+            None,
+            None,
+            Some("member-env.json".into()),
+        )
+        .is_err());
+        assert!(parse_cli(
+            strings(&["native.db"]),
+            None,
+            None,
+            None,
+            None,
+            Some("member-env.json".into()),
+        )
+        .is_err());
+    }
+
+    /// Direct proof (no subprocess, no process-env race) that the early
+    /// controller-exclusivity predicate rejects `--member-copy`/env together
+    /// with every other controller, and leaves ordinary non-member unchanged.
+    #[test]
+    fn member_copy_controller_conflict_matches_main() {
+        // Flag only + Postgres env / Turso env.
+        assert!(member_copy_controller_conflict(
+            true,
+            None,
+            None,
+            None,
+            Some("pg.json"),
+            None
+        ));
+        assert!(member_copy_controller_conflict(
+            true,
+            None,
+            None,
+            None,
+            None,
+            Some("turso.json")
+        ));
+        // Env-selected member-copy + both backend envs.
+        assert!(member_copy_controller_conflict(
+            true,
+            None,
+            None,
+            None,
+            Some("pg.json"),
+            Some("turso.json")
+        ));
+        // Member-copy with db / standby / controlled-target envs.
+        assert!(member_copy_controller_conflict(
+            true,
+            Some("db"),
+            None,
+            None,
+            None,
+            None
+        ));
+        assert!(member_copy_controller_conflict(
+            true,
+            None,
+            Some("sb.json"),
+            None,
+            None,
+            None
+        ));
+        assert!(member_copy_controller_conflict(
+            true,
+            None,
+            None,
+            Some("ct.json"),
+            None,
+            None
+        ));
+        // Member-copy alone is fine.
+        assert!(!member_copy_controller_conflict(
+            true, None, None, None, None, None
+        ));
+        // Ordinary non-member is unchanged: never a conflict.
+        assert!(!member_copy_controller_conflict(
+            false,
+            Some("db"),
+            Some("sb.json"),
+            Some("ct.json"),
+            Some("pg.json"),
+            Some("turso.json")
+        ));
     }
 
     #[test]

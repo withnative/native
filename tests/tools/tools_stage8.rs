@@ -105,18 +105,35 @@ async fn link(registry: &ToolRegistry, db: &Db, source: &str, rel: &str, target:
 /// account. Without this, `create_record` refuses with "caller has no
 /// portable account binding".
 async fn ensure_account_binding(db: &Db, account: &str, person_id: &str) {
-    let pool = crate::common::fixture_write_pool(db).await;
-    sqlx::query(
-        "INSERT OR IGNORE INTO records
-            (id, type, kind, name, home_id, policy_anchor_id, persistence)
-         VALUES (?, 'Entity', 'person', 'Test account', ?, ?, 'enduring')",
+    // Authenticated creates reference this person as owner_id. Its identity
+    // must exist in the canonical prefix as well as the live projection, so
+    // historical replay can satisfy the owner foreign key.
+    let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM records WHERE id=?)")
+        .bind(person_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    if !exists {
+        let created = create(
+            &registry(),
+            db,
+            json!({ "id": person_id, "type": "Entity", "kind": "person", "name": "Test account" }),
+        )
+        .await;
+        assert_eq!(created, person_id);
+    }
+    let canonical_creations: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM content_events WHERE record_id=? AND type='record.created'",
     )
     .bind(person_id)
-    .bind(native_ce::schema::UNFILED_RECORD_ID)
-    .bind(native_ce::schema::ROOT_RECORD_ID)
-    .execute(&pool)
+    .fetch_one(db.pool())
     .await
     .unwrap();
+    assert_eq!(
+        canonical_creations, 1,
+        "the account owner must be replayable"
+    );
+    let pool = crate::common::fixture_write_pool(db).await;
     sqlx::query(
         "INSERT OR IGNORE INTO bindings
             (record_id, system, identifier, is_canonical)
@@ -669,15 +686,14 @@ async fn claiming_adds_no_event_type_or_claims_table() {
     assert_eq!(claim_event_type, "record.updated");
     let schema = call(&registry, &db, "describe_schema", json!({})).await;
     assert_eq!(schema["engine"]["ddl_fingerprint"], FROZEN_DDL_SHA256);
-    // No claims table appeared under the tool.
-    assert_eq!(
-        count(
-            &db,
-            "SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name LIKE '%claim%'"
-        )
-        .await,
-        0
-    );
+    // Only the per-event metadata cache exists; claiming adds no state table.
+    let claim_tables: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE '%claim%' ORDER BY name",
+    )
+    .fetch_all(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(claim_tables, vec!["content_event_claim_meta"],);
 }
 
 // ---------------------------------------------------------------------------
@@ -1678,7 +1694,7 @@ async fn claim_with_no_neighbours_carries_no_work_overlap_key() {
 async fn create_record_overlap_names_a_claimed_sibling_at_create_time() {
     let db = db().await;
     let registry = registry();
-    ensure_account_binding(&db, "account:a", "test:account-a-person").await;
+    ensure_account_binding(&db, "account:a", "700c3000-0000-4000-8000-0000000000b1").await;
 
     let parent = task(&registry, &db, "Parent container", "in_progress").await;
     let sibling = task(&registry, &db, "Sibling", "in_progress").await;
@@ -1761,7 +1777,7 @@ async fn create_record_overlap_names_a_claimed_sibling_at_create_time() {
 async fn create_record_overlap_replay_carries_no_key_and_keeps_the_receipt() {
     let db = db().await;
     let registry = registry();
-    ensure_account_binding(&db, "account:a", "test:account-a-person").await;
+    ensure_account_binding(&db, "account:a", "700c3000-0000-4000-8000-0000000000b1").await;
 
     let parent = task(&registry, &db, "Parent container", "in_progress").await;
     let sibling = task(&registry, &db, "Sibling", "in_progress").await;
@@ -1842,7 +1858,7 @@ async fn create_record_overlap_replay_carries_no_key_and_keeps_the_receipt() {
 async fn create_record_without_overlap_keeps_every_other_create_byte_identical() {
     let db = db().await;
     let registry = registry();
-    ensure_account_binding(&db, "account:a", "test:account-a-person").await;
+    ensure_account_binding(&db, "account:a", "700c3000-0000-4000-8000-0000000000b1").await;
 
     let document = registry
         .call(
@@ -1903,7 +1919,7 @@ async fn create_record_without_overlap_keeps_every_other_create_byte_identical()
 async fn overlap_notices_persist_only_their_safe_emission_annotations() {
     let db = db().await;
     let registry = registry();
-    ensure_account_binding(&db, "account:a", "test:account-a-emission-person").await;
+    ensure_account_binding(&db, "account:a", "700c3000-0000-4000-8000-0000000000b2").await;
 
     let parent = task(&registry, &db, "Emission parent", "in_progress").await;
     let sibling = task(&registry, &db, "Emission sibling", "in_progress").await;

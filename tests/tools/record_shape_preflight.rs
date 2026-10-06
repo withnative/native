@@ -614,7 +614,7 @@ async fn proposed_facets_bound_large_context_and_required_declarations_without_w
     let required = (0..500)
         .map(|index| {
             (
-                format!("required-{index:03}-{}", "k".repeat(512)),
+                format!("required-{index:03}-{}", "k".repeat(384)),
                 json!({ "required": true }),
             )
         })
@@ -624,13 +624,15 @@ async fn proposed_facets_bound_large_context_and_required_declarations_without_w
         .take(100)
         .map(|key| (key.clone(), json!("supplied")))
         .collect::<serde_json::Map<_, _>>();
-    write_user_schema_config(
-        &db,
-        json!({ "shapes": { "Document": { "facets": required } } }),
-        SchemaConfigOptions::default(),
-    )
-    .await
-    .unwrap();
+    let config = json!({ "shapes": { "Document": { "facets": required } } });
+    let config_bytes = serde_json::to_vec(&config).unwrap().len();
+    assert!(
+        config_bytes <= 262_144,
+        "large required-declaration fixture must fit the source bound: {config_bytes} bytes"
+    );
+    write_user_schema_config(&db, config, SchemaConfigOptions::default())
+        .await
+        .unwrap();
     let before = authoritative_heads(&db).await;
 
     let preview = call(

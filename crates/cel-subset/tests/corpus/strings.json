@@ -1,0 +1,16 @@
+[
+{"name":"size_empty","expr":"size('')","bindings":{},"expect":{"value":{"int":"0"}},"spec":"Functions: size(string)"},
+{"name":"size_ascii","expr":"size('four')","bindings":{},"expect":{"value":{"int":"4"}}},
+{"name":"size_unicode","expr":"size('\u03c0\u03ad\u03bd\u03c4\u03b5')","bindings":{},"expect":{"value":{"int":"5"}},"spec":"Abstract Sizes: string size is code points"},
+{"name":"size_binding","expr":"size(s)","bindings":{"s":{"string":"h\u00e9llo"}},"expect":{"value":{"int":"5"}}},
+{"name":"concat","expr":"'he' + 'llo'","bindings":{},"expect":{"value":{"string":"hello"}}},
+{"name":"concat_unicode","expr":"'\u00a2' + '\u00ff' + '\u0200'","bindings":{},"expect":{"value":{"string":"\u00a2\u00ff\u0200"}}},
+{"name":"contains_true","expr":"'hello'.contains('he')","bindings":{},"expect":{"value":{"bool":true}}},
+{"name":"contains_empty_arg","expr":"'hello'.contains('')","bindings":{},"expect":{"value":{"bool":true}}},
+{"name":"contains_false","expr":"'hello'.contains('ol')","bindings":{},"expect":{"value":{"bool":false}}},
+{"name":"starts_with","expr":"'foobar'.startsWith('foo')","bindings":{},"expect":{"value":{"bool":true}}},
+{"name":"ends_with","expr":"'foobar'.endsWith('bar')","bindings":{},"expect":{"value":{"bool":true}}},
+{"name":"concat_with_int_err","expr":"'a' + 1","bindings":{},"expect":{"error":"no_matching_overload","note":"no_matching_overload"}},
+{"name":"eq_no_unicode_normalization","expr":"'Am\\u00E9lie' == 'Ame\\u0301lie'","bindings":{},"expect":{"value":{"bool":false}},"spec":"String and Bytes Values: no Unicode normalization attempted"},
+{"name":"matches_substring","expr":"'hubba'.matches('ubb')","bindings":{},"expect":{"value":{"bool":true}},"spec":"Regular Expressions: match succeeds on substring"}
+]

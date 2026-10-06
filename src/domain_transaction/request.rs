@@ -182,6 +182,7 @@ pub(crate) trait RequestLifecyclePort: Sync {
         intent: &'a str,
         authenticated_account: &'a str,
         reported: crate::control::ReportedRunIdentity,
+        channel: crate::provenance::Channel,
     ) -> BoxFuture<'a, Result<()>>;
 
     fn displaced_key_note<'a>(&'a self, caller: &'a Caller) -> BoxFuture<'a, Option<String>>;
@@ -559,6 +560,24 @@ where
     };
     let mut trace = GovernedRequestTrace::new();
     let started_at = crate::mcp::interactions::timestamp();
+    // `manage_instructions.resolve` rejoins the caller's existing run after
+    // compaction. The `"new"` sentinel must never mint here: issuance would
+    // fabricate a fresh run boundary instead of refreshing the compacted one.
+    // Refuse before run-context resolution so no key is issued and the
+    // handler's own presence check stays a backstop rather than the gate.
+    if kind == Some(ToolKind::ManageInstructions)
+        && original_arguments.get("action").and_then(Value::as_str) == Some("resolve")
+    {
+        let (raw_run_key, _) = run_context_values(&original_arguments);
+        if crate::runkey::validate_run_key_value(raw_run_key)
+            .stored()
+            .is_none()
+        {
+            return Err(Error::engine(
+                "manage_instructions: resolve requires an existing run_key; pass the run_key from bootstrap on this call",
+            ));
+        }
+    }
     let mut resolved = if kind.is_some_and(ToolKind::ignores_run_context_arguments) {
         ResolvedRunContext {
             caller: caller.with_run_context(None, None).with_intent(None),
@@ -681,7 +700,13 @@ where
                         .map(str::to_string),
                 );
                 if let Err(error) = port
-                    .persist_intent(run_key, intent, capture_caller.credential(), reported)
+                    .persist_intent(
+                        run_key,
+                        intent,
+                        capture_caller.credential(),
+                        reported,
+                        capture_caller.channel(),
+                    )
                     .await
                 {
                     outcome = Err(error);

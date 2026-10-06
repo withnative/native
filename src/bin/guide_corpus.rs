@@ -145,6 +145,11 @@ fn render_template(topic: &str, template: &str) -> Result<String> {
         "QUERY_SQL_CONTRACT",
         &native_ce::query::sql_contract::render_guide_contract_markdown(),
     )?;
+    output = replace_once(
+        output,
+        "QUERY_SQL_MAX_RUN_INTENT_BYTES",
+        &native_ce::query::sql::MAX_RUN_INTENT_BYTES.to_string(),
+    )?;
     if output.contains("<!-- GENERATED:") {
         return Err(Error::engine(format!(
             "{topic}.md.in contains an unknown generated-section marker"
@@ -295,13 +300,13 @@ fn generated_markers(topic: &str) -> &'static [&'static str] {
             "ENGINE_RESERVED_FACET_KEYS",
             "PERSISTENCE_VALUES",
         ],
-        "query-sql" => &["QUERY_SQL_CONTRACT"],
+        "query-sql" => &["QUERY_SQL_CONTRACT", "QUERY_SQL_MAX_RUN_INTENT_BYTES"],
         _ => &[],
     }
 }
 
 fn validate_markers(topic: &str, template: &str) -> Result<()> {
-    const KNOWN: [&str; 8] = [
+    const KNOWN: [&str; 9] = [
         "SPINE_TYPES",
         "SPINE_TYPE_MEANINGS",
         "SPINE_RELATIONSHIPS",
@@ -310,6 +315,7 @@ fn validate_markers(topic: &str, template: &str) -> Result<()> {
         "ENGINE_RESERVED_FACET_KEYS",
         "PERSISTENCE_VALUES",
         "QUERY_SQL_CONTRACT",
+        "QUERY_SQL_MAX_RUN_INTENT_BYTES",
     ];
     let expected = generated_markers(topic);
     for name in KNOWN {

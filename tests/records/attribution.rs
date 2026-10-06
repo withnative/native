@@ -498,9 +498,13 @@ async fn canonical_interchange_preserves_claim_and_provenance_without_manufactur
         .unwrap();
     let bytes = export_canonical_interchange(&db).await.unwrap();
     let temp = tempfile::tempdir().unwrap();
-    let imported = import_canonical_interchange(&bytes, &temp.path().join("imported.db"))
-        .await
-        .unwrap();
+    let imported = import_canonical_interchange(
+        &bytes,
+        &temp.path().join("imported.db"),
+        native_ce::interchange::ImportContinuity::ForeignBoundary,
+    )
+    .await
+    .unwrap();
     let after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM provenance_action_attestations")
         .fetch_one(imported.pool())
         .await
@@ -619,9 +623,13 @@ async fn imported_declaration_keeps_source_claim_but_loses_trusted_presentation(
 
     let bytes = export_canonical_interchange(&db).await.unwrap();
     let temp = tempfile::tempdir().unwrap();
-    let imported = import_canonical_interchange(&bytes, &temp.path().join("declaration.db"))
-        .await
-        .unwrap();
+    let imported = import_canonical_interchange(
+        &bytes,
+        &temp.path().join("declaration.db"),
+        native_ce::interchange::ImportContinuity::ForeignBoundary,
+    )
+    .await
+    .unwrap();
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM provenance_local_attestation_authority")
             .fetch_one(imported.pool())

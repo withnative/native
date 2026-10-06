@@ -25,7 +25,9 @@ pub const INTENT_RESULT_VERSION: &str = "native.artifact-intent-result.v2";
 const RESULT_CHANGE_LIMIT: usize = 100;
 pub const RESULT_REFRESH_JSON_LIMIT: usize = 1_048_576;
 const MAX_SLOTS: usize = 32;
-const MAX_INVOCATION_VALUE_BYTES: usize = 262_144;
+// Encoded values need room for a 512 KiB body with worst-case JSON escaping.
+// Effect-specific raw bounds, depth/node limits and HTTP admission still apply.
+const MAX_INVOCATION_VALUE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_INVOCATION_VALUE_DEPTH: usize = 8;
 const MAX_INVOCATION_VALUE_NODES: usize = 1_024;
 const MAX_OBSERVED_RECORDS: usize = 64;
@@ -54,6 +56,18 @@ pub struct AlphaTabInstallGuard {
     pub version: String,
     pub digest: String,
     pub declaration_digest: String,
+}
+
+/// Names the original invocation a reversal undoes (D7 slice U2b). The
+/// host holds the original's key from the forward receipt; the engine
+/// resolves the original event itself and derives the reverse from history.
+/// A reversal carries no package claim: it must not ride with an install
+/// guard or any later app claim.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ReversalReference {
+    pub entry_id: String,
+    pub idempotency_key: String,
 }
 
 /// One artifact-authored request to run one declared interaction entry.
@@ -94,6 +108,14 @@ pub struct ArtifactInvocation {
     /// a later slice.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub alpha_install_guard: Option<AlphaTabInstallGuard>,
+    /// Optional reversal mode (D7 slice U2b). When present, the host reverses
+    /// the named original invocation instead of running a declared entry:
+    /// `slots`, `values` and `observed` must be empty, the top-level
+    /// `entry_id` must name the original entry, and no install guard or
+    /// other package claim may ride along. Omitted (`None`) preserves every
+    /// existing digest and key byte-identically.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reverses: Option<ReversalReference>,
 }
 
 /// An authoritative host response. Each status carries only the fields
@@ -118,7 +140,10 @@ pub enum ArtifactIntentResult {
         idempotency_key: String,
         error: IntentError,
         /// The version token the host actually found, in the same encoding the
-        /// read path hands out.
+        /// read path hands out. For comment threads this is the opaque
+        /// `ct:` target token, which carries no observed-map key: the key
+        /// is fixed by the `comment.create` effect itself, so the token
+        /// alone is complete.
         current_version: String,
         /// The exact event whose projected state failed the compare-and-set.
         /// Unlike a later history lookup, this cannot drift to a newer actor.
@@ -242,6 +267,40 @@ impl FacetVersion {
     }
 }
 
+/// Reserved observed-map key carrying a comment thread's target-state token.
+/// Ordinary facet tokens (`obs:`/`rec:`) remain valid under this key, so
+/// legacy facet-only artifacts keep validating; the `ct:` token below is
+/// additionally admitted ONLY here and refused under any other key. The
+/// token is never authority — only the write transaction's recomputation
+/// authorizes — and manifest validation refuses sources that mix a
+/// `comment.create` entry with a facet interaction on this key.
+pub const COMMENT_TARGET_KEY: &str = "comment_target";
+
+/// Prefix for comment target-state tokens: `ct:` plus 32 lowercase
+/// hexadecimal characters (128 bits of HMAC output over the parent thread's
+/// authoritative state, minted in the governed render transaction).
+pub const COMMENT_TOKEN_PREFIX: &str = "ct:";
+
+/// Parse a comment target-state token into its 16 raw bytes. `None` for any
+/// other shape — including `obs:`/`rec:` tokens, which keep their own
+/// parser, and uppercase hex, which is never minted.
+pub fn parse_comment_token(token: &str) -> Option<[u8; 16]> {
+    let hex = token.strip_prefix(COMMENT_TOKEN_PREFIX)?;
+    if hex.len() != 32
+        || !hex
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return None;
+    }
+    let mut out = [0u8; 16];
+    for (index, pair) in hex.as_bytes().chunks(2).enumerate() {
+        let text = std::str::from_utf8(pair).ok()?;
+        out[index] = u8::from_str_radix(text, 16).ok()?;
+    }
+    Some(out)
+}
+
 impl ArtifactInvocation {
     /// Validate shape and bounds, independent of authorization, manifest and
     /// database state. Passing this says nothing about whether the invocation
@@ -287,7 +346,9 @@ impl ArtifactInvocation {
             }
             for (key, token) in keys {
                 validate_identity(key, "observed facet key is blank or too long")?;
-                if FacetVersion::parse(token).is_none() {
+                let admitted = FacetVersion::parse(token).is_some()
+                    || (key == COMMENT_TARGET_KEY && parse_comment_token(token).is_some());
+                if !admitted {
                     return Err("observed facet version is not a host-issued token");
                 }
             }
@@ -301,6 +362,24 @@ impl ArtifactInvocation {
         }
         if let Some(guard) = &self.alpha_install_guard {
             guard.validate_shape()?;
+        }
+        if let Some(reverses) = &self.reverses {
+            // A reversal carries no package claim and no forward fillings:
+            // the original entry, key and record are resolved server-side.
+            if self.alpha_install_guard.is_some() {
+                return Err("a reversal carries no package claim");
+            }
+            for value in [&reverses.entry_id, &reverses.idempotency_key] {
+                validate_identity(value, "reversal identity is blank or too long")?;
+            }
+            if self.entry_id != reverses.entry_id {
+                return Err("reversal entry_id must name the original entry");
+            }
+            if !self.slots.is_empty() || !self.values.is_empty() || !self.observed.is_empty() {
+                return Err(
+                    "a reversal names only its original; slots, values and observed must be empty",
+                );
+            }
         }
         Ok(())
     }
@@ -384,7 +463,15 @@ impl ArtifactIntentResult {
                 refresh,
             } => {
                 validate_error(error)?;
-                if FacetVersion::parse(current_version).is_none() {
+                // Conflict versions are host-issued facet tokens — or, for
+                // comment threads, the opaque comment target token. The
+                // accepted syntax is identical to the invocation observed
+                // map: `obs:`/`rec:` anywhere, `ct:` already constrained to
+                // its reserved key at envelope validation. No new fields,
+                // statuses, or protocol version here.
+                if FacetVersion::parse(current_version).is_none()
+                    && parse_comment_token(current_version).is_none()
+                {
                     return Err("conflict version is not a host-issued token");
                 }
                 validate_identity(
@@ -554,6 +641,7 @@ mod tests {
             gesture: Some("click".into()),
             include_next_plan: false,
             alpha_install_guard: None,
+            reverses: None,
         }
     }
 
@@ -593,6 +681,75 @@ mod tests {
             forged_token.validate_shape(),
             Err("observed facet version is not a host-issued token")
         );
+    }
+
+    #[test]
+    fn body_sized_escaped_values_fit_without_removing_encoded_bounds() {
+        let mut input = invocation();
+        input.values.insert(
+            "body".into(),
+            Value::String("\u{1}".repeat(crate::mdx_v2::BODY_SET_MAX_BODY_BYTES)),
+        );
+        assert!(input.validate_shape().is_ok());
+        input.values.insert(
+            "body".into(),
+            Value::String("x".repeat(MAX_INVOCATION_VALUE_BYTES)),
+        );
+        assert_eq!(
+            input.validate_shape(),
+            Err("invocation value is null, too large, or too deeply nested")
+        );
+    }
+
+    #[test]
+    fn comment_target_tokens_parse_and_validate_only_at_the_reserved_key() {
+        assert_eq!(
+            parse_comment_token(&format!("ct:{}", "0".repeat(32))),
+            Some([0u8; 16])
+        );
+        assert_eq!(
+            parse_comment_token(&format!("ct:{}", "ab".repeat(16))),
+            Some([0xabu8; 16])
+        );
+        for bad in [
+            "ct:".to_string(),
+            format!("ct:{}", "0".repeat(31)),
+            format!("ct:{}", "0".repeat(33)),
+            format!("ct:{}", "G".repeat(32)),
+            format!("ct:{}", "A".repeat(32)),
+            "obs:12".to_string(),
+            "rec:12".to_string(),
+            "12".to_string(),
+        ] {
+            assert_eq!(parse_comment_token(&bad), None, "{bad}");
+        }
+        // A comment token is admitted only under the reserved key.
+        let mut threaded = invocation();
+        threaded.observed.insert(
+            "r".into(),
+            BTreeMap::from([(
+                COMMENT_TARGET_KEY.to_owned(),
+                format!("ct:{}", "1".repeat(32)),
+            )]),
+        );
+        assert!(threaded.validate_shape().is_ok());
+        let mut misplaced = invocation();
+        misplaced.observed.insert(
+            "r".into(),
+            BTreeMap::from([("triage".to_owned(), format!("ct:{}", "1".repeat(32)))]),
+        );
+        assert_eq!(
+            misplaced.validate_shape(),
+            Err("observed facet version is not a host-issued token")
+        );
+        // Ordinary facet tokens stay valid under the reserved key, so legacy
+        // facet-only artifacts keep validating.
+        let mut legacy = invocation();
+        legacy.observed.insert(
+            "r".into(),
+            BTreeMap::from([(COMMENT_TARGET_KEY.to_owned(), "obs:12".to_owned())]),
+        );
+        assert!(legacy.validate_shape().is_ok());
     }
 
     #[test]
@@ -746,6 +903,54 @@ mod tests {
         assert!(pending.validate_shape().is_ok());
     }
 
+    #[test]
+    fn conflict_accepts_opaque_comment_tokens_and_rejects_malformed() {
+        // A comment conflict carries the opaque ct: token and the parent
+        // event id, with no observed-map key anywhere on the result: the
+        // key is fixed by the comment.create effect.
+        let comment_conflict = ArtifactIntentResult::Conflict {
+            version: INTENT_RESULT_VERSION.into(),
+            idempotency_key: "k".into(),
+            error: IntentError::retryable("comment_conflict", "the thread moved"),
+            current_version: format!("ct:{}", "1".repeat(32)),
+            conflicting_event_id: "0196c2d4-0000-4000-8000-000000000001".into(),
+            competing_actor: None,
+            refresh: None,
+        };
+        assert!(comment_conflict.validate_shape().is_ok());
+        let encoded = serde_json::to_value(&comment_conflict).unwrap();
+        assert_eq!(encoded["current_version"], format!("ct:{}", "1".repeat(32)));
+        assert!(encoded.get("observed").is_none());
+        assert_eq!(
+            serde_json::from_value::<ArtifactIntentResult>(encoded).unwrap(),
+            comment_conflict
+        );
+        // Malformed ct: shapes fail with the same host-issued-token error
+        // as forged facet tokens; obs:/rec: keep validating.
+        for bad in [
+            "ct:short".to_string(),
+            format!("ct:{}", "G".repeat(32)),
+            format!("ct:{}", "0".repeat(33)),
+            "comment_target".to_string(),
+            "obs:".to_string(),
+        ] {
+            let malformed = ArtifactIntentResult::Conflict {
+                version: INTENT_RESULT_VERSION.into(),
+                idempotency_key: "k".into(),
+                error: IntentError::retryable("comment_conflict", "the thread moved"),
+                current_version: bad.clone(),
+                conflicting_event_id: "event-9".into(),
+                competing_actor: None,
+                refresh: None,
+            };
+            assert_eq!(
+                malformed.validate_shape(),
+                Err("conflict version is not a host-issued token"),
+                "{bad}"
+            );
+        }
+    }
+
     /// The resulting version token rides on the change, so a caller can run its
     /// next compare-and-set against the state its own write produced. It is
     /// additive: a v2 result written before this field existed still parses.
@@ -897,6 +1102,87 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<ArtifactInvocation>(encoded).unwrap(),
             opted_in
+        );
+    }
+
+    fn reversal() -> ArtifactInvocation {
+        ArtifactInvocation {
+            version: INVOCATION_VERSION.into(),
+            artifact_id: "a".into(),
+            entry_id: "mark_triaged".into(),
+            source_digest: "a".repeat(64),
+            slots: BTreeMap::new(),
+            values: BTreeMap::new(),
+            observed: BTreeMap::new(),
+            idempotency_key: "u".into(),
+            gesture: Some("submit".into()),
+            include_next_plan: false,
+            alpha_install_guard: None,
+            reverses: Some(ReversalReference {
+                entry_id: "mark_triaged".into(),
+                idempotency_key: "k".into(),
+            }),
+        }
+    }
+
+    #[test]
+    fn reversal_mode_validates_and_round_trips() {
+        let undo = reversal();
+        assert!(undo.validate_shape().is_ok());
+        let encoded = serde_json::to_value(&undo).unwrap();
+        assert_eq!(
+            serde_json::from_value::<ArtifactInvocation>(encoded).unwrap(),
+            undo
+        );
+        // Omitted on the wire means forward mode, byte-identical to before.
+        let mut legacy = invocation();
+        legacy.reverses = None;
+        let encoded = serde_json::to_value(&legacy).unwrap();
+        assert!(encoded.get("reverses").is_none());
+    }
+
+    #[test]
+    fn reversal_refuses_fillings_package_claims_and_entry_mismatch() {
+        let mut filled = reversal();
+        filled.slots.insert("record".into(), "r".into());
+        assert_eq!(
+            filled.validate_shape(),
+            Err("a reversal names only its original; slots, values and observed must be empty")
+        );
+        let mut valued = reversal();
+        valued
+            .values
+            .insert("choice".into(), Value::String("x".into()));
+        assert_eq!(
+            valued.validate_shape(),
+            Err("a reversal names only its original; slots, values and observed must be empty")
+        );
+        let mut observed = reversal();
+        observed.observed.insert(
+            "r".into(),
+            BTreeMap::from([("triage".to_owned(), "obs:12".to_owned())]),
+        );
+        assert_eq!(
+            observed.validate_shape(),
+            Err("a reversal names only its original; slots, values and observed must be empty")
+        );
+        let mut guarded = reversal();
+        guarded.alpha_install_guard = Some(install_guard());
+        assert_eq!(
+            guarded.validate_shape(),
+            Err("a reversal carries no package claim")
+        );
+        let mut renamed = reversal();
+        renamed.entry_id = "set_triage".into();
+        assert_eq!(
+            renamed.validate_shape(),
+            Err("reversal entry_id must name the original entry")
+        );
+        let mut blank = reversal();
+        blank.reverses.as_mut().unwrap().idempotency_key.clear();
+        assert_eq!(
+            blank.validate_shape(),
+            Err("reversal identity is blank or too long")
         );
     }
 }

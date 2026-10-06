@@ -1,0 +1,480 @@
+use crate::common::value::Val;
+use crate::context::Context;
+use crate::objects::Value;
+use crate::resolvers::Resolver;
+use crate::ExecutionError;
+use std::borrow::Cow;
+
+type Result<T> = std::result::Result<T, ExecutionError>;
+
+/// `FunctionContext` is a context object passed to functions when they are called.
+///
+/// It contains references to the target object (if the function is called as
+/// a method), the program context ([`Context`]) which gives functions access
+/// to variables, and the arguments to the function call.
+#[derive(Clone)]
+pub struct FunctionContext<'context, 'call: 'context> {
+    pub name: &'call str,
+    pub this: Option<Cow<'context, dyn Val>>,
+    pub ptx: &'context Context<'context>,
+    pub args: Vec<Cow<'context, dyn Val>>,
+    pub arg_idx: usize,
+}
+
+impl<'context, 'call: 'context> FunctionContext<'context, 'call> {
+    pub fn new(
+        name: &'call str,
+        this: Option<Cow<'context, dyn Val>>,
+        ptx: &'context Context<'context>,
+        args: Vec<Cow<'context, dyn Val>>,
+    ) -> Self {
+        Self {
+            name,
+            this,
+            ptx,
+            args,
+            arg_idx: 0,
+        }
+    }
+
+    /// Resolves the given expression using the program's [`Context`].
+    pub fn resolve<R>(&self, resolver: R) -> Result<Value>
+    where
+        R: Resolver,
+    {
+        resolver.resolve(self)
+    }
+
+    /// Returns an execution error for the currently execution function.
+    pub fn error<M: std::fmt::Display>(&self, message: M) -> ExecutionError {
+        ExecutionError::function_error(self.name, message)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::context::Context;
+    use crate::tests::test_script;
+
+    fn assert_script(input: &(&str, &str)) {
+        assert_eq!(test_script(input.1, None), Ok(true.into()), "{}", input.0);
+    }
+
+    fn assert_error(input: &(&str, &str, &str)) {
+        assert_eq!(
+            test_script(input.1, None).map_err(|e| e.to_string()),
+            Err(input.2.to_string()),
+            "{}",
+            input.0
+        );
+    }
+
+    #[test]
+    fn test_size() {
+        [
+            ("size of list", "size([1, 2, 3]) == 3"),
+            ("size of map", "size({'a': 1, 'b': 2, 'c': 3}) == 3"),
+            ("size of string", "size('foo') == 3"),
+            ("size of bytes", "size(b'foo') == 3"),
+            ("size as a list method", "[1, 2, 3].size() == 3"),
+            ("size as a string method", "'foobar'.size() == 6"),
+            ("size as a bytes method", "b'foobar'.size() == 6"),
+        ]
+        .iter()
+        .for_each(assert_script);
+    }
+
+    #[test]
+    fn test_has() {
+        let tests = vec![
+            ("map has", "has(foo.bar) == true"),
+            ("map not has", "has(foo.baz) == false"),
+        ];
+
+        for (name, script) in tests {
+            let mut ctx = Context::default();
+            ctx.add_variable_from_value("foo", indexmap::IndexMap::from([("bar", 1)]));
+            assert_eq!(test_script(script, Some(ctx)), Ok(true.into()), "{name}");
+        }
+    }
+
+    #[test]
+    fn test_map() {
+        [
+            ("map list", "[1, 2, 3].map(x, x * 2) == [2, 4, 6]"),
+            ("map list 2", "[1, 2, 3].map(y, y + 1) == [2, 3, 4]"),
+            (
+                "map list filter",
+                "[1, 2, 3].map(y, y % 2 == 0, y + 1) == [3]",
+            ),
+            (
+                "nested map",
+                "[[1, 2], [2, 3]].map(x, x.map(x, x * 2)) == [[2, 4], [4, 6]]",
+            ),
+            (
+                "map to list",
+                r#"{'John': 'smart'}.map(key, key) == ['John']"#,
+            ),
+        ]
+        .iter()
+        .for_each(assert_script);
+    }
+
+    #[test]
+    fn test_filter() {
+        [("filter list", "[1, 2, 3].filter(x, x > 2) == [3]")]
+            .iter()
+            .for_each(assert_script);
+    }
+
+    #[test]
+    fn test_all() {
+        [
+            ("all list #1", "[0, 1, 2].all(x, x >= 0)"),
+            ("all list #2", "[0, 1, 2].all(x, x > 0) == false"),
+            ("all map", "{0: 0, 1:1, 2:2}.all(x, x >= 0) == true"),
+        ]
+        .iter()
+        .for_each(assert_script);
+    }
+
+    #[test]
+    fn test_exists() {
+        [
+            ("exist list #1", "[0, 1, 2].exists(x, x > 0)"),
+            ("exist list #2", "[0, 1, 2].exists(x, x == 3) == false"),
+            ("exist list #3", "[0, 1, 2, 2].exists(x, x == 2)"),
+            ("exist map", "{0: 0, 1:1, 2:2}.exists(x, x > 0)"),
+        ]
+        .iter()
+        .for_each(assert_script);
+    }
+
+    #[test]
+    fn test_exists_one() {
+        [
+            ("exist list #1", "[0, 1, 2].exists_one(x, x > 0) == false"),
+            ("exist list #2", "[0, 1, 2].exists_one(x, x == 0)"),
+            ("exist map", "{0: 0, 1:1, 2:2}.exists_one(x, x == 2)"),
+        ]
+        .iter()
+        .for_each(assert_script);
+    }
+
+    #[test]
+    fn test_starts_with() {
+        [
+            ("starts with true", "'foobar'.startsWith('foo') == true"),
+            ("starts with false", "'foobar'.startsWith('bar') == false"),
+        ]
+        .iter()
+        .for_each(assert_script);
+    }
+
+    #[test]
+    fn test_ends_with() {
+        [
+            ("ends with true", "'foobar'.endsWith('bar') == true"),
+            ("ends with false", "'foobar'.endsWith('foo') == false"),
+        ]
+        .iter()
+        .for_each(assert_script);
+    }
+
+    #[test]
+    fn test_timestamp() {
+        [(
+                "comparison",
+                "timestamp('2023-05-29T00:00:00Z') > timestamp('2023-05-28T00:00:00Z')",
+            ),
+            (
+                "comparison",
+                "timestamp('2023-05-29T00:00:00Z') < timestamp('2023-05-30T00:00:00Z')",
+            ),
+            (
+                "subtracting duration",
+                "timestamp('2023-05-29T00:00:00Z') - duration('24h') == timestamp('2023-05-28T00:00:00Z')",
+            ),
+            (
+                "subtracting date",
+                "timestamp('2023-05-29T00:00:00Z') - timestamp('2023-05-28T00:00:00Z') == duration('24h')",
+            ),
+            (
+                "adding duration",
+                "timestamp('2023-05-28T00:00:00Z') + duration('24h') == timestamp('2023-05-29T00:00:00Z')",
+            ),
+            (
+                "timestamp string",
+                "string(timestamp('2023-05-28T00:00:00Z')) == '2023-05-28T00:00:00+00:00'",
+            ),
+            (
+                "timestamp timestamp",
+                "string(timestamp(timestamp('2023-05-28T00:00:00Z'))) == '2023-05-28T00:00:00+00:00'",
+            ),
+            (
+                "timestamp getFullYear",
+                "timestamp('2023-05-28T00:00:00Z').getFullYear() == 2023",
+            ),
+            (
+                "timestamp getMonth",
+                "timestamp('2023-05-28T00:00:00Z').getMonth() == 4",
+            ),
+            (
+                "timestamp getDayOfMonth",
+                "timestamp('2023-05-28T00:00:00Z').getDayOfMonth() == 27",
+            ),
+            (
+                "timestamp getDayOfYear",
+                "timestamp('2023-05-28T00:00:00Z').getDayOfYear() == 147",
+            ),
+            (
+                "timestamp getDate",
+                "timestamp('2023-05-28T00:00:00Z').getDate() == 28",
+            ),
+            (
+                "timestamp getDayOfWeek",
+                "timestamp('2023-05-28T00:00:00Z').getDayOfWeek() == 0",
+            ),
+            (
+                "timestamp getHours",
+                "timestamp('2023-05-28T02:00:00Z').getHours() == 2",
+            ),
+            (
+                "timestamp getMinutes",
+                " timestamp('2023-05-28T00:05:00Z').getMinutes() == 5",
+            ),
+            (
+                "timestamp getSeconds",
+                "timestamp('2023-05-28T00:00:06Z').getSeconds() == 6",
+            ),
+            (
+                "timestamp getMilliseconds",
+                "timestamp('2023-05-28T00:00:42.123Z').getMilliseconds() == 123",
+            ),
+        ]
+        .iter()
+        .for_each(assert_script);
+
+        [
+            (
+                "timestamp out of range",
+                "timestamp('0000-01-00T00:00:00Z')",
+                "Error executing function 'timestamp': input is out of range",
+            ),
+            (
+                "timestamp out of range",
+                "timestamp('9999-12-32T23:59:59.999999999Z')",
+                "Error executing function 'timestamp': input is out of range",
+            ),
+            (
+                "timestamp overflow",
+                "timestamp('9999-12-31T23:59:59Z') + duration('1s')",
+                "Overflow from binary operator 'add': timestamp, duration",
+            ),
+            (
+                "timestamp underflow",
+                "timestamp('0001-01-01T00:00:00Z') - duration('1s')",
+                "Overflow from binary operator 'sub': timestamp, duration",
+            ),
+            (
+                "timestamp underflow",
+                "timestamp('0001-01-01T00:00:00Z') + duration('-1s')",
+                "Overflow from binary operator 'add': timestamp, duration",
+            ),
+        ]
+        .iter()
+        .for_each(assert_error)
+    }
+
+    #[test]
+    fn test_duration() {
+        [
+            ("duration equal 1", "duration('1s') == duration('1000ms')"),
+            ("duration equal 2", "duration('1m') == duration('60s')"),
+            ("duration equal 3", "duration('1h') == duration('60m')"),
+            ("duration comparison 1", "duration('1m') > duration('1s')"),
+            ("duration comparison 2", "duration('1m') < duration('1h')"),
+            (
+                "duration subtraction",
+                "duration('1h') - duration('1m') == duration('59m')",
+            ),
+            (
+                "duration addition",
+                "duration('1h') + duration('1m') == duration('1h1m')",
+            ),
+            ("duration getHours", "duration('2h30m45s').getHours() == 2"),
+            (
+                "duration getMinutes",
+                "duration('2h30m45s').getMinutes() == 150",
+            ),
+            (
+                "duration getSeconds",
+                "duration('2h30m45s').getSeconds() == 9045",
+            ),
+            (
+                "duration getMilliseconds",
+                "duration('1s500ms').getMilliseconds() == 1500",
+            ),
+            (
+                "duration getHours overflow",
+                "duration('25h').getHours() == 25",
+            ),
+            (
+                "duration getMinutes overflow",
+                "duration('90m').getMinutes() == 90",
+            ),
+            (
+                "duration getSeconds overflow",
+                "duration('90s').getSeconds() == 90",
+            ),
+            (
+                "duration getSeconds overflow",
+                "duration(duration('13s')).getSeconds() == 13",
+            ),
+        ]
+        .iter()
+        .for_each(assert_script);
+    }
+
+    #[test]
+    fn test_timestamp_variable() {
+        let mut context = Context::default();
+        let ts: chrono::DateTime<chrono::FixedOffset> =
+            chrono::DateTime::parse_from_rfc3339("2023-05-29T00:00:00Z").unwrap();
+        context
+            .add_variable("ts", crate::Value::Timestamp(ts))
+            .unwrap();
+
+        let program = crate::Program::compile("ts == timestamp('2023-05-29T00:00:00Z')").unwrap();
+        let result = program.execute(&context).unwrap();
+        assert_eq!(result, true.into());
+    }
+
+    #[test]
+    fn test_chrono_string() {
+        [
+            ("duration", "string(duration('1h30m')) == '1h30m0s'"),
+            (
+                "timestamp",
+                "string(timestamp('2023-05-29T00:00:00Z')) == '2023-05-29T00:00:00+00:00'",
+            ),
+        ]
+        .iter()
+        .for_each(assert_script);
+    }
+
+    #[test]
+    fn test_contains() {
+        let tests = vec![("string", "'foobar'.contains('bar') == true")];
+
+        for (name, script) in tests {
+            assert_eq!(test_script(script, None), Ok(true.into()), "{name}");
+        }
+    }
+
+    #[test]
+    fn test_matches() {
+        let tests = vec![
+            ("string", "'foobar'.matches('^[a-zA-Z]*$') == true"),
+            (
+                "map",
+                "{'1': 'abc', '2': 'def', '3': 'ghi'}.all(key, key.matches('^[a-zA-Z]*$')) == false",
+            ),
+        ];
+
+        for (name, script) in tests {
+            assert_eq!(
+                test_script(script, None),
+                Ok(true.into()),
+                ".matches failed for '{name}'"
+            );
+        }
+    }
+
+    #[test]
+    fn test_matches_err() {
+        // U5: a literal pattern that compiles under no tier is refused
+        // at `check` time, not at evaluation.
+        let report = crate::check(
+            "'foobar'.matches('(foo') == true",
+            &crate::Policy::P0_INTERIM,
+        );
+        assert!(
+            report.result.is_err(),
+            "an invalid literal pattern must be refused at check"
+        );
+    }
+
+    #[test]
+    fn test_string() {
+        [
+            ("string", "string('foo') == 'foo'"),
+            ("int", "string(10) == '10'"),
+            ("float", "string(10.5) == '10.5'"),
+            ("bytes", "string(b'foo') == 'foo'"),
+        ]
+        .iter()
+        .for_each(assert_script);
+    }
+
+    #[test]
+    fn test_bytes() {
+        [
+            ("string", "bytes('abc') == b'abc'"),
+            ("bytes", "bytes('abc') == b'\\x61b\\x63'"),
+            ("bytes_to_bytes", "bytes(b'abc') == b'\\x61b\\x63'"),
+        ]
+        .iter()
+        .for_each(assert_script);
+    }
+
+    #[test]
+    fn test_double() {
+        [
+            ("string", "double('10') == 10.0"),
+            ("int", "double(10) == 10.0"),
+            ("double", "double(10.0) == 10.0"),
+        ]
+        .iter()
+        .for_each(assert_script);
+    }
+
+    #[test]
+    fn test_uint() {
+        [
+            ("uint", "uint(10u) == 10u"),
+            ("int", "uint(10) == 10u"),
+            ("string", "uint('10') == 10u"),
+            ("double", "uint(10.5) == 10u"),
+        ]
+        .iter()
+        .for_each(assert_script);
+    }
+
+    #[test]
+    fn test_int() {
+        [
+            ("string", "int('10') == 10"),
+            ("int", "int(10) == 10"),
+            ("uint", "int(10u) == 10"),
+            ("double", "int(10.5) == 10"),
+        ]
+        .iter()
+        .for_each(assert_script);
+    }
+
+    #[test]
+    fn no_bool_coercion() {
+        [
+            ("string || bool", "'' || false", "No such overload"),
+            ("int || bool", "1 || false", "No such overload"),
+            ("int || bool", "1u || false", "No such overload"),
+            ("float || bool", "0.1|| false", "No such overload"),
+            ("list || bool", "[] || false", "No such overload"),
+            ("map || bool", "{} || false", "No such overload"),
+            ("null || bool", "null || false", "No such overload"),
+        ]
+        .iter()
+        .for_each(assert_error)
+    }
+}

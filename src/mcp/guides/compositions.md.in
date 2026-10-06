@@ -190,6 +190,36 @@ the smallest source first, then add presentation features and re-render after
 each change, including binding changes. A render from before the final write
 does not verify the final artifact.
 
+### What the HTML validator requires
+
+A `native.html.v1` write is rejected only for rules that keep the artifact
+self-contained and isolated, or that the runtime depends on. Every rejection
+in a body is reported in one failure, so fix them together rather than one
+per attempt. A rejection tied to an element carries its line and column;
+document-, CSS-, slide- and declaration-level rejections carry none.
+
+- **Rejected.** Anything that is not a complete document: an HTML5 doctype,
+  then `<html lang="…">`, then an attribute-free `<head>`, one `<body>`, and a
+  non-empty `<title>`. External or ambient authority: `script[src]`, import
+  maps, `<link>`, `<base>`, `<iframe>`/`<frame>`/`<object>`/`<embed>` and
+  similar, URL-bearing attributes (`href`, `src`, `srcset`, `action`, …) other
+  than `<a href="#…">` and `<img src="data:…">`, `form[action]`, authored CSP
+  or refresh `<meta>`, CSS `@import`, CSS `image-set`, and CSS `url()` other
+  than a permitted data asset or a fragment. Size limits on the body, DOM,
+  CSS rules and decoded data assets. For `native-artifact-profile` `slides`,
+  one `main[data-native-deck]` of 2–200 `section[data-native-slide]` children,
+  each with a unique `id`, `aria-labelledby` and a visible heading. A malformed
+  `native-artifact-manifest` declaration.
+- **Warned, never rejected.** Accessibility and layout conventions: exactly
+  one `<main>`, at least one `<h1>`, heading levels that do not skip, `alt` on
+  every `<img>` (empty for decorative images), no positive `tabindex`,
+  `<meta charset="utf-8">` and a responsive viewport `<meta>`. These come
+  back as located `diagnostics` on the write receipt. Fix them when the
+  artifact is meant for people to read; a full-bleed app or desktop mock-up
+  need not contort itself to pass them.
+- Links out go through host-mediated navigation: `data-native-record-id` or
+  an absolute http(s) `data-native-external-url` on a control, not `href`.
+
 ### Fields outside the nine fixed record fields
 
 The record row carries nine fixed fields: `id`, `type`, `kind`, `name`,

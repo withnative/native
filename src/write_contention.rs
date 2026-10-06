@@ -61,9 +61,18 @@
 //! which disclosure would need thinking about.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
+
+// The standby process performs real writes only in verification scratch
+// databases. Its protocol diagnostics have a closed, bounded schema. Keep
+// measuring those writes, but avoid the ordinary raw histogram formatter.
+static BOUNDED_STANDBY_DIAGNOSTICS: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn enable_bounded_standby_diagnostics() {
+    BOUNDED_STANDBY_DIAGNOSTICS.store(true, Ordering::Relaxed);
+}
 
 /// Upper bounds, in microseconds, of the fixed histogram buckets. A reported
 /// percentile is the upper bound of the bucket the percentile falls in, so it
@@ -424,10 +433,20 @@ pub(crate) fn close_critical_section(domain: WriteDomain, connection_key: usize)
     registry().totals(domain).held.record(held);
     if held >= SLOW_HOLD_LOG_AFTER {
         if let Some(operation) = section.operation {
-            eprintln!(
-                "write-contention-slow domain={domain:?} operation={operation} held_ms={}",
-                held.as_millis()
-            );
+            if BOUNDED_STANDBY_DIAGNOSTICS.load(Ordering::Relaxed) {
+                let domain = match domain {
+                    WriteDomain::Workspace => "workspace",
+                    WriteDomain::HostCatalog => "host_catalog",
+                };
+                tracing::info!(target: "native_ce::standby::verification",
+                    domain, held_ms = held.as_millis(),
+                    "standby writer contention slow");
+            } else {
+                eprintln!(
+                    "write-contention-slow domain={domain:?} operation={operation} held_ms={}",
+                    held.as_millis()
+                );
+            }
         }
     }
     #[cfg(test)]
@@ -647,10 +666,21 @@ fn maybe_report() {
         return;
     }
     if !workspace.is_empty() {
-        eprintln!("{}", report_line("workspace", elapsed, &workspace));
+        emit_report("workspace", elapsed, &workspace);
     }
     if !catalog.is_empty() {
-        eprintln!("{}", report_line("host_catalog", elapsed, &catalog));
+        emit_report("host_catalog", elapsed, &catalog);
+    }
+}
+
+fn emit_report(domain: &'static str, elapsed: Duration, sample: &DomainSnapshot) {
+    if BOUNDED_STANDBY_DIAGNOSTICS.load(Ordering::Relaxed) {
+        tracing::info!(target: "native_ce::standby::verification",
+            domain, transactions = sample.transactions,
+            busy_retries = sample.busy_retries, failures = sample.failures,
+            "standby writer contention window");
+    } else {
+        eprintln!("{}", report_line(domain, elapsed, sample));
     }
 }
 

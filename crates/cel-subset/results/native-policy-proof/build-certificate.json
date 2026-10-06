@@ -1,0 +1,42 @@
+{
+  "schema": "cel-native-build-certificate/1",
+  "started_utc": "2026-10-03T08:58:38.496972+00:00",
+  "before": {
+    "head": "b307a2c5954630eb58b69159495f8422ee6c800f",
+    "tree": "e19b0872cd5f7a2a378392ee126be9f82ff2d5ea",
+    "status": ""
+  },
+  "command": [
+    "cargo",
+    "build",
+    "-p",
+    "cel-subset",
+    "--features",
+    "native-proof-tools",
+    "--bin",
+    "cel-native-evidence"
+  ],
+  "features": [
+    "native-proof-tools"
+  ],
+  "profile": "dev (debug assertions enabled; workspace Cargo profile applies)",
+  "custom_build_environment": {},
+  "cargo": "cargo 1.98.0 (797e8a9bc 2026-08-05)",
+  "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18)\nbinary: rustc\ncommit-hash: 88d9e12ae178fab0fb5cc050a94da85685d449ea\ncommit-date: 2026-08-18\nhost: x86_64-unknown-linux-gnu\nrelease: 1.98.0\nLLVM version: 22.1.8",
+  "cargo_lock_sha256": "c13a958f82125298904572bb95b634a2aa7b8d6e5e266c4957ffcf0495ea558c",
+  "cargo_manifest_sha256": "07932ac86c1e46faf7c96f18ff9e0c8a47cefb378c562c83c9ebe259a18171de",
+  "package_manifest_sha256": "489e0df2296713c195bba41ecdae255f62d77c69cd5a16edf63c7eb74745bb72",
+  "source_tree_list_sha256": "734ee816a0beda2cbda32b39808e888164213d68d754253ac2202c6bfa3a66ef",
+  "exit_code": 0,
+  "finished_utc": "2026-10-03T08:58:41.917408+00:00",
+  "after": {
+    "head": "b307a2c5954630eb58b69159495f8422ee6c800f",
+    "tree": "e19b0872cd5f7a2a378392ee126be9f82ff2d5ea",
+    "status": ""
+  },
+  "build_log_sha256": "911094018a8284efceef69ef1e13665734c1f8023281de8e487dd40f6f3fdfaf",
+  "binary": {
+    "path": "target/debug/cel-native-evidence",
+    "sha256": "5ffa225d4907100a4967f2f60136806352a76c62e4d35cbd2745c77abd95e71e"
+  }
+}

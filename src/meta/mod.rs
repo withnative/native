@@ -36,12 +36,40 @@
 //! ```compile_fail
 //! use native_ce::meta::{append_meta, MetaAppendSpec};
 //! ```
+//!
+//! Production workspace receipts decoded for replay cannot become admission
+//! tokens. Operational intake and its qualified issuer remain closed.
+//! <!-- native-doctest-id: workspace-rule-admission-closed -->
+//! ```compile_fail
+//! use native_ce::meta::workspace_rule_installation::VerifiedAdmission;
+//! let admitted: VerifiedAdmission = serde_json::from_str("{}").unwrap();
+//! ```
 
+#[allow(dead_code)]
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+pub(crate) mod adoption;
+#[cfg(test)]
+mod adoption_tests;
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+pub(crate) mod consumer;
+#[cfg(test)]
+mod consumer_tests;
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+pub mod definition_artifact;
 pub mod events;
 pub mod kind;
 mod log;
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+pub(crate) mod package;
+#[cfg(test)]
+mod package_tests;
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+pub(crate) mod rule_installation;
+#[cfg(test)]
+mod rule_installation_tests;
 pub mod schema_config;
 pub mod vocabulary;
+pub(crate) mod workspace_rule_installation;
 
 pub use events::*;
 pub use kind::*;

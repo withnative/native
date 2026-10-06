@@ -173,6 +173,10 @@ pub(crate) async fn project_policy(
 }
 
 async fn project_policy_rows(conn: &mut SqliteConnection, event: &PolicyEventRow) -> Result<()> {
+    #[cfg(any(test, feature = "v2-kernel-probe"))]
+    if event.record_id == crate::events::KERNEL_ROOT_ID {
+        return crate::kernel::project_kernel_policy_rows(conn, event).await;
+    }
     match event.event_type.as_str() {
         "policy.replaced" => {
             let payload = replaced_payload(event)?;

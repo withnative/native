@@ -69,6 +69,62 @@ async fn validate_target_shape_on(
     position: Position,
     bearer_id: &str,
 ) -> Result<()> {
+    match validate_target_shape_checked_on(tx, id, position, bearer_id).await? {
+        Ok(()) => Ok(()),
+        Err(shape) => Err(Error::engine(render_shape(tool, &shape))),
+    }
+}
+
+/// Backend-neutral fold for the optional exact-body target carried by a
+/// governed comment. SQLite and portable backend readers call the same fold
+/// after gathering their transaction-scoped physical rows.
+/// Pure target-shape check returning the expected refusal. No IO is
+/// possible here by construction: the target row was already read.
+pub(crate) fn check_target_shape(
+    position: Position,
+    bearer_id: &str,
+    target: Option<(&str, &str)>,
+) -> std::result::Result<(), CommentShape> {
+    let Some((target_record_id, source_slot)) = target else {
+        return Ok(());
+    };
+    if position == Position::Reply {
+        return Err(CommentShape::ReplyTargeted);
+    }
+    if target_record_id != bearer_id || source_slot != "body" {
+        return Err(CommentShape::BadAnchor);
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_target_shape(
+    tool: &str,
+    position: Position,
+    bearer_id: &str,
+    target: Option<(&str, &str)>,
+) -> Result<()> {
+    check_target_shape(position, bearer_id, target)
+        .map_err(|shape| Error::engine(render_shape(tool, &shape)))
+}
+
+/// Target-shape check over a live annotation row. Read failures propagate
+/// as the outer error; only the expected shape branches are inner.
+async fn validate_target_shape_checked_on(
+    tx: &mut Transaction<'_, Sqlite>,
+    id: &str,
+    position: Position,
+    bearer_id: &str,
+) -> Result<std::result::Result<(), CommentShape>> {
+    validate_target_shape_recorded_on(tx, id, position, bearer_id, &mut Vec::new()).await
+}
+
+async fn validate_target_shape_recorded_on(
+    tx: &mut Transaction<'_, Sqlite>,
+    id: &str,
+    position: Position,
+    bearer_id: &str,
+    proof: &mut Vec<serde_json::Value>,
+) -> Result<std::result::Result<(), CommentShape>> {
     let target = sqlx::query(
         "SELECT target_record_id, source_slot FROM annotation_targets WHERE annotation_id = ?",
     )
@@ -84,39 +140,126 @@ async fn validate_target_shape_on(
             ))
         })
         .transpose()?;
-    validate_target_shape(
-        tool,
+    proof.push(
+        serde_json::json!({"template":"eligibility.annotation-target.v1","id":id,"row":target}),
+    );
+    Ok(check_target_shape(
         position,
         bearer_id,
         target.as_ref().map(|(target_record_id, source_slot)| {
             (target_record_id.as_str(), source_slot.as_str())
         }),
-    )
+    ))
 }
 
-/// Backend-neutral fold for the optional exact-body target carried by a
-/// governed comment. SQLite and portable backend readers call the same fold
-/// after gathering their transaction-scoped physical rows.
-pub(crate) fn validate_target_shape(
-    tool: &str,
-    position: Position,
+async fn position_for_bearer_checked_on(
+    tx: &mut Transaction<'_, Sqlite>,
     bearer_id: &str,
-    target: Option<(&str, &str)>,
-) -> Result<()> {
-    let Some((target_record_id, source_slot)) = target else {
-        return Ok(());
+) -> Result<std::result::Result<Position, CommentShape>> {
+    position_for_bearer_checked_identity_on(tx, bearer_id, false, &mut Vec::new()).await
+}
+
+async fn is_comment_identity_on(
+    tx: &mut Transaction<'_, Sqlite>,
+    record_type: &str,
+    kind: Option<&str>,
+    proof: &mut Vec<serde_json::Value>,
+) -> Result<bool> {
+    proof.push(
+        serde_json::json!({"template":"eligibility.kind-input.v1","type":record_type,"kind":kind}),
+    );
+    let Some(kind) = kind else {
+        return Ok(false);
     };
-    if position == Position::Reply {
-        return Err(Error::engine(format!(
-            "{tool}: comment replies must be targetless; quoted context belongs to the root"
-        )));
+    let mut executor = crate::portable_sql::BorrowedSqliteStatementExecutor::new(tx);
+    let resolution =
+        crate::meta::kind::resolve_identity_with(&mut executor, record_type, kind).await?;
+    Ok(CoreKind::AnnotationComment.matches(&resolution))
+}
+
+async fn position_for_bearer_checked_identity_on(
+    tx: &mut Transaction<'_, Sqlite>,
+    bearer_id: &str,
+    minimal_identity: bool,
+    proof: &mut Vec<serde_json::Value>,
+) -> Result<std::result::Result<Position, CommentShape>> {
+    let row = sqlx::query(
+        "SELECT type, kind, body, lifecycle, summary, deleted_at
+           FROM records WHERE id = ?",
+    )
+    .bind(bearer_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(row) = row else {
+        proof.push(
+            serde_json::json!({"template":"eligibility.bearer-live.v1","id":bearer_id,"row":null}),
+        );
+        return Ok(Err(CommentShape::MissingBearer));
+    };
+    let deleted: Option<String> = row.try_get("deleted_at")?;
+    proof.push(serde_json::json!({"template":"eligibility.bearer-live.v1","id":bearer_id,"deleted_at":deleted}));
+    if deleted.is_some() {
+        return Ok(Err(CommentShape::DeletedBearer));
     }
-    if target_record_id != bearer_id || source_slot != "body" {
-        return Err(Error::engine(format!(
-            "{tool}: anchored comment root must target its part_of bearer's body"
-        )));
+    let record_type: String = row.try_get("type")?;
+    let kind: Option<String> = row.try_get("kind")?;
+    let governed = if minimal_identity {
+        is_comment_identity_on(tx, &record_type, kind.as_deref(), proof).await?
+    } else {
+        is_governed_comment_on(tx, &record_type, kind.as_deref()).await?
+    };
+    if !governed {
+        return Ok(Ok(Position::Root));
     }
-    Ok(())
+    let bearer_body: Option<String> = row.try_get("body")?;
+    let bearer_lifecycle: Option<String> = row.try_get("lifecycle")?;
+    let bearer_summary: Option<String> = row.try_get("summary")?;
+    proof.push(serde_json::json!({"template":"eligibility.root-state.v1","id":bearer_id,"body":bearer_body,"lifecycle":bearer_lifecycle,"summary":bearer_summary}));
+    if let Err(shape) = check_prospective(
+        Position::Root,
+        bearer_body.as_deref(),
+        bearer_lifecycle.as_deref(),
+        bearer_summary.as_deref(),
+    ) {
+        return Ok(Err(shape));
+    }
+
+    let root_bearers = bearer_ids_on(tx, bearer_id).await?;
+    proof.push(serde_json::json!({"template":"eligibility.bearers.v1","id":bearer_id,"targets":root_bearers}));
+    if root_bearers.len() != 1 {
+        return Ok(Err(CommentShape::InvalidRootBearer));
+    }
+    let root_target = sqlx::query("SELECT type, kind, deleted_at FROM records WHERE id = ?")
+        .bind(&root_bearers[0])
+        .fetch_optional(&mut **tx)
+        .await?;
+    let Some(root_target) = root_target else {
+        return Ok(Err(CommentShape::DeadRootBearer));
+    };
+    if root_target
+        .try_get::<Option<String>, _>("deleted_at")?
+        .is_some()
+    {
+        return Ok(Err(CommentShape::DeadRootBearer));
+    }
+    let root_target_type: String = root_target.try_get("type")?;
+    let root_target_kind: Option<String> = root_target.try_get("kind")?;
+    proof.push(serde_json::json!({"template":"eligibility.root-target.v1","id":root_bearers[0],"type":root_target_type,"kind":root_target_kind,"deleted_at":null}));
+    let nested = if minimal_identity {
+        is_comment_identity_on(tx, &root_target_type, root_target_kind.as_deref(), proof).await?
+    } else {
+        is_governed_comment_on(tx, &root_target_type, root_target_kind.as_deref()).await?
+    };
+    if nested {
+        return Ok(Err(CommentShape::NestedReply));
+    }
+    if let Err(shape) =
+        validate_target_shape_recorded_on(tx, bearer_id, Position::Root, &root_bearers[0], proof)
+            .await?
+    {
+        return Ok(Err(shape));
+    }
+    Ok(Ok(Position::Reply))
 }
 
 async fn position_for_bearer_on(
@@ -124,67 +267,134 @@ async fn position_for_bearer_on(
     tool: &str,
     bearer_id: &str,
 ) -> Result<Position> {
-    let row = sqlx::query(
-        "SELECT type, kind, body, lifecycle, summary, deleted_at
-           FROM records WHERE id = ?",
-    )
-    .bind(bearer_id)
-    .fetch_optional(&mut **tx)
-    .await?
-    .ok_or_else(|| Error::engine(format!("{tool}: comment bearer does not exist")))?;
-    if row.try_get::<Option<String>, _>("deleted_at")?.is_some() {
-        return Err(Error::engine(format!(
-            "{tool}: comment bearer is deleted (tombstoned)"
-        )));
+    match position_for_bearer_checked_on(tx, bearer_id).await? {
+        Ok(position) => Ok(position),
+        Err(shape) => Err(Error::engine(render_shape(tool, &shape))),
     }
-    let record_type: String = row.try_get("type")?;
-    let kind: Option<String> = row.try_get("kind")?;
-    if !is_governed_comment_on(tx, &record_type, kind.as_deref()).await? {
-        return Ok(Position::Root);
-    }
-    let bearer_body: Option<String> = row.try_get("body")?;
-    let bearer_lifecycle: Option<String> = row.try_get("lifecycle")?;
-    let bearer_summary: Option<String> = row.try_get("summary")?;
-    validate_prospective(
-        tool,
-        Position::Root,
-        bearer_body.as_deref(),
-        bearer_lifecycle.as_deref(),
-        bearer_summary.as_deref(),
-    )?;
-
-    let root_bearers = bearer_ids_on(tx, bearer_id).await?;
-    if root_bearers.len() != 1 {
-        return Err(Error::engine(format!(
-            "{tool}: reply bearer must be a valid root comment"
-        )));
-    }
-    let root_target = sqlx::query("SELECT type, kind, deleted_at FROM records WHERE id = ?")
-        .bind(&root_bearers[0])
-        .fetch_optional(&mut **tx)
-        .await?
-        .ok_or_else(|| Error::engine(format!("{tool}: reply bearer has a dead bearer")))?;
-    if root_target
-        .try_get::<Option<String>, _>("deleted_at")?
-        .is_some()
-    {
-        return Err(Error::engine(format!(
-            "{tool}: reply bearer has a dead bearer"
-        )));
-    }
-    let root_target_type: String = root_target.try_get("type")?;
-    let root_target_kind: Option<String> = root_target.try_get("kind")?;
-    if is_governed_comment_on(tx, &root_target_type, root_target_kind.as_deref()).await? {
-        return Err(Error::engine(format!(
-            "{tool}: replies must bear directly on a root comment; reply-to-reply nesting is not supported"
-        )));
-    }
-    validate_target_shape_on(tx, tool, bearer_id, Position::Root, &root_bearers[0]).await?;
-    Ok(Position::Reply)
 }
 
 pub(crate) fn nonblank(value: Option<&str>) -> bool {
     value.is_some_and(|value| !value.trim().is_empty())
+}
+
+/// Expected thread-shape refusal: provably free of infrastructure failure.
+///
+/// Every variant is constructed from successfully-read state or pure
+/// inputs, never from a failed read. Storage, kind-resolver, and IO
+/// failures — including their `Error::engine` mappings such as
+/// `stable_storage_error` — surface as the outer `Err` and are never
+/// converted here. Callers that need a deterministic refusal match the
+/// inner value; callers that must preserve unknown propagate the outer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CommentShape {
+    BearerCount,
+    MissingBearer,
+    DeletedBearer,
+    InvalidRootBearer,
+    DeadRootBearer,
+    NestedReply,
+    ResolvedRoot,
+    BlankBody,
+    ReplyLifecycle,
+    ReplySummary,
+    RootSummary,
+    ResolvedNeedsSummary,
+    BadRootLifecycle { got: String },
+    ReplyTargeted,
+    BadAnchor,
+}
+
+/// Legacy Engine text for one expected shape refusal. The strings are
+/// byte-identical to the historical validator messages; the mapping lives
+/// here so ordinary wrappers and the checked path cannot drift apart.
+fn render_shape(tool: &str, shape: &CommentShape) -> String {
+    match shape {
+        CommentShape::BearerCount => format!(
+            "{tool}: Annotation kind:comment requires exactly one outgoing part_of link to its bearer"
+        ),
+        CommentShape::MissingBearer => {
+            format!("{tool}: comment bearer does not exist")
+        }
+        CommentShape::DeletedBearer => {
+            format!("{tool}: comment bearer is deleted (tombstoned)")
+        }
+        CommentShape::InvalidRootBearer => {
+            format!("{tool}: reply bearer must be a valid root comment")
+        }
+        CommentShape::DeadRootBearer => {
+            format!("{tool}: reply bearer has a dead bearer")
+        }
+        CommentShape::NestedReply => format!(
+            "{tool}: replies must bear directly on a root comment; reply-to-reply nesting is not supported"
+        ),
+        CommentShape::ResolvedRoot => format!(
+            "{tool}: comment roots cannot be created resolved; create open, then resolve with update_record"
+        ),
+        CommentShape::BlankBody => format!(
+            "{tool}: Annotation kind:comment requires a nonblank body"
+        ),
+        CommentShape::ReplyLifecycle => format!(
+            "{tool}: comment replies must have null lifecycle; thread state lives on the root"
+        ),
+        CommentShape::ReplySummary => format!(
+            "{tool}: comment replies cannot carry a resolution summary"
+        ),
+        CommentShape::RootSummary => format!(
+            "{tool}: comment resolution summary is only valid on a resolved root"
+        ),
+        CommentShape::ResolvedNeedsSummary => format!(
+            "{tool}: resolved comment root requires a nonblank resolution summary"
+        ),
+        CommentShape::BadRootLifecycle { got } => format!(
+            "{tool}: comment root lifecycle must be null, open, or resolved, or informational \u{2014} the named form of null (got {got})"
+        ),
+        CommentShape::ReplyTargeted => format!(
+            "{tool}: comment replies must be targetless; quoted context belongs to the root"
+        ),
+        CommentShape::BadAnchor => format!(
+            "{tool}: anchored comment root must target its part_of bearer's body"
+        ),
+    }
+}
+
+/// Pure prospective check returning the expected refusal. No IO is
+/// possible here by construction: only already-available field values.
+pub(crate) fn check_prospective(
+    position: Position,
+    body: Option<&str>,
+    lifecycle: Option<&str>,
+    summary: Option<&str>,
+) -> std::result::Result<(), CommentShape> {
+    if !nonblank(body) {
+        return Err(CommentShape::BlankBody);
+    }
+    match position {
+        Position::Reply => {
+            if lifecycle.is_some() {
+                return Err(CommentShape::ReplyLifecycle);
+            }
+            if summary.is_some() {
+                return Err(CommentShape::ReplySummary);
+            }
+        }
+        Position::Root => match lifecycle {
+            // Null is the legacy spelling of `informational`; both are open
+            // states that carry no resolution summary.
+            None | Some(INFORMATIONAL) | Some(OPEN) => {
+                if summary.is_some() {
+                    return Err(CommentShape::RootSummary);
+                }
+            }
+            Some(RESOLVED) if nonblank(summary) => {}
+            Some(RESOLVED) => return Err(CommentShape::ResolvedNeedsSummary),
+            Some(other) => {
+                return Err(CommentShape::BadRootLifecycle {
+                    got: other.to_string(),
+                })
+            }
+        },
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_prospective(
@@ -194,48 +404,37 @@ pub(crate) fn validate_prospective(
     lifecycle: Option<&str>,
     summary: Option<&str>,
 ) -> Result<()> {
-    if !nonblank(body) {
-        return Err(Error::engine(format!(
-            "{tool}: Annotation kind:comment requires a nonblank body"
-        )));
+    check_prospective(position, body, lifecycle, summary)
+        .map_err(|shape| Error::engine(render_shape(tool, &shape)))
+}
+
+/// Checked creation validation: infrastructure failures (SQL, kind
+/// resolution, IO) propagate as the outer error; only the expected
+/// thread-shape branches are inner. Shares every decision with the legacy
+/// wrapper below, which renders identical text.
+pub(crate) async fn validate_create_checked_on(
+    tx: &mut Transaction<'_, Sqlite>,
+    bearer_ids: &[String],
+    body: Option<&str>,
+    lifecycle: Option<&str>,
+    summary: Option<&str>,
+) -> Result<std::result::Result<Position, CommentShape>> {
+    if bearer_ids.len() != 1 {
+        return Ok(Err(CommentShape::BearerCount));
     }
-    match position {
-        Position::Reply => {
-            if lifecycle.is_some() {
-                return Err(Error::engine(format!(
-                    "{tool}: comment replies must have null lifecycle; thread state lives on the root"
-                )));
-            }
-            if summary.is_some() {
-                return Err(Error::engine(format!(
-                    "{tool}: comment replies cannot carry a resolution summary"
-                )));
-            }
-        }
-        Position::Root => match lifecycle {
-            // Null is the legacy spelling of `informational`; both are open
-            // states that carry no resolution summary.
-            None | Some(INFORMATIONAL) | Some(OPEN) => {
-                if summary.is_some() {
-                    return Err(Error::engine(format!(
-                        "{tool}: comment resolution summary is only valid on a resolved root"
-                    )));
-                }
-            }
-            Some(RESOLVED) if nonblank(summary) => {}
-            Some(RESOLVED) => {
-                return Err(Error::engine(format!(
-                    "{tool}: resolved comment root requires a nonblank resolution summary"
-                )))
-            }
-            Some(other) => {
-                return Err(Error::engine(format!(
-                    "{tool}: comment root lifecycle must be null, open, or resolved, or informational \u{2014} the named form of null (got {other})"
-                )))
-            }
-        },
+    let position = match position_for_bearer_checked_on(tx, &bearer_ids[0]).await? {
+        Ok(position) => position,
+        Err(shape) => return Ok(Err(shape)),
+    };
+    // Creation never manufactures already-resolved history. Resolution is an
+    // explicit compare-and-set transition through update_record.
+    if lifecycle == Some(RESOLVED) {
+        return Ok(Err(CommentShape::ResolvedRoot));
     }
-    Ok(())
+    match check_prospective(position, body, lifecycle, summary) {
+        Ok(()) => Ok(Ok(position)),
+        Err(shape) => Ok(Err(shape)),
+    }
 }
 
 pub async fn validate_create_on(
@@ -246,21 +445,50 @@ pub async fn validate_create_on(
     lifecycle: Option<&str>,
     summary: Option<&str>,
 ) -> Result<Position> {
-    if bearer_ids.len() != 1 {
-        return Err(Error::engine(format!(
-            "{tool}: Annotation kind:comment requires exactly one outgoing part_of link to its bearer"
-        )));
+    match validate_create_checked_on(tx, bearer_ids, body, lifecycle, summary).await? {
+        Ok(position) => Ok(position),
+        Err(shape) => Err(Error::engine(render_shape(tool, &shape))),
     }
-    let position = position_for_bearer_on(tx, tool, &bearer_ids[0]).await?;
-    // Creation never manufactures already-resolved history. Resolution is an
-    // explicit compare-and-set transition through update_record.
-    if lifecycle == Some(RESOLVED) {
-        return Err(Error::engine(format!(
-            "{tool}: comment roots cannot be created resolved; create open, then resolve with update_record"
-        )));
+}
+
+/// Stored, unchanged-context comment eligibility. Expected CommentShape absence
+/// is inner; storage/identity/normalization failures stay outer. Unlike create,
+/// a valid resolved stored root is admitted. Canonical prospective/target and
+/// unchanged update-transition checks are shared with the public writer.
+pub(crate) async fn validate_stored_checked_on(
+    tx: &mut Transaction<'_, Sqlite>,
+    id: &str,
+    proof: &mut Vec<serde_json::Value>,
+) -> Result<std::result::Result<(), CommentShape>> {
+    // Read and normalize the candidate state just as the ordinary reader does.
+    let (body, lifecycle, summary): (Option<String>, Option<String>, Option<String>) =
+        sqlx::query_as("SELECT body,lifecycle,summary FROM records WHERE id=?")
+            .bind(id)
+            .fetch_one(&mut **tx)
+            .await?;
+    proof.push(serde_json::json!({"template":"eligibility.comment-state.v1","id":id,"body":body,"lifecycle":lifecycle,"summary":summary}));
+    let bearers = bearer_ids_on(tx, id).await?;
+    proof.push(serde_json::json!({"template":"eligibility.bearers.v1","id":id,"targets":bearers}));
+    if bearers.len() != 1 {
+        return Ok(Err(CommentShape::BearerCount));
     }
-    validate_prospective(tool, position, body, lifecycle, summary)?;
-    Ok(position)
+    let position =
+        match position_for_bearer_checked_identity_on(tx, &bearers[0], true, proof).await? {
+            Ok(position) => position,
+            Err(shape) => return Ok(Err(shape)),
+        };
+    if let Err(shape) =
+        validate_target_shape_recorded_on(tx, id, position, &bearers[0], proof).await?
+    {
+        return Ok(Err(shape));
+    }
+    // Unchanged stored update has no lifecycle/summary touch.
+    Ok(check_prospective(
+        position,
+        body.as_deref(),
+        lifecycle.as_deref(),
+        summary.as_deref(),
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -420,4 +648,142 @@ pub async fn assert_bearer_immutable_on(
         )));
     }
     Ok(())
+}
+
+/// Pins every legacy Engine text rendered from a typed shape refusal.
+/// Byte-identity with the historical validator messages is the ordinary
+/// compatibility contract; add a case here with any new variant.
+#[cfg(test)]
+mod shape_text_tests {
+    use super::*;
+
+    #[test]
+    fn rendered_texts_match_historical_validator_messages() {
+        let tool = "create_record";
+        let cases: Vec<(CommentShape, String)> = vec![
+            (
+                CommentShape::BearerCount,
+                format!("{tool}: Annotation kind:comment requires exactly one outgoing part_of link to its bearer"),
+            ),
+            (
+                CommentShape::MissingBearer,
+                format!("{tool}: comment bearer does not exist"),
+            ),
+            (
+                CommentShape::DeletedBearer,
+                format!("{tool}: comment bearer is deleted (tombstoned)"),
+            ),
+            (
+                CommentShape::InvalidRootBearer,
+                format!("{tool}: reply bearer must be a valid root comment"),
+            ),
+            (
+                CommentShape::DeadRootBearer,
+                format!("{tool}: reply bearer has a dead bearer"),
+            ),
+            (
+                CommentShape::NestedReply,
+                format!("{tool}: replies must bear directly on a root comment; reply-to-reply nesting is not supported"),
+            ),
+            (
+                CommentShape::ResolvedRoot,
+                format!("{tool}: comment roots cannot be created resolved; create open, then resolve with update_record"),
+            ),
+            (
+                CommentShape::BlankBody,
+                format!("{tool}: Annotation kind:comment requires a nonblank body"),
+            ),
+            (
+                CommentShape::ReplyLifecycle,
+                format!("{tool}: comment replies must have null lifecycle; thread state lives on the root"),
+            ),
+            (
+                CommentShape::ReplySummary,
+                format!("{tool}: comment replies cannot carry a resolution summary"),
+            ),
+            (
+                CommentShape::RootSummary,
+                format!("{tool}: comment resolution summary is only valid on a resolved root"),
+            ),
+            (
+                CommentShape::ResolvedNeedsSummary,
+                format!("{tool}: resolved comment root requires a nonblank resolution summary"),
+            ),
+            (
+                CommentShape::BadRootLifecycle { got: "snoozed".into() },
+                format!("{tool}: comment root lifecycle must be null, open, or resolved, or informational \u{2014} the named form of null (got snoozed)"),
+            ),
+            (
+                CommentShape::ReplyTargeted,
+                format!("{tool}: comment replies must be targetless; quoted context belongs to the root"),
+            ),
+            (
+                CommentShape::BadAnchor,
+                format!("{tool}: anchored comment root must target its part_of bearer's body"),
+            ),
+        ];
+        assert_eq!(cases.len(), 15, "pin every CommentShape variant");
+        for (shape, expected) in &cases {
+            assert_eq!(&render_shape(tool, shape), expected, "{shape:?}");
+        }
+        // The pure decider agrees with the legacy wrapper on representative
+        // inputs, so the typed path cannot admit what the wrapper refuses.
+        assert_eq!(
+            check_prospective(Position::Reply, Some("x"), None, None),
+            Ok(())
+        );
+        assert_eq!(
+            check_prospective(Position::Reply, Some("x"), Some("open"), None),
+            Err(CommentShape::ReplyLifecycle)
+        );
+        assert_eq!(check_target_shape(Position::Root, "b", None), Ok(()));
+        assert_eq!(
+            check_target_shape(Position::Reply, "b", Some(("b", "body"))),
+            Err(CommentShape::ReplyTargeted)
+        );
+    }
+}
+
+#[cfg(test)]
+mod stored_eligibility_tests {
+    use super::*;
+    #[tokio::test]
+    async fn checked_stored_eligibility_preserves_early_exclusion_before_bad_kind() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        for (id, kind, body, deleted) in [
+            ("comment", "comment", "body", None),
+            ("deleted", "", "body", Some("gone")),
+            ("root", "comment", "", None),
+            ("bad-root-target", "", "body", None),
+        ] {
+            sqlx::query("INSERT INTO records(id,type,kind,name,body,deleted_at) VALUES (?,'Annotation',?,'probe',?,?)").bind(id).bind(kind).bind(body).bind(deleted).execute(db.write_pool()).await.unwrap();
+        }
+        sqlx::query("INSERT INTO links(id,source_id,target_id,relationship) VALUES ('probe1','comment','deleted','part_of'),('probe2','root','bad-root-target','part_of')").execute(db.write_pool()).await.unwrap();
+        let mut tx = db.write_pool().begin().await.unwrap();
+        let mut proof = Vec::new();
+        assert_eq!(
+            validate_stored_checked_on(&mut tx, "comment", &mut proof)
+                .await
+                .unwrap(),
+            Err(CommentShape::DeletedBearer)
+        );
+        assert!(!proof
+            .iter()
+            .any(|v| v["template"] == "eligibility.kind-input.v1"));
+        tx.rollback().await.unwrap();
+        sqlx::query("UPDATE links SET target_id='root' WHERE id='probe1'")
+            .execute(db.write_pool())
+            .await
+            .unwrap();
+        let mut tx = db.write_pool().begin().await.unwrap();
+        let mut proof = Vec::new();
+        assert_eq!(
+            validate_stored_checked_on(&mut tx, "comment", &mut proof)
+                .await
+                .unwrap(),
+            Err(CommentShape::BlankBody)
+        );
+        assert!(!proof.iter().any(|v| v["id"] == "bad-root-target"));
+        tx.rollback().await.unwrap();
+    }
 }

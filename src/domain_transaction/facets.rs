@@ -18,7 +18,7 @@ use crate::portable_sql::{
     NormalizedValue, StatementKind, StatementTemplate,
 };
 use crate::query::cascade;
-use crate::schema::{spine_facet_column, ARCHIVED_FACET_KEY, SPINE_FACET_KEYS};
+use crate::schema::{spine_facet_column, SPINE_FACET_KEYS};
 use crate::store::AppendSpec;
 use crate::{Error, Result};
 
@@ -333,13 +333,30 @@ pub(crate) enum FacetKeyClassification {
     GovernedRelationship { relationship_type: String },
 }
 
-pub(crate) fn classify_facet_key(key: &str) -> FacetKeyClassification {
-    if key == ARCHIVED_FACET_KEY
-        || key == crate::blob::BLOB_REF_FACET_KEY
-        || key == crate::canvas::PROMOTED_FROM_FACET_KEY
-    {
+/// Owning-tool sentence for an engine-reserved facet key, looked up in the
+/// shared [`crate::schema::ENGINE_RESERVED_FACET_GUIDANCE`] table beside
+/// [`crate::schema::ENGINE_RESERVED_FACET_KEYS`]. Returns `None` for open,
+/// spine and governed-relationship keys. The three pre-retraction fragments
+/// reproduce their historical refusal text byte-identically.
+pub(crate) fn engine_reserved_facet_guidance(key: &str) -> Option<&'static str> {
+    crate::schema::ENGINE_RESERVED_FACET_GUIDANCE
+        .iter()
+        .find(|(reserved, _)| *reserved == key)
+        .map(|(_, guidance)| *guidance)
+}
+
+/// Shared classification with an injectable spine lookup so tests can
+/// exercise a synthetic reserved-over-spine overlap through the same
+/// production logic. Production always passes `spine_facet_column(key)`.
+fn classify_facet_key_with_spine(
+    key: &str,
+    spine_column: Option<&'static str>,
+) -> FacetKeyClassification {
+    // Reserved first: an overlap with a spine key stays reserved, never
+    // silently becomes spine-configurable.
+    if crate::schema::ENGINE_RESERVED_FACET_KEYS.contains(&key) {
         FacetKeyClassification::EngineReserved
-    } else if let Some(create_record_path) = spine_facet_column(key) {
+    } else if let Some(create_record_path) = spine_column {
         FacetKeyClassification::Spine { create_record_path }
     } else if let Some(relationship_type) = governed_relationship_type_for_key(key) {
         FacetKeyClassification::GovernedRelationship { relationship_type }
@@ -348,22 +365,20 @@ pub(crate) fn classify_facet_key(key: &str) -> FacetKeyClassification {
     }
 }
 
+pub(crate) fn classify_facet_key(key: &str) -> FacetKeyClassification {
+    classify_facet_key_with_spine(key, spine_facet_column(key))
+}
+
 pub(crate) fn assert_open_facet_key(tool: &str, key: &str) -> Result<()> {
-    if key == ARCHIVED_FACET_KEY {
+    // Gate on the same constant the classifier reads. Guidance is selected
+    // second; a reserved key without a guidance entry still fails closed
+    // with generic reserved guidance rather than falling through to spine
+    // or open admission.
+    if crate::schema::ENGINE_RESERVED_FACET_KEYS.contains(&key) {
+        let guidance = engine_reserved_facet_guidance(key)
+            .unwrap_or("reserved for engine use and not user-configurable");
         return Err(Error::engine(format!(
-            "{tool}: facet '{ARCHIVED_FACET_KEY}' is engine-reserved — archive and restore via the archive_record tool"
-        )));
-    }
-    if key == crate::blob::BLOB_REF_FACET_KEY {
-        return Err(Error::engine(format!(
-            "{tool}: facet '{}' is engine-reserved — create attachment bindings via the attach_text or attach_from_url tool",
-            crate::blob::BLOB_REF_FACET_KEY
-        )));
-    }
-    if key == crate::canvas::PROMOTED_FROM_FACET_KEY {
-        return Err(Error::engine(format!(
-            "{tool}: facet '{}' is engine-reserved — it records that a record was promoted from a canvas, and only manage_canvas.promote writes it",
-            crate::canvas::PROMOTED_FROM_FACET_KEY
+            "{tool}: facet '{key}' is engine-reserved — {guidance}"
         )));
     }
     if let Some(column) = spine_facet_column(key) {
@@ -388,9 +403,39 @@ pub(crate) struct FacetWrite {
     pub(crate) key: String,
     pub(crate) value: Value,
     pub(crate) vocab_ref: Option<String>,
+    /// Set by [`govern_facet_writes`] when the resolved shape declares a
+    /// typed time type. The value is then already in its persisted form, and
+    /// `facet.set` carries the type so the content projector can fold the
+    /// `facet_times` row without reading schema state.
+    pub(crate) time_type: Option<crate::typed_time::TimeFacetType>,
 }
 
 impl FacetWrite {
+    /// Take what governance decided for this key from a governed copy: the
+    /// governing vocabulary, and for a typed time facet the persisted value
+    /// and its type. Writers that govern a clone (so that engine-added keys
+    /// such as lifecycle are judged with the caller's) call this per key.
+    pub(crate) fn adopt_governed(&mut self, governed: Option<&FacetWrite>) {
+        self.vocab_ref = governed.and_then(|checked| checked.vocab_ref.clone());
+        if let Some(checked) = governed.filter(|checked| checked.time_type.is_some()) {
+            self.value = checked.value.clone();
+            self.time_type = checked.time_type;
+        }
+    }
+
+    /// Stamp the governed outcome onto a `facet.set` payload built before
+    /// governance ran: `vocab_ref` when governed, and for a typed time facet
+    /// the persisted value and `time_kind`.
+    pub(crate) fn stamp_governed_payload(&self, payload: &mut Value) {
+        if let Some(vocab_ref) = &self.vocab_ref {
+            payload["vocab_ref"] = json!(vocab_ref);
+        }
+        if let Some(time_type) = self.time_type {
+            payload["value"] = json!(self.stored_value());
+            payload[crate::events::FACET_TIME_KIND_MEMBER] = json!(time_type.as_str());
+        }
+    }
+
     pub(crate) fn stored_value(&self) -> String {
         match &self.value {
             Value::String(value) => value.clone(),
@@ -412,6 +457,7 @@ pub(crate) fn parse_facet_write_value(tool: &str, key: &str, value: &Value) -> R
             key: key.into(),
             value: value.clone(),
             vocab_ref: None,
+            time_type: None,
         }),
         Value::Object(object)
             if object
@@ -439,12 +485,14 @@ pub(crate) fn parse_facet_write_value(tool: &str, key: &str, value: &Value) -> R
                 key: key.into(),
                 value: facet_value.clone(),
                 vocab_ref,
+                time_type: None,
             })
         }
         Value::Object(_) => Ok(FacetWrite {
             key: key.into(),
             value: value.clone(),
             vocab_ref: None,
+            time_type: None,
         }),
         _ => Err(Error::engine(format!(
             "{tool}: facet '{key}' must be a string, number, object or {{ value, vocab_ref }}"
@@ -481,12 +529,18 @@ pub(crate) struct FacetPredicateAssessment {
     pub(crate) governing_vocabulary: Option<FacetVocabularyIdentity>,
     pub(crate) value_resolution: Option<FacetVocabularyValueResolution>,
     pub(crate) issues: Vec<FacetPredicateIssue>,
+    /// The persisted form of a value accepted under a typed time type.
+    #[serde(skip)]
+    pub(crate) typed_time: Option<(crate::typed_time::TimeFacetType, Value)>,
 }
 
 pub(crate) fn facet_set_spec(record_id: &str, facet: &FacetWrite, actor: &str) -> AppendSpec {
     let mut payload = json!({ "key": facet.key, "value": facet.stored_value() });
     if let Some(vocab_ref) = &facet.vocab_ref {
         payload["vocab_ref"] = json!(vocab_ref);
+    }
+    if let Some(time_type) = facet.time_type {
+        payload[crate::events::FACET_TIME_KIND_MEMBER] = json!(time_type.as_str());
     }
     AppendSpec {
         record_id: record_id.into(),
@@ -925,6 +979,7 @@ where
             key: key.clone(),
             value,
             vocab_ref,
+            time_type: None,
         }),
         Some((_value, _)) => {
             return Err(Error::engine(format!(
@@ -1342,12 +1397,12 @@ async fn resolve_record_facets<E: DomainStatementExecutor>(
             // (assert_no_reserved_facet_keys refuses them), so the cascade
             // has no shape for them and an object-valued reserved facet
             // would otherwise decode as a raw JSON string with no error.
-            let object_typed = shape
-                .get(&key)
-                .and_then(|shape| shape.get("type"))
-                .and_then(Value::as_str)
-                == Some("object")
-                || key == crate::canvas::PROMOTED_FROM_FACET_KEY;
+            let object_typed = crate::domain_transaction::declared_type_is_json_object(
+                shape
+                    .get(&key)
+                    .and_then(|shape| shape.get("type"))
+                    .and_then(Value::as_str),
+            ) || key == crate::canvas::PROMOTED_FROM_FACET_KEY;
             let value = stored.map(|stored| {
                 if object_typed {
                     serde_json::from_str::<Value>(&stored)
@@ -1849,6 +1904,7 @@ pub(crate) async fn assess_facet_write<E: DomainStatementExecutor>(
                 governing_vocabulary: None,
                 value_resolution: None,
                 issues: vec![predicate_issue("saved_sql_not_portable", message)],
+                typed_time: None,
             });
         }
     }
@@ -1875,6 +1931,7 @@ pub(crate) async fn assess_facet_write<E: DomainStatementExecutor>(
             governing_vocabulary: None,
             value_resolution: None,
             issues,
+            typed_time: None,
         });
     };
     let shape_suffix = kind.map(|kind| format!(":{kind}")).unwrap_or_default();
@@ -1896,6 +1953,7 @@ pub(crate) async fn assess_facet_write<E: DomainStatementExecutor>(
         issues.push(lifecycle_governance_issue(tool, record_type, kind));
     }
 
+    let mut typed_time = None;
     match declared_type.as_deref() {
         Some("number") if !facet.value.is_number() => issues.push(predicate_issue(
             "declared_type_mismatch",
@@ -1926,14 +1984,37 @@ pub(crate) async fn assess_facet_write<E: DomainStatementExecutor>(
             ),
         )),
         Some("number") | None => {}
-        Some(other) => issues.push(predicate_issue(
-            "unsupported_declared_type",
-            format!(
-                "{tool}: facet '{}' declares unsupported type '{other}' (supported: 'number', 'object')",
-                facet.key
-            ),
-        )),
+        Some(other) => match crate::typed_time::TimeFacetType::parse(other) {
+            Some(time_type) => match crate::typed_time::normalise_facet_value(
+                time_type,
+                &facet.value,
+                declared_disambiguation(shape),
+            ) {
+                Ok(stored) => typed_time = Some((time_type, stored)),
+                Err(error) => issues.push(predicate_issue(
+                    "time_value_invalid",
+                    format!(
+                        "{tool}: facet '{}' is declared type '{other}' for {record_type}{shape_suffix}: {error}",
+                        facet.key,
+                    ),
+                )),
+            },
+            None => issues.push(predicate_issue(
+                "unsupported_declared_type",
+                format!(
+                    "{tool}: facet '{}' declares unsupported type '{other}' (supported: {})",
+                    facet.key,
+                    supported_declared_types_phrase(),
+                ),
+            )),
+        },
     }
+    // A typed time value compares with a declared `values` set, and a
+    // `when` object is not an undeclared object, in its persisted form.
+    let assessed_value = typed_time
+        .as_ref()
+        .map(|(_, stored)| stored)
+        .unwrap_or(&facet.value);
     if declared_type.is_none() && facet.value.is_object() {
         issues.push(predicate_issue(
             "undeclared_object_value",
@@ -1944,13 +2025,13 @@ pub(crate) async fn assess_facet_write<E: DomainStatementExecutor>(
         ));
     }
     if let Some(allowed) = shape.get("values").and_then(Value::as_array) {
-        if !allowed.contains(&facet.value) {
+        if !allowed.contains(assessed_value) {
             issues.push(predicate_issue(
                 "not_in_declared_values",
                 format!(
                     "{tool}: facet '{}' value {} is not in the declared values set {} for {record_type}{shape_suffix}",
                     facet.key,
-                    facet.value,
+                    assessed_value,
                     Value::Array(allowed.clone()),
                 ),
             ));
@@ -2069,6 +2150,7 @@ pub(crate) async fn assess_facet_write<E: DomainStatementExecutor>(
         governing_vocabulary,
         value_resolution,
         issues,
+        typed_time,
     })
 }
 
@@ -2104,8 +2186,65 @@ pub(crate) async fn govern_facet_writes<E: DomainStatementExecutor>(
         if let Some(vocabulary) = assessment.governing_vocabulary {
             facet.vocab_ref = Some(crate::meta::vocab_ref(&vocabulary.id));
         }
+        if let Some((time_type, stored)) = assessment.typed_time {
+            facet.value = stored;
+            facet.time_type = Some(time_type);
+        }
     }
     Ok(())
+}
+
+/// Whether a declared facet type persists its value as JSON object text that
+/// readers decode: `object`, and the object-valued typed time types `zoned`
+/// and `when`. `date` and `instant` persist as plain strings.
+///
+/// Readers apply this to the *current* declaration, not to how a value was
+/// written, exactly as they always have for `object`. So declaring a key
+/// `zoned`, `when` or `object` later changes the read shape of text stored
+/// under it earlier: stored text that parses as a JSON object reads back as
+/// that object, anything else as the original string. The stored text and
+/// the `facet_times` projection (which follows write-time `time_kind` only)
+/// are unchanged.
+pub(crate) fn declared_type_is_json_object(declared_type: Option<&str>) -> bool {
+    matches!(declared_type, Some("object" | "zoned" | "when"))
+}
+
+/// Rebuild the caller-shaped value of a stored non-numeric facet for
+/// revalidation. Stored text is ambiguous (a string and an object's JSON are
+/// both TEXT), so the `facet_times` kind decides: a current `zoned` or `when`
+/// value was accepted as an object and is decoded as one. Everything else,
+/// including every untyped facet, stays the raw string it always was.
+pub(crate) fn stored_non_numeric_facet_value(stored: String, time_kind: Option<&str>) -> Value {
+    if matches!(time_kind, Some("zoned" | "when")) {
+        if let Ok(object @ Value::Object(_)) = serde_json::from_str::<Value>(&stored) {
+            return object;
+        }
+    }
+    Value::String(stored)
+}
+
+/// Every declared facet type a supported writer understands.
+pub(crate) const DECLARED_FACET_TYPES: [&str; 6] =
+    ["number", "object", "date", "instant", "zoned", "when"];
+
+/// `'number', 'object', 'date', ...` for refusal messages.
+fn supported_declared_types_phrase() -> String {
+    DECLARED_FACET_TYPES
+        .iter()
+        .map(|name| format!("'{name}'"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// How a `zoned` or `when` shape resolves a wall time that DST skips or
+/// repeats: `disambiguation: "reject"` refuses it, and the default is
+/// Temporal's `compatible` rule. `manage_schema_config` refuses any other
+/// value, so an unrecognised one cannot reach a writer.
+pub(crate) fn declared_disambiguation(shape: &Value) -> crate::typed_time::Disambiguation {
+    match shape.get("disambiguation").and_then(Value::as_str) {
+        Some("reject") => crate::typed_time::Disambiguation::Reject,
+        _ => crate::typed_time::Disambiguation::Compatible,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2305,6 +2444,7 @@ mod tests {
             key: key.into(),
             value: Value::String("someone".into()),
             vocab_ref: None,
+            time_type: None,
         }
     }
 
@@ -2401,5 +2541,105 @@ mod tests {
         assert_eq!(indexed["index"], 3);
         assert_eq!(indexed["id"], "rec-9");
         assert_eq!(indexed["code"], GOVERNED_ALIAS_ISSUE);
+    }
+
+    #[test]
+    fn engine_reserved_table_and_constant_agree_in_both_directions() {
+        use crate::schema::{ENGINE_RESERVED_FACET_GUIDANCE, ENGINE_RESERVED_FACET_KEYS};
+
+        // The guidance table's key set equals the constant's key set, so no
+        // guidance can exist for a key outside the constant (which would
+        // falsely refuse an ordinary facet). Admission itself gates on the
+        // constant and fails closed with generic guidance when an entry is
+        // missing, so a missing entry can never silently admit. Reintroducing
+        // a private list in either function fails here in either direction.
+        let mut table_keys = ENGINE_RESERVED_FACET_GUIDANCE
+            .iter()
+            .map(|(key, _)| *key)
+            .collect::<Vec<_>>();
+        let mut constant_keys = ENGINE_RESERVED_FACET_KEYS.to_vec();
+        table_keys.sort_unstable();
+        constant_keys.sort_unstable();
+        assert_eq!(table_keys, constant_keys);
+
+        // Every reserved key classifies reserved, refuses with its own
+        // guidance, and reports guidance.
+        for key in ENGINE_RESERVED_FACET_KEYS {
+            assert!(
+                matches!(
+                    classify_facet_key(key),
+                    FacetKeyClassification::EngineReserved
+                ),
+                "{key} must classify as engine-reserved"
+            );
+            let guidance = engine_reserved_facet_guidance(key)
+                .unwrap_or_else(|| panic!("{key} must have reserved guidance"));
+            let error = assert_open_facet_key("create_record", key)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(key) && error.contains(guidance), "{error}");
+        }
+    }
+
+    #[test]
+    fn retraction_is_reserved_with_its_own_guidance_and_beats_spine() {
+        use crate::schema::RETRACTION_FACET_KEY;
+
+        assert!(crate::schema::ENGINE_RESERVED_FACET_KEYS.contains(&RETRACTION_FACET_KEY));
+        assert_eq!(
+            engine_reserved_facet_guidance(RETRACTION_FACET_KEY),
+            Some("only archive_record writes it, when a comment's author retracts it"),
+        );
+        assert!(matches!(
+            classify_facet_key(RETRACTION_FACET_KEY),
+            FacetKeyClassification::EngineReserved
+        ));
+        // Reserved-over-spine precedence through the same production logic:
+        // a synthetic spine overlap on the reserved `retraction` key still
+        // classifies reserved, never spine.
+        assert!(matches!(
+            classify_facet_key_with_spine(RETRACTION_FACET_KEY, Some("retraction")),
+            FacetKeyClassification::EngineReserved
+        ));
+        let error = assert_open_facet_key("update_record", RETRACTION_FACET_KEY)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("facet 'retraction' is engine-reserved — only archive_record writes it"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn pre_retraction_reserved_refusals_are_byte_identical() {
+        // The three historical messages survive the shared-table refactor
+        // unchanged; only the lookup moved.
+        assert_eq!(
+            assert_open_facet_key("create_record", "archived")
+                .unwrap_err()
+                .to_string(),
+            "create_record: facet 'archived' is engine-reserved — archive and restore via the archive_record tool",
+        );
+        assert_eq!(
+            assert_open_facet_key("create_record", "blob_ref")
+                .unwrap_err()
+                .to_string(),
+            "create_record: facet 'blob_ref' is engine-reserved — create attachment bindings via the attach_text or attach_from_url tool",
+        );
+        assert_eq!(
+            assert_open_facet_key("create_record", "canvas.promoted_from")
+                .unwrap_err()
+                .to_string(),
+            "create_record: facet 'canvas.promoted_from' is engine-reserved — it records that a record was promoted from a canvas, and only manage_canvas.promote writes it",
+        );
+    }
+
+    #[test]
+    fn ordinary_open_keys_stay_open() {
+        for key in ["triage", "confidence", "area", "assignees", "assigned"] {
+            assert_eq!(classify_facet_key(key), FacetKeyClassification::Open);
+            assert_open_facet_key("create_record", key).unwrap();
+            assert!(engine_reserved_facet_guidance(key).is_none());
+        }
     }
 }

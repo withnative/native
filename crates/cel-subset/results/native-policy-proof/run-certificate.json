@@ -1,0 +1,58 @@
+[
+  {
+    "command": [
+      "target/debug/cel-native-evidence",
+      "fixtures",
+      "p1",
+      "0",
+      "/tmp/ontology-rules-ownership-20261003/native-fixtures-p1.json"
+    ],
+    "started_utc": "2026-10-03T08:59:20.934951+00:00",
+    "finished_utc": "2026-10-03T08:59:49.799775+00:00",
+    "exit_code": 0,
+    "report_sha256": "39755cca5276f6609011b55b98913843c5212bf14aba7ce6d543ee3db743ab9c",
+    "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "command": [
+      "target/debug/cel-native-evidence",
+      "calibrate",
+      "p1",
+      "0",
+      "/tmp/ontology-rules-ownership-20261003/native-calibrate-p1.json"
+    ],
+    "started_utc": "2026-10-03T08:59:49.800353+00:00",
+    "finished_utc": "2026-10-03T08:59:50.943896+00:00",
+    "exit_code": 0,
+    "report_sha256": "ef4578ea91fc5c1ce78bf783971eb36f64353bcec96f59152ff23b77a1078e6b",
+    "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "command": [
+      "target/debug/cel-native-evidence",
+      "regex",
+      "p1",
+      "0",
+      "/tmp/ontology-rules-ownership-20261003/native-regex-p1.json"
+    ],
+    "started_utc": "2026-10-03T08:59:50.944691+00:00",
+    "finished_utc": "2026-10-03T08:59:51.721782+00:00",
+    "exit_code": 0,
+    "report_sha256": "36dd9f21c5b888eede18ff5945d5c6767704365607889507d8992ff86747a4bd",
+    "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "command": [
+      "target/debug/cel-native-evidence",
+      "generated",
+      "p1",
+      "10000",
+      "/tmp/ontology-rules-ownership-20261003/native-generated-p1.json"
+    ],
+    "started_utc": "2026-10-03T09:01:15.058854+00:00",
+    "finished_utc": "2026-10-03T09:06:30.716922+00:00",
+    "exit_code": 0,
+    "report_sha256": "024febad3cb50bd2124c08b1ced4fd8b15e2150817267c75889b091537feee9c",
+    "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  }
+]

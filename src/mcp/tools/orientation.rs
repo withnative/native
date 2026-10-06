@@ -699,6 +699,11 @@ fn next_steps(intent_declared: bool, world: &Value, run_key: &str) -> Value {
 
 async fn bootstrap(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
     let _args: BootstrapArgs = parse_args("bootstrap", arguments)?;
+    // Contract c323277 rev 8 §2.3(a): a member copy serves a reduced
+    // bootstrap from the admitted slice. Online legs below are unchanged.
+    if caller.is_member_copy() {
+        return bootstrap_member(db, caller).await;
+    }
     resolve_session_footing(&db, &caller, "bootstrap").await
 }
 
@@ -779,6 +784,7 @@ pub(crate) async fn resolve_session_footing(db: &Db, caller: &Caller, tool: &str
         db.pool(),
         caller.credential(),
         caller.is_host_member(),
+        caller.is_host_owner(),
         Some(&run_key),
     )
     .await?;
@@ -1029,6 +1035,671 @@ pub(crate) async fn resolve_session_footing(db: &Db, caller: &Caller, tool: &str
 }
 
 // ---------------------------------------------------------------------------
+// Member-copy bootstrap (contract c323277 rev 8 §2.3(a), consumer C2c-3)
+// ---------------------------------------------------------------------------
+
+/// The one member marker shape (contract §2.3(a)): a part the member copy
+/// cannot compute. It carries no counter and never stands in for a value.
+fn member_bootstrap_marker(surface: &str) -> Value {
+    json!({ "unavailable_offline": { "surface": surface, "retry": "when_online" } })
+}
+
+/// Reduced bootstrap over an admitted `member-read-v1` slice.
+///
+/// Serves only what the slice ships: caller-bound footing (own bindings and
+/// `member_contexts`), instructions from shipped `instruction_bindings`
+/// whose source is in the slice, and a record-derived world scan. The
+/// run/claim/intent parts are explicit markers, never empty defaults; the
+/// run key is minted locally without storage reads and never persisted.
+/// Reads only shipped tables (`records`, `bindings`, `member_contexts`,
+/// `instruction_bindings`, `facet_values`, `links`, `schema_config`,
+/// `vocabularies`, `member_display_references`); excluded tables
+/// (`policy_entries`, `content_events`, `read_log_*`, onboarding companions)
+/// are never touched, so a missing table is a closed failure, not a probe.
+async fn bootstrap_member(db: Db, caller: Caller) -> Result<Value> {
+    const TOOL: &str = "bootstrap";
+    let run_key = match caller.run_key() {
+        Some(existing) => existing.to_string(),
+        // No `suggest_in_pool`: it reads `content_events`/`read_log_calls`,
+        // both excluded. Mint locally; the key is nondurable and only
+        // becomes real by being used.
+        None => crate::runkey::mint_fresh_agent_run(&HashSet::new())?,
+    };
+
+    // Canonical root by known id, never by parentless-row census: the
+    // producer nulls `home_id` when a visible child's parent is hidden
+    // (§3.3 rule 1), so a valid slice holds redacted orphans alongside
+    // the root. Counting parentless rows would refuse such a slice while
+    // online — where the source keeps the hidden parent id — succeeds.
+    let root = sqlx::query(
+        "SELECT r.id, r.type, r.kind, r.name, r.persistence, r.home_id, r.deleted_at
+           FROM records r WHERE r.id = ?",
+    )
+    .bind(crate::schema::ROOT_RECORD_ID)
+    .fetch_optional(db.pool())
+    .await?
+    .ok_or_else(|| {
+        Error::engine(format!(
+            "{TOOL}: canonical-root invariant violated: '{0}' is not in the admitted slice",
+            crate::schema::ROOT_RECORD_ID,
+        ))
+    })?;
+    let root_deleted: Option<String> = root.try_get("deleted_at")?;
+    let root_home: Option<String> = root.try_get("home_id")?;
+    if root_deleted.is_some() || root_home.is_some() {
+        return Err(Error::engine(format!(
+            "{TOOL}: canonical-root invariant violated: '{0}' is not a live parentless record",
+            crate::schema::ROOT_RECORD_ID,
+        )));
+    }
+    let root_archived: Option<String> = sqlx::query_scalar(
+        "SELECT av.record_id FROM facet_values av WHERE av.record_id = ? AND av.key = 'archived'",
+    )
+    .bind(crate::schema::ROOT_RECORD_ID)
+    .fetch_optional(db.pool())
+    .await?;
+    if root_archived.is_some() {
+        return Err(Error::engine(format!(
+            "{TOOL}: canonical-root invariant violated: '{0}' is archived",
+            crate::schema::ROOT_RECORD_ID,
+        )));
+    }
+    let root_id: String = root.try_get("id")?;
+
+    let observed_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let principal = member_principal_footing(&db, &caller, &observed_at).await?;
+    let workspace = member_workspace_footing(&db, &caller, &root).await?;
+    let current_world = member_current_world(&db, &caller, &observed_at).await?;
+    let intent_declared = caller.intent().is_some();
+    let next_steps = next_steps(intent_declared, &current_world, &run_key);
+    let orientation = json!({
+        "template_key": crate::instructions::ENGINE_ORIENTATION_TEMPLATE_KEY,
+        "template_version": crate::instructions::ENGINE_ORIENTATION_TEMPLATE_VERSION,
+        "content": crate::instructions::ENGINE_ORIENTATION,
+        "ownership": "build-owned and guaranteed independently of portable instruction resolution",
+    });
+    let instructions = member_instruction_stack(&db, &caller).await?;
+    let entry_count = instructions.entries.len();
+    let standing_context = json!({
+        "portable_instructions": {
+            "status": instructions.status,
+            "entry_count": entry_count,
+            "exact_entries_path": "/instructions/entries",
+            "diagnostics_path": "/instructions/diagnostics",
+            "note": "Binding layers only (workspace + member). Obligation-derived sources are unavailable offline; see /pending_obligations.",
+        },
+        "pending_onboarding_obligations": member_bootstrap_marker("bootstrap.claim"),
+        "note": "Permissions and product boundaries still apply when no additional instruction body is present.",
+        "product_boundaries": [
+            "Native does not passively learn from or observe activity outside durable recorded state and calls made through currently available tools.",
+            "Do not claim unverified training, egress, encryption, security, compliance, confidentiality, residency, or data-sovereignty properties.",
+            "Do not run unprompted bulk surveys or imports, or offer connectors that are not currently available."
+        ],
+    });
+    // Run/claim/intent parts are markers, never empty defaults. The session
+    // key is functional but explicitly nondurable: minted without storage
+    // reads, never persisted, real only by being used.
+    let intentful_sessions = member_bootstrap_marker("bootstrap.intent");
+    let pending_obligations = member_bootstrap_marker("bootstrap.claim");
+    let run = member_bootstrap_marker("bootstrap.run");
+    let session = json!({
+        "run_key": run_key,
+        "reuse_required": false,
+        "nondurable": true,
+        "guidance": "Member-copy run key: minted locally without storage reads and never persisted. Pass it for call correlation within this session only; it carries no run history and survives no reconnect.",
+        "whole_run_rollback": false,
+    });
+    let engine = json!({
+        "name": ENGINE_NAME,
+        "version": ENGINE_VERSION,
+        "schema_version": CURRENT_ENGINE_SCHEMA_VERSION,
+        "user_version": user_version(&db).await?,
+    });
+    let roots = member_roots(&db, &root_id, &root).await?;
+    let orientation_bytes =
+        enforce_component("orientation", &orientation, MAX_BOOTSTRAP_ORIENTATION_BYTES)?;
+    let footing = json!({ "principal": &principal, "workspace": &workspace, "standing_context": &standing_context });
+    let footing_bytes = enforce_component("footing", &footing, MAX_BOOTSTRAP_FOOTING_BYTES)?;
+    let current_world_bytes = enforce_component(
+        "current-world",
+        &current_world,
+        MAX_BOOTSTRAP_CURRENT_WORLD_BYTES,
+    )?;
+    let intentful_sessions_bytes = enforce_component(
+        "intentful-sessions",
+        &intentful_sessions,
+        MAX_BOOTSTRAP_INTENTFUL_SESSIONS_BYTES,
+    )?;
+    let next_steps_bytes =
+        enforce_component("next-steps", &next_steps, MAX_BOOTSTRAP_NEXT_STEPS_BYTES)?;
+    let session_bytes = enforce_component("session", &session, MAX_BOOTSTRAP_SESSION_BYTES)?;
+    let compatibility = json!({ "engine": &engine, "run": &run, "roots": &roots });
+    let compatibility_bytes = enforce_component(
+        "compatibility",
+        &compatibility,
+        MAX_BOOTSTRAP_COMPATIBILITY_BYTES,
+    )?;
+    let instruction_context = json!({
+        "instructions": &instructions,
+        "pending_obligations": &pending_obligations,
+    });
+    let instruction_context_bytes = enforce_component(
+        "instruction-context",
+        &instruction_context,
+        MAX_BOOTSTRAP_INSTRUCTION_CONTEXT_BYTES,
+    )?;
+    let json_envelope_bytes = bootstrap_json_envelope_bytes()?;
+    if json_envelope_bytes > MAX_BOOTSTRAP_JSON_ENVELOPE_BYTES {
+        return Err(Error::engine(format!(
+            "bootstrap JSON envelope is {json_envelope_bytes} bytes; limit is {MAX_BOOTSTRAP_JSON_ENVELOPE_BYTES} bytes"
+        )));
+    }
+    let contract = json!({
+        "version": BOOTSTRAP_CONTRACT_VERSION,
+        "intent_agnostic": true,
+        "member_copy": true,
+        "compatibility_projections": ["run", "roots", "instructions", "pending_obligations", "engine"],
+        "bounds_bytes": {
+            "orientation": MAX_BOOTSTRAP_ORIENTATION_BYTES,
+            "footing": MAX_BOOTSTRAP_FOOTING_BYTES,
+            "current_world": MAX_BOOTSTRAP_CURRENT_WORLD_BYTES,
+            "intentful_sessions": MAX_BOOTSTRAP_INTENTFUL_SESSIONS_BYTES,
+            "next_steps": MAX_BOOTSTRAP_NEXT_STEPS_BYTES,
+            "session": MAX_BOOTSTRAP_SESSION_BYTES,
+            "compatibility": MAX_BOOTSTRAP_COMPATIBILITY_BYTES,
+            "contract": MAX_BOOTSTRAP_CONTRACT_BYTES,
+            "diagnostics": MAX_BOOTSTRAP_DIAGNOSTICS_BYTES,
+            "tool_exposure": MAX_BOOTSTRAP_TOOL_EXPOSURE_BYTES,
+            "json_envelope": MAX_BOOTSTRAP_JSON_ENVELOPE_BYTES,
+            "instruction_context": MAX_BOOTSTRAP_INSTRUCTION_CONTEXT_BYTES,
+            "portable_instruction_bodies": crate::instructions::MAX_RESOLVED_INSTRUCTION_BYTES,
+            "portable_context_metadata": crate::instructions::MAX_BOOTSTRAP_CONTEXT_METADATA_BYTES,
+            "instruction_context_overhead": MAX_BOOTSTRAP_INSTRUCTION_CONTEXT_OVERHEAD_BYTES,
+            "total": MAX_BOOTSTRAP_TOTAL_BYTES,
+        },
+    });
+    let contract_bytes = enforce_component("contract", &contract, MAX_BOOTSTRAP_CONTRACT_BYTES)?;
+    let diagnostics = json!({
+        "engine": &engine,
+        "member_copy": true,
+        "component_bytes": {
+            "contract": contract_bytes,
+            "orientation": orientation_bytes,
+            "footing": footing_bytes,
+            "current_world": current_world_bytes,
+            "intentful_sessions": intentful_sessions_bytes,
+            "next_steps": next_steps_bytes,
+            "session": session_bytes,
+            "compatibility": compatibility_bytes,
+            "instruction_context": instruction_context_bytes,
+            "json_envelope": json_envelope_bytes,
+        },
+        "instruction_provenance": "Retained under instructions.entries[].source; intentionally omitted from default text.",
+    });
+    enforce_component("diagnostics", &diagnostics, MAX_BOOTSTRAP_DIAGNOSTICS_BYTES)?;
+
+    let payload = json!({
+        "contract": contract,
+        "orientation": orientation,
+        "principal": principal,
+        "workspace": workspace,
+        "standing_context": standing_context,
+        "current_world": current_world,
+        "intentful_sessions": intentful_sessions,
+        "next_steps": next_steps,
+        "session": session,
+        "diagnostics": diagnostics,
+        "engine": {
+            "name": ENGINE_NAME,
+            "version": ENGINE_VERSION,
+            "schema_version": CURRENT_ENGINE_SCHEMA_VERSION,
+            "user_version": user_version(&db).await?,
+        },
+        "run": run,
+        "roots": roots,
+        "instructions": instructions,
+        "pending_obligations": pending_obligations,
+    });
+    let total_bytes = serialized_bytes(&payload)?;
+    if total_bytes > MAX_BOOTSTRAP_TOTAL_BYTES {
+        return Err(Error::engine(format!(
+            "bootstrap payload is {total_bytes} bytes; compositional transport limit is {MAX_BOOTSTRAP_TOTAL_BYTES} bytes"
+        )));
+    }
+    Ok(payload)
+}
+
+/// Slice presence: the admitted copy holds exactly E(m), so a row's
+/// presence is its visibility. No policy/Unit fold (excluded tables).
+async fn slice_contains(pool: &sqlx::SqlitePool, id: &str) -> Result<bool> {
+    let row = sqlx::query("SELECT 1 FROM records WHERE id = ? AND deleted_at IS NULL")
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.is_some())
+}
+
+/// Caller-bound principal footing from the slice. Own `account`/`email`
+/// bindings and the person record ship caller-bound (§3.2); the private
+/// context comes from the shipped `member_contexts` row without the
+/// `policy_entries` verification online performs, so policy-dependent
+/// parts are markers rather than verified claims.
+async fn member_principal_footing(db: &Db, caller: &Caller, observed_at: &str) -> Result<Value> {
+    let row = sqlx::query(
+        "SELECT r.id, r.name,
+                (SELECT e.identifier FROM bindings e
+                   WHERE e.record_id=r.id AND e.system='email' AND e.is_canonical=1
+                   ORDER BY e.identifier LIMIT 1) AS email
+            FROM bindings a
+            JOIN records r ON r.id=a.record_id
+           WHERE a.system='account' AND a.identifier=? AND a.is_canonical=1
+             AND r.deleted_at IS NULL
+           LIMIT 1",
+    )
+    .bind(caller.credential())
+    .fetch_optional(db.pool())
+    .await?;
+
+    let mut person_record_id = None;
+    let mut display_name = None;
+    let mut display_name_truncated = false;
+    let mut email = None;
+    let mut email_truncated = false;
+    if let Some(row) = row {
+        let id: String = row.try_get("id")?;
+        // Slice presence replaces `can_record`: the join already ran over
+        // shipped rows only.
+        if slice_contains(db.pool(), &id).await? {
+            person_record_id = Some(id);
+            let raw_name: String = row.try_get("name")?;
+            if !raw_name.trim().is_empty() {
+                let (bounded, truncated) = bounded_text(&raw_name, MAX_PREVIEW_NAME_CHARS);
+                display_name = Some(bounded);
+                display_name_truncated = truncated;
+            }
+            let raw_email: Option<String> = row.try_get("email")?;
+            if let Some(raw_email) = raw_email.filter(|value| !value.trim().is_empty()) {
+                let (bounded, truncated) = bounded_text(&raw_email, MAX_PREVIEW_NAME_CHARS);
+                email = Some(bounded);
+                email_truncated = truncated;
+            }
+        }
+    }
+
+    // Shipped caller row only; no `policy_entries` read, so the boundary is
+    // reported from the row without the online policy verification.
+    let context_row = sqlx::query(
+        "SELECT mc.root_record_id, mc.person_record_id, r.name
+           FROM member_contexts mc JOIN records r ON r.id=mc.root_record_id
+          WHERE mc.account_id=?",
+    )
+    .bind(caller.credential())
+    .fetch_optional(db.pool())
+    .await?;
+    let private_context = if let Some(row) = context_row {
+        let root_record_id: String = row.try_get("root_record_id")?;
+        let raw_name: String = row.try_get("name")?;
+        let (name, name_truncated) = bounded_text(&raw_name, MAX_PREVIEW_NAME_CHARS);
+        Some(json!({
+            "root_record_id": root_record_id,
+            "name": name,
+            "name_truncated": name_truncated,
+            "visibility": "member_copy",
+            "visibility_guidance": "Caller-bound row from the admitted copy. The online policy verification over excluded policy tables cannot run offline.",
+            "starting_context_contract": member_bootstrap_marker("bootstrap.claim"),
+        }))
+    } else {
+        None
+    };
+
+    Ok(json!({
+        "person_record_id": person_record_id,
+        "display_name": display_name,
+        "display_name_truncated": display_name_truncated,
+        "email": email,
+        "email_truncated": email_truncated,
+        "identity_basis": "member copy slice: authenticated credential with a producer-attested visible binding",
+        "principal_distinction": "The authenticated human principal is distinct from the agent or client acting for them.",
+        "local_timezone": null,
+        "local_datetime": null,
+        "local_time_status": "unknown: no verified principal timezone is available in native-ce",
+        "utc_datetime": observed_at,
+        "private_context": private_context,
+    }))
+}
+
+/// Record-derived workspace footing over the slice: the root name plus
+/// slice counts. No `visible_ids` fold (policy reads); counts are over
+/// shipped rows with the slice-bound qualification stated.
+async fn member_workspace_footing(
+    db: &Db,
+    _caller: &Caller,
+    root: &sqlx::sqlite::SqliteRow,
+) -> Result<Value> {
+    let raw_name: String = root.try_get("name")?;
+    let (name, name_truncated) = bounded_text(&raw_name, MAX_PREVIEW_NAME_CHARS);
+    let not_hidden = crate::query::member_not_hidden_predicate("r");
+    let records_visible: i64 = sqlx::query_scalar(&format!(
+        "SELECT COUNT(*) FROM records r
+          WHERE r.deleted_at IS NULL AND {not_hidden}
+            AND NOT EXISTS (SELECT 1 FROM facet_values av
+                              WHERE av.record_id=r.id AND av.key='archived')"
+    ))
+    .fetch_one(db.pool())
+    .await?;
+    let registered_humans_visible: i64 = sqlx::query_scalar(&format!(
+        "SELECT COUNT(DISTINCT r.id) FROM records r
+           JOIN bindings a ON a.record_id=r.id
+          WHERE r.deleted_at IS NULL AND {not_hidden}
+            AND r.type='Entity' AND r.kind='person'
+            AND a.system='account' AND a.is_canonical=1"
+    ))
+    .fetch_one(db.pool())
+    .await?;
+
+    Ok(json!({
+        "scope": "one connected Native database and one primary workspace",
+        "primary_workspace": {
+            "id": crate::schema::ROOT_RECORD_ID,
+            "name": name,
+            "name_truncated": name_truncated,
+        },
+        "records_visible": records_visible.max(0) as usize,
+        "record_count_truncated": false,
+        "record_count_qualification": "admitted slice rows visible to this member; hidden, withdrawn and nonexistent records are absent, never zeroed",
+        "registered_humans_visible": registered_humans_visible.max(0) as usize,
+        "human_count_truncated": false,
+        "human_count_qualification": "person records in the admitted slice; not proof of an exhaustive roster",
+        "known_limitations": ["personal-home and multi-workspace orientation are outside the current native-ce bootstrap horizon"],
+    }))
+}
+
+/// Compatibility `roots` projection over the slice: the root plus the
+/// count of its non-archived children in the copy.
+async fn member_roots(db: &Db, root_id: &str, root: &sqlx::sqlite::SqliteRow) -> Result<Value> {
+    let child_not_hidden = crate::query::member_not_hidden_predicate("c");
+    let visible_children: i64 = sqlx::query_scalar(&format!(
+        "SELECT COUNT(*) FROM records c
+          WHERE c.home_id=? AND c.deleted_at IS NULL
+            AND {child_not_hidden}
+            AND NOT EXISTS (SELECT 1 FROM facet_values av
+                              WHERE av.record_id=c.id AND av.key='archived')"
+    ))
+    .bind(root_id)
+    .fetch_one(db.pool())
+    .await?;
+    Ok(json!({
+        "items": [{
+            "id": root_id,
+            "type": root.try_get::<String, _>("type")?,
+            "kind": root.try_get::<Option<String>, _>("kind")?,
+            "name": root.try_get::<String, _>("name")?,
+            "persistence": root.try_get::<String, _>("persistence")?,
+            "child_count": visible_children.max(0),
+        }],
+        "total": 1,
+        "continuation": {
+            "tool": "get_structure",
+            "arguments": { "root_id": crate::schema::ROOT_RECORD_ID },
+        },
+    }))
+}
+
+/// Record-derived world scan over the slice. Same exclusions as online for
+/// the shipped tables (`native:%` ids, instruction sources, member-context
+/// persons/roots); the onboarding-source exclusion cannot run offline
+/// (companions excluded) and such rows stay listed — a stated limitation,
+/// covered by keeping onboarding-backed records out of the differential
+/// fixture. Slice presence replaces the visibility fold; succession and
+/// lifecycle interpretation reuse the member-safe seams.
+async fn member_current_world(db: &Db, caller: &Caller, observed_at: &str) -> Result<Value> {
+    let not_hidden = crate::query::member_not_hidden_predicate("r");
+    let sql = format!(
+        "SELECT r.id,r.type,r.kind,r.name,r.home_id,r.lifecycle,
+                COALESCE(r.last_activity_at,r.updated_at,r.created_at) AS observed_activity_at
+            FROM records r
+           WHERE r.deleted_at IS NULL AND {not_hidden}
+             AND r.id NOT IN (?,?)
+             AND r.id NOT LIKE 'native:%'
+             AND NOT EXISTS (SELECT 1 FROM facet_values av
+                              WHERE av.record_id=r.id AND av.key='archived')
+             AND NOT EXISTS (SELECT 1 FROM instruction_bindings ib
+                              WHERE ib.source_record_id=r.id)
+             AND NOT EXISTS (SELECT 1 FROM member_contexts mc
+                              WHERE mc.person_record_id=r.id OR mc.root_record_id=r.id)
+           ORDER BY observed_activity_at DESC,r.id LIMIT ?"
+    );
+    let rows = sqlx::query(&sql)
+        .bind(crate::schema::ROOT_RECORD_ID)
+        .bind(crate::schema::UNFILED_RECORD_ID)
+        .bind((CURRENT_WORLD_SCAN_LIMIT + 1) as i64)
+        .fetch_all(db.pool())
+        .await?;
+    let scan_truncated = rows.len() > CURRENT_WORLD_SCAN_LIMIT;
+    let rows = rows
+        .into_iter()
+        .take(CURRENT_WORLD_SCAN_LIMIT)
+        .collect::<Vec<_>>();
+
+    // Shipped schema rows only (no principal scoping over excluded policy).
+    let schema_rows = crate::query::cascade::schema_config_rows_in_pool(db.pool(), None).await?;
+    let lifecycle_interpreter =
+        crate::query::lifecycle::LifecycleInterpreter::load_from_pool(db.pool(), schema_rows)
+            .await?;
+
+    let mut superseded_stubs: Vec<Value> = rows
+        .iter()
+        .filter_map(|row| row.try_get::<String, _>("id").ok())
+        .map(|id| json!({ "id": id }))
+        .collect();
+    super::lifecycle::annotate_superseded_refs_in_pools(
+        db.pool(),
+        db.pool(),
+        caller,
+        &mut superseded_stubs,
+    )
+    .await?;
+    let superseded_by = superseded_stubs
+        .into_iter()
+        .filter_map(|stub| {
+            let id = stub.get("id")?.as_str()?.to_owned();
+            let disclosure = stub.get("superseded_by")?.clone();
+            Some((id, disclosure))
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+
+    let mut recent = Vec::new();
+    let mut open_work = Vec::new();
+    let mut recent_total = 0usize;
+    let mut open_work_total = 0usize;
+    let mut omitted_unrepresentable = 0usize;
+    for row in &rows {
+        let id: String = row.try_get("id")?;
+        recent_total += 1;
+        let record_type: String = row.try_get("type")?;
+        let kind: Option<String> = row.try_get("kind")?;
+        let home_id: Option<String> = row.try_get("home_id")?;
+        let lifecycle: Option<String> = row.try_get("lifecycle")?;
+        let interpretation = lifecycle_interpreter.interpret(
+            &record_type,
+            kind.as_deref(),
+            home_id.as_deref(),
+            lifecycle.as_deref(),
+        );
+        let item = world_item(row, &interpretation, superseded_by.get(&id))?;
+        if item.is_none() {
+            omitted_unrepresentable += 1;
+        }
+        if recent.len() < RECENT_ACTIVITY_LIMIT {
+            if let Some(item) = item.clone() {
+                recent.push(item);
+            }
+        }
+        let is_open_work = record_type == "WorkItem"
+            && matches!(
+                &interpretation,
+                crate::query::lifecycle::LifecycleInterpretation::Governed(value)
+                    if value.terminality == "open"
+            );
+        if is_open_work {
+            open_work_total += 1;
+            if open_work.len() < OPEN_WORK_LIMIT {
+                if let Some(item) = item {
+                    open_work.push(item);
+                }
+            }
+        }
+    }
+
+    Ok(json!({
+        "observed_at": observed_at,
+        "freshness": "point-in-time slice preview; activity may have changed since the cut",
+        "scope": "bounded preview over the admitted member slice, not a complete dashboard or claim of omniscience",
+        "scan_limit": CURRENT_WORLD_SCAN_LIMIT,
+        "scan_truncated": scan_truncated,
+        "recent_activity": {
+            "items": recent,
+            "total_count": recent_total,
+            "limit": RECENT_ACTIVITY_LIMIT,
+            "truncated": scan_truncated || recent_total > RECENT_ACTIVITY_LIMIT,
+        },
+        "open_work": {
+            "items": open_work,
+            "total_count": open_work_total,
+            "limit": OPEN_WORK_LIMIT,
+            "truncated": scan_truncated || open_work_total > OPEN_WORK_LIMIT,
+        },
+        "resumability": {
+            "assessed": false,
+            "reason": "Bootstrap does not infer same-agent resumability from lifecycle alone; set_intent owns the purpose-relative resume briefing.",
+        },
+        "omitted_unrepresentable_count": omitted_unrepresentable,
+    }))
+}
+
+/// Instructions from the shipped bindings whose source is in the slice.
+/// Layers mirror online numbering (0 workspace, 2 member); the
+/// obligation-derived layer 1 cannot run offline (companions excluded) and
+/// stays covered by the `bootstrap.claim` marker. `created_by` is never
+/// selected (§3.2); seed provenance has no shipped source, so `seed` is
+/// `None`. A source missing, deleted or not a Document in the slice is
+/// skipped silently, exactly like online's non-owner path, so withdrawn
+/// and never-present bindings are indistinguishable.
+async fn member_instruction_stack(
+    db: &Db,
+    caller: &Caller,
+) -> Result<crate::instructions::ResolvedInstructionStack> {
+    use sha2::{Digest, Sha256};
+
+    let rows = sqlx::query(
+        "SELECT 0 layer, b.source_record_id, b.id binding_id, b.scope_kind,
+                b.scope_id, b.position binding_position, r.type record_type,
+                r.name source_title, r.body, r.updated_at source_updated_at,
+                r.deleted_at
+           FROM instruction_bindings b
+           LEFT JOIN records r ON r.id=b.source_record_id
+          WHERE b.enabled=1 AND b.scope_kind='database' AND b.scope_id='native:database'
+         UNION ALL
+         SELECT 2, b.source_record_id, b.id, b.scope_kind,
+                b.scope_id, b.position, r.type,
+                r.name, r.body, r.updated_at,
+                r.deleted_at
+           FROM instruction_bindings b
+           LEFT JOIN records r ON r.id=b.source_record_id
+          WHERE b.enabled=1 AND b.scope_kind='account' AND b.scope_id=?
+          ORDER BY layer, binding_position, source_record_id",
+    )
+    .bind(caller.credential())
+    .fetch_all(db.pool())
+    .await?;
+
+    let mut entries = Vec::with_capacity(rows.len());
+    let mut resolved_bytes = 0usize;
+    for row in rows {
+        let source_record_id: String = row.try_get("source_record_id")?;
+        let layer: i64 = row.try_get("layer")?;
+        let record_type: Option<String> = row.try_get("record_type")?;
+        let deleted_at: Option<String> = row.try_get("deleted_at")?;
+        if record_type.as_deref() != Some("Document") || deleted_at.is_some() {
+            continue;
+        }
+        let body: Option<String> = row.try_get("body")?;
+        let body = body.unwrap_or_default();
+        if body.is_empty() {
+            continue;
+        }
+        resolved_bytes = resolved_bytes
+            .checked_add(body.len())
+            .ok_or_else(|| Error::engine("resolved instruction byte count overflow"))?;
+        let layer_scope = match layer {
+            0 => "workspace",
+            2 => "member",
+            _ => "invalid",
+        };
+        let binding_id: Option<String> = row.try_get("binding_id")?;
+        let binding_position: Option<i64> = row.try_get("binding_position")?;
+        let identity = format!(
+            "{layer_scope}\0{}\0\0\0{source_record_id}",
+            binding_id.as_deref().unwrap_or(""),
+        );
+        let entry_id = format!(
+            "instruction-entry:{}",
+            &hex::encode(Sha256::digest(identity.as_bytes()))[..32]
+        );
+        entries.push(crate::instructions::ResolvedInstructionEntry {
+            entry_id,
+            scope: layer_scope.into(),
+            kind: "standing".into(),
+            position: binding_position.unwrap_or_default(),
+            source: crate::instructions::InstructionSource::Record {
+                record_id: source_record_id,
+                title: row.try_get("source_title")?,
+                body_digest: hex::encode(Sha256::digest(body.as_bytes())),
+                updated_at: row.try_get("source_updated_at")?,
+            },
+            content: Some(body),
+            binding_id,
+            scope_kind: row.try_get("scope_kind")?,
+            scope_id: row.try_get("scope_id")?,
+            programme_id: None,
+            generation: None,
+            trigger_key: None,
+            programme_position: None,
+            source_role: None,
+            source_position: None,
+            seed: None,
+        });
+    }
+    if resolved_bytes > crate::instructions::MAX_RESOLVED_INSTRUCTION_BYTES {
+        return Err(Error::engine(
+            "member instruction stack exceeds the 32 KiB UTF-8 budget; no partial stack is authoritative",
+        ));
+    }
+    // The build-owned engine entry is compile-time content (local, §2.3(a)),
+    // so the member stack carries it exactly as online does.
+    let stack = crate::instructions::ResolvedInstructionStack {
+        status: "ready".into(),
+        resolved_bytes,
+        limit_bytes: crate::instructions::MAX_RESOLVED_INSTRUCTION_BYTES,
+        entries,
+        diagnostics: vec![crate::instructions::ResolutionDiagnostic {
+            code: "obligation_layer_unavailable_offline".into(),
+            message: "Onboarding-derived instruction sources are unavailable on a member copy; see /pending_obligations.".into(),
+            source_record_id: None,
+        }],
+        guidance: crate::instructions::NEUTRAL_PRECEDENCE_GUIDANCE,
+        delivery: crate::instructions::DURABLE_ORIENTATION_GUIDANCE,
+    };
+    Ok(crate::instructions::prepend_engine_instruction(
+        crate::instructions::BootstrapInstructionResolution {
+            instructions: stack,
+            pending_obligations: Vec::new(),
+        },
+    )
+    .instructions)
+}
+
+// ---------------------------------------------------------------------------
 // Tool 2 — get_structure
 // ---------------------------------------------------------------------------
 
@@ -1053,6 +1724,17 @@ async fn get_structure(db: Db, caller: Caller, mut arguments: Value) -> Result<V
     // write handlers that may depend on read-your-writes inside an open
     // write transaction; this read-only handler must not queue on them.
     // See `resolve_session_footing` for the same seam choice.
+    if caller.is_member_copy() {
+        let visible =
+            super::visible_ids_in_pool(db.pool(), &caller, vec![args.root_id.clone()]).await?;
+        if !visible.contains(&args.root_id) {
+            return Err(Error::engine(format!(
+                "{TOOL}: record {} does not exist",
+                args.root_id
+            )));
+        }
+        return get_structure_from_lens(&ReadLens::live(&db), None, &caller, args).await;
+    }
     require_record_in_pool(db.pool(), &caller, TOOL, &args.root_id, Capability::View).await?;
     let Some(selector) = as_of else {
         return get_structure_from_lens(&ReadLens::live(&db), Some(&db), &caller, args).await;
@@ -1152,6 +1834,15 @@ async fn get_structure_from_lens(
         "max_children_per_node": max_children_per_node,
         "nodes": nodes,
     });
+    if caller.is_member_copy() {
+        if let Some(nodes) = output.get_mut("nodes").and_then(Value::as_array_mut) {
+            for node in nodes {
+                node["custody_boundary"] = json!({"unavailable_offline": {
+                    "surface":"custody_boundary", "retry":"when_online"
+                }});
+            }
+        }
+    }
     // Succession per node: content (which successors, what they are called)
     // from this read's projection — the replay scratch under `as_of` —
     // while visibility and short references stay live, matching how the
@@ -1233,7 +1924,9 @@ async fn governed_structure_nodes(
     root_id: &str,
     opts: &tree::TreeOptions,
 ) -> Result<Vec<tree::TreeNode>> {
-    if super::is_legacy_local(caller) {
+    if caller.is_member_copy() {
+        tree::descendants_member(lens.projection(), root_id, opts.clone()).await
+    } else if super::is_legacy_local(caller) {
         tree::descendants_from(lens.projection(), root_id, opts.clone()).await
     } else {
         tree::descendants_with_lens_as(lens, root_id, opts.clone(), super::principal(caller)).await
@@ -1771,6 +2464,7 @@ const UNCLASSIFIED_LIFECYCLE_NOTE: &str =
 
 async fn get_dashboard(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
     const TOOL: &str = "get_dashboard";
+    let member = caller.is_member_copy();
     let args: GetDashboardArgs = parse_args(TOOL, arguments)?;
     let stale_after_days = args.stale_after_days.unwrap_or(DEFAULT_STALE_AFTER_DAYS);
     if !(1..=MAX_STALE_AFTER_DAYS).contains(&stale_after_days) {
@@ -1786,8 +2480,21 @@ async fn get_dashboard(db: Db, caller: Caller, arguments: Value) -> Result<Value
     }
     let scope_set: Option<HashSet<String>> = match &args.scope {
         Some(root) => {
-            require_record(&db, &caller, TOOL, root, Capability::View).await?;
-            let ids = tree::subtree_ids(&db, root).await?;
+            let ids = if member {
+                let exists: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM records WHERE id=? AND deleted_at IS NULL)",
+                )
+                .bind(root)
+                .fetch_one(db.pool())
+                .await?;
+                if !exists {
+                    return Err(super::record_not_found(TOOL, root));
+                }
+                tree::member_subtree_ids(&db, root, false).await?
+            } else {
+                require_record(&db, &caller, TOOL, root, Capability::View).await?;
+                tree::subtree_ids(&db, root).await?
+            };
             if ids.is_empty() {
                 return Err(Error::engine(format!(
                     "{TOOL}: scope record {root} does not exist"
@@ -1811,7 +2518,11 @@ async fn get_dashboard(db: Db, caller: Caller, arguments: Value) -> Result<Value
     // both miss every kind-specific vocabulary and rot the moment one changed.
     // The interpretation happens once per row below, through the governed
     // seam, so a new terminal token needs a vocabulary edit and nothing here.
-    let not_hidden_r = crate::query::not_hidden_predicate("r");
+    let not_hidden_r = if member {
+        crate::query::member_not_hidden_predicate("r")
+    } else {
+        crate::query::not_hidden_predicate("r")
+    };
     let attention_sql = format!(
         "SELECT r.id, r.type, r.kind, r.name, r.home_id, r.lifecycle, r.maturity,
                 r.last_activity_at
@@ -1828,7 +2539,12 @@ async fn get_dashboard(db: Db, caller: Caller, arguments: Value) -> Result<Value
     // One interpreter for the whole pass: it amortizes the schema-cascade and
     // vocabulary reads that would otherwise repeat per row.
     let principal = (!super::is_legacy_local(&caller)).then(|| super::principal(&caller));
-    let lifecycle_interpreter = LifecycleInterpreter::load(&db, principal).await?;
+    let lifecycle_interpreter = if member {
+        let rows = crate::query::cascade::schema_config_rows_in_pool(db.pool(), None).await?;
+        LifecycleInterpreter::load_from_pool(db.pool(), rows).await?
+    } else {
+        LifecycleInterpreter::load(&db, principal).await?
+    };
     let mut active = Vec::new();
     let mut stale = Vec::new();
     let mut unclassified_lifecycle = Vec::new();
@@ -1839,7 +2555,7 @@ async fn get_dashboard(db: Db, caller: Caller, arguments: Value) -> Result<Value
         if !in_scope(&id) {
             continue;
         }
-        if !can_record(&db, &caller, &id, Capability::View).await? {
+        if !member && !can_record(&db, &caller, &id, Capability::View).await? {
             continue;
         }
         let record_type: String = row.try_get("type")?;
@@ -1904,7 +2620,11 @@ async fn get_dashboard(db: Db, caller: Caller, arguments: Value) -> Result<Value
     // whose other endpoint is live and unarchived. Tombstoning or archiving
     // the blocker releases the block.
     let live_other = |col: &str| {
-        let not_hidden_o = crate::query::not_hidden_predicate("o");
+        let not_hidden_o = if member {
+            crate::query::member_not_hidden_predicate("o")
+        } else {
+            crate::query::not_hidden_predicate("o")
+        };
         format!(
             "EXISTS (SELECT 1 FROM records o
                       WHERE o.id = {col} AND o.deleted_at IS NULL
@@ -1945,7 +2665,7 @@ async fn get_dashboard(db: Db, caller: Caller, arguments: Value) -> Result<Value
         if !in_scope(&id) {
             continue;
         }
-        if !can_record(&db, &caller, &id, Capability::View).await? {
+        if !member && !can_record(&db, &caller, &id, Capability::View).await? {
             continue;
         }
         let mut entry = dashboard_entry(row, &lifecycle_interpreter)?;
@@ -2029,7 +2749,7 @@ async fn get_dashboard(db: Db, caller: Caller, arguments: Value) -> Result<Value
         .await?
     };
 
-    Ok(json!({
+    let mut output = json!({
         "scope": args.scope,
         "stale_after_days": stale_after_days,
         "stale_cutoff": cutoff,
@@ -2047,7 +2767,18 @@ async fn get_dashboard(db: Db, caller: Caller, arguments: Value) -> Result<Value
             "truncated": unclassified_lifecycle_total > limit,
         },
         "lifecycle_census": census,
-    }))
+    });
+    if member {
+        for section in ["claims", "runs"] {
+            output[section] = json!({
+                "unavailable_offline": {
+                    "surface": format!("get_dashboard.{section}"),
+                    "retry": "when_online",
+                }
+            });
+        }
+    }
+    Ok(output)
 }
 
 // ---------------------------------------------------------------------------
@@ -2114,8 +2845,17 @@ fn table_role(table: &str) -> &'static str {
 
 async fn describe_schema(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
     let args: DescribeSchemaArgs = parse_args("describe_schema", arguments)?;
+    // A member copy ships a strict subset of the engine tables (member
+    // profile, contract c323277 §3.2). Report exactly that shipped catalog:
+    // listing the full engine `REQUIRED_TABLES` would invent tables the copy
+    // does not carry with empty `columns`, which is not online parity.
+    let table_names: Vec<&str> = if caller.is_member_copy() {
+        crate::schema::member_schema::shipped_tables()
+    } else {
+        REQUIRED_TABLES.to_vec()
+    };
     let mut tables = Vec::new();
-    for table in REQUIRED_TABLES {
+    for table in table_names {
         let owner_only = matches!(
             table,
             "record_policies"

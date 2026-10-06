@@ -679,6 +679,182 @@ async fn message_reaction_acknowledgement_rolls_back_on_late_routing_failure() {
     assert_eq!(routing, ("open".into(), "human".into(), 1));
 }
 
+// A production append runs the insert trigger before Rust projection. Keep
+// field-specific domain diagnostics and rollback while accepting both serde
+// payload encodings. Wrong-typed references fail serde decoding rather than
+// MessageReactionPayload::validate; SQL still identifies that field honestly.
+#[tokio::test]
+async fn reaction_trigger_diagnostics_preserve_atomicity_for_objects_and_sequences() {
+    let db = create_database(":memory:").await.unwrap();
+    install_accounts(&db).await;
+    let registry = registry();
+    let message = create_message(&registry, &db, SENDER, "none", Value::Null).await;
+    let mut cases = Vec::new();
+    for kind in ["human_attested", "agent", "delegated_service"] {
+        for reference in [
+            None,
+            Some(Value::Null),
+            Some(json!("")),
+            Some(json!("\u{2003}")),
+            Some(json!(7)),
+            Some(json!(true)),
+            Some(json!({})),
+        ] {
+            cases.push((
+                kind,
+                reference,
+                "👍",
+                "add_reaction",
+                "native.message-reaction.v1",
+                "attested Message reaction executors require a nonblank executor_ref",
+            ));
+        }
+    }
+    for kind in ["local", "authenticated_principal"] {
+        for reference in [
+            Some(json!("ref")),
+            Some(json!("")),
+            Some(json!(7)),
+            Some(json!(false)),
+        ] {
+            cases.push((
+                kind,
+                reference,
+                "👍",
+                "add_reaction",
+                "native.message-reaction.v1",
+                "unattested Message reaction executors cannot carry executor_ref",
+            ));
+        }
+    }
+    cases.push((
+        "local",
+        None,
+        "❤️",
+        "satisfy_acknowledgement_expectation_with_reaction",
+        "native.message-reaction.v1",
+        "acknowledgement reactions must use 👍",
+    ));
+    // The malformed format must remain generic, even with a missing agent ref.
+    cases.push((
+        "agent",
+        None,
+        "👍",
+        "add_reaction",
+        "invalid-format",
+        "invalid Message reaction payload",
+    ));
+    let before: (i64, i64) = sqlx::query_as("SELECT (SELECT count(*) FROM content_events),(SELECT count(*) FROM content_event_reaction_meta)").fetch_one(db.pool()).await.unwrap();
+    for (kind, reference, emoji, command, format, diagnostic) in cases {
+        let mut object = json!({"format":format,"emoji":emoji,"idempotency_key":"diagnostic","command":command,"changed":true,"actor_account_id":RECIPIENT,"executor_kind":kind,"reason":"diagnostic"});
+        if let Some(reference) = &reference {
+            object["executor_ref"] = reference.clone();
+        }
+        let mut sequence = json!([
+            format,
+            emoji,
+            "diagnostic",
+            command,
+            true,
+            RECIPIENT,
+            kind,
+            reference.clone().unwrap_or(Value::Null),
+            "diagnostic"
+        ]);
+        for encoding in 0..3 {
+            let payload = match encoding {
+                0 => object.clone(),
+                1 => sequence.clone(),
+                _ => {
+                    sequence.as_array_mut().unwrap().push(Value::Null);
+                    sequence.clone()
+                }
+            };
+            let decoded = serde_json::from_value::<native_ce::events::MessageReactionPayload>(
+                payload.clone(),
+            );
+            if reference
+                .as_ref()
+                .is_some_and(|value| !value.is_null() && !value.is_string())
+            {
+                assert!(decoded.is_err(), "typed serde ref accepted: {payload}");
+            } else {
+                let error = decoded
+                    .unwrap()
+                    .validate(Some(RECIPIENT))
+                    .unwrap_err()
+                    .to_string();
+                if format == "native.message-reaction.v1" {
+                    assert!(error.contains(diagnostic), "{error}");
+                }
+            }
+            let error = append(
+                &db,
+                AppendSpec {
+                    record_id: message.clone(),
+                    event_type: "message.reaction.added.v1".into(),
+                    payload,
+                    actor: Some(RECIPIENT.into()),
+                },
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains(diagnostic), "{kind}/{encoding}: {error}");
+            if format != "native.message-reaction.v1" {
+                assert!(!error.contains("executor_ref"), "{error}");
+            }
+            let after: (i64, i64) = sqlx::query_as("SELECT (SELECT count(*) FROM content_events),(SELECT count(*) FROM content_event_reaction_meta)").fetch_one(db.pool()).await.unwrap();
+            assert_eq!(after, before, "failed reaction left source/projection rows");
+        }
+    }
+    for kind in [
+        "human_attested",
+        "agent",
+        "delegated_service",
+        "local",
+        "authenticated_principal",
+    ] {
+        let reference = if matches!(kind, "local" | "authenticated_principal") {
+            Value::Null
+        } else {
+            json!("valid-ref")
+        };
+        let object = json!({"format":"native.message-reaction.v1","emoji":"👍","idempotency_key":"valid","command":"add_reaction","changed":false,"actor_account_id":RECIPIENT,"executor_kind":kind,"executor_ref":reference,"reason":"valid"});
+        let sequence = json!([
+            "native.message-reaction.v1",
+            "👍",
+            "valid",
+            "add_reaction",
+            false,
+            RECIPIENT,
+            kind,
+            reference,
+            "valid"
+        ]);
+        for payload in [object, sequence] {
+            serde_json::from_value::<native_ce::events::MessageReactionPayload>(payload.clone())
+                .unwrap()
+                .validate(Some(RECIPIENT))
+                .unwrap();
+            append(
+                &db,
+                AppendSpec {
+                    record_id: message.clone(),
+                    event_type: "message.reaction.added.v1".into(),
+                    payload,
+                    actor: Some(RECIPIENT.into()),
+                },
+            )
+            .await
+            .unwrap();
+        }
+    }
+    let after: (i64, i64) = sqlx::query_as("SELECT (SELECT count(*) FROM content_events),(SELECT count(*) FROM content_event_reaction_meta)").fetch_one(db.pool()).await.unwrap();
+    assert_eq!(after, (before.0 + 10, before.1 + 10));
+    db.close().await;
+}
+
 #[tokio::test]
 async fn message_reaction_rejects_federated_shadows_and_incoherent_replay() {
     let db = create_database(":memory:").await.unwrap();

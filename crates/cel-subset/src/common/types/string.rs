@@ -1,0 +1,384 @@
+use crate::common::traits::{self, Adder, Comparer, Sizer, Zeroer};
+use crate::common::types::{CelBool, CelBytes, CelDouble, CelInt, CelUInt, Kind, Type};
+use crate::common::types::{CelDuration, CelTimestamp};
+use crate::common::value::Val;
+use crate::ExecutionError;
+use std::borrow::Cow;
+use std::cmp::Ordering;
+use std::ops::Deref;
+use std::string::String as StdString;
+
+#[derive(Clone, Debug, Default, Eq, Hash, PartialEq, PartialOrd, Ord)]
+pub struct String(StdString);
+
+impl String {
+    pub fn into_inner(self) -> StdString {
+        self.0
+    }
+
+    pub fn inner(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Deref for String {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        self.inner()
+    }
+}
+
+impl Val for String {
+    fn get_type(&self) -> &Type {
+        &super::STRING_TYPE
+    }
+
+    fn as_adder(&self) -> Option<&dyn Adder> {
+        Some(self)
+    }
+
+    fn as_comparer(&self) -> Option<&dyn Comparer> {
+        Some(self)
+    }
+
+    fn as_sizer(&self) -> Option<&dyn Sizer> {
+        Some(self)
+    }
+
+    fn as_zeroer(&self) -> Option<&dyn Zeroer> {
+        Some(self)
+    }
+
+    fn cached_bytes(&self) -> u64 {
+        self.inner().len() as u64
+    }
+
+    fn equals(&self, other: &dyn Val) -> bool {
+        other
+            .downcast_ref::<Self>()
+            .is_some_and(|other| self.0 == other.0)
+    }
+
+    fn clone_as_boxed(&self) -> Box<dyn Val> {
+        Box::new(String(self.0.clone()))
+    }
+}
+
+impl Adder for String {
+    fn add<'a>(&'a self, rhs: &dyn Val) -> Result<Cow<'a, dyn Val>, ExecutionError> {
+        if let Some(rhs) = rhs.downcast_ref::<Self>() {
+            // §1.3 `s + t` row, memory column (its wu is deferred to
+            // increment 5).
+            crate::meter::charge_cost(crate::charges::excluding_node_visit(
+                crate::charges::string_concat(self.0.len() as u64, rhs.0.len() as u64),
+            ))?;
+            crate::meter::note_op_body();
+            let mut s = StdString::with_capacity(rhs.0.len() + self.0.len());
+            s.push_str(&self.0);
+            s.push_str(&rhs.0);
+            Ok(Cow::<dyn Val>::Owned(Box::new(Self(s))))
+        } else {
+            Err(ExecutionError::UnsupportedBinaryOperator(
+                "add",
+                crate::val_desc::ValueDesc::of(self as &dyn Val),
+                crate::val_desc::ValueDesc::of(rhs),
+            ))
+        }
+    }
+}
+
+impl Comparer for String {
+    fn compare(&self, rhs: &dyn Val) -> Result<Ordering, ExecutionError> {
+        if let Some(rhs) = rhs.downcast_ref::<Self>() {
+            Ok(self.0.cmp(&rhs.0))
+        } else {
+            Err(ExecutionError::NoSuchOverload)
+        }
+    }
+}
+
+impl Sizer for String {
+    fn size(&self) -> CelInt {
+        // Fork fix: cel-spec "Abstract Sizes" counts code points,
+        // not UTF-8 bytes (was `self.inner().len()`).
+        (self.inner().chars().count() as i64).into()
+    }
+}
+
+impl Zeroer for String {
+    fn is_zero_value(&self) -> bool {
+        self.inner().is_empty()
+    }
+}
+
+impl From<StdString> for String {
+    fn from(v: StdString) -> Self {
+        Self(v)
+    }
+}
+
+impl From<String> for StdString {
+    fn from(v: String) -> Self {
+        v.0
+    }
+}
+
+impl From<&str> for String {
+    fn from(value: &str) -> Self {
+        Self(StdString::from(value))
+    }
+}
+
+impl TryFrom<Box<dyn Val>> for StdString {
+    type Error = Box<dyn Val>;
+
+    fn try_from(value: Box<dyn Val>) -> Result<Self, Self::Error> {
+        super::cast_boxed::<String>(value).map(|s| s.into_inner())
+    }
+}
+
+impl<'a> TryFrom<&'a dyn Val> for &'a str {
+    type Error = &'a dyn Val;
+    fn try_from(value: &'a dyn Val) -> Result<Self, Self::Error> {
+        if let Some(s) = value.downcast_ref::<String>() {
+            return Ok(s.inner());
+        }
+        Err(value)
+    }
+}
+
+fn string_contains<'a>(args: Vec<Cow<'a, dyn Val>>) -> Result<Cow<'a, dyn Val>, ExecutionError> {
+    let target = &args[0];
+    let arg = &args[1];
+    match target.downcast_ref::<String>() {
+        None => Err(ExecutionError::unexpected_type(
+            target.get_type().name(),
+            super::STRING_TYPE.name(),
+        )),
+        Some(s) => match arg.downcast_ref::<String>() {
+            None => Err(ExecutionError::unexpected_type(
+                arg.get_type().name(),
+                super::STRING_TYPE.name(),
+            )),
+            Some(needle) => Ok(Cow::<dyn Val>::Owned(Box::new(CelBool::from(
+                s.contains(needle.inner()),
+            )))),
+        },
+    }
+}
+
+fn ends_with_string<'a>(args: Vec<Cow<'a, dyn Val>>) -> Result<Cow<'a, dyn Val>, ExecutionError> {
+    super::binary_fn(
+        args,
+        super::STRING_TYPE,
+        super::STRING_TYPE,
+        |target: &String, needle: &String| {
+            Ok(Box::new(CelBool::from(target.ends_with(needle.inner()))))
+        },
+    )
+}
+
+fn starts_with_string<'a>(args: Vec<Cow<'a, dyn Val>>) -> Result<Cow<'a, dyn Val>, ExecutionError> {
+    super::binary_fn(
+        args,
+        super::STRING_TYPE,
+        super::STRING_TYPE,
+        |target: &String, needle: &String| {
+            Ok(Box::new(CelBool::from(target.starts_with(needle.inner()))))
+        },
+    )
+}
+
+fn matches<'a>(args: Vec<Cow<'a, dyn Val>>) -> Result<Cow<'a, dyn Val>, ExecutionError> {
+    super::binary_fn(
+        args,
+        super::STRING_TYPE,
+        super::STRING_TYPE,
+        |this: &String, regex: &String| match regex::Regex::new(regex.inner()) {
+            Ok(re) => Ok(Box::new(CelBool::from(re.is_match(this.inner())))),
+            Err(err) => Err(ExecutionError::FunctionError {
+                function: "matches".to_string(),
+                message: format!("'{}' not a valid regex:\n{err}", regex.inner()),
+            }),
+        },
+    )
+}
+
+// Rust Display uses <=17 significant digits and exponents in [-324,308].
+// Fixed decimal needs <=1 sign +2 prefix +323 leading fractional zeros +17
+// digits =343 bytes; 344 also includes NaN/±inf. This is a formatter bound,
+// not the scalar's cached allocation metric. Timestamp RFC3339 <=40; chrono
+// duration formatting is at most 31 bytes using a 32-byte scratch buffer.
+pub(crate) fn conversion_bytes(arg: &dyn Val) -> u64 {
+    match arg.get_type().kind() {
+        Kind::String => arg.cached_bytes(),
+        Kind::Bytes => arg.cached_bytes().saturating_mul(3),
+        Kind::Double => 344,
+        Kind::Int | Kind::UInt => 20,
+        Kind::Timestamp => 40,
+        Kind::Duration => 31,
+        _ => 0,
+    }
+}
+
+fn string<'a>(args: Vec<Cow<'a, dyn Val>>) -> Result<Cow<'a, dyn Val>, ExecutionError> {
+    // U3 removal: borrow the argument; only the result is allocated.
+    let arg: &dyn Val = args[0].as_ref();
+    // F4: the result copy is O(len); charge from the argument bytes
+    // before converting.
+    crate::meter::charge_cost(crate::charges::excluding_node_visit(
+        crate::charges::string_or_bytes_conversion(arg.cached_bytes(), conversion_bytes(arg)),
+    ))?;
+    crate::meter::note_op_body();
+    let ret: Result<Box<String>, ()> = match arg.get_type().kind() {
+        Kind::String => Ok(Box::new(
+            arg.downcast_ref::<String>().expect("kind string").clone(),
+        )),
+        Kind::Int => Ok(Box::new(String::from(
+            arg.downcast_ref::<CelInt>().expect("kind int").to_string(),
+        ))),
+        Kind::UInt => Ok(Box::new(String::from(
+            arg.downcast_ref::<CelUInt>()
+                .expect("kind uint")
+                .to_string(),
+        ))),
+        Kind::Double => Ok(Box::new(String::from(
+            arg.downcast_ref::<CelDouble>()
+                .expect("kind double")
+                .to_string(),
+        ))),
+        Kind::Bytes => {
+            let bytes = arg.downcast_ref::<CelBytes>().expect("kind bytes");
+            Ok(Box::new(String::from(
+                StdString::from_utf8_lossy(bytes.inner()).into_owned(),
+            )))
+        }
+        Kind::Timestamp => Ok(Box::new(String::from(
+            arg.downcast_ref::<CelTimestamp>()
+                .expect("kind timestamp")
+                .inner()
+                .to_rfc3339(),
+        ))),
+        Kind::Duration => Ok(Box::new(String::from(crate::duration::format_duration(
+            arg.downcast_ref::<CelDuration>()
+                .expect("kind duration")
+                .inner(),
+        )))),
+        _ => Err(()),
+    };
+    match ret {
+        Ok(ret) => Ok(Cow::<dyn Val>::Owned(ret)),
+        Err(()) => Err(ExecutionError::function_error(
+            "string",
+            "unsupported string conversion",
+        )),
+    }
+}
+
+pub(crate) fn stdlib(env: &mut crate::Env) {
+    env.add_overload(
+        "string",
+        "string_to_string",
+        vec![super::STRING_TYPE],
+        string,
+    )
+    .expect("Must be unique id");
+    env.add_overload("string", "int64_to_string", vec![super::INT_TYPE], string)
+        .expect("Must be unique id");
+    env.add_overload("string", "uint64_to_string", vec![super::UINT_TYPE], string)
+        .expect("Must be unique id");
+    env.add_overload(
+        "string",
+        "double_to_string",
+        vec![super::DOUBLE_TYPE],
+        string,
+    )
+    .expect("Must be unique id");
+    env.add_overload("string", "bytes_to_string", vec![super::BYTES_TYPE], string)
+        .expect("Must be unique id");
+
+    {
+        env.add_overload(
+            "string",
+            "timestamp_to_string",
+            vec![super::TIMESTAMP_TYPE],
+            string,
+        )
+        .expect("Must be unique id");
+        env.add_overload(
+            "string",
+            "duration_to_string",
+            vec![super::DURATION_TYPE],
+            string,
+        )
+        .expect("Must be unique id");
+    }
+
+    env.add_member_overload(
+        "contains",
+        "contains_string",
+        super::STRING_TYPE,
+        vec![super::STRING_TYPE],
+        string_contains,
+    )
+    .expect("Must be unique id");
+    env.add_member_overload(
+        "endsWith",
+        "ends_with_string",
+        super::STRING_TYPE,
+        vec![super::STRING_TYPE],
+        ends_with_string,
+    )
+    .expect("Must be unique id");
+    env.add_overload(
+        "size",
+        "size_string",
+        vec![super::STRING_TYPE],
+        traits::adapter::sizer_size,
+    )
+    .expect("Must be unique id");
+    env.add_member_overload(
+        "size",
+        "string_size",
+        super::STRING_TYPE,
+        vec![],
+        traits::adapter::sizer_size,
+    )
+    .expect("Must be unique id");
+    env.add_member_overload(
+        "startsWith",
+        "starts_with_string",
+        super::STRING_TYPE,
+        vec![super::STRING_TYPE],
+        starts_with_string,
+    )
+    .expect("Must be unique id");
+    env.add_member_overload(
+        "matches",
+        "matches",
+        super::STRING_TYPE,
+        vec![super::STRING_TYPE],
+        matches,
+    )
+    .expect("Must be unique id");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::StdString;
+    use super::String;
+    use crate::common::value::Val;
+
+    #[test]
+    fn test_try_into_string() {
+        let str: Box<dyn Val> = Box::new(String::from("cel-rust"));
+        assert_eq!(Ok(StdString::from("cel-rust")), str.try_into())
+    }
+
+    #[test]
+    fn test_try_into_str() {
+        let str: Box<dyn Val> = Box::new(String::from("cel-rust"));
+        assert_eq!(Ok("cel-rust"), str.as_ref().try_into())
+    }
+}

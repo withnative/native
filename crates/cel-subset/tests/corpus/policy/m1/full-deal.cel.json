@@ -1,0 +1,64 @@
+{
+  "namespace": "deal-desk",
+  "name": "full-deal",
+  "args": ["deal_id", "now_ms"],
+  "inputs": [
+    {
+      "name": "deal",
+      "cardinality": "one",
+      "sql": "SELECT r.id AS id, (SELECT value_num FROM facet_values WHERE record_id = r.id AND key = 'discount_bp') AS discount_bp FROM records r WHERE r.id = ?1",
+      "params": ["deal_id"],
+      "required": {"discount_bp": "discount"}
+    },
+    {
+      "name": "policy",
+      "cardinality": "one",
+      "sql": "SELECT r.id AS id, (SELECT value_num FROM facet_values WHERE record_id = r.id AND key = 'base_cap_bp') AS base_cap, (SELECT value_num FROM facet_values WHERE record_id = r.id AND key = 'approval_cap_bp') AS appr_cap FROM records r WHERE r.type = 'ConcessionPolicy' AND (SELECT value_num FROM facet_values WHERE record_id = r.id AND key = 'effective_from_ms') <= ?2 AND ?2 <= (SELECT value_num FROM facet_values WHERE record_id = r.id AND key = 'effective_to_ms') AND ((SELECT value FROM facet_values WHERE record_id = r.id AND key = 'segment') IS NULL OR (SELECT value FROM facet_values WHERE record_id = r.id AND key = 'segment') = (SELECT value FROM facet_values WHERE record_id = ?1 AND key = 'segment')) AND ((SELECT value FROM facet_values WHERE record_id = r.id AND key = 'region') IS NULL OR (SELECT value FROM facet_values WHERE record_id = r.id AND key = 'region') = (SELECT value FROM facet_values WHERE record_id = ?1 AND key = 'region')) ORDER BY (((SELECT value FROM facet_values WHERE record_id = r.id AND key = 'segment') IS NOT NULL) + ((SELECT value FROM facet_values WHERE record_id = r.id AND key = 'region') IS NOT NULL)) DESC, r.id LIMIT 1",
+      "params": ["deal_id", "now_ms"]
+    },
+    {
+      "name": "approvals",
+      "cardinality": "many",
+      "sql": "SELECT r.id AS id, (SELECT value_num FROM facet_values WHERE record_id = r.id AND key = 'cap_bp') AS cap_bp, (SELECT value_num FROM facet_values WHERE record_id = r.id AND key = 'expires_at_ms') AS expires_at_ms FROM records r JOIN links l ON l.source_id = r.id WHERE r.type = 'Approval' AND l.target_id = ?1 AND l.relationship = 'approval_for' ORDER BY r.id",
+      "params": ["deal_id"]
+    }
+  ],
+  "clauses": [
+    {"id": "approval", "when": "approvals.exists(a, a.expires_at_ms > now_ms && a.cap_bp >= deal.discount_bp)", "result": "{\"decision\": \"allow\", \"role\": \"\", \"used\": [deal.id] + approvals.filter(a, a.expires_at_ms > now_ms && a.cap_bp >= deal.discount_bp).map(a, a.id)}"},
+    {"id": "policy_allow", "when": "deal.discount_bp <= policy.base_cap", "result": "{\"decision\": \"allow\", \"role\": \"\", \"used\": [deal.id, policy.id]}"},
+    {"id": "policy_approval", "when": "deal.discount_bp <= policy.appr_cap", "result": "{\"decision\": \"needs_approval\", \"role\": \"deal_desk\", \"used\": [deal.id, policy.id]}"},
+    {"id": "policy_deny", "when": "true", "result": "{\"decision\": \"deny\", \"role\": \"\", \"used\": [deal.id, policy.id]}"}
+  ],
+  "examples": [
+    {
+      "name": "approval overrides",
+      "inputs": {
+        "deal": {"id": "a1", "discount_bp": 2100},
+        "policy": {"id": "p-default", "base_cap": 1500, "appr_cap": 2000},
+        "approvals": [{"id": "ap1", "cap_bp": 2200, "expires_at_ms": 1700000005000}]
+      },
+      "args": {"deal_id": "a1", "now_ms": 1700000000000},
+      "expect": {"decision": "allow", "clause": "approval", "used": ["a1", "ap1"]}
+    },
+    {
+      "name": "policy allow",
+      "inputs": {
+        "deal": {"id": "e2", "discount_bp": 1100},
+        "policy": {"id": "p-seg", "base_cap": 1200, "appr_cap": 1800},
+        "approvals": []
+      },
+      "args": {"deal_id": "e2", "now_ms": 1700000000000},
+      "expect": {"decision": "allow", "clause": "policy_allow", "used": ["e2", "p-seg"]}
+    },
+    {
+      "name": "no policy is unknown",
+      "inputs": {
+        "deal": {"id": "n1", "discount_bp": 100},
+        "policy": null,
+        "approvals": []
+      },
+      "args": {"deal_id": "n1", "now_ms": 1700000000000},
+      "expect": {"decision": "unknown", "clause": "unknown(policy)", "used": []}
+    }
+  ]
+}

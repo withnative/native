@@ -29,11 +29,15 @@ use crate::store::{append_in, append_with_event_id_in, AppendSpec};
 
 use super::super::registry::{Caller, ToolRegistry};
 use super::super::{ToolKind, ToolResult, TransientEvidence};
+use super::artifact_interactions::{
+    read_comment_parent_state_in, seal_comment_token, CommentMintContext,
+};
 use super::{
     can_record, echo_act, parse_args, previous_record_seq_in, require_record, require_record_in,
     ACT_DESCRIPTION, PREVIOUS_SEQ_DESCRIPTION,
 };
 
+use native_artifact_runtime::artifact_intents::COMMENT_TARGET_KEY;
 use native_artifact_runtime::{mdx, mdx_v2};
 
 const INPUT_BUNDLE_RECEIPT: &str = "native.artifact-input-bundle-receipt.v1";
@@ -996,7 +1000,9 @@ mod advance_pin_end_to_end_tests {
         crate::mcp::register_surface_tools(&mut registry).unwrap();
         let query_id = "9b100000-0000-4000-8000-000000000001";
         let artifact_id = "9b100000-0000-4000-8000-000000000002";
-        let definition = content_events_definition(2);
+        let definition = content_events_definition(
+            native_query_contract::sql_contract::CONTENT_EVENTS_RELATION_VERSION,
+        );
         registry
             .call(
                 db.clone(),
@@ -1019,7 +1025,7 @@ mod advance_pin_end_to_end_tests {
                 json!({
                     "id": artifact_id, "type": "Document", "kind": "artifact",
                     "name": "Content events port",
-                    "body": artifact_source(&definition.output.schema_sha256, 1),
+                    "body": artifact_source(&definition.output.schema_sha256, native_query_contract::sql_contract::CONTENT_EVENTS_RELATION_VERSION - 1),
                     "facets": {"runtime": mdx_v2::RUNTIME_ID},
                     "reason": "Author a port pinned one version behind the catalog."
                 }),
@@ -1082,7 +1088,7 @@ mod advance_pin_end_to_end_tests {
                 "advance_artifact_port_pin",
                 json!({
                     "artifact_id": artifact_id, "port_name": "rows",
-                    "target_version": 3, "reason": "Try a non-current target."
+                    "target_version": native_query_contract::sql_contract::CONTENT_EVENTS_RELATION_VERSION + 1, "reason": "Try a non-current target."
                 }),
             )
             .await
@@ -1139,7 +1145,7 @@ mod advance_pin_end_to_end_tests {
         let descriptor: Value = serde_json::from_str(&descriptor).unwrap();
         assert_eq!(
             descriptor["artifact_ports"]["rows"]["relations"]["content_events"]["semantic_version"],
-            2
+            native_query_contract::sql_contract::CONTENT_EVENTS_RELATION_VERSION
         );
         assert_eq!(descriptor["source_sha256"], json!(new_source_sha256));
 
@@ -1199,7 +1205,9 @@ mod advance_pin_end_to_end_tests {
         );
         let query_id = "9b100000-0000-4000-8000-000000000011";
         let artifact_id = "9b100000-0000-4000-8000-000000000012";
-        let definition = content_events_definition(2);
+        let definition = content_events_definition(
+            native_query_contract::sql_contract::CONTENT_EVENTS_RELATION_VERSION,
+        );
         registry
             .call(
                 db.clone(),
@@ -1222,7 +1230,7 @@ mod advance_pin_end_to_end_tests {
                 json!({
                     "id": artifact_id, "type": "Document", "kind": "artifact",
                     "name": "HTML stale pin",
-                    "body": html_artifact_source(&definition.output.schema_sha256, 1),
+                    "body": html_artifact_source(&definition.output.schema_sha256, native_query_contract::sql_contract::CONTENT_EVENTS_RELATION_VERSION - 1),
                     "facets": {"runtime": HTML_RUNTIME},
                     "reason": "Create an HTML port pinned one version behind."
                 }),
@@ -1301,7 +1309,7 @@ mod advance_pin_end_to_end_tests {
         assert_eq!(descriptor["runtime"], HTML_RUNTIME);
         assert_eq!(
             descriptor["artifact_ports"]["rows"]["relations"]["content_events"]["semantic_version"],
-            2
+            native_query_contract::sql_contract::CONTENT_EVENTS_RELATION_VERSION
         );
         let rendered = registry
             .call(
@@ -1363,7 +1371,9 @@ mod advance_pin_end_to_end_tests {
         crate::mcp::register_surface_tools(&mut registry).unwrap();
         let query_id = "9b200000-0000-4000-8000-000000000001";
         let artifact_id = "9b200000-0000-4000-8000-000000000002";
-        let definition = content_events_definition(2);
+        let definition = content_events_definition(
+            native_query_contract::sql_contract::CONTENT_EVENTS_RELATION_VERSION,
+        );
         registry
             .call(
                 db.clone(),
@@ -1386,7 +1396,7 @@ mod advance_pin_end_to_end_tests {
                 json!({
                     "id": artifact_id, "type": "Document", "kind": "artifact",
                     "name": "Two ports",
-                    "body": artifact_source_two_ports(&definition.output.schema_sha256, 1, 2),
+                    "body": artifact_source_two_ports(&definition.output.schema_sha256, native_query_contract::sql_contract::CONTENT_EVENTS_RELATION_VERSION - 1, native_query_contract::sql_contract::CONTENT_EVENTS_RELATION_VERSION),
                     "facets": {"runtime": mdx_v2::RUNTIME_ID},
                     "reason": "One stale port and one current port share one body."
                 }),
@@ -3446,6 +3456,9 @@ struct RecordIdArgs {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RenderArtifactArgs {
+    /// Exact deployment-allowlisted parent for HTML delivery only.
+    #[serde(default)]
+    parent_origin: Option<String>,
     #[serde(alias = "record_id")]
     id: String,
     #[serde(default)]
@@ -4048,6 +4061,15 @@ async fn collection_member_values(
             .flatten();
             match super::querying::inspect_saved_record_query(raw.as_deref()) {
                 super::querying::SavedQueryInspection::Valid { query, .. } => {
+                    let all_matching: Option<String> = sqlx::query_scalar(
+                        "SELECT value FROM facet_values WHERE record_id = ? AND key = 'input_membership'",
+                    ).bind(id).fetch_optional(lens.projection().snapshot_pool()).await?.flatten();
+                    // Full membership is explicit on this Collection; existing
+                    // saved queries retain their authored/default page scope.
+                    if all_matching.as_deref() == Some("all_matching")
+                        && query.get("limit").is_none() && query.get("offset").is_none() {
+                        return paged_query(lens, caller, &query).await;
+                    }
                     let output = super::querying::execute_query_record_args_with_lens_as(
                         lens,
                         caller,
@@ -4115,6 +4137,13 @@ async fn collection_member_values_in(
             .flatten();
             match super::querying::inspect_saved_record_query(raw.as_deref()) {
                 super::querying::SavedQueryInspection::Valid { query, .. } => {
+                    let all_matching: Option<String> = sqlx::query_scalar(
+                        "SELECT value FROM facet_values WHERE record_id = ? AND key = 'input_membership'",
+                    ).bind(id).fetch_optional(&mut **tx).await?.flatten();
+                    if all_matching.as_deref() == Some("all_matching")
+                        && query.get("limit").is_none() && query.get("offset").is_none() {
+                        return paged_query_in(tx, caller, &query).await;
+                    }
                     let output = super::querying::execute_query_record_args_in_as(
                         tx,
                         caller,
@@ -4401,6 +4430,9 @@ async fn incoming_artifacts(db: &Db, caller: &Caller, collection_id: &str) -> Re
 async fn open_collection(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
     const TOOL: &str = "open_collection";
     let args: RecordIdArgs = parse_args(TOOL, arguments)?;
+    if caller.is_member_copy() {
+        return open_collection_member(db, caller, args.id).await;
+    }
     require_record(&db, &caller, TOOL, &args.id, Capability::View).await?;
     let Some(kind) = live_collection_kind(&db, &args.id).await? else {
         return Ok(diagnostic(
@@ -4427,6 +4459,207 @@ async fn open_collection(db: Db, caller: Caller, arguments: Value) -> Result<Val
             json!({ "collection_id": args.id, "kind": kind }),
         )),
     }
+}
+
+/// Member `open_collection` (contract c323277 rev 9 §2.3(a), §2.5, §3.3
+/// rule 6).
+///
+/// Every input is a table the slice already ships (`records`, `links`,
+/// `facet_values`, `schema_config`), so members come from the shared
+/// `query_record` engine over the member lens: a folder is a `home_id` filter,
+/// a selection traverses incoming `member_of` links, and a query collection
+/// runs its saved `query_record` definition. The slice ships no hidden member,
+/// so there is no hidden member and no hidden count.
+///
+/// Refusals decided from the saved definition (never a silent partial
+/// interpretation):
+/// - a saved record query that uses `as_of`, `activity` or
+///   `include_coordination` refuses `unavailable_offline`;
+/// - a saved governed-SQL definition refuses `unavailable_offline`
+///   (`saved_governed_sql`). This is the contract-supported refusal: §2.5
+///   refuses such definitions for record inputs online too, and the member
+///   profile must never run a partial interpretation. The C5 brief's
+///   "qualified member `query_sql` path" describes the relation-level
+///   refusals the qualified member `query_sql` port already raises; it is not
+///   a product permission to execute a governed-SQL definition as a
+///   collection member source.
+/// - where an admitted collection-scoped schema row was withheld
+///   (`schema_incomplete_for`), refusal applies only for that visible
+///   collection: the opened collection itself, or a member record whose
+///   visible `home_id` is the affected collection (the enrichment reads
+///   `schema_config` for that home). A `global` marker refuses everywhere and
+///   is already handled by the dispatch gate.
+/// - a member record whose containing collection is excluded (`home_id`
+///   nulled) refuses `schema_provenance_hidden`: online enrichment reads all
+///   `schema_config` rows, so an excluded containing collection with scoped
+///   schema can diverge from the shipped set, and the copy carries no visible
+///   metadata to rule that out (§2.5, "never a silent partial
+///   interpretation"). The differential fixture demonstrates the divergence.
+///   The canonical parentless root (`native:root`) is exempt: it is the one
+///   legitimately NULL home and no scoped schema can apply to a NULL home, so
+///   the copy can rule out divergence for it.
+///
+/// `renderers` lists only visible artifact records: the slice ships a
+/// `renders` link only when both endpoints are eligible, so the join cannot
+/// surface a hidden artifact. Opening a renderer remains
+/// `unavailable_offline` (`render_artifact` is an `UnavailableOffline`
+/// surface), unchanged here.
+async fn open_collection_member(db: Db, caller: Caller, id: String) -> Result<Value> {
+    const TOOL: &str = "open_collection";
+    // Slice presence: hidden, deleted and never-existed ids are one answer.
+    let present: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM records WHERE id = ? AND deleted_at IS NULL)",
+    )
+    .bind(&id)
+    .fetch_one(db.write_pool())
+    .await?;
+    if !present {
+        return Err(Error::engine(format!("{TOOL}: record {id} does not exist")));
+    }
+    let Some(kind) = live_collection_kind(&db, &id).await? else {
+        return Ok(diagnostic(
+            "invalid_collection_shape",
+            format!("{id} is not a live governed Collection kind:query|selection|folder"),
+            json!({ "collection_id": id }),
+        ));
+    };
+    let markers = caller.member_schema_incomplete_for().to_vec();
+    if markers.iter().any(|marker| marker == &id) {
+        return Err(Error::unavailable_offline(TOOL, "schema_incomplete"));
+    }
+    let read_lens = lens::ReadLens::live(&db);
+    let raw = collection_member_values_member(&read_lens, &caller, &id, &kind).await?;
+    for value in &raw {
+        if let Some(home) = value.get("home_id").and_then(Value::as_str) {
+            if markers.iter().any(|marker| marker == home) {
+                return Err(Error::unavailable_offline(TOOL, "schema_incomplete"));
+            }
+        } else if value.get("home_id").is_some_and(Value::is_null)
+            && value.get("id").and_then(Value::as_str) != Some(crate::schema::ROOT_RECORD_ID)
+        {
+            // The containing collection is excluded from the copy (its
+            // `home_id` was nulled at produce time). Online enrichment reads
+            // *all* `schema_config` rows unfiltered, so an excluded containing
+            // collection with scoped schema can shape the interpretation
+            // while the member's shipped scoped set cannot. The copy carries
+            // no visible metadata saying whether that collection has scoped
+            // schema, so the narrowest honest answer is refusal — never a
+            // silent partial interpretation (§2.5).
+            //
+            // `native:root` is the one legitimately parentless record
+            // (creation enforces a non-null home for every other record, and
+            // root is required to have a NULL home). No scoped schema can
+            // apply to a NULL home online, so the copy can rule out
+            // divergence for root and must not over-refuse it.
+            return Err(Error::unavailable_offline(TOOL, "schema_provenance_hidden"));
+        }
+    }
+    let mut records = input_records_from_values_in_pool(db.write_pool(), raw).await?;
+    sort_input_records(&mut records);
+    Ok(json!({
+        "status": "opened",
+        "surface": "neutral_table",
+        "collection": { "id": id, "kind": kind },
+        "input": { "version": INPUT_ENVELOPE_VERSION, "records": records },
+        "renderers": incoming_artifacts_member(&db, &id).await?,
+    }))
+}
+
+/// `true` when a saved record query's definition uses an input the member
+/// profile refuses (`as_of`, `activity`, `include_coordination`, §2.3(a)
+/// `open_collection` row). Decided from the saved definition, never from a
+/// partial execution.
+fn saved_record_query_uses_excluded_input(query: &Value) -> bool {
+    let Some(object) = query.as_object() else {
+        return false;
+    };
+    object.get("as_of").is_some_and(|value| !value.is_null())
+        || object.get("activity").is_some_and(|value| !value.is_null())
+        || object.get("include_coordination").and_then(Value::as_bool) == Some(true)
+}
+
+/// Member form of [`collection_member_values`]: folder and selection reuse the
+/// shared paging, and a query collection refuses a definition the member
+/// profile cannot serve instead of running a partial interpretation.
+async fn collection_member_values_member(
+    lens: &lens::ReadLens<'_>,
+    caller: &Caller,
+    id: &str,
+    kind: &str,
+) -> Result<Vec<Value>> {
+    match kind {
+        "folder" | "selection" => collection_member_values(lens, caller, id, kind).await,
+        "query" => {
+            let raw: Option<String> = sqlx::query_scalar(
+                "SELECT value FROM facet_values WHERE record_id = ? AND key = 'query'",
+            )
+            .bind(id)
+            .fetch_optional(lens.projection().snapshot_pool())
+            .await?
+            .flatten();
+            match super::querying::inspect_saved_record_query(raw.as_deref()) {
+                super::querying::SavedQueryInspection::Valid { query, .. } => {
+                    if saved_record_query_uses_excluded_input(&query) {
+                        return Err(Error::unavailable_offline(
+                            "open_collection",
+                            "saved_query_definition",
+                        ));
+                    }
+                    let output = super::querying::execute_query_record_args_with_lens_as(
+                        lens,
+                        caller,
+                        "Collection query input",
+                        query,
+                    )
+                    .await?;
+                    output
+                        .get("records")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .ok_or_else(|| Error::engine("Collection kind:query must resolve to records, not a count or aggregate"))
+                }
+                super::querying::SavedQueryInspection::GovernedSql { .. } => Err(
+                    Error::unavailable_offline("open_collection", "saved_governed_sql"),
+                ),
+                super::querying::SavedQueryInspection::Invalid { diagnostic }
+                | super::querying::SavedQueryInspection::UnsupportedVersion {
+                    diagnostic, ..
+                } => Err(Error::engine(diagnostic)),
+            }
+        }
+        _ => Err(Error::engine(format!(
+            "unsupported Collection kind '{kind}'"
+        ))),
+    }
+}
+
+/// Member renderers: the slice ships a `renders` link only when both endpoints
+/// are eligible, so the join lists visible artifact records only. Hidden
+/// artifacts never appear and are never counted.
+async fn incoming_artifacts_member(db: &Db, collection_id: &str) -> Result<Vec<Value>> {
+    let predicate = identity_predicate("r", "Document", ARTIFACT_KIND_VALUE_ID);
+    let sql = format!(
+        "SELECT r.id, r.name, f.value AS runtime
+           FROM links l JOIN records r ON r.id = l.source_id
+           LEFT JOIN facet_values f ON f.record_id = r.id AND f.key = 'runtime'
+          WHERE l.target_id = ? AND l.relationship = 'renders'
+            AND r.deleted_at IS NULL AND {predicate}
+          ORDER BY r.name COLLATE NOCASE, r.id"
+    );
+    let rows = sqlx::query(&sql)
+        .bind(collection_id)
+        .fetch_all(db.write_pool())
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            json!({
+                "id": row.get::<String, _>("id"),
+                "name": row.get::<String, _>("name"),
+                "runtime": row.get::<Option<String>, _>("runtime"),
+            })
+        })
+        .collect())
 }
 
 #[path = "artifacts/advance_pin.rs"]
@@ -6131,6 +6364,12 @@ async fn render_mdx_v2_in(
         &manifest.interactions,
         &records_by_port,
         aggregate_records.keys().cloned().collect(),
+        &CommentMintContext {
+            caller_credential: caller.credential(),
+            artifact_id,
+            source_event_id,
+            source_digest: &parsed.source_sha256,
+        },
     )
     .await
     {
@@ -6164,6 +6403,7 @@ async fn render_mdx_v2_in(
                 bound_collections: &bound_collections,
                 resolved_bound_ports: &resolved_bound_ports,
                 root_readable_ports: &root_readable_ports,
+                comment_runtime_supported: false,
             },
         )
         .await
@@ -6484,11 +6724,85 @@ async fn render_observed_versions(
     interactions: &[mdx_v2::InteractionEntry],
     records_by_port: &BTreeMap<String, BTreeSet<String>>,
     all_records: BTreeSet<String>,
+    comment_mint: &CommentMintContext<'_>,
 ) -> Result<BTreeMap<String, BTreeMap<String, String>>> {
     let mut required = BTreeMap::<String, BTreeSet<String>>::new();
+    let mut observed = BTreeMap::<String, BTreeMap<String, String>>::new();
     let empty_records = BTreeSet::new();
+    // Records whose `title.set` entry admits them via its explicit bound-input
+    // port. Title tokens are minted below from the shared title CAS observed
+    // key, never through the ordinary facet path (which would seed an
+    // empty-key or `obs:` token).
+    let mut title_records = BTreeSet::<String>::new();
     for entry in interactions {
+        // BodySet uses expected_body_digest; never mint facet observed tokens.
+        if entry.effect == mdx_v2::InteractionEffect::BodySet {
+            continue;
+        }
         if entry.effect == mdx_v2::InteractionEffect::RecordCreate {
+            continue;
+        }
+        if entry.effect == mdx_v2::InteractionEffect::CommentCreate {
+            // Bearer cohort only: the entry's explicit bound-input port.
+            // Manifest validation guarantees exactly one such slot; anything
+            // else skips rather than mints, and comment entries never fall
+            // through to facet logic (no empty-key `obs:0` tokens).
+            let bearer_port = match entry.slots.len() {
+                1 => entry
+                    .slots
+                    .values()
+                    .next()
+                    .and_then(|slot| match &slot.domain {
+                        mdx_v2::SlotDomain::BoundInput { port } => port.as_deref(),
+                        mdx_v2::SlotDomain::Values { .. } => None,
+                    }),
+                _ => None,
+            };
+            let Some(port) = bearer_port else {
+                continue;
+            };
+            let Some(cohort) = records_by_port.get(port) else {
+                continue;
+            };
+            for record_id in cohort {
+                let Some(state) = read_comment_parent_state_in(tx, record_id).await? else {
+                    continue;
+                };
+                let token = seal_comment_token(comment_mint, record_id, &state);
+                // Never overwrite: a legacy facet-only manifest may already
+                // carry a facet token under this key, and mixed manifests
+                // cannot validate.
+                observed
+                    .entry(record_id.clone())
+                    .or_default()
+                    .entry(COMMENT_TARGET_KEY.to_string())
+                    .or_insert(token);
+            }
+            continue;
+        }
+        if entry.effect == mdx_v2::InteractionEffect::TitleSet {
+            // Bearer cohort only: the entry's explicit bound-input port.
+            // Manifest validation guarantees exactly one bound-input slot on a
+            // record port; anything else skips rather than mints, and title
+            // entries never fall through to facet logic (no empty-key tokens).
+            let bearer_port = match entry.slots.len() {
+                1 => entry
+                    .slots
+                    .values()
+                    .next()
+                    .and_then(|slot| match &slot.domain {
+                        mdx_v2::SlotDomain::BoundInput { port } => port.as_deref(),
+                        mdx_v2::SlotDomain::Values { .. } => None,
+                    }),
+                _ => None,
+            };
+            let Some(port) = bearer_port else {
+                continue;
+            };
+            let Some(cohort) = records_by_port.get(port) else {
+                continue;
+            };
+            title_records.extend(cohort.iter().cloned());
             continue;
         }
         let record_domain = entry
@@ -6511,11 +6825,29 @@ async fn render_observed_versions(
         }
     }
 
+    // Token-contract ambiguity, kept fail-closed: the shared title CAS
+    // observed key cannot carry both an ordinary `title` facet version and
+    // the record token a `title.set` precondition needs. A record whose
+    // ordinary facet path already requires a `title` token keeps that exact
+    // `obs:` token — never silently overwritten — so a title submission on
+    // that record refuses on the token class, while the legacy facet
+    // invocation stays usable. Title tokens are minted only for cohort
+    // records with no such required facet token; disjoint cohorts stay
+    // independent.
+    let facet_title_records: BTreeSet<String> = required
+        .iter()
+        .filter(|(_, facets)| facets.contains(super::lifecycle::TITLE_OBSERVED_KEY))
+        .map(|(record_id, _)| record_id.clone())
+        .collect();
+    title_records.retain(|record_id| !facet_title_records.contains(record_id));
+
     // GROUP BY omits records with no matching row, so seed every required pair
     // with its load-bearing never-observed token before filling in present
     // versions. This also preserves the required-set boundary: records outside
-    // the interaction domains never enter `observed` at all.
-    let mut observed = BTreeMap::<String, BTreeMap<String, String>>::new();
+    // the interaction domains never enter `observed` at all. Comment tokens
+    // minted above already live in `observed`; facet keys seeded here cannot
+    // collide with them because a manifest mixing comment posting with a
+    // facet on the reserved key refuses to compile.
     let mut records_by_facet = BTreeMap::<String, Vec<String>>::new();
     let mut spine_records = BTreeSet::<String>::new();
     for (record_id, facets) in required {
@@ -6563,8 +6895,14 @@ async fn render_observed_versions(
         }
     }
 
-    let spine_records = spine_records.into_iter().collect::<Vec<_>>();
-    for chunk in spine_records.chunks(400) {
+    // Spine record-token keys and `title.set` cohort records share the same
+    // batched `content_events` record-token query: both mint a `rec:` token
+    // over the record's MAX(seq). Title records enter only when a row exists,
+    // so a record with no events yields no token rather than an empty key.
+    let mut record_token_records = spine_records;
+    record_token_records.extend(title_records.iter().cloned());
+    let record_token_records = record_token_records.into_iter().collect::<Vec<_>>();
+    for chunk in record_token_records.chunks(400) {
         let placeholders = vec!["?"; chunk.len()].join(",");
         let sql = format!(
             "SELECT record_id, MAX(seq) AS event_seq \
@@ -6579,10 +6917,17 @@ async fn render_observed_versions(
         for row in query.fetch_all(&mut **tx).await? {
             let record_id: String = row.try_get("record_id")?;
             let event_seq: i64 = row.try_get("event_seq")?;
+            let token = format!("rec:{event_seq}");
+            if title_records.contains(&record_id) {
+                observed.entry(record_id.clone()).or_default().insert(
+                    super::lifecycle::TITLE_OBSERVED_KEY.to_string(),
+                    token.clone(),
+                );
+            }
             if let Some(facets) = observed.get_mut(&record_id) {
-                for (facet, token) in facets {
+                for (facet, value) in facets.iter_mut() {
                     if spine_facet_column(facet).is_some() {
-                        *token = format!("rec:{event_seq}");
+                        *value = token.clone();
                     }
                 }
             }
@@ -6674,6 +7019,10 @@ struct InteractionAvailabilityInputs<'a> {
     bound_collections: &'a BTreeMap<String, String>,
     resolved_bound_ports: &'a BTreeSet<String>,
     root_readable_ports: &'a BTreeSet<String>,
+    /// Private runtime eligibility: true on native.html.v1 only, so MDX
+    /// comment declarations stay unsupported while HTML uses explicit
+    /// named-port cohorts. No new public field or bootstrap protocol.
+    comment_runtime_supported: bool,
 }
 
 async fn render_interaction_availability(
@@ -6688,6 +7037,7 @@ async fn render_interaction_availability(
         bound_collections,
         resolved_bound_ports,
         root_readable_ports,
+        comment_runtime_supported,
     } = inputs;
     if interactions.is_empty() {
         return Ok((None, None));
@@ -6702,6 +7052,36 @@ async fn render_interaction_availability(
     let mut label_ports = BTreeSet::new();
     let mut create_destinations = BTreeMap::<String, String>::new();
     for entry in interactions {
+        // HTML Body uses the explicit bound-input cohort and current Edit
+        // availability below. This is a provisional render hint: the Body
+        // kernel rechecks ordinary target eligibility and install/needs pins.
+        // MDX remains unavailable, and neither runtime mints facet tokens.
+        if entry.effect == mdx_v2::InteractionEffect::BodySet && !comment_runtime_supported {
+            continue;
+        }
+        if entry.effect == mdx_v2::InteractionEffect::CommentCreate {
+            // Task `b9fb9fd` family 1: MDX comment stays unsupported; HTML
+            // advertises only explicit named root-readable cohorts with
+            // current editable targets. No new public fields.
+            if !comment_runtime_supported {
+                continue;
+            }
+            let Some(port) = entry.slots.values().find_map(|slot| match &slot.domain {
+                mdx_v2::SlotDomain::BoundInput { port } => port.as_deref(),
+                mdx_v2::SlotDomain::Values { .. } => None,
+            }) else {
+                continue;
+            };
+            if root_readable_ports.contains(port)
+                && records_by_port
+                    .get(port)
+                    .is_some_and(|records| !records.is_empty())
+            {
+                supported_entries.insert(entry.id.clone());
+                referenced_ports.insert(port);
+            }
+            continue;
+        }
         if entry.effect == mdx_v2::InteractionEffect::RecordCreate {
             let Some(create) = entry.create.as_ref() else {
                 continue;
@@ -7683,6 +8063,15 @@ pub(crate) async fn try_render_live_html(
     caller: &Caller,
     artifact_id: &str,
 ) -> Result<Option<Value>> {
+    try_render_live_html_for_parent(db, caller, artifact_id, None).await
+}
+
+async fn try_render_live_html_for_parent(
+    db: &Db,
+    caller: &Caller,
+    artifact_id: &str,
+    parent_origin: Option<&str>,
+) -> Result<Option<Value>> {
     let Some(materialization) =
         materialize_live_html(db, caller, artifact_id, "render_artifact").await?
     else {
@@ -7691,12 +8080,13 @@ pub(crate) async fn try_render_live_html(
     let Some(prepared) = materialization.prepared else {
         return Ok(Some(materialization.rendered));
     };
-    let launch = match crate::artifact_html::issue_launch(
+    let launch = match crate::artifact_html::issue_launch_for_parent(
         &materialization.body,
         &prepared.manifest,
         caller.hosting_principal().unwrap_or(caller.credential()),
         caller.hosting_database(),
         artifact_id,
+        parent_origin,
     ) {
         Ok(launch) => launch,
         Err(failure) => {
@@ -7793,6 +8183,50 @@ pub(crate) fn validate_prospective_html(
     Ok(Some(manifest))
 }
 
+/// The runtime of `artifact_id` when it is a live governed `Document
+/// kind:artifact` whose runtime facet is exactly `native.mdx.v1` or
+/// `native.mdx.v2`, read from `tx`; `None` for anything else, a missing
+/// record included. Visibility is the caller's to check first, so that a
+/// `None` never says more than the viewer could already see.
+pub(crate) async fn live_mdx_runtime_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    artifact_id: &str,
+) -> Result<Option<&'static str>> {
+    let predicate = identity_predicate("r", "Document", ARTIFACT_KIND_VALUE_ID);
+    let runtime: Option<Option<String>> = sqlx::query_scalar(&format!(
+        "SELECT f.value FROM records r
+           LEFT JOIN facet_values f ON f.record_id = r.id AND f.key = 'runtime'
+          WHERE r.id = ? AND r.deleted_at IS NULL AND {predicate}"
+    ))
+    .bind(artifact_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    Ok(match runtime.flatten().as_deref() {
+        Some(mdx::RUNTIME_ID) => Some(mdx::RUNTIME_ID),
+        Some(mdx_v2::RUNTIME_ID) => Some(mdx_v2::RUNTIME_ID),
+        _ => None,
+    })
+}
+
+/// A live `render_artifact` of one artifact as `caller`, exactly as the
+/// viewer's own call without `as_of`, `revalidate` or timing would answer.
+/// The `artifact.render.v1` tab read projects this answer; it never renders
+/// any other way. The render future is boxed: it is large, and unboxed it
+/// would grow every declared tab read's future, since they share one
+/// dispatcher.
+pub(crate) async fn render_live_as_viewer(
+    db: &Db,
+    caller: &Caller,
+    artifact_id: &str,
+) -> Result<Value> {
+    Box::pin(render_artifact(
+        db.clone(),
+        caller.clone(),
+        json!({ "id": artifact_id }),
+    ))
+    .await
+}
+
 async fn render_artifact(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
     const TOOL: &str = "render_artifact";
     let args: RenderArtifactArgs = parse_args(TOOL, arguments)?;
@@ -7809,6 +8243,11 @@ async fn render_artifact(db: Db, caller: Caller, arguments: Value) -> Result<Val
         .fetch_optional(db.write_pool())
         .await?
         .flatten();
+        if args.parent_origin.is_some() && runtime.as_deref() != Some(HTML_RUNTIME) {
+            return Err(Error::engine(
+                "render_artifact: parent_origin is only supported for native.html.v1",
+            ));
+        }
         if runtime.as_deref() == Some(mdx_v2::RUNTIME_ID) {
             if let Some(rendered) =
                 try_render_live_mdx_v2(&db, &caller, &args.id, args.include_timing, args.revalidate)
@@ -7818,7 +8257,14 @@ async fn render_artifact(db: Db, caller: Caller, arguments: Value) -> Result<Val
             }
         }
         if runtime.as_deref() == Some(HTML_RUNTIME) {
-            if let Some(rendered) = try_render_live_html(&db, &caller, &args.id).await? {
+            if let Some(rendered) = try_render_live_html_for_parent(
+                &db,
+                &caller,
+                &args.id,
+                args.parent_origin.as_deref(),
+            )
+            .await?
+            {
                 return Ok(rendered);
             }
         }
@@ -7830,6 +8276,7 @@ async fn render_artifact(db: Db, caller: Caller, arguments: Value) -> Result<Val
             V2SnapshotMode::Materialize,
             None,
             args.include_timing,
+            args.parent_origin.as_deref(),
         )
         .await;
     };
@@ -7877,6 +8324,11 @@ async fn render_artifact(db: Db, caller: Caller, arguments: Value) -> Result<Val
             })
             .flatten()
     });
+    if args.parent_origin.is_some() && historical_runtime.as_deref() != Some(HTML_RUNTIME) {
+        return Err(Error::engine(
+            "render_artifact: parent_origin is only supported for native.html.v1",
+        ));
+    }
     let historical_v1 = historical_runtime.as_deref() == Some(mdx::RUNTIME_ID);
     let historical_v2 = historical_runtime.as_deref() == Some(mdx_v2::RUNTIME_ID);
     let historical_permit = if historical_v1 || historical_v2 {
@@ -7920,6 +8372,7 @@ async fn render_artifact(db: Db, caller: Caller, arguments: Value) -> Result<Val
             V2SnapshotMode::AlreadyMaterialized,
             historical_v1_permit,
             args.include_timing,
+            args.parent_origin.as_deref(),
         )
         .await?;
         decorate_historical_render(&mut output, &resolved, requested_boundary);
@@ -8393,6 +8846,38 @@ async fn artifact_source_holds_input_read(
     .bind(source_sha256)
     .bind(&scope_sha256)
     .fetch_one(projection)
+    .await?)
+}
+
+/// Transaction twin of [`artifact_source_holds_input_read`]: the identical
+/// exact-match statement on the caller's transaction, so write-time
+/// admission reads current grants on the commit snapshot. No new executor,
+/// no new statement — only the executor differs.
+pub(crate) async fn artifact_source_holds_input_read_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    artifact_id: &str,
+    attestation_event_id: &str,
+    source_event_id: &str,
+    source_sha256: &str,
+    port: &str,
+) -> Result<bool> {
+    let scope_sha256 = mdx_sha256_for_projection(&json!({ "artifact_port": port }));
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM artifact_module_grants
+          WHERE artifact_id=? AND subject_kind='artifact_source' AND subject_record_id=?
+            AND subject_event_id=? AND source_sha256=?
+            AND artifact_source_attestation_event_id=? AND artifact_source_event_id=?
+            AND artifact_source_sha256=? AND capability='input.read' AND scope_sha256=?)",
+    )
+    .bind(artifact_id)
+    .bind(artifact_id)
+    .bind(source_event_id)
+    .bind(source_sha256)
+    .bind(attestation_event_id)
+    .bind(source_event_id)
+    .bind(source_sha256)
+    .bind(&scope_sha256)
+    .fetch_one(&mut **tx)
     .await?)
 }
 
@@ -8973,8 +9458,19 @@ async fn resolve_html_named_inputs_in(
         .flat_map(BTreeSet::iter)
         .cloned()
         .collect();
-    let observed =
-        render_observed_versions(tx, &manifest.interactions, &records_by_port, all_records).await?;
+    let observed = render_observed_versions(
+        tx,
+        &manifest.interactions,
+        &records_by_port,
+        all_records,
+        &CommentMintContext {
+            caller_credential: caller.credential(),
+            artifact_id,
+            source_event_id,
+            source_digest: &source_sha256,
+        },
+    )
+    .await?;
     let bound_collections = bound
         .iter()
         .map(|(port, (id, _))| (port.clone(), id.clone()))
@@ -8991,6 +9487,7 @@ async fn resolve_html_named_inputs_in(
             bound_collections: &bound_collections,
             resolved_bound_ports: &resolved_bound_ports,
             root_readable_ports: &root_readable_ports,
+            comment_runtime_supported: true,
         },
     )
     .await?;
@@ -9013,6 +9510,7 @@ async fn render_artifact_at(
     v2_snapshot_mode: V2SnapshotMode,
     preadmitted_mdx_v1: Option<tokio::sync::OwnedSemaphorePermit>,
     include_timing: bool,
+    parent_origin: Option<&str>,
 ) -> Result<Value> {
     let resolved = match resolve_artifact(
         lens,
@@ -9027,6 +9525,11 @@ async fn render_artifact_at(
         Err(diagnostic) => return Ok(attach_empty_timing_if_requested(diagnostic, include_timing)),
     };
     let adapter = runtime(&resolved.runtime_id).expect("resolved runtime remains installed");
+    if parent_origin.is_some() && resolved.runtime_id != HTML_RUNTIME {
+        return Err(Error::engine(
+            "render_artifact: parent_origin is only supported for native.html.v1",
+        ));
+    }
     if resolved.runtime_id == HTML_RUNTIME {
         let manifest = match crate::artifact_html::validate_cached(&resolved.body) {
             Ok(manifest) => manifest,
@@ -9078,12 +9581,13 @@ async fn render_artifact_at(
                 }
             }
         };
-        let launch = match crate::artifact_html::issue_launch(
+        let launch = match crate::artifact_html::issue_launch_for_parent(
             &resolved.body,
             &prepared.manifest,
             caller.hosting_principal().unwrap_or(caller.credential()),
             caller.hosting_database(),
             &resolved.artifact_id,
+            parent_origin,
         ) {
             Ok(launch) => launch,
             Err(failure) => {
@@ -10111,6 +10615,7 @@ pub fn register_artifact_tools(registry: &mut ToolRegistry) -> Result<()> {
             "type": "object",
             "properties": {
                 "id": { "type": "string", "description": "Artifact record id." },
+                "parent_origin": { "type": "string", "description": "Exact allowlisted native.html.v1 parent; default workbench." },
                 "as_of": {
                     "description": "Optional historical content-event boundary.",
                     "oneOf": [
@@ -10119,7 +10624,7 @@ pub fn register_artifact_tools(registry: &mut ToolRegistry) -> Result<()> {
                         { "type": "object", "properties": { "event_id": { "type": "string", "description": "Portable event boundary; remains meaningful if local content sequence numbers are remapped during import." } }, "required": ["event_id"], "additionalProperties": false }
                     ]
                 },
-                "include_timing": { "type": "boolean", "description": "Opt-in per-render timing. When true, a content-free timing member (phase names, microseconds, record/byte counts for this render only, plus cache.state and a per-port kind/cache/micros split) is returned under plan.timing for rendered plans or as a top-level timing member for diagnostics. Additive provenance fields are always present on live v2 renders; absent/false only omits timing." },
+                "include_timing": { "type": "boolean", "description": "Opt in to content-free phases/micros, record/byte counts, cache and per-port timing: plan.timing, or top-level timing on diagnostics. Live v2 provenance stays included." },
                 "revalidate": {
                     "type": "object",
                     "description": "Optional conditional revalidation: copy plan.provenance.revalidation wholesale from a previous live native.mdx.v2 result and add ports from input_bundle.ports. Unknown extra keys are ignored. Any doubt falls through to a full render rather than an error.",
@@ -10170,6 +10675,180 @@ pub fn register_artifact_tools(registry: &mut ToolRegistry) -> Result<()> {
 #[cfg(test)]
 mod admission_tests {
     use super::*;
+
+    fn capacity_input(count: usize) -> ResolvedArtifact {
+        ResolvedArtifact {
+            artifact_id: "capacity-artifact".into(),
+            runtime_id: HTML_RUNTIME.into(),
+            body: "<!doctype html><html lang=\"en\"><head><title>Capacity</title></head><body><main><h1>Capacity</h1></main></body></html>".into(),
+            body_event_id: None,
+            event_seq: 1,
+            snapshot_event_id: "capacity-snapshot".into(),
+            snapshot_event_seq: 1,
+            mode: "live",
+            collection: None,
+            records: (0..count)
+                .map(|i| InputRecord {
+                    id: format!("capacity-{i}"),
+                    record_type: "Document".into(),
+                    kind: Some("note".into()),
+                    name: format!("Document {i}"),
+                    summary: None,
+                    lifecycle: None,
+                    lifecycle_interpretation: Value::Null,
+                    maturity: None,
+                    persistence: None,
+                    facets: BTreeMap::new(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn html_capacity_accepts_workspace_above_old_record_and_byte_limits() {
+        let mut resolved = capacity_input(5_001);
+        resolved.records[0].summary = Some("x".repeat(5 * 1024 * 1024));
+        let prepared = prepare_html(&resolved).unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(prepared.input["records"].as_array().unwrap().len(), 5_001);
+        assert_eq!(
+            prepared.input["records"][0]["summary"]
+                .as_str()
+                .unwrap()
+                .len(),
+            5 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn html_capacity_record_boundary_refuses_without_truncating_membership() {
+        let mut resolved = capacity_input(crate::artifact_html::INPUT_RECORD_LIMIT);
+        assert!(prepare_html(&resolved).is_ok());
+        resolved.records.push(resolved.records[0].clone());
+        let error = prepare_html(&resolved).err().expect("over record budget");
+        assert_eq!(error["diagnostic"]["code"], "html_input_too_large");
+        assert_eq!(error["diagnostic"]["details"]["limit"], "input_records");
+        assert_eq!(
+            error["diagnostic"]["details"]["actual"],
+            crate::artifact_html::INPUT_RECORD_LIMIT + 1
+        );
+    }
+
+    #[test]
+    fn html_capacity_serialized_boundary_counts_json_escaping() {
+        let mut resolved = capacity_input(1);
+        resolved.records[0].summary = Some(String::new());
+        let overhead = serde_json::to_vec(&prepare_html(&resolved).unwrap().input)
+            .unwrap()
+            .len();
+        // Escaped controls use six wire bytes each, rather than one raw byte.
+        let available = crate::artifact_html::INPUT_JSON_LIMIT - overhead;
+        let mut summary = "\u{1}".repeat(available / 6);
+        summary.push_str(&"x".repeat(available % 6));
+        resolved.records[0].summary = Some(summary);
+        let prepared = prepare_html(&resolved).unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(
+            serde_json::to_vec(&prepared.input).unwrap().len(),
+            crate::artifact_html::INPUT_JSON_LIMIT
+        );
+        resolved.records[0].summary.as_mut().unwrap().push('x');
+        let error = prepare_html(&resolved)
+            .err()
+            .expect("over encoded byte budget");
+        assert_eq!(error["diagnostic"]["code"], "html_input_too_large");
+        assert_eq!(error["diagnostic"]["details"]["limit"], "input_json_bytes");
+        assert_eq!(
+            error["diagnostic"]["details"]["actual"],
+            crate::artifact_html::INPUT_JSON_LIMIT + 1
+        );
+    }
+
+    #[tokio::test]
+    async fn query_collection_explicit_all_matching_resolves_all_pages_and_preserves_bounds() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let caller = Caller::local();
+        let mut registry = crate::mcp::ToolRegistry::new();
+        crate::mcp::register_surface_tools(&mut registry).unwrap();
+        let home = "bbbbbbbb-eeee-4000-8000-000000000001";
+        registry.call(db.clone(), caller.clone(), "create_record", json!({
+            "id": home, "type": "Collection", "kind": "folder", "name": "Membership test documents",
+            "reason": "Isolate the membership paging fixture from seeded records."
+        })).await.unwrap();
+        for i in 0..501 {
+            registry
+                .call(
+                    db.clone(),
+                    caller.clone(),
+                    "create_record",
+                    json!({
+                        "id": format!("{i:08x}-eeee-4000-8000-{i:012x}"),
+                        "type": "Document", "kind": "note", "name": format!("scope-{i:03}"), "home_id": home,
+                        "reason": "Exercise collection membership across the query page boundary."
+                    }),
+                )
+                .await
+                .unwrap();
+        }
+        let collection = "aaaaaaaa-eeee-4000-8000-000000000001";
+        let query = json!({"steps": [{"step": "filter", "types": ["Document"], "home_id": home}], "order": "name_asc"});
+        registry.call(db.clone(), caller.clone(), "create_record", json!({
+            "id": collection, "type": "Collection", "kind": "query", "name": "Document scope",
+            "facets": {"query": json!({"v": "0.2", "query": query}).to_string()},
+            "reason": "Resolve all accessible documents."
+        })).await.unwrap();
+        let read_lens = lens::ReadLens::live(&db);
+        // Existing implicit page membership is unchanged without opt-in.
+        assert_eq!(
+            collection_member_values(&read_lens, &caller, collection, "query")
+                .await
+                .unwrap()
+                .len(),
+            50
+        );
+        registry
+            .call(
+                db.clone(),
+                caller.clone(),
+                "update_record",
+                json!({
+                    "id": collection, "facets": {"input_membership": "all_matching"},
+                    "reason": "Explicitly opt this collection into full input membership."
+                }),
+            )
+            .await
+            .unwrap();
+        let rows = collection_member_values(&read_lens, &caller, collection, "query")
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 501);
+        let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+        let rows = collection_member_values_in(&mut tx, &caller, collection, "query")
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 501);
+        tx.rollback().await.unwrap();
+        let mut limited = query;
+        limited["limit"] = json!(2);
+        registry.call(db.clone(), caller.clone(), "update_record", json!({
+            "id": collection, "facets": {"query": json!({"v": "0.2", "query": limited}).to_string()},
+            "reason": "Preserve the saved query's explicit membership bound."
+        })).await.unwrap();
+        assert_eq!(
+            collection_member_values(&read_lens, &caller, collection, "query")
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+        let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+        assert_eq!(
+            collection_member_values_in(&mut tx, &caller, collection, "query")
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+        tx.rollback().await.unwrap();
+    }
 
     const LIVE_SNAPSHOT_ARTIFACT: &str = "aaaa0000-0000-4000-8000-000000000001";
     const LIVE_SNAPSHOT_COLLECTION: &str = "aaaa0000-0000-4000-8000-000000000002";
@@ -10310,6 +10989,114 @@ mod admission_tests {
     }
 
     #[tokio::test]
+    async fn body_does_not_mint_facet_tokens_and_only_html_advertises() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let caller = Caller::local();
+        let body: mdx_v2::InteractionEntry = serde_json::from_value(json!({
+            "id":"save","label":"Save","effect":"body.set",
+            "slots":{"page":{"domain":{"kind":"bound_input","port":"body-only"}}},
+            "body":{"max_bytes":32768}
+        }))
+        .unwrap();
+        let facet: mdx_v2::InteractionEntry = serde_json::from_value(json!({
+            "id":"priority","label":"Priority","effect":"facet.set",
+            "slots":{"record":{"domain":{"kind":"bound_input","port":"items"}}},
+            "facet":"priority","value":{"from":"literal","value":"high"}
+        }))
+        .unwrap();
+        let ports = BTreeMap::from([
+            (
+                "items".to_owned(),
+                BTreeSet::from(["legacy-record".to_owned()]),
+            ),
+            (
+                "body-only".to_owned(),
+                BTreeSet::from(["body-record".to_owned()]),
+            ),
+        ]);
+        let port_names = ports.keys().cloned().collect::<BTreeSet<_>>();
+        let mint = CommentMintContext {
+            caller_credential: caller.credential(),
+            artifact_id: "artifact",
+            source_event_id: "source",
+            source_digest: "digest",
+        };
+        let mut tx = db.write_pool().begin().await.unwrap();
+        let mut results = Vec::new();
+        for entries in [
+            vec![facet.clone()],
+            vec![body.clone(), facet],
+            vec![body.clone()],
+        ] {
+            let observed = render_observed_versions(
+                &mut tx,
+                &entries,
+                &ports,
+                ports.values().flat_map(BTreeSet::iter).cloned().collect(),
+                &mint,
+            )
+            .await
+            .unwrap();
+            let (availability, _) = render_interaction_availability(
+                &mut tx,
+                None,
+                &caller,
+                InteractionAvailabilityInputs {
+                    interactions: &entries,
+                    records_by_port: &ports,
+                    bound_collections: &BTreeMap::new(),
+                    resolved_bound_ports: &port_names,
+                    root_readable_ports: &port_names,
+                    comment_runtime_supported: false,
+                },
+            )
+            .await
+            .unwrap();
+            results.push((observed, availability));
+        }
+        let (html, _) = render_interaction_availability(
+            &mut tx,
+            None,
+            &caller,
+            InteractionAvailabilityInputs {
+                interactions: &[body],
+                records_by_port: &ports,
+                bound_collections: &BTreeMap::new(),
+                resolved_bound_ports: &port_names,
+                root_readable_ports: &port_names,
+                comment_runtime_supported: true,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            html,
+            Some(json!({
+                "supported_entries":["save"], "editable_records":["body-record"],
+                "records_by_port":{"body-only":["body-record"]}
+            }))
+        );
+        tx.rollback().await.unwrap();
+        assert_eq!(
+            results[0], results[1],
+            "MDX Body adds no token, supported id or referenced port"
+        );
+        assert_eq!(results[0].0["legacy-record"]["priority"], "obs:0");
+        assert_eq!(
+            results[0].1.as_ref().unwrap()["supported_entries"],
+            json!(["priority"])
+        );
+        assert!(results[2].0.is_empty(), "Body-only observed is empty");
+        assert_eq!(
+            results[2].1,
+            Some(json!({
+                "supported_entries":[],"editable_records":[],"records_by_port":{}
+            })),
+            "Unsupported does not suppress the entire availability plan"
+        );
+    }
+
+    #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn interaction_availability_is_port_scoped_and_uses_bulk_edit_authority() {
         let _guard = mdx::test_guard();
@@ -10360,6 +11147,7 @@ mod admission_tests {
                 bound_collections: &BTreeMap::new(),
                 resolved_bound_ports: &resolved_bound_ports,
                 root_readable_ports: &root_readable_ports,
+                comment_runtime_supported: false,
             },
         )
         .await
@@ -10398,6 +11186,7 @@ mod admission_tests {
                 bound_collections: &BTreeMap::new(),
                 resolved_bound_ports: &resolved_bound_ports,
                 root_readable_ports: &root_readable_ports,
+                comment_runtime_supported: false,
             },
         )
         .await
@@ -10451,6 +11240,7 @@ mod admission_tests {
                 bound_collections: &BTreeMap::new(),
                 resolved_bound_ports: &mixed_bound_ports,
                 root_readable_ports: &root_readable_ports,
+                comment_runtime_supported: false,
             },
         )
         .await
@@ -10488,6 +11278,7 @@ mod admission_tests {
                 bound_collections: &BTreeMap::new(),
                 resolved_bound_ports: &writable_bound_ports,
                 root_readable_ports: &root_readable_ports,
+                comment_runtime_supported: false,
             },
         )
         .await
@@ -13805,6 +14596,171 @@ export const nativeArtifact = {{
         );
         assert!(rendered.get("input").is_none(), "{rendered:#}");
         assert!(rendered.get("launch").is_none(), "{rendered:#}");
+        db.close().await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn html_parent_origin_binds_live_and_historical_legacy_and_named_delivery() {
+        use axum::body::{to_bytes, Body};
+        use axum::http::{header::CONTENT_SECURITY_POLICY, Request};
+        use tower::ServiceExt;
+
+        let _guard = mdx::test_guard();
+        let db = crate::create_database(":memory:").await.unwrap();
+        let mut registry = crate::mcp::ToolRegistry::new();
+        crate::mcp::register_surface_tools(&mut registry).unwrap();
+        let config = crate::artifact_html::RuntimeConfig::new(
+            "http://localhost:8080",
+            "http://artifact.localhost:8080",
+        )
+        .unwrap()
+        .with_parent_origins(["http://127.0.0.1:4319"])
+        .unwrap();
+        crate::artifact_html::configure(config.clone());
+        let legacy_id = "92774113-4a6a-4679-b155-fbf5399cdd2e";
+        let named_id = "8f02b4ed-19d1-4ddd-bc21-3a329ef3562f";
+        let legacy = "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>Parent fixture</title></head><body><main><h1>Parent fixture</h1></main></body></html>";
+        registry.call(db.clone(), Caller::local(), "create_record", json!({
+            "id": legacy_id, "type": "Document", "kind": "artifact",
+            "name": "Parent legacy fixture", "body": legacy,
+            "facets": {"runtime": HTML_RUNTIME}, "reason": "Verify per-ticket custom-parent delivery."
+        })).await.unwrap();
+        create_html_named_collection_fixture(
+            &registry,
+            &db,
+            named_id,
+            "a0f39dfa-2094-459e-9917-706130fa0d41",
+            "a0f2f8a0-0d98-4f80-b59a-4a0f1c164c90",
+            json!({}),
+        )
+        .await;
+        let boundary: String =
+            sqlx::query_scalar("SELECT id FROM content_events ORDER BY seq DESC LIMIT 1")
+                .fetch_one(db.write_pool())
+                .await
+                .unwrap();
+        let app = crate::artifact_html::router(config);
+        for id in [legacy_id, named_id] {
+            for historical in [false, true] {
+                for parent in [None, Some("http://127.0.0.1:4319/")] {
+                    let mut args = json!({"id": id});
+                    if let Some(parent) = parent {
+                        args["parent_origin"] = json!(parent);
+                    }
+                    if historical {
+                        args["as_of"] = json!({"event_id": boundary});
+                    }
+                    let rendered = registry
+                        .call(db.clone(), Caller::local(), "render_artifact", args)
+                        .await
+                        .unwrap();
+                    assert_eq!(rendered["status"], "rendered", "{rendered:#}");
+                    let url = url::Url::parse(rendered["launch"]["url"].as_str().unwrap()).unwrap();
+                    let wrong_host = app
+                        .clone()
+                        .oneshot(
+                            Request::builder()
+                                .uri(url.path())
+                                .header("host", "localhost:8080")
+                                .body(Body::empty())
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(wrong_host.status(), axum::http::StatusCode::NOT_FOUND);
+                    let response = app
+                        .clone()
+                        .oneshot(
+                            Request::builder()
+                                .uri(url.path())
+                                .header("host", "artifact.localhost:8080")
+                                .body(Body::empty())
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(response.status(), axum::http::StatusCode::OK);
+                    let expected = if parent.is_some() {
+                        "http://127.0.0.1:4319"
+                    } else {
+                        "http://localhost:8080"
+                    };
+                    assert_eq!(
+                        response.headers()[CONTENT_SECURITY_POLICY],
+                        crate::artifact_html::content_security_policy(expected).unwrap()
+                    );
+                    let body = to_bytes(response.into_body(), 2 * 1024 * 1024)
+                        .await
+                        .unwrap();
+                    assert!(String::from_utf8(body.to_vec()).unwrap().contains(&format!(
+                        "const HOST={}",
+                        serde_json::to_string(expected).unwrap()
+                    )));
+                    if id == named_id {
+                        assert_eq!(
+                            rendered["input"]["version"],
+                            "native.named-artifact-input.v1"
+                        );
+                    } else {
+                        assert_eq!(rendered["input"]["version"], INPUT_ENVELOPE_VERSION);
+                    }
+                }
+            }
+            for historical in [false, true] {
+                for parent in [
+                    "https://unlisted.example",
+                    "http://127.0.0.1:4320",
+                    "http://127.0.0.1:\t4319",
+                    "https://*.example",
+                    "null",
+                    "http://artifact.localhost:8080",
+                ] {
+                    let mut args = json!({"id": id, "parent_origin": parent});
+                    if historical {
+                        args["as_of"] = json!({"event_id": boundary});
+                    }
+                    let denied = registry
+                        .call(db.clone(), Caller::local(), "render_artifact", args)
+                        .await
+                        .unwrap();
+                    assert_eq!(denied["status"], "error", "{denied:#}");
+                    assert!(denied.get("launch").is_none(), "{denied:#}");
+                }
+            }
+        }
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn parent_origin_is_rejected_for_non_html_rendering() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let mut registry = crate::mcp::ToolRegistry::new();
+        crate::mcp::register_surface_tools(&mut registry).unwrap();
+        let id = "927ccde6-2029-42d1-ae59-2f4211d75f51";
+        registry.call(db.clone(), Caller::local(), "create_record", json!({
+            "id": id, "type": "Document", "kind": "artifact", "name": "Non HTML parent fixture",
+            "body": "# Hello", "facets": {"runtime": "native.mdx.v1"},
+            "reason": "Verify HTML parent binding cannot silently apply to another runtime."
+        })).await.unwrap();
+        let boundary: String =
+            sqlx::query_scalar("SELECT id FROM content_events ORDER BY seq DESC LIMIT 1")
+                .fetch_one(db.write_pool())
+                .await
+                .unwrap();
+        for historical in [false, true] {
+            let mut args = json!({"id": id, "parent_origin": "http://127.0.0.1:4319"});
+            if historical {
+                args["as_of"] = json!({"event_id": boundary});
+            }
+            let denied = registry
+                .call(db.clone(), Caller::local(), "render_artifact", args)
+                .await
+                .unwrap_err();
+            assert!(denied
+                .to_string()
+                .contains("parent_origin is only supported for native.html.v1"));
+        }
         db.close().await;
     }
 

@@ -586,18 +586,20 @@ async fn manage_links(db: Db, caller: Caller, arguments: Value) -> Result<Value>
             } else {
                 None
             };
-            if let Some(indexed) = try_indexed_links_list(
-                &db,
-                &caller,
-                &record_id,
-                limit,
-                cursor.as_deref(),
-                decoded.as_ref(),
-            )
-            .await?
-            {
-                crate::mcp::request_timing::record_m4_index_decision(true);
-                return Ok(indexed);
+            if !caller.is_member_copy() {
+                if let Some(indexed) = try_indexed_links_list(
+                    &db,
+                    &caller,
+                    &record_id,
+                    limit,
+                    cursor.as_deref(),
+                    decoded.as_ref(),
+                )
+                .await?
+                {
+                    crate::mcp::request_timing::record_m4_index_decision(true);
+                    return Ok(indexed);
+                }
             }
             let response =
                 list_governed(&db, &caller, &record_id, limit, cursor, decoded.as_ref()).await?;
@@ -607,11 +609,12 @@ async fn manage_links(db: Db, caller: Caller, arguments: Value) -> Result<Value>
     }
 }
 
-/// The pre-M4 governed `manage_links.list` implementation, verbatim: physical
+/// Shared governed `manage_links.list` reader. Online retains the pre-M4 physical
 /// link rows page from `links` on the write pool with keyset
 /// `(direction_rank, relationship, created_at, id)` and `limit + 1`, `has_more`
 /// and the cursor derive from that physical page, then the first `limit`
-/// opposite endpoints filter by `View`. This is the production fallback for
+/// opposite endpoints filter by `View`. Member copies page only shipped visible
+/// links, with slice-presence anchor admission. This is the production fallback for
 /// the indexed slice above — and the independent differential oracle its
 /// tests compare against field by field.
 async fn list_governed(
@@ -623,7 +626,19 @@ async fn list_governed(
     decoded: Option<&LinkListCursor>,
 ) -> Result<Value> {
     let mut tx = db.write_pool().begin().await?;
-    if !can_record_in(&mut tx, caller, record_id, Capability::View).await? {
+    // Member links have two slice-visible endpoints. Paging the shipped rows
+    // therefore counts visible links; online retains its physical-page contract.
+    let anchor_visible = if caller.is_member_copy() {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM records WHERE id=? AND deleted_at IS NULL)",
+        )
+        .bind(record_id)
+        .fetch_one(&mut *tx)
+        .await?
+    } else {
+        can_record_in(&mut tx, caller, record_id, Capability::View).await?
+    };
+    if !anchor_visible {
         return Err(Error::engine(format!("record {record_id} does not exist")));
     }
     let after_direction = decoded.map(|cursor| cursor.direction_rank);
@@ -735,7 +750,7 @@ async fn list_governed(
     }))
 }
 
-pub(super) async fn relationship_owned_in(
+pub(crate) async fn relationship_owned_in(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     source_id: &str,
     target_id: &str,

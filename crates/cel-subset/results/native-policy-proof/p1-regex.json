@@ -1,0 +1,1681 @@
+{
+  "cases": [
+    {
+      "bound": {
+        "memory": 1840,
+        "work": 16429
+      },
+      "family": "counted-repetition",
+      "pattern": "a{1}",
+      "pattern_bytes": 4,
+      "public_check_elapsed_ns": 3760280,
+      "public_load": {
+        "memory": 1856,
+        "work": 281
+      },
+      "searches": [
+        {
+          "body_bytes": 4096,
+          "elapsed_ns": 750806,
+          "memory": 48,
+          "ok_bool": true,
+          "result": "Ok(Bool(true))",
+          "suffix": "",
+          "within_bound": true,
+          "work": 16394
+        },
+        {
+          "body_bytes": 4096,
+          "elapsed_ns": 835827,
+          "memory": 48,
+          "ok_bool": true,
+          "result": "Ok(Bool(true))",
+          "suffix": "b",
+          "within_bound": true,
+          "work": 16394
+        },
+        {
+          "body_bytes": 4096,
+          "elapsed_ns": 591775,
+          "memory": 48,
+          "ok_bool": true,
+          "result": "Ok(Bool(true))",
+          "suffix": "!",
+          "within_bound": true,
+          "work": 16394
+        }
+      ],
+      "source": "one.body.matches(r'a{1}')",
+      "tiers": [
+        {
+          "compiled": true,
+          "elapsed_ns": 14470,
+          "native_compile_row": {
+            "memory": 256,
+            "work": 256
+          },
+          "tier": 256
+        },
+        {
+          "compiled": true,
+          "elapsed_ns": 1630,
+          "native_compile_row": {
+            "memory": 1024,
+            "work": 1024
+          },
+          "tier": 1024
+        },
+        {
+          "compiled": true,
+          "elapsed_ns": 1560,
+          "native_compile_row": {
+            "memory": 4096,
+            "work": 4096
+          },
+          "tier": 4096
+        }
+      ]
+    },
+    {
+      "bound": {
+        "memory": 1840,
+        "work": 16429
+      },
+      "family": "counted-repetition",
+      "pattern": "a{4}",
+      "pattern_bytes": 4,
+      "public_check_elapsed_ns": 1350541,
+      "public_load": {
+        "memory": 1856,
+        "work": 281
+      },
+      "searches": [
+        {
+          "body_bytes": 4096,
+          "elapsed_ns": 746946,
+          "memory": 48,
+          "ok_bool": true,
+          "result": "Ok(Bool(true))",
+          "suffix": "",
+          "within_bound": true,
+          "work": 16394
+        },
+        {
+          "body_bytes": 4096,
+          "elapsed_ns": 652165,
+          "memory": 48,
+          "ok_bool": true,
+          "result": "Ok(Bool(true))",
+          "suffix": "b",
+          "within_bound": true,
+          "work": 16394
+        },
+        {
+          "body_bytes": 4096,
+          "elapsed_ns": 626835,
+          "memory": 48,
+          "ok_bool": true,
+          "result": "Ok(Bool(true))",
+          "suffix": "!",
+          "within_bound": true,
+          "work": 16394
+        }
+      ],
+      "source": "one.body.matches(r'a{4}')",
+      "tiers": [
+        {
+          "compiled": true,
+          "elapsed_ns": 15390,
+          "native_compile_row": {
+            "memory": 256,
+            "work": 256
+          },
+          "tier": 256
+        },
+        {
+          "compiled": true,
+          "elapsed_ns": 4010,
+          "native_compile_row": {
+            "memory": 1024,
+            "work": 1024
+          },
+          "tier": 1024
+        },
+        {
+          "compiled": true,
+          "elapsed_ns": 3740,
+          "native_compile_row": {
+            "memory": 4096,
+            "work": 4096
+          },
+          "tier": 4096
+        }
+      ]
+    },
+    {
+      "bound": {
+        "memory": 1841,
+        "work": 65581
+      },
+      "family": "counted-repetition",
+      "pattern": "a{16}",
+      "pattern_bytes": 5,
+      "public_check_elapsed_ns": 813857,
+      "public_load": {
+        "memory": 2944,
+        "work": 1306
+      },
+      "searches": [
+        {
+          "body_bytes": 4096,
+          "elapsed_ns": 598764,
+          "memory": 49,
+          "ok_bool": true,
+          "result": "Ok(Bool(true))",
+          "suffix": "",
+          "within_bound": true,
+          "work": 65546
+        },
+        {
+          "body_bytes": 4096,
+          "elapsed_ns": 545625,
+          "memory": 49,
+          "ok_bool": true,
+          "result": "Ok(Bool(true))",
+          "suffix": "b",
+          "within_bound": true,
+          "work": 65546
+        },
+        {
+          "body_bytes": 4096,
+          "elapsed_ns": 725155,
+          "memory": 49,
+          "ok_bool": true,
+          "result": "Ok(Bool(true))",
+          "suffix": "!",
+          "within_bound": true,
+          "work": 65546
+        }
+      ],
+      "source": "one.body.matches(r'a{16}')",
+      "tiers": [
+        {
+          "compiled": false,
+          "elapsed_ns": 5720,
+          "native_compile_row": {
+            "memory": 256,
+            "work": 256
+          },
+          "tier": 256
+        },
+        {
+          "compiled": true,
+          "elapsed_ns": 33450,
+          "native_compile_row": {
+            "memory": 1024,
+            "work": 1024
+          },
+          "tier": 1024
+        },
+        {
+          "compiled": true,
+          "elapsed_ns": 3470,
+          "native_compile_row": {
+            "memory": 4096,
+            "work": 4096
+          },
+          "tier": 4096
+        }
+      ]
+    },
+    {
+      "bound": {
+        "memory": 1841,
+        "work": 262189
+      },
+      "family": "counted-repetition",
+      "pattern": "a{64}",
+      "pattern_bytes": 5,
+      "public_check_elapsed_ns": 1100759,
+      "public_load": {
+        "memory": 7040,
+        "work": 5402
+      },
+      "searches": [
+        {
+          "body_bytes": 4096,
+          "elapsed_ns": 784056,
+          "memory": 49,
+          "ok_bool": true,
+          "result": "Ok(Bool(true))",
+          "suffix": "",
+          "within_bound": true,
+          "work": 262154
+        },
+        {
+          "body_bytes": 4096,
+          "elapsed_ns": 679365,
+          "memory": 49,
+          "ok_bool": true,
+          "result": "Ok(Bool(true))",
+          "suffix": "b",
+          "within_bound": true,
+          "work": 262154
+        },
+        {
+          "body_bytes": 4096,
+          "elapsed_ns": 812657,
+          "memory": 49,
+          "ok_bool": true,
+          "result": "Ok(Bool(true))",
+          "suffix": "!",
+          "within_bound": true,
+          "work": 262154
+        }
+      ],
+      "source": "one.body.matches(r'a{64}')",
+      "tiers": [
+        {
+          "compiled": false,
+          "elapsed_ns": 4020,
+          "native_compile_row": {
+            "memory": 256,
+            "work": 256
+          },
+          "tier": 256
+        },
+        {
+          "compiled": false,
+          "elapsed_ns": 35520,
+          "native_compile_row": {
+            "memory": 1024,
+            "work": 1024
+          },
+          "tier": 1024
+        },
+        {
+          "compiled": true,
+          "elapsed_ns": 9010,
+          "native_compile_row": {
+            "memory": 4096,
+            "work": 4096
+          },
+          "tier": 4096
+        }
+      ]
+    },
+    {
+      "family": "counted-repetition",
+      "pattern": "a{128}",
+      "pattern_bytes": 6,
+      "public_check_elapsed_ns": 885627,
+      "public_load": {
+        "memory": 7104,
+        "work": 5403
+      },
+      "public_refusal": [
+        "matches pattern exceeds the top NFA size tier (4096 bytes)"
+      ],
+      "source": "one.body.matches(r'a{128}')",
+      "tiers": [
+        {
+          "compiled": false,
+          "elapsed_ns": 4560,
+          "native_compile_row": {
+            "memory": 256,
+            "work": 256
+          },
+          "tier": 256
+        },
+        {
+          "compiled": false,
+          "elapsed_ns": 36120,
+          "native_compile_row": {
+            "memory": 1024,
+            "work": 1024
+          },
+          "tier": 1024
+        },
+        {
+          "compiled": false,
+          "elapsed_ns": 11160,
+          "native_compile_row": {
+            "memory": 4096,
+            "work": 4096
+          },
+          "tier": 4096
+        }
+      ]
+    },
+    {
+      "family": "counted-repetition",
+      "pattern": "a{256}",
+      "pattern_bytes": 6,
+      "public_check_elapsed_ns": 694405,
+      "public_load": {
+        "memory": 7104,
+        "work": 5403
+      },
+      "public_refusal": [
+        "matches pattern exceeds the top NFA size tier (4096 bytes)"
+      ],
+      "source": "one.body.matches(r'a{256}')",
+      "tiers": [
+        {
+          "compiled": false,
+          "elapsed_ns": 3590,
+          "native_compile_row": {
+            "memory": 256,
+            "work": 256
+          },
+          "tier": 256
+        },
+        {
+          "compiled": false,
+          "elapsed_ns": 30721,
+          "native_compile_row": {
+            "memory": 1024,
+            "work": 1024
+          },
+          "tier": 1024
+        },
+        {
+          "compiled": false,
+          "elapsed_ns": 6810,
+          "native_compile_row": {
+            "memory": 4096,
+            "work": 4096
+          },
+          "tier": 4096
+        }
+      ]
+    },
+    {
+      "family": "counted-repetition",
+      "pattern": "a{512}",
+      "pattern_bytes": 6,
+      "public_check_elapsed_ns": 676085,
+      "public_load": {
+        "memory": 7104,
+        "work": 5403
+      },
+      "public_refusal": [
+        "matches pattern exceeds the top NFA size tier (4096 bytes)"
+      ],
+      "source": "one.body.matches(r'a{512}')",
+      "tiers": [
+        {
+          "compiled": false,
+          "elapsed_ns": 2600,
+          "native_compile_row": {
+            "memory": 256,
+            "work": 256
+          },
+          "tier": 256
+        },
+        {
+          "compiled": false,
+          "elapsed_ns": 21021,
+          "native_compile_row": {
+            "memory": 1024,
+            "work": 1024
+          },
+          "tier": 1024
+        },
+        {
+          "compiled": false,
+          "elapsed_ns": 6330,
+          "native_compile_row": {
+            "memory": 4096,
+            "work": 4096
+          },
+          "tier": 4096
+        }
+      ]
+    },
+    {
+      "family": "counted-repetition",
+      "pattern": "a{1024}",
+      "pattern_bytes": 7,
+      "public_check_elapsed_ns": 692676,
+      "public_load": {
+        "memory": 7168,
+        "work": 5404
+      },
+      "public_refusal": [
+        "matches pattern exceeds the top NFA size tier (4096 bytes)"
+      ],
+      "source": "one.body.matches(r'a{1024}')",
+      "tiers": [
+        {
+          "compiled": false,
+          "elapsed_ns": 3070,
+          "native_compile_row": {
+            "memory": 256,
+            "work": 256
+          },
+          "tier": 256
+        },
+        {
+          "compiled": false,
+          "elapsed_ns": 21350,
+          "native_compile_row": {
+            "memory": 1024,
+            "work": 1024
+          },
+          "tier": 1024
+        },
+        {
+          "compiled": false,
+          "elapsed_ns": 6790,
+          "native_compile_row": {
+            "memory": 4096,
+            "work": 4096
+          },
+          "tier": 4096
+        }
+      ]
+    },
+    {
+      "family": "counted-repetition",
+      "pattern": "a{2048}",
+      "pattern_bytes": 7,
+      "public_check_elapsed_ns": 774126,
+      "public_load": {
+        "memory": 7168,
+        "work": 5404
+      },
+      "public_refusal": [
+        "matches pattern exceeds the top NFA size tier (4096 bytes)"
+      ],
+      "source": "one.body.matches(r'a{2048}')",
+      "tiers": [
+        {
+          "compiled": false,
+          "elapsed_ns": 2610,
+          "native_compile_row": {
+            "memory": 256,
+            "work": 256
+          },
+          "tier": 256
+        },
+        {
+          "compiled": false,
+          "elapsed_ns": 19860,
+          "native_compile_row": {
+            "memory": 1024,
+            "work": 1024
+          },
+          "tier": 1024
+        },
+        {
+          "compiled": false,
+          "elapsed_ns": 6580,
+          "native_compile_row": {
+            "memory": 4096,
+            "work": 4096
+          },
+          "tier": 4096
+        }
+      ]
+    },
+    {
+      "family": "counted-repetition",
+      "pattern": "a{1000000}",
+      "pattern_bytes": 10,
+      "public_check_elapsed_ns": 691615,
+      "public_load": {
+        "memory": 7360,
+        "work": 5407
+      },
+      "public_refusal": [
+        "matches pattern exceeds the top NFA size tier (4096 bytes)"
+      ],
+      "source": "one.body.matches(r'a{1000000}')",
+      "tiers": [
+        {
+          "compiled": false,
+          "elapsed_ns": 3311,
+          "native_compile_row": {
+            "memory": 256,
+            "work": 256
+          },
+          "tier": 256
+        },
+        {
+          "compiled": false,
+          "elapsed_ns": 13980,
+          "native_compile_row": {
+            "memory": 1024,
+            "work": 1024
+          },
+          "tier": 1024
+        },
+        {
+          "compiled": false,
+          "elapsed_ns": 8030,
+          "native_compile_row": {
+            "memory": 4096,
+            "work": 4096
+          },
+          "tier": 4096
+        }
+      ]
+    },
+    {
+      "bound": {
+        "memory": 1843,
+        "work": 65581
+      },
+      "family": "wide-alternation",
+      "pattern": "(a0|a1)",
+      "pattern_bytes": 7,
+      "public_check_elapsed_ns": 1025338,
+      "public_load": {
+        "memory": 3072,
+        "work": 1308
+      },
+      "searches": [
+        {
+          "body_bytes": 4096,
+          "elapsed_ns": 1236909,
+          "memory": 51,
+          "ok_bool": true,
+          "result": "Ok(Bool(false))",
+          "suffix": "",
+          "within_bound": true,
+          "work": 65546
+        },
+        {
+          "body_bytes": 4096,
+          "elapsed_ns": 1055859,
+          "memory": 51,
+          "ok_bool": true,
+          "result": "Ok(Bool(false))",
+          "suffix": "b",
+          "within_bound": true,
+          "work": 65546
+        },
+        {
+          "body_bytes": 4096,
+          "elapsed_ns": 1294340,
+          "memory": 51,
+          "ok_bool": true,
+          "result": "Ok(Bool(false))",
+          "suffix": "!",
+          "within_bound": true,
+          "work": 65546
+        }
+      ],
+      "source": "one.body.matches(r'(a0|a1)')",
+      "tiers": [
+        {
+          "compiled": false,
+          "elapsed_ns": 10030,
+          "native_compile_row": {
+            "memory": 256,
+            "work": 256
+          },
+          "tier": 256
+        },
+        {
+          "compiled": true,
+          "elapsed_ns": 10160,
+          "native_compile_row": {
+            "memory": 1024,
+            "work": 1024
+          },
+          "tier": 1024
+        },
+        {
+          "compiled": true,
+          "elapsed_ns": 3110,
+          "native_compile_row": {
+            "memory": 4096,
+            "work": 4096
+          },
+          "tier": 4096
+        }
+      ]
+    },
+    {
+      "bound": {
+        "memory": 1849,
+        "work": 65581
+      },
+      "family": "wide-alternation",
+      "pattern": "(a0|a1|a2|a3)",
+      "pattern_bytes": 13,
+      "public_check_elapsed_ns": 1026339,
+      "public_load": {
+        "memory": 3456,
+        "work": 1314
+      },
+      "searches": [
+        {
+          "body_bytes": 4096,
+          "elapsed_ns": 1562182,
+          "memory": 57,
+          "ok_bool": true,
+          "result": "Ok(Bool(false))",
+          "suffix": "",
+          "within_bound": true,
+          "work": 65546
+        },
+        {
+          "body_bytes": 4096,
+          "elapsed_ns": 1543992,
+          "memory": 57,
+          "ok_bool": true,
+          "result": "Ok(Bool(false))",
+          "suffix": "b",
+          "within_bound": true,
+          "work": 65546
+        },
+        {
+          "body_bytes": 4096,
+          "elapsed_ns": 1333630,
+          "memory": 57,
+          "ok_bool": true,
+          "result": "Ok(Bool(false))",
+          "suffix": "!",
+          "within_bound": true,
+          "work": 65546
+        }
+      ],
+      "source": "one.body.matches(r'(a0|a1|a2|a3)')",
+      "tiers": [
+        {
+          "compiled": false,
+          "elapsed_ns": 18230,
+          "native_compile_row": {
+            "memory": 256,
+            "work": 256
+          },
+          "tier": 256
+        },
+        {
+          "compiled": true,
+          "elapsed_ns": 8140,
+          "native_compile_row": {
+            "memory": 1024,
+            "work": 1024
+          },
+          "tier": 1024
+        },
+        {
+          "compiled": true,
+          "elapsed_ns": 4460,
+          "native_compile_row": {
+            "memory": 4096,
+            "work": 4096
+          },
+          "tier": 4096
+        }
+      ]
+    },
+    {
+      "bound": {
+        "memory": 1861,
+        "work": 65581
+      },
+      "family": "wide-alternation",
+      "pattern": "(a0|a1|a2|a3|a4|a5|a6|a7)",
+      "pattern_bytes": 25,
+      "public_check_elapsed_ns": 893927,
+      "public_load": {
+        "memory": 4224,
+        "work": 1326
+      },
+      "searches": [
+        {
+          "body_bytes": 4096,
+          "elapsed_ns": 1746104,
+          "memory": 69,
+          "ok_bool": true,
+          "result": "Ok(Bool(false))",
+          "suffix": "",
+          "within_bound": true,
+          "work": 65546
+        },
+        {
+          "body_bytes": 4096,
+          "elapsed_ns": 1719123,
+          "memory": 69,
+          "ok_bool": true,
+          "result": "Ok(Bool(false))",
+          "suffix": "b",
+          "within_bound": true,
+          "work": 65546
+        },
+        {
+          "body_bytes": 4096,
+          "elapsed_ns": 1711184,
+          "memory": 69,
+          "ok_bool": true,
+          "result": "Ok(Bool(false))",
+          "suffix": "!",
+          "within_bound": true,
+          "work": 65546
+        }
+      ],
+      "source": "one.body.matches(r'(a0|a1|a2|a3|a4|a5|a6|a7)')",
+      "tiers": [
+        {
+          "compiled": false,
+          "elapsed_ns": 45380,
+          "native_compile_row": {
+            "memory": 256,
+            "work": 256
+          },
+          "tier": 256
+        },
+        {
+          "compiled": true,
+          "elapsed_ns": 10830,
+          "native_compile_row": {
+            "memory": 1024,
+            "work": 1024
+          },
+          "tier": 1024
+        },
+        {
+          "compiled": true,
+          "elapsed_ns": 5940,
+          "native_compile_row": {
+            "memory": 4096,
+            "work": 4096
+          },
+          "tier": 4096
+        }
+      ]
+    },
+    {
+      "bound": {
+        "memory": 1891,
+        "work": 262189
+      },
+      "family": "wide-alternation",
+      "pattern": "(a0|a1|a2|a3|a4|a5|a6|a7|a8|a9|a10|a11|a12|a13|a14|a15)",
+      "pattern_bytes": 55,
+      "public_check_elapsed_ns": 850396,
+      "public_load": {
+        "memory": 10240,
+        "work": 5452
+      },
+      "searches": [
+        {
+          "body_bytes": 4096,
+          "elapsed_ns": 2778772,
+          "memory": 99,
+          "ok_bool": true,
+          "result": "Ok(Bool(false))",
+          "suffix": "",
+          "within_bound": true,
+          "work": 262154
+        },
+        {
+          "body_bytes": 4096,
+          "elapsed_ns": 2814132,
+          "memory": 99,
+          "ok_bool": true,
+          "result": "Ok(Bool(false))",
+          "suffix": "b",
+          "within_bound": true,
+          "work": 262154
+        },
+        {
+          "body_bytes": 4096,
+          "elapsed_ns": 3708679,
+          "memory": 99,
+          "ok_bool": true,
+          "result": "Ok(Bool(false))",
+          "suffix": "!",
+          "within_bound": true,
+          "work": 262154
+        }
+      ],
+      "source": "one.body.matches(r'(a0|a1|a2|a3|a4|a5|a6|a7|a8|a9|a10|a11|a12|a13|a14|a15)')",
+      "tiers": [
+        {
+          "compiled": false,
+          "elapsed_ns": 45170,
+          "native_compile_row": {
+            "memory": 256,
+            "work": 256
+          },
+          "tier": 256
+        },
+        {
+          "compiled": false,
+          "elapsed_ns": 12350,
+          "native_compile_row": {
+            "memory": 1024,
+            "work": 1024
+          },
+          "tier": 1024
+        },
+        {
+          "compiled": true,
+          "elapsed_ns": 9481,
+          "native_compile_row": {
+            "memory": 4096,
+            "work": 4096
+          },
+          "tier": 4096
+        }
+      ]
+    },
+    {
+      "bound": {
+        "memory": 1955,
+        "work": 262189
+      },
+      "family": "wide-alternation",
+      "pattern": "(a0|a1|a2|a3|a4|a5|a6|a7|a8|a9|a10|a11|a12|a13|a14|a15|a16|a17|a18|a19|a20|a21|a22|a23|a24|a25|a26|a27|a28|a29|a30|a31)",
+      "pattern_bytes": 119,
+      "public_check_elapsed_ns": 1280410,
+      "public_load": {
+        "memory": 14336,
+        "work": 5516
+      },
+      "searches": [
+        {
+          "body_bytes": 4096,
+          "elapsed_ns": 6355479,
+          "memory": 163,
+          "ok_bool": true,
+          "result": "Ok(Bool(false))",
+          "suffix": "",
+          "within_bound": true,
+          "work": 262154
+        },
+        {
+          "body_bytes": 4096,
+          "elapsed_ns": 6305549,
+          "memory": 163,
+          "ok_bool": true,
+          "result": "Ok(Bool(false))",
+          "suffix": "b",
+          "within_bound": true,
+          "work": 262154
+        },
+        {
+          "body_bytes": 4096,
+          "elapsed_ns": 4849408,
+          "memory": 163,
+          "ok_bool": true,
+          "result": "Ok(Bool(false))",
+          "suffix": "!",
+          "within_bound": true,
+          "work": 262154
+        }
+      ],
+      "source": "one.body.matches(r'(a0|a1|a2|a3|a4|a5|a6|a7|a8|a9|a10|a11|a12|a13|a14|a15|a16|a17|a18|a19|a20|a21|a22|a23|a24|a25|a26|a27|a28|a29|a30|a31)')",
+      "tiers": [
+        {
+          "compiled": false,
+          "elapsed_ns": 56430,
+          "native_compile_row": {
+            "memory": 256,
+            "work": 256
+          },
+          "tier": 256
+        },
+        {
+          "compiled": false,
+          "elapsed_ns": 16910,
+          "native_compile_row": {
+            "memory": 1024,
+            "work": 1024
+          },
+          "tier": 1024
+        },
+        {
+          "compiled": true,
+          "elapsed_ns": 21180,
+          "native_compile_row": {
+            "memory": 4096,
+            "work": 4096
+          },
+          "tier": 4096
+        }
+      ]
+    },
+    {
+      "bound": {
+        "memory": 1899,
+        "work": 262189
+      },
+      "family": "nest-boundary",
+      "pattern": "(((((((((((((((((((((((((((((((a)))))))))))))))))))))))))))))))",
+      "pattern_bytes": 63,
+      "public_check_elapsed_ns": 965837,
+      "public_load": {
+        "memory": 10752,
+        "work": 5460
+      },
+      "searches": [
+        {
+          "body_bytes": 4096,
+          "elapsed_ns": 955557,
+          "memory": 107,
+          "ok_bool": true,
+          "result": "Ok(Bool(true))",
+          "suffix": "",
+          "within_bound": true,
+          "work": 262154
+        },
+        {
+          "body_bytes": 4096,
+          "elapsed_ns": 663326,
+          "memory": 107,
+          "ok_bool": true,
+          "result": "Ok(Bool(true))",
+          "suffix": "b",
+          "within_bound": true,
+          "work": 262154
+        },
+        {
+          "body_bytes": 4096,
+          "elapsed_ns": 664585,
+          "memory": 107,
+          "ok_bool": true,
+          "result": "Ok(Bool(true))",
+          "suffix": "!",
+          "within_bound": true,
+          "work": 262154
+        }
+      ],
+      "source": "one.body.matches(r'(((((((((((((((((((((((((((((((a)))))))))))))))))))))))))))))))')",
+      "tiers": [
+        {
+          "compiled": false,
+          "elapsed_ns": 37030,
+          "native_compile_row": {
+            "memory": 256,
+            "work": 256
+          },
+          "tier": 256
+        },
+        {
+          "compiled": false,
+          "elapsed_ns": 51180,
+          "native_compile_row": {
+            "memory": 1024,
+            "work": 1024
+          },
+          "tier": 1024
+        },
+        {
+          "compiled": true,
+          "elapsed_ns": 20151,
+          "native_compile_row": {
+            "memory": 4096,
+            "work": 4096
+          },
+          "tier": 4096
+        }
+      ]
+    },
+    {
+      "bound": {
+        "memory": 1901,
+        "work": 262189
+      },
+      "family": "nest-boundary",
+      "pattern": "((((((((((((((((((((((((((((((((a))))))))))))))))))))))))))))))))",
+      "pattern_bytes": 65,
+      "public_check_elapsed_ns": 831537,
+      "public_load": {
+        "memory": 10880,
+        "work": 5462
+      },
+      "searches": [
+        {
+          "body_bytes": 4096,
+          "elapsed_ns": 709095,
+          "memory": 109,
+          "ok_bool": true,
+          "result": "Ok(Bool(true))",
+          "suffix": "",
+          "within_bound": true,
+          "work": 262154
+        },
+        {
+          "body_bytes": 4096,
+          "elapsed_ns": 676625,
+          "memory": 109,
+          "ok_bool": true,
+          "result": "Ok(Bool(true))",
+          "suffix": "b",
+          "within_bound": true,
+          "work": 262154
+        },
+        {
+          "body_bytes": 4096,
+          "elapsed_ns": 820827,
+          "memory": 109,
+          "ok_bool": true,
+          "result": "Ok(Bool(true))",
+          "suffix": "!",
+          "within_bound": true,
+          "work": 262154
+        }
+      ],
+      "source": "one.body.matches(r'((((((((((((((((((((((((((((((((a))))))))))))))))))))))))))))))))')",
+      "tiers": [
+        {
+          "compiled": false,
+          "elapsed_ns": 18380,
+          "native_compile_row": {
+            "memory": 256,
+            "work": 256
+          },
+          "tier": 256
+        },
+        {
+          "compiled": false,
+          "elapsed_ns": 22900,
+          "native_compile_row": {
+            "memory": 1024,
+            "work": 1024
+          },
+          "tier": 1024
+        },
+        {
+          "compiled": true,
+          "elapsed_ns": 21740,
+          "native_compile_row": {
+            "memory": 4096,
+            "work": 4096
+          },
+          "tier": 4096
+        }
+      ]
+    },
+    {
+      "family": "nest-boundary",
+      "pattern": "(((((((((((((((((((((((((((((((((a)))))))))))))))))))))))))))))))))",
+      "pattern_bytes": 67,
+      "public_check_elapsed_ns": 883337,
+      "public_load": {
+        "memory": 11008,
+        "work": 5464
+      },
+      "public_refusal": [
+        "matches pattern exceeds the top NFA size tier (4096 bytes)"
+      ],
+      "source": "one.body.matches(r'(((((((((((((((((((((((((((((((((a)))))))))))))))))))))))))))))))))')",
+      "tiers": [
+        {
+          "compiled": false,
+          "elapsed_ns": 6390,
+          "native_compile_row": {
+            "memory": 256,
+            "work": 256
+          },
+          "tier": 256
+        },
+        {
+          "compiled": false,
+          "elapsed_ns": 4920,
+          "native_compile_row": {
+            "memory": 1024,
+            "work": 1024
+          },
+          "tier": 1024
+        },
+        {
+          "compiled": false,
+          "elapsed_ns": 4700,
+          "native_compile_row": {
+            "memory": 4096,
+            "work": 4096
+          },
+          "tier": 4096
+        }
+      ]
+    },
+    {
+      "bound": {
+        "memory": 1837,
+        "work": 16429
+      },
+      "family": "search-adversary",
+      "pattern": "a",
+      "pattern_bytes": 1,
+      "public_check_elapsed_ns": 767746,
+      "public_load": {
+        "memory": 1664,
+        "work": 278
+      },
+      "searches": [
+        {
+          "body_bytes": 4096,
+          "elapsed_ns": 782377,
+          "memory": 45,
+          "ok_bool": true,
+          "result": "Ok(Bool(true))",
+          "suffix": "",
+          "within_bound": true,
+          "work": 16394
+        },
+        {
+          "body_bytes": 4096,
+          "elapsed_ns": 648336,
+          "memory": 45,
+          "ok_bool": true,
+          "result": "Ok(Bool(true))",
+          "suffix": "b",
+          "within_bound": true,
+          "work": 16394
+        },
+        {
+          "body_bytes": 4096,
+          "elapsed_ns": 1008148,
+          "memory": 45,
+          "ok_bool": true,
+          "result": "Ok(Bool(true))",
+          "suffix": "!",
+          "within_bound": true,
+          "work": 16394
+        }
+      ],
+      "source": "one.body.matches(r'a')",
+      "tiers": [
+        {
+          "compiled": true,
+          "elapsed_ns": 2960,
+          "native_compile_row": {
+            "memory": 256,
+            "work": 256
+          },
+          "tier": 256
+        },
+        {
+          "compiled": true,
+          "elapsed_ns": 980,
+          "native_compile_row": {
+            "memory": 1024,
+            "work": 1024
+          },
+          "tier": 1024
+        },
+        {
+          "compiled": true,
+          "elapsed_ns": 900,
+          "native_compile_row": {
+            "memory": 4096,
+            "work": 4096
+          },
+          "tier": 4096
+        }
+      ]
+    },
+    {
+      "bound": {
+        "memory": 1849,
+        "work": 16429
+      },
+      "family": "search-adversary",
+      "pattern": "[a-zA-Z0-9_]+",
+      "pattern_bytes": 13,
+      "public_check_elapsed_ns": 1156049,
+      "public_load": {
+        "memory": 2432,
+        "work": 290
+      },
+      "searches": [
+        {
+          "body_bytes": 4096,
+          "elapsed_ns": 1127209,
+          "memory": 57,
+          "ok_bool": true,
+          "result": "Ok(Bool(true))",
+          "suffix": "",
+          "within_bound": true,
+          "work": 16394
+        },
+        {
+          "body_bytes": 4096,
+          "elapsed_ns": 730656,
+          "memory": 57,
+          "ok_bool": true,
+          "result": "Ok(Bool(true))",
+          "suffix": "b",
+          "within_bound": true,
+          "work": 16394
+        },
+        {
+          "body_bytes": 4096,
+          "elapsed_ns": 835896,
+          "memory": 57,
+          "ok_bool": true,
+          "result": "Ok(Bool(true))",
+          "suffix": "!",
+          "within_bound": true,
+          "work": 16394
+        }
+      ],
+      "source": "one.body.matches(r'[a-zA-Z0-9_]+')",
+      "tiers": [
+        {
+          "compiled": true,
+          "elapsed_ns": 11040,
+          "native_compile_row": {
+            "memory": 256,
+            "work": 256
+          },
+          "tier": 256
+        },
+        {
+          "compiled": true,
+          "elapsed_ns": 2560,
+          "native_compile_row": {
+            "memory": 1024,
+            "work": 1024
+          },
+          "tier": 1024
+        },
+        {
+          "compiled": true,
+          "elapsed_ns": 3250,
+          "native_compile_row": {
+            "memory": 4096,
+            "work": 4096
+          },
+          "tier": 4096
+        }
+      ]
+    },
+    {
+      "bound": {
+        "memory": 1844,
+        "work": 65581
+      },
+      "family": "search-adversary",
+      "pattern": "(a|aa)*b",
+      "pattern_bytes": 8,
+      "public_check_elapsed_ns": 1106509,
+      "public_load": {
+        "memory": 3136,
+        "work": 1309
+      },
+      "searches": [
+        {
+          "body_bytes": 4096,
+          "elapsed_ns": 1303070,
+          "memory": 52,
+          "ok_bool": true,
+          "result": "Ok(Bool(false))",
+          "suffix": "",
+          "within_bound": true,
+          "work": 65546
+        },
+        {
+          "body_bytes": 4096,
+          "elapsed_ns": 1108249,
+          "memory": 52,
+          "ok_bool": true,
+          "result": "Ok(Bool(true))",
+          "suffix": "b",
+          "within_bound": true,
+          "work": 65546
+        },
+        {
+          "body_bytes": 4096,
+          "elapsed_ns": 1022858,
+          "memory": 52,
+          "ok_bool": true,
+          "result": "Ok(Bool(false))",
+          "suffix": "!",
+          "within_bound": true,
+          "work": 65546
+        }
+      ],
+      "source": "one.body.matches(r'(a|aa)*b')",
+      "tiers": [
+        {
+          "compiled": false,
+          "elapsed_ns": 18610,
+          "native_compile_row": {
+            "memory": 256,
+            "work": 256
+          },
+          "tier": 256
+        },
+        {
+          "compiled": true,
+          "elapsed_ns": 10960,
+          "native_compile_row": {
+            "memory": 1024,
+            "work": 1024
+          },
+          "tier": 1024
+        },
+        {
+          "compiled": true,
+          "elapsed_ns": 4730,
+          "native_compile_row": {
+            "memory": 4096,
+            "work": 4096
+          },
+          "tier": 4096
+        }
+      ]
+    },
+    {
+      "bound": {
+        "memory": 1842,
+        "work": 65581
+      },
+      "family": "search-adversary",
+      "pattern": "(a+)+$",
+      "pattern_bytes": 6,
+      "public_check_elapsed_ns": 863797,
+      "public_load": {
+        "memory": 3008,
+        "work": 1307
+      },
+      "searches": [
+        {
+          "body_bytes": 4096,
+          "elapsed_ns": 904807,
+          "memory": 50,
+          "ok_bool": true,
+          "result": "Ok(Bool(true))",
+          "suffix": "",
+          "within_bound": true,
+          "work": 65546
+        },
+        {
+          "body_bytes": 4096,
+          "elapsed_ns": 839996,
+          "memory": 50,
+          "ok_bool": true,
+          "result": "Ok(Bool(false))",
+          "suffix": "b",
+          "within_bound": true,
+          "work": 65546
+        },
+        {
+          "body_bytes": 4096,
+          "elapsed_ns": 1152790,
+          "memory": 50,
+          "ok_bool": true,
+          "result": "Ok(Bool(false))",
+          "suffix": "!",
+          "within_bound": true,
+          "work": 65546
+        }
+      ],
+      "source": "one.body.matches(r'(a+)+$')",
+      "tiers": [
+        {
+          "compiled": false,
+          "elapsed_ns": 8800,
+          "native_compile_row": {
+            "memory": 256,
+            "work": 256
+          },
+          "tier": 256
+        },
+        {
+          "compiled": true,
+          "elapsed_ns": 10360,
+          "native_compile_row": {
+            "memory": 1024,
+            "work": 1024
+          },
+          "tier": 1024
+        },
+        {
+          "compiled": true,
+          "elapsed_ns": 2730,
+          "native_compile_row": {
+            "memory": 4096,
+            "work": 4096
+          },
+          "tier": 4096
+        }
+      ]
+    },
+    {
+      "bound": {
+        "memory": 1847,
+        "work": 262189
+      },
+      "family": "search-adversary",
+      "pattern": "(?:a?){32}b",
+      "pattern_bytes": 11,
+      "public_check_elapsed_ns": 1058219,
+      "public_load": {
+        "memory": 7424,
+        "work": 5408
+      },
+      "searches": [
+        {
+          "body_bytes": 4096,
+          "elapsed_ns": 7091366,
+          "memory": 55,
+          "ok_bool": true,
+          "result": "Ok(Bool(false))",
+          "suffix": "",
+          "within_bound": true,
+          "work": 262154
+        },
+        {
+          "body_bytes": 4096,
+          "elapsed_ns": 7017725,
+          "memory": 55,
+          "ok_bool": true,
+          "result": "Ok(Bool(true))",
+          "suffix": "b",
+          "within_bound": true,
+          "work": 262154
+        },
+        {
+          "body_bytes": 4096,
+          "elapsed_ns": 5461853,
+          "memory": 55,
+          "ok_bool": true,
+          "result": "Ok(Bool(false))",
+          "suffix": "!",
+          "within_bound": true,
+          "work": 262154
+        }
+      ],
+      "source": "one.body.matches(r'(?:a?){32}b')",
+      "tiers": [
+        {
+          "compiled": false,
+          "elapsed_ns": 11450,
+          "native_compile_row": {
+            "memory": 256,
+            "work": 256
+          },
+          "tier": 256
+        },
+        {
+          "compiled": false,
+          "elapsed_ns": 38480,
+          "native_compile_row": {
+            "memory": 1024,
+            "work": 1024
+          },
+          "tier": 1024
+        },
+        {
+          "compiled": true,
+          "elapsed_ns": 12240,
+          "native_compile_row": {
+            "memory": 4096,
+            "work": 4096
+          },
+          "tier": 4096
+        }
+      ]
+    },
+    {
+      "bound": {
+        "memory": 1856,
+        "work": 262189
+      },
+      "family": "search-adversary",
+      "pattern": "^(?:a{1,8}|b{1,8})+$",
+      "pattern_bytes": 20,
+      "public_check_elapsed_ns": 1284361,
+      "public_load": {
+        "memory": 8000,
+        "work": 5417
+      },
+      "searches": [
+        {
+          "body_bytes": 4096,
+          "elapsed_ns": 2323898,
+          "memory": 64,
+          "ok_bool": true,
+          "result": "Ok(Bool(true))",
+          "suffix": "",
+          "within_bound": true,
+          "work": 262154
+        },
+        {
+          "body_bytes": 4096,
+          "elapsed_ns": 1873625,
+          "memory": 64,
+          "ok_bool": true,
+          "result": "Ok(Bool(true))",
+          "suffix": "b",
+          "within_bound": true,
+          "work": 262154
+        },
+        {
+          "body_bytes": 4096,
+          "elapsed_ns": 2356928,
+          "memory": 64,
+          "ok_bool": true,
+          "result": "Ok(Bool(false))",
+          "suffix": "!",
+          "within_bound": true,
+          "work": 262154
+        }
+      ],
+      "source": "one.body.matches(r'^(?:a{1,8}|b{1,8})+$')",
+      "tiers": [
+        {
+          "compiled": false,
+          "elapsed_ns": 11690,
+          "native_compile_row": {
+            "memory": 256,
+            "work": 256
+          },
+          "tier": 256
+        },
+        {
+          "compiled": false,
+          "elapsed_ns": 8130,
+          "native_compile_row": {
+            "memory": 1024,
+            "work": 1024
+          },
+          "tier": 1024
+        },
+        {
+          "compiled": true,
+          "elapsed_ns": 6280,
+          "native_compile_row": {
+            "memory": 4096,
+            "work": 4096
+          },
+          "tier": 4096
+        }
+      ]
+    },
+    {
+      "family": "search-adversary",
+      "pattern": "(ab|cd){128}",
+      "pattern_bytes": 12,
+      "public_check_elapsed_ns": 754526,
+      "public_load": {
+        "memory": 7488,
+        "work": 5409
+      },
+      "public_refusal": [
+        "matches pattern exceeds the top NFA size tier (4096 bytes)"
+      ],
+      "source": "one.body.matches(r'(ab|cd){128}')",
+      "tiers": [
+        {
+          "compiled": false,
+          "elapsed_ns": 11691,
+          "native_compile_row": {
+            "memory": 256,
+            "work": 256
+          },
+          "tier": 256
+        },
+        {
+          "compiled": false,
+          "elapsed_ns": 33830,
+          "native_compile_row": {
+            "memory": 1024,
+            "work": 1024
+          },
+          "tier": 1024
+        },
+        {
+          "compiled": false,
+          "elapsed_ns": 18460,
+          "native_compile_row": {
+            "memory": 4096,
+            "work": 4096
+          },
+          "tier": 4096
+        }
+      ]
+    }
+  ],
+  "execution": {
+    "arch": "x86_64",
+    "available_parallelism": 12,
+    "binary_sha256": "5ffa225d4907100a4967f2f60136806352a76c62e4d35cbd2745c77abd95e71e",
+    "command": {
+      "candidate": 18446744073709551615,
+      "mode": "regex",
+      "requested_successes": 0
+    },
+    "cpu": "model name\t: AMD EPYC 7232P 8-Core Processor",
+    "debug_assertions": true,
+    "elapsed_seconds": 0.617950553,
+    "execution_head_end": "b307a2c5954630eb58b69159495f8422ee6c800f",
+    "execution_head_start": "b307a2c5954630eb58b69159495f8422ee6c800f",
+    "memory": "MemTotal:       131768020 kB",
+    "os": "linux",
+    "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18)\nbinary: rustc\ncommit-hash: 88d9e12ae178fab0fb5cc050a94da85685d449ea\ncommit-date: 2026-08-18\nhost: x86_64-unknown-linux-gnu\nrelease: 1.98.0\nLLVM version: 22.1.8",
+    "scope": "Native wall time includes source check, input validation, proof diagnostics and runtime; not guest fuel or allocator high-water.",
+    "working_tree_end": "",
+    "working_tree_start": ""
+  },
+  "limits": {
+    "B": 1048576,
+    "Imax": 16,
+    "S": 4096,
+    "guard_memory": 1048576,
+    "guard_work": 16000000,
+    "regex_K": 64,
+    "regex_nest": 32,
+    "regex_pattern": 256,
+    "regex_tiers": [
+      256,
+      1024,
+      4096
+    ],
+    "rows": 5000,
+    "rule_memory": 402653184,
+    "rule_work": 16000000
+  },
+  "policy": "cel-subset@1/p1",
+  "scope": "Native compile timings invoke the same RegexBuilder parameters directly; public check includes parsing/preparation/estimation. Public search timings include validation/conversion/emission. K is a conservative native charge scale, not guest fuel evidence."
+}

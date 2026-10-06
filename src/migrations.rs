@@ -210,6 +210,23 @@ fn production_migrations() -> Vec<Arc<dyn EngineMigrationStep>> {
         Arc::new(Engine62To63Migration),
         Arc::new(Engine63To64Migration),
         Arc::new(Engine64To65Migration),
+        Arc::new(Engine65To66Migration),
+        Arc::new(Engine66To67Migration),
+        Arc::new(Engine67To68Migration),
+        Arc::new(Engine68To69Migration),
+        Arc::new(Engine69To70Migration),
+        Arc::new(Engine70To71Migration),
+        Arc::new(Engine71To72Migration),
+        Arc::new(Engine72To73Migration),
+        Arc::new(Engine73To74Migration),
+        Arc::new(Engine74To75Migration),
+        Arc::new(Engine75To76Migration),
+        Arc::new(Engine76To77Migration),
+        Arc::new(Engine77To78Migration),
+        Arc::new(Engine78To79Migration),
+        Arc::new(Engine79To80Migration),
+        Arc::new(Engine80To81Migration),
+        Arc::new(Engine81To82Migration),
     ]
 }
 
@@ -2260,6 +2277,1217 @@ pub(crate) const ENGINE_64_TO_65_STATEMENTS: [&str; 2] = [
     r#"CREATE INDEX idx_alpha_tab_installs_artifact ON alpha_tab_installs(artifact_id)"#,
 ];
 
+/// The exact engine-65-to-66 DDL: the single authoritative source for this
+/// schema edge's structural change.
+///
+/// Both the reference SQLite runner (`Engine65To66Migration::apply` below)
+/// and the Turso-local runner
+/// (`crate::turso_local::migrate_existing_engine_schema`) execute this same
+/// sequence. The edge is DDL-only: `authorization_grant_revision` is new
+/// install state with no pre-existing rows to backfill, so a migrated
+/// database gains the empty counter and converges with a fresh database.
+/// Seeding at 0 is sound because the realtime stream uses a new hash domain
+/// for this counter, distinct from pre-66 contexts derived from the broad
+/// authorization revision.
+///
+/// The statements must stay byte-identical to the corresponding
+/// `crate::schema::DDL_STATEMENTS` entries; the 65→66 migration test asserts
+/// that rather than assuming it.
+pub(crate) const ENGINE_65_TO_66_STATEMENTS: [&str; 19] = [
+    r#"CREATE TABLE IF NOT EXISTS authorization_grant_revision (
+     id     INTEGER PRIMARY KEY CHECK (id = 1),
+     epoch  INTEGER NOT NULL
+   )"#,
+    r#"INSERT OR IGNORE INTO authorization_grant_revision (id, epoch) VALUES (1, 0)"#,
+    r#"CREATE TRIGGER IF NOT EXISTS authorization_grant_record_policies_insert AFTER INSERT ON record_policies
+       BEGIN UPDATE authorization_grant_revision SET epoch = epoch + 1 WHERE id = 1; END"#,
+    r#"CREATE TRIGGER IF NOT EXISTS authorization_grant_record_policies_delete AFTER DELETE ON record_policies
+       WHEN EXISTS (SELECT 1 FROM records WHERE id = OLD.record_id)
+       BEGIN UPDATE authorization_grant_revision SET epoch = epoch + 1 WHERE id = 1; END"#,
+    r#"CREATE TRIGGER IF NOT EXISTS authorization_grant_record_policies_update AFTER UPDATE ON record_policies
+       WHEN OLD.record_id IS NOT NEW.record_id
+       BEGIN UPDATE authorization_grant_revision SET epoch = epoch + 1 WHERE id = 1; END"#,
+    r#"CREATE TRIGGER IF NOT EXISTS authorization_grant_policy_entries_insert AFTER INSERT ON policy_entries
+       BEGIN UPDATE authorization_grant_revision SET epoch = epoch + 1 WHERE id = 1; END"#,
+    r#"CREATE TRIGGER IF NOT EXISTS authorization_grant_policy_entries_delete AFTER DELETE ON policy_entries
+       WHEN EXISTS (SELECT 1 FROM records WHERE id = OLD.policy_anchor_id)
+       BEGIN UPDATE authorization_grant_revision SET epoch = epoch + 1 WHERE id = 1; END"#,
+    r#"CREATE TRIGGER IF NOT EXISTS authorization_grant_policy_entries_update AFTER UPDATE ON policy_entries
+       WHEN OLD.policy_anchor_id IS NOT NEW.policy_anchor_id
+         OR OLD.subject_kind IS NOT NEW.subject_kind
+         OR OLD.subject_id IS NOT NEW.subject_id
+         OR OLD.effect IS NOT NEW.effect
+         OR OLD.capability IS NOT NEW.capability
+       BEGIN UPDATE authorization_grant_revision SET epoch = epoch + 1 WHERE id = 1; END"#,
+    r#"CREATE TRIGGER IF NOT EXISTS authorization_grant_bindings_insert AFTER INSERT ON bindings
+       WHEN NEW.system = 'account'
+       BEGIN UPDATE authorization_grant_revision SET epoch = epoch + 1 WHERE id = 1; END"#,
+    r#"CREATE TRIGGER IF NOT EXISTS authorization_grant_bindings_delete AFTER DELETE ON bindings
+       WHEN OLD.system = 'account'
+       BEGIN UPDATE authorization_grant_revision SET epoch = epoch + 1 WHERE id = 1; END"#,
+    r#"CREATE TRIGGER IF NOT EXISTS authorization_grant_bindings_update AFTER UPDATE ON bindings
+       WHEN (OLD.system = 'account' OR NEW.system = 'account')
+        AND (OLD.record_id IS NOT NEW.record_id
+          OR OLD.system IS NOT NEW.system
+          OR OLD.identifier IS NOT NEW.identifier
+          OR OLD.is_canonical IS NOT NEW.is_canonical)
+       BEGIN UPDATE authorization_grant_revision SET epoch = epoch + 1 WHERE id = 1; END"#,
+    r#"CREATE TRIGGER IF NOT EXISTS authorization_grant_records_update
+       AFTER UPDATE OF owner_id, policy_anchor_id, deleted_at, type, kind ON records
+       WHEN OLD.owner_id IS NOT NEW.owner_id
+         OR OLD.policy_anchor_id IS NOT NEW.policy_anchor_id
+         OR OLD.type IS NOT NEW.type
+         OR OLD.kind IS NOT NEW.kind
+         OR (OLD.deleted_at IS NOT NEW.deleted_at
+           AND (EXISTS (SELECT 1 FROM links JOIN records src ON src.id = links.source_id WHERE links.target_id = OLD.id AND links.relationship = 'part_of' AND src.deleted_at IS NULL AND (src.type = 'Annotation' OR (src.type = 'Document' AND src.kind = 'attachment')))
+             OR EXISTS (SELECT 1 FROM semantic_units JOIN records u ON u.id = semantic_units.unit_id WHERE semantic_units.authority_bearer_record_id = OLD.id AND u.deleted_at IS NULL)))
+       BEGIN UPDATE authorization_grant_revision SET epoch = epoch + 1 WHERE id = 1; END"#,
+    r#"CREATE TRIGGER IF NOT EXISTS authorization_grant_records_delete BEFORE DELETE ON records
+       WHEN EXISTS (SELECT 1 FROM links JOIN records src ON src.id = links.source_id WHERE links.target_id = OLD.id AND links.relationship = 'part_of' AND src.deleted_at IS NULL AND (src.type = 'Annotation' OR (src.type = 'Document' AND src.kind = 'attachment')))
+         OR EXISTS (SELECT 1 FROM semantic_units JOIN records u ON u.id = semantic_units.unit_id WHERE semantic_units.authority_bearer_record_id = OLD.id AND u.deleted_at IS NULL)
+       BEGIN UPDATE authorization_grant_revision SET epoch = epoch + 1 WHERE id = 1; END"#,
+    r#"CREATE TRIGGER IF NOT EXISTS authorization_grant_links_insert AFTER INSERT ON links
+       WHEN NEW.relationship = 'part_of'
+        AND EXISTS (SELECT 1 FROM records WHERE id = NEW.source_id AND deleted_at IS NULL AND (type = 'Annotation' OR (type = 'Document' AND kind = 'attachment')))
+        AND (SELECT COUNT(*) FROM links WHERE source_id = NEW.source_id AND relationship = 'part_of') > 1
+       BEGIN UPDATE authorization_grant_revision SET epoch = epoch + 1 WHERE id = 1; END"#,
+    r#"CREATE TRIGGER IF NOT EXISTS authorization_grant_links_delete AFTER DELETE ON links
+       WHEN OLD.relationship = 'part_of'
+        AND EXISTS (SELECT 1 FROM records WHERE id = OLD.source_id AND deleted_at IS NULL AND (type = 'Annotation' OR (type = 'Document' AND kind = 'attachment')))
+        AND (SELECT COUNT(*) FROM links WHERE source_id = OLD.source_id AND relationship = 'part_of') = 0
+       BEGIN UPDATE authorization_grant_revision SET epoch = epoch + 1 WHERE id = 1; END"#,
+    r#"CREATE TRIGGER IF NOT EXISTS authorization_grant_links_update AFTER UPDATE ON links
+       WHEN (OLD.relationship = 'part_of' OR NEW.relationship = 'part_of')
+        AND (OLD.source_id IS NOT NEW.source_id
+          OR OLD.target_id IS NOT NEW.target_id
+          OR OLD.relationship IS NOT NEW.relationship)
+        AND (EXISTS (SELECT 1 FROM records WHERE id = OLD.source_id AND deleted_at IS NULL AND (type = 'Annotation' OR (type = 'Document' AND kind = 'attachment')))
+          OR EXISTS (SELECT 1 FROM records WHERE id = NEW.source_id AND deleted_at IS NULL AND (type = 'Annotation' OR (type = 'Document' AND kind = 'attachment'))))
+       BEGIN UPDATE authorization_grant_revision SET epoch = epoch + 1 WHERE id = 1; END"#,
+    r#"CREATE TRIGGER IF NOT EXISTS authorization_grant_semantic_units_write AFTER INSERT ON semantic_units
+       BEGIN UPDATE authorization_grant_revision SET epoch = epoch + 1 WHERE id = 1; END"#,
+    r#"CREATE TRIGGER IF NOT EXISTS authorization_grant_semantic_units_delete AFTER DELETE ON semantic_units
+       BEGIN UPDATE authorization_grant_revision SET epoch = epoch + 1 WHERE id = 1; END"#,
+    r#"CREATE TRIGGER IF NOT EXISTS authorization_grant_semantic_units_update AFTER UPDATE OF authority_bearer_record_id ON semantic_units
+       WHEN OLD.authority_bearer_record_id IS NOT NEW.authority_bearer_record_id
+       BEGIN UPDATE authorization_grant_revision SET epoch = epoch + 1 WHERE id = 1; END"#,
+];
+
+/// The grant-only realtime authorization revision edge (engine 65 → 66).
+#[derive(Debug)]
+struct Engine65To66Migration;
+
+impl EngineMigrationStep for Engine65To66Migration {
+    fn from(&self) -> i64 {
+        65
+    }
+
+    fn to(&self) -> i64 {
+        66
+    }
+
+    fn name(&self) -> &str {
+        "engine-65-to-66-grant-only-realtime-authorization-revision"
+    }
+
+    fn preflight<'a>(&'a self, connection: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move {
+            let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+                .fetch_one(&mut *connection)
+                .await?;
+            if version == 65 {
+                crate::db::validate_supported_engine_migration_source(connection, 65).await?;
+            }
+            Ok(())
+        }
+        .boxed()
+    }
+
+    fn apply<'a>(&'a self, connection: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move {
+            for statement in ENGINE_65_TO_66_STATEMENTS {
+                sqlx::query(statement).execute(&mut *connection).await?;
+            }
+            Ok(())
+        }
+        .boxed()
+    }
+}
+
+/// The exact engine-66-to-67 DDL + deterministic backfill: the single
+/// authoritative source for this schema edge's structural change.
+///
+/// Both the reference SQLite runner (`Engine66To67Migration::apply` below)
+/// and the Turso-local runner
+/// (`crate::turso_local::migrate_existing_engine_schema`) execute this same
+/// sequence.
+///
+/// The edge adds caller-independent `records.archived` (INTEGER 0/1) and
+/// backfills it from the engine-reserved `archived` facet presence:
+/// `archived=1` iff a `facet_values` row with `key='archived'` exists.
+/// The default is 0, so only the 1-side needs writing. This matches the
+/// content projector's write-time maintenance (facet.set archived → 1,
+/// facet.unset archived → 0, both non-observation_only only), so a migrated
+/// database converges with a fresh database replayed through the same
+/// projector.
+///
+/// The ADD COLUMN text must stay token-identical (after schema normalization)
+/// to the `archived` column in `crate::schema::DDL_STATEMENTS`' records
+/// table, which is positioned last for ALTER-append convergence; the 66→67
+/// migration test asserts the twin relationship rather than assuming it.
+pub(crate) const ENGINE_66_TO_67_STATEMENTS: [&str; 2] = [
+    "ALTER TABLE records ADD COLUMN archived INTEGER NOT NULL DEFAULT 0 CHECK (archived IN (0,1))",
+    "UPDATE records SET archived=1 WHERE EXISTS (SELECT 1 FROM facet_values WHERE record_id=records.id AND key='archived')",
+];
+
+/// The exact engine-67-to-68 DDL: the single authoritative source for this
+/// schema edge's structural change (task `c5d3820` alpha-tab order).
+///
+/// Both the reference SQLite runner (`Engine67To68Migration::apply` below)
+/// and the Turso-local runner
+/// (`crate::turso_local::migrate_existing_engine_schema`) execute this same
+/// sequence. The edge is DDL-only: `alpha_tab_orders` is new per-account
+/// order state with no pre-existing rows to backfill, so a migrated database
+/// gains the empty preference table and converges with a fresh database
+/// trivially.
+///
+/// The statement must stay byte-identical to the corresponding
+/// `crate::schema::DDL_STATEMENTS` entry; the 67→68 migration test asserts
+/// that rather than assuming it.
+pub(crate) const ENGINE_67_TO_68_STATEMENTS: [&str; 1] = [r#"CREATE TABLE alpha_tab_orders (
+     account_id TEXT NOT NULL PRIMARY KEY CHECK (length(trim(account_id)) > 0),
+     tab_order  TEXT NOT NULL CHECK (json_valid(tab_order) AND json_type(tab_order) = 'array'),
+     event_id   TEXT NOT NULL UNIQUE REFERENCES control_events(id),
+     event_seq  INTEGER NOT NULL UNIQUE REFERENCES control_events(seq),
+     updated_at TEXT NOT NULL
+    )"#];
+
+/// The exact engine-68-to-69 DDL + backfill: the single authoritative source
+/// for this schema edge's structural change (task `73e5b92` claim metadata).
+///
+/// Both the reference SQLite runner (`Engine68To69Migration::apply` below)
+/// and the Turso-local runner
+/// (`crate::turso_local::migrate_existing_engine_schema`) execute this same
+/// sequence.
+///
+/// The table and trigger statements must stay byte-identical to the
+/// corresponding `crate::schema::DDL_STATEMENTS` entries; the 68→69 migration
+/// test asserts that rather than assuming it. The backfill classifies every
+/// pre-existing row, of every event type, from its stored payload: presence
+/// bits use the `->` existence test (explicit JSON nulls count as present,
+/// matching the history rule), and `claim_class` applies the strict
+/// text/null pair rule. The edge never UPDATEs `content_events` itself, so
+/// the append-only triggers are untouched; new rows are classified by the
+/// trigger at insert time under full write limits.
+/// The `->` (not `json_type`) spelling is shared so the Turso-local runner,
+/// whose read path already relies on `->` presence semantics, executes the
+/// identical statements.
+///
+/// Malformed payloads are deliberately asymmetric: the trigger lets `->`
+/// raise, so a fresh malformed insert fails loudly (governed admission
+/// always serializes a JSON object and the projector rejects anything else,
+/// so no supported path can hit this), while the backfill guards every
+/// classification with `json_valid(payload) = 1` so one legacy oddity
+/// classifies `other` instead of bricking the offline migration. SQL NULL
+/// and valid non-object payloads classify all-absent `other` on both paths
+/// because `->` yields NULL there.
+pub(crate) const ENGINE_68_TO_69_STATEMENTS: [&str; 3] = [
+    r#"CREATE TABLE content_event_claim_meta (
+     event_seq          INTEGER PRIMARY KEY REFERENCES content_events(seq) ON DELETE CASCADE,
+     has_claimed_by     INTEGER NOT NULL CHECK (has_claimed_by IN (0,1)),
+     has_claimed_run    INTEGER NOT NULL CHECK (has_claimed_run IN (0,1)),
+     has_released_from  INTEGER NOT NULL CHECK (has_released_from IN (0,1)),
+     claim_class        TEXT NOT NULL CHECK (claim_class IN ('claim','release','other'))
+    )"#,
+    r#"CREATE TRIGGER content_event_claim_meta_insert AFTER INSERT ON content_events
+     BEGIN
+      INSERT INTO content_event_claim_meta(event_seq, has_claimed_by, has_claimed_run, has_released_from, claim_class)
+      VALUES (
+       NEW.seq,
+       (NEW.payload -> 'claimed_by_account') IS NOT NULL,
+       (NEW.payload -> 'claimed_run_key') IS NOT NULL,
+       (NEW.payload -> 'released_from_run_key') IS NOT NULL,
+       CASE WHEN (NEW.payload -> 'claimed_by_account') LIKE '"%"'
+                 AND (NEW.payload -> 'claimed_run_key') LIKE '"%"' THEN 'claim'
+            WHEN (NEW.payload -> 'claimed_by_account') = 'null'
+                 AND (NEW.payload -> 'claimed_run_key') = 'null' THEN 'release'
+            ELSE 'other' END
+      );
+     END"#,
+    r#"INSERT INTO content_event_claim_meta(event_seq, has_claimed_by, has_claimed_run, has_released_from, claim_class)
+     SELECT seq,
+      CASE WHEN json_valid(payload) = 1 THEN (payload -> 'claimed_by_account') IS NOT NULL ELSE 0 END,
+      CASE WHEN json_valid(payload) = 1 THEN (payload -> 'claimed_run_key') IS NOT NULL ELSE 0 END,
+      CASE WHEN json_valid(payload) = 1 THEN (payload -> 'released_from_run_key') IS NOT NULL ELSE 0 END,
+      CASE WHEN json_valid(payload) = 1 THEN
+       CASE WHEN (payload -> 'claimed_by_account') LIKE '"%"'
+                 AND (payload -> 'claimed_run_key') LIKE '"%"' THEN 'claim'
+            WHEN (payload -> 'claimed_by_account') = 'null'
+                 AND (payload -> 'claimed_run_key') = 'null' THEN 'release'
+            ELSE 'other' END
+      ELSE 'other' END
+      FROM content_events"#,
+];
+
+/// The exact engine-69-to-70 DDL (task `fef3469`, D2 slice T2): the
+/// `facet_times` table and its two indexes, which are
+/// [`crate::schema::FACET_TIMES_DDL`] itself, so the edge and fresh DDL cannot
+/// drift apart.
+///
+/// Both the reference SQLite runner (`Engine69To70Migration::apply` below)
+/// and the Turso-local runner
+/// (`crate::turso_local::migrate_existing_engine_schema`) execute these
+/// statements. The projection's only source is `facet.set` events that carry
+/// `time_kind`, a payload member no binary below engine 70 writes, so a
+/// database genuinely written at engine 69 or earlier has nothing to
+/// backfill. The
+/// SQLite edge still runs the shared rebuild
+/// ([`crate::projector::rebuild_facet_times`]) after the DDL rather than
+/// assuming that: its existence probe returns at once when no event carries
+/// the marker, and when one does (a file that was touched by a newer binary,
+/// or a test that plants typed events) the rebuild folds exactly what replay
+/// would. The Turso-local mirror is DDL-only and relies on that marker
+/// never appearing below engine 70.
+pub(crate) const ENGINE_69_TO_70_STATEMENTS: [&str; 3] = crate::schema::FACET_TIMES_DDL;
+
+/// The typed time projection edge (engine 69 → 70, task `fef3469`).
+#[derive(Debug)]
+struct Engine69To70Migration;
+
+impl EngineMigrationStep for Engine69To70Migration {
+    fn from(&self) -> i64 {
+        69
+    }
+
+    fn to(&self) -> i64 {
+        70
+    }
+
+    fn name(&self) -> &str {
+        "engine-69-to-70-facet-times"
+    }
+
+    fn preflight<'a>(&'a self, connection: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move {
+            let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+                .fetch_one(&mut *connection)
+                .await?;
+            if version == 69 {
+                crate::db::validate_supported_engine_migration_source(connection, 69).await?;
+            }
+            Ok(())
+        }
+        .boxed()
+    }
+
+    fn apply<'a>(&'a self, connection: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move {
+            for statement in ENGINE_69_TO_70_STATEMENTS {
+                sqlx::query(statement).execute(&mut *connection).await?;
+            }
+            crate::projector::rebuild_facet_times(connection).await?;
+            Ok(())
+        }
+        .boxed()
+    }
+}
+
+/// The exact engine-70-to-71 DDL (task `68b48e5`, `records.changes.v1`): a
+/// partial index over each record's content events that leaves out the
+/// event types that tab read never shows. Its `WHERE` is
+/// `crate::query::events::FIELD_CHANGE_ROWS_PREDICATE` byte for byte, so
+/// the read walks only rows a viewer can see and a hidden row can neither
+/// cost work nor shape a page.
+///
+/// Both the reference SQLite runner (`Engine70To71Migration::apply` below)
+/// and the Turso-local runner execute this same sequence. The edge is
+/// DDL-only and additive: an index derives entirely from existing rows, so a
+/// migrated database converges with a fresh one. The statement must stay
+/// byte-identical to its `crate::schema::DDL_STATEMENTS` entry; the 70→71
+/// migration test asserts that.
+pub(crate) const ENGINE_70_TO_71_STATEMENTS: [&str; 1] = [
+    r#"CREATE INDEX idx_content_events_record_changes ON content_events(record_id, seq) WHERE type NOT IN ('occurrence.bound.v1','receipt.dependency_audited.v1','reconciliation.recorded.v1','unit.superseded.v1')"#,
+];
+
+/// The field-change index edge (engine 70 → 71, task `68b48e5`).
+#[derive(Debug)]
+struct Engine70To71Migration;
+
+impl EngineMigrationStep for Engine70To71Migration {
+    fn from(&self) -> i64 {
+        70
+    }
+
+    fn to(&self) -> i64 {
+        71
+    }
+
+    fn name(&self) -> &str {
+        "engine-70-to-71-record-changes-index"
+    }
+
+    fn preflight<'a>(&'a self, connection: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move {
+            let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+                .fetch_one(&mut *connection)
+                .await?;
+            if version == 70 {
+                crate::db::validate_supported_engine_migration_source(connection, 70).await?;
+            }
+            Ok(())
+        }
+        .boxed()
+    }
+
+    fn apply<'a>(&'a self, connection: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move {
+            for statement in ENGINE_70_TO_71_STATEMENTS {
+                sqlx::query(statement).execute(&mut *connection).await?;
+            }
+            Ok(())
+        }
+        .boxed()
+    }
+}
+
+/// The exact engine-71-to-72 DDL + copy: the single authoritative source
+/// for this schema edge's structural change (task `f1d80b0` shell auto-adopt
+/// plus install request text).
+///
+/// Both the reference SQLite runner (`Engine71To72Migration::apply` below)
+/// and the Turso-local runner
+/// (`crate::turso_local::migrate_existing_engine_schema`) execute this same
+/// sequence.
+///
+/// The edge rebuilds `alpha_tab_installs` in place: the `adoption` CHECK
+/// widens to `shell_auto.v1` and a nullable display-only `request` column
+/// appears after `adoption`. Existing rows copy across with `request = NULL`
+/// (pre-72 installs carry no request text; the tier default covers them),
+/// so a migrated database converges with a fresh database replayed through
+/// the same projector.
+///
+/// The CREATE TABLE and CREATE INDEX statements must stay byte-identical to
+/// the corresponding `crate::schema::DDL_STATEMENTS` entries; the 71→72
+/// migration test asserts that rather than assuming it.
+pub(crate) const ENGINE_71_TO_72_STATEMENTS: [&str; 7] = [
+    "PRAGMA legacy_alter_table=ON",
+    "ALTER TABLE alpha_tab_installs RENAME TO alpha_tab_installs_v71",
+    r#"CREATE TABLE alpha_tab_installs (
+     account_id                TEXT NOT NULL CHECK (length(trim(account_id)) > 0),
+     package                   TEXT NOT NULL CHECK (length(trim(package)) > 0),
+     version                   TEXT NOT NULL CHECK (length(trim(version)) > 0),
+     digest                    TEXT NOT NULL CHECK (length(trim(digest)) > 0),
+     artifact_id               TEXT NOT NULL REFERENCES records(id),
+     consented_source_revision TEXT NOT NULL CHECK (length(trim(consented_source_revision)) > 0),
+     declaration_digest        TEXT NOT NULL CHECK (length(declaration_digest) = 64),
+     consented_declaration     TEXT NOT NULL CHECK (json_valid(consented_declaration) AND json_type(consented_declaration) = 'object'),
+     adoption                  TEXT NOT NULL CHECK (adoption IN ('caller_asserted','shell_adopt.v1','shell_auto.v1')),
+     request                   TEXT CHECK (request IS NULL OR (length(trim(request)) > 0 AND length(request) <= 500)),
+     status                    TEXT NOT NULL CHECK (status IN ('installed','disabled','removed')),
+     event_id                  TEXT NOT NULL UNIQUE REFERENCES control_events(id),
+     event_seq                 INTEGER NOT NULL UNIQUE REFERENCES control_events(seq),
+     updated_at                TEXT NOT NULL,
+     PRIMARY KEY (account_id, package)
+    )"#,
+    r#"INSERT INTO alpha_tab_installs
+         (account_id,package,version,digest,artifact_id,consented_source_revision,
+          declaration_digest,consented_declaration,adoption,request,status,event_id,event_seq,updated_at)
+       SELECT account_id,package,version,digest,artifact_id,consented_source_revision,
+          declaration_digest,consented_declaration,adoption,NULL,status,event_id,event_seq,updated_at
+         FROM alpha_tab_installs_v71"#,
+    "DROP TABLE alpha_tab_installs_v71",
+    r#"CREATE INDEX idx_alpha_tab_installs_artifact ON alpha_tab_installs(artifact_id)"#,
+    "PRAGMA legacy_alter_table=OFF",
+];
+
+/// The exact engine-72-to-73 DDL + deterministic backfill: the single
+/// authoritative source for this schema edge's structural change (E3 M1
+/// currency counts).
+///
+/// Both the reference SQLite runner (`Engine72To73Migration::apply` below)
+/// and any future Turso-local mirror execute this same sequence. (This
+/// increment ships the SQLite runner only; Turso/Postgres/catalog exposure
+/// is an explicit follow-on.)
+///
+/// The edge adds caller-independent currency counts `records.is_current`
+/// (tri-state: 1 = no live incoming `supersedes`, NULL = scope unknown) and
+/// `records.successor_count` (live incoming `supersedes` count, deleted
+/// source excluded). `is_current` defaults to 1 (a created record has no
+/// incoming links), so the backfill only writes the unknown side plus the
+/// counts: `successor_count` is recomputed row-for-row from live incoming
+/// links, then `is_current` is nulled where the count is positive. This
+/// matches the content projector's write-time maintenance (supersedes
+/// link add → recompute target; link remove → recompute target; successor
+/// tombstone → recompute its targets), so a migrated database converges
+/// with a fresh database replayed through the same projector. `is_current=0`
+/// is never written by this edge; the column CHECK admits it so a future
+/// explicit whole-record assertion needs no migration. No successor names
+/// are stored: naming stays caller-relative in `get_record` after visibility
+/// filtering. `archived` stays orthogonal: the backfill never reads or
+/// writes it.
+///
+/// The ADD COLUMN texts must stay token-identical (after schema normalization)
+/// to the `is_current`/`successor_count` columns in
+/// `crate::schema::DDL_STATEMENTS`' records table, which are positioned last
+/// for ALTER-append convergence; the 72→73 migration test asserts the twin
+/// relationship rather than assuming it.
+pub(crate) const ENGINE_72_TO_73_STATEMENTS: [&str; 4] = [
+    "ALTER TABLE records ADD COLUMN is_current INTEGER NULL DEFAULT 1 CHECK (is_current IS NULL OR is_current IN (0,1))",
+    "ALTER TABLE records ADD COLUMN successor_count INTEGER NOT NULL DEFAULT 0 CHECK (successor_count >= 0)",
+    "UPDATE records SET successor_count=(SELECT COUNT(*) FROM links l JOIN records s ON s.id=l.source_id WHERE l.target_id=records.id AND l.relationship='supersedes' AND s.deleted_at IS NULL)",
+    "UPDATE records SET is_current=NULL WHERE successor_count>0",
+];
+
+/// The archived-projection edge (engine 66 → 67, E3 M1 slice 1).
+#[derive(Debug)]
+struct Engine66To67Migration;
+
+impl EngineMigrationStep for Engine66To67Migration {
+    fn from(&self) -> i64 {
+        66
+    }
+
+    fn to(&self) -> i64 {
+        67
+    }
+
+    fn name(&self) -> &str {
+        "engine-66-to-67-archived-projection"
+    }
+
+    fn preflight<'a>(&'a self, connection: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move {
+            let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+                .fetch_one(&mut *connection)
+                .await?;
+            if version == 66 {
+                crate::db::validate_supported_engine_migration_source(connection, 66).await?;
+            }
+            Ok(())
+        }
+        .boxed()
+    }
+
+    fn apply<'a>(&'a self, connection: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move {
+            for statement in ENGINE_66_TO_67_STATEMENTS {
+                sqlx::query(statement).execute(&mut *connection).await?;
+            }
+            Ok(())
+        }
+        .boxed()
+    }
+}
+
+/// The personal alpha-tab order projection edge (engine 67 → 68, task
+/// `c5d3820`).
+#[derive(Debug)]
+struct Engine67To68Migration;
+
+impl EngineMigrationStep for Engine67To68Migration {
+    fn from(&self) -> i64 {
+        67
+    }
+
+    fn to(&self) -> i64 {
+        68
+    }
+
+    fn name(&self) -> &str {
+        "engine-67-to-68-alpha-tab-orders"
+    }
+
+    fn preflight<'a>(&'a self, connection: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move {
+            let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+                .fetch_one(&mut *connection)
+                .await?;
+            if version == 67 {
+                crate::db::validate_supported_engine_migration_source(connection, 67).await?;
+            }
+            Ok(())
+        }
+        .boxed()
+    }
+
+    fn apply<'a>(&'a self, connection: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move {
+            for statement in ENGINE_67_TO_68_STATEMENTS {
+                sqlx::query(statement).execute(&mut *connection).await?;
+            }
+            Ok(())
+        }
+        .boxed()
+    }
+}
+
+/// The content-event claim-metadata edge (engine 68 → 69, task `73e5b92`).
+#[derive(Debug)]
+struct Engine68To69Migration;
+
+impl EngineMigrationStep for Engine68To69Migration {
+    fn from(&self) -> i64 {
+        68
+    }
+
+    fn to(&self) -> i64 {
+        69
+    }
+
+    fn name(&self) -> &str {
+        "engine-68-to-69-content-event-claim-meta"
+    }
+
+    fn preflight<'a>(&'a self, connection: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move {
+            let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+                .fetch_one(&mut *connection)
+                .await?;
+            if version == 68 {
+                crate::db::validate_supported_engine_migration_source(connection, 68).await?;
+            }
+            Ok(())
+        }
+        .boxed()
+    }
+
+    fn apply<'a>(&'a self, connection: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move {
+            for statement in ENGINE_68_TO_69_STATEMENTS {
+                sqlx::query(statement).execute(&mut *connection).await?;
+            }
+            Ok(())
+        }
+        .boxed()
+    }
+}
+
+/// The alpha-tab install request + shell-auto adoption edge (engine 71 → 72,
+/// task `f1d80b0`).
+#[derive(Debug)]
+struct Engine71To72Migration;
+
+impl EngineMigrationStep for Engine71To72Migration {
+    fn from(&self) -> i64 {
+        71
+    }
+
+    fn to(&self) -> i64 {
+        72
+    }
+
+    fn name(&self) -> &str {
+        "engine-71-to-72-alpha-tab-request-and-shell-auto"
+    }
+
+    fn requires_foreign_keys_disabled(&self) -> bool {
+        true
+    }
+
+    fn preflight<'a>(&'a self, connection: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move {
+            let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+                .fetch_one(&mut *connection)
+                .await?;
+            if version == 71 {
+                crate::db::validate_supported_engine_migration_source(connection, 71).await?;
+            }
+            Ok(())
+        }
+        .boxed()
+    }
+
+    fn apply<'a>(&'a self, connection: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move {
+            for statement in ENGINE_71_TO_72_STATEMENTS {
+                sqlx::query(statement).execute(&mut *connection).await?;
+            }
+            Ok(())
+        }
+        .boxed()
+    }
+}
+
+/// The currency-counts edge (engine 72 → 73, E3 M1).
+#[derive(Debug)]
+struct Engine72To73Migration;
+
+impl EngineMigrationStep for Engine72To73Migration {
+    fn from(&self) -> i64 {
+        72
+    }
+
+    fn to(&self) -> i64 {
+        73
+    }
+
+    fn name(&self) -> &str {
+        "engine-72-to-73-currency-counts"
+    }
+
+    fn preflight<'a>(&'a self, connection: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move {
+            let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+                .fetch_one(&mut *connection)
+                .await?;
+            if version == 72 {
+                crate::db::validate_supported_engine_migration_source(connection, 72).await?;
+            }
+            Ok(())
+        }
+        .boxed()
+    }
+
+    fn apply<'a>(&'a self, connection: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move {
+            for statement in ENGINE_72_TO_73_STATEMENTS {
+                sqlx::query(statement).execute(&mut *connection).await?;
+            }
+            Ok(())
+        }
+        .boxed()
+    }
+}
+
+/// Both the reference SQLite runner (`Engine73To74Migration::apply` below)
+/// and the Turso-local runner
+/// (`crate::turso_local::migrate_existing_engine_schema`) execute this same
+/// sequence.
+///
+/// The edge adds the caller-independent `body_task_items` projection table
+/// (E3 M3 increment 2A): one row per GFM task-list item in each record's
+/// current body, stamped with that body's provenance event. The table is a
+/// pure function of current bodies — creation scans the stored body, updates
+/// carrying a body delete and re-scan, deletion keeps rows (a tombstone
+/// carries no body and the caller-visible view excludes deleted records, so
+/// retaining rows keeps migration, live folding and replay converged).
+/// Extraction is fail-closed: an [`ExtractError`](crate::body_task_items::ExtractError)
+/// aborts the migration with the offending record's identity rather than
+/// persisting partial or empty rows. `Unknown` markers never reach storage:
+/// the extractor refuses them, and the insert path below refuses them again.
+///
+/// The two statements must stay byte-identical to the corresponding
+/// `crate::schema::DDL_STATEMENTS` entries; the 73→74 migration test asserts
+/// the twin relationship rather than assuming it. The data backfill is a Rust
+/// loop over the parser (see `backfill_body_task_items`), so it cannot be
+/// shared as SQL:
+///
+/// - SQLite applies DDL + backfill together, inside the runner's
+///   `BEGIN IMMEDIATE` transaction.
+/// - Turso-local applies DDL + its own `backfill_body_task_items` mirror
+///   together, inside the same `BEGIN IMMEDIATE` transaction. Both backfills
+///   share `record_body::BODY_CARRYING_EVENT_SQL` and the same scan/coercion
+///   semantics, so a migrated database converges with the live fold and replay
+///   on either backend.
+pub(crate) const ENGINE_73_TO_74_STATEMENTS: [&str; 2] = [
+    r#"CREATE TABLE body_task_items (
+      record_id          TEXT NOT NULL REFERENCES records(id) ON DELETE CASCADE,
+      item_index         INTEGER NOT NULL,
+      source_event_seq   INTEGER NOT NULL REFERENCES content_events(seq),
+      marker             TEXT NOT NULL CHECK (marker IN ('-', '*', '+', 'ordered')),
+      checked            INTEGER NOT NULL CHECK (checked IN (0,1)),
+      in_quote           INTEGER NOT NULL CHECK (in_quote IN (0,1)),
+      start_offset       INTEGER NOT NULL CHECK (start_offset >= 0),
+      end_offset         INTEGER NOT NULL CHECK (end_offset >= 0),
+      PRIMARY KEY (record_id, item_index)
+    )"#,
+    r#"CREATE INDEX idx_body_task_items_record
+        ON body_task_items(record_id)"#,
+];
+
+/// The body-task-items projection edge (engine 73 → 74, E3 M3 increment 2A).
+#[derive(Debug)]
+struct Engine73To74Migration;
+
+impl EngineMigrationStep for Engine73To74Migration {
+    fn from(&self) -> i64 {
+        73
+    }
+
+    fn to(&self) -> i64 {
+        74
+    }
+
+    fn name(&self) -> &str {
+        "engine-73-to-74-body-task-items"
+    }
+
+    fn preflight<'a>(&'a self, connection: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move {
+            let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+                .fetch_one(&mut *connection)
+                .await?;
+            if version == 73 {
+                crate::db::validate_supported_engine_migration_source(connection, 73).await?;
+            }
+            Ok(())
+        }
+        .boxed()
+    }
+
+    fn apply<'a>(&'a self, connection: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move {
+            for statement in ENGINE_73_TO_74_STATEMENTS {
+                sqlx::query(statement).execute(&mut *connection).await?;
+            }
+            backfill_body_task_items(connection).await?;
+            Ok(())
+        }
+        .boxed()
+    }
+}
+
+/// E3 M3 physical block projection. This table is deliberately absent from
+/// caller SQL until the separate admission increment. The 16 MiB body and
+/// 4096 chunk ceilings are new projection admission policy: an older body
+/// beyond either ceiling refuses migration atomically with its record ID.
+pub(crate) const ENGINE_74_TO_75_STATEMENTS: [&str; 1] = [r#"CREATE TABLE body_blocks (
+      record_id          TEXT NOT NULL REFERENCES records(id) ON DELETE CASCADE,
+      block_index        INTEGER NOT NULL CHECK (block_index >= 0),
+      chunk_index        INTEGER NOT NULL CHECK (chunk_index >= 0),
+      chunk_count        INTEGER NOT NULL CHECK (chunk_count > 0 AND chunk_index < chunk_count),
+      source_event_seq   INTEGER NOT NULL REFERENCES content_events(seq),
+      heading_path       TEXT NOT NULL CHECK (json_valid(heading_path) AND json_type(heading_path) = 'array'),
+      block_kind         TEXT NOT NULL CHECK (block_kind IN ('heading','paragraph','code','blockquote','list','table','html','thematic_break','definition','footnote_definition','other','interstitial','opaque')),
+      text               TEXT NOT NULL CHECK (length(CAST(text AS BLOB)) BETWEEN 1 AND 32768),
+      start_offset       INTEGER NOT NULL CHECK (start_offset >= 0),
+      end_offset         INTEGER NOT NULL CHECK (end_offset > start_offset),
+      PRIMARY KEY (record_id, block_index, chunk_index)
+    )"#];
+
+#[derive(Debug)]
+struct Engine74To75Migration;
+
+impl EngineMigrationStep for Engine74To75Migration {
+    fn from(&self) -> i64 {
+        74
+    }
+    fn to(&self) -> i64 {
+        75
+    }
+    fn name(&self) -> &str {
+        "engine-74-to-75-body-blocks"
+    }
+    fn preflight<'a>(&'a self, connection: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move {
+            let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+                .fetch_one(&mut *connection)
+                .await?;
+            if version == 74 {
+                crate::db::validate_supported_engine_migration_source(connection, 74).await?;
+            }
+            Ok(())
+        }
+        .boxed()
+    }
+    fn apply<'a>(&'a self, connection: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move {
+            for statement in ENGINE_74_TO_75_STATEMENTS {
+                sqlx::query(statement).execute(&mut *connection).await?;
+            }
+            crate::body_blocks_projection::backfill_sqlite(connection).await
+        }
+        .boxed()
+    }
+}
+
+/// Current vocabulary metadata becomes a bounded, occurrence-preserving JSON
+/// projection. An invalid or over-budget source aborts the full migration.
+#[derive(Debug)]
+struct Engine75To76Migration;
+
+impl EngineMigrationStep for Engine75To76Migration {
+    fn from(&self) -> i64 {
+        75
+    }
+    fn to(&self) -> i64 {
+        76
+    }
+    fn name(&self) -> &str {
+        "engine-75-to-76-vocabulary-metadata-json-nodes"
+    }
+    fn preflight<'a>(&'a self, connection: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move {
+            let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+                .fetch_one(&mut *connection)
+                .await?;
+            if version == 75 {
+                crate::db::validate_supported_engine_migration_source(connection, 75).await?;
+            }
+            Ok(())
+        }
+        .boxed()
+    }
+    fn apply<'a>(&'a self, connection: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move {
+            sqlx::query(crate::schema::ddl::VOCABULARY_VALUE_JSON_NODES_DDL)
+                .execute(&mut *connection)
+                .await?;
+            crate::json_nodes_projection::backfill_sqlite(connection).await
+        }
+        .boxed()
+    }
+}
+
+/// Exact source validator shared with the Turso structural migration mirror.
+/// Refusal is deliberately stronger than the old winning-addition-only fold:
+/// no historical reaction event is silently dropped, even when superseded.
+pub(crate) fn validate_reaction_meta_source(
+    id: &str,
+    payload: Option<&str>,
+    actor: Option<&str>,
+) -> Result<()> {
+    let validate = || -> Result<()> {
+        let raw = payload.ok_or_else(|| Error::engine("Message reaction has no payload"))?;
+        let payload: crate::events::MessageReactionPayload = serde_json::from_str(raw)?;
+        payload.validate(actor)
+    };
+    validate().map_err(|error| {
+        Error::engine(format!(
+            "reaction metadata migration refuses event {id}: {error}"
+        ))
+    })
+}
+
+pub(crate) const ENGINE_76_TO_77_STATEMENTS: [&str; 3] = crate::schema::ddl::REACTION_META_DDL;
+pub(crate) const REACTION_META_BACKFILL: &str =
+    "INSERT INTO content_event_reaction_meta(event_seq,record_id,actor,legacy_emoji,emoji,executor_kind,reaction_class,created_at)
+     SELECT seq,record_id,actor,json_extract(payload,'$.emoji'),
+      json_extract(payload,CASE WHEN json_type(payload)='array' THEN '$[1]' ELSE '$.emoji' END),
+      json_extract(payload,CASE WHEN json_type(payload)='array' THEN '$[6]' ELSE '$.executor_kind' END),
+      CASE type WHEN 'message.reaction.added.v1' THEN 'added' ELSE 'removed' END,created_at
+     FROM content_events WHERE type IN ('message.reaction.added.v1','message.reaction.removed.v1')";
+
+#[derive(Debug)]
+struct Engine76To77Migration;
+impl EngineMigrationStep for Engine76To77Migration {
+    fn from(&self) -> i64 {
+        76
+    }
+    fn to(&self) -> i64 {
+        77
+    }
+    fn name(&self) -> &str {
+        "engine-76-to-77-reaction-meta"
+    }
+    fn preflight<'a>(&'a self, connection: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move {
+            let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+                .fetch_one(&mut *connection)
+                .await?;
+            if version == 76 {
+                crate::db::validate_supported_engine_migration_source(connection, 76).await?;
+            }
+            Ok(())
+        }
+        .boxed()
+    }
+    fn apply<'a>(&'a self, connection: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move {
+            // Bound memory by one event, rather than fetching the whole historical log.
+            // All source events are retained; only the reaction family is copied.
+            let mut after = i64::MIN;
+            loop {
+                let row: Option<(i64,String,Option<String>,Option<String>)> = sqlx::query_as(
+                    "SELECT seq,id,payload,actor FROM content_events WHERE seq>=? AND type IN ('message.reaction.added.v1','message.reaction.removed.v1') ORDER BY seq LIMIT 1"
+                ).bind(after).fetch_optional(&mut *connection).await?;
+                let Some((seq,id,payload,actor)) = row else { break; };
+                validate_reaction_meta_source(&id,payload.as_deref(),actor.as_deref())?;
+                let Some(next) = seq.checked_add(1) else { break; };
+                after = next;
+            }
+            for statement in ENGINE_76_TO_77_STATEMENTS {
+                sqlx::query(statement).execute(&mut *connection).await?;
+            }
+            sqlx::query(REACTION_META_BACKFILL).execute(&mut *connection).await?;
+            Ok(())
+        }.boxed()
+    }
+}
+
+pub(crate) const ENGINE_77_TO_78_STATEMENT: &str =
+    "ALTER TABLE alpha_tab_installs ADD COLUMN adoption_provenance TEXT CHECK (adoption_provenance IS NULL OR (json_valid(adoption_provenance) AND json_type(adoption_provenance) = 'object'))";
+
+#[derive(Debug)]
+struct Engine77To78Migration;
+impl EngineMigrationStep for Engine77To78Migration {
+    fn from(&self) -> i64 {
+        77
+    }
+    fn to(&self) -> i64 {
+        78
+    }
+    fn name(&self) -> &str {
+        "engine-77-to-78-alpha-tab-adoption-provenance"
+    }
+    fn preflight<'a>(&'a self, connection: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move {
+            let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+                .fetch_one(&mut *connection)
+                .await?;
+            if version == 77 {
+                crate::db::validate_supported_engine_migration_source(connection, 77).await?;
+            }
+            Ok(())
+        }
+        .boxed()
+    }
+    fn apply<'a>(&'a self, connection: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move {
+            sqlx::query(ENGINE_77_TO_78_STATEMENT)
+                .execute(&mut *connection)
+                .await?;
+            crate::control::alpha_tab_provenance::backfill(connection).await
+        }
+        .boxed()
+    }
+}
+
+/// Inert nullable reader pointer. Historical adoption never mints this field.
+pub(crate) const ENGINE_78_TO_79_STATEMENT: &str =
+    "ALTER TABLE alpha_tab_installs ADD COLUMN body_read_admission_event_id TEXT REFERENCES control_events(id)";
+
+#[derive(Debug)]
+struct Engine78To79Migration;
+impl EngineMigrationStep for Engine78To79Migration {
+    fn from(&self) -> i64 {
+        78
+    }
+    fn to(&self) -> i64 {
+        79
+    }
+    fn name(&self) -> &str {
+        "engine-78-to-79-inert-body-reader-pointer"
+    }
+    fn preflight<'a>(&'a self, connection: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move {
+            let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+                .fetch_one(&mut *connection)
+                .await?;
+            if version == 78 {
+                crate::db::validate_supported_engine_migration_source(connection, 78).await?;
+            }
+            Ok(())
+        }
+        .boxed()
+    }
+    fn apply<'a>(&'a self, connection: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move {
+            sqlx::query(ENGINE_78_TO_79_STATEMENT)
+                .execute(connection)
+                .await?;
+            Ok(())
+        }
+        .boxed()
+    }
+}
+
+/// Production v1 storage edge. Historical79 shape is checked before any DDL.
+#[derive(Debug)]
+struct Engine79To80Migration;
+impl EngineMigrationStep for Engine79To80Migration {
+    fn from(&self) -> i64 {
+        79
+    }
+    fn to(&self) -> i64 {
+        80
+    }
+    fn name(&self) -> &str {
+        "engine-79-to-80-workspace-rule-installations"
+    }
+    fn preflight<'a>(&'a self, connection: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move {
+            let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+                .fetch_one(&mut *connection)
+                .await?;
+            // All pending preflights inspect the original preimage. Earlier
+            // edges validate their own released source before reaching 79.
+            if version == 79 {
+                crate::db::validate_supported_engine_migration_source(connection, 79).await?;
+            }
+            Ok(())
+        }
+        .boxed()
+    }
+    fn apply<'a>(&'a self, connection: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move {
+            // Check the actual intermediate shape inside the write transaction,
+            // including when the original preimage preceded schema 79.
+            crate::db::validate_supported_engine_migration_source(connection, 79).await?;
+            for statement in crate::schema::ddl::WORKSPACE_RULE_INSTALLATION_DDL {
+                sqlx::query(statement).execute(&mut *connection).await?;
+            }
+            Ok(())
+        }
+        .boxed()
+    }
+}
+
+/// SQLite-only config node carrier. The runner owns BEGIN/stamp/COMMIT;
+/// invalid legacy data rolls back the entire edge, including its new table.
+#[derive(Debug)]
+struct Engine80To81Migration;
+impl EngineMigrationStep for Engine80To81Migration {
+    fn from(&self) -> i64 {
+        80
+    }
+    fn to(&self) -> i64 {
+        81
+    }
+    fn name(&self) -> &str {
+        "engine-80-to-81-schema-config-json-nodes"
+    }
+    fn preflight<'a>(&'a self, connection: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move {
+            let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+                .fetch_one(&mut *connection)
+                .await?;
+            if version == 80 {
+                crate::db::validate_supported_engine_migration_source(connection, 80).await?;
+            }
+            Ok(())
+        }
+        .boxed()
+    }
+    fn apply<'a>(&'a self, connection: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move {
+            // Validate the actual intermediate workspace80 shape, including
+            // historical chains whose preflights inspected an earlier stamp.
+            crate::db::validate_supported_engine_migration_source(connection, 80).await?;
+            sqlx::query(crate::schema::ddl::SCHEMA_CONFIG_JSON_NODES_DDL)
+                .execute(&mut *connection)
+                .await?;
+            crate::schema_config_json_nodes::backfill(connection).await
+        }
+        .boxed()
+    }
+}
+
+/// SQLite-only facet-value node carrier. The runner owns BEGIN/stamp/COMMIT.
+/// Unlike config nodes, malformed or over-budget facet text is skipped by the
+/// backfill rather than aborting the edge: a facet write must never fail
+/// because its value cannot be projected.
+#[derive(Debug)]
+struct Engine81To82Migration;
+impl EngineMigrationStep for Engine81To82Migration {
+    fn from(&self) -> i64 {
+        81
+    }
+    fn to(&self) -> i64 {
+        82
+    }
+    fn name(&self) -> &str {
+        "engine-81-to-82-facet-value-json-nodes"
+    }
+    fn preflight<'a>(&'a self, connection: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move {
+            let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+                .fetch_one(&mut *connection)
+                .await?;
+            if version == 81 {
+                crate::db::validate_supported_engine_migration_source(connection, 81).await?;
+            }
+            Ok(())
+        }
+        .boxed()
+    }
+    fn apply<'a>(&'a self, connection: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move {
+            crate::db::validate_supported_engine_migration_source(connection, 81).await?;
+            sqlx::query(crate::schema::ddl::FACET_VALUE_JSON_NODES_DDL)
+                .execute(&mut *connection)
+                .await?;
+            crate::facet_value_json_nodes::backfill(connection).await
+        }
+        .boxed()
+    }
+}
+
+/// Backfill `body_task_items` from current bodies.
+///
+/// For each record whose stored body is non-empty text, scan the CURRENT body
+/// text and stamp every row with the latest body-carrying event's sequence,
+/// not `MAX(seq)` overall — the same provenance rule as
+/// [`backfill_record_mentions`]: metadata-only updates carry higher sequences
+/// but no body, and stamping those would diverge from the live fold, which
+/// keeps the body's own event sequence. The event set is exactly the
+/// projector's body writers (`crate::record_body::BODY_CARRYING_EVENT_SQL`).
+///
+/// Unlike mentions, deleted records are NOT excluded: a tombstone carries no
+/// body and the live fold keeps the deleted record's rows, so excluding them
+/// here would diverge from a fresh replay, which retains those same rows.
+/// Tombstoned, removed (null/empty body) and never-written sources yield no
+/// rows — the same replacement semantics as the live fold, so backfill, live
+/// folding and replay converge.
+///
+/// Fail-closed: an extraction error aborts the whole migration with the
+/// offending record's identity. A body with no body-carrying event (only
+/// possible when the row was written outside the projector, never through an
+/// append) is left without rows rather than stamped with an invented
+/// sequence; the next body-carrying write folds it, and a replay over the
+/// same log produces no rows either, preserving rebuild equality.
+///
+/// `typeof(body)='text'` excludes non-text storage classes the parser cannot
+/// read; a stored body is already the canonical text the projector coerced,
+/// so the live fold scans the same bytes.
+pub(crate) async fn backfill_body_task_items(connection: &mut SqliteConnection) -> Result<()> {
+    let sources: Vec<(String, String)> = sqlx::query_as(
+        "SELECT id, body FROM records
+          WHERE typeof(body) = 'text' AND body <> ''
+          ORDER BY id",
+    )
+    .fetch_all(&mut *connection)
+    .await?;
+    let provenance_sql = format!(
+        "SELECT MAX(seq) FROM content_events
+          WHERE record_id = ? AND ({})",
+        crate::record_body::BODY_CARRYING_EVENT_SQL
+    );
+    for (record_id, body) in sources {
+        let source_event_seq: Option<i64> = sqlx::query_scalar(&provenance_sql)
+            .bind(&record_id)
+            .fetch_one(&mut *connection)
+            .await?;
+        let Some(source_event_seq) = source_event_seq else {
+            continue;
+        };
+        let items = crate::body_task_items::extract_task_items(&body).map_err(|error| {
+            crate::error::Error::engine(format!(
+                "engine-74 backfill cannot extract task items for record {record_id}: {error}"
+            ))
+        })?;
+        sqlx::query("DELETE FROM body_task_items WHERE record_id = ?")
+            .bind(&record_id)
+            .execute(&mut *connection)
+            .await?;
+        for item in &items {
+            let marker = crate::body_task_items::TaskMarker::as_str(&item.marker).ok_or_else(|| {
+                crate::error::Error::engine(format!(
+                    "engine-74 backfill refuses unrepresentable marker for record {record_id} item {}",
+                    item.index
+                ))
+            })?;
+            sqlx::query(
+                "INSERT INTO body_task_items
+                   (record_id, item_index, source_event_seq, marker,
+                    checked, in_quote, start_offset, end_offset)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&record_id)
+            .bind(item.index as i64)
+            .bind(source_event_seq)
+            .bind(marker)
+            .bind(i64::from(item.checked))
+            .bind(i64::from(item.in_quote))
+            .bind(item.start_offset as i64)
+            .bind(item.end_offset as i64)
+            .execute(&mut *connection)
+            .await?;
+        }
+    }
+    Ok(())
+}
+
 /// The personal alpha-tab install projection edge (engine 64 → 65).
 #[derive(Debug)]
 struct Engine64To65Migration;
@@ -2443,6 +3671,16 @@ const ENGINE_62_TO_63_POST_FREEZE_TOOLS: &[&str] = &[
     "authority_act_delta",
     "manage_alpha_tabs",
 ];
+
+/// Read actions that arrived after the 62→63 freeze on already-shipped
+/// mixed-disposition tools. This list is a review record for the frozen-policy
+/// test only: historical deletion replay reads [`ENGINE_62_TO_63_MIXED_READS`]
+/// unchanged, so a post-freeze read action is retained (kept) by the frozen
+/// replay exactly like an unknown action — fail-closed. Adding here requires
+/// the same deliberate review as widening the frozen list itself.
+#[cfg(test)]
+const ENGINE_62_TO_63_POST_FREEZE_READ_ACTIONS: &[(&str, &[&str])] =
+    &[("manage_instructions", &["resolve"])];
 
 /// Shipped tools whose calls are disposable unless kept by an earlier
 /// retention rule (issuance, annotation, mutated touch, `set_intent`): the
@@ -3129,6 +4367,42 @@ pub struct DatabaseMigrationReport {
     pub backup: Option<PreimageBackup>,
     pub error_kind: Option<String>,
     pub error_message: Option<String>,
+    /// Requested selection, even when verification was never reached.
+    pub verification_profile: crate::conformance::ConformanceProfile,
+    /// Set only after the conformance dispatcher actually ran.
+    pub executed_verification_profile: Option<crate::conformance::ConformanceProfile>,
+    pub verification_status: MigrationVerificationStatus,
+    /// Checks omitted by an executed profile; no check is reported as passed
+    /// merely because it was deferred.
+    pub deferred_checks: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MigrationVerificationStatus {
+    NotRun,
+    NotRunCurrent,
+    NotRunHistoricalTarget,
+    /// The executed profile passed; deferred checks have no pass claim.
+    Passed,
+    Failed,
+}
+
+impl DatabaseMigrationReport {
+    fn with_conformance(
+        mut self,
+        profile: crate::conformance::ConformanceProfile,
+        status: MigrationVerificationStatus,
+    ) -> Self {
+        self.executed_verification_profile = Some(profile);
+        self.verification_status = status;
+        self.deferred_checks = profile
+            .deferred_checks()
+            .iter()
+            .map(|name| (*name).into())
+            .collect();
+        self
+    }
 }
 
 fn single_connection_options(path: &Path) -> Result<SqliteConnectOptions> {
@@ -3281,6 +4555,36 @@ pub async fn migrate_database(
     .await
 }
 
+/// Migrate with an explicit post-migration verification selection.
+/// Migration, preimage, integrity and fencing behavior is invariant across profiles.
+#[allow(clippy::too_many_arguments)]
+pub async fn migrate_database_with_profile(
+    path: &Path,
+    db_id: &str,
+    run_id: &str,
+    target: i64,
+    registry: &EngineMigrationRegistry,
+    backup_options: &dyn MigrationPreimageStore,
+    fence: FenceFn,
+    profile: crate::conformance::ConformanceProfile,
+) -> DatabaseMigrationReport {
+    migrate_database_with_reservation_and_profile(
+        path,
+        db_id,
+        run_id,
+        target,
+        registry,
+        backup_options,
+        fence,
+        None,
+        None,
+        #[cfg(test)]
+        None,
+        profile,
+    )
+    .await
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn migrate_database_with_reservation(
     path: &Path,
@@ -3294,6 +4598,83 @@ async fn migrate_database_with_reservation(
     verifier: Option<PostMigrationVerifier>,
     #[cfg(test)] probe_override: Option<DatabaseVersionState>,
 ) -> DatabaseMigrationReport {
+    migrate_database_with_reservation_and_profile(
+        path,
+        db_id,
+        run_id,
+        target,
+        registry,
+        backup_options,
+        fence,
+        reserve_attempt,
+        verifier,
+        #[cfg(test)]
+        probe_override,
+        crate::conformance::ConformanceProfile::Full,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn migrate_database_with_reservation_and_profile(
+    path: &Path,
+    db_id: &str,
+    run_id: &str,
+    target: i64,
+    registry: &EngineMigrationRegistry,
+    backup_options: &dyn MigrationPreimageStore,
+    fence: FenceFn,
+    reserve_attempt: Option<AttemptReservationFn>,
+    verifier: Option<PostMigrationVerifier>,
+    #[cfg(test)] probe_override: Option<DatabaseVersionState>,
+    profile: crate::conformance::ConformanceProfile,
+) -> DatabaseMigrationReport {
+    let mut report = migrate_database_with_reservation_impl(
+        path,
+        db_id,
+        run_id,
+        target,
+        registry,
+        backup_options,
+        fence,
+        reserve_attempt,
+        verifier,
+        #[cfg(test)]
+        probe_override,
+        profile,
+    )
+    .await;
+    report.verification_profile = profile;
+    report
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn migrate_database_with_reservation_impl(
+    path: &Path,
+    db_id: &str,
+    run_id: &str,
+    target: i64,
+    registry: &EngineMigrationRegistry,
+    backup_options: &dyn MigrationPreimageStore,
+    fence: FenceFn,
+    reserve_attempt: Option<AttemptReservationFn>,
+    verifier: Option<PostMigrationVerifier>,
+    #[cfg(test)] probe_override: Option<DatabaseVersionState>,
+    profile: crate::conformance::ConformanceProfile,
+) -> DatabaseMigrationReport {
+    if let Err(error) = crate::managed_custody::refuse_maintenance(path) {
+        return failed(path, None, target, "custody", error.to_string());
+    }
+    // The durable reservation seam also fences pathname reopens. The caller
+    // supplies the authority (HOSTED composes lease + path admission); the
+    // portable runner has no managed-root policy. Ordinary migrate-db without
+    // a reservation retains its existing fence timing.
+    let reopen_fence = reserve_attempt.as_ref().map(|_| fence.clone());
+    if let Some(guard) = &reopen_fence {
+        if let Err(err) = guard().await {
+            return failed(path, None, target, "fence", err.to_string());
+        }
+    }
     #[cfg(not(test))]
     let state = probe_database(path, registry.current).await;
     #[cfg(test)]
@@ -3323,6 +4704,10 @@ async fn migrate_database_with_reservation(
             backup: None,
             error_kind: None,
             error_message: None,
+            verification_profile: crate::conformance::ConformanceProfile::Full,
+            executed_verification_profile: None,
+            verification_status: MigrationVerificationStatus::NotRunCurrent,
+            deferred_checks: Vec::new(),
         };
     }
     let pending = match registry.pending(from, target) {
@@ -3339,6 +4724,11 @@ async fn migrate_database_with_reservation(
                 .foreign_keys(true),
             Err(err) => return failed(path, Some(from), target, "open", err.to_string()),
         };
+    if let Some(guard) = &reopen_fence {
+        if let Err(err) = guard().await {
+            return failed(path, Some(from), target, "fence", err.to_string());
+        }
+    }
     let mut preflight_connection = match SqliteConnection::connect_with(&read_only_options).await {
         Ok(connection) => connection,
         Err(err) => return failed(path, Some(from), target, "open", err.to_string()),
@@ -3357,6 +4747,11 @@ async fn migrate_database_with_reservation(
     }
     let _ = preflight_connection.close().await;
 
+    if let Some(guard) = &reopen_fence {
+        if let Err(err) = guard().await {
+            return failed(path, Some(from), target, "fence", err.to_string());
+        }
+    }
     let mut connection = match single_connection_options(path) {
         Ok(options) => match SqliteConnection::connect_with(&options).await {
             Ok(connection) => connection,
@@ -3599,9 +4994,25 @@ async fn migrate_database_with_reservation(
     );
     let _ = connection.close().await;
     if target == CURRENT_ENGINE_SCHEMA_VERSION {
+        // The transaction and version stamp have already committed. A
+        // failing reopen fence preserves the preimage and reports failure;
+        // callers must not interpret `fence` as proof of rollback.
+        if let Some(guard) = &reopen_fence {
+            if let Err(err) = guard().await {
+                return failed_with_backup(path, from, target, "fence", err.to_string(), backup);
+            }
+        }
         let verification = match verifier.clone() {
             Some(verifier) => verifier(path.to_path_buf()).await,
-            None => verify_migrated_database(path.to_path_buf(), db_id).await,
+            None => {
+                verify_migrated_database_fenced_with_profile(
+                    path.to_path_buf(),
+                    db_id,
+                    reopen_fence,
+                    profile,
+                )
+                .await
+            }
         };
         match verification {
             PostMigrationVerification::Passed => {}
@@ -3612,11 +5023,12 @@ async fn migrate_database_with_reservation(
                 return failed_with_backup(path, from, target, "verify-open", message, backup);
             }
             PostMigrationVerification::ConformanceFailed(message) => {
-                return failed_with_backup(path, from, target, "conformance", message, backup);
+                return failed_with_backup(path, from, target, "conformance", message, backup)
+                    .with_conformance(profile, MigrationVerificationStatus::Failed);
             }
         }
     }
-    DatabaseMigrationReport {
+    let report = DatabaseMigrationReport {
         path: path.to_path_buf(),
         from_version: Some(from),
         to_version: target,
@@ -3624,6 +5036,15 @@ async fn migrate_database_with_reservation(
         backup: Some(backup),
         error_kind: None,
         error_message: None,
+        verification_profile: profile,
+        executed_verification_profile: None,
+        verification_status: MigrationVerificationStatus::NotRunHistoricalTarget,
+        deferred_checks: Vec::new(),
+    };
+    if target == CURRENT_ENGINE_SCHEMA_VERSION {
+        report.with_conformance(profile, MigrationVerificationStatus::Passed)
+    } else {
+        report
     }
 }
 
@@ -3632,6 +5053,9 @@ async fn migrate_database_with_reservation(
 /// Hosted fleet orchestration uses this seam to record the verified pre-image
 /// before the first mutation without moving catalog ownership into the
 /// portable migration module.
+/// Reopen fences also run after commit, so a failed fence can leave the
+/// target stamp committed. The durable reservation and verified preimage
+/// must remain unresolved until restoration or explicit recovery authority.
 #[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
 pub async fn migrate_database_with_attempt_reservation(
@@ -3660,7 +5084,55 @@ pub async fn migrate_database_with_attempt_reservation(
     .await
 }
 
+/// Attempt-reservation migration with explicit verification selection.
+/// Existing hosted callers continue to use the FULL wrapper above.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub async fn migrate_database_with_attempt_reservation_and_profile(
+    path: &Path,
+    db_id: &str,
+    run_id: &str,
+    target: i64,
+    registry: &EngineMigrationRegistry,
+    backup_options: &dyn MigrationPreimageStore,
+    fence: FenceFn,
+    reserve_attempt: AttemptReservationFn,
+    profile: crate::conformance::ConformanceProfile,
+) -> DatabaseMigrationReport {
+    migrate_database_with_reservation_and_profile(
+        path,
+        db_id,
+        run_id,
+        target,
+        registry,
+        backup_options,
+        fence,
+        Some(reserve_attempt),
+        None,
+        #[cfg(test)]
+        None,
+        profile,
+    )
+    .await
+}
+
+#[cfg(test)]
 async fn verify_migrated_database(path: PathBuf, db_id: &str) -> PostMigrationVerification {
+    verify_migrated_database_fenced_with_profile(
+        path,
+        db_id,
+        None,
+        crate::conformance::ConformanceProfile::Full,
+    )
+    .await
+}
+
+async fn verify_migrated_database_fenced_with_profile(
+    path: PathBuf,
+    db_id: &str,
+    reopen_fence: Option<FenceFn>,
+    profile: crate::conformance::ConformanceProfile,
+) -> PostMigrationVerification {
     eprintln!("migration-verification db_id={db_id:?} check=shape phase=start");
     let shape_started = std::time::Instant::now();
     if let Err(err) = crate::db::validate_current_engine_shape_read_only(&path).await {
@@ -3672,6 +5144,11 @@ async fn verify_migrated_database(path: PathBuf, db_id: &str) -> PostMigrationVe
     );
     eprintln!("migration-verification db_id={db_id:?} check=open phase=start");
     let open_started = std::time::Instant::now();
+    if let Some(guard) = &reopen_fence {
+        if let Err(err) = guard().await {
+            return PostMigrationVerification::VerifyOpenFailed(err.to_string());
+        }
+    }
     let db = match crate::db::open_existing_database_at(&path).await {
         Ok(db) => db,
         Err(err) => {
@@ -3682,7 +5159,11 @@ async fn verify_migrated_database(path: PathBuf, db_id: &str) -> PostMigrationVe
         "migration-verification db_id={db_id:?} check=open phase=passed elapsed_ms={}",
         open_started.elapsed().as_millis()
     );
-    let conformance = crate::conformance::run_conformance_with_progress(&db, |name, elapsed| {
+    eprintln!(
+        "migration-verification db_id={db_id:?} profile={profile} deferred_checks={:?}",
+        profile.deferred_checks()
+    );
+    let conformance = crate::conformance::run_conformance_with_profile_and_progress(&db, profile, |name, elapsed| {
         if let Some(elapsed_ms) = elapsed {
             eprintln!(
                 "migration-verification db_id={db_id:?} check={name} phase=completed elapsed_ms={elapsed_ms}"
@@ -3715,6 +5196,10 @@ fn failed(
         backup: None,
         error_kind: Some(kind.into()),
         error_message: Some(message),
+        verification_profile: crate::conformance::ConformanceProfile::Full,
+        executed_verification_profile: None,
+        verification_status: MigrationVerificationStatus::NotRun,
+        deferred_checks: Vec::new(),
     }
 }
 
@@ -3852,6 +5337,324 @@ mod tests {
         assert_eq!(version, CURRENT_ENGINE_SCHEMA_VERSION);
     }
 
+    // Compare all persisted tables, including event logs and backfill projections.
+    // Debug-encoded typed SQLite values preserve NULL/blob/text distinctions.
+    fn persisted_state(path: &Path) -> Vec<(String, Vec<String>)> {
+        let connection = rusqlite::Connection::open(path).unwrap();
+        let mut schema = connection
+            .prepare("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name")
+            .unwrap();
+        let names = schema
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        names
+            .into_iter()
+            .map(|name| {
+                let quoted = name.replace('"', "\"\"");
+                let mut statement = connection
+                    .prepare(&format!("SELECT * FROM \"{quoted}\""))
+                    .unwrap();
+                let columns = statement.column_count();
+                let mut rows = statement
+                    .query_map([], |row| {
+                        (0..columns)
+                            .map(|column| row.get::<_, rusqlite::types::Value>(column))
+                            .collect::<std::result::Result<Vec<_>, _>>()
+                            .map(|values| format!("{values:?}"))
+                    })
+                    .unwrap()
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .unwrap();
+                rows.sort();
+                (name, rows)
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn verification_profiles_preserve_multihop_migration_and_backfill_state() {
+        use crate::conformance::ConformanceProfile;
+        let dir = tempfile::tempdir().unwrap();
+        let seed = dir.path().join("legacy.db");
+        let db = crate::create_database(&seed.to_string_lossy())
+            .await
+            .unwrap();
+        let body = format!("# Backfill\n\n```\n{}\n```\n", "é".repeat(160_000));
+        let id = crate::store::create_record(&db, serde_json::json!({"type":"Document","kind":"note","name":"migration backfill","body":body})).await.unwrap();
+        let expected_blocks: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM body_blocks WHERE record_id=?")
+                .bind(&id)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert!(expected_blocks > 8);
+        let expected_nodes: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM vocabulary_value_json_nodes")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert!(expected_nodes > 0);
+        db.close().await;
+        let mut connection =
+            SqliteConnection::connect_with(&single_connection_options(&seed).unwrap())
+                .await
+                .unwrap();
+        revert_to_engine_75(&mut connection).await;
+        sqlx::query("DROP TABLE body_blocks")
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        sqlx::query("PRAGMA user_version=74")
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        connection.close().await.unwrap();
+        let full_path = dir.path().join("full.db");
+        let core_path = dir.path().join("core.db");
+        std::fs::copy(&seed, &full_path).unwrap();
+        std::fs::copy(&seed, &core_path).unwrap();
+        let offbox = tempfile::tempdir().unwrap();
+        let backup = test_preimage_store(offbox.path(), dir.path());
+        let registry = EngineMigrationRegistry::production();
+        let full = migrate_database(
+            &full_path,
+            "full",
+            "full-run",
+            CURRENT_ENGINE_SCHEMA_VERSION,
+            &registry,
+            &backup,
+            Arc::new(|| async { Ok(()) }.boxed()),
+        )
+        .await;
+        let core = migrate_database_with_profile(
+            &core_path,
+            "core",
+            "core-run",
+            CURRENT_ENGINE_SCHEMA_VERSION,
+            &registry,
+            &backup,
+            Arc::new(|| async { Ok(()) }.boxed()),
+            ConformanceProfile::Core,
+        )
+        .await;
+        for report in [&full, &core] {
+            assert_eq!(report.outcome, "migrated", "{report:?}");
+            assert_eq!(report.from_version, Some(74));
+            assert_eq!(
+                report.verification_status,
+                MigrationVerificationStatus::Passed
+            );
+            assert!(report.backup.is_some());
+            assert_eq!(header_version(&report.path), CURRENT_ENGINE_SCHEMA_VERSION);
+            let db = crate::open_existing_database_at(&report.path)
+                .await
+                .unwrap();
+            let blocks: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM body_blocks WHERE record_id=?")
+                    .bind(&id)
+                    .fetch_one(db.pool())
+                    .await
+                    .unwrap();
+            let nodes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM vocabulary_value_json_nodes")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+            assert_eq!(blocks, expected_blocks);
+            assert_eq!(nodes, expected_nodes);
+            db.close().await;
+        }
+        assert_eq!(full.verification_profile, ConformanceProfile::Full);
+        assert_eq!(
+            full.executed_verification_profile,
+            Some(ConformanceProfile::Full)
+        );
+        assert!(full.deferred_checks.is_empty());
+        assert_eq!(
+            core.executed_verification_profile,
+            Some(ConformanceProfile::Core)
+        );
+        assert_eq!(
+            core.deferred_checks,
+            ConformanceProfile::Core.deferred_checks()
+        );
+        assert_eq!(persisted_state(&full_path), persisted_state(&core_path));
+        assert_eq!(
+            serde_json::to_value(&core).unwrap()["verification_profile"],
+            "production-release"
+        );
+    }
+
+    #[tokio::test]
+    async fn verification_profiles_never_claim_current_or_historical_target_conformance() {
+        use crate::conformance::ConformanceProfile;
+        for profile in [ConformanceProfile::Full, ConformanceProfile::Core] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("user.db");
+            create_current_schema(&path).await;
+            let db = crate::open_existing_database_at(&path).await.unwrap();
+            // A full comparison would fail, but neither no-op/historical-target
+            // outcome is allowed to pretend it executed that comparison.
+            sqlx::query("INSERT INTO links (id,source_id,target_id,relationship,created_at) VALUES ('unverified-drift','native:root','native:root','corrupt projection','2026-01-01T00:00:00Z')")
+                .execute(db.write_pool()).await.unwrap();
+            db.close().await;
+            let offbox = tempfile::tempdir().unwrap();
+            let backup = test_preimage_store(offbox.path(), dir.path());
+            let registry = synthetic_zero_to_current_registry();
+            let current = migrate_database_with_profile(
+                &path,
+                "user",
+                "current",
+                CURRENT_ENGINE_SCHEMA_VERSION,
+                &registry,
+                &backup,
+                Arc::new(|| async { Ok(()) }.boxed()),
+                profile,
+            )
+            .await;
+            assert_eq!(current.outcome, "current");
+            assert_eq!(
+                current.verification_status,
+                MigrationVerificationStatus::NotRunCurrent
+            );
+            assert!(current.backup.is_none());
+            let historical = migrate_database_with_reservation_and_profile(
+                &path,
+                "user",
+                "historical",
+                CURRENT_ENGINE_SCHEMA_VERSION - 1,
+                &registry,
+                &backup,
+                Arc::new(|| async { Ok(()) }.boxed()),
+                None,
+                None,
+                Some(DatabaseVersionState::Known(0)),
+                profile,
+            )
+            .await;
+            assert_eq!(historical.outcome, "migrated", "{historical:?}");
+            assert_eq!(
+                historical.verification_status,
+                MigrationVerificationStatus::NotRunHistoricalTarget
+            );
+            assert!(historical.backup.is_some());
+            for report in [&current, &historical] {
+                assert_eq!(report.verification_profile, profile);
+                assert_eq!(report.executed_verification_profile, None);
+                assert!(report.deferred_checks.is_empty());
+                let json = serde_json::to_value(report).unwrap();
+                assert!(json["executed_verification_profile"].is_null());
+                assert_ne!(json["verification_status"], "passed");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn production_release_retained_failure_is_failed_with_preimage() {
+        use crate::conformance::ConformanceProfile;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("user.db");
+        create_current_schema(&path).await;
+        let offbox = tempfile::tempdir().unwrap();
+        let backup = test_preimage_store(offbox.path(), dir.path());
+        // Fault immediately before the real dispatcher so shape/open admission
+        // cannot mask whether CORE still executes authorization validation.
+        let verifier: PostMigrationVerifier = Arc::new(|path| {
+            async move {
+                let db = crate::open_existing_database_at(&path).await.unwrap();
+                sqlx::query("DROP TRIGGER authorization_revision_records_insert")
+                    .execute(db.write_pool())
+                    .await
+                    .unwrap();
+                let report =
+                    crate::conformance::run_conformance_with_profile(&db, ConformanceProfile::Core)
+                        .await;
+                db.close().await;
+                assert!(!report.ok);
+                assert!(
+                    !report
+                        .checks
+                        .iter()
+                        .find(|check| check.check == "authorization-revision-state")
+                        .unwrap()
+                        .ok
+                );
+                PostMigrationVerification::ConformanceFailed(format!("{report:?}"))
+            }
+            .boxed()
+        });
+        let report = migrate_database_with_reservation_and_profile(
+            &path,
+            "user",
+            "failure",
+            CURRENT_ENGINE_SCHEMA_VERSION,
+            &synthetic_zero_to_current_registry(),
+            &backup,
+            Arc::new(|| async { Ok(()) }.boxed()),
+            None,
+            Some(verifier),
+            Some(DatabaseVersionState::Known(0)),
+            ConformanceProfile::Core,
+        )
+        .await;
+        assert_eq!(report.outcome, "failed");
+        assert_eq!(report.error_kind.as_deref(), Some("conformance"));
+        assert_eq!(
+            report.verification_status,
+            MigrationVerificationStatus::Failed
+        );
+        assert_eq!(
+            report.executed_verification_profile,
+            Some(ConformanceProfile::Core)
+        );
+        assert_eq!(
+            report.deferred_checks,
+            ConformanceProfile::Core.deferred_checks()
+        );
+        let restored = dir.path().join("restored.db");
+        backup
+            .sink
+            .get(report.backup.unwrap().key, restored.clone())
+            .await
+            .unwrap();
+        crate::open_existing_database_at(&restored)
+            .await
+            .unwrap()
+            .close()
+            .await;
+    }
+
+    #[tokio::test]
+    async fn production_release_verifier_retains_shape_and_reopen_fence_refusals() {
+        use crate::conformance::ConformanceProfile;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("valid.db");
+        create_current_schema(&path).await;
+        let refusal: FenceFn =
+            Arc::new(|| async { Err(Error::engine("lost reopen authority")) }.boxed());
+        assert!(matches!(
+            verify_migrated_database_fenced_with_profile(path.clone(), "fixture", Some(refusal), ConformanceProfile::Core).await,
+            PostMigrationVerification::VerifyOpenFailed(message) if message.contains("lost reopen authority")
+        ));
+        let db = crate::open_existing_database_at(&path).await.unwrap();
+        sqlx::query("DROP TABLE jobs")
+            .execute(db.write_pool())
+            .await
+            .unwrap();
+        db.close().await;
+        assert!(matches!(
+            verify_migrated_database_fenced_with_profile(
+                path,
+                "fixture",
+                None,
+                ConformanceProfile::Core
+            )
+            .await,
+            PostMigrationVerification::StructuralFailed(_)
+        ));
+    }
+
     #[tokio::test]
     async fn real_post_migration_verifier_covers_pass_and_structural_failure() {
         let dir = tempfile::tempdir().unwrap();
@@ -3950,6 +5753,125 @@ mod tests {
             .unwrap()
             .close()
             .await;
+    }
+
+    #[tokio::test]
+    async fn unreserved_portable_migration_preserves_precommit_only_fence_timing() {
+        assert!(
+            matches!(CURRENT_ENGINE_SCHEMA_VERSION, 75..=82),
+            "refresh historical edge fixture"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        // This plain portable target is deliberately outside HOSTED layouts.
+        let path = dir.path().join("portable.db");
+        create_current_schema(&path).await;
+        {
+            let connection = rusqlite::Connection::open(&path).unwrap();
+            connection
+                .execute_batch("DROP TABLE schema_config_json_nodes;")
+                .unwrap();
+            if CURRENT_ENGINE_SCHEMA_VERSION >= 82 {
+                connection
+                    .execute_batch("DROP TABLE facet_value_json_nodes;")
+                    .unwrap();
+            }
+            if CURRENT_ENGINE_SCHEMA_VERSION >= 80 {
+                connection
+                    .execute_batch("DROP TABLE workspace_rule_installations;")
+                    .unwrap();
+            }
+            if CURRENT_ENGINE_SCHEMA_VERSION >= 79 {
+                connection
+                    .execute_batch(
+                        "ALTER TABLE alpha_tab_installs DROP COLUMN body_read_admission_event_id;",
+                    )
+                    .unwrap();
+            }
+            if CURRENT_ENGINE_SCHEMA_VERSION >= 78 {
+                connection
+                    .execute_batch(
+                        "ALTER TABLE alpha_tab_installs DROP COLUMN adoption_provenance;",
+                    )
+                    .unwrap();
+            }
+            if CURRENT_ENGINE_SCHEMA_VERSION >= 77 {
+                connection
+                    .execute_batch("DROP TRIGGER content_event_reaction_meta_insert; DROP TABLE content_event_reaction_meta;")
+                    .unwrap();
+            }
+            if CURRENT_ENGINE_SCHEMA_VERSION >= 76 {
+                connection
+                    .execute_batch("DROP TABLE vocabulary_value_json_nodes;")
+                    .unwrap();
+            }
+            connection
+                .execute_batch("DROP TABLE body_blocks; PRAGMA user_version=74;")
+                .unwrap();
+        }
+        let offbox = tempfile::tempdir().unwrap();
+        let backup = test_preimage_store(offbox.path(), dir.path());
+        let after_commit = Arc::new(AtomicUsize::new(0));
+        let fence: FenceFn = Arc::new({
+            let path = path.clone();
+            let after_commit = after_commit.clone();
+            move || {
+                let path = path.clone();
+                let after_commit = after_commit.clone();
+                async move {
+                    let version: i64 = {
+                        let connection = rusqlite::Connection::open_with_flags(
+                            &path,
+                            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                        )
+                        .unwrap();
+                        connection
+                            .pragma_query_value(None, "user_version", |row| row.get(0))
+                            .unwrap()
+                    };
+                    if version == CURRENT_ENGINE_SCHEMA_VERSION {
+                        after_commit.fetch_add(1, Ordering::SeqCst);
+                        return Err(Error::engine(
+                            "portable fence unexpectedly called after commit",
+                        ));
+                    }
+                    // A later edge's precommit fence sees only its earlier committed stamps;
+                    // only a fence after the final target commit is forbidden.
+                    assert!(
+                        matches!(
+                            (CURRENT_ENGINE_SCHEMA_VERSION, version),
+                            (75, 74)
+                                | (76, 74..=75)
+                                | (77, 74..=76)
+                                | (78, 74..=77)
+                                | (79, 74..=78)
+                                | (80, 74..=79)
+                                | (81, 74..=80)
+                                | (82, 74..=81)
+                        ),
+                        "unexpected committed source/intermediate stamp {version}"
+                    );
+                    Ok(())
+                }
+                .boxed()
+            }
+        });
+        // The ordinary public API passes reserve_attempt=None and retains
+        // its historical guard timing through real shape/conformance opens.
+        let report = migrate_database(
+            &path,
+            "portable-user",
+            "portable-run",
+            CURRENT_ENGINE_SCHEMA_VERSION,
+            &EngineMigrationRegistry::production(),
+            &backup,
+            fence,
+        )
+        .await;
+        assert_eq!(report.outcome, "migrated", "{report:?}");
+        assert_eq!(report.from_version, Some(74));
+        assert!(report.backup.is_some());
+        assert_eq!(after_commit.load(Ordering::SeqCst), 0);
+        assert_eq!(header_version(&path), CURRENT_ENGINE_SCHEMA_VERSION);
     }
 
     /// Undo engine 50's webhook storage and attestation vocabulary, leaving
@@ -4156,7 +6078,7 @@ mod tests {
 
     /// Advance a focused historical-edge fixture to the current schema
     /// before ordinary reopen, starting at its verified source version.
-    async fn advance_engine_58_to_current(connection: &mut SqliteConnection, start: i64) {
+    async fn advance_engine_to_current(connection: &mut SqliteConnection, start: i64) {
         for (from, to, name) in [
             (58, 59, "engine-58-to-59-record-mentions-projection"),
             (59, 60, "engine-59-to-60-provenance-validity-act-stamping"),
@@ -4165,6 +6087,27 @@ mod tests {
             (62, 63, "engine-62-to-63-read-log-selective-cleanup"),
             (63, 64, "engine-63-to-64-read-log-freelist-compaction"),
             (64, 65, "engine-64-to-65-alpha-tab-installs-projection"),
+            (
+                65,
+                66,
+                "engine-65-to-66-grant-only-realtime-authorization-revision",
+            ),
+            (66, 67, "engine-66-to-67-archived-projection"),
+            (67, 68, "engine-67-to-68-alpha-tab-orders"),
+            (68, 69, "engine-68-to-69-content-event-claim-meta"),
+            (69, 70, "engine-69-to-70-facet-times"),
+            (70, 71, "engine-70-to-71-record-changes-index"),
+            (71, 72, "engine-71-to-72-alpha-tab-request-and-shell-auto"),
+            (72, 73, "engine-72-to-73-currency-counts"),
+            (73, 74, "engine-73-to-74-body-task-items"),
+            (74, 75, "engine-74-to-75-body-blocks"),
+            (75, 76, "engine-75-to-76-vocabulary-metadata-json-nodes"),
+            (76, 77, "engine-76-to-77-reaction-meta"),
+            (77, 78, "engine-77-to-78-alpha-tab-adoption-provenance"),
+            (78, 79, "engine-78-to-79-inert-body-reader-pointer"),
+            (79, 80, "engine-79-to-80-workspace-rule-installations"),
+            (80, 81, "engine-80-to-81-schema-config-json-nodes"),
+            (81, 82, "engine-81-to-82-facet-value-json-nodes"),
         ] {
             if from < start {
                 continue;
@@ -7140,7 +9083,7 @@ mod tests {
             .execute(&mut conn)
             .await
             .unwrap();
-        advance_engine_58_to_current(&mut conn, 58).await;
+        advance_engine_to_current(&mut conn, 58).await;
         conn.close().await.unwrap();
 
         // Every pre-cutover row is unstamped: grouping unknown, fabricated
@@ -7266,7 +9209,7 @@ mod tests {
             .execute(&mut conn)
             .await
             .unwrap();
-        advance_engine_58_to_current(&mut conn, 58).await;
+        advance_engine_to_current(&mut conn, 58).await;
         let integrity: String = sqlx::query_scalar("PRAGMA integrity_check")
             .fetch_one(&mut conn)
             .await
@@ -7403,7 +9346,7 @@ mod tests {
             .execute(&mut *conn)
             .await
             .unwrap();
-        advance_engine_58_to_current(&mut conn, 58).await;
+        advance_engine_to_current(&mut conn, 58).await;
     }
 
     /// The 56→57 edge installs the content-event append-only triggers on an
@@ -7473,7 +9416,7 @@ mod tests {
             .execute(&mut conn)
             .await
             .unwrap();
-        advance_engine_58_to_current(&mut conn, 58).await;
+        advance_engine_to_current(&mut conn, 58).await;
         conn.close().await.unwrap();
 
         let migrated = crate::open_existing_database_at(&path).await.unwrap();
@@ -7567,7 +9510,7 @@ mod tests {
         assert!(crate::db::validate_engine_shape_on_for_test(&mut conn, 58)
             .await
             .unwrap());
-        advance_engine_58_to_current(&mut conn, 58).await;
+        advance_engine_to_current(&mut conn, 58).await;
         conn.close().await.unwrap();
 
         let migrated = crate::open_existing_database_at(&path).await.unwrap();
@@ -7797,7 +9740,7 @@ mod tests {
         // Backfill ran inside the edge: the migrated table already matches
         // the live fold before reopening.
         assert_eq!(dump_record_mentions(&mut conn).await, expected);
-        advance_engine_58_to_current(&mut conn, 59).await;
+        advance_engine_to_current(&mut conn, 59).await;
         conn.close().await.unwrap();
 
         let migrated = crate::open_existing_database_at(&path).await.unwrap();
@@ -8270,6 +10213,14 @@ mod tests {
             })
             .collect();
         derived_mixed.retain(|(name, _)| !ENGINE_62_TO_63_POST_FREEZE_TOOLS.contains(name));
+        for (name, reads) in &mut derived_mixed {
+            if let Some((_, post_freeze)) = ENGINE_62_TO_63_POST_FREEZE_READ_ACTIONS
+                .iter()
+                .find(|(tool, _)| tool == name)
+            {
+                reads.retain(|action| !post_freeze.contains(action));
+            }
+        }
         derived_mixed.sort_unstable_by(|a, b| a.0.cmp(b.0));
         let mut frozen_mixed: Vec<(&str, Vec<&str>)> = ENGINE_62_TO_63_MIXED_READS
             .iter()
@@ -8938,6 +10889,20 @@ mod tests {
             .execute(&mut conn)
             .await
             .unwrap();
+        let grant_step = EngineMigrationRegistry::production()
+            .pending(65, 66)
+            .unwrap()
+            .pop()
+            .unwrap();
+        grant_step.preflight(&mut conn).await.unwrap();
+        grant_step.apply(&mut conn).await.unwrap();
+        sqlx::query("PRAGMA user_version=66")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        // Binary is at 67: continue through the archived-projection edge so
+        // the final open sees current.
+        apply_remaining_production_steps(&mut conn, 66).await;
         conn.close().await.unwrap();
 
         // The migrated file opens and passes post-migration verification:
@@ -8968,10 +10933,13 @@ mod tests {
 
     /// Reconstruct the released engine-64 (main64) shape: current DDL minus
     /// exactly the `alpha_tab_installs` projection table and its artifact
-    /// index. Dropping the table removes its index with it; the reverted
-    /// schema compares equal to fresh main64 DDL under the shape contract.
+    /// index, and minus the engine-66 grant revision. Dropping the tables
+    /// removes their indexes with it; grant triggers owned by other tables
+    /// go through the engine-65 revert first. The reverted schema compares
+    /// equal to fresh main64 DDL under the shape contract.
     /// Test fixtures only; this is not a rollback API.
     async fn revert_to_engine_64(connection: &mut SqliteConnection) {
+        revert_to_engine_65(connection).await;
         sqlx::query("DROP TABLE alpha_tab_installs")
             .execute(&mut *connection)
             .await
@@ -8982,12 +10950,2201 @@ mod tests {
             .unwrap();
     }
 
-    /// The 64→65 DDL is transition text, but the objects it creates must stay
+    /// Reconstruct the released engine-66 shape: current DDL minus exactly
+    /// the `records.archived` column and the `alpha_tab_orders` preference
+    /// table. `DROP COLUMN` rewrites the stored table text, so the reverted
+    /// table compares equal to fresh pre-67 DDL under the shape contract.
+    /// Test fixtures only; this is not a rollback API.
+    async fn revert_to_engine_66(connection: &mut SqliteConnection) {
+        revert_to_engine_67(connection).await;
+        sqlx::query("ALTER TABLE records DROP COLUMN archived")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        sqlx::query("PRAGMA user_version=66")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+    }
+
+    /// Reconstruct the released engine-75 shape: current DDL minus exactly the
+    /// engine-76 `vocabulary_value_json_nodes` parser projection. Every edge
+    /// fixture below 76 walks back through here first, so a later engine-76
+    /// addition can never leak into a released-shape pin. Test fixtures only;
+    /// this is not a rollback API.
+    async fn revert_to_engine_75(connection: &mut SqliteConnection) {
+        revert_to_engine_76(connection).await;
+        sqlx::query("DROP TABLE vocabulary_value_json_nodes")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        sqlx::query("PRAGMA user_version=75")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+    }
+
+    /// Reconstruct the released engine-72 shape: current DDL minus the
+    /// engine-76 parser projection, the engine-75 `body_blocks` and engine-74
+    /// `body_task_items` tables, and exactly the `records.is_current` and
+    /// `records.successor_count` currency columns. `DROP COLUMN` rewrites the
+    /// stored table text, so the reverted table compares equal to fresh pre-73
+    /// DDL under the shape contract. Test fixtures only; this is not a
+    /// rollback API.
+    async fn revert_to_engine_72(connection: &mut SqliteConnection) {
+        revert_to_engine_75(connection).await;
+        sqlx::query("DROP TABLE body_blocks")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        sqlx::query("DROP TABLE body_task_items")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        for column in ["is_current", "successor_count"] {
+            sqlx::query(&format!("ALTER TABLE records DROP COLUMN {column}"))
+                .execute(&mut *connection)
+                .await
+                .unwrap();
+        }
+        sqlx::query("PRAGMA user_version=72")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+    }
+
+    /// Reconstruct the released engine-71 shape: current DDL with the
+    /// `alpha_tab_installs` table rebuilt to its pre-72 text (two-value
+    /// adoption CHECK, no request column). Rows copy across minus the
+    /// request text, which pre-72 installs never carried. Test fixtures
+    /// only; this is not a rollback API.
+    async fn revert_to_engine_71(connection: &mut SqliteConnection) {
+        revert_to_engine_72(connection).await;
+        for statement in [
+            "PRAGMA legacy_alter_table=ON",
+            "ALTER TABLE alpha_tab_installs RENAME TO alpha_tab_installs_v72revert",
+            ENGINE_64_TO_65_STATEMENTS[0],
+            r#"INSERT INTO alpha_tab_installs
+                 (account_id,package,version,digest,artifact_id,consented_source_revision,
+                  declaration_digest,consented_declaration,adoption,status,event_id,event_seq,updated_at)
+               SELECT account_id,package,version,digest,artifact_id,consented_source_revision,
+                  declaration_digest,consented_declaration,adoption,status,event_id,event_seq,updated_at
+                 FROM alpha_tab_installs_v72revert"#,
+            "DROP TABLE alpha_tab_installs_v72revert",
+            ENGINE_64_TO_65_STATEMENTS[1],
+            "PRAGMA legacy_alter_table=OFF",
+        ] {
+            sqlx::query(statement)
+                .execute(&mut *connection)
+                .await
+                .unwrap();
+        }
+        sqlx::query("PRAGMA user_version=71")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+    }
+
+    /// Reconstruct the released engine-70 shape: current DDL minus exactly
+    /// the `idx_content_events_record_changes` partial index.
+    /// Test fixtures only; this is not a rollback API.
+    async fn revert_to_engine_70(connection: &mut SqliteConnection) {
+        revert_to_engine_71(connection).await;
+        sqlx::query("DROP INDEX idx_content_events_record_changes")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        sqlx::query("PRAGMA user_version=70")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+    }
+
+    /// Continue a fixture at engine 70 through the 70→71 field-change index
+    /// edge (checking the engine-71 shape on the way) and every later
+    /// production edge, so a ladder that ends at 70 reopens at current.
+    async fn continue_from_engine_70(connection: &mut SqliteConnection) {
+        let step = EngineMigrationRegistry::production()
+            .pending(70, 71)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(step.name(), "engine-70-to-71-record-changes-index");
+        step.preflight(&mut *connection).await.unwrap();
+        step.apply(&mut *connection).await.unwrap();
+        sqlx::query("PRAGMA user_version=71")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        assert!(crate::db::validate_engine_shape_on_for_test(connection, 71)
+            .await
+            .unwrap());
+        apply_remaining_production_steps(connection, 71).await;
+    }
+
+    /// Reconstruct the released engine-69 shape: current DDL minus exactly
+    /// the `facet_times` table. Dropping it drops its two indexes and nothing
+    /// else; the reverted schema compares equal to fresh pre-70 DDL under the
+    /// shape contract.
+    /// Test fixtures only; this is not a rollback API.
+    async fn revert_to_engine_69(connection: &mut SqliteConnection) {
+        revert_to_engine_70(connection).await;
+        sqlx::query("DROP TABLE facet_times")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        sqlx::query("PRAGMA user_version=69")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+    }
+
+    /// Run the 69→70 edge (checking the engine-70 shape on the way) and every
+    /// later production edge, for a test whose own edge ends at 69, so the
+    /// final open sees the binary's current schema.
+    async fn continue_from_engine_69(connection: &mut SqliteConnection) {
+        let step = EngineMigrationRegistry::production()
+            .pending(69, 70)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(step.name(), "engine-69-to-70-facet-times");
+        step.preflight(&mut *connection).await.unwrap();
+        step.apply(&mut *connection).await.unwrap();
+        sqlx::query("PRAGMA user_version=70")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        assert!(crate::db::validate_engine_shape_on_for_test(connection, 70)
+            .await
+            .unwrap());
+        continue_from_engine_70(connection).await;
+    }
+
+    /// Reconstruct the released engine-68 shape: current DDL minus exactly
+    /// the `content_event_claim_meta` table and its insert trigger. Dropping
+    /// the table removes the trigger's target and the explicit trigger drop
+    /// keeps the helper sound standing alone; the reverted schema compares
+    /// equal to fresh pre-69 DDL under the shape contract.
+    /// Test fixtures only; this is not a rollback API.
+    async fn revert_to_engine_68(connection: &mut SqliteConnection) {
+        revert_to_engine_69(connection).await;
+        sqlx::query("DROP TRIGGER IF EXISTS content_event_claim_meta_insert")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        sqlx::query("DROP TABLE content_event_claim_meta")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        sqlx::query("PRAGMA user_version=68")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+    }
+
+    /// Reconstruct the released engine-67 shape: current DDL minus exactly
+    /// the `alpha_tab_orders` preference table. Dropping the table removes
+    /// nothing else; the reverted schema compares equal to fresh pre-68 DDL
+    /// under the shape contract.
+    /// Test fixtures only; this is not a rollback API.
+    async fn revert_to_engine_67(connection: &mut SqliteConnection) {
+        revert_to_engine_68(connection).await;
+        sqlx::query("DROP TABLE alpha_tab_orders")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        sqlx::query("PRAGMA user_version=67")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+    }
+
+    /// Reconstruct the released engine-65 shape: current DDL minus exactly
+    /// the `records.archived` column plus the `authorization_grant_revision`
+    /// table and its 17 triggers.
+    /// Dropping the table does not remove triggers owned by other tables,
+    /// so each grant trigger is dropped explicitly; the reverted schema
+    /// compares equal to fresh pre-66 DDL under the shape contract.
+    /// Test fixtures only; this is not a rollback API.
+    async fn revert_to_engine_65(connection: &mut SqliteConnection) {
+        revert_to_engine_66(connection).await;
+        for trigger in [
+            "authorization_grant_record_policies_insert",
+            "authorization_grant_record_policies_delete",
+            "authorization_grant_record_policies_update",
+            "authorization_grant_policy_entries_insert",
+            "authorization_grant_policy_entries_delete",
+            "authorization_grant_policy_entries_update",
+            "authorization_grant_bindings_insert",
+            "authorization_grant_bindings_delete",
+            "authorization_grant_bindings_update",
+            "authorization_grant_records_update",
+            "authorization_grant_records_delete",
+            "authorization_grant_links_insert",
+            "authorization_grant_links_delete",
+            "authorization_grant_links_update",
+            "authorization_grant_semantic_units_write",
+            "authorization_grant_semantic_units_delete",
+            "authorization_grant_semantic_units_update",
+        ] {
+            sqlx::query(&format!("DROP TRIGGER {trigger}"))
+                .execute(&mut *connection)
+                .await
+                .unwrap();
+        }
+        sqlx::query("DROP TABLE authorization_grant_revision")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        sqlx::query("PRAGMA user_version=65")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+    }
+
+    /// The 65→66 DDL is transition text, but the objects it creates must stay
     /// byte-identical to the fresh-schema DDL: migrated databases are
     /// byte-identical to fresh ones under the shape contract only while both
     /// spellings agree.
     #[test]
-    fn engine_64_to_65_statements_match_fresh_ddl() {
+    fn engine_65_to_66_statements_match_fresh_ddl() {
+        for statement in ENGINE_65_TO_66_STATEMENTS {
+            assert!(
+                crate::schema::DDL_STATEMENTS.contains(&statement),
+                "65→66 statement has no fresh-DDL twin: {}",
+                statement.chars().take(80).collect::<String>()
+            );
+        }
+    }
+
+    /// The 65→66 edge adds the empty grant-only realtime revision: the
+    /// migrated database validates at schema 66, the counter starts at 0,
+    /// and the reverted pre-image pins the released engine-65 shape.
+    #[tokio::test]
+    async fn engine_65_to_66_adds_empty_grant_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("grant-revision-edge.db");
+        create_current_schema(&path).await;
+        let options = SqliteConnectOptions::from_str(&format!("sqlite:{}", path.display()))
+            .unwrap()
+            .foreign_keys(true);
+        let mut conn = SqliteConnection::connect_with(&options).await.unwrap();
+        revert_to_engine_65(&mut conn).await;
+        let digest = crate::db::schema_shape_contract_sha256_for_test(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(digest, crate::db::ENGINE_65_SHAPE_CONTRACT_SHA256);
+        let step = EngineMigrationRegistry::production()
+            .pending(65, 66)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(
+            step.name(),
+            "engine-65-to-66-grant-only-realtime-authorization-revision"
+        );
+        step.preflight(&mut conn).await.unwrap();
+        step.apply(&mut conn).await.unwrap();
+        sqlx::query("PRAGMA user_version=66")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        assert!(crate::db::validate_engine_shape_on_for_test(&mut conn, 66)
+            .await
+            .unwrap());
+        let epoch: i64 =
+            sqlx::query_scalar("SELECT epoch FROM authorization_grant_revision WHERE id = 1")
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+        assert_eq!(epoch, 0);
+        assert!(crate::authorization_grant::state_violations_on(&mut conn)
+            .await
+            .unwrap()
+            .is_empty());
+        // The edge under test ends at 66, but the binary is at 72: continue
+        // through the archived-projection edge so the final open sees current.
+        apply_remaining_production_steps(&mut conn, 66).await;
+        conn.close().await.unwrap();
+
+        let migrated = crate::open_existing_database_at(&path).await.unwrap();
+        let result = crate::conformance::rebuild_and_diff_control(&migrated)
+            .await
+            .unwrap();
+        assert!(
+            result.equal,
+            "rebuild drift after 65→66: {}",
+            serde_json::to_string_pretty(&result.tables).unwrap()
+        );
+        migrated.close().await;
+    }
+
+    /// The 66→67 ADD COLUMN is transition text, but the column it adds must
+    /// stay token-identical to the fresh-schema records definition: migrated
+    /// databases converge with fresh ones under the shape contract only while
+    /// both spellings agree. The backfill UPDATE has no fresh-DDL twin by
+    /// construction (fresh databases fold archived from the log).
+    #[test]
+    fn engine_66_to_67_statements_match_fresh_ddl() {
+        assert_eq!(ENGINE_66_TO_67_STATEMENTS.len(), 2);
+        let add = ENGINE_66_TO_67_STATEMENTS[0];
+        assert!(
+            add.starts_with("ALTER TABLE records ADD COLUMN archived "),
+            "66→67 first statement must add records.archived: {add}"
+        );
+        let fresh = crate::schema::DDL_STATEMENTS
+            .iter()
+            .find(|candidate| candidate.starts_with("CREATE TABLE records ("))
+            .expect("fresh DDL contains records");
+        // Token-identical after schema normalization (whitespace/comments
+        // stripped): the migrated rewrite must spell the column like fresh.
+        let normalize = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+        let column_def = "archived INTEGER NOT NULL DEFAULT 0 CHECK (archived IN (0,1))";
+        assert!(
+            normalize(fresh).contains(&normalize(column_def)),
+            "fresh records DDL must carry the archived column"
+        );
+        assert!(
+            normalize(add).contains(&normalize(column_def)),
+            "66→67 ADD COLUMN drifted from fresh DDL"
+        );
+        assert!(
+            ENGINE_66_TO_67_STATEMENTS[1].contains("facet_values")
+                && ENGINE_66_TO_67_STATEMENTS[1].contains("key='archived'"),
+            "66→67 backfill must derive from the reserved archived facet"
+        );
+    }
+
+    /// The 66→67 edge adds caller-independent `records.archived` with a
+    /// deterministic facet-presence backfill: the migrated database validates
+    /// at schema 67, archived matches facet_values presence row-for-row, the
+    /// reverted pre-image pins the released engine-66 shape, and content
+    /// rebuild-and-diff proves replay convergence.
+    #[tokio::test]
+    async fn engine_66_to_67_backfills_archived_from_facet() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("archived-projection-edge.db");
+        create_current_schema(&path).await;
+        let db = crate::open_existing_database_at(&path).await.unwrap();
+        let kept = crate::store::create_record(
+            &db,
+            serde_json::json!({"type": "Document", "kind": "note", "name": "kept"}),
+        )
+        .await
+        .unwrap();
+        let archived = crate::store::create_record(
+            &db,
+            serde_json::json!({"type": "Document", "kind": "note", "name": "archived"}),
+        )
+        .await
+        .unwrap();
+        crate::store::archive_record(&db, &archived).await.unwrap();
+        let restored = crate::store::create_record(
+            &db,
+            serde_json::json!({"type": "Document", "kind": "note", "name": "restored"}),
+        )
+        .await
+        .unwrap();
+        crate::store::archive_record(&db, &restored).await.unwrap();
+        crate::store::restore_record(&db, &restored).await.unwrap();
+        // Live fold's answer, captured before the revert destroys it.
+        let expected: Vec<(String, i64)> =
+            sqlx::query_as("SELECT id, archived FROM records WHERE id IN (?, ?, ?) ORDER BY id")
+                .bind(&kept)
+                .bind(&archived)
+                .bind(&restored)
+                .fetch_all(db.write_pool())
+                .await
+                .unwrap();
+        assert_eq!(expected.len(), 3);
+        let archived_flag = |id: &str| {
+            expected
+                .iter()
+                .find(|(row_id, _)| row_id == id)
+                .map(|(_, flag)| *flag)
+                .unwrap()
+        };
+        assert_eq!(archived_flag(&kept), 0);
+        assert_eq!(archived_flag(&archived), 1);
+        assert_eq!(archived_flag(&restored), 0);
+        // Facet presence agrees with the physical column on the live fold.
+        for id in [&kept, &archived, &restored] {
+            let facet_count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM facet_values WHERE record_id = ? AND key = 'archived'",
+            )
+            .bind(id)
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap();
+            assert_eq!(facet_count, archived_flag(id));
+        }
+        db.close().await;
+
+        // Reconstruct the engine-66 preimage, then run the real 66→67 edge.
+        let options = SqliteConnectOptions::from_str(&format!("sqlite:{}", path.display()))
+            .unwrap()
+            .foreign_keys(true);
+        let mut conn = SqliteConnection::connect_with(&options).await.unwrap();
+        revert_to_engine_66(&mut conn).await;
+        let digest = crate::db::schema_shape_contract_sha256_for_test(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(digest, crate::db::ENGINE_66_SHAPE_CONTRACT_SHA256);
+        let step = EngineMigrationRegistry::production()
+            .pending(66, 67)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(step.name(), "engine-66-to-67-archived-projection");
+        step.preflight(&mut conn).await.unwrap();
+        step.apply(&mut conn).await.unwrap();
+        sqlx::query("PRAGMA user_version=67")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        assert!(crate::db::validate_engine_shape_on_for_test(&mut conn, 67)
+            .await
+            .unwrap());
+        // Backfill ran inside the edge: the migrated column already matches
+        // the live fold before reopening.
+        let migrated_flags: Vec<(String, i64)> =
+            sqlx::query_as("SELECT id, archived FROM records WHERE id IN (?, ?, ?) ORDER BY id")
+                .bind(&kept)
+                .bind(&archived)
+                .bind(&restored)
+                .fetch_all(&mut conn)
+                .await
+                .unwrap();
+        assert_eq!(migrated_flags, expected);
+        // The edge under test ends at 67, but the binary is at 72: continue
+        // through the tab-order and claim-meta edges so the final open sees
+        // current.
+        let order_step = EngineMigrationRegistry::production()
+            .pending(67, 68)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(order_step.name(), "engine-67-to-68-alpha-tab-orders");
+        order_step.preflight(&mut conn).await.unwrap();
+        order_step.apply(&mut conn).await.unwrap();
+        sqlx::query("PRAGMA user_version=68")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        assert!(crate::db::validate_engine_shape_on_for_test(&mut conn, 68)
+            .await
+            .unwrap());
+        let claim_step = EngineMigrationRegistry::production()
+            .pending(68, 69)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(
+            claim_step.name(),
+            "engine-68-to-69-content-event-claim-meta"
+        );
+        claim_step.preflight(&mut conn).await.unwrap();
+        claim_step.apply(&mut conn).await.unwrap();
+        sqlx::query("PRAGMA user_version=69")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        assert!(crate::db::validate_engine_shape_on_for_test(&mut conn, 69)
+            .await
+            .unwrap());
+        continue_from_engine_69(&mut conn).await;
+        conn.close().await.unwrap();
+
+        let migrated = crate::open_existing_database_at(&path).await.unwrap();
+        let result = crate::conformance::rebuild_and_diff(&migrated)
+            .await
+            .unwrap();
+        assert!(
+            result.equal,
+            "rebuild drift after 66→67: {}",
+            serde_json::to_string_pretty(&result.tables).unwrap()
+        );
+        // Ordinary archive/restore keeps folding on the migrated database,
+        // and replay still converges afterwards.
+        crate::store::archive_record(&migrated, &kept)
+            .await
+            .unwrap();
+        let flag: i64 = sqlx::query_scalar("SELECT archived FROM records WHERE id = ?")
+            .bind(&kept)
+            .fetch_one(migrated.write_pool())
+            .await
+            .unwrap();
+        assert_eq!(flag, 1);
+        crate::store::restore_record(&migrated, &kept)
+            .await
+            .unwrap();
+        let flag: i64 = sqlx::query_scalar("SELECT archived FROM records WHERE id = ?")
+            .bind(&kept)
+            .fetch_one(migrated.write_pool())
+            .await
+            .unwrap();
+        assert_eq!(flag, 0);
+        let replayed = crate::conformance::rebuild_and_diff(&migrated)
+            .await
+            .unwrap();
+        assert!(
+            replayed.equal,
+            "replay drift after post-migration archive/restore: {}",
+            serde_json::to_string_pretty(&replayed.tables).unwrap()
+        );
+        migrated.close().await;
+    }
+
+    /// The 73→74 statements are transition text, but the objects they create
+    /// must stay byte-identical to the fresh-schema DDL: migrated databases
+    /// converge with fresh ones under the shape contract only while every
+    /// spelling agrees. The backfill is a Rust loop with no SQL twin by
+    /// construction (fresh databases fold task items from the log).
+    #[test]
+    fn engine_73_to_74_statements_match_fresh_ddl() {
+        assert_eq!(ENGINE_73_TO_74_STATEMENTS.len(), 2);
+        let fresh: Vec<&str> = crate::schema::DDL_STATEMENTS
+            .iter()
+            .filter(|candidate| {
+                candidate.starts_with("CREATE TABLE body_task_items")
+                    || candidate.starts_with("CREATE INDEX idx_body_task_items_")
+            })
+            .copied()
+            .collect();
+        assert_eq!(
+            fresh.len(),
+            2,
+            "fresh DDL must carry exactly the body_task_items table and its index"
+        );
+        for (statement, entry) in ENGINE_73_TO_74_STATEMENTS.iter().zip(fresh.iter()) {
+            assert_eq!(
+                statement, entry,
+                "73→74 statement drifted from fresh DDL: {statement}"
+            );
+        }
+    }
+
+    async fn schema79_connection(version: i64) -> SqliteConnection {
+        let options = SqliteConnectOptions::from_str("sqlite::memory:")
+            .unwrap()
+            .foreign_keys(true);
+        let mut connection = SqliteConnection::connect_with(&options).await.unwrap();
+        for statement in crate::schema::DDL_STATEMENTS {
+            if version < 81 && statement.starts_with("CREATE TABLE schema_config_json_nodes") {
+                continue;
+            }
+            if version < 82 && statement.starts_with("CREATE TABLE facet_value_json_nodes") {
+                continue;
+            }
+            if version < 80 && statement.contains("workspace_rule_installations") {
+                continue;
+            }
+            let statement =
+                crate::schema::contract::alpha_tab_installs_create_for_version(statement, version);
+            sqlx::query(&statement)
+                .execute(&mut connection)
+                .await
+                .unwrap();
+        }
+        sqlx::query(&format!("PRAGMA user_version={version}"))
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        connection
+    }
+
+    #[tokio::test]
+    async fn engine_79_to_80_historical_shape_upgrade_fresh_and_drift_refusal() {
+        let mut source = schema79_connection(79).await;
+        assert_eq!(
+            crate::db::schema_shape_contract_sha256_for_test(&mut source)
+                .await
+                .unwrap(),
+            crate::db::ENGINE_79_SHAPE_CONTRACT_SHA256
+        );
+        Engine79To80Migration.preflight(&mut source).await.unwrap();
+        let mut tx = source.begin().await.unwrap();
+        Engine79To80Migration.apply(&mut tx).await.unwrap();
+        sqlx::query("PRAGMA user_version=80")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        assert!(
+            crate::db::validate_engine_shape_on_for_test(&mut source, 80)
+                .await
+                .unwrap()
+        );
+        type ForeignKeyRow = (i64, i64, String, String, String, String, String, String);
+        let foreign_keys: Vec<ForeignKeyRow> =
+            sqlx::query_as("PRAGMA foreign_key_list(workspace_rule_installations)")
+                .fetch_all(&mut source)
+                .await
+                .unwrap();
+        assert!(foreign_keys.is_empty());
+        source.close().await.unwrap();
+        for change in [
+            "ALTER TABLE meta_events ADD COLUMN forged TEXT",
+            "CREATE TABLE workspace_rule_installations(bad TEXT)",
+        ] {
+            let mut bad = schema79_connection(79).await;
+            sqlx::query(change).execute(&mut bad).await.unwrap();
+            assert!(Engine79To80Migration.preflight(&mut bad).await.is_err());
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("PRAGMA user_version")
+                    .fetch_one(&mut bad)
+                    .await
+                    .unwrap(),
+                79
+            );
+            bad.close().await.unwrap();
+        }
+    }
+
+    // Frozen measurements use the existing authoritative Rust shape/DDL functions.
+    // Values were measured at 35df7e3; no replacement fingerprint algorithm.
+    #[tokio::test]
+    async fn schema79_measure_contracts() {
+        let mut source = schema79_connection(78).await;
+        let mut fresh = schema79_connection(79).await;
+        assert_eq!(
+            crate::db::schema_shape_contract_sha256_for_test(&mut source)
+                .await
+                .unwrap(),
+            crate::db::ENGINE_78_SHAPE_CONTRACT_SHA256
+        );
+        assert_eq!(
+            crate::db::schema_shape_contract_sha256_for_test(&mut fresh)
+                .await
+                .unwrap(),
+            "4e0d87b74b7facb2ce66ef4bab29d79fd24ed2ff3ebe276f84a9bd68e7a28095"
+        );
+        assert_eq!(
+            crate::schema::contract::ddl_sha256(),
+            crate::schema::contract::FROZEN_DDL_SHA256
+        );
+        source.close().await.unwrap();
+        fresh.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn engine_78_to_79_fresh_migrated_and_null_foreign_key() {
+        let (db, _, _) = crate::control::alpha_tab_provenance_tests::fixture(Some(
+            crate::control::ALPHA_TAB_ADOPTION_VERIFIED,
+        ))
+        .await;
+        let mut connection = db.write_pool().acquire().await.unwrap();
+        let before: Option<String> =
+            sqlx::query_scalar("SELECT adoption_provenance FROM alpha_tab_installs")
+                .fetch_one(&mut *connection)
+                .await
+                .unwrap();
+        assert!(before.is_some());
+        sqlx::query("DROP TABLE facet_value_json_nodes")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        sqlx::query("DROP TABLE schema_config_json_nodes")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        sqlx::query("DROP TABLE workspace_rule_installations")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        sqlx::query("ALTER TABLE alpha_tab_installs DROP COLUMN body_read_admission_event_id")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        sqlx::query("PRAGMA user_version=78")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        assert_eq!(
+            crate::db::schema_shape_contract_sha256_for_test(&mut connection)
+                .await
+                .unwrap(),
+            crate::db::ENGINE_78_SHAPE_CONTRACT_SHA256
+        );
+        Engine78To79Migration
+            .preflight(&mut connection)
+            .await
+            .unwrap();
+        let mut tx = connection.begin().await.unwrap();
+        Engine78To79Migration.apply(&mut tx).await.unwrap();
+        sqlx::query("PRAGMA user_version=79")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        assert!(
+            crate::db::validate_engine_shape_on_for_test(&mut connection, 79)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, Option<String>>(
+                "SELECT adoption_provenance FROM alpha_tab_installs"
+            )
+            .fetch_one(&mut *connection)
+            .await
+            .unwrap(),
+            before
+        );
+        assert_eq!(sqlx::query_scalar::<_,i64>("SELECT COUNT(*) FROM alpha_tab_installs WHERE body_read_admission_event_id IS NOT NULL").fetch_one(&mut *connection).await.unwrap(),0);
+        assert!(sqlx::query(
+            "UPDATE alpha_tab_installs SET body_read_admission_event_id='no-such-control-event'"
+        )
+        .execute(&mut *connection)
+        .await
+        .is_err());
+        drop(connection);
+        assert!(
+            crate::conformance::rebuild::rebuild_and_diff_control(&db)
+                .await
+                .unwrap()
+                .equal
+        );
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn engine_78_to_79_rejects_alternate_and_drift_before_mutation() {
+        for isolated in [false, true] {
+            let mut connection = schema79_connection(78).await;
+            if isolated {
+                sqlx::query("ALTER TABLE alpha_tab_installs DROP COLUMN adoption_provenance")
+                    .execute(&mut connection)
+                    .await
+                    .unwrap();
+                sqlx::query(ENGINE_78_TO_79_STATEMENT)
+                    .execute(&mut connection)
+                    .await
+                    .unwrap();
+            } else {
+                sqlx::query("CREATE TABLE unregistered_schema_drift(value TEXT)")
+                    .execute(&mut connection)
+                    .await
+                    .unwrap();
+            }
+            let before = crate::db::schema_shape_contract_sha256_for_test(&mut connection)
+                .await
+                .unwrap();
+            assert!(Engine78To79Migration
+                .preflight(&mut connection)
+                .await
+                .is_err());
+            assert_eq!(
+                crate::db::schema_shape_contract_sha256_for_test(&mut connection)
+                    .await
+                    .unwrap(),
+                before
+            );
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("PRAGMA user_version")
+                    .fetch_one(&mut connection)
+                    .await
+                    .unwrap(),
+                78
+            );
+            connection.close().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn engine_78_to_79_preserves_released_77_and_78_shapes() {
+        let mut connection = schema79_connection(77).await;
+        assert_eq!(
+            crate::db::schema_shape_contract_sha256_for_test(&mut connection)
+                .await
+                .unwrap(),
+            crate::db::ENGINE_77_SHAPE_CONTRACT_SHA256
+        );
+        Engine77To78Migration
+            .preflight(&mut connection)
+            .await
+            .unwrap();
+        Engine77To78Migration.apply(&mut connection).await.unwrap();
+        sqlx::query("PRAGMA user_version=78")
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        assert!(
+            crate::db::validate_engine_shape_on_for_test(&mut connection, 78)
+                .await
+                .unwrap()
+        );
+        Engine78To79Migration
+            .preflight(&mut connection)
+            .await
+            .unwrap();
+        Engine78To79Migration.apply(&mut connection).await.unwrap();
+        sqlx::query("PRAGMA user_version=79")
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        assert!(
+            crate::db::validate_engine_shape_on_for_test(&mut connection, 79)
+                .await
+                .unwrap()
+        );
+        connection.close().await.unwrap();
+    }
+
+    async fn revert_to_engine_76(connection: &mut SqliteConnection) {
+        sqlx::query("DROP TABLE IF EXISTS facet_value_json_nodes")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        sqlx::query("DROP TABLE IF EXISTS schema_config_json_nodes")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        let columns: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM pragma_table_info('alpha_tab_installs')")
+                .fetch_all(&mut *connection)
+                .await
+                .unwrap();
+        if columns
+            .iter()
+            .any(|name| name == "body_read_admission_event_id")
+        {
+            sqlx::query("DROP TABLE IF EXISTS workspace_rule_installations")
+                .execute(&mut *connection)
+                .await
+                .unwrap();
+            sqlx::query("ALTER TABLE alpha_tab_installs DROP COLUMN body_read_admission_event_id")
+                .execute(&mut *connection)
+                .await
+                .unwrap();
+        }
+        if columns.iter().any(|name| name == "adoption_provenance") {
+            sqlx::query("ALTER TABLE alpha_tab_installs DROP COLUMN adoption_provenance")
+                .execute(&mut *connection)
+                .await
+                .unwrap();
+        }
+        sqlx::query("DROP TRIGGER IF EXISTS content_event_reaction_meta_insert")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        sqlx::query("DROP TABLE IF EXISTS content_event_reaction_meta")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        sqlx::query("PRAGMA user_version=76")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    fn engine_76_to_77_ddl_matches_fresh() {
+        let fresh: Vec<_> = crate::schema::DDL_STATEMENTS
+            .iter()
+            .filter(|sql| {
+                sql.contains("CREATE TABLE content_event_reaction_meta")
+                    || sql.contains("CREATE INDEX idx_content_event_reaction_meta_")
+                    || sql.contains("CREATE TRIGGER content_event_reaction_meta_insert")
+            })
+            .copied()
+            .collect();
+        assert_eq!(fresh, ENGINE_76_TO_77_STATEMENTS);
+    }
+
+    fn reaction_payload(emoji: &str, command: &str, actor: &str) -> serde_json::Value {
+        serde_json::json!({"format":"native.message-reaction.v1","emoji":emoji,"command":command,"changed":true,"actor_account_id":actor,"executor_kind":"local","reason":"r".repeat(32_000),"idempotency_key":"k".repeat(32_000)})
+    }
+
+    async fn insert_reaction(
+        connection: &mut SqliteConnection,
+        id: &str,
+        kind: &str,
+        actor: Option<&str>,
+        payload: Option<&str>,
+    ) -> Result<()> {
+        sqlx::query("INSERT INTO content_events(id,record_id,type,payload,actor,causal_envelope_version,causal_status,created_at) VALUES (?,'reaction-message',?,?,?,1,'legacy_unknown','2026-10-01T00:00:00Z')")
+            .bind(id).bind(kind).bind(payload).bind(actor).execute(connection).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn engine_76_to_77_fresh_header_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fresh-header.db");
+        create_current_schema(&path).await;
+        assert_eq!(header_version(&path), CURRENT_ENGINE_SCHEMA_VERSION);
+        crate::open_existing_database_at(&path)
+            .await
+            .unwrap()
+            .close()
+            .await;
+        assert_eq!(header_version(&path), CURRENT_ENGINE_SCHEMA_VERSION);
+        // Execute the published DDL directly too, without a database helper
+        // or manual stamp concealing a wrong final PRAGMA.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        for sql in crate::schema::DDL_STATEMENTS {
+            conn.execute_batch(sql).unwrap();
+        }
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_ENGINE_SCHEMA_VERSION);
+    }
+
+    #[tokio::test]
+    async fn engine_76_to_77_backfill_matches_live_and_payload_free_fold() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reaction-edge.db");
+        create_current_schema(&path).await;
+        let options = SqliteConnectOptions::from_str(&format!("sqlite:{}", path.display()))
+            .unwrap()
+            .foreign_keys(true);
+        let mut conn = SqliteConnection::connect_with(&options).await.unwrap();
+        for (id, actor, emoji, command) in [
+            ("add-a", "alice", "👍", "add_reaction"),
+            ("add-b", "bea", "👍", "add_reaction"),
+            ("remove-a", "alice", "👍", "remove_reaction"),
+            ("undo-a", "alice", "👍", "add_reaction"),
+            ("other-emoji", "alice", "👀", "add_reaction"),
+            ("remove-b", "bea", "👍", "remove_reaction"),
+        ] {
+            let kind = if command == "remove_reaction" {
+                "message.reaction.removed.v1"
+            } else {
+                "message.reaction.added.v1"
+            };
+            insert_reaction(
+                &mut conn,
+                id,
+                kind,
+                Some(actor),
+                Some(&reaction_payload(emoji, command, actor).to_string()),
+            )
+            .await
+            .unwrap();
+        }
+        for (id, emoji, command) in [
+            ("seq-add", "🎉", "add_reaction"),
+            ("seq-remove", "😂", "remove_reaction"),
+            ("seq-undo", "❤️", "add_reaction"),
+        ] {
+            let payload = serde_json::json!([
+                "native.message-reaction.v1",
+                emoji,
+                "key",
+                command,
+                true,
+                "alice",
+                "local",
+                null,
+                "reason"
+            ]);
+            validate_reaction_meta_source(id, Some(&payload.to_string()), Some("alice")).unwrap();
+            let kind = if command == "remove_reaction" {
+                "message.reaction.removed.v1"
+            } else {
+                "message.reaction.added.v1"
+            };
+            insert_reaction(
+                &mut conn,
+                id,
+                kind,
+                Some("alice"),
+                Some(&payload.to_string()),
+            )
+            .await
+            .unwrap();
+        }
+        type Meta = (
+            i64,
+            String,
+            String,
+            Option<String>,
+            String,
+            String,
+            String,
+            String,
+        );
+        let select = "SELECT event_seq,record_id,actor,legacy_emoji,emoji,executor_kind,reaction_class,created_at FROM content_event_reaction_meta ORDER BY event_seq";
+        let live: Vec<Meta> = sqlx::query_as(select).fetch_all(&mut conn).await.unwrap();
+        assert_eq!(live.len(), 9);
+        let source: Vec<Meta> = sqlx::query_as("SELECT seq,record_id,actor,json_extract(payload,'$.emoji'),
+      json_extract(payload,CASE WHEN json_type(payload)='array' THEN '$[1]' ELSE '$.emoji' END),
+      json_extract(payload,CASE WHEN json_type(payload)='array' THEN '$[6]' ELSE '$.executor_kind' END),CASE type WHEN 'message.reaction.added.v1' THEN 'added' ELSE 'removed' END,created_at FROM content_events WHERE type IN ('message.reaction.added.v1','message.reaction.removed.v1') ORDER BY seq").fetch_all(&mut conn).await.unwrap();
+        assert_eq!(live, source);
+        let fold = "WITH ranked AS (SELECT actor,legacy_emoji,emoji,executor_kind,created_at,reaction_class,ROW_NUMBER() OVER (PARTITION BY actor,legacy_emoji ORDER BY event_seq DESC) recency FROM content_event_reaction_meta WHERE record_id='reaction-message') SELECT actor,emoji,executor_kind,created_at FROM ranked WHERE recency=1 AND reaction_class='added' ORDER BY legacy_emoji,actor";
+        let expected: Vec<(String, String, String, String)> =
+            sqlx::query_as(fold).fetch_all(&mut conn).await.unwrap();
+        assert_eq!(expected.len(), 3);
+        let payload_fold: Vec<(String,String,String)> = sqlx::query_as(
+            "WITH ranked AS (SELECT actor,payload,created_at,type,ROW_NUMBER() OVER (PARTITION BY actor,json_extract(payload,'$.emoji') ORDER BY seq DESC) recency FROM content_events WHERE record_id='reaction-message' AND type IN ('message.reaction.added.v1','message.reaction.removed.v1')) SELECT actor,payload,created_at FROM ranked WHERE recency=1 AND type='message.reaction.added.v1' ORDER BY json_extract(payload,'$.emoji'),actor"
+        ).fetch_all(&mut conn).await.unwrap();
+        let parsed: Vec<_> = payload_fold
+            .into_iter()
+            .map(|(actor, payload, created_at)| {
+                let payload: crate::events::MessageReactionPayload =
+                    serde_json::from_str(&payload).unwrap();
+                payload.validate(Some(&actor)).unwrap();
+                (actor, payload.emoji, payload.executor_kind, created_at)
+            })
+            .collect();
+        assert_eq!(expected, parsed);
+        revert_to_engine_76(&mut conn).await;
+        let digest = crate::db::schema_shape_contract_sha256_for_test(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(digest, crate::db::ENGINE_76_SHAPE_CONTRACT_SHA256);
+        let step = EngineMigrationRegistry::production()
+            .pending(76, 77)
+            .unwrap()
+            .pop()
+            .unwrap();
+        step.preflight(&mut conn).await.unwrap();
+        step.apply(&mut conn).await.unwrap();
+        sqlx::query("PRAGMA user_version=77")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        assert!(crate::db::validate_engine_shape_on_for_test(&mut conn, 77)
+            .await
+            .unwrap());
+        let migrated: Vec<Meta> = sqlx::query_as(select).fetch_all(&mut conn).await.unwrap();
+        assert_eq!(migrated, live);
+        // Append-only guards continue to reject source mutations.
+        for sql in [
+            "UPDATE content_events SET payload=NULL",
+            "DELETE FROM content_events",
+        ] {
+            assert!(sqlx::query(sql).execute(&mut conn).await.is_err());
+        }
+        let actual: Vec<(String, String, String, String)> =
+            sqlx::query_as(fold).fetch_all(&mut conn).await.unwrap();
+        assert_eq!(actual, expected);
+        conn.close().await.unwrap();
+        let reader = rusqlite::Connection::open(&path).unwrap();
+        reader.authorizer(Some(|ctx: rusqlite::hooks::AuthContext<'_>| {
+            if matches!(
+                ctx.action,
+                rusqlite::hooks::AuthAction::Read {
+                    table_name: "content_events",
+                    ..
+                }
+            ) {
+                rusqlite::hooks::Authorization::Deny
+            } else {
+                rusqlite::hooks::Authorization::Allow
+            }
+        }));
+        assert!(reader
+            .prepare("SELECT payload FROM content_events")
+            .is_err());
+        let actual: Vec<(String, String, String, String)> = reader
+            .prepare(fold)
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn engine_76_to_77_runner_preserves_preimage_and_header_on_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let offbox = tempfile::tempdir().unwrap();
+        let backup = test_preimage_store(offbox.path(), dir.path());
+        for invalid in [false, true] {
+            let path = dir.path().join(format!("runner-{invalid}.db"));
+            let db = crate::create_database(&path.to_string_lossy())
+                .await
+                .unwrap();
+            let message=crate::store::create_record(&db,serde_json::json!({"type":"Message","kind":"message","name":"runner","body":"body"})).await.unwrap();
+            crate::store::append(
+                &db,
+                crate::store::AppendSpec {
+                    record_id: message,
+                    event_type: "message.reaction.added.v1".into(),
+                    actor: Some("alice".into()),
+                    payload: serde_json::json!([
+                        "native.message-reaction.v1",
+                        "👍",
+                        "key",
+                        "add_reaction",
+                        true,
+                        "alice",
+                        "local",
+                        null,
+                        "reason"
+                    ]),
+                },
+            )
+            .await
+            .unwrap();
+            db.close().await;
+            let options =
+                SqliteConnectOptions::from_str(&format!("sqlite:{}", path.display())).unwrap();
+            let mut conn = SqliteConnection::connect_with(&options).await.unwrap();
+            revert_to_engine_76(&mut conn).await;
+            if invalid {
+                insert_reaction(
+                    &mut conn,
+                    "historical-invalid",
+                    "message.reaction.removed.v1",
+                    Some("alice"),
+                    Some(&reaction_payload("invalid", "remove_reaction", "alice").to_string()),
+                )
+                .await
+                .unwrap();
+            }
+            conn.close().await.unwrap();
+            let report = migrate_database(
+                &path,
+                "reaction-runner",
+                &format!("reaction-{invalid}"),
+                77,
+                &EngineMigrationRegistry::production(),
+                &backup,
+                Arc::new(|| async { Ok(()) }.boxed()),
+            )
+            .await;
+            assert_eq!(
+                report.outcome,
+                if invalid { "failed" } else { "migrated" },
+                "{report:?}"
+            );
+            assert_eq!(header_version(&path), if invalid { 76 } else { 77 });
+            let preimage = report.backup.expect("verified preimage before migration");
+            let restored = dir.path().join(format!("restored-{invalid}.db"));
+            backup
+                .sink
+                .get(preimage.key, restored.clone())
+                .await
+                .unwrap();
+            assert_eq!(header_version(&restored), 76);
+            let mut restored_conn = SqliteConnection::connect_with(
+                &SqliteConnectOptions::from_str(&format!("sqlite:{}", restored.display())).unwrap(),
+            )
+            .await
+            .unwrap();
+            Engine76To77Migration
+                .preflight(&mut restored_conn)
+                .await
+                .unwrap();
+            restored_conn.close().await.unwrap();
+            if invalid {
+                assert!(report.error_message.unwrap().contains("historical-invalid"));
+                let conn = rusqlite::Connection::open(&path).unwrap();
+                let tables:i64=conn.query_row("SELECT count(*) FROM sqlite_schema WHERE name='content_event_reaction_meta'",[],|r|r.get(0)).unwrap();
+                assert_eq!(
+                    tables, 0,
+                    "failed runner transaction leaves the predecessor schema"
+                );
+                let count: i64 = conn
+                    .query_row(
+                        "SELECT count(*) FROM content_events WHERE id='historical-invalid'",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(count, 1);
+            } else {
+                // The focused runner proved 76→77 above. Ordinary serving
+                // opens only the current schema, so finish successor edges.
+                let mut conn = SqliteConnection::connect_with(&options).await.unwrap();
+                advance_engine_to_current(&mut conn, 77).await;
+                conn.close().await.unwrap();
+                crate::open_existing_database_at(&path)
+                    .await
+                    .unwrap()
+                    .close()
+                    .await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn engine_76_to_77_backfill_covers_signed_sequence_extremes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("seq-extremes.db");
+        create_current_schema(&path).await;
+        let mut conn = SqliteConnection::connect_with(
+            &SqliteConnectOptions::from_str(&format!("sqlite:{}", path.display())).unwrap(),
+        )
+        .await
+        .unwrap();
+        revert_to_engine_76(&mut conn).await;
+        for seq in [i64::MIN, i64::MAX] {
+            sqlx::query("INSERT INTO content_events(seq,id,record_id,type,payload,actor,causal_envelope_version,causal_status) VALUES (?,?,'reaction-message','message.reaction.added.v1',?,'alice',1,'legacy_unknown')").bind(seq).bind(format!("event-{seq}")).bind(reaction_payload("👍","add_reaction","alice").to_string()).execute(&mut conn).await.unwrap();
+        }
+        Engine76To77Migration.apply(&mut conn).await.unwrap();
+        let actual: Vec<i64> = sqlx::query_scalar(
+            "SELECT event_seq FROM content_event_reaction_meta ORDER BY event_seq",
+        )
+        .fetch_all(&mut conn)
+        .await
+        .unwrap();
+        assert_eq!(actual, [i64::MIN, i64::MAX]);
+    }
+
+    #[tokio::test]
+    async fn engine_76_to_77_invalid_payloads_refuse_without_partial_projection() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reaction-invalid.db");
+        create_current_schema(&path).await;
+        let options =
+            SqliteConnectOptions::from_str(&format!("sqlite:{}", path.display())).unwrap();
+        let mut conn = SqliteConnection::connect_with(&options).await.unwrap();
+        let base = reaction_payload("👍", "add_reaction", "alice");
+        let mut invalid = vec![
+            None,
+            Some("not JSON".into()),
+            Some("null".into()),
+            Some("[]".into()),
+            Some("{}".into()),
+        ];
+        for (key, value) in [
+            ("emoji", serde_json::json!("x")),
+            ("changed", serde_json::json!("true")),
+            ("format", serde_json::json!("wrong")),
+            ("reason", serde_json::json!("\u{2003}")),
+            ("idempotency_key", serde_json::json!(0)),
+            ("actor_account_id", serde_json::json!("bea")),
+            ("executor_kind", serde_json::json!("invalid")),
+            ("executor_kind", serde_json::json!("agent")),
+            ("idempotency_key", serde_json::json!("\u{2003}")),
+            ("executor_ref", serde_json::json!("forbidden")),
+            ("command", serde_json::json!("invalid")),
+            ("unknown", serde_json::json!(true)),
+        ] {
+            let mut payload = base.clone();
+            payload[key] = value;
+            invalid.push(Some(payload.to_string()));
+        }
+        let mut bad_ack = base.clone();
+        bad_ack["command"] = serde_json::json!("satisfy_acknowledgement_expectation_with_reaction");
+        bad_ack["emoji"] = serde_json::json!("👀");
+        invalid.push(Some(bad_ack.to_string()));
+        let mut bad_ref = base.clone();
+        bad_ref["executor_kind"] = serde_json::json!("agent");
+        bad_ref["executor_ref"] = serde_json::json!("\u{2003}");
+        invalid.push(Some(bad_ref.to_string()));
+        let mut missing = base.clone();
+        missing.as_object_mut().unwrap().remove("emoji");
+        invalid.push(Some(missing.to_string()));
+        invalid.push(Some(base.to_string().replacen(
+            "{",
+            "{\"emoji\":\"👍\",",
+            1,
+        )));
+        for (index, payload) in invalid.iter().enumerate() {
+            let id = format!("bad-{index}");
+            assert!(
+                insert_reaction(
+                    &mut conn,
+                    &id,
+                    "message.reaction.added.v1",
+                    Some("alice"),
+                    payload.as_deref()
+                )
+                .await
+                .is_err(),
+                "{index}"
+            );
+        }
+        assert!(insert_reaction(
+            &mut conn,
+            "null-actor",
+            "message.reaction.added.v1",
+            None,
+            Some(&base.to_string())
+        )
+        .await
+        .is_err());
+        let events: i64 = sqlx::query_scalar("SELECT count(*) FROM content_events WHERE type IN ('message.reaction.added.v1','message.reaction.removed.v1')")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(
+            events, 0,
+            "every rejected insert rolls back its source and projections"
+        );
+        for (kind, reference) in [
+            ("local", None),
+            ("authenticated_principal", None),
+            ("human_attested", Some("human:ref")),
+            ("agent", Some("agent:ref")),
+            ("delegated_service", Some("service:ref")),
+        ] {
+            let mut payload = base.clone();
+            payload["executor_kind"] = serde_json::json!(kind);
+            payload["executor_ref"] = serde_json::json!(reference);
+            payload["changed"] = serde_json::json!(false);
+            validate_reaction_meta_source(kind, Some(&payload.to_string()), Some("alice")).unwrap();
+            insert_reaction(
+                &mut conn,
+                kind,
+                "message.reaction.added.v1",
+                Some("alice"),
+                Some(&payload.to_string()),
+            )
+            .await
+            .unwrap();
+        }
+        let projected: i64 = sqlx::query_scalar("SELECT count(*) FROM content_event_reaction_meta")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(
+            projected, 5,
+            "every valid executor and no-change event is retained"
+        );
+        // Historical malformed events need no invented sentinel: each refuses
+        // migration before any new schema is installed, naming the source id.
+        revert_to_engine_76(&mut conn).await;
+        sqlx::query("DROP TRIGGER content_event_claim_meta_insert")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        let valid = base.to_string();
+        let historical = invalid
+            .iter()
+            .map(|payload| (payload.as_deref(), Some("alice")))
+            .chain(std::iter::once((Some(valid.as_str()), None)));
+        for (index, (payload, actor)) in historical.enumerate() {
+            sqlx::query("SAVEPOINT invalid_case")
+                .execute(&mut conn)
+                .await
+                .unwrap();
+            let id = format!("historic-{index}");
+            // Explicit negative local sequences are representable historical
+            // SQLite input; validation must not assume AUTOINCREMENT origins.
+            sqlx::query("INSERT INTO content_events(seq,id,record_id,type,payload,actor,causal_envelope_version,causal_status) VALUES (-1,?,'reaction-message','message.reaction.removed.v1',?,?,1,'legacy_unknown')").bind(&id).bind(payload).bind(actor).execute(&mut conn).await.unwrap();
+            let claim_trigger = crate::schema::DDL_STATEMENTS
+                .iter()
+                .find(|sql| sql.starts_with("CREATE TRIGGER content_event_claim_meta_insert"))
+                .unwrap();
+            sqlx::query(claim_trigger).execute(&mut conn).await.unwrap();
+            Engine76To77Migration.preflight(&mut conn).await.unwrap();
+            let error = Engine76To77Migration
+                .apply(&mut conn)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(&id), "{error}");
+            let count: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM sqlite_schema WHERE name='content_event_reaction_meta'",
+            )
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+            assert_eq!(count, 0);
+            let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+            assert_eq!(version, 76);
+            let preserved: i64 =
+                sqlx::query_scalar("SELECT count(*) FROM content_events WHERE id=?")
+                    .bind(&id)
+                    .fetch_one(&mut conn)
+                    .await
+                    .unwrap();
+            assert_eq!(preserved, 1);
+            sqlx::query("ROLLBACK TO invalid_case")
+                .execute(&mut conn)
+                .await
+                .unwrap();
+            sqlx::query("RELEASE invalid_case")
+                .execute(&mut conn)
+                .await
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn engine_74_to_75_ddl_matches_fresh() {
+        let fresh: Vec<_> = crate::schema::DDL_STATEMENTS
+            .iter()
+            .filter(|statement| statement.starts_with("CREATE TABLE body_blocks"))
+            .collect();
+        assert_eq!(fresh.len(), 1);
+        assert_eq!(&ENGINE_74_TO_75_STATEMENTS[0], fresh[0]);
+    }
+
+    /// Allocated measurement entry. Reconstructs genuine workspace80 with the
+    /// existing historical DDL transform, not the old unmerged JSON80 shape.
+    /// Reports shapes independently of historical admission pins and the DDL freeze.
+    #[tokio::test]
+    async fn schema81_measure_contracts() {
+        let mut source79 = schema79_connection(79).await;
+        let mut source80 = schema79_connection(80).await;
+        let mut current = schema79_connection(81).await;
+        let old_shape = crate::db::schema_shape_contract_sha256_for_test(&mut source79)
+            .await
+            .unwrap();
+        assert_eq!(old_shape, crate::db::ENGINE_79_SHAPE_CONTRACT_SHA256);
+        let workspace_shape = crate::db::schema_shape_contract_sha256_for_test(&mut source80)
+            .await
+            .unwrap();
+        let current_shape = crate::db::schema_shape_contract_sha256_for_test(&mut current)
+            .await
+            .unwrap();
+        let workspace_ddl = crate::schema::contract::historical_ddl_for_test(80);
+        use sha2::{Digest, Sha256};
+        println!(
+            "{}",
+            serde_json::json!({
+                "engine_version":81,"source79_shape_sha256":old_shape,
+                "source80_shape_sha256":workspace_shape,
+                "source80_ddl_sha256":hex::encode(Sha256::digest(workspace_ddl.as_bytes())),
+                "source80_ddl_bytes":workspace_ddl.len(),
+                "source80_ddl_statements":crate::schema::DDL_STATEMENTS.len()-1,
+                "current_shape_sha256":current_shape,
+                "current_ddl_sha256":crate::schema::contract::ddl_sha256(),
+                "current_ddl_bytes":crate::schema::canonical_ddl().len(),
+                "current_ddl_statements":crate::schema::DDL_STATEMENTS.len()
+            })
+        );
+        source79.close().await.unwrap();
+        source80.close().await.unwrap();
+        current.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn engine_80_admission_accepts_released_workspace_shape_and_refuses_drift() {
+        let mut source = schema79_connection(80).await;
+        assert_eq!(
+            crate::db::schema_shape_contract_sha256_for_test(&mut source)
+                .await
+                .unwrap(),
+            "a5c0e65d4d1f709940ab7cd8b158b2d2d885e086af6771780310bd728528aab5"
+        );
+        assert!(
+            crate::db::validate_engine_shape_on_for_test(&mut source, 80)
+                .await
+                .unwrap()
+        );
+        sqlx::query("ALTER TABLE workspace_rule_installations ADD COLUMN unexpected TEXT")
+            .execute(&mut source)
+            .await
+            .unwrap();
+        assert!(
+            !crate::db::validate_engine_shape_on_for_test(&mut source, 80)
+                .await
+                .unwrap()
+        );
+        source.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn engine_79_to_81_preserves_workspace_edge_and_config_literals() {
+        let mut connection = schema79_connection(79).await;
+        sqlx::query(r#"INSERT INTO schema_config(id,layer,data) VALUES('','user','{"n":1.00}')"#)
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        let edges = EngineMigrationRegistry::production()
+            .pending(79, 81)
+            .unwrap();
+        assert_eq!(edges.len(), 2);
+        for edge in &edges {
+            edge.preflight(&mut connection).await.unwrap();
+        }
+        let mut tx = connection.begin().await.unwrap();
+        for edge in edges {
+            edge.apply(&mut tx).await.unwrap();
+            sqlx::query(&format!("PRAGMA user_version={}", edge.to()))
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+        }
+        tx.commit().await.unwrap();
+        assert!(
+            crate::db::validate_engine_shape_on_for_test(&mut connection, 81)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM workspace_rule_installations")
+                .fetch_one(&mut connection)
+                .await
+                .unwrap(),
+            0
+        );
+        let literal: (String,i64,String) = sqlx::query_as("SELECT path,parent_ordinal,number_text FROM schema_config_json_nodes WHERE config_id='' AND ordinal=1").fetch_one(&mut connection).await.unwrap();
+        assert_eq!(literal, ("/n".into(), 0, "1.00".into()));
+        connection.close().await.unwrap();
+    }
+
+    #[test]
+    fn engine_80_to_81_ddl_is_the_fresh_config_carrier() {
+        let fresh: Vec<_> = crate::schema::DDL_STATEMENTS
+            .iter()
+            .filter(|statement| statement.starts_with("CREATE TABLE schema_config_json_nodes"))
+            .collect();
+        assert_eq!(
+            fresh,
+            vec![&crate::schema::ddl::SCHEMA_CONFIG_JSON_NODES_DDL]
+        );
+    }
+
+    #[tokio::test]
+    async fn engine_80_to_81_backfills_lowest_key_lexemes_and_matches_fresh_shape() {
+        let mut connection = schema79_connection(80).await;
+        // The empty ID is legal in the persisted TEXT PRIMARY KEY. A cursor
+        // beginning after "" would skip the first source and its entire tree.
+        sqlx::query(
+            "INSERT INTO schema_config(id,layer,data) VALUES('', 'user', ?), ('z','user','{}')",
+        )
+        .bind(r#"{"a":{"n":1.00},"a":{"n":2E+09}}"#)
+        .execute(&mut connection)
+        .await
+        .unwrap();
+        Engine80To81Migration
+            .preflight(&mut connection)
+            .await
+            .unwrap();
+        let mut tx = connection.begin().await.unwrap();
+        Engine80To81Migration.apply(&mut tx).await.unwrap();
+        sqlx::query("PRAGMA user_version=81")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        type ConfigNodeRow = (String, i64, String, Option<i64>, Option<String>);
+        let rows: Vec<ConfigNodeRow> = sqlx::query_as(
+            "SELECT config_id,ordinal,path,parent_ordinal,number_text FROM schema_config_json_nodes ORDER BY config_id,ordinal"
+        ).fetch_all(&mut connection).await.unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("".into(), 0, "".into(), None, None),
+                ("".into(), 1, "/a".into(), Some(0), None),
+                ("".into(), 2, "/a/n".into(), Some(1), Some("1.00".into())),
+                ("".into(), 3, "/a".into(), Some(0), None),
+                ("".into(), 4, "/a/n".into(), Some(3), Some("2E+09".into())),
+                ("z".into(), 0, "".into(), None, None),
+            ]
+        );
+        let mut fresh = schema79_connection(81).await;
+        assert_eq!(
+            crate::db::schema_shape_contract_sha256_for_test(&mut connection)
+                .await
+                .unwrap(),
+            crate::db::schema_shape_contract_sha256_for_test(&mut fresh)
+                .await
+                .unwrap()
+        );
+        assert!(
+            crate::db::validate_engine_shape_on_for_test(&mut connection, 81)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT data FROM schema_config WHERE id=''")
+                .fetch_one(&mut connection)
+                .await
+                .unwrap(),
+            r#"{"a":{"n":1.00},"a":{"n":2E+09}}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn engine_80_to_81_runner_rolls_back_every_invalid_source_and_prior_backfill() {
+        for (source, message) in crate::schema_config_json_nodes::invalid_sources() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("legacy-config.db");
+            let db = crate::create_database(path.to_str().unwrap())
+                .await
+                .unwrap();
+            crate::meta::schema_config::write_user_schema_config(
+                &db,
+                "{}",
+                crate::meta::schema_config::SchemaConfigOptions {
+                    id: Some("".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            let events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM meta_events")
+                .fetch_one(db.write_pool())
+                .await
+                .unwrap();
+            // Install legacy bytes directly, then reconstruct the exact v80
+            // source shape. Malformed config data had no SQLite JSON CHECK.
+            sqlx::query("INSERT INTO schema_config(id,layer,data) VALUES('zz:invalid','user',?)")
+                .bind(&source)
+                .execute(db.write_pool())
+                .await
+                .unwrap();
+            // Uninterpreted physical storage sentinel, not a rule admission receipt.
+            sqlx::query("INSERT INTO workspace_rule_installations(root,namespace,name,snapshot_json,snapshot_digest,event_seq,actor,created_at) VALUES('native:root','fixture','preserved','{}',?,1,'fixture:physical','2000-01-01T00:00:00Z')")
+                .bind("a".repeat(64)).execute(db.write_pool()).await.unwrap();
+            sqlx::query("DROP TABLE facet_value_json_nodes")
+                .execute(db.write_pool())
+                .await
+                .unwrap();
+            sqlx::query("DROP TABLE schema_config_json_nodes")
+                .execute(db.write_pool())
+                .await
+                .unwrap();
+            sqlx::query("PRAGMA user_version=80")
+                .execute(db.write_pool())
+                .await
+                .unwrap();
+            db.close().await;
+            let offbox = tempfile::tempdir().unwrap();
+            let backup = test_preimage_store(offbox.path(), dir.path());
+            let report = migrate_database(
+                &path,
+                "config-invalid",
+                "config-invalid-run",
+                81,
+                &EngineMigrationRegistry::production(),
+                &backup,
+                Arc::new(|| async { Ok(()) }.boxed()),
+            )
+            .await;
+            assert_ne!(report.outcome, "migrated", "{report:?}");
+            assert!(
+                format!("{report:?}").contains(message),
+                "{message}: {report:?}"
+            );
+            assert_eq!(header_version(&path), 80);
+            let mut conn =
+                SqliteConnection::connect_with(&single_connection_options(&path).unwrap())
+                    .await
+                    .unwrap();
+            assert!(crate::db::validate_engine_shape_on_for_test(&mut conn, 80)
+                .await
+                .unwrap());
+            assert_eq!(sqlx::query_scalar::<_,String>("SELECT actor||':'||snapshot_json||':'||event_seq FROM workspace_rule_installations WHERE namespace='fixture' AND name='preserved'").fetch_one(&mut conn).await.unwrap(),"fixture:physical:{}:1");
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT count(*) FROM sqlite_master WHERE name='schema_config_json_nodes'"
+                )
+                .fetch_one(&mut conn)
+                .await
+                .unwrap(),
+                0
+            );
+            assert_eq!(
+                sqlx::query_scalar::<_, String>(
+                    "SELECT data FROM schema_config WHERE id='zz:invalid'"
+                )
+                .fetch_one(&mut conn)
+                .await
+                .unwrap(),
+                source
+            );
+            assert_eq!(
+                sqlx::query_scalar::<_, String>("SELECT data FROM schema_config WHERE id=''")
+                    .fetch_one(&mut conn)
+                    .await
+                    .unwrap(),
+                "{}"
+            );
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("SELECT count(*) FROM meta_events")
+                    .fetch_one(&mut conn)
+                    .await
+                    .unwrap(),
+                events
+            );
+            conn.close().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn engine_80_to_81_preflight_refuses_drift_before_table_creation() {
+        let mut connection = schema79_connection(80).await;
+        sqlx::query("ALTER TABLE schema_config ADD COLUMN unreviewed TEXT")
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        assert!(Engine80To81Migration
+            .preflight(&mut connection)
+            .await
+            .is_err());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM sqlite_master WHERE name='schema_config_json_nodes'"
+            )
+            .fetch_one(&mut connection)
+            .await
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("PRAGMA user_version")
+                .fetch_one(&mut connection)
+                .await
+                .unwrap(),
+            80
+        );
+    }
+
+    /// Engine 82 projects flattenable facet text and skips every value that
+    /// cannot produce nodes, without aborting the edge.
+    #[tokio::test]
+    async fn engine_81_to_82_backfills_flattenable_facets_and_skips_bad_values() {
+        let mut connection = schema79_connection(81).await;
+        sqlx::query("INSERT INTO records(id,type,kind) VALUES('r1','Document','note')")
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        let oversize = format!(
+            "{{\"a\":\"{}\"}}",
+            "x".repeat(crate::json_nodes::MAX_JSON_SOURCE_BYTES)
+        );
+        let facets: [(&str, &str); 6] = [
+            ("fv:r1:obj", r#"{"a":1}"#),
+            ("fv:r1:arr", "[true]"),
+            ("fv:r1:scalar", "5"),
+            ("fv:r1:plain", "plain text"),
+            ("fv:r1:malformed", "{oops"),
+            ("fv:r1:big", oversize.as_str()),
+        ];
+        for (id, value) in facets {
+            sqlx::query("INSERT INTO facet_values(id,record_id,key,value) VALUES(?,?,?,?)")
+                .bind(id)
+                .bind("r1")
+                .bind(id.rsplit(':').next().unwrap())
+                .bind(value)
+                .execute(&mut connection)
+                .await
+                .unwrap();
+        }
+        Engine81To82Migration
+            .preflight(&mut connection)
+            .await
+            .unwrap();
+        let mut tx = connection.begin().await.unwrap();
+        Engine81To82Migration.apply(&mut tx).await.unwrap();
+        sqlx::query("PRAGMA user_version=82")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        type FacetNodeRow = (String, i64, String, String);
+        let rows: Vec<FacetNodeRow> = sqlx::query_as(
+            "SELECT facet_id,ordinal,path,node_type FROM facet_value_json_nodes ORDER BY facet_id,ordinal",
+        )
+        .fetch_all(&mut connection)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("fv:r1:arr".into(), 0, "".into(), "array".into()),
+                ("fv:r1:arr".into(), 1, "/0".into(), "boolean".into()),
+                ("fv:r1:obj".into(), 0, "".into(), "object".into()),
+                ("fv:r1:obj".into(), 1, "/a".into(), "number".into()),
+            ]
+        );
+        assert!(
+            crate::db::validate_engine_shape_on_for_test(&mut connection, 82)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn engine_75_to_76_ddl_matches_fresh() {
+        let fresh: Vec<_> = crate::schema::DDL_STATEMENTS
+            .iter()
+            .filter(|statement| statement.starts_with("CREATE TABLE vocabulary_value_json_nodes"))
+            .collect();
+        assert_eq!(
+            fresh,
+            vec![&crate::schema::ddl::VOCABULARY_VALUE_JSON_NODES_DDL]
+        );
+    }
+
+    #[tokio::test]
+    async fn engine_75_to_76_backfills_stored_metadata_and_rolls_back_on_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("json-nodes-edge.db");
+        create_current_schema(&path).await;
+        let options = SqliteConnectOptions::from_str(&format!("sqlite:{}", path.display()))
+            .unwrap()
+            .foreign_keys(true);
+        let mut conn = SqliteConnection::connect_with(&options).await.unwrap();
+        sqlx::query("INSERT INTO vocabularies(id,name) VALUES('voc:test','test')")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO vocabulary_values(id,vocabulary_id,value,metadata) VALUES('vv:test','voc:test','test',?)")
+            .bind(r#"{"x":1.00,"x":2E+09}"#)
+            .execute(&mut conn).await.unwrap();
+        revert_to_engine_75(&mut conn).await;
+        let step = EngineMigrationRegistry::production()
+            .pending(75, 76)
+            .unwrap()
+            .pop()
+            .unwrap();
+        step.preflight(&mut conn).await.unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        step.apply(&mut conn).await.unwrap();
+        sqlx::query("COMMIT").execute(&mut conn).await.unwrap();
+        let lexemes: Vec<String> = sqlx::query_scalar(
+            "SELECT number_text FROM vocabulary_value_json_nodes WHERE value_id='vv:test' AND node_type='number' ORDER BY ordinal",
+        ).fetch_all(&mut conn).await.unwrap();
+        assert_eq!(lexemes, ["1.00", "2E+09"]);
+
+        sqlx::query("DROP TABLE vocabulary_value_json_nodes")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        let oversize = format!(
+            "\"{}\"",
+            "x".repeat(crate::json_nodes::MAX_JSON_SOURCE_BYTES)
+        );
+        sqlx::query("UPDATE vocabulary_values SET metadata=? WHERE id='vv:test'")
+            .bind(oversize)
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        let error = step.apply(&mut conn).await.unwrap_err();
+        assert!(error.to_string().contains("source exceeds"), "{error}");
+        sqlx::query("ROLLBACK").execute(&mut conn).await.unwrap();
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name='vocabulary_value_json_nodes'",
+        )
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn engine_74_to_75_backfills_exact_body_event_and_rebuilds() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("blocks-edge.db");
+        create_current_schema(&path).await;
+        let db = crate::open_existing_database_at(&path).await.unwrap();
+        let body = format!("# H\n\n```\n{}\n```\n", "é".repeat(160_000));
+        let id = crate::store::create_record(
+            &db,
+            serde_json::json!({"type":"Document","kind":"note","name":"large","body":body.clone()}),
+        )
+        .await
+        .unwrap();
+        let opaque_id = crate::store::create_record(
+            &db,
+            serde_json::json!({"type":"Document","kind":"note","name":"opaque","body":{"heading":"# not Markdown"}}),
+        ).await.unwrap();
+        crate::store::update_record(&db, &id, serde_json::json!({"summary":"later metadata"}))
+            .await
+            .unwrap();
+        type BodyBlockRow = (i64, i64, i64, i64, String, String, String, i64, i64);
+        let expected: Vec<BodyBlockRow> = sqlx::query_as(
+            "SELECT block_index,chunk_index,chunk_count,source_event_seq,heading_path,block_kind,text,start_offset,end_offset FROM body_blocks WHERE record_id=? ORDER BY block_index,chunk_index"
+        ).bind(&id).fetch_all(db.write_pool()).await.unwrap();
+        assert!(expected.len() > 8);
+        db.close().await;
+        let options = SqliteConnectOptions::from_str(&format!("sqlite:{}", path.display()))
+            .unwrap()
+            .foreign_keys(true);
+        let mut conn = SqliteConnection::connect_with(&options).await.unwrap();
+        revert_to_engine_75(&mut conn).await;
+        sqlx::query("DROP TABLE body_blocks")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        sqlx::query("PRAGMA user_version=74")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(
+            crate::db::schema_shape_contract_sha256_for_test(&mut conn)
+                .await
+                .unwrap(),
+            crate::db::ENGINE_74_SHAPE_CONTRACT_SHA256,
+        );
+        let step = EngineMigrationRegistry::production()
+            .pending(74, 75)
+            .unwrap()
+            .pop()
+            .unwrap();
+        step.preflight(&mut conn).await.unwrap();
+        step.apply(&mut conn).await.unwrap();
+        sqlx::query("PRAGMA user_version=75")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        assert!(crate::db::validate_engine_shape_on_for_test(&mut conn, 75)
+            .await
+            .unwrap());
+        let actual: Vec<BodyBlockRow> = sqlx::query_as(
+            "SELECT block_index,chunk_index,chunk_count,source_event_seq,heading_path,block_kind,text,start_offset,end_offset FROM body_blocks WHERE record_id=? ORDER BY block_index,chunk_index"
+        ).bind(&id).fetch_all(&mut conn).await.unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(
+            actual.iter().map(|row| row.6.as_str()).collect::<String>(),
+            body
+        );
+        let opaque: (String, String) =
+            sqlx::query_as("SELECT block_kind,heading_path FROM body_blocks WHERE record_id=?")
+                .bind(&opaque_id)
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+        assert_eq!(opaque, ("opaque".into(), "[]".into()));
+        // Serving requires the current schema. Keep the historical v75 shape
+        // and row assertions above, then apply the 75→76 edge before opening
+        // this file through the runtime for replay.
+        advance_engine_to_current(&mut conn, 75).await;
+        conn.close().await.unwrap();
+        let reopened = crate::open_existing_database_at(&path).await.unwrap();
+        assert!(
+            crate::conformance::rebuild_and_diff(&reopened)
+                .await
+                .unwrap()
+                .equal
+        );
+        reopened.close().await;
+    }
+
+    #[tokio::test]
+    async fn engine_74_to_75_refuses_oversized_existing_body_atomically() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oversized-block-edge.db");
+        create_current_schema(&path).await;
+        let options = SqliteConnectOptions::new().filename(&path);
+        let mut conn = SqliteConnection::connect_with(&options).await.unwrap();
+        let record_id = "oversized-body";
+        let body = "x".repeat(crate::body_blocks::MAX_PROJECTED_BODY_BYTES + 1);
+        sqlx::query("INSERT INTO records(id,type,kind,name,body,created_at,updated_at) VALUES(?,'Document','note','oversized',?,datetime('now'),datetime('now'))")
+            .bind(record_id).bind(&body).execute(&mut conn).await.unwrap();
+        sqlx::query("INSERT INTO content_events(id,record_id,type,payload,causal_envelope_version,causal_status) VALUES('oversized-event',?,'record.created',?,1,'legacy_unknown')")
+            .bind(record_id).bind(serde_json::json!({"body":body}).to_string()).execute(&mut conn).await.unwrap();
+        revert_to_engine_75(&mut conn).await;
+        sqlx::query("DROP TABLE body_blocks")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        sqlx::query("PRAGMA user_version=74")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        let step = EngineMigrationRegistry::production()
+            .pending(74, 75)
+            .unwrap()
+            .pop()
+            .unwrap();
+        step.preflight(&mut conn).await.unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        let error = step.apply(&mut conn).await.unwrap_err();
+        assert!(error.to_string().contains("16777216-byte"), "{error}");
+        sqlx::query("ROLLBACK").execute(&mut conn).await.unwrap();
+        let table: Option<String> = sqlx::query_scalar(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='body_blocks'",
+        )
+        .fetch_optional(&mut conn)
+        .await
+        .unwrap();
+        assert_eq!(table, None);
+        let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(version, 74);
+    }
+
+    /// The 73→74 edge adds the body-task-items projection with a deterministic
+    /// current-body backfill: the migrated database validates at schema 74,
+    /// `body_task_items` rows match the live fold row-for-row (all markers,
+    /// checked/quoted/ordered rows stored; tombstoned records keep rows; empty
+    /// and body-less records yield none), the reverted pre-image pins the
+    /// released engine-73 shape, and content rebuild-and-diff proves replay
+    /// convergence — including after a post-migration body fold.
+    #[tokio::test]
+    async fn engine_73_to_74_backfills_task_items() {
+        type TaskItemRow = (String, i64, i64, String, i64, i64, i64, i64);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("task-items-edge.db");
+        create_current_schema(&path).await;
+        let db = crate::open_existing_database_at(&path).await.unwrap();
+        let doc = |name: &str, body: serde_json::Value| {
+            let mut fields = serde_json::json!({"type": "Document", "kind": "note", "name": name});
+            if !body.is_null() {
+                fields["body"] = body;
+            }
+            fields
+        };
+        let tasks = crate::store::create_record(
+            &db,
+            doc("tasks", "- [ ] dash\n* [ ] star\n+ [ ] plus".into()),
+        )
+        .await
+        .unwrap();
+        // A later event without body must not become the task rows' provenance.
+        crate::store::update_record(&db, &tasks, serde_json::json!({"summary":"metadata only"}))
+            .await
+            .unwrap();
+        let mixed = crate::store::create_record(
+            &db,
+            doc(
+                "mixed",
+                "- [x] done\n> - [ ] quoted\n```\n- [ ] fenced\n```\n1. [ ] ordered".into(),
+            ),
+        )
+        .await
+        .unwrap();
+        let doomed = crate::store::create_record(&db, doc("doomed", "- [ ] doomed task".into()))
+            .await
+            .unwrap();
+        // A tombstone keeps the record's task rows: deletion carries no body.
+        crate::store::delete_record(&db, &doomed).await.unwrap();
+        let empty = crate::store::create_record(&db, doc("empty", "".into()))
+            .await
+            .unwrap();
+        let _plain = crate::store::create_record(
+            &db,
+            serde_json::json!({"type": "Document", "kind": "note", "name": "plain"}),
+        )
+        .await
+        .unwrap();
+        // Live fold's answer, captured before the revert destroys it.
+        let expected: Vec<TaskItemRow> = sqlx::query_as(
+            "SELECT record_id, item_index, source_event_seq, marker,
+                    checked, in_quote, start_offset, end_offset
+             FROM body_task_items ORDER BY record_id, item_index",
+        )
+        .fetch_all(db.write_pool())
+        .await
+        .unwrap();
+        let rows_for = |id: &str| {
+            expected
+                .iter()
+                .filter(|(row_id, _, _, _, _, _, _, _)| row_id == id)
+                .count()
+        };
+        assert_eq!(rows_for(&tasks), 3);
+        // done + quoted + ordered; the fenced line is not a task.
+        assert_eq!(rows_for(&mixed), 3);
+        // The tombstoned record keeps its row.
+        assert_eq!(rows_for(&doomed), 1);
+        assert_eq!(rows_for(&empty), 0);
+        // Markers and flags stored exactly: dash/star/plus unchecked
+        // unquoted, done checked, quoted flagged, ordered stored.
+        let markers: Vec<(String, i64, i64)> = expected
+            .iter()
+            .filter(|(row_id, _, _, _, _, _, _, _)| row_id == &mixed)
+            .map(|(_, _, _, marker, checked, in_quote, _, _)| (marker.clone(), *checked, *in_quote))
+            .collect();
+        assert!(markers.contains(&("ordered".to_string(), 0, 0)));
+        assert!(markers.contains(&("-".to_string(), 1, 0)));
+        assert!(markers.contains(&("-".to_string(), 0, 1)));
+        db.close().await;
+
+        // Reconstruct the engine-73 preimage, then run the real 73→74 edge.
+        let options = SqliteConnectOptions::from_str(&format!("sqlite:{}", path.display()))
+            .unwrap()
+            .foreign_keys(true);
+        let mut conn = SqliteConnection::connect_with(&options).await.unwrap();
+        revert_to_engine_75(&mut conn).await;
+        sqlx::query("DROP TABLE body_blocks")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        sqlx::query("DROP TABLE body_task_items")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        sqlx::query("PRAGMA user_version=73")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        let digest = crate::db::schema_shape_contract_sha256_for_test(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(digest, crate::db::ENGINE_73_SHAPE_CONTRACT_SHA256);
+        let step = EngineMigrationRegistry::production()
+            .pending(73, 74)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(step.name(), "engine-73-to-74-body-task-items");
+        step.preflight(&mut conn).await.unwrap();
+        step.apply(&mut conn).await.unwrap();
+        sqlx::query("PRAGMA user_version=74")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        assert!(crate::db::validate_engine_shape_on_for_test(&mut conn, 74)
+            .await
+            .unwrap());
+        // Backfill ran inside the edge: the migrated rows already match the
+        // live fold before reopening.
+        let migrated: Vec<TaskItemRow> = sqlx::query_as(
+            "SELECT record_id, item_index, source_event_seq, marker,
+                    checked, in_quote, start_offset, end_offset
+             FROM body_task_items ORDER BY record_id, item_index",
+        )
+        .fetch_all(&mut conn)
+        .await
+        .unwrap();
+        assert_eq!(migrated, expected);
+        advance_engine_to_current(&mut conn, 74).await;
+        conn.close().await.unwrap();
+
+        let migrated = crate::open_existing_database_at(&path).await.unwrap();
+        let result = crate::conformance::rebuild_and_diff(&migrated)
+            .await
+            .unwrap();
+        assert!(
+            result.equal,
+            "rebuild drift after 73→74: {}",
+            serde_json::to_string_pretty(&result.tables).unwrap()
+        );
+        // Ordinary body folds keep working on the migrated database: a body
+        // replacement re-scans, and replay still converges afterwards.
+        crate::store::update_record(&migrated, &tasks, serde_json::json!({"body": "- [ ] only"}))
+            .await
+            .unwrap();
+        let after: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM body_task_items WHERE record_id = ?")
+                .bind(&tasks)
+                .fetch_one(migrated.write_pool())
+                .await
+                .unwrap();
+        assert_eq!(after, 1);
+        let replayed = crate::conformance::rebuild_and_diff(&migrated)
+            .await
+            .unwrap();
+        assert!(
+            replayed.equal,
+            "replay drift after post-migration body fold: {}",
+            serde_json::to_string_pretty(&replayed.tables).unwrap()
+        );
+        migrated.close().await;
+    }
+    /// The 64→65 DDL is frozen transition text: it creates the engine-65
+    /// alpha-tab shape (two-value adoption CHECK, no request column), which
+    /// the 71→72 edge later rebuilds. It matches fresh DDL with the pre-72
+    /// rewrite applied — the same rewrite `historical()` uses for version <
+    /// 72 — so migrated databases stay byte-identical to the engine-65 shape
+    /// under the shape contract while fresh databases move on.
+    #[test]
+    fn engine_64_to_65_statements_match_engine_65_shape() {
         for statement in ENGINE_64_TO_65_STATEMENTS {
             let prefix = if statement.starts_with("CREATE TABLE alpha_tab_installs (") {
                 "CREATE TABLE alpha_tab_installs ("
@@ -9000,8 +13157,448 @@ mod tests {
                 .iter()
                 .find(|candidate| candidate.starts_with(prefix))
                 .unwrap_or_else(|| panic!("64→65 statement has no fresh-DDL twin: {prefix}"));
-            assert_eq!(*fresh, statement, "64→65 statement drifted from fresh DDL");
+            let expected =
+                crate::schema::contract::alpha_tab_installs_create_for_version(fresh, 65);
+            assert_eq!(
+                expected, statement,
+                "64→65 statement drifted from engine-65 shape"
+            );
         }
+    }
+
+    /// The 71→72 DDL is frozen transition text matching the engine-72
+    /// table shape, before successor edges add columns. Pragmas and data-copy statements have no fresh twin
+    /// and are skipped; the table and index rebuilds are the contract.
+    #[test]
+    fn engine_71_to_72_statements_match_fresh_ddl() {
+        let mut twins = 0;
+        for statement in ENGINE_71_TO_72_STATEMENTS {
+            let prefix = if statement.starts_with("CREATE TABLE alpha_tab_installs (") {
+                "CREATE TABLE alpha_tab_installs ("
+            } else if statement.starts_with("CREATE INDEX idx_alpha_tab_installs_artifact") {
+                "CREATE INDEX idx_alpha_tab_installs_artifact"
+            } else {
+                continue;
+            };
+            let fresh = crate::schema::DDL_STATEMENTS
+                .iter()
+                .find(|candidate| candidate.starts_with(prefix))
+                .unwrap_or_else(|| panic!("71→72 statement has no fresh-DDL twin: {prefix}"));
+            let expected =
+                crate::schema::contract::alpha_tab_installs_create_for_version(fresh, 72);
+            assert_eq!(
+                expected, statement,
+                "71→72 statement drifted from engine-72 DDL"
+            );
+            twins += 1;
+        }
+        assert_eq!(twins, 2, "71→72 must twin exactly the table and its index");
+    }
+
+    /// The 71→72 edge rebuilds `alpha_tab_installs` in place: the adoption
+    /// CHECK widens to `shell_auto.v1` and the nullable request column
+    /// appears. A governed pre-72 install survives the rebuild with its pin
+    /// and event token intact, the migrated database validates at schema 72,
+    /// then advances to the current schema before replay and a fresh install
+    /// with request text fold through the governed path.
+    #[tokio::test]
+    async fn engine_71_to_72_rebuilds_alpha_tab_installs_preserving_rows() {
+        use crate::control::{
+            alpha_tab_aggregate_id, append_control_event, AlphaTabStatePayload,
+            ControlEventPayload, NewControlEvent,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("alpha-tab-71-72.db");
+        create_current_schema(&path).await;
+        let db = crate::open_existing_database_at(&path).await.unwrap();
+        crate::store::create_record(
+            &db,
+            serde_json::json!({"id": "c07f0000-0000-4000-8000-000000000070",
+                "type": "Document", "kind": "artifact", "name": "alpha-7172"}),
+        )
+        .await
+        .unwrap();
+        let installed = append_control_event(
+            &db,
+            NewControlEvent::authored(
+                "alpha-install-7172",
+                alpha_tab_aggregate_id("acct_alice", "agent.attention-cockpit"),
+                "acct_alice",
+                Some("run-7172".into()),
+                "Pre-72 install without request text.",
+                ControlEventPayload::AlphaTabInstalled(AlphaTabStatePayload {
+                    account_id: "acct_alice".into(),
+                    package: "agent.attention-cockpit".into(),
+                    version: "0.1.0".into(),
+                    digest: format!("sha256:{}", "a".repeat(64)),
+                    artifact_id: "c07f0000-0000-4000-8000-000000000070".into(),
+                    consented_source_revision: "rev-1".into(),
+                    declaration_digest: "b".repeat(64),
+                    consented_declaration: serde_json::json!({"needs": [], "effects": []}),
+                    adoption: crate::control::ALPHA_TAB_ADOPTION_CALLER_ASSERTED.into(),
+                    request: None,
+                    previous_event_id: None,
+                }),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        db.close().await;
+
+        let options = SqliteConnectOptions::from_str(&format!("sqlite:{}", path.display()))
+            .unwrap()
+            .foreign_keys(true);
+        let mut conn = SqliteConnection::connect_with(&options).await.unwrap();
+        revert_to_engine_71(&mut conn).await;
+        assert!(crate::db::validate_engine_shape_on_for_test(&mut conn, 71)
+            .await
+            .unwrap());
+        let step = EngineMigrationRegistry::production()
+            .pending(71, 72)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(
+            step.name(),
+            "engine-71-to-72-alpha-tab-request-and-shell-auto"
+        );
+        step.preflight(&mut conn).await.unwrap();
+        step.apply(&mut conn).await.unwrap();
+        sqlx::query("PRAGMA user_version=72")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        assert!(crate::db::validate_engine_shape_on_for_test(&mut conn, 72)
+            .await
+            .unwrap());
+        // The pin and event token survive; the pre-72 text is NULL.
+        let row: (String, String, Option<String>, String) = sqlx::query_as(
+            "SELECT adoption, status, request, event_id FROM alpha_tab_installs
+              WHERE account_id='acct_alice' AND package='agent.attention-cockpit'",
+        )
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+        assert_eq!(
+            row,
+            (
+                crate::control::ALPHA_TAB_ADOPTION_CALLER_ASSERTED.to_string(),
+                "installed".to_string(),
+                None,
+                installed.id.clone(),
+            )
+        );
+        // The rebuilt table text carries the widened CHECK; the row itself
+        // is untouched above, so replay conformance below still holds.
+        let table_sql: String =
+            sqlx::query_scalar("SELECT sql FROM sqlite_master WHERE name='alpha_tab_installs'")
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+        assert!(
+            table_sql.contains("adoption IN ('caller_asserted','shell_adopt.v1','shell_auto.v1')"),
+            "migrated table lacks the widened adoption CHECK: {table_sql}",
+        );
+        // Serving requires the current schema. Keep the historical v72 shape
+        // and row assertions above, then apply the real next edge before
+        // opening this file through the runtime for replay/write checks.
+        let next = EngineMigrationRegistry::production()
+            .pending(72, 73)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(next.name(), "engine-72-to-73-currency-counts");
+        next.preflight(&mut conn).await.unwrap();
+        next.apply(&mut conn).await.unwrap();
+        sqlx::query("PRAGMA user_version=73")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        assert!(crate::db::validate_engine_shape_on_for_test(&mut conn, 73)
+            .await
+            .unwrap());
+        let next = EngineMigrationRegistry::production()
+            .pending(73, 74)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(next.name(), "engine-73-to-74-body-task-items");
+        next.preflight(&mut conn).await.unwrap();
+        next.apply(&mut conn).await.unwrap();
+        sqlx::query("PRAGMA user_version=74")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        assert!(crate::db::validate_engine_shape_on_for_test(&mut conn, 74)
+            .await
+            .unwrap());
+        advance_engine_to_current(&mut conn, 74).await;
+        conn.close().await.unwrap();
+
+        // The migrated database is fully live with replay conformance
+        // intact, and a fresh install with request text folds through the
+        // governed path with the text stored.
+        let migrated = crate::open_existing_database_at(&path).await.unwrap();
+        let result = crate::conformance::rebuild_and_diff_control(&migrated)
+            .await
+            .unwrap();
+        assert!(
+            result.equal,
+            "rebuild drift after 71→72: {}",
+            serde_json::to_string_pretty(&result.tables).unwrap()
+        );
+        let live = append_control_event(
+            &migrated,
+            NewControlEvent::authored(
+                "alpha-install-7172-live",
+                alpha_tab_aggregate_id("acct_alice", "agent.second-cockpit"),
+                "acct_alice",
+                Some("run-7172".into()),
+                "Install with request text on the migrated shape.",
+                ControlEventPayload::AlphaTabInstalled(AlphaTabStatePayload {
+                    account_id: "acct_alice".into(),
+                    package: "agent.second-cockpit".into(),
+                    version: "0.1.0".into(),
+                    digest: format!("sha256:{}", "a".repeat(64)),
+                    artifact_id: "c07f0000-0000-4000-8000-000000000070".into(),
+                    consented_source_revision: "rev-1".into(),
+                    declaration_digest: "b".repeat(64),
+                    consented_declaration: serde_json::json!({"needs": [], "effects": []}),
+                    adoption: crate::control::ALPHA_TAB_ADOPTION_CALLER_ASSERTED.into(),
+                    request: Some("make it green".into()),
+                    previous_event_id: None,
+                }),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        let live_request: Option<String> = sqlx::query_scalar(
+            "SELECT request FROM alpha_tab_installs
+              WHERE account_id='acct_alice' AND package='agent.second-cockpit'",
+        )
+        .fetch_one(migrated.write_pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            live_request.as_deref(),
+            Some("make it green"),
+            "request text folds on the migrated shape (event {})",
+            live.id,
+        );
+        migrated.close().await;
+    }
+
+    /// The 72→73 ADD COLUMNs are transition text, but the columns they add
+    /// must stay token-identical to the fresh-schema records definition:
+    /// migrated databases converge with fresh ones under the shape contract
+    /// only while both spellings agree. The backfill UPDATEs have no
+    /// fresh-DDL twin by construction (fresh databases fold currency from
+    /// the log).
+    #[test]
+    fn engine_72_to_73_statements_match_fresh_ddl() {
+        assert_eq!(ENGINE_72_TO_73_STATEMENTS.len(), 4);
+        let fresh = crate::schema::DDL_STATEMENTS
+            .iter()
+            .find(|candidate| candidate.starts_with("CREATE TABLE records ("))
+            .expect("fresh DDL contains records");
+        // Token-identical after schema normalization (whitespace/comments
+        // stripped): the migrated rewrite must spell the columns like fresh.
+        let normalize = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+        let columns = [
+            "is_current INTEGER NULL DEFAULT 1 CHECK (is_current IS NULL OR is_current IN (0,1))",
+            "successor_count INTEGER NOT NULL DEFAULT 0 CHECK (successor_count >= 0)",
+        ];
+        for (add, column_def) in [
+            (&ENGINE_72_TO_73_STATEMENTS[0], columns[0]),
+            (&ENGINE_72_TO_73_STATEMENTS[1], columns[1]),
+        ] {
+            assert!(
+                add.starts_with("ALTER TABLE records ADD COLUMN "),
+                "72→73 DDL statement must add a records column: {add}"
+            );
+            assert!(
+                normalize(fresh).contains(&normalize(column_def)),
+                "fresh records DDL must carry the currency column: {column_def}"
+            );
+            assert!(
+                normalize(add).contains(&normalize(column_def)),
+                "72→73 ADD COLUMN drifted from fresh DDL: {add}"
+            );
+        }
+        assert!(
+            ENGINE_72_TO_73_STATEMENTS[2].contains("relationship='supersedes'")
+                && ENGINE_72_TO_73_STATEMENTS[2].contains("s.deleted_at IS NULL"),
+            "72→73 count backfill must count live incoming supersedes only"
+        );
+        assert!(
+            ENGINE_72_TO_73_STATEMENTS[3].contains("is_current=NULL")
+                && ENGINE_72_TO_73_STATEMENTS[3].contains("successor_count>0"),
+            "72→73 tri-state backfill must null is_current exactly where counted"
+        );
+    }
+
+    /// The 72→73 edge adds caller-independent `records.is_current` /
+    /// `records.successor_count` with a deterministic live-incoming backfill:
+    /// the migrated database validates at schema 73, the columns match the
+    /// live fold row-for-row (tombstoned successor excluded, unrelated
+    /// relationship ignored, archived orthogonal, reserved 0 absent), the
+    /// reverted pre-image pins the released engine-72 shape, and content
+    /// rebuild-and-diff proves replay convergence.
+    #[tokio::test]
+    async fn engine_72_to_73_backfills_currency_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("currency-counts-edge.db");
+        create_current_schema(&path).await;
+        let db = crate::open_existing_database_at(&path).await.unwrap();
+        let target = crate::store::create_record(
+            &db,
+            serde_json::json!({"type": "Document", "kind": "note", "name": "target"}),
+        )
+        .await
+        .unwrap();
+        let successor = crate::store::create_record(
+            &db,
+            serde_json::json!({"type": "Document", "kind": "note", "name": "successor"}),
+        )
+        .await
+        .unwrap();
+        let tombstoned = crate::store::create_record(
+            &db,
+            serde_json::json!({"type": "Document", "kind": "note", "name": "tombstoned"}),
+        )
+        .await
+        .unwrap();
+        let unrelated = crate::store::create_record(
+            &db,
+            serde_json::json!({"type": "Document", "kind": "note", "name": "unrelated"}),
+        )
+        .await
+        .unwrap();
+        let link = |source: &str, relationship: &str| crate::events::LinkAddedPayload {
+            id: None,
+            source_id: source.to_string(),
+            target_id: target.clone(),
+            relationship: relationship.to_string(),
+            note: None,
+        };
+        crate::store::add_link(&db, link(&successor, "supersedes"))
+            .await
+            .unwrap();
+        crate::store::add_link(&db, link(&tombstoned, "supersedes"))
+            .await
+            .unwrap();
+        crate::store::delete_record(&db, &tombstoned).await.unwrap();
+        crate::store::add_link(&db, link(&unrelated, "relates_to"))
+            .await
+            .unwrap();
+        // Archived stays orthogonal: the target carries archived=1 while its
+        // currency still reflects the one live incoming successor.
+        crate::store::archive_record(&db, &target).await.unwrap();
+        // Live fold's answer, captured before the revert destroys it.
+        let expected: Vec<(String, Option<i64>, i64, i64)> = sqlx::query_as(
+            "SELECT id, is_current, successor_count, archived FROM records
+              WHERE id IN (?, ?, ?, ?) ORDER BY id",
+        )
+        .bind(&target)
+        .bind(&successor)
+        .bind(&tombstoned)
+        .bind(&unrelated)
+        .fetch_all(db.write_pool())
+        .await
+        .unwrap();
+        assert_eq!(expected.len(), 4);
+        let row = |id: &str| {
+            expected
+                .iter()
+                .find(|(row_id, _, _, _)| row_id == id)
+                .map(|(_, current, count, archived)| (*current, *count, *archived))
+                .unwrap()
+        };
+        assert_eq!(row(&target), (None, 1, 1));
+        assert_eq!(row(&successor), (Some(1), 0, 0));
+        assert_eq!(row(&tombstoned), (Some(1), 0, 0));
+        assert_eq!(row(&unrelated), (Some(1), 0, 0));
+        let reserved: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM records WHERE is_current=0")
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap();
+        assert_eq!(reserved, 0);
+        db.close().await;
+
+        // Reconstruct the engine-72 preimage, then run the real 72→73 edge.
+        let options = SqliteConnectOptions::from_str(&format!("sqlite:{}", path.display()))
+            .unwrap()
+            .foreign_keys(true);
+        let mut conn = SqliteConnection::connect_with(&options).await.unwrap();
+        revert_to_engine_72(&mut conn).await;
+        let digest = crate::db::schema_shape_contract_sha256_for_test(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(digest, crate::db::ENGINE_72_SHAPE_CONTRACT_SHA256);
+        let step = EngineMigrationRegistry::production()
+            .pending(72, 73)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(step.name(), "engine-72-to-73-currency-counts");
+        step.preflight(&mut conn).await.unwrap();
+        step.apply(&mut conn).await.unwrap();
+        sqlx::query("PRAGMA user_version=73")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        assert!(crate::db::validate_engine_shape_on_for_test(&mut conn, 73)
+            .await
+            .unwrap());
+        // Backfill ran inside the edge: the migrated columns already match
+        // the live fold before reopening.
+        let migrated: Vec<(String, Option<i64>, i64, i64)> = sqlx::query_as(
+            "SELECT id, is_current, successor_count, archived FROM records
+              WHERE id IN (?, ?, ?, ?) ORDER BY id",
+        )
+        .bind(&target)
+        .bind(&successor)
+        .bind(&tombstoned)
+        .bind(&unrelated)
+        .fetch_all(&mut conn)
+        .await
+        .unwrap();
+        assert_eq!(migrated, expected);
+
+        // Preserve the v73 backfill assertions above, then reach the current
+        // schema through the next production edge before reopening.
+        let next = EngineMigrationRegistry::production()
+            .pending(73, 74)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(next.name(), "engine-73-to-74-body-task-items");
+        next.preflight(&mut conn).await.unwrap();
+        next.apply(&mut conn).await.unwrap();
+        sqlx::query("PRAGMA user_version=74")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        assert!(crate::db::validate_engine_shape_on_for_test(&mut conn, 74)
+            .await
+            .unwrap());
+        advance_engine_to_current(&mut conn, 74).await;
+        conn.close().await.unwrap();
+
+        // The migrated database now opens for replay conformance.
+        let migrated = crate::open_existing_database_at(&path).await.unwrap();
+        let result = crate::conformance::rebuild_and_diff(&migrated)
+            .await
+            .unwrap();
+        assert!(
+            result.equal,
+            "rebuild drift after 72→73: {}",
+            serde_json::to_string_pretty(&result.tables).unwrap()
+        );
+        migrated.close().await;
     }
 
     /// The 64→65 edge adds the empty `alpha_tab_installs` projection: the
@@ -9041,6 +13638,28 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rows, 0);
+        // The edge under test ends at 65, but the binary is at 72: continue
+        // through the grant-revision, archived-projection, and tab-order
+        // edges so the final open sees current.
+        let grant_step = EngineMigrationRegistry::production()
+            .pending(65, 66)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(
+            grant_step.name(),
+            "engine-65-to-66-grant-only-realtime-authorization-revision"
+        );
+        grant_step.preflight(&mut conn).await.unwrap();
+        grant_step.apply(&mut conn).await.unwrap();
+        sqlx::query("PRAGMA user_version=66")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        assert!(crate::db::validate_engine_shape_on_for_test(&mut conn, 66)
+            .await
+            .unwrap());
+        apply_remaining_production_steps(&mut conn, 66).await;
         conn.close().await.unwrap();
 
         let migrated = crate::open_existing_database_at(&path).await.unwrap();
@@ -9050,6 +13669,1113 @@ mod tests {
         assert!(
             result.equal,
             "rebuild drift after 64→65: {}",
+            serde_json::to_string_pretty(&result.tables).unwrap()
+        );
+        migrated.close().await;
+    }
+
+    /// The 67→68 DDL is transition text, but the object it creates must stay
+    /// byte-identical to the fresh-schema DDL: migrated databases are
+    /// byte-identical to fresh ones under the shape contract only while both
+    /// spellings agree.
+    #[test]
+    fn engine_67_to_68_statements_match_fresh_ddl() {
+        assert_eq!(ENGINE_67_TO_68_STATEMENTS.len(), 1);
+        for statement in ENGINE_67_TO_68_STATEMENTS {
+            let prefix = "CREATE TABLE alpha_tab_orders";
+            assert!(
+                statement.starts_with(prefix),
+                "unexpected 67→68 statement: {statement}"
+            );
+            let fresh = crate::schema::DDL_STATEMENTS
+                .iter()
+                .find(|candidate| candidate.starts_with(prefix))
+                .unwrap_or_else(|| panic!("67→68 statement has no fresh-DDL twin: {prefix}"));
+            assert_eq!(*fresh, statement, "67→68 statement drifted from fresh DDL");
+        }
+    }
+
+    /// The 67→68 edge adds the empty `alpha_tab_orders` preference: the
+    /// migrated database validates at schema 68, the table starts empty, and
+    /// ordinary control writes keep folding on the migrated database.
+    #[tokio::test]
+    async fn engine_67_to_68_adds_empty_alpha_tab_orders() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("alpha-tab-orders-edge.db");
+        create_current_schema(&path).await;
+        let options = SqliteConnectOptions::from_str(&format!("sqlite:{}", path.display()))
+            .unwrap()
+            .foreign_keys(true);
+        let mut conn = SqliteConnection::connect_with(&options).await.unwrap();
+        revert_to_engine_67(&mut conn).await;
+        let digest = crate::db::schema_shape_contract_sha256_for_test(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(digest, crate::db::ENGINE_67_SHAPE_CONTRACT_SHA256);
+        let step = EngineMigrationRegistry::production()
+            .pending(67, 68)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(step.name(), "engine-67-to-68-alpha-tab-orders");
+        step.preflight(&mut conn).await.unwrap();
+        step.apply(&mut conn).await.unwrap();
+        sqlx::query("PRAGMA user_version=68")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        assert!(crate::db::validate_engine_shape_on_for_test(&mut conn, 68)
+            .await
+            .unwrap());
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM alpha_tab_orders")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(rows, 0);
+        // The edge under test ends at 68, but the binary is at 72: continue
+        // through the claim-meta edge so the final open sees current.
+        let claim_step = EngineMigrationRegistry::production()
+            .pending(68, 69)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(
+            claim_step.name(),
+            "engine-68-to-69-content-event-claim-meta"
+        );
+        claim_step.preflight(&mut conn).await.unwrap();
+        claim_step.apply(&mut conn).await.unwrap();
+        sqlx::query("PRAGMA user_version=69")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        assert!(crate::db::validate_engine_shape_on_for_test(&mut conn, 69)
+            .await
+            .unwrap());
+        continue_from_engine_69(&mut conn).await;
+        conn.close().await.unwrap();
+
+        let migrated = crate::open_existing_database_at(&path).await.unwrap();
+        let result = crate::conformance::rebuild_and_diff_control(&migrated)
+            .await
+            .unwrap();
+        assert!(
+            result.equal,
+            "rebuild drift after 67→68: {}",
+            serde_json::to_string_pretty(&result.tables).unwrap()
+        );
+        migrated.close().await;
+    }
+
+    /// The 68→69 DDL is transition text, but the table and trigger it creates
+    /// must stay byte-identical to the fresh-schema DDL: migrated databases
+    /// are byte-identical to fresh ones under the shape contract only while
+    /// both spellings agree. The backfill SELECT has no fresh twin.
+    #[test]
+    fn engine_68_to_69_statements_match_fresh_ddl() {
+        assert_eq!(ENGINE_68_TO_69_STATEMENTS.len(), 3);
+        for statement in ENGINE_68_TO_69_STATEMENTS {
+            let prefix = if statement.starts_with("CREATE TABLE content_event_claim_meta (") {
+                "CREATE TABLE content_event_claim_meta ("
+            } else if statement.starts_with("CREATE TRIGGER content_event_claim_meta_insert") {
+                "CREATE TRIGGER content_event_claim_meta_insert"
+            } else if statement.starts_with("INSERT INTO content_event_claim_meta") {
+                continue;
+            } else {
+                panic!("unexpected 68→69 statement: {statement}");
+            };
+            let fresh = crate::schema::DDL_STATEMENTS
+                .iter()
+                .find(|candidate| candidate.starts_with(prefix))
+                .unwrap_or_else(|| panic!("68→69 statement has no fresh-DDL twin: {prefix}"));
+            assert_eq!(*fresh, statement, "68→69 statement drifted from fresh DDL");
+        }
+    }
+
+    /// The 68→69 edge classifies every legacy row, of every event type,
+    /// without touching the log: the migrated database validates at schema
+    /// 69, an over-ceiling legacy payload backfills, and the governed
+    /// readers disclose the backfilled run lineage past the ceiling. Raw
+    /// fixture rows skip the live projector by construction, so replay
+    /// conformance stays out of this test: the governed-writes twin below
+    /// proves replay convergence on projectable fixtures instead.
+    /// NULL/malformed legacy payloads are covered by the dedicated backfill
+    /// and trigger tests below: they cannot project, so they stay out of
+    /// every rebuild-covered fixture set.
+    #[tokio::test]
+    async fn engine_68_to_69_claim_meta_backfills_all_shapes_and_discloses_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("claim-meta-edge.db");
+        create_current_schema(&path).await;
+        // Base records through the real store path, so every rebuilt event
+        // projects (raw `record.created` rows would need a valid home and
+        // policy anchor by hand).
+        let db = crate::open_existing_database_at(&path).await.unwrap();
+        let rec_plain = crate::store::create_record(
+            &db,
+            serde_json::json!({"type": "Document", "kind": "note", "name": "plain"}),
+        )
+        .await
+        .unwrap();
+        let rec_claimed = crate::store::create_record(
+            &db,
+            serde_json::json!({"type": "Document", "kind": "note", "name": "claimed"}),
+        )
+        .await
+        .unwrap();
+        let home_id: String = sqlx::query_scalar("SELECT home_id FROM records WHERE id = ?")
+            .bind(&rec_plain)
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap();
+        db.close().await;
+
+        // Legacy history, written while the trigger did not exist.
+        let options = SqliteConnectOptions::from_str(&format!("sqlite:{}", path.display()))
+            .unwrap()
+            .foreign_keys(true);
+        let mut conn = SqliteConnection::connect_with(&options).await.unwrap();
+        revert_to_engine_68(&mut conn).await;
+        let digest = crate::db::schema_shape_contract_sha256_for_test(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(digest, crate::db::ENGINE_68_SHAPE_CONTRACT_SHA256);
+
+        async fn insert_event(
+            conn: &mut SqliteConnection,
+            id: &str,
+            record_id: &str,
+            event_type: &str,
+            payload: &str,
+        ) {
+            insert_stamped_event(conn, id, record_id, event_type, payload, None, None).await;
+        }
+
+        async fn insert_stamped_event(
+            conn: &mut SqliteConnection,
+            id: &str,
+            record_id: &str,
+            event_type: &str,
+            payload: &str,
+            run_key: Option<&str>,
+            parent_key: Option<&str>,
+        ) {
+            sqlx::query(
+                "INSERT INTO content_events(id, record_id, type, payload, actor, run_key, parent_key, created_at, causal_envelope_version, causal_status)
+                 VALUES (?, ?, ?, ?, 'alice', ?, ?, '2026-01-01T00:00:00.000Z', 1, 'legacy_unknown')",
+            )
+            .bind(id)
+            .bind(record_id)
+            .bind(event_type)
+            .bind(payload)
+            .bind(run_key)
+            .bind(parent_key)
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        }
+
+        // A non-`record.updated` claim shape: the fold ignores the claim
+        // keys on creation, but the classifier still marks presence.
+        let created_claim = serde_json::json!({
+            "type": "Document",
+            "kind": "note",
+            "name": "created-claimed",
+            "home_id": home_id,
+            "claimed_by_account": "alice",
+            "claimed_run_key": "run-a",
+        })
+        .to_string();
+        insert_event(
+            &mut conn,
+            "evt-claim-created",
+            "rec-created-claimed",
+            "record.created",
+            &created_claim,
+        )
+        .await;
+        insert_event(
+            &mut conn,
+            "evt-claim",
+            &rec_claimed,
+            "record.updated",
+            r#"{"claimed_by_account":"alice","claimed_run_key":"run-a"}"#,
+        )
+        .await;
+        insert_event(
+            &mut conn,
+            "evt-release",
+            &rec_claimed,
+            "record.updated",
+            r#"{"claimed_by_account":null,"claimed_run_key":null}"#,
+        )
+        .await;
+        insert_event(
+            &mut conn,
+            "evt-takeover",
+            &rec_claimed,
+            "record.updated",
+            r#"{"claimed_by_account":null,"claimed_run_key":null,"released_from_run_key":"run-a"}"#,
+        )
+        .await;
+        insert_event(
+            &mut conn,
+            "evt-null-key",
+            &rec_plain,
+            "record.updated",
+            r#"{"claimed_by_account":"alice","claimed_run_key":null}"#,
+        )
+        .await;
+        insert_event(
+            &mut conn,
+            "evt-plain-updated",
+            &rec_plain,
+            "record.updated",
+            r#"{"summary":"touched"}"#,
+        )
+        .await;
+        // Over-ceiling legacy payload: the backfill runs at full write
+        // limits, so this classifies where the lowered read ceiling fails.
+        let big_body = "x".repeat(300_000);
+        let big_payload = serde_json::json!({
+            "body": big_body,
+            "claimed_by_account": "alice",
+            "claimed_run_key": "run-a",
+        })
+        .to_string();
+        assert!(
+            big_payload.len() > 256 * 1024,
+            "fixture must exceed the read ceiling"
+        );
+        // Stamp the envelope columns the disclosure proof needs: the run
+        // lineage a governed agent write stamps alongside the payload.
+        insert_stamped_event(
+            &mut conn,
+            "evt-big-claim",
+            &rec_plain,
+            "record.updated",
+            &big_payload,
+            Some("run-a"),
+            Some("run-a"),
+        )
+        .await;
+
+        let step = EngineMigrationRegistry::production()
+            .pending(68, 69)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(step.name(), "engine-68-to-69-content-event-claim-meta");
+        step.preflight(&mut conn).await.unwrap();
+        step.apply(&mut conn).await.unwrap();
+        sqlx::query("PRAGMA user_version=69")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        assert!(crate::db::validate_engine_shape_on_for_test(&mut conn, 69)
+            .await
+            .unwrap());
+        continue_from_engine_69(&mut conn).await;
+
+        // (has_claimed_by, has_claimed_run, has_released_from, claim_class).
+        async fn meta_for(conn: &mut SqliteConnection, id: &str) -> (i64, i64, i64, String) {
+            sqlx::query_as(
+                "SELECT m.has_claimed_by, m.has_claimed_run, m.has_released_from, m.claim_class
+                   FROM content_event_claim_meta m
+                   JOIN content_events e ON e.seq = m.event_seq
+                  WHERE e.id = ?",
+            )
+            .bind(id)
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap()
+        }
+        assert_eq!(
+            meta_for(&mut conn, "evt-claim-created").await,
+            (1, 1, 0, "claim".into())
+        );
+        assert_eq!(
+            meta_for(&mut conn, "evt-claim").await,
+            (1, 1, 0, "claim".into())
+        );
+        assert_eq!(
+            meta_for(&mut conn, "evt-release").await,
+            (1, 1, 0, "release".into())
+        );
+        assert_eq!(
+            meta_for(&mut conn, "evt-takeover").await,
+            (1, 1, 1, "release".into())
+        );
+        // Run-less claim: an explicit JSON null still counts as present for
+        // the bit, but the strict pair rule leaves the class `other`.
+        assert_eq!(
+            meta_for(&mut conn, "evt-null-key").await,
+            (1, 1, 0, "other".into())
+        );
+        assert_eq!(
+            meta_for(&mut conn, "evt-plain-updated").await,
+            (0, 0, 0, "other".into())
+        );
+        assert_eq!(
+            meta_for(&mut conn, "evt-big-claim").await,
+            (1, 1, 0, "claim".into())
+        );
+        let meta_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM content_event_claim_meta")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        let event_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM content_events")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(
+            meta_rows, event_rows,
+            "backfill must cover every legacy row"
+        );
+
+        // Post-migration inserts classify through the trigger, including a
+        // non-`record.updated` type the old view predicates also covered.
+        insert_event(
+            &mut conn,
+            "evt-live-claim",
+            &rec_plain,
+            "record.updated",
+            r#"{"claimed_by_account":"bea","claimed_run_key":"run-b"}"#,
+        )
+        .await;
+        assert_eq!(
+            meta_for(&mut conn, "evt-live-claim").await,
+            (1, 1, 0, "claim".into())
+        );
+
+        // The log stays append-only: the edge adds a trigger but never an
+        // exception to the no-update/no-delete pair.
+        assert!(
+            sqlx::query("UPDATE content_events SET payload='{}' WHERE id='evt-claim'")
+                .execute(&mut conn)
+                .await
+                .is_err()
+        );
+        assert!(
+            sqlx::query("DELETE FROM content_events WHERE id='evt-claim'")
+                .execute(&mut conn)
+                .await
+                .is_err()
+        );
+        conn.close().await.unwrap();
+
+        let migrated = crate::open_existing_database_at(&path).await.unwrap();
+        // The governed readers use the backfilled metadata past the
+        // ceiling: the holder-actor sees the stamped run lineage on the
+        // legacy oversized claim row, while a disclosable non-holder sees
+        // the row with its run hidden.
+        crate::authorization::replace_explicit_policy(
+            &migrated,
+            "test:claim-meta",
+            &rec_plain,
+            vec![
+                crate::authorization::AllowEntry::account(
+                    "alice",
+                    crate::authorization::Capability::View,
+                ),
+                crate::authorization::AllowEntry::account(
+                    "bea",
+                    crate::authorization::Capability::View,
+                ),
+            ],
+        )
+        .await
+        .unwrap();
+        let alice = crate::query::QueryPrincipal::authenticated("alice", true);
+        let disclosed = crate::query::sql::query_sql(
+            &migrated,
+            alice,
+            &format!(
+                "SELECT id, run_key, parent_key FROM content_events
+                  WHERE record_id = '{rec_plain}' AND run_key = 'run-a' ORDER BY local_seq"
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(disclosed.row_count, 1);
+        assert_eq!(disclosed.rows[0]["id"].as_str().unwrap(), "evt-big-claim");
+        assert_eq!(disclosed.rows[0]["run_key"].as_str().unwrap(), "run-a");
+        assert_eq!(disclosed.rows[0]["parent_key"].as_str().unwrap(), "run-a");
+        let bea = crate::query::QueryPrincipal::authenticated("bea", true);
+        let hidden = crate::query::sql::query_sql(
+            &migrated,
+            bea,
+            "SELECT id, actor, run_key, parent_key FROM content_events
+              WHERE id = 'evt-big-claim'",
+        )
+        .await
+        .unwrap();
+        assert_eq!(hidden.row_count, 1);
+        assert_eq!(hidden.rows[0]["run_key"], serde_json::Value::Null);
+        assert_eq!(hidden.rows[0]["parent_key"], serde_json::Value::Null);
+        migrated.close().await;
+    }
+
+    /// The live trigger classifies governed writes at insert time — which
+    /// backfill alone cannot prove — and replay regenerates the side table
+    /// from the log. Every fixture here passes admission and projects, so
+    /// the live fold and the replay fold converge exactly, including the
+    /// over-ceiling plain rows and the start_work-owned claim cycle.
+    #[tokio::test]
+    async fn engine_68_to_69_claim_meta_governed_writes_converge_on_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("claim-meta-governed.db");
+        create_current_schema(&path).await;
+        let migrated = crate::open_existing_database_at(&path).await.unwrap();
+        let rec_plain = crate::store::create_record(
+            &migrated,
+            serde_json::json!({"type": "Document", "kind": "note", "name": "plain"}),
+        )
+        .await
+        .unwrap();
+        let rec_claimed = crate::store::create_record(
+            &migrated,
+            serde_json::json!({"type": "Document", "kind": "note", "name": "claimed"}),
+        )
+        .await
+        .unwrap();
+        let home_id: String = sqlx::query_scalar("SELECT home_id FROM records WHERE id = ?")
+            .bind(&rec_plain)
+            .fetch_one(migrated.write_pool())
+            .await
+            .unwrap();
+        crate::authorization::replace_explicit_policy(
+            &migrated,
+            "test:claim-meta-governed",
+            &rec_claimed,
+            vec![crate::authorization::AllowEntry::account(
+                "alice",
+                crate::authorization::Capability::Edit,
+            )],
+        )
+        .await
+        .unwrap();
+        let mut registry = crate::mcp::ToolRegistry::new();
+        crate::mcp::register_builtin_tools(&mut registry).unwrap();
+        crate::mcp::register_surface_tools(&mut registry).unwrap();
+        let claim = |record_id: &str, action: &str, run_key: &str| {
+            serde_json::json!({
+                "record_id": record_id,
+                "action": action,
+                "run_key": run_key,
+            })
+        };
+        let release = |record_id: &str, run_key: &str, expected_holder_run_key: Option<&str>| {
+            let mut args = serde_json::json!({
+                "record_id": record_id,
+                "action": "release",
+                "run_key": run_key,
+            });
+            if let Some(expected) = expected_holder_run_key {
+                args["expected_holder_run_key"] = serde_json::Value::String(expected.into());
+            }
+            args
+        };
+        let alice_caller = || crate::mcp::Caller::authenticated("alice");
+        // Claim, release, reclaim, then a same-account takeover release:
+        // the mined classes must read claim, release, claim, release with
+        // the takeover carrying its released_from marker. Run keys in tool
+        // arguments pass format validation, so they use real handle-word
+        // shapes rather than the bare tokens the raw fixtures use.
+        registry
+            .call(
+                migrated.clone(),
+                alice_caller(),
+                "start_work",
+                claim(&rec_claimed, "claim", "scout-chair-c748b2"),
+            )
+            .await
+            .unwrap();
+        registry
+            .call(
+                migrated.clone(),
+                alice_caller(),
+                "start_work",
+                release(&rec_claimed, "scout-chair-c748b2", None),
+            )
+            .await
+            .unwrap();
+        registry
+            .call(
+                migrated.clone(),
+                alice_caller(),
+                "start_work",
+                claim(&rec_claimed, "claim", "scout-chair-c748b2"),
+            )
+            .await
+            .unwrap();
+        registry
+            .call(
+                migrated.clone(),
+                alice_caller(),
+                "start_work",
+                release(
+                    &rec_claimed,
+                    "scout-chair-d748b2",
+                    Some("scout-chair-c748b2"),
+                ),
+            )
+            .await
+            .unwrap();
+        // Governed plain updates, one of them over the ceiling with run
+        // stamps mirroring an agent tool dispatch.
+        crate::store::update_record(
+            &migrated,
+            &rec_plain,
+            serde_json::json!({"summary": "touched"}),
+        )
+        .await
+        .unwrap();
+        let live_big_body = "y".repeat(300_000);
+        assert!(live_big_body.len() > 256 * 1024);
+        let live_updated = crate::store::with_event_annotations(
+            crate::store::EventAnnotations {
+                run_key: Some("scout-chair-c748b2".into()),
+                parent_key: Some("scout-chair-c748b2".into()),
+                intent: None,
+            },
+            crate::store::append(
+                &migrated,
+                crate::store::AppendSpec {
+                    record_id: rec_plain.clone(),
+                    event_type: "record.updated".into(),
+                    payload: serde_json::json!({ "body": live_big_body }),
+                    actor: Some("alice".into()),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        let live_created = crate::store::with_event_annotations(
+            crate::store::EventAnnotations {
+                run_key: Some("scout-chair-c748b2".into()),
+                parent_key: Some("scout-chair-c748b2".into()),
+                intent: None,
+            },
+            crate::store::create_record_as(
+                &migrated,
+                serde_json::json!({
+                    "type": "Document",
+                    "kind": "note",
+                    "name": "live-big",
+                    "home_id": home_id,
+                    "body": "z".repeat(300_000),
+                }),
+                Some("alice"),
+            ),
+        )
+        .await
+        .unwrap();
+        // The trigger classified every governed write at insert time.
+        let mut live_conn = migrated.write_pool().acquire().await.unwrap();
+        let claim_cycle: Vec<(i64, i64, i64, String)> = sqlx::query_as(
+            "SELECT m.has_claimed_by, m.has_claimed_run, m.has_released_from, m.claim_class
+               FROM content_event_claim_meta m
+               JOIN content_events e ON e.seq = m.event_seq
+              WHERE e.record_id = ? AND e.type = 'record.updated'
+              ORDER BY e.seq",
+        )
+        .bind(&rec_claimed)
+        .fetch_all(&mut *live_conn)
+        .await
+        .unwrap();
+        assert_eq!(
+            claim_cycle,
+            vec![
+                (1, 1, 0, "claim".to_string()),
+                (1, 1, 0, "release".to_string()),
+                (1, 1, 0, "claim".to_string()),
+                (1, 1, 1, "release".to_string()),
+            ]
+        );
+        let live_update_meta: (i64, i64, i64, String) = sqlx::query_as(
+            "SELECT m.has_claimed_by, m.has_claimed_run, m.has_released_from, m.claim_class
+               FROM content_event_claim_meta m
+              WHERE m.event_seq = ?",
+        )
+        .bind(live_updated.local_seq)
+        .fetch_one(&mut *live_conn)
+        .await
+        .unwrap();
+        assert_eq!(live_update_meta, (0, 0, 0, "other".to_string()));
+        drop(live_conn);
+
+        // Run disclosure works on the live oversized row past the ceiling.
+        crate::authorization::replace_explicit_policy(
+            &migrated,
+            "test:claim-meta-governed",
+            &rec_plain,
+            vec![crate::authorization::AllowEntry::account(
+                "alice",
+                crate::authorization::Capability::View,
+            )],
+        )
+        .await
+        .unwrap();
+        let alice = crate::query::QueryPrincipal::authenticated("alice", true);
+        let disclosed = crate::query::sql::query_sql(
+            &migrated,
+            alice,
+            &format!(
+                "SELECT id, run_key, parent_key FROM content_events
+                  WHERE record_id = '{rec_plain}' AND run_key = 'scout-chair-c748b2' ORDER BY local_seq"
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(disclosed.row_count, 1);
+        assert_eq!(
+            disclosed.rows[0]["id"].as_str().unwrap(),
+            live_updated.id.as_str()
+        );
+        assert_eq!(
+            disclosed.rows[0]["run_key"].as_str().unwrap(),
+            "scout-chair-c748b2"
+        );
+        assert_eq!(
+            disclosed.rows[0]["parent_key"].as_str().unwrap(),
+            "scout-chair-c748b2"
+        );
+        let _ = live_created;
+        let result = crate::conformance::rebuild_and_diff(&migrated)
+            .await
+            .unwrap();
+        assert!(
+            result.equal,
+            "rebuild drift after governed 68→69 writes: {}",
+            serde_json::to_string_pretty(&result.tables).unwrap()
+        );
+        migrated.close().await;
+    }
+
+    /// The claim trigger never invents claim shape and never fails a valid
+    /// write: SQL NULL and valid non-object payloads classify as all-absent
+    /// `other` because `->` yields NULL there, while a malformed payload
+    /// aborts the insert (`->` raises). Governed admission always serializes
+    /// a JSON object (see `ProjectorIntent::from_event`, which rejects
+    /// missing/unparseable payloads), so no supported path can hit the
+    /// abort; raw SQL is the only way to reach it, and failing loudly beats
+    /// storing a row the projector must refuse. No rebuild runs here: NULL
+    /// payloads cannot project by design.
+    #[tokio::test]
+    async fn claim_meta_trigger_marks_null_as_other_and_refuses_malformed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("claim-meta-malformed.db");
+        create_current_schema(&path).await;
+        let options = SqliteConnectOptions::from_str(&format!("sqlite:{}", path.display()))
+            .unwrap()
+            .foreign_keys(true);
+        let mut conn = SqliteConnection::connect_with(&options).await.unwrap();
+
+        for (id, payload) in [
+            ("evt-null-payload", None::<&str>),
+            ("evt-json-array", Some("[1,2]")),
+            ("evt-json-number", Some("5")),
+            ("evt-json-null", Some("null")),
+            ("evt-unrelated-object", Some(r#"{"body":"hi"}"#)),
+        ] {
+            sqlx::query(
+                "INSERT INTO content_events(id, record_id, type, payload, actor, created_at, causal_envelope_version, causal_status)
+                 VALUES (?, 'rec-x', 'record.updated', ?, 'alice', '2026-01-01T00:00:00.000Z', 1, 'legacy_unknown')",
+            )
+            .bind(id)
+            .bind(payload)
+            .execute(&mut conn)
+            .await
+            .unwrap();
+            let row: (i64, i64, i64, String) = sqlx::query_as(
+                "SELECT m.has_claimed_by, m.has_claimed_run, m.has_released_from, m.claim_class
+                   FROM content_event_claim_meta m
+                   JOIN content_events e ON e.seq = m.event_seq
+                  WHERE e.id = ?",
+            )
+            .bind(id)
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+            assert_eq!(row, (0, 0, 0, "other".to_string()), "wrong class for {id}");
+        }
+        // Malformed JSON fails the insert rather than storing an
+        // unclassifiable row.
+        assert!(sqlx::query(
+            "INSERT INTO content_events(id, record_id, type, payload, actor, created_at, causal_envelope_version, causal_status)
+             VALUES ('evt-bad-json', 'rec-x', 'record.updated', 'not json', 'alice', '2026-01-01T00:00:00.000Z', 1, 'legacy_unknown')",
+        )
+        .execute(&mut conn)
+        .await
+        .is_err());
+        conn.close().await.unwrap();
+    }
+
+    /// The 68→69 backfill tolerates legacy oddities the trigger refuses:
+    /// malformed and NULL payloads predate the trigger and classify `other`
+    /// instead of bricking the migration. No rebuild runs here: such rows
+    /// cannot project by design, so replay conformance stays on the main
+    /// 68→69 test's projectable fixtures.
+    #[tokio::test]
+    async fn engine_68_to_69_claim_meta_backfill_marks_legacy_malformed_as_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("claim-meta-legacy-malformed.db");
+        create_current_schema(&path).await;
+        let options = SqliteConnectOptions::from_str(&format!("sqlite:{}", path.display()))
+            .unwrap()
+            .foreign_keys(true);
+        let mut conn = SqliteConnection::connect_with(&options).await.unwrap();
+        revert_to_engine_68(&mut conn).await;
+        for (id, payload) in [
+            ("evt-legacy-bad", Some("not json")),
+            ("evt-legacy-half", Some("{bad")),
+            ("evt-legacy-null", None::<&str>),
+            // Single-key shapes: presence per key, class `other` outside the
+            // strict pair rule. (The projector's pair rule would reject these
+            // on replay, which is why they live in this non-rebuild test.)
+            (
+                "evt-legacy-single-null",
+                Some(r#"{"claimed_by_account":null}"#),
+            ),
+            (
+                "evt-legacy-single-run",
+                Some(r#"{"claimed_run_key":"run-a"}"#),
+            ),
+        ] {
+            sqlx::query(
+                "INSERT INTO content_events(id, record_id, type, payload, actor, created_at, causal_envelope_version, causal_status)
+                 VALUES (?, 'rec-x', 'record.updated', ?, 'alice', '2026-01-01T00:00:00.000Z', 1, 'legacy_unknown')",
+            )
+            .bind(id)
+            .bind(payload)
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        }
+        let step = EngineMigrationRegistry::production()
+            .pending(68, 69)
+            .unwrap()
+            .pop()
+            .unwrap();
+        step.preflight(&mut conn).await.unwrap();
+        step.apply(&mut conn).await.unwrap();
+        sqlx::query("PRAGMA user_version=69")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        assert!(crate::db::validate_engine_shape_on_for_test(&mut conn, 69)
+            .await
+            .unwrap());
+        continue_from_engine_69(&mut conn).await;
+        for (id, expected) in [
+            ("evt-legacy-bad", (0, 0, 0, "other".to_string())),
+            ("evt-legacy-half", (0, 0, 0, "other".to_string())),
+            ("evt-legacy-null", (0, 0, 0, "other".to_string())),
+            ("evt-legacy-single-null", (1, 0, 0, "other".to_string())),
+            ("evt-legacy-single-run", (0, 1, 0, "other".to_string())),
+        ] {
+            let row: (i64, i64, i64, String) = sqlx::query_as(
+                "SELECT m.has_claimed_by, m.has_claimed_run, m.has_released_from, m.claim_class
+                   FROM content_event_claim_meta m
+                   JOIN content_events e ON e.seq = m.event_seq
+                  WHERE e.id = ?",
+            )
+            .bind(id)
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+            assert_eq!(row, expected, "wrong class for {id}");
+        }
+        conn.close().await.unwrap();
+    }
+
+    /// The 69→70 statements are the fresh-DDL entries themselves, so the
+    /// migrated and fresh `facet_times` cannot drift apart.
+    #[test]
+    fn engine_69_to_70_statements_are_the_fresh_ddl() {
+        assert_eq!(ENGINE_69_TO_70_STATEMENTS.len(), 3);
+        assert!(ENGINE_69_TO_70_STATEMENTS[0].starts_with("CREATE TABLE facet_times"));
+        for statement in ENGINE_69_TO_70_STATEMENTS {
+            assert!(
+                crate::schema::DDL_STATEMENTS.contains(&statement),
+                "69→70 statement has no fresh-DDL twin: {statement}"
+            );
+        }
+    }
+
+    /// The 69→70 edge adds `facet_times` and rebuilds it from the content
+    /// log. No engine below 70 wrote `time_kind`, so a real engine-69 file
+    /// backfills nothing; this test plants typed `facet.set` events first to
+    /// prove the rebuild folds exactly what replay does: the current typed
+    /// value per key, not an unset one, an untyped overwrite, or an
+    /// observation. The reverted pre-image pins the engine-69 shape.
+    #[tokio::test]
+    async fn engine_69_to_70_adds_facet_times_rebuilt_from_the_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("facet-times-edge.db");
+        create_current_schema(&path).await;
+        let db = crate::open_existing_database_at(&path).await.unwrap();
+        let record = crate::store::create_record(
+            &db,
+            serde_json::json!({"type": "WorkItem", "kind": "task", "name": "typed time"}),
+        )
+        .await
+        .unwrap();
+        let set = |payload: serde_json::Value| crate::store::AppendSpec {
+            record_id: record.clone(),
+            event_type: "facet.set".into(),
+            payload,
+            actor: None,
+        };
+        for payload in [
+            serde_json::json!({"key": "due", "value": "2026-10-05", "time_kind": "date"}),
+            serde_json::json!({"key": "meeting", "value": "{\"all_day\":false,\"start\":{\"local\":\"2026-10-24T10:00\",\"tz\":\"Europe/London\",\"offset\":\"+01:00\",\"tzdb\":\"2025b\"},\"end\":{\"local\":\"2026-10-25T10:00\",\"tz\":\"Europe/London\",\"offset\":\"+00:00\",\"tzdb\":\"2025b\"}}", "time_kind": "when"}),
+            serde_json::json!({"key": "gone", "value": "2026-10-06", "time_kind": "date"}),
+            serde_json::json!({"key": "untyped_later", "value": "2026-10-07", "time_kind": "date"}),
+            serde_json::json!({"key": "untyped_later", "value": "next week"}),
+            serde_json::json!({"key": "due", "value": "2020-01-01", "time_kind": "date", "as_of": "2020-01-01T00:00:00.000Z", "observation_only": true}),
+        ] {
+            crate::store::append(&db, set(payload)).await.unwrap();
+        }
+        crate::store::unset_facet(&db, &record, "gone")
+            .await
+            .unwrap();
+        type Row = (
+            String,
+            String,
+            i64,
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+            Option<i64>,
+            Option<String>,
+        );
+        let rows = "SELECT key, kind, all_day, start_date, end_date, start_ms, end_ms, tz FROM facet_times ORDER BY key";
+        let live: Vec<Row> = sqlx::query_as(rows)
+            .fetch_all(db.write_pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            live,
+            vec![
+                (
+                    "due".into(),
+                    "date".into(),
+                    1,
+                    Some("2026-10-05".into()),
+                    Some("2026-10-06".into()),
+                    None,
+                    None,
+                    None
+                ),
+                (
+                    "meeting".into(),
+                    "when".into(),
+                    0,
+                    None,
+                    None,
+                    Some(1_792_832_400_000),
+                    Some(1_792_922_400_000),
+                    Some("Europe/London".into())
+                ),
+            ]
+        );
+        db.close().await;
+
+        let options = SqliteConnectOptions::from_str(&format!("sqlite:{}", path.display()))
+            .unwrap()
+            .foreign_keys(true);
+        let mut conn = SqliteConnection::connect_with(&options).await.unwrap();
+        revert_to_engine_69(&mut conn).await;
+        let digest = crate::db::schema_shape_contract_sha256_for_test(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(digest, crate::db::ENGINE_69_SHAPE_CONTRACT_SHA256);
+        continue_from_engine_69(&mut conn).await;
+        let migrated_rows: Vec<Row> = sqlx::query_as(rows).fetch_all(&mut conn).await.unwrap();
+        assert_eq!(migrated_rows, live);
+        conn.close().await.unwrap();
+
+        let migrated = crate::open_existing_database_at(&path).await.unwrap();
+        let result = crate::conformance::rebuild_and_diff(&migrated)
+            .await
+            .unwrap();
+        assert!(
+            result.equal,
+            "rebuild drift after 69→70: {}",
+            serde_json::to_string_pretty(&result.tables).unwrap()
+        );
+        migrated.close().await;
+    }
+
+    /// The rebuild returns at once when no event carries `time_kind`, and
+    /// otherwise folds its candidates page by page with the same result as
+    /// replay, however the pages fall.
+    #[tokio::test]
+    async fn facet_times_rebuild_probes_first_and_pages_to_the_live_fold() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let mut conn = db.write_pool().acquire().await.unwrap();
+        assert_eq!(
+            crate::projector::rebuild_facet_times(&mut conn)
+                .await
+                .unwrap(),
+            0
+        );
+        drop(conn);
+        let mut records = Vec::new();
+        for day in 1..=5 {
+            let record = crate::store::create_record(
+                &db,
+                serde_json::json!({"type": "Document", "kind": "note", "name": format!("day {day}")}),
+            )
+            .await
+            .unwrap();
+            for (key, value) in [
+                ("due", format!("2026-10-0{day}")),
+                ("again", format!("2026-11-0{day}")),
+            ] {
+                crate::store::append(
+                    &db,
+                    crate::store::AppendSpec {
+                        record_id: record.clone(),
+                        event_type: "facet.set".into(),
+                        payload: serde_json::json!({"key": key, "value": value, "time_kind": "date"}),
+                        actor: None,
+                    },
+                )
+                .await
+                .unwrap();
+            }
+            records.push(record);
+        }
+        // One key later loses its type, another is unset.
+        crate::store::append(
+            &db,
+            crate::store::AppendSpec {
+                record_id: records[0].clone(),
+                event_type: "facet.set".into(),
+                payload: serde_json::json!({"key": "again", "value": "untyped"}),
+                actor: None,
+            },
+        )
+        .await
+        .unwrap();
+        crate::store::unset_facet(&db, &records[1], "due")
+            .await
+            .unwrap();
+        let dump =
+            "SELECT record_id, key, start_date, end_date FROM facet_times ORDER BY record_id, key";
+        let live: Vec<(String, String, Option<String>, Option<String>)> = sqlx::query_as(dump)
+            .fetch_all(db.write_pool())
+            .await
+            .unwrap();
+        assert_eq!(live.len(), 8);
+        for page in [1, 2, 3, 500] {
+            let mut conn = db.write_pool().acquire().await.unwrap();
+            let rebuilt = crate::projector::rebuild_facet_times_paged(&mut conn, page)
+                .await
+                .unwrap();
+            assert_eq!(rebuilt, 8, "page {page}");
+            let rows: Vec<(String, String, Option<String>, Option<String>)> =
+                sqlx::query_as(dump).fetch_all(&mut *conn).await.unwrap();
+            assert_eq!(rows, live, "page {page}");
+            let leftover: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM sqlite_temp_master WHERE name = '_facet_times_rebuild'",
+            )
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap();
+            assert_eq!(leftover, 0, "the working table is dropped");
+        }
+    }
+
+    /// The 70→71 index must stay byte-identical to its fresh-DDL twin, and
+    /// its `WHERE` to the predicate the field-change read states, or SQLite
+    /// would not use it for that read.
+    #[test]
+    fn engine_70_to_71_statements_match_fresh_ddl_and_the_read_predicate() {
+        assert_eq!(ENGINE_70_TO_71_STATEMENTS.len(), 1);
+        let statement = ENGINE_70_TO_71_STATEMENTS[0];
+        let fresh = crate::schema::DDL_STATEMENTS
+            .iter()
+            .find(|candidate| {
+                candidate.starts_with("CREATE INDEX idx_content_events_record_changes ")
+            })
+            .expect("70→71 statement has no fresh-DDL twin");
+        assert_eq!(*fresh, statement, "70→71 statement drifted from fresh DDL");
+        assert!(statement.starts_with(&format!(
+            "CREATE INDEX {} ON content_events(record_id, seq) WHERE ",
+            crate::query::events::FIELD_CHANGE_ROWS_INDEX
+        )));
+        assert!(statement.ends_with(&format!(
+            " WHERE {}",
+            crate::query::events::FIELD_CHANGE_ROWS_PREDICATE
+        )));
+        assert_eq!(
+            crate::query::events::FIELD_CHANGE_ROWS_PREDICATE,
+            crate::query::events::visibility_predicates::not_in(
+                &crate::query::events::visibility_predicates::field_change_excluded_types()
+            )
+        );
+    }
+
+    /// The 70→71 edge adds the partial index over an existing log: the
+    /// migrated database validates at schema 71, the index holds exactly the
+    /// rows the field-change read may see, the read's statement plans on it,
+    /// and a rebuild converges.
+    #[tokio::test]
+    async fn engine_70_to_71_adds_the_record_changes_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("record-changes-index-edge.db");
+        {
+            let db = crate::create_database(&path.to_string_lossy())
+                .await
+                .unwrap();
+            crate::store::create_record(
+                &db,
+                serde_json::json!({
+                    "id": "0e5c0a4e-7d1b-4c5e-9f3a-1b2c3d4e5f60", "type": "Document", "kind": "note", "name": "Edge",
+                }),
+            )
+            .await
+            .unwrap();
+            db.close().await;
+        }
+        let options = SqliteConnectOptions::from_str(&format!("sqlite:{}", path.display()))
+            .unwrap()
+            .foreign_keys(true);
+        let mut conn = SqliteConnection::connect_with(&options).await.unwrap();
+        revert_to_engine_70(&mut conn).await;
+        let digest = crate::db::schema_shape_contract_sha256_for_test(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(digest, crate::db::ENGINE_70_SHAPE_CONTRACT_SHA256);
+        continue_from_engine_70(&mut conn).await;
+        // `INDEXED BY` refuses to prepare unless SQLite can use the index
+        // for the statement, so this is the read's own statement shape
+        // proving the partial index serves it.
+        let indexed: Vec<String> = sqlx::query_scalar(&format!(
+            "SELECT id FROM content_events INDEXED BY {} \
+              WHERE record_id = ? AND seq < ? AND {} ORDER BY seq DESC LIMIT 16",
+            crate::query::events::FIELD_CHANGE_ROWS_INDEX,
+            crate::query::events::FIELD_CHANGE_ROWS_PREDICATE
+        ))
+        .bind("0e5c0a4e-7d1b-4c5e-9f3a-1b2c3d4e5f60")
+        .bind(i64::MAX)
+        .fetch_all(&mut conn)
+        .await
+        .unwrap();
+        assert_eq!(indexed.len(), 1);
+        conn.close().await.unwrap();
+
+        let migrated = crate::open_existing_database_at(&path).await.unwrap();
+        let result = crate::conformance::rebuild_and_diff(&migrated)
+            .await
+            .unwrap();
+        assert!(
+            result.equal,
+            "rebuild drift after 70→71: {}",
             serde_json::to_string_pretty(&result.tables).unwrap()
         );
         migrated.close().await;

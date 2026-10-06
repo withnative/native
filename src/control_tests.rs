@@ -1,9 +1,10 @@
 use crate::conformance::rebuild_and_diff_control;
 use crate::control::{
-    alpha_tab_aggregate_id, append_control_event, append_control_event_in, close_agent_run,
-    control_events_in_act_range, ensure_agent_run, member_obligation_aggregate_id,
-    programme_source_aggregate_id, read_agent_run_reported_identity, read_all_control_events,
-    replay_control, AlphaTabAdoptPayload, AlphaTabStatePayload, ControlEventPayload,
+    alpha_tab_aggregate_id, alpha_tab_order_aggregate_id, append_control_event,
+    append_control_event_in, close_agent_run, control_events_in_act_range, ensure_agent_run,
+    member_obligation_aggregate_id, programme_source_aggregate_id,
+    read_agent_run_reported_identity, read_all_control_events, replay_control,
+    AlphaTabAdoptPayload, AlphaTabOrderPayload, AlphaTabStatePayload, ControlEventPayload,
     ControlEventRow, EmptyPayload, InstructionBindingReorderedPayload,
     InstructionBindingStatePayload, InstructionBindingTogglePayload,
     MemberContextProvisionedPayload, MemberObligationProgressedPayload,
@@ -374,7 +375,7 @@ async fn replay_rebuilds_every_projection_and_reports_drift() {
     append_minimal_graph(&db).await;
     let result = rebuild_and_diff_control(&db).await.unwrap();
     assert!(result.equal, "{result:#?}");
-    assert_eq!(result.tables.len(), 10);
+    assert_eq!(result.tables.len(), 11);
 
     sqlx::query("UPDATE instruction_bindings SET position=999 WHERE id='binding-1'")
         .execute(db.write_pool())
@@ -1621,14 +1622,22 @@ async fn reported_model_has_no_decision_reader() {
     // The two standby modules name it only while constructing complete
     // `AgentRunStartedPayload` fixtures for act-cut/materialisation coverage;
     // neither reads the reported value or uses it to decide behaviour.
+    // `query/sql.rs` projects the column into the caller-relative `runs`
+    // relation (task 6867ce6) for display beside a constant `self_declared`
+    // label: the value decides neither admission nor anything else there.
+    // `export.rs` names the column only in its cfg(test) standby admission
+    // regression: it counts retained run metadata after filtering. This is
+    // fixture verification, with no production reader or decision use.
     let literal_allowed = [
         "act.rs",
         "conformance/rebuild.rs",
         "control.rs",
         "control_tests.rs",
         "contribution.rs",
+        "export.rs",
         "mcp/registry.rs",
         "migrations.rs",
+        "query/sql.rs",
         "schema/ddl.rs",
         "standby/act_materialise.rs",
         "standby/authority_probe.rs",
@@ -1642,11 +1651,14 @@ async fn reported_model_has_no_decision_reader() {
     // model, and never to decide anything; `mcp/registry.rs` constructs the
     // admitted identity and reads it back in tests; the rest construct the
     // default identity for admission calls or read it back in migration tests.
+    // `export.rs` constructs the identity only in that cfg(test) fixture;
+    // the declared model is never used to choose admission or behavior.
     let accessor_allowed = [
         "control.rs",
         "control_tests.rs",
         "contribution.rs",
         "domain_transaction/request.rs",
+        "export.rs",
         "mcp/registry.rs",
         "mcp/tools/event_context.rs",
         "mcp/tools/intent.rs",
@@ -1836,6 +1848,7 @@ fn alpha_tab_payload(previous_event_id: Option<&str>) -> AlphaTabStatePayload {
         declaration_digest: "b".repeat(64),
         consented_declaration: json!({"needs": ["attention.query.v1"], "effects": []}),
         adoption: crate::control::ALPHA_TAB_ADOPTION_CALLER_ASSERTED.into(),
+        request: None,
         previous_event_id: previous_event_id.map(str::to_owned),
     }
 }
@@ -1887,6 +1900,68 @@ async fn alpha_tab_install_folds_and_reapplied_event_is_a_no_op() {
     )
     .await;
     assert!(collision.is_err());
+    db.close().await;
+}
+
+#[tokio::test]
+async fn alpha_tab_order_set_folds_last_writer_wins() {
+    // Task c5d3820: the per-account order is complete-state preference —
+    // the later event stands, with no CAS token — and a wrong aggregate id
+    // is refused rather than folded.
+    let db = create_database(":memory:").await.unwrap();
+    fn order(account: &str, tabs: &[&str]) -> ControlEventPayload {
+        ControlEventPayload::AlphaTabOrderSet(AlphaTabOrderPayload {
+            account_id: account.into(),
+            tab_order: tabs.iter().map(|tab| tab.to_string()).collect(),
+        })
+    }
+    let first = append_control_event(
+        &db,
+        command(
+            "alpha-order-1",
+            &alpha_tab_order_aggregate_id("acct_alice"),
+            order("acct_alice", &["agents", "pending:agent.team-pulse"]),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(first.event_type, "alpha_tab.order_set");
+    let row: (String, String) = sqlx::query_as(
+        "SELECT tab_order, event_id FROM alpha_tab_orders WHERE account_id='acct_alice'",
+    )
+    .fetch_one(db.write_pool())
+    .await
+    .unwrap();
+    assert_eq!(row.0, r#"["agents","pending:agent.team-pulse"]"#);
+    assert_eq!(row.1, first.id);
+    let second = append_control_event(
+        &db,
+        command(
+            "alpha-order-2",
+            &alpha_tab_order_aggregate_id("acct_alice"),
+            order("acct_alice", &["graph", "agents"]),
+        ),
+    )
+    .await
+    .unwrap();
+    let row: (String, String) = sqlx::query_as(
+        "SELECT tab_order, event_id FROM alpha_tab_orders WHERE account_id='acct_alice'",
+    )
+    .fetch_one(db.write_pool())
+    .await
+    .unwrap();
+    assert_eq!(row.0, r#"["graph","agents"]"#);
+    assert_eq!(row.1, second.id);
+    let forged = append_control_event(
+        &db,
+        command(
+            "alpha-order-3",
+            &alpha_tab_order_aggregate_id("acct_bea"),
+            order("acct_alice", &["agents"]),
+        ),
+    )
+    .await;
+    assert!(forged.is_err());
     db.close().await;
 }
 
@@ -1951,6 +2026,113 @@ async fn alpha_tab_transitions_require_matching_cas_token() {
 }
 
 #[tokio::test]
+async fn alpha_tab_stale_declaration_digest_is_refused_by_state_cas() {
+    use crate::mcp::tools::alpha_tabs::alpha_tab_declaration_digest;
+    let db = create_database(":memory:").await.unwrap();
+    record(&db, ALPHA_FIXTURE_ARTIFACT_ID).await;
+    let sessions_declaration = json!({
+        "needs": ["attention.query.v1"],
+        "effects": [],
+        "sessions": [{
+            "session": "session.body.v1",
+            "key": "doc",
+            "scope": {"type": "Document", "kind": "note"},
+            "mode": "edit",
+            "presence": true
+        }]
+    });
+    let legacy_declaration = json!({"needs": ["attention.query.v1"], "effects": []});
+    let fresh = alpha_tab_declaration_digest(&sessions_declaration).unwrap();
+    let stale = alpha_tab_declaration_digest(&legacy_declaration).unwrap();
+    assert_ne!(fresh, stale, "sessions must change the declaration digest");
+
+    let mut install = alpha_tab_payload(None);
+    install.consented_declaration = sessions_declaration.clone();
+    install.declaration_digest = fresh.clone();
+    let installed = append_control_event(
+        &db,
+        command(
+            "alpha-install-cas-1",
+            &alpha_tab_aggregate_id("acct_alice", "agent.attention-cockpit"),
+            ControlEventPayload::AlphaTabInstalled(install),
+        ),
+    )
+    .await
+    .unwrap();
+
+    // An adopt over the current CAS token but a STALE declaration_digest (the
+    // legacy declaration, differing only by `sessions`) fails the state
+    // UPDATE CAS and persists nothing.
+    let mut stale_adopt = alpha_tab_adopt_payload(&installed.id);
+    stale_adopt.consented_declaration = legacy_declaration;
+    stale_adopt.declaration_digest = stale;
+    let refused = append_control_event(
+        &db,
+        command(
+            "alpha-adopt-cas-1",
+            &alpha_tab_aggregate_id("acct_alice", "agent.attention-cockpit"),
+            ControlEventPayload::AlphaTabAdopted(stale_adopt),
+        ),
+    )
+    .await;
+    assert!(refused.is_err());
+    let (status, adoption): (String, String) = sqlx::query_as(
+        "SELECT status, adoption FROM alpha_tab_installs WHERE account_id='acct_alice' AND package='agent.attention-cockpit'",
+    )
+    .fetch_one(db.write_pool())
+    .await
+    .unwrap();
+    assert_eq!(status, "installed");
+    assert_eq!(adoption, "caller_asserted");
+
+    // The matching digest succeeds, proving the refusal was the digest CAS.
+    let mut ok_adopt = alpha_tab_adopt_payload(&installed.id);
+    ok_adopt.consented_declaration = sessions_declaration;
+    ok_adopt.declaration_digest = fresh;
+    let _ = append_control_event(
+        &db,
+        command(
+            "alpha-adopt-cas-2",
+            &alpha_tab_aggregate_id("acct_alice", "agent.attention-cockpit"),
+            ControlEventPayload::AlphaTabAdopted(ok_adopt),
+        ),
+    )
+    .await
+    .unwrap();
+    let adoption: String = sqlx::query_scalar(
+        "SELECT adoption FROM alpha_tab_installs WHERE account_id='acct_alice' AND package='agent.attention-cockpit'",
+    )
+    .fetch_one(db.write_pool())
+    .await
+    .unwrap();
+    assert_eq!(adoption, ALPHA_TAB_ADOPTION_VERIFIED);
+    db.close().await;
+}
+
+#[tokio::test]
+async fn alpha_tab_legacy_control_consent_object_is_not_narrowed() {
+    let db = create_database(":memory:").await.unwrap();
+    record(&db, ALPHA_FIXTURE_ARTIFACT_ID).await;
+    let mut payload = alpha_tab_payload(None);
+    // No `sessions`: extra legacy fields remain accepted at the control seam,
+    // exactly as before this unit (the tool gate is where the key allowlist
+    // applies, not here).
+    payload.consented_declaration =
+        json!({"needs": [], "effects": [], "legacy_extra": {"kept": true}});
+    let _ = append_control_event(
+        &db,
+        command(
+            "alpha-install-legacy-1",
+            &alpha_tab_aggregate_id("acct_alice", "agent.attention-cockpit"),
+            ControlEventPayload::AlphaTabInstalled(payload),
+        ),
+    )
+    .await
+    .unwrap();
+    db.close().await;
+}
+
+#[tokio::test]
 async fn alpha_tab_validation_rejects_malformed_pins() {
     let db = create_database(":memory:").await.unwrap();
     let aggregate = alpha_tab_aggregate_id("acct_alice", "agent.attention-cockpit");
@@ -1994,6 +2176,20 @@ async fn alpha_tab_validation_rejects_malformed_pins() {
     )
     .await
     .is_err());
+    // Request text is bounded at the tier: over-long display text is
+    // refused rather than folded.
+    let mut bad_request = alpha_tab_payload(None);
+    bad_request.request = Some("x".repeat(501));
+    assert!(append_control_event(
+        &db,
+        command(
+            "alpha-bad-5",
+            &aggregate,
+            ControlEventPayload::AlphaTabInstalled(bad_request)
+        ),
+    )
+    .await
+    .is_err());
     // Aggregate id must match the payload identity (punctuation cannot alias).
     assert!(append_control_event(
         &db,
@@ -2005,6 +2201,37 @@ async fn alpha_tab_validation_rejects_malformed_pins() {
     )
     .await
     .is_err());
+    // Optional declared sessions must be well formed; a bad mode refuses the
+    // whole event and persists nothing.
+    let mut bad_sessions = alpha_tab_payload(None);
+    bad_sessions.consented_declaration = json!({
+        "needs": ["attention.query.v1"],
+        "effects": [],
+        "sessions": [{
+            "session": "session.body.v1",
+            "key": "doc",
+            "scope": {"type": "Document", "kind": "note"},
+            "mode": "write",
+            "presence": true
+        }]
+    });
+    assert!(append_control_event(
+        &db,
+        command(
+            "alpha-bad-6",
+            &aggregate,
+            ControlEventPayload::AlphaTabInstalled(bad_sessions)
+        ),
+    )
+    .await
+    .is_err());
+    let installs: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM alpha_tab_installs WHERE account_id='acct_alice' AND package='agent.attention-cockpit'",
+    )
+    .fetch_one(db.write_pool())
+    .await
+    .unwrap();
+    assert_eq!(installs, 0);
     db.close().await;
 }
 
@@ -2021,8 +2248,11 @@ fn alpha_tab_adopt_payload(previous_event_id: &str) -> AlphaTabAdoptPayload {
         consented_declaration: installed.consented_declaration,
         adoption: ALPHA_TAB_ADOPTION_VERIFIED.into(),
         previous_event_id: previous_event_id.into(),
-        receipt_id: "preview_testreceipt01".into(),
-        preview_session: "sess_test01".into(),
+        receipt_id: Some("preview_testreceipt01".into()),
+        preview_session: Some("sess_test01".into()),
+        launch_id: None,
+        authored_run_key: None,
+        request: None,
     }
 }
 
@@ -2106,6 +2336,104 @@ async fn alpha_tab_adopt_folds_verified_and_replay_is_a_no_op() {
     .await
     .unwrap();
     assert_eq!(retry.id, adopted.id);
+    assert!(rebuild_and_diff_control(&db).await.unwrap().equal);
+    db.close().await;
+}
+
+#[tokio::test]
+async fn alpha_tab_adopt_authored_folds_shell_auto_and_holds_single_basis() {
+    use crate::control::ALPHA_TAB_ADOPTION_SHELL_AUTO;
+    let db = create_database(":memory:").await.unwrap();
+    record(&db, ALPHA_FIXTURE_ARTIFACT_ID).await;
+    let aggregate = alpha_tab_aggregate_id("acct_alice", "agent.attention-cockpit");
+    let mut install = alpha_tab_payload(None);
+    install.request = Some("make it blue".into());
+    let installed = append_control_event(
+        &db,
+        command(
+            "alpha-install-authored-1",
+            &aggregate,
+            ControlEventPayload::AlphaTabInstalled(install),
+        ),
+    )
+    .await
+    .unwrap();
+    // A receipt-carrying shell_auto is two consent bases at once: refused.
+    let mut mixed = alpha_tab_adopt_payload(&installed.id);
+    mixed.adoption = ALPHA_TAB_ADOPTION_SHELL_AUTO.into();
+    mixed.launch_id = Some("launch-1".into());
+    assert!(append_control_event(
+        &db,
+        command(
+            "alpha-adopt-authored-mixed",
+            &aggregate,
+            ControlEventPayload::AlphaTabAdopted(mixed)
+        ),
+    )
+    .await
+    .is_err());
+    // The other direction of the split: a shell_adopt.v1 without its
+    // receipt fields is a claim without proof — refused.
+    let mut no_receipt = alpha_tab_adopt_payload(&installed.id);
+    no_receipt.receipt_id = None;
+    assert!(append_control_event(
+        &db,
+        command(
+            "alpha-adopt-no-receipt",
+            &aggregate,
+            ControlEventPayload::AlphaTabAdopted(no_receipt)
+        ),
+    )
+    .await
+    .is_err());
+    // And a shell_adopt.v1 carrying authored fields claims two bases at
+    // once — refused.
+    let mut receipt_plus_authored = alpha_tab_adopt_payload(&installed.id);
+    receipt_plus_authored.launch_id = Some("launch-1".into());
+    receipt_plus_authored.authored_run_key = Some("pane-run-1".into());
+    assert!(append_control_event(
+        &db,
+        command(
+            "alpha-adopt-receipt-plus-authored",
+            &aggregate,
+            ControlEventPayload::AlphaTabAdopted(receipt_plus_authored)
+        ),
+    )
+    .await
+    .is_err());
+    // An authored adopt with no receipt folds, echoing the install request.
+    let mut authored = alpha_tab_adopt_payload(&installed.id);
+    authored.adoption = ALPHA_TAB_ADOPTION_SHELL_AUTO.into();
+    authored.receipt_id = None;
+    authored.preview_session = None;
+    authored.launch_id = Some("launch-1".into());
+    authored.authored_run_key = Some("pane-run-1".into());
+    authored.request = Some("make it blue".into());
+    let adopted = append_control_event(
+        &db,
+        command(
+            "alpha-adopt-authored-1",
+            &aggregate,
+            ControlEventPayload::AlphaTabAdopted(authored),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(adopted.event_type, "alpha_tab.adopted");
+    let row: (String, Option<String>, String) = sqlx::query_as(
+        "SELECT adoption, request, event_id FROM alpha_tab_installs WHERE account_id='acct_alice' AND package='agent.attention-cockpit'",
+    )
+    .fetch_one(db.write_pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        row,
+        (
+            ALPHA_TAB_ADOPTION_SHELL_AUTO.to_string(),
+            Some("make it blue".to_string()),
+            adopted.id.clone()
+        )
+    );
     assert!(rebuild_and_diff_control(&db).await.unwrap().equal);
     db.close().await;
 }
@@ -2227,4 +2555,385 @@ async fn alpha_tab_adopt_projector_is_fail_closed() {
         )
     );
     db.close().await;
+}
+
+/// All constructors below are explicitly TRUSTED private control fixtures.
+/// They bypass genuine hosted issuance solely to qualify folds/replay; no
+/// public route or current SQL/fresh adoption policy is exercised or enabled.
+mod private_body_admission_v2 {
+    use super::*;
+    use crate::alpha_tab_body_admission_v1 as frozen;
+    use crate::control::{validate_control_event, AlphaTabAdoptV2Payload};
+
+    fn declaration() -> serde_json::Value {
+        json!({"needs":[{"need":"records.body.read.v1","scope":"viewer-visible-current-bodies"}],"effects":[]})
+    }
+    fn install(previous: Option<&str>, d: serde_json::Value) -> AlphaTabStatePayload {
+        let mut p = alpha_tab_payload(previous);
+        p.consented_declaration = d;
+        p.declaration_digest = frozen::declaration_digest(&p.consented_declaration).unwrap();
+        p.digest = frozen::install_digest(&"b".repeat(64), &p.declaration_digest, "native.html.v1");
+        p
+    }
+    fn adopted(prior: &str, p: &AlphaTabStatePayload) -> AlphaTabAdoptV2Payload {
+        let mut v = serde_json::to_value(alpha_tab_adopt_payload(prior)).unwrap();
+        for (k, value) in serde_json::to_value(p).unwrap().as_object().unwrap() {
+            if !["previous_event_id", "adoption", "request"].contains(&k.as_str()) {
+                v[k] = value.clone();
+            }
+        }
+        v["runtime"] = json!("native.html.v1");
+        v["bundle_sha256"] = json!("b".repeat(64));
+        v["body_read_admission"] = declaration()["needs"][0].clone();
+        serde_json::from_value(v).unwrap()
+    }
+    async fn pointer(db: &crate::Db) -> (String, String, Option<String>, String) {
+        sqlx::query_as("SELECT status,adoption,body_read_admission_event_id,event_id FROM alpha_tab_installs WHERE account_id='acct_alice' AND package='agent.attention-cockpit'").fetch_one(db.write_pool()).await.unwrap()
+    }
+    async fn append(db: &crate::Db, key: &str, payload: ControlEventPayload) -> ControlEventRow {
+        append_control_event(
+            db,
+            command(
+                key,
+                &alpha_tab_aggregate_id("acct_alice", "agent.attention-cockpit"),
+                payload,
+            ),
+        )
+        .await
+        .unwrap()
+    }
+    async fn setup() -> (
+        crate::Db,
+        AlphaTabStatePayload,
+        ControlEventRow,
+        ControlEventRow,
+    ) {
+        let db = create_database(":memory:").await.unwrap();
+        record(&db, ALPHA_FIXTURE_ARTIFACT_ID).await;
+        let p = install(None, declaration());
+        let installed = append(
+            &db,
+            "v2-install",
+            ControlEventPayload::AlphaTabInstalled(p.clone()),
+        )
+        .await;
+        assert_eq!(pointer(&db).await.2, None);
+        let event = append(
+            &db,
+            "v2-adopt",
+            ControlEventPayload::AlphaTabAdoptedV2(adopted(&installed.id, &p)),
+        )
+        .await;
+        (db, p, installed, event)
+    }
+
+    #[tokio::test]
+    async fn trusted_v2_sets_exact_identity_and_full_replay_preserves_it() {
+        let (db, _, _, event) = setup().await;
+        assert_eq!(event.event_type, "alpha_tab.adopted.v2");
+        assert_eq!(pointer(&db).await.2, Some(event.id.clone()));
+        assert!(rebuild_and_diff_control(&db).await.unwrap().equal);
+        let mut conn = db.write_pool().acquire().await.unwrap();
+        let events = read_all_control_events(&mut conn).await.unwrap();
+        drop(conn);
+        let replayed = create_database(":memory:").await.unwrap();
+        record(&replayed, ALPHA_FIXTURE_ARTIFACT_ID).await;
+        let mut target = replayed.write_pool().acquire().await.unwrap();
+        replay_control(&mut target, &events).await.unwrap();
+        replay_control(&mut target, &events).await.unwrap();
+        drop(target);
+        assert_eq!(pointer(&db).await, pointer(&replayed).await);
+        assert!(rebuild_and_diff_control(&replayed).await.unwrap().equal);
+        // Same id with edited pin is not a second valid replay outcome.
+        let mut altered = events.last().unwrap().clone();
+        let mut payload: serde_json::Value = serde_json::from_str(&altered.payload).unwrap();
+        payload["bundle_sha256"] = json!("a".repeat(64));
+        altered.payload = payload.to_string();
+        let mut target = replayed.write_pool().acquire().await.unwrap();
+        assert!(replay_control(&mut target, &[altered]).await.is_err());
+        drop(target);
+        replayed.close().await;
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn trusted_historical_v2_fold_and_backfill_use_frozen_structure_not_current_sql_safety() {
+        let db = create_database(":memory:").await.unwrap();
+        record(&db, ALPHA_FIXTURE_ARTIFACT_ID).await;
+        let mut d = declaration();
+        d["needs"].as_array_mut().unwrap().push(json!({
+            "need":"sql.snapshot.v1","key":"historical","label":"Old structural commitment",
+            "sql":"DELETE FROM records"
+        }));
+        assert!(crate::mcp::tools::alpha_tabs::alpha_tab_declaration_digest(&d).is_err());
+        let p = install(None, d);
+        let installed = append(
+            &db,
+            "frozen-history-install",
+            ControlEventPayload::AlphaTabInstalled(p.clone()),
+        )
+        .await;
+        let event = append(
+            &db,
+            "frozen-history-v2",
+            ControlEventPayload::AlphaTabAdoptedV2(adopted(&installed.id, &p)),
+        )
+        .await;
+        let raw: String = sqlx::query_scalar("SELECT adoption_provenance FROM alpha_tab_installs")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        let expected: crate::control::AlphaTabAdoptionProvenance =
+            serde_json::from_str(&raw).unwrap();
+        assert_eq!(expected.original_adoption_event_id, event.id);
+        assert_eq!(expected.adopted_declaration_digest, p.declaration_digest);
+        assert_eq!(expected.original_bundle_digest, p.digest);
+        let mut connection = db.write_pool().acquire().await.unwrap();
+        crate::control::alpha_tab_provenance::backfill(&mut connection)
+            .await
+            .unwrap();
+        let recomputed: String =
+            sqlx::query_scalar("SELECT adoption_provenance FROM alpha_tab_installs")
+                .fetch_one(&mut *connection)
+                .await
+                .unwrap();
+        assert_eq!(
+            serde_json::from_str::<crate::control::AlphaTabAdoptionProvenance>(&recomputed)
+                .unwrap(),
+            expected
+        );
+        drop(connection);
+        assert!(rebuild_and_diff_control(&db).await.unwrap().equal);
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn disable_restore_requires_fresh_v2_and_remove_reinstall_clears_pointer() {
+        let (db, p, _, adopt) = setup().await;
+        let mut state = p.clone();
+        state.previous_event_id = Some(adopt.id.clone());
+        let disabled = append(
+            &db,
+            "v2-disable",
+            ControlEventPayload::AlphaTabDisabled(state),
+        )
+        .await;
+        assert!(append_control_event(
+            &db,
+            command(
+                "v2-disabled-refusal",
+                &alpha_tab_aggregate_id(&p.account_id, &p.package),
+                ControlEventPayload::AlphaTabAdoptedV2(adopted(&disabled.id, &p))
+            )
+        )
+        .await
+        .is_err());
+        let row = pointer(&db).await;
+        assert_eq!(row.0, "disabled");
+        assert_eq!(row.2, Some(adopt.id.clone()));
+        let mut state = p.clone();
+        state.previous_event_id = Some(disabled.id.clone());
+        let restored = append(
+            &db,
+            "v2-restore",
+            ControlEventPayload::AlphaTabRestored(state),
+        )
+        .await;
+        let row = pointer(&db).await;
+        assert_eq!(row.1, "caller_asserted");
+        assert_eq!(row.2, None);
+        assert_ne!(row.3, adopt.id);
+        // Restore clears body authority; fresh adoption uses the restored CAS.
+        let fresh = append(
+            &db,
+            "v2-readopt",
+            ControlEventPayload::AlphaTabAdoptedV2(adopted(&restored.id, &p)),
+        )
+        .await;
+        assert_eq!(pointer(&db).await.2, Some(fresh.id.clone()));
+        let mut state = p.clone();
+        state.previous_event_id = Some(fresh.id);
+        let removed = append(
+            &db,
+            "v2-remove",
+            ControlEventPayload::AlphaTabRemoved(state),
+        )
+        .await;
+        assert_eq!(pointer(&db).await.2, None);
+        let mut state = p.clone();
+        state.previous_event_id = Some(removed.id);
+        let reinstalled = append(
+            &db,
+            "v2-reinstall",
+            ControlEventPayload::AlphaTabInstalled(state),
+        )
+        .await;
+        assert_eq!(pointer(&db).await.2, None);
+        let event = append(
+            &db,
+            "v2-reinstall-adopt",
+            ControlEventPayload::AlphaTabAdoptedV2(adopted(&reinstalled.id, &p)),
+        )
+        .await;
+        let before_refusal = pointer(&db).await;
+        assert_eq!(before_refusal.2, Some(event.id.clone()));
+        assert_eq!(before_refusal.3, event.id);
+        let mut state = p.clone();
+        state.previous_event_id = Some(event.id.clone());
+        // An installed row cannot be replaced directly, even with its current CAS.
+        // The permitted remove/reinstall path above already clears the pointer.
+        let refusal = append_control_event(
+            &db,
+            command(
+                "v2-direct-install-refusal",
+                &alpha_tab_aggregate_id(&p.account_id, &p.package),
+                ControlEventPayload::AlphaTabInstalled(state),
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert!(refusal.to_string().contains("with status installed"));
+        assert_eq!(pointer(&db).await, before_refusal);
+        assert!(rebuild_and_diff_control(&db).await.unwrap().equal);
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn historic_v1_descriptor_is_legal_inert_and_v1_adopt_clears_new_evidence() {
+        let (db, p, _, adopt) = setup().await;
+        let v2 = adopted(&adopt.id, &p);
+        let mut raw = serde_json::to_value(v2).unwrap();
+        for k in ["runtime", "bundle_sha256", "body_read_admission"] {
+            raw.as_object_mut().unwrap().remove(k);
+        }
+        let v1: AlphaTabAdoptPayload = serde_json::from_value(raw).unwrap();
+        append(&db, "v1-readopt", ControlEventPayload::AlphaTabAdopted(v1)).await;
+        assert_eq!(pointer(&db).await.2, None);
+        assert_eq!(pointer(&db).await.1, ALPHA_TAB_ADOPTION_VERIFIED);
+        // Historic v1 low-level unknown objects never acquire today's grammar.
+        let prior = pointer(&db).await.3;
+        let mut removed = p.clone();
+        removed.previous_event_id = Some(prior);
+        let removed = append(
+            &db,
+            "v1-remove-before-unknown-history",
+            ControlEventPayload::AlphaTabRemoved(removed),
+        )
+        .await;
+        assert_eq!(pointer(&db).await.2, None);
+        let mut old = p.clone();
+        old.previous_event_id = Some(removed.id);
+        old.consented_declaration = json!({"legacy":true,"needs":[{"need":"records.body.read.v1","scope":"historical-unknown"}],"effects":[]});
+        append(
+            &db,
+            "v1-unknown-history",
+            ControlEventPayload::AlphaTabInstalled(old),
+        )
+        .await;
+        assert_eq!(pointer(&db).await.2, None);
+        assert!(rebuild_and_diff_control(&db).await.unwrap().equal);
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn malformed_v2_payload_pin_aggregate_type_and_cas_refuse_atomically() {
+        let (db, p, installed, adopt) = setup().await;
+        let valid = adopted(&adopt.id, &p);
+        let json = serde_json::to_value(&valid).unwrap();
+        for (key, value) in [
+            ("runtime", json!("native.mdx.v2")),
+            ("bundle_sha256", json!("a".repeat(64))),
+            ("digest", json!(format!("sha256:{}", "a".repeat(64)))),
+            ("declaration_digest", json!("a".repeat(64))),
+            ("marker_id", json!(adopt.id)),
+            (
+                "body_read_admission",
+                json!({"need":"records.body.read.v1","scope":"all"}),
+            ),
+            (
+                "body_read_admission",
+                json!({"need":"records.body.read.v1","scope":"viewer-visible-current-bodies","extra":true}),
+            ),
+        ] {
+            let mut row = adopt.clone();
+            let mut raw = json.clone();
+            raw[key] = value;
+            row.payload = raw.to_string();
+            assert!(validate_control_event(&row).is_err(), "{key}");
+        }
+        let mut row = adopt.clone();
+        row.payload = format!(
+            "{{{},\"runtime\":\"native.html.v1\"}}",
+            &adopt.payload[1..adopt.payload.len() - 1]
+        );
+        assert!(validate_control_event(&row).is_err()); // typed payload duplicate, not a Value-normalization claim
+        let mut row = adopt.clone();
+        row.aggregate_kind = "record".into();
+        assert!(validate_control_event(&row).is_err());
+        let mut row = adopt.clone();
+        row.aggregate_id = alpha_tab_aggregate_id("acct_other", &p.package);
+        assert!(validate_control_event(&row).is_err());
+        let mut row = adopt.clone();
+        row.event_type = "alpha_tab.adopted".into();
+        assert!(validate_control_event(&row).is_err());
+        let mut row = installed;
+        let mut raw: serde_json::Value = serde_json::from_str(&row.payload).unwrap();
+        raw["body_read_admission_event_id"] = json!(adopt.id);
+        row.payload = raw.to_string();
+        assert!(validate_control_event(&row).is_err());
+        for (i, key) in [
+            "account_id",
+            "package",
+            "version",
+            "artifact_id",
+            "consented_source_revision",
+            "previous_event_id",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let mut raw = json.clone();
+            raw[*key] = json!(if *key == "previous_event_id" {
+                uuid::Uuid::new_v4().to_string()
+            } else {
+                "wrong-pin".to_owned()
+            });
+            let bad: AlphaTabAdoptV2Payload = serde_json::from_value(raw).unwrap();
+            let mut cmd = command(
+                &format!("v2-mismatch-{i}"),
+                &alpha_tab_aggregate_id(&bad.account_id, &bad.package),
+                ControlEventPayload::AlphaTabAdoptedV2(bad),
+            );
+            cmd.actor = "acct_alice".into();
+            assert!(append_control_event(&db, cmd).await.is_err());
+        }
+        assert_eq!(pointer(&db).await.2, Some(adopt.id));
+        assert!(rebuild_and_diff_control(&db).await.unwrap().equal);
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn trusted_historic_sql_commitment_replays_without_current_sql_admission() {
+        let db = create_database(":memory:").await.unwrap();
+        record(&db, ALPHA_FIXTURE_ARTIFACT_ID).await;
+        let mut d = declaration();
+        d["needs"].as_array_mut().unwrap().push(json!({"need":"sql.snapshot.v1","key":"old.sql","label":"retained commitment","sql":"DELETE FROM records"}));
+        assert!(crate::query::sql::validate("DELETE FROM records").is_err());
+        let p = install(None, d);
+        let installed = append(
+            &db,
+            "old-sql-install",
+            ControlEventPayload::AlphaTabInstalled(p.clone()),
+        )
+        .await;
+        let adopted = append(
+            &db,
+            "old-sql-v2",
+            ControlEventPayload::AlphaTabAdoptedV2(adopted(&installed.id, &p)),
+        )
+        .await;
+        assert_eq!(pointer(&db).await.2, Some(adopted.id));
+        assert!(rebuild_and_diff_control(&db).await.unwrap().equal);
+        db.close().await;
+    }
 }

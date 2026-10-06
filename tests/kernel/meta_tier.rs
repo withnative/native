@@ -487,7 +487,7 @@ async fn reads_both_cascade_views_and_writes_the_user_layer() {
     );
     assert_eq!(
         read["reserved_facets"],
-        json!(["archived", "blob_ref", "canvas.promoted_from"])
+        json!(["archived", "blob_ref", "canvas.promoted_from", "retraction"])
     );
     assert_eq!(read["rows"].as_array().unwrap().len(), 2);
 
@@ -696,7 +696,7 @@ async fn rejection_b_fires_on_any_configuration_of_reserved_facets_in_either_dir
     let registry = registry();
     seed_pack(&db).await;
 
-    for key in ["archived", "blob_ref", "canvas.promoted_from"] {
+    for key in native_ce::schema::ENGINE_RESERVED_FACET_KEYS {
         for shape in [
             json!({ "values": ["true", "false"] }), // loosening direction
             json!({ "required": true }),            // tightening direction

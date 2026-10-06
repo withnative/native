@@ -1,0 +1,34 @@
+{
+  "name": "@withnative/native-coedit",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Transport-agnostic live co-editing client for session.body.v1 (Yjs doc, single root Y.Text `body`).",
+  "license": "AGPL-3.0-only",
+  "repository": "withnative/native-ce",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./testing": "./src/testing/fakeHome.ts",
+    "./package.json": "./package.json"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "yjs": "^13.6.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "typescript": "^5.8.3",
+    "vitest": "^3.2.4"
+  },
+  "files": [
+    "src/",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "test:core-interop": "vitest run --config interop/vitest.config.ts"
+  }
+}

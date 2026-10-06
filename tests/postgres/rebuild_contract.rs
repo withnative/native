@@ -23,6 +23,7 @@
 use crate::contract::{ContractHarness, DeliveredMessageFixture, PostgresHarness, TestCaller};
 use native_ce::postgres::{event_sequences, PostgresContentRebuildDiff, PostgresDb};
 use serde_json::json;
+use sha2::Digest;
 
 const REBUILD_REASON: &str =
     "Exercise the Postgres content rebuild-and-diff conformance instrument.";
@@ -131,10 +132,11 @@ async fn seed_rebuild_fixture(harness: &PostgresHarness, database: &PostgresDb) 
                 "type": "WorkItem",
                 "kind": "task",
                 "name": "Rebuild source",
+                "body": "- [ ] original item",
                 "facets": { "effort": "small" },
                 "links": [{
                     "target_id": "510691f0-0000-4000-8000-000000000001",
-                    "relationship": "implements"
+                    "relationship": "supersedes"
                 }],
                 "reason": REBUILD_REASON,
             }),
@@ -149,6 +151,8 @@ async fn seed_rebuild_fixture(harness: &PostgresHarness, database: &PostgresDb) 
             json!({
                 "id": "510691f0-0000-4000-8000-000000000002",
                 "name": "Rebuild source updated",
+                "body": "* [ ] current item\n> - [ ] quoted item",
+                "if_body_digest": hex::encode(sha2::Sha256::digest(b"- [ ] original item")),
                 "facets": { "effort": "medium" },
                 "reason": REBUILD_REASON,
             }),
@@ -215,6 +219,36 @@ async fn postgres_content_rebuild_and_diff_reproduces_its_own_log() {
     let harness = live_harness().await;
     let database = harness.fresh_logical_database().await.unwrap();
     seed_rebuild_fixture(&harness, &database).await;
+    let records_table = database.qualified_table("records").unwrap();
+    let target = "510691f0-0000-4000-8000-000000000001";
+    let before: (Option<bool>, i64, bool) = sqlx::query_as(&format!(
+        "SELECT is_current,successor_count,archived FROM {records_table} WHERE id=$1"
+    ))
+    .bind(target)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(before, (None, 1, true));
+    harness
+        .call(
+            &database,
+            TestCaller::Local,
+            "delete_record",
+            json!({
+                "id": "510691f0-0000-4000-8000-000000000002",
+                "reason": REBUILD_REASON,
+            }),
+        )
+        .await
+        .unwrap();
+    let after: (Option<bool>, i64, bool) = sqlx::query_as(&format!(
+        "SELECT is_current,successor_count,archived FROM {records_table} WHERE id=$1"
+    ))
+    .bind(target)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(after, (Some(true), 0, true));
 
     // Positive evidence the fixture really appended a gapless log from seq 1,
     // and that the check replays exactly that log.
@@ -231,7 +265,6 @@ async fn postgres_content_rebuild_and_diff_reproduces_its_own_log() {
     );
     // Prove the compared `deleted_at` column is non-null on the live side, so
     // its equality is a real comparison rather than two nulls.
-    let records_table = database.qualified_table("records").unwrap();
     let tombstoned: i64 = sqlx::query_scalar(&format!(
         "SELECT COUNT(*) FROM {records_table} WHERE deleted_at IS NOT NULL"
     ))
@@ -239,8 +272,8 @@ async fn postgres_content_rebuild_and_diff_reproduces_its_own_log() {
     .await
     .unwrap();
     assert_eq!(
-        tombstoned, 1,
-        "the fixture must produce exactly one tombstoned record"
+        tombstoned, 2,
+        "the fixture must produce exactly two tombstoned records"
     );
 
     let diff = database.rebuild_and_diff_content().await.unwrap();
@@ -259,6 +292,12 @@ async fn postgres_content_rebuild_and_diff_reproduces_its_own_log() {
         records.live > 0,
         "the fixture must produce live projection rows"
     );
+    let task_items = diff
+        .tables
+        .iter()
+        .find(|table| table.table == "body_task_items")
+        .expect("task items are a compared content projection");
+    assert_eq!(task_items.live, 2, "delete preserves the current body rows");
     let audience = diff
         .tables
         .iter()
@@ -296,6 +335,15 @@ async fn postgres_content_rebuild_and_diff_detects_projection_drift() {
     .await
     .unwrap();
     assert_eq!(updated.rows_affected(), 1);
+    let task_items = database.qualified_table("body_task_items").unwrap();
+    let updated = sqlx::query(&format!(
+        "UPDATE {task_items} SET checked=TRUE WHERE record_id=$1 AND item_index=0"
+    ))
+    .bind("510691f0-0000-4000-8000-000000000002")
+    .execute(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(updated.rows_affected(), 1);
 
     let diff = database.rebuild_and_diff_content().await.unwrap();
     assert!(
@@ -310,6 +358,16 @@ async fn postgres_content_rebuild_and_diff_detects_projection_drift() {
     assert!(
         !records_diff.mismatches.is_empty(),
         "the corrupted row must appear as a mismatch:\n{}",
+        describe_diff(&diff)
+    );
+    let task_diff = diff
+        .tables
+        .iter()
+        .find(|table| table.table == "body_task_items")
+        .expect("task items are a compared table");
+    assert!(
+        !task_diff.mismatches.is_empty(),
+        "corrupted task projection must be detected:\n{}",
         describe_diff(&diff)
     );
 

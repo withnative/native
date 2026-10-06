@@ -270,6 +270,7 @@ pub async fn descendants(db: &Db, root_id: &str, opts: TreeOptions) -> Result<Ve
         root_id,
         opts,
         None,
+        false,
     )
     .await
 }
@@ -290,6 +291,7 @@ pub async fn descendants_as(
         root_id,
         opts,
         Some(principal),
+        false,
     )
     .await
 }
@@ -317,6 +319,7 @@ pub async fn descendants_with_lens_as(
         root_id,
         opts,
         Some(principal),
+        false,
     )
     .await
 }
@@ -339,6 +342,26 @@ pub async fn descendants_from(
         root_id,
         opts,
         None,
+        false,
+    )
+    .await
+}
+
+/// Slice-only walk. Custody anchors are excluded, so the MCP caller replaces
+/// that companion field with an explicit unavailable marker before serving.
+pub(crate) async fn descendants_member(
+    projection: ProjectionRead<'_>,
+    root_id: &str,
+    opts: TreeOptions,
+) -> Result<Vec<TreeNode>> {
+    descendants_inner(
+        projection,
+        projection.shared_pool(),
+        projection.shared_pool(),
+        root_id,
+        opts,
+        None,
+        true,
     )
     .await
 }
@@ -350,6 +373,7 @@ async fn descendants_inner(
     root_id: &str,
     opts: TreeOptions,
     principal: Option<crate::authorization::Principal<'_>>,
+    member: bool,
 ) -> Result<Vec<TreeNode>> {
     let db = content_pool;
     if opts.max_depth < 0 {
@@ -421,13 +445,17 @@ async fn descendants_inner(
     // trade is worth naming and not worth avoiding.
     let mut nodes: Vec<(String, TreeNode)> = Vec::new();
     let mut visited: HashSet<String> = HashSet::new();
-    let not_hidden = super::not_hidden_predicate("r");
+    let not_hidden = if member {
+        super::member_not_hidden_predicate("r")
+    } else {
+        super::not_hidden_predicate("r")
+    };
 
     // The root is emitted whatever its archive state — pointing at a record is
     // asking for it, same rule `read::get_record` follows. Only the walk BELOW
     // it honours the visibility default. The same holds for `exclude_types`:
     // the root is emitted even when its own type is excluded.
-    let cols = node_columns(archived_count_filter, &type_count_filter);
+    let cols = node_columns(archived_count_filter, &type_count_filter, member);
     let root_sql = format!(
         "SELECT {cols} FROM records r
           WHERE r.id = ? AND r.deleted_at IS NULL
@@ -608,13 +636,27 @@ async fn descendants_inner(
     }
 
     nodes.sort_by(|(a, _), (b, _)| a.cmp(b));
-    let root_path_visible = match principal {
-        None => true,
-        Some(principal) => {
-            containment_path_visible(projection, authorization_pool, root_id, principal).await?
+    let root_path_visible = if member {
+        root_id == crate::schema::ROOT_RECORD_ID
+            || ancestors_from(projection, root_id)
+                .await?
+                .first()
+                .is_some_and(|ancestor| ancestor.id == crate::schema::ROOT_RECORD_ID)
+    } else {
+        match principal {
+            None => true,
+            Some(principal) => {
+                containment_path_visible(projection, authorization_pool, root_id, principal).await?
+            }
         }
     };
     for (_, node) in &mut nodes {
+        if member {
+            // Never read missing policy_anchor_id or invent a served value.
+            // The typed node's placeholder is marked unavailable by MCP.
+            node.containment_path_visible = root_path_visible;
+            continue;
+        }
         let authored_home: Option<String> =
             sqlx::query_scalar("SELECT home_id FROM records WHERE id = ?")
                 .bind(&node.id)
@@ -645,8 +687,12 @@ struct Frontier {
 /// The node projection, shared by the root fetch and both level strategies so
 /// they cannot drift apart in what they select. Every statement using it binds
 /// the `archived` key first.
-fn node_columns(archived_count_filter: &str, type_count_filter: &str) -> String {
-    let not_hidden = super::not_hidden_predicate("c");
+fn node_columns(archived_count_filter: &str, type_count_filter: &str, member: bool) -> String {
+    let not_hidden = if member {
+        super::member_not_hidden_predicate("c")
+    } else {
+        super::not_hidden_predicate("c")
+    };
     format!(
         "r.id, r.type, r.kind, r.name, r.home_id, r.persistence,
          r.last_activity_at,
@@ -977,6 +1023,37 @@ pub(crate) async fn subtree_ids_with_hidden_in(
         "AND {}",
         super::hidden_visibility_predicate("r", include_suggestions, include_citations, false)
     );
+    subtree_ids_with_filter_in(conn, root_id, &hidden_filter, include_archived).await
+}
+
+/// Member-copy subtree walk: the same recursive walk over the shipped
+/// `records`/`home_id`, with the hidden predicate replaced by the constant
+/// member predicate. Every row in the slice is E(m), and the member profile
+/// excludes semantic Units and attribution/acknowledgement annotations, so the
+/// generic predicate's clauses are already satisfied.
+pub(crate) async fn member_subtree_ids(
+    db: &Db,
+    root_id: &str,
+    include_archived: bool,
+) -> Result<Vec<String>> {
+    let mut conn = db.write_pool().acquire().await?;
+    member_subtree_ids_in(&mut conn, root_id, include_archived).await
+}
+
+pub(crate) async fn member_subtree_ids_in(
+    conn: &mut SqliteConnection,
+    root_id: &str,
+    include_archived: bool,
+) -> Result<Vec<String>> {
+    subtree_ids_with_filter_in(conn, root_id, "AND 1", include_archived).await
+}
+
+async fn subtree_ids_with_filter_in(
+    conn: &mut SqliteConnection,
+    root_id: &str,
+    hidden_filter: &str,
+    include_archived: bool,
+) -> Result<Vec<String>> {
     let archived_filter = if include_archived {
         String::new()
     } else {

@@ -46,6 +46,347 @@ const VALID_SOURCE: &str = "b0075000-0000-4000-8000-000000000006";
 const BROKEN_SOURCE: &str = "b0075000-0000-4000-8000-000000000007";
 /// `stale-criteria`
 const STALE_CRITERIA: &str = "b0075000-0000-4000-8000-000000000008";
+/// `resolve-source`
+const RESOLVE_SOURCE: &str = "b0075000-0000-4000-8000-000000000009";
+/// `resolve-member-source`
+const RESOLVE_MEMBER_SOURCE: &str = "b0075000-0000-4000-8000-00000000000a";
+
+fn resolve_body_digest(body: &str) -> String {
+    hex::encode(sha2::Sha256::digest(body.as_bytes()))
+}
+
+async fn resolve_call(
+    registry: &ToolRegistry,
+    db: &Db,
+    caller: Caller,
+    arguments: Value,
+) -> native_ce::Result<Value> {
+    registry
+        .call(db.clone(), caller, "manage_instructions", arguments)
+        .await
+}
+
+async fn resolve_fixture(registry: &ToolRegistry, db: &Db, body: &str) -> String {
+    document(registry, db, RESOLVE_SOURCE, body).await;
+    call(
+        registry,
+        db,
+        Caller::local(),
+        "manage_instructions",
+        json!({
+            "action":"create_binding", "scope":"workspace", "binding_id":"resolve-binding",
+            "source_record_id":RESOLVE_SOURCE, "position":100,
+            "idempotency_key":"resolve:binding", "reason":"create resolve refresh fixture"
+        }),
+    )
+    .await;
+    let bootstrap = call(registry, db, Caller::local(), "bootstrap", json!({})).await;
+    bootstrap["run"]["run_key"].as_str().unwrap().to_string()
+}
+
+#[tokio::test]
+async fn manage_instructions_resolve_returns_current_effective_stack() {
+    let db = create_database(":memory:").await.unwrap();
+    let registry = registry();
+    let key = resolve_fixture(&registry, &db, "resolve refresh body v1").await;
+    let bootstrap = call(
+        &registry,
+        &db,
+        Caller::local(),
+        "bootstrap",
+        json!({"run_key": key}),
+    )
+    .await;
+    let resolved = resolve_call(
+        &registry,
+        &db,
+        Caller::local(),
+        json!({"action":"resolve", "run_key": key}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(resolved["instructions"], bootstrap["instructions"]);
+    assert_eq!(resolved["instructions"]["status"], "ready");
+    let entries = resolved["instructions"]["entries"].as_array().unwrap();
+    let entry = entries
+        .iter()
+        .find(|entry| entry["source"]["record_id"].as_str() == Some(RESOLVE_SOURCE))
+        .expect("workspace entry present");
+    assert_eq!(
+        entry["content"].as_str().unwrap(),
+        "resolve refresh body v1"
+    );
+    assert_eq!(
+        entry["source"]["body_digest"].as_str().unwrap(),
+        resolve_body_digest("resolve refresh body v1")
+    );
+    assert!(resolved["pending_obligations"].is_array());
+    let text = render::render("manage_instructions", &resolved).unwrap();
+    assert!(
+        text.contains("Current effective instruction stack"),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn manage_instructions_resolve_reflects_changed_guide_body() {
+    let db = create_database(":memory:").await.unwrap();
+    let registry = registry();
+    let key = resolve_fixture(&registry, &db, "resolve body before edit").await;
+    let before = resolve_call(
+        &registry,
+        &db,
+        Caller::local(),
+        json!({"action":"resolve", "run_key": key}),
+    )
+    .await
+    .unwrap();
+    let digest_before = before["instructions"]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["source"]["record_id"].as_str() == Some(RESOLVE_SOURCE))
+        .unwrap()["source"]["body_digest"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    call(
+        &registry,
+        &db,
+        Caller::local(),
+        "update_record",
+        json!({"id":RESOLVE_SOURCE, "body":"resolve body after edit", "if_body_digest":digest_before, "reason":"edit resolve fixture"}),
+    )
+    .await;
+    let after = resolve_call(
+        &registry,
+        &db,
+        Caller::local(),
+        json!({"action":"resolve", "run_key": key}),
+    )
+    .await
+    .unwrap();
+    let entry = after["instructions"]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["source"]["record_id"].as_str() == Some(RESOLVE_SOURCE))
+        .expect("edited entry still present")
+        .clone();
+    assert_eq!(
+        entry["content"].as_str().unwrap(),
+        "resolve body after edit"
+    );
+    assert_eq!(
+        entry["source"]["body_digest"].as_str().unwrap(),
+        resolve_body_digest("resolve body after edit")
+    );
+    assert_ne!(
+        entry["source"]["body_digest"].as_str().unwrap(),
+        digest_before
+    );
+}
+
+#[tokio::test]
+async fn manage_instructions_resolve_excludes_disabled_guide() {
+    let db = create_database(":memory:").await.unwrap();
+    let registry = registry();
+    let key = resolve_fixture(&registry, &db, "resolve body to disable").await;
+    call(
+        &registry,
+        &db,
+        Caller::local(),
+        "manage_instructions",
+        json!({
+            "action":"disable_binding", "binding_id":"resolve-binding",
+            "idempotency_key":"resolve:disable", "reason":"disable resolve fixture"
+        }),
+    )
+    .await;
+    let resolved = resolve_call(
+        &registry,
+        &db,
+        Caller::local(),
+        json!({"action":"resolve", "run_key": key}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(resolved["instructions"]["status"], "ready");
+    assert!(
+        resolved["instructions"]["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|entry| entry["source"]["record_id"].as_str() != Some(RESOLVE_SOURCE)),
+        "disabled source must not resolve"
+    );
+}
+
+#[tokio::test]
+async fn manage_instructions_resolve_refuses_missing_run_key() {
+    let db = create_database(":memory:").await.unwrap();
+    let registry = registry();
+    resolve_fixture(&registry, &db, "resolve keyless body").await;
+    let error = resolve_call(&registry, &db, Caller::local(), json!({"action":"resolve"}))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("resolve"), "{error}");
+    assert!(error.contains("run_key"), "{error}");
+}
+
+#[tokio::test]
+async fn manage_instructions_resolve_refuses_new_sentinel_before_issuance() {
+    // Regression: run-key issuance used to mint on the `"new"` sentinel
+    // before the resolve handler ran, so resolve silently started a fresh run
+    // instead of rejoining the compacted one. The refusal now happens before
+    // any key is issued.
+    let db = create_database(":memory:").await.unwrap();
+    let registry = registry();
+    resolve_fixture(&registry, &db, "resolve sentinel body").await;
+    let error = resolve_call(
+        &registry,
+        &db,
+        Caller::local(),
+        json!({"action":"resolve", "run_key":"new"}),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("requires an existing run_key"), "{error}");
+}
+
+#[tokio::test]
+async fn manage_instructions_resolve_hides_other_member_sources() {
+    // Member-scope resolution is account-confined by binding scope: another
+    // member's resolve omits Alice's member-scoped source while her own
+    // resolve includes it, both status ready.
+    let db = create_database(":memory:").await.unwrap();
+    let registry = registry();
+    let alice = Caller::authenticated("acct:alice");
+    let bea = Caller::authenticated("acct:bea");
+    document(
+        &registry,
+        &db,
+        RESOLVE_MEMBER_SOURCE,
+        "alice private guidance",
+    )
+    .await;
+    call(
+        &registry,
+        &db,
+        alice.clone(),
+        "manage_instructions",
+        json!({
+            "action":"create_binding", "scope":"member", "binding_id":"alice-private",
+            "source_record_id":RESOLVE_MEMBER_SOURCE, "position":100,
+            "idempotency_key":"resolve:alice-private", "reason":"bind alice private fixture"
+        }),
+    )
+    .await;
+    let alice_bootstrap = call(&registry, &db, alice.clone(), "bootstrap", json!({})).await;
+    let alice_key = alice_bootstrap["run"]["run_key"].as_str().unwrap();
+    let bea_bootstrap = call(&registry, &db, bea.clone(), "bootstrap", json!({})).await;
+    let bea_key = bea_bootstrap["run"]["run_key"].as_str().unwrap();
+    let alice_resolved = resolve_call(
+        &registry,
+        &db,
+        alice.clone(),
+        json!({"action":"resolve", "run_key":alice_key}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(alice_resolved["instructions"]["status"], "ready");
+    assert!(alice_resolved["instructions"]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|entry| entry["source"]["record_id"].as_str() == Some(RESOLVE_MEMBER_SOURCE)));
+    let bea_resolved = resolve_call(
+        &registry,
+        &db,
+        bea.clone(),
+        json!({"action":"resolve", "run_key":bea_key}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(bea_resolved["instructions"]["status"], "ready");
+    assert!(bea_resolved["instructions"]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|entry| entry["source"]["record_id"].as_str() != Some(RESOLVE_MEMBER_SOURCE)));
+}
+
+#[tokio::test]
+async fn manage_instructions_resolve_enforces_exact_instruction_budget() {
+    let db = create_database(":memory:").await.unwrap();
+    let registry = registry();
+    document(&registry, &db, VALID_SOURCE, "valid").await;
+    document(&registry, &db, BROKEN_SOURCE, "broken").await;
+    for (id, source, position) in [
+        ("resolve-valid-binding", VALID_SOURCE, 100),
+        ("resolve-broken-binding", BROKEN_SOURCE, 200),
+    ] {
+        call(
+            &registry,
+            &db,
+            Caller::local(),
+            "manage_instructions",
+            json!({
+                "action":"create_binding", "scope":"workspace", "binding_id":id,
+                "source_record_id":source, "position":position,
+                "idempotency_key":format!("resolve:{id}"), "reason":"create resolve budget fixture"
+            }),
+        )
+        .await;
+    }
+    let bootstrap = call(&registry, &db, Caller::local(), "bootstrap", json!({})).await;
+    let key = bootstrap["run"]["run_key"].as_str().unwrap().to_string();
+    let maximum_valid_body = "a".repeat(32 * 1024 - "valid".len());
+    sqlx::query(&format!(
+        "UPDATE records SET body=? WHERE id='{BROKEN_SOURCE}'"
+    ))
+    .bind(maximum_valid_body)
+    .execute(&crate::common::fixture_write_pool(&db).await)
+    .await
+    .unwrap();
+    let maximum_valid = resolve_call(
+        &registry,
+        &db,
+        Caller::local(),
+        json!({"action":"resolve", "run_key": key}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(maximum_valid["instructions"]["status"], "ready");
+    assert_eq!(maximum_valid["instructions"]["resolved_bytes"], 32 * 1024);
+    let over_budget_body = "a".repeat(32 * 1024 - "valid".len() + 1);
+    sqlx::query(&format!(
+        "UPDATE records SET body=? WHERE id='{BROKEN_SOURCE}'"
+    ))
+    .bind(over_budget_body)
+    .execute(&crate::common::fixture_write_pool(&db).await)
+    .await
+    .unwrap();
+    let over_budget = resolve_call(
+        &registry,
+        &db,
+        Caller::local(),
+        json!({"action":"resolve", "run_key": key}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(over_budget["instructions"]["status"], "invalid");
+    assert!(over_budget["instructions"]["entries"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        over_budget["instructions"]["diagnostics"][0]["code"],
+        "instruction_budget_exceeded"
+    );
+}
 
 async fn document(registry: &ToolRegistry, db: &Db, id: &str, body: &str) {
     call(
@@ -313,7 +654,7 @@ async fn bootstrap_resolves_ordered_caller_context_without_consuming_obligations
         native_ce::ENGINE_VERSION
     );
     assert_eq!(entries[0]["source"]["template_key"], "engine-orientation");
-    assert_eq!(entries[0]["source"]["template_version"], 9);
+    assert_eq!(entries[0]["source"]["template_version"], 10);
     assert!(entries[0]["source"]["record_id"].is_null());
     let orientation = entries[0]["content"].as_str().unwrap();
     for guarantee in [
@@ -781,25 +1122,38 @@ async fn bootstrap_returns_no_partial_authoritative_stack_when_active_state_is_i
     let unauthorized = call(
         &registry,
         &db,
-        Caller::authenticated("acct:outsider"),
+        Caller::authenticated("acct:outsider")
+            .with_hosting_context("host:db", "db:test")
+            .with_hosting_owner(false)
+            .with_hosting_member(true),
         "bootstrap",
         json!({}),
     )
     .await;
-    assert_eq!(unauthorized["instructions"]["status"], "invalid");
-    assert_eq!(
-        unauthorized["instructions"]["diagnostics"][0]["code"],
-        "instruction_source_unreadable"
+    // A live database-scope source hidden from this caller is skipped
+    // silently (product fix 0b7d366): the outsider resolves the visible
+    // VALID_SOURCE stack, `ready`, with no id oracle for BROKEN_SOURCE.
+    assert_eq!(unauthorized["instructions"]["status"], "ready");
+    assert!(unauthorized["instructions"]["diagnostics"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    let unauthorized_text = serde_json::to_string(&unauthorized).unwrap();
+    assert!(
+        !unauthorized_text.contains(BROKEN_SOURCE),
+        "{unauthorized_text}"
     );
-    assert_eq!(
-        unauthorized["instructions"]["diagnostics"][0]["source_record_id"],
-        Value::Null
+    assert!(
+        unauthorized_text.contains(VALID_SOURCE),
+        "{unauthorized_text}"
     );
     let rendered = render::render("bootstrap", &unauthorized).unwrap();
     assert!(rendered.starts_with("# Working in Native"), "{rendered}");
-    assert!(rendered.contains("withheld partial guidance"));
-    assert!(rendered.contains("manage_instructions"));
     assert!(!rendered.contains(BROKEN_SOURCE), "{rendered}");
+    assert!(
+        !rendered.contains("withheld partial guidance"),
+        "{rendered}"
+    );
 }
 
 #[tokio::test]
@@ -879,7 +1233,8 @@ async fn bootstrap_fails_closed_when_one_source_exceeds_the_serialized_metadata_
         .as_array()
         .unwrap()
         .is_empty());
-    assert!(serde_json::to_vec(&payload).unwrap().len() < 16 * 1024);
+    // 8b1e3da: approved SQL pointer grows orientation by ~0.16 KiB.
+    assert!(serde_json::to_vec(&payload).unwrap().len() < 17 * 1024);
 }
 
 #[tokio::test]

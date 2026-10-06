@@ -1,0 +1,11 @@
+[
+{"name":"map_bool_key","expr":"{true:1, false:2}[true]","bindings":{},"expect":{"value":{"int":"1"}},"spec":"Aggregate Values: bool is an allowed map key type"},
+{"name":"map_bool_key_missing","expr":"{true:1}[false]","bindings":{},"expect":{"error":"no_such_key"},"spec":"conformance fields map_no_such_key"},
+{"name":"map_uint_key","expr":"{1u:1, 2u:2}[2u]","bindings":{},"expect":{"value":{"int":"2"}}},
+{"name":"map_cross_int_uint_key","expr":"{1:1}[1u]","bindings":{},"expect":{"value":{"int":"1"}},"spec":"Lists and Maps: int/uint keys cross-lookup"},
+{"name":"map_missing_uint_key","expr":"{1u:1}[2u]","bindings":{},"expect":{"error":"no_such_key"},"spec":"conformance fields map_no_such_key"},
+{"name":"map_string_key_missing","expr":"{'a':1}['b']","bindings":{},"expect":{"error":"no_such_key"},"spec":"conformance fields map_no_such_key"},
+{"name":"map_double_key_err","expr":"{3.3:15.15, 1.0:5}[1.0]","bindings":{},"expect":{"error":"bad_key_type"},"spec":"conformance fields unsupported key type; Aggregate Values key types"},
+{"name":"map_bad_key_before_error_value","expr":"{3.3: 1/0}","bindings":{},"expect":{"error":"bad_key_type"},"spec":"N1: the key's type is checked before its value is evaluated"},
+{"name":"map_bad_key_before_missing_value","expr":"{3.3: missing}","bindings":{},"expect":{"error":"bad_key_type"},"spec":"N1: the key's type is checked before its value is resolved"}
+]

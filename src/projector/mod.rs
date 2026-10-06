@@ -416,6 +416,7 @@ async fn next_record_updated_at(
 
 /// Fold one event into the projection tables.
 pub async fn project(conn: &mut SqliteConnection, event: &EventRow) -> Result<()> {
+    crate::db::enrolled::require_content_connection(conn, None).await?;
     let intent = ProjectorIntent::from_event(event)?;
     project_intent(conn, event, &intent).await
 }
@@ -427,11 +428,50 @@ pub(crate) async fn project_intent(
     event: &EventRow,
     intent: &ProjectorIntent,
 ) -> Result<()> {
+    crate::db::enrolled::require_content_connection(conn, None).await?;
     if !matches!(intent, ProjectorIntent::Extended { .. }) {
         return project_canonical_intent(conn, event, intent).await;
     }
     match intent.event_type() {
         "annotation.target.set" => project_annotation_target_set(conn, event).await,
+        #[cfg(any(test, feature = "v2-kernel-probe"))]
+        crate::events::KERNEL_GENESIS_EVENT => project_kernel_root_created(conn, event).await,
+        #[cfg(any(test, feature = "v2-kernel-probe"))]
+        "kernel.record_created.v1" => {
+            crate::kernel::project_kernel_record_created(conn, event).await
+        }
+        #[cfg(any(test, feature = "v2-kernel-probe"))]
+        "kernel.link_added.v1" => crate::kernel::project_kernel_link_added(conn, event).await,
+        #[cfg(any(test, feature = "v2-kernel-probe"))]
+        "kernel.principal_created.v1" => {
+            crate::kernel::project_kernel_principal_created(conn, event).await
+        }
+        #[cfg(any(test, feature = "v2-kernel-probe"))]
+        "kernel.home_created.v1" => crate::kernel::project_kernel_home_created(conn, event).await,
+        #[cfg(any(test, feature = "v2-kernel-probe"))]
+        "kernel.home_policy_replaced.v1" => {
+            crate::kernel::project_kernel_home_policy_replaced(conn, event).await
+        }
+        #[cfg(any(test, feature = "v2-kernel-probe"))]
+        "kernel.root_admin_bootstrapped.v1" => {
+            crate::kernel::project_kernel_root_admin_bootstrapped(conn, event).await
+        }
+        #[cfg(any(test, feature = "v2-kernel-probe"))]
+        "kernel.record_rehomed.v1" => {
+            crate::kernel::project_kernel_record_rehomed(conn, event).await
+        }
+        #[cfg(any(test, feature = "v2-kernel-probe"))]
+        "kernel.definition_adopted.v1" => {
+            crate::kernel::project_kernel_definition_adopted(conn, event).await
+        }
+        #[cfg(any(test, feature = "v2-kernel-probe"))]
+        "kernel.package_adopted.v1" => {
+            crate::kernel::project_kernel_package_adopted(conn, event).await
+        }
+        #[cfg(any(test, feature = "v2-kernel-probe"))]
+        "kernel.record_revised.v1" => {
+            crate::kernel::project_kernel_record_revised(conn, event).await
+        }
         "annotation.target.removed" => project_annotation_target_removed(conn, event).await,
         "attribution.target.bound.v1" => project_attribution_target_bound(conn, event).await,
         "attribution.asserted.v1" => project_attribution_asserted(conn, event).await,
@@ -449,8 +489,8 @@ pub(crate) async fn project_intent(
         "message.send_evaluated.v1" => project_message_send_evaluated(conn, event).await,
         "message.delivery.authorized.v1" => project_message_delivery_authorized(conn, event).await,
         // Reactions are event-derived annotations. V1 deliberately has no
-        // mutable reaction projection: grouped current state is a bounded fold
-        // over these record-local events, so replay has nothing else to write.
+        // mutable grouped reaction projection: the insert trigger derives
+        // event metadata; grouped current state remains a record-local fold.
         // The no-op is still a semantic projector boundary: imported/replayed
         // bytes must satisfy the same exact payload contract as live writes.
         "message.reaction.added.v1" | "message.reaction.removed.v1" => {
@@ -625,6 +665,7 @@ async fn project_annotation_target_removed(
 
 /// Replay a whole log (ordered by seq) into a fresh database.
 pub async fn replay(conn: &mut SqliteConnection, events: &[EventRow]) -> Result<()> {
+    crate::db::enrolled::require_content_connection(conn, None).await?;
     for event in events {
         project(conn, event).await.map_err(|error| {
             Error::engine(format!(
@@ -666,6 +707,7 @@ async fn replay_with_blob_source(
     events: &[EventRow],
     hydrate_annotation_id: Option<&str>,
 ) -> Result<()> {
+    crate::db::enrolled::require_content_connection(conn, None).await?;
     let mut blob_ids = BTreeMap::<String, bool>::new();
     for event in events {
         if event.event_type != "annotation.target.set" {
@@ -826,9 +868,11 @@ async fn apply_projection_plan(
             apply_record_type_corrected(conn, event, &record_type, &kind).await
         }
         ProjectionPlan::RecordDeleted => apply_record_deleted(conn, event).await,
-        ProjectionPlan::FacetSet { payload, spine } => {
-            apply_facet_set(conn, event, payload, spine).await
-        }
+        ProjectionPlan::FacetSet {
+            payload,
+            spine,
+            time,
+        } => apply_facet_set(conn, event, payload, spine, time).await,
         ProjectionPlan::FacetUnset { payload, spine } => {
             apply_facet_unset(conn, event, payload, spine).await
         }
@@ -857,6 +901,55 @@ async fn apply_record_type_corrected(
         .bind(updated_at)
         .bind(&event.created_at)
         .bind(&event.record_id)
+        .execute(&mut *conn)
+        .await?;
+    Ok(())
+}
+
+/// Experimental bare-kernel root fold. Genesis must be content event one,
+/// on the fixed kernel id, from the kernel seeder, with an empty object
+/// payload and no existing root. A database without the additive
+/// `kernel_roots` table (every ordinary v1 database) fails closed here
+/// with a missing-table error, so the prod shape can never silently
+/// absorb a kernel genesis.
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+async fn project_kernel_root_created(conn: &mut SqliteConnection, event: &EventRow) -> Result<()> {
+    let payload = payload_object(event)?;
+    if event.record_id != crate::events::KERNEL_ROOT_ID
+        || event.event_type != crate::events::KERNEL_GENESIS_EVENT
+        || event.local_seq != 1
+        || event.actor.as_deref() != Some(crate::events::KERNEL_GENESIS_ACTOR)
+        || !payload.is_empty()
+    {
+        return Err(Error::engine("invalid kernel root genesis marker"));
+    }
+    root_created_inserts(conn, event).await
+}
+
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+async fn root_created_inserts(conn: &mut SqliteConnection, event: &EventRow) -> Result<()> {
+    let existing: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM kernel_roots WHERE root_id = ?)")
+            .bind(crate::events::KERNEL_ROOT_ID)
+            .fetch_one(&mut *conn)
+            .await?;
+    if existing {
+        return Err(Error::engine("duplicate kernel root genesis marker"));
+    }
+    sqlx::query(
+        "INSERT INTO kernel_roots (root_id, parent_id, created_seq, created_at) VALUES (?, NULL, ?, ?)",
+    )
+    .bind(crate::events::KERNEL_ROOT_ID)
+    .bind(event.local_seq)
+    .bind(&event.created_at)
+    .execute(&mut *conn)
+    .await?;
+    // The workspace root always carries a policy anchor (possibly
+    // entry-free, i.e. default-deny), so replay restores it and capability
+    // evaluation never meets a missing anchor on the root.
+    sqlx::query("INSERT INTO kernel_policies (root_id, created_at) VALUES (?, ?)")
+        .bind(crate::events::KERNEL_ROOT_ID)
+        .bind(&event.created_at)
         .execute(&mut *conn)
         .await?;
     Ok(())
@@ -899,6 +992,8 @@ async fn apply_record_created(
     for _ in 0..3 {
         push_json_arg(&mut args, &Value::String(ts.into()))?;
     }
+    // E3 M1 slice 1: creation omits archived so DEFAULT 0 applies. No
+    // record is created archived; archive/restore fold via facet.set/unset.
     sqlx::query_with(
         "INSERT INTO records
             (id, type, kind, name, body, home_id,
@@ -949,7 +1044,28 @@ async fn apply_record_created(
             .await?;
         }
     }
+    let body_value = fields.get("body");
+    let body_text = body_value.and_then(crate::record_body::coerce_body);
+    crate::body_blocks_projection::replace_sqlite(
+        conn,
+        &event.record_id,
+        event.local_seq,
+        body_text.as_deref(),
+        body_value
+            .map(crate::body_blocks_projection::body_format)
+            .unwrap_or(crate::body_blocks::BodyFormat::Markdown),
+    )
+    .await?;
     replace_record_mentions(
+        conn,
+        &event.record_id,
+        event.local_seq,
+        fields.get("body").and_then(crate::record_body::coerce_body),
+    )
+    .await?;
+    // E3 M3 increment 2A: body-task rows fold with the same body the mention
+    // rows scan — creation stores the body's extraction, if any.
+    replace_body_task_items(
         conn,
         &event.record_id,
         event.local_seq,
@@ -1009,6 +1125,71 @@ async fn replace_record_mentions(
     Ok(())
 }
 
+/// Replace the current-state body-task rows for one record (E3 M3 increment
+/// 2A: physical projection, live fold of the 68→69 edge).
+///
+/// `body_task_items` is a pure function of the record's current body: every
+/// fold path deletes the record's rows first and then inserts the extraction
+/// of the new body, so live folding, migration backfill and event replay
+/// converge on identical contents. The body is already the canonical stored
+/// text (`record_body::coerce_body`), so a non-string JSON body is scanned as
+/// the JSON text the `records.body` column holds. A missing, null or empty
+/// body leaves no rows. `source_event_seq` is the sequence of the event that
+/// supplied the current body — the provenance the backfill reconstructs as the
+/// latest body-carrying event.
+///
+/// Fail-closed: an extraction error aborts the write transaction with the
+/// record's identity. A body that cannot be parsed must refuse, never persist
+/// partial or empty rows that a later W3 selection would mistake for a clean
+/// negative.
+async fn replace_body_task_items(
+    conn: &mut SqliteConnection,
+    record_id: &str,
+    source_event_seq: i64,
+    body: Option<String>,
+) -> Result<()> {
+    sqlx::query("DELETE FROM body_task_items WHERE record_id = ?")
+        .bind(record_id)
+        .execute(&mut *conn)
+        .await?;
+    let Some(body) = body else {
+        return Ok(());
+    };
+    if body.is_empty() {
+        return Ok(());
+    }
+    let items = crate::body_task_items::extract_task_items(&body).map_err(|error| {
+        crate::error::Error::engine(format!(
+            "body_task_items extraction failed for record {record_id}: {error}"
+        ))
+    })?;
+    for item in &items {
+        let marker = crate::body_task_items::TaskMarker::as_str(&item.marker).ok_or_else(|| {
+            crate::error::Error::engine(format!(
+                "body_task_items refuses unrepresentable marker for record {record_id} item {}",
+                item.index
+            ))
+        })?;
+        sqlx::query(
+            "INSERT INTO body_task_items
+               (record_id, item_index, source_event_seq, marker,
+                checked, in_quote, start_offset, end_offset)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(record_id)
+        .bind(item.index as i64)
+        .bind(source_event_seq)
+        .bind(marker)
+        .bind(i64::from(item.checked))
+        .bind(i64::from(item.in_quote))
+        .bind(item.start_offset as i64)
+        .bind(item.end_offset as i64)
+        .execute(&mut *conn)
+        .await?;
+    }
+    Ok(())
+}
+
 async fn project_record_updated(conn: &mut SqliteConnection, event: &EventRow) -> Result<()> {
     let intent = ProjectorIntent::from_event(event)?;
     project_canonical_intent(conn, event, &intent).await
@@ -1060,7 +1241,26 @@ async fn apply_record_updated(
         RecordFieldUpdate::Body(value) => Some(value),
         _ => None,
     }) {
+        let body_text = crate::record_body::coerce_body(body);
+        crate::body_blocks_projection::replace_sqlite(
+            conn,
+            &event.record_id,
+            event.local_seq,
+            body_text.as_deref(),
+            crate::body_blocks_projection::body_format(body),
+        )
+        .await?;
         replace_record_mentions(
+            conn,
+            &event.record_id,
+            event.local_seq,
+            crate::record_body::coerce_body(body),
+        )
+        .await?;
+        // E3 M3 increment 2A: a carried body re-scans task rows exactly as
+        // creation does, so removal yields no rows. An update naming no body
+        // leaves both the rows and their provenance untouched.
+        replace_body_task_items(
             conn,
             &event.record_id,
             event.local_seq,
@@ -1095,6 +1295,26 @@ async fn apply_record_deleted(conn: &mut SqliteConnection, event: &EventRow) -> 
     // body and the backfill excludes it, so any retained row would be a
     // replay divergence.
     replace_record_mentions(conn, &event.record_id, event.local_seq, None).await?;
+    // E3 M3 increment 2A: unlike mentions, a tombstone keeps the record's
+    // body-task rows. A deletion carries no body, so there is nothing to
+    // re-scan, and the caller-visible view excludes deleted records; keeping
+    // the rows lets the 68→69 backfill (which scans deleted records too) and
+    // a fresh replay converge row-for-row. No restore action: restoring
+    // clears deleted_at without touching the body, so the rows still
+    // describe it.
+    // E3 M1 (v73): a tombstoned successor stops counting. The deleted
+    // record's own links stay (soft delete cascades nothing), but every
+    // target it named via `supersedes` loses one live incoming successor,
+    // so recompute each affected target in this same transaction.
+    let targets: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT target_id FROM links WHERE source_id=? AND relationship='supersedes'",
+    )
+    .bind(&event.record_id)
+    .fetch_all(&mut *conn)
+    .await?;
+    for target in targets {
+        recompute_currency(conn, &target).await?;
+    }
     Ok(())
 }
 
@@ -1103,6 +1323,7 @@ async fn apply_facet_set(
     event: &EventRow,
     payload: crate::events::FacetSetPayload,
     spine: Option<SpineFacet>,
+    time: Option<crate::typed_time::FacetTimeRow>,
 ) -> Result<()> {
     if let Some(spine) = spine {
         let updated_at = next_record_updated_at(conn, &event.record_id, &event.created_at).await?;
@@ -1144,6 +1365,33 @@ async fn apply_facet_set(
         .bind(&event.created_at)
         .execute(&mut *conn)
         .await?;
+        // E3 M1 slice 1: caller-independent archived projection. The
+        // engine-reserved archived facet is presence-based (only 'true' is
+        // representable; restore unsets). The physical column follows the
+        // current facet state, not observations, so observation_only writes
+        // leave it alone and the v66→67 backfill (facet_values presence)
+        // converges with live folding and replay.
+        if payload.key == ARCHIVED_FACET_KEY {
+            sqlx::query("UPDATE records SET archived=1 WHERE id=?")
+                .bind(&event.record_id)
+                .execute(&mut *conn)
+                .await?;
+        }
+        replace_facet_time(conn, &event.record_id, &payload.key, time.as_ref()).await?;
+        // The current value changed, so its JSON occurrence projection must be
+        // replaced in the same transaction. Malformed/scalar/over-budget text
+        // simply leaves the facet with no nodes; the write is never refused.
+        // Read the row's actual id rather than assuming the computed `fv:` form:
+        // a pre-existing row may carry a legacy id, and the upsert keeps it on
+        // conflict, so nodes must key to the id that exists. Unset/record delete
+        // remove nodes through `facet_values`' ON DELETE CASCADE.
+        let facet_id: String =
+            sqlx::query_scalar("SELECT id FROM facet_values WHERE record_id=? AND key=?")
+                .bind(&event.record_id)
+                .bind(&payload.key)
+                .fetch_one(&mut *conn)
+                .await?;
+        crate::facet_value_json_nodes::replace(conn, &facet_id, payload.value.as_deref()).await?;
     }
     let as_of = payload.as_of.as_deref().unwrap_or(&event.created_at);
     sqlx::query(
@@ -1168,6 +1416,192 @@ async fn apply_facet_set(
     .execute(&mut *conn)
     .await?;
     touch(conn, &event.record_id, &event.created_at).await
+}
+
+/// Rebuild `facet_times` from the content log: the row each current facet's
+/// latest current-state write folds to. This is exactly what replaying the
+/// log through [`replace_facet_time`] produces, computed without replay, for
+/// the places that materialise projections directly: the 68→69 migration
+/// edge and canonical interchange import (where `facet_times` is derived
+/// state, not a section).
+///
+/// Cost is bounded for the common case. One existence probe, a scan that
+/// stops at the first match, looks for any `facet.set` whose parsed payload
+/// has a `time_kind` member; with none (every database written before
+/// engine 70) nothing else runs. The probe and the candidate selection use
+/// the same JSON test, so the shortcut is sound: it skips only when the full
+/// rebuild would find nothing. Otherwise the grouped scan
+/// runs once, restricted to the keys that were ever typed, into a temporary
+/// table that is then folded in bounded pages, so no result set is held in
+/// memory whole.
+pub(crate) async fn rebuild_facet_times(conn: &mut SqliteConnection) -> Result<u64> {
+    rebuild_facet_times_paged(conn, 500).await
+}
+
+/// [`rebuild_facet_times`] with an explicit page size, so tests can cross
+/// page boundaries with a handful of rows.
+pub(crate) async fn rebuild_facet_times_paged(
+    conn: &mut SqliteConnection,
+    page: i64,
+) -> Result<u64> {
+    // JSON semantics, never lexical matching: `"time\u005fkind"` is the same
+    // member as `"time_kind"` to the projector's parser and to SQLite's JSON
+    // functions, so a byte search would miss typed events that replay folds.
+    // `json_valid` (inside CASE, since SQLite does not order AND operands)
+    // keeps one malformed legacy payload from aborting the scan; such a
+    // payload cannot be projected, so it can hold no typed value.
+    const TYPED_EVENT: &str = "e.type = 'facet.set'
+              AND CASE WHEN json_valid(e.payload)
+                       THEN json_type(e.payload, '$.time_kind') END = 'text'";
+    sqlx::query("DELETE FROM facet_times")
+        .execute(&mut *conn)
+        .await?;
+    let any_typed: bool = sqlx::query_scalar(&format!(
+        "SELECT EXISTS (SELECT 1 FROM content_events AS e WHERE {TYPED_EVENT})"
+    ))
+    .fetch_one(&mut *conn)
+    .await?;
+    if !any_typed {
+        return Ok(0);
+    }
+    sqlx::query(
+        "CREATE TEMP TABLE IF NOT EXISTS _facet_times_rebuild (
+           ordinal   INTEGER PRIMARY KEY,
+           event_id  TEXT NOT NULL,
+           record_id TEXT NOT NULL,
+           key       TEXT NOT NULL,
+           value     TEXT,
+           time_kind TEXT NOT NULL
+         )",
+    )
+    .execute(&mut *conn)
+    .await?;
+    let rebuilt = fold_facet_time_candidates(conn, TYPED_EVENT, page).await;
+    let dropped = sqlx::query("DROP TABLE IF EXISTS temp._facet_times_rebuild")
+        .execute(&mut *conn)
+        .await;
+    let rebuilt = rebuilt?;
+    dropped?;
+    Ok(rebuilt)
+}
+
+async fn fold_facet_time_candidates(
+    conn: &mut SqliteConnection,
+    typed_event: &str,
+    page: i64,
+) -> Result<u64> {
+    sqlx::query("DELETE FROM temp._facet_times_rebuild")
+        .execute(&mut *conn)
+        .await?;
+    sqlx::query(&format!(
+        "INSERT INTO temp._facet_times_rebuild (event_id, record_id, key, value, time_kind)
+         WITH typed_keys AS MATERIALIZED (
+             SELECT DISTINCT e.record_id, json_extract(e.payload, '$.key') AS key
+               FROM content_events AS e
+              WHERE {typed_event}
+         ), current_writes AS (
+             SELECT e.seq, e.id, e.type, e.record_id, k.key, e.payload
+               FROM content_events AS e
+               JOIN typed_keys AS k
+                 ON k.record_id = e.record_id
+                AND k.key = CASE WHEN json_valid(e.payload)
+                                 THEN json_extract(e.payload, '$.key') END
+              WHERE e.type IN ('facet.set', 'facet.unset')
+                AND CASE WHEN json_valid(e.payload)
+                         THEN COALESCE(json_extract(e.payload, '$.observation_only'), 0) = 0
+                    END
+         ), latest AS (
+             SELECT record_id, key, MAX(seq) AS seq FROM current_writes GROUP BY record_id, key
+         )
+         SELECT w.id, w.record_id, w.key,
+                json_extract(w.payload, '$.value'),
+                json_extract(w.payload, '$.time_kind')
+           FROM current_writes AS w
+           JOIN latest AS l ON l.seq = w.seq
+           JOIN facet_values AS f ON f.record_id = w.record_id AND f.key = w.key
+          WHERE w.type = 'facet.set'
+            AND json_type(w.payload, '$.time_kind') = 'text'
+          ORDER BY w.seq"
+    ))
+    .execute(&mut *conn)
+    .await?;
+    let mut rebuilt = 0;
+    let mut after = 0i64;
+    loop {
+        let candidates: Vec<(i64, String, String, String, Option<String>, String)> =
+            sqlx::query_as(
+                "SELECT ordinal, event_id, record_id, key, value, time_kind
+                   FROM temp._facet_times_rebuild
+                  WHERE ordinal > ? ORDER BY ordinal LIMIT ?",
+            )
+            .bind(after)
+            .bind(page)
+            .fetch_all(&mut *conn)
+            .await?;
+        let Some(last) = candidates.last().map(|candidate| candidate.0) else {
+            return Ok(rebuilt);
+        };
+        after = last;
+        for (_, event_id, record_id, key, value, time_kind) in candidates {
+            let time_type =
+                crate::typed_time::TimeFacetType::parse(&time_kind).ok_or_else(|| {
+                    Error::engine(format!(
+                        "cannot rebuild facet_times: event {event_id} names unknown time_kind '{time_kind}'"
+                    ))
+                })?;
+            let row = crate::domain_transaction::facet_time_row(
+                &event_id,
+                &key,
+                value.as_deref(),
+                time_type,
+            )?;
+            replace_facet_time(conn, &record_id, &key, Some(&row)).await?;
+            rebuilt += 1;
+        }
+    }
+}
+
+/// Keep `facet_times` equal to the current typed time value of one facet
+/// (D2 slice T2). Like `records.archived`, it follows current state only:
+/// callers skip observation-only writes. A current write without a time row
+/// (an untyped value, or an unset) removes whatever row the key held.
+async fn replace_facet_time(
+    conn: &mut SqliteConnection,
+    record_id: &str,
+    key: &str,
+    time: Option<&crate::typed_time::FacetTimeRow>,
+) -> Result<()> {
+    let Some(time) = time else {
+        sqlx::query("DELETE FROM facet_times WHERE record_id = ? AND key = ?")
+            .bind(record_id)
+            .bind(key)
+            .execute(&mut *conn)
+            .await?;
+        return Ok(());
+    };
+    sqlx::query(
+        "INSERT INTO facet_times
+            (record_id, key, kind, all_day, start_date, end_date, start_ms, end_ms, tz, tzdb_version)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT (record_id, key)
+         DO UPDATE SET kind=excluded.kind, all_day=excluded.all_day,
+                       start_date=excluded.start_date, end_date=excluded.end_date,
+                       start_ms=excluded.start_ms, end_ms=excluded.end_ms,
+                       tz=excluded.tz, tzdb_version=excluded.tzdb_version",
+    )
+    .bind(record_id)
+    .bind(key)
+    .bind(time.kind.as_str())
+    .bind(i64::from(time.all_day))
+    .bind(&time.start_date)
+    .bind(&time.end_date)
+    .bind(time.start_ms)
+    .bind(time.end_ms)
+    .bind(&time.tz)
+    .bind(&time.tzdb_version)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
 }
 
 async fn apply_facet_unset(
@@ -1204,6 +1638,15 @@ async fn apply_facet_unset(
             .bind(&payload.key)
             .execute(&mut *conn)
             .await?;
+        // E3 M1 slice 1: restore clears the physical projection. See
+        // apply_facet_set for the observation_only contract.
+        if payload.key == ARCHIVED_FACET_KEY {
+            sqlx::query("UPDATE records SET archived=0 WHERE id=?")
+                .bind(&event.record_id)
+                .execute(&mut *conn)
+                .await?;
+        }
+        replace_facet_time(conn, &event.record_id, &payload.key, None).await?;
     }
     let as_of = payload.as_of.as_deref().unwrap_or(&event.created_at);
     sqlx::query(
@@ -1270,6 +1713,12 @@ async fn apply_link_added(
         .execute(&mut *conn)
         .await?;
     }
+    // E3 M1 (v73): a new live incoming `supersedes` edge moves the target
+    // from current to scope-unknown. Other relationships never touch
+    // currency; the recompute counts live incoming successors only.
+    if payload.relationship == "supersedes" {
+        recompute_currency(conn, &payload.target_id).await?;
+    }
     touch(conn, &payload.source_id, &event.created_at).await
 }
 
@@ -1307,7 +1756,44 @@ async fn apply_link_removed(
         .execute(&mut *conn)
         .await?;
     }
+    // E3 M1 (v73): removing the last live incoming `supersedes` edge
+    // restores the target to current. The recompute recounts rather than
+    // assuming, so convergent successors stay NULL until fully cleared.
+    if payload.relationship == "supersedes" {
+        recompute_currency(conn, &payload.target_id).await?;
+    }
     touch(conn, &payload.source_id, &event.created_at).await
+}
+
+/// E3 M1 (v73): recompute one record's caller-independent currency counts
+/// inside the caller's content transaction.
+///
+/// `successor_count` is the live incoming `supersedes` count — links whose
+/// source record is not tombstoned (`s.deleted_at IS NULL`), with no
+/// visibility filter: an invisible successor is counted but never named,
+/// and naming stays in `get_record` after filtering. `is_current` is
+/// tri-state: 1 when the count is zero, NULL when positive
+/// (whole/partial scope unknown), and 0 is never written here — it is
+/// reserved for a future explicit whole-record assertion the column CHECK
+/// already admits.
+async fn recompute_currency(conn: &mut SqliteConnection, target_id: &str) -> Result<()> {
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM links l JOIN records s ON s.id=l.source_id
+          WHERE l.target_id=? AND l.relationship='supersedes' AND s.deleted_at IS NULL",
+    )
+    .bind(target_id)
+    .fetch_one(&mut *conn)
+    .await?;
+    sqlx::query(
+        "UPDATE records SET successor_count=?,
+           is_current=CASE WHEN ? > 0 THEN NULL ELSE 1 END WHERE id=?",
+    )
+    .bind(count)
+    .bind(count)
+    .bind(target_id)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
 }
 
 async fn assert_portable_person(
@@ -1444,5 +1930,83 @@ mod historical_projection_table_tests {
         ] {
             assert!(!is_optional_projection_table_missing(message));
         }
+    }
+}
+
+#[cfg(test)]
+mod facet_value_json_node_id_tests {
+    use crate::events::FacetSetPayload;
+    use crate::store::{create_record, set_facet};
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn legacy_facet_id_keeps_nodes_keyed_to_the_existing_row() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let id = create_record(
+            &db,
+            json!({"type": "Document", "kind": "note", "name": "legacy facet id"}),
+        )
+        .await
+        .unwrap();
+        // Seed a facet row with a legacy id, as a pre-upgrade database could hold.
+        sqlx::query(
+            "INSERT INTO facet_values (id, record_id, key, value, created_at)
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind("legacy-fv-row")
+        .bind(&id)
+        .bind("k")
+        .bind(r#"{"old":1}"#)
+        .bind("2000-01-01T00:00:00Z")
+        .execute(db.write_pool())
+        .await
+        .unwrap();
+        // The `facet.set` conflicts on the upsert and keeps the legacy id, so
+        // nodes must key to that id, not the computed `fv:` form.
+        set_facet(
+            &db,
+            &id,
+            FacetSetPayload {
+                key: "k".into(),
+                value: Some(r#"{"new":2}"#.into()),
+                vocab_ref: None,
+                as_of: None,
+                observation_only: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        let actual: String =
+            sqlx::query_scalar("SELECT id FROM facet_values WHERE record_id=? AND key=?")
+                .bind(&id)
+                .bind("k")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(actual, "legacy-fv-row");
+
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT path, node_type FROM facet_value_json_nodes WHERE facet_id=? ORDER BY ordinal",
+        )
+        .bind("legacy-fv-row")
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("".into(), "object".into()),
+                ("/new".into(), "number".into())
+            ]
+        );
+
+        let computed: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM facet_value_json_nodes WHERE facet_id=?")
+                .bind(format!("fv:{id}:k"))
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(computed, 0);
     }
 }

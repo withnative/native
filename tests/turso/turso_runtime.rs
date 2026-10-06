@@ -2834,8 +2834,8 @@ async fn engine_handle_routes_the_qualified_domain_slice_and_isolated_query_sql(
         .call_engine(engine.clone(), caller.clone(), "engine_info", json!({}))
         .await
         .unwrap();
-    assert_eq!(info["storage_profile"]["revision"], 4);
-    assert_eq!(info["health"]["profile_revision"], 4);
+    assert_eq!(info["storage_profile"]["revision"], 5);
+    assert_eq!(info["health"]["profile_revision"], 5);
     assert_eq!(
         info["query_sql"],
         native_ce::query::sql_contract::capability(
@@ -3078,6 +3078,284 @@ async fn corrupt_live_runtime_steps(
 }
 
 #[tokio::test]
+async fn current_stamp_config_node_carrier_corruption_refuses_health_and_reopen() {
+    async fn state(path: &std::path::Path) -> (i64, String, i64) {
+        let raw = turso::Builder::new_local(path.to_str().unwrap())
+            .experimental_index_method(true)
+            .build()
+            .await
+            .unwrap();
+        let connection = raw.connect().unwrap();
+        let mut versions = connection.query("PRAGMA user_version", ()).await.unwrap();
+        let version = versions
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get::<i64>(0)
+            .unwrap();
+        drop(versions);
+        let mut rows = connection.query(
+            "SELECT COALESCE((SELECT sql FROM sqlite_schema WHERE name='schema_config_json_nodes'),''),
+                    (SELECT count(*) FROM meta_events)", (),
+        ).await.unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        (
+            version,
+            row.get::<String>(0).unwrap(),
+            row.get::<i64>(1).unwrap(),
+        )
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    for (name, corruption) in [
+        (
+            "missing-config-nodes",
+            "DROP TABLE schema_config_json_nodes",
+        ),
+        (
+            "altered-config-nodes",
+            "ALTER TABLE schema_config_json_nodes ADD COLUMN unreviewed TEXT",
+        ),
+    ] {
+        let runtime_config = config(directory.path(), name);
+        let runtime = runtime_config.open().await.unwrap();
+        assert!(runtime.health().await.unwrap().ready);
+        let path = runtime.path().to_path_buf();
+        // Corruption keeps the current stamp and all advertised runtime tables.
+        corrupt_turso_file(&path, &[corruption]).await;
+        let before = state(&path).await;
+        assert_eq!(before.0, 82);
+        let health = runtime.health().await.unwrap();
+        assert!(!health.ready && !health.write_ready);
+        drop(runtime);
+        assert_eq!(
+            runtime_config.open().await.unwrap_err().to_string(),
+            "Turso-local shared schema-config node carrier is incomplete"
+        );
+        // Refusal cannot silently reconstruct a current-stamp carrier, change
+        // its definition, advance the stamp, or append genesis events.
+        assert_eq!(state(&path).await, before);
+    }
+}
+
+#[tokio::test]
+async fn current_stamp_facet_value_carrier_corruption_refuses_health_and_reopen() {
+    async fn state(path: &std::path::Path) -> (i64, String, i64) {
+        let raw = turso::Builder::new_local(path.to_str().unwrap())
+            .experimental_index_method(true)
+            .build()
+            .await
+            .unwrap();
+        let connection = raw.connect().unwrap();
+        let mut versions = connection.query("PRAGMA user_version", ()).await.unwrap();
+        let version = versions
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get::<i64>(0)
+            .unwrap();
+        drop(versions);
+        let mut rows = connection
+            .query(
+                "SELECT COALESCE((SELECT sql FROM sqlite_schema WHERE name='facet_value_json_nodes'),''),
+                    (SELECT count(*) FROM meta_events)",
+                (),
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        (
+            version,
+            row.get::<String>(0).unwrap(),
+            row.get::<i64>(1).unwrap(),
+        )
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    for (name, corruption) in [
+        ("missing-facet-nodes", "DROP TABLE facet_value_json_nodes"),
+        (
+            "altered-facet-nodes",
+            "ALTER TABLE facet_value_json_nodes ADD COLUMN unreviewed TEXT",
+        ),
+    ] {
+        let runtime_config = config(directory.path(), name);
+        let runtime = runtime_config.open().await.unwrap();
+        assert!(runtime.health().await.unwrap().ready);
+        let path = runtime.path().to_path_buf();
+        corrupt_turso_file(&path, &[corruption]).await;
+        let before = state(&path).await;
+        assert_eq!(before.0, 82);
+        let health = runtime.health().await.unwrap();
+        assert!(!health.ready && !health.write_ready);
+        drop(runtime);
+        assert_eq!(
+            runtime_config.open().await.unwrap_err().to_string(),
+            "Turso-local shared facet-value node carrier is incomplete"
+        );
+        assert_eq!(state(&path).await, before);
+    }
+}
+
+#[tokio::test]
+async fn current_stamp_workspace_carrier_corruption_refuses_health_and_reopen() {
+    async fn state(path: &std::path::Path) -> (i64, Vec<(String, String, String)>, i64) {
+        let raw = turso::Builder::new_local(path.to_str().unwrap())
+            .experimental_index_method(true)
+            .build()
+            .await
+            .unwrap();
+        let connection = raw.connect().unwrap();
+        let mut versions = connection.query("PRAGMA user_version", ()).await.unwrap();
+        let version = versions
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get::<i64>(0)
+            .unwrap();
+        drop(versions);
+        let mut rows = connection.query("SELECT type,name,sql FROM sqlite_schema WHERE name IN ('workspace_rule_installations','idx_workspace_rule_installations_root') ORDER BY name",()).await.unwrap();
+        let mut objects = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            objects.push((
+                row.get(0).unwrap(),
+                row.get(1).unwrap(),
+                row.get(2).unwrap(),
+            ));
+        }
+        drop(rows);
+        let mut events = connection
+            .query("SELECT count(*) FROM meta_events", ())
+            .await
+            .unwrap();
+        let count = events.next().await.unwrap().unwrap().get::<i64>(0).unwrap();
+        (version, objects, count)
+    }
+    let directory = tempfile::tempdir().unwrap();
+    for (name, corruption) in [
+        (
+            "missing-workspace-carrier",
+            "DROP TABLE workspace_rule_installations",
+        ),
+        (
+            "altered-workspace-carrier",
+            "ALTER TABLE workspace_rule_installations ADD COLUMN unreviewed TEXT",
+        ),
+        (
+            "missing-workspace-index",
+            "DROP INDEX idx_workspace_rule_installations_root",
+        ),
+    ] {
+        let runtime_config = config(directory.path(), name);
+        let runtime = runtime_config.open().await.unwrap();
+        assert!(runtime.health().await.unwrap().ready);
+        let path = runtime.path().to_path_buf();
+        corrupt_turso_file(&path, &[corruption]).await;
+        let before = state(&path).await;
+        assert_eq!(before.0, 82);
+        let health = runtime.health().await.unwrap();
+        assert!(!health.ready && !health.write_ready);
+        drop(runtime);
+        assert_eq!(
+            runtime_config.open().await.unwrap_err().to_string(),
+            "Turso-local shared workspace-rule carrier is incomplete"
+        );
+        assert_eq!(state(&path).await, before);
+    }
+}
+
+#[tokio::test]
+async fn fresh_and_reopened_turso_pack_nodes_have_literal_roots_and_scalars() {
+    async fn assert_pack_nodes(path: &std::path::Path) -> (i64, i64) {
+        let raw = turso::Builder::new_local(path.to_str().unwrap())
+            .experimental_index_method(true)
+            .build()
+            .await
+            .unwrap();
+        let connection = raw.connect().unwrap();
+        let mut rows = connection
+            .query(
+                "SELECT path,parent_path,node_type,text_value,number_text,bool_value
+             FROM schema_config_json_nodes WHERE config_id='pack:@native/recommended'
+             AND (ordinal=0 OR path IN (
+               '/shapes/Annotation:comment/facets/lifecycle/axis/key',
+               '/shapes/Annotation:comment/facets/lifecycle/required',
+               '/shapes/Annotation:suggestion/facets/anchor.old')) ORDER BY path",
+                (),
+            )
+            .await
+            .unwrap();
+        let mut actual = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            actual.push((
+                row.get::<String>(0).unwrap(),
+                row.get::<Option<String>>(1).unwrap(),
+                row.get::<String>(2).unwrap(),
+                row.get::<Option<String>>(3).unwrap(),
+                row.get::<Option<String>>(4).unwrap(),
+                row.get::<Option<i64>>(5).unwrap(),
+            ));
+        }
+        // Authored pack semantics, not extraction output used as its own oracle.
+        assert_eq!(
+            actual,
+            vec![
+                ("".into(), None, "object".into(), None, None, None),
+                (
+                    "/shapes/Annotation:comment/facets/lifecycle/axis/key".into(),
+                    Some("/shapes/Annotation:comment/facets/lifecycle/axis".into()),
+                    "string".into(),
+                    Some("thread_state".into()),
+                    None,
+                    None
+                ),
+                (
+                    "/shapes/Annotation:comment/facets/lifecycle/required".into(),
+                    Some("/shapes/Annotation:comment/facets/lifecycle".into()),
+                    "boolean".into(),
+                    None,
+                    None,
+                    Some(0)
+                ),
+                (
+                    "/shapes/Annotation:suggestion/facets/anchor.old".into(),
+                    Some("/shapes/Annotation:suggestion/facets".into()),
+                    "object".into(),
+                    None,
+                    None,
+                    None
+                ),
+            ]
+        );
+        drop(rows);
+        let mut rows = connection.query(
+            "SELECT (SELECT count(*) FROM meta_events),
+                    (SELECT count(*) FROM schema_config_json_nodes WHERE config_id='pack:@native/recommended')", (),
+        ).await.unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        (row.get::<i64>(0).unwrap(), row.get::<i64>(1).unwrap())
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let runtime_config = config(directory.path(), "fresh-pack-config-nodes");
+    let runtime = runtime_config.open().await.unwrap();
+    assert!(runtime.health().await.unwrap().ready);
+    let path = runtime.path().to_path_buf();
+    let counts = assert_pack_nodes(&path).await;
+    assert!(counts.0 > 0 && counts.1 > 4);
+    drop(runtime);
+    for _ in 0..2 {
+        let reopened = runtime_config.open().await.unwrap();
+        assert!(reopened.health().await.unwrap().ready);
+        assert_eq!(assert_pack_nodes(&path).await, counts);
+        drop(reopened);
+    }
+}
+
+#[tokio::test]
 async fn health_covers_every_qualified_projection_before_handlers_reach_it() {
     let directory = tempfile::tempdir().unwrap();
     for (name, table) in [
@@ -3245,5 +3523,262 @@ async fn reopen_rejects_overlay_schema_policy_and_seed_corruption() {
     assert_eq!(
         seed.open().await.unwrap_err().to_string(),
         "Turso-local governed vocabulary genesis is incomplete"
+    );
+}
+
+#[tokio::test]
+async fn governed_content_events_discloses_attribution_by_history_rule() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = config(directory.path(), "runtime-attributed-events")
+        .open()
+        .await
+        .unwrap();
+    let tools = registry();
+    let engine = EngineHandle::TursoLocal(db.clone());
+    for (id, name, account, principal) in [
+        (
+            "70250000-0000-4000-8000-005000000071",
+            "Alice",
+            "acct:sql-alice",
+            "native/sql-alice",
+        ),
+        (
+            "70250000-0000-4000-8000-005000000072",
+            "Bea",
+            "acct:sql-bea",
+            "native/sql-bea",
+        ),
+    ] {
+        tools
+            .call_engine(
+                engine.clone(),
+                Caller::local(),
+                "create_record",
+                json!({
+                    "id": id, "type": "Entity", "kind": "person", "name": name,
+                    "reason": "Create the attribution principal."
+                }),
+            )
+            .await
+            .unwrap();
+        db.contract_provision_member(id, account, principal)
+            .await
+            .unwrap();
+    }
+    tools
+        .call_engine(
+            engine.clone(),
+            Caller::local(),
+            "create_record",
+            json!({
+                "id": "70250000-0000-4000-8000-005000000079",
+                "type": "Document",
+                "kind": "note",
+                "name": "Common",
+                "reason": "Create the attribution visibility fixture."
+            }),
+        )
+        .await
+        .unwrap();
+    // Raw event fixtures go through a direct connection: the engine exposes
+    // no generic SQL seam, so drop the handle, write, and reopen the same
+    // directory (the corrupt_runtime pattern).
+    let path = db.path().to_path_buf();
+    drop(engine);
+    drop(db);
+    let raw = turso::Builder::new_local(path.to_str().unwrap())
+        .experimental_index_method(true)
+        .build()
+        .await
+        .unwrap();
+    let connection = raw.connect().unwrap();
+    for (id, payload, actor, run_key, parent_key) in [
+        (
+            "evt-sql-disclosed",
+            r#"{"summary":"ordinary"}"#,
+            Some("acct:sql-alice"),
+            Some("scout-chair-a748b2"),
+            Some("heron-river-b748b2"),
+        ),
+        (
+            "evt-sql-hidden",
+            r#"{"summary":"bea"}"#,
+            Some("acct:sql-bea"),
+            Some("scout-chair-b748b2"),
+            None,
+        ),
+        (
+            "evt-sql-claim",
+            r#"{"summary":"claimed","claimed_by_account":"acct:sql-alice","claimed_run_key":"scout-chair-a749b2"}"#,
+            Some("acct:sql-alice"),
+            Some("scout-chair-a749b2"),
+            Some("heron-river-c748b2"),
+        ),
+        // An explicit-JSON-null claim key is still claim-shaped: the history
+        // rule tests key presence, and `->` preserves the JSON null.
+        (
+            "evt-sql-claim-null",
+            r#"{"summary":"claimed-null","claimed_by_account":null}"#,
+            Some("acct:sql-alice"),
+            Some("scout-chair-a750b2"),
+            Some("heron-river-d748b2"),
+        ),
+        (
+            "evt-sql-actorless",
+            r#"{"summary":"system"}"#,
+            None,
+            Some("otter-field-c748b2"),
+            None,
+        ),
+    ] {
+        let payload = payload.replace('\'', "''");
+        let cell = |value: Option<&str>| {
+            value
+                .map(|value| format!("'{}'", value.replace('\'', "''")))
+                .unwrap_or_else(|| "NULL".to_string())
+        };
+        connection
+            .execute(
+                &format!(
+                    "INSERT INTO content_events(id,record_id,type,payload,actor,run_key,parent_key,created_at,causal_envelope_version,causal_status) \
+                     VALUES('{id}','70250000-0000-4000-8000-005000000079','record.updated','{payload}',{actor},{run},{parent},'2026-01-03T00:00:00.000Z',1,'complete')",
+                    actor = cell(actor),
+                    run = cell(run_key),
+                    parent = cell(parent_key),
+                ),
+                (),
+            )
+            .await
+            .unwrap();
+    }
+    drop(connection);
+    drop(raw);
+    let db = config(directory.path(), "runtime-attributed-events")
+        .open()
+        .await
+        .unwrap();
+    // Bea's person is visible to members by default; restrict it so her
+    // events are hidden from alice while alice's stay visible to bea.
+    db.contract_restrict_record_to_account_for_test(
+        "70250000-0000-4000-8000-005000000072",
+        "acct:sql-bea",
+    )
+    .await
+    .unwrap();
+    let engine = EngineHandle::TursoLocal(db.clone());
+    let attributed = |caller: Caller| {
+        let tools = registry();
+        let engine = engine.clone();
+        async move {
+            tools
+                .call_engine(
+                    engine,
+                    caller,
+                    "query_sql",
+                    json!({"sql":"SELECT id, actor, run_key, parent_key FROM content_events WHERE record_id='70250000-0000-4000-8000-005000000079' AND id LIKE 'evt-sql-%' ORDER BY local_seq"}),
+                )
+                .await
+                .unwrap()
+        }
+    };
+    let cell =
+        |row: &Value, column: &str| row.get(column).and_then(Value::as_str).map(str::to_string);
+    let rows = |result: Value| {
+        result["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| {
+                (
+                    row["id"].as_str().unwrap().to_string(),
+                    cell(row, "actor"),
+                    cell(row, "run_key"),
+                    cell(row, "parent_key"),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        rows(attributed(Caller::authenticated("acct:sql-alice")).await),
+        vec![
+            (
+                "evt-sql-disclosed".to_string(),
+                Some("acct:sql-alice".to_string()),
+                Some("scout-chair-a748b2".to_string()),
+                Some("heron-river-b748b2".to_string()),
+            ),
+            ("evt-sql-hidden".to_string(), None, None, None),
+            (
+                "evt-sql-claim".to_string(),
+                Some("acct:sql-alice".to_string()),
+                Some("scout-chair-a749b2".to_string()),
+                Some("heron-river-c748b2".to_string()),
+            ),
+            (
+                "evt-sql-claim-null".to_string(),
+                Some("acct:sql-alice".to_string()),
+                Some("scout-chair-a750b2".to_string()),
+                Some("heron-river-d748b2".to_string()),
+            ),
+            ("evt-sql-actorless".to_string(), None, None, None),
+        ]
+    );
+    assert_eq!(
+        rows(attributed(Caller::authenticated("acct:sql-bea")).await),
+        vec![
+            (
+                "evt-sql-disclosed".to_string(),
+                Some("acct:sql-alice".to_string()),
+                Some("scout-chair-a748b2".to_string()),
+                Some("heron-river-b748b2".to_string()),
+            ),
+            (
+                "evt-sql-hidden".to_string(),
+                Some("acct:sql-bea".to_string()),
+                Some("scout-chair-b748b2".to_string()),
+                None,
+            ),
+            (
+                "evt-sql-claim".to_string(),
+                Some("acct:sql-alice".to_string()),
+                None,
+                None,
+            ),
+            (
+                "evt-sql-claim-null".to_string(),
+                Some("acct:sql-alice".to_string()),
+                None,
+                None,
+            ),
+            ("evt-sql-actorless".to_string(), None, None, None),
+        ]
+    );
+    assert!(rows(attributed(Caller::local()).await)
+        .iter()
+        .all(|(id, actor, run_key, _)| {
+            actor.is_some() || (id == "evt-sql-actorless" && run_key.is_some())
+        }));
+    // Withdrawing View of alice's person record hides her attribution from
+    // bea through the same join, exactly as get_history redaction does.
+    db.contract_restrict_record_to_account_for_test(
+        "70250000-0000-4000-8000-005000000071",
+        "acct:sql-alice",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        rows(attributed(Caller::authenticated("acct:sql-bea")).await),
+        vec![
+            ("evt-sql-disclosed".to_string(), None, None, None),
+            (
+                "evt-sql-hidden".to_string(),
+                Some("acct:sql-bea".to_string()),
+                Some("scout-chair-b748b2".to_string()),
+                None,
+            ),
+            ("evt-sql-claim".to_string(), None, None, None),
+            ("evt-sql-claim-null".to_string(), None, None, None),
+            ("evt-sql-actorless".to_string(), None, None, None),
+        ]
     );
 }

@@ -118,6 +118,62 @@ async fn active_derivation_role_lookup_has_a_pinned_partial_index() {
 
 #[tokio::test]
 async fn fresh_and_reopened_databases_install_defaults_without_duplicate_meta_events() {
+    async fn assert_pack_nodes(db: &native_ce::Db) -> i64 {
+        type PackNodeRow = (
+            String,
+            Option<String>,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+        );
+        let rows: Vec<PackNodeRow> = sqlx::query_as(
+            "SELECT path,parent_path,node_type,text_value,number_text,bool_value
+             FROM schema_config_json_nodes WHERE config_id='pack:@native/recommended'
+             AND (ordinal=0 OR path IN (
+               '/shapes/Annotation:comment/facets/lifecycle/axis/key',
+               '/shapes/Annotation:comment/facets/lifecycle/required',
+               '/shapes/Annotation:suggestion/facets/anchor.old')) ORDER BY path",
+        )
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        // Literal pack semantics, independent of the extraction implementation:
+        // root, scalar type slots, and an empty object must all be projected.
+        assert_eq!(
+            rows,
+            vec![
+                ("".into(), None, "object".into(), None, None, None),
+                (
+                    "/shapes/Annotation:comment/facets/lifecycle/axis/key".into(),
+                    Some("/shapes/Annotation:comment/facets/lifecycle/axis".into()),
+                    "string".into(),
+                    Some("thread_state".into()),
+                    None,
+                    None
+                ),
+                (
+                    "/shapes/Annotation:comment/facets/lifecycle/required".into(),
+                    Some("/shapes/Annotation:comment/facets/lifecycle".into()),
+                    "boolean".into(),
+                    None,
+                    None,
+                    Some(0)
+                ),
+                (
+                    "/shapes/Annotation:suggestion/facets/anchor.old".into(),
+                    Some("/shapes/Annotation:suggestion/facets".into()),
+                    "object".into(),
+                    None,
+                    None,
+                    None
+                ),
+            ]
+        );
+        sqlx::query_scalar("SELECT count(*) FROM schema_config_json_nodes WHERE config_id='pack:@native/recommended'")
+            .fetch_one(db.pool()).await.unwrap()
+    }
+
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("native.db");
     let url = path.to_string_lossy();
@@ -158,6 +214,8 @@ async fn fresh_and_reopened_databases_install_defaults_without_duplicate_meta_ev
         .await
         .unwrap();
     assert!(after_create > 0);
+    let node_count = assert_pack_nodes(&db).await;
+    assert!(node_count > 4);
     db.close().await;
 
     for _ in 0..2 {
@@ -167,6 +225,7 @@ async fn fresh_and_reopened_databases_install_defaults_without_duplicate_meta_ev
             .await
             .unwrap();
         assert_eq!(after_reopen, after_create);
+        assert_eq!(assert_pack_nodes(&reopened).await, node_count);
         reopened.close().await;
     }
 }

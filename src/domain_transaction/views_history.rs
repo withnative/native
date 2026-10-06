@@ -445,12 +445,12 @@ async fn load_facets<E: DomainStatementExecutor>(
             // (assert_no_reserved_facet_keys refuses them), so the cascade
             // has no shape for them and an object-valued reserved facet
             // would otherwise decode as a raw JSON string with no error.
-            let object_typed = shapes
-                .get(&key)
-                .and_then(|shape| shape.get("type"))
-                .and_then(Value::as_str)
-                == Some("object")
-                || key == crate::canvas::PROMOTED_FROM_FACET_KEY;
+            let object_typed = crate::domain_transaction::declared_type_is_json_object(
+                shapes
+                    .get(&key)
+                    .and_then(|shape| shape.get("type"))
+                    .and_then(Value::as_str),
+            ) || key == crate::canvas::PROMOTED_FROM_FACET_KEY;
             let value = optional_text(raw, "value")?.map(|stored| {
                 if object_typed {
                     serde_json::from_str::<Value>(&stored)

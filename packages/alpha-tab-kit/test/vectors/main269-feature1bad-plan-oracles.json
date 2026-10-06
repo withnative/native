@@ -1,0 +1,2182 @@
+{
+  "main": "269dbff08890a36ef660945970665bac601627c0",
+  "root": "1bad1ca097caf0b78d5f46a974817e40a0e5f341",
+  "note": "Produced ONLY with immutable original sources; feature UUID field alone replaced by sentinel. No existing expected vectors regenerated.",
+  "legacy": [
+    {
+      "name": "default",
+      "input": {
+        "descriptor": {
+          "package": "agent.kit-probe",
+          "version": "0.1.0",
+          "bundle": "probe-concurrent.html",
+          "runtime": "native.html.v1",
+          "declaration": {
+            "needs": [
+              {
+                "need": "sql.snapshot.v1",
+                "key": "probe.list",
+                "label": "Open tasks, newest first",
+                "sql": "SELECT id, name FROM records WHERE type = 'WorkItem' ORDER BY last_activity_at_ms DESC, id LIMIT 200"
+              },
+              {
+                "need": "sql.snapshot.v1",
+                "key": "probe.body",
+                "label": "One record's body, read when opened",
+                "sql": "SELECT id, body FROM records WHERE id = ?1",
+                "params": [
+                  {
+                    "name": "id",
+                    "type": "text",
+                    "max_len": 64
+                  }
+                ]
+              },
+              {
+                "need": "sql.snapshot.v1",
+                "key": "probe.links",
+                "label": "One record's outgoing links, read when opened",
+                "sql": "SELECT target_id, relationship FROM links WHERE source_id = ?1 ORDER BY target_id LIMIT 50",
+                "params": [
+                  {
+                    "name": "id",
+                    "type": "text",
+                    "max_len": 64
+                  }
+                ]
+              }
+            ],
+            "effects": []
+          }
+        },
+        "html": "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n<title>Kit probe</title>\n</head>\n<body>\n<main>\n<h1>Kit probe</h1>\n<ul id=\"list\"></ul>\n<section id=\"detail\"><h2>Detail</h2><p id=\"body\">Nothing open</p><p id=\"links\"></p></section>\n</main>\n<script>\n// One read in flight, busy (or a synchronous bridge refusal) retried with\n// bounded backoff: the pattern the 0.1.1 tabs adopted.\nconst queue = [];\nlet active = false;\nfunction pump() {\n  if (active || !queue.length) return;\n  active = true;\n  const job = queue.shift();\n  const attempt = (tries) => {\n    let request;\n    try { request = window.nativeArtifact.read(job.need, job.params); } catch (error) { request = Promise.resolve({ status: \"busy\" }); }\n    request.then((reply) => {\n      if (reply && reply.status === \"busy\" && tries < 8) { setTimeout(() => attempt(tries + 1), 120 * (tries + 1)); return; }\n      active = false;\n      job.resolve(reply && reply.status === \"ok\" ? reply.result.rows : null);\n      pump();\n    }, () => { active = false; job.resolve(null); pump(); });\n  };\n  attempt(0);\n}\nconst read = (need, params) => new Promise((resolve) => { queue.push({ need, params, resolve }); pump(); });\nfunction open(id) {\n  document.getElementById(\"body\").textContent = \"Loading\";\n  read(\"probe.body\", { id }).then((rows) => { document.getElementById(\"body\").textContent = rows && rows[0] ? rows[0].body : \"The record body could not be read\"; });\n  read(\"probe.links\", { id }).then((rows) => { document.getElementById(\"links\").textContent = rows ? rows.length + \" links\" : \"Links could not be read\"; });\n}\nfunction render(input) {\n  const list = document.getElementById(\"list\");\n  list.textContent = \"\";\n  const section = input.sql && input.sql[\"probe.list\"];\n  for (const row of section ? section.rows : []) {\n    const item = document.createElement(\"li\");\n    const button = document.createElement(\"button\");\n    button.type = \"button\"; button.textContent = row.name; button.dataset.id = row.id;\n    button.addEventListener(\"click\", () => { open(row.id); window.nativeArtifact.setViewState({ open: row.id }); });\n    item.append(button);\n    list.append(item);\n  }\n  list.dataset.count = section ? section.row_count + (section.truncated ? \" truncated\" : \"\") : \"sample\";\n}\nwindow.nativeArtifact.ready.then((delivery) => render(delivery.input));\nwindow.nativeArtifact.onInput((delivery) => render(delivery.input));\n</script>\n</body>\n</html>\n",
+        "homeId": "home",
+        "reason": "Pinned immutable main oracle",
+        "chunkBytes": 700
+      },
+      "plan": {
+        "package": "agent.kit-probe",
+        "version": "0.1.0",
+        "digests": {
+          "digest_version": "alpha-tab-digest.v1",
+          "bundle_sha256": "1c7811887596c0cd39dc9746bee08eb9424161b715585bfeec54a784f64ff976",
+          "declaration_digest": "7046960d2f71a024b142dda14cf51ce5616c8964b0782ab7f275a97078724c16",
+          "digest": "sha256:c593f94136e397ad144116428cdcdc9eb643ed186015c22a712d0b26913cd2c8"
+        },
+        "chunks": 1,
+        "steps": [
+          {
+            "step": "create-artifact",
+            "executor": "records_write",
+            "operation": "create_record",
+            "arguments": {
+              "type": "Document",
+              "kind": "artifact",
+              "name": "agent.kit-probe 0.1.0 (alpha tab source)",
+              "home_id": "home",
+              "summary": "Source bytes of alpha tab agent.kit-probe 0.1.0.",
+              "body": "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n<title>Kit probe</title>\n</head>\n<body>\n<main>\n<h1>Kit probe</h1>\n<ul id=\"list\"></ul>\n<section id=\"detail\"><h2>Detail</h2><p id=\"body\">Nothing open</p><p id=\"links\"></p></section>\n</main>\n<script>\n// One read in flight, busy (or a synchronous bridge refusal) retried with\n// bounded backoff: the pattern the 0.1.1 tabs adopted.\nconst queue = [];\nlet active = false;\nfunction pump() {\n  if (active || !queue.length) return;\n  active = true;\n  const job = queue.shift();\n  const attempt = (tries) => {\n    let request;\n    try { request = window.nativeArtifact.read(job.need, job.params); } catch (error) { request = Promise.resolve({ status: \"busy\" }); }\n    request.then((reply) => {\n      if (reply && reply.status === \"busy\" && tries < 8) { setTimeout(() => attempt(tries + 1), 120 * (tries + 1)); return; }\n      active = false;\n      job.resolve(reply && reply.status === \"ok\" ? reply.result.rows : null);\n      pump();\n    }, () => { active = false; job.resolve(null); pump(); });\n  };\n  attempt(0);\n}\nconst read = (need, params) => new Promise((resolve) => { queue.push({ need, params, resolve }); pump(); });\nfunction open(id) {\n  document.getElementById(\"body\").textContent = \"Loading\";\n  read(\"probe.body\", { id }).then((rows) => { document.getElementById(\"body\").textContent = rows && rows[0] ? rows[0].body : \"The record body could not be read\"; });\n  read(\"probe.links\", { id }).then((rows) => { document.getElementById(\"links\").textContent = rows ? rows.length + \" links\" : \"Links could not be read\"; });\n}\nfunction render(input) {\n  const list = document.getElementById(\"list\");\n  list.textContent = \"\";\n  const section = input.sql && input.sql[\"probe.list\"];\n  for (const row of section ? section.rows : []) {\n    const item = document.createElement(\"li\");\n    const button = document.createElement(\"button\");\n    button.type = \"button\"; button.textContent = row.name; button.dataset.id = row.id;\n    button.addEventListener(\"click\", () => { open(row.id); window.nativeArtifact.setViewState({ open: row.id }); });\n    item.append(button);\n    list.append(item);\n  }\n  list.dataset.count = section ? section.row_count + (section.truncated ? \" truncated\" : \"\") : \"sample\";\n}\nwindow.nativeArtifact.ready.then((delivery) => render(delivery.input));\nwindow.nativeArtifact.onInput((delivery) => render(delivery.input));\n</script>\n</body>\n</html>\n",
+              "facets": {
+                "runtime": "native.html.v1"
+              },
+              "reason": "Pinned immutable main oracle",
+              "sources": [],
+              "response_mode": "summary"
+            },
+            "expect": {
+              "body_digest": "1c7811887596c0cd39dc9746bee08eb9424161b715585bfeec54a784f64ff976",
+              "body_bytes": 2486
+            }
+          },
+          {
+            "step": "install",
+            "executor": "artifacts_write",
+            "operation": "manage_alpha_tabs.install",
+            "arguments": {
+              "package": "agent.kit-probe",
+              "version": "0.1.0",
+              "digest": "sha256:c593f94136e397ad144116428cdcdc9eb643ed186015c22a712d0b26913cd2c8",
+              "artifact_id": "{{record_id}}",
+              "source_revision": "{{source_revision}}",
+              "declaration": {
+                "needs": [
+                  {
+                    "need": "sql.snapshot.v1",
+                    "key": "probe.list",
+                    "label": "Open tasks, newest first",
+                    "sql": "SELECT id, name FROM records WHERE type = 'WorkItem' ORDER BY last_activity_at_ms DESC, id LIMIT 200"
+                  },
+                  {
+                    "need": "sql.snapshot.v1",
+                    "key": "probe.body",
+                    "label": "One record's body, read when opened",
+                    "sql": "SELECT id, body FROM records WHERE id = ?1",
+                    "params": [
+                      {
+                        "name": "id",
+                        "type": "text",
+                        "max_len": 64
+                      }
+                    ]
+                  },
+                  {
+                    "need": "sql.snapshot.v1",
+                    "key": "probe.links",
+                    "label": "One record's outgoing links, read when opened",
+                    "sql": "SELECT target_id, relationship FROM links WHERE source_id = ?1 ORDER BY target_id LIMIT 50",
+                    "params": [
+                      {
+                        "name": "id",
+                        "type": "text",
+                        "max_len": 64
+                      }
+                    ]
+                  }
+                ],
+                "effects": []
+              },
+              "reason": "Pinned immutable main oracle"
+            },
+            "expect": {
+              "digest": "sha256:c593f94136e397ad144116428cdcdc9eb643ed186015c22a712d0b26913cd2c8",
+              "declaration_digest": "7046960d2f71a024b142dda14cf51ce5616c8964b0782ab7f275a97078724c16"
+            }
+          },
+          {
+            "step": "inspect",
+            "executor": "artifacts_read",
+            "operation": "manage_alpha_tabs.inspect",
+            "arguments": {
+              "package": "agent.kit-probe"
+            },
+            "expect": {
+              "digest": "sha256:c593f94136e397ad144116428cdcdc9eb643ed186015c22a712d0b26913cd2c8",
+              "declaration_digest": "7046960d2f71a024b142dda14cf51ce5616c8964b0782ab7f275a97078724c16",
+              "version": "0.1.0"
+            },
+            "note": "Preview and adoption are the viewer's, in a signed-in browser at /alpha/: agents are refused preview receipts (preview_authority_missing)."
+          }
+        ]
+      }
+    },
+    {
+      "name": "chunked",
+      "input": {
+        "descriptor": {
+          "package": "agent.kit-probe",
+          "version": "0.1.0",
+          "bundle": "probe-concurrent.html",
+          "runtime": "native.html.v1",
+          "declaration": {
+            "needs": [
+              {
+                "need": "sql.snapshot.v1",
+                "key": "probe.list",
+                "label": "Open tasks, newest first",
+                "sql": "SELECT id, name FROM records WHERE type = 'WorkItem' ORDER BY last_activity_at_ms DESC, id LIMIT 200"
+              },
+              {
+                "need": "sql.snapshot.v1",
+                "key": "probe.body",
+                "label": "One record's body, read when opened",
+                "sql": "SELECT id, body FROM records WHERE id = ?1",
+                "params": [
+                  {
+                    "name": "id",
+                    "type": "text",
+                    "max_len": 64
+                  }
+                ]
+              },
+              {
+                "need": "sql.snapshot.v1",
+                "key": "probe.links",
+                "label": "One record's outgoing links, read when opened",
+                "sql": "SELECT target_id, relationship FROM links WHERE source_id = ?1 ORDER BY target_id LIMIT 50",
+                "params": [
+                  {
+                    "name": "id",
+                    "type": "text",
+                    "max_len": 64
+                  }
+                ]
+              }
+            ],
+            "effects": []
+          }
+        },
+        "html": "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n<title>Kit probe</title>\n</head>\n<body>\n<main>\n<h1>Kit probe</h1>\n<ul id=\"list\"></ul>\n<section id=\"detail\"><h2>Detail</h2><p id=\"body\">Nothing open</p><p id=\"links\"></p></section>\n</main>\n<script>\n// One read in flight, busy (or a synchronous bridge refusal) retried with\n// bounded backoff: the pattern the 0.1.1 tabs adopted.\nconst queue = [];\nlet active = false;\nfunction pump() {\n  if (active || !queue.length) return;\n  active = true;\n  const job = queue.shift();\n  const attempt = (tries) => {\n    let request;\n    try { request = window.nativeArtifact.read(job.need, job.params); } catch (error) { request = Promise.resolve({ status: \"busy\" }); }\n    request.then((reply) => {\n      if (reply && reply.status === \"busy\" && tries < 8) { setTimeout(() => attempt(tries + 1), 120 * (tries + 1)); return; }\n      active = false;\n      job.resolve(reply && reply.status === \"ok\" ? reply.result.rows : null);\n      pump();\n    }, () => { active = false; job.resolve(null); pump(); });\n  };\n  attempt(0);\n}\nconst read = (need, params) => new Promise((resolve) => { queue.push({ need, params, resolve }); pump(); });\nfunction open(id) {\n  document.getElementById(\"body\").textContent = \"Loading\";\n  read(\"probe.body\", { id }).then((rows) => { document.getElementById(\"body\").textContent = rows && rows[0] ? rows[0].body : \"The record body could not be read\"; });\n  read(\"probe.links\", { id }).then((rows) => { document.getElementById(\"links\").textContent = rows ? rows.length + \" links\" : \"Links could not be read\"; });\n}\nfunction render(input) {\n  const list = document.getElementById(\"list\");\n  list.textContent = \"\";\n  const section = input.sql && input.sql[\"probe.list\"];\n  for (const row of section ? section.rows : []) {\n    const item = document.createElement(\"li\");\n    const button = document.createElement(\"button\");\n    button.type = \"button\"; button.textContent = row.name; button.dataset.id = row.id;\n    button.addEventListener(\"click\", () => { open(row.id); window.nativeArtifact.setViewState({ open: row.id }); });\n    item.append(button);\n    list.append(item);\n  }\n  list.dataset.count = section ? section.row_count + (section.truncated ? \" truncated\" : \"\") : \"sample\";\n}\nwindow.nativeArtifact.ready.then((delivery) => render(delivery.input));\nwindow.nativeArtifact.onInput((delivery) => render(delivery.input));\n</script>\n</body>\n</html>\n",
+        "homeId": "home",
+        "reason": "Pinned immutable main oracle",
+        "chunkBytes": 700,
+        "chunked": true
+      },
+      "plan": {
+        "package": "agent.kit-probe",
+        "version": "0.1.0",
+        "digests": {
+          "digest_version": "alpha-tab-digest.v1",
+          "bundle_sha256": "1c7811887596c0cd39dc9746bee08eb9424161b715585bfeec54a784f64ff976",
+          "declaration_digest": "7046960d2f71a024b142dda14cf51ce5616c8964b0782ab7f275a97078724c16",
+          "digest": "sha256:c593f94136e397ad144116428cdcdc9eb643ed186015c22a712d0b26913cd2c8"
+        },
+        "chunks": 4,
+        "steps": [
+          {
+            "step": "create-note",
+            "executor": "records_write",
+            "operation": "create_record",
+            "arguments": {
+              "type": "Document",
+              "kind": "note",
+              "name": "agent.kit-probe 0.1.0 (alpha tab source)",
+              "home_id": "home",
+              "summary": "Source bytes of alpha tab agent.kit-probe 0.1.0; staged as a note, then switched to native.html.v1.",
+              "body": "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n<title>Kit probe</title>\n</head>\n<body>\n<main>\n<h1>Kit probe</h1>\n<ul id=\"list\"></ul>\n<section id=\"detail\"><h2>Detail</h2><p id=\"body\">Nothing open</p><p id=\"links\"></p></section>\n</main>\n<script>\n// One read in flight, busy (or a synchronous bridge refusal) retried with\n// bounded backoff: the pattern the 0.1.1 tabs adopted.\nconst queue = [];\nlet active = false;\nfunction pump() {\n  if (active || !queue.length) return;\n  active = true;\n  const job = queue.shift();\n  const attempt = (tries) => {\n    let request;\n    try { request = window.nativeArtifact.read(job.n",
+              "reason": "Pinned immutable main oracle",
+              "sources": []
+            },
+            "expect": {
+              "body_digest": "4ec685e918638f1206077bf32a17dd6ea61ef1a8540f1da491c87347f0b2395f",
+              "body_bytes": 700
+            }
+          },
+          {
+            "step": "append-2",
+            "executor": "records_write",
+            "operation": "update_record",
+            "arguments": {
+              "id": "{{record_id}}",
+              "body_append": "eed, job.params); } catch (error) { request = Promise.resolve({ status: \"busy\" }); }\n    request.then((reply) => {\n      if (reply && reply.status === \"busy\" && tries < 8) { setTimeout(() => attempt(tries + 1), 120 * (tries + 1)); return; }\n      active = false;\n      job.resolve(reply && reply.status === \"ok\" ? reply.result.rows : null);\n      pump();\n    }, () => { active = false; job.resolve(null); pump(); });\n  };\n  attempt(0);\n}\nconst read = (need, params) => new Promise((resolve) => { queue.push({ need, params, resolve }); pump(); });\nfunction open(id) {\n  document.getElementById(\"body\").textContent = \"Loading\";\n  read(\"probe.body\", { id }).then((rows) => { document.getElementById(\"bod",
+              "if_body_digest": "4ec685e918638f1206077bf32a17dd6ea61ef1a8540f1da491c87347f0b2395f",
+              "reason": "Pinned immutable main oracle (chunk 2 of 4)",
+              "sources": []
+            },
+            "expect": {
+              "body_digest": "481b63a7a687853512cac57785dcc3e35d24a75426f4c015456455d4445c6405",
+              "body_bytes": 1400
+            }
+          },
+          {
+            "step": "append-3",
+            "executor": "records_write",
+            "operation": "update_record",
+            "arguments": {
+              "id": "{{record_id}}",
+              "body_append": "y\").textContent = rows && rows[0] ? rows[0].body : \"The record body could not be read\"; });\n  read(\"probe.links\", { id }).then((rows) => { document.getElementById(\"links\").textContent = rows ? rows.length + \" links\" : \"Links could not be read\"; });\n}\nfunction render(input) {\n  const list = document.getElementById(\"list\");\n  list.textContent = \"\";\n  const section = input.sql && input.sql[\"probe.list\"];\n  for (const row of section ? section.rows : []) {\n    const item = document.createElement(\"li\");\n    const button = document.createElement(\"button\");\n    button.type = \"button\"; button.textContent = row.name; button.dataset.id = row.id;\n    button.addEventListener(\"click\", () => { open(row.id)",
+              "if_body_digest": "481b63a7a687853512cac57785dcc3e35d24a75426f4c015456455d4445c6405",
+              "reason": "Pinned immutable main oracle (chunk 3 of 4)",
+              "sources": []
+            },
+            "expect": {
+              "body_digest": "8a0d33cd33a7776489c2f4819b5cbe1c76edec53d5b9d4ef9ffc575e370822a4",
+              "body_bytes": 2100
+            }
+          },
+          {
+            "step": "append-4",
+            "executor": "records_write",
+            "operation": "update_record",
+            "arguments": {
+              "id": "{{record_id}}",
+              "body_append": "; window.nativeArtifact.setViewState({ open: row.id }); });\n    item.append(button);\n    list.append(item);\n  }\n  list.dataset.count = section ? section.row_count + (section.truncated ? \" truncated\" : \"\") : \"sample\";\n}\nwindow.nativeArtifact.ready.then((delivery) => render(delivery.input));\nwindow.nativeArtifact.onInput((delivery) => render(delivery.input));\n</script>\n</body>\n</html>\n",
+              "if_body_digest": "8a0d33cd33a7776489c2f4819b5cbe1c76edec53d5b9d4ef9ffc575e370822a4",
+              "reason": "Pinned immutable main oracle (chunk 4 of 4)",
+              "sources": []
+            },
+            "expect": {
+              "body_digest": "1c7811887596c0cd39dc9746bee08eb9424161b715585bfeec54a784f64ff976",
+              "body_bytes": 2486
+            }
+          },
+          {
+            "step": "source-revision",
+            "executor": "sql_read",
+            "operation": "query_sql",
+            "arguments": {
+              "sql": "SELECT id, type FROM content_events WHERE record_id = ?1 AND type IN ('record.created', 'record.updated', 'receipt.committed.v1') ORDER BY local_seq DESC, id LIMIT 1",
+              "parameters": [
+                {
+                  "type": "text",
+                  "value": "{{record_id}}"
+                }
+              ]
+            },
+            "capture": {
+              "source_revision": "rows[0].id"
+            },
+            "note": "Run before any other write to the record: the newest event is the last body-carrying write."
+          },
+          {
+            "step": "rekind-artifact",
+            "executor": "records_write",
+            "operation": "update_record",
+            "arguments": {
+              "id": "{{record_id}}",
+              "kind": "artifact",
+              "facets": {
+                "runtime": "native.html.v1"
+              },
+              "if_body_digest": "1c7811887596c0cd39dc9746bee08eb9424161b715585bfeec54a784f64ff976",
+              "reason": "Pinned immutable main oracle (switch to native.html.v1; validates the complete document)",
+              "sources": []
+            },
+            "expect": {
+              "body_digest": "1c7811887596c0cd39dc9746bee08eb9424161b715585bfeec54a784f64ff976"
+            }
+          },
+          {
+            "step": "install",
+            "executor": "artifacts_write",
+            "operation": "manage_alpha_tabs.install",
+            "arguments": {
+              "package": "agent.kit-probe",
+              "version": "0.1.0",
+              "digest": "sha256:c593f94136e397ad144116428cdcdc9eb643ed186015c22a712d0b26913cd2c8",
+              "artifact_id": "{{record_id}}",
+              "source_revision": "{{source_revision}}",
+              "declaration": {
+                "needs": [
+                  {
+                    "need": "sql.snapshot.v1",
+                    "key": "probe.list",
+                    "label": "Open tasks, newest first",
+                    "sql": "SELECT id, name FROM records WHERE type = 'WorkItem' ORDER BY last_activity_at_ms DESC, id LIMIT 200"
+                  },
+                  {
+                    "need": "sql.snapshot.v1",
+                    "key": "probe.body",
+                    "label": "One record's body, read when opened",
+                    "sql": "SELECT id, body FROM records WHERE id = ?1",
+                    "params": [
+                      {
+                        "name": "id",
+                        "type": "text",
+                        "max_len": 64
+                      }
+                    ]
+                  },
+                  {
+                    "need": "sql.snapshot.v1",
+                    "key": "probe.links",
+                    "label": "One record's outgoing links, read when opened",
+                    "sql": "SELECT target_id, relationship FROM links WHERE source_id = ?1 ORDER BY target_id LIMIT 50",
+                    "params": [
+                      {
+                        "name": "id",
+                        "type": "text",
+                        "max_len": 64
+                      }
+                    ]
+                  }
+                ],
+                "effects": []
+              },
+              "reason": "Pinned immutable main oracle"
+            },
+            "expect": {
+              "digest": "sha256:c593f94136e397ad144116428cdcdc9eb643ed186015c22a712d0b26913cd2c8",
+              "declaration_digest": "7046960d2f71a024b142dda14cf51ce5616c8964b0782ab7f275a97078724c16"
+            }
+          },
+          {
+            "step": "inspect",
+            "executor": "artifacts_read",
+            "operation": "manage_alpha_tabs.inspect",
+            "arguments": {
+              "package": "agent.kit-probe"
+            },
+            "expect": {
+              "digest": "sha256:c593f94136e397ad144116428cdcdc9eb643ed186015c22a712d0b26913cd2c8",
+              "declaration_digest": "7046960d2f71a024b142dda14cf51ce5616c8964b0782ab7f275a97078724c16",
+              "version": "0.1.0"
+            },
+            "note": "Preview and adoption are the viewer's, in a signed-in browser at /alpha/: agents are refused preview receipts (preview_authority_missing)."
+          }
+        ]
+      }
+    },
+    {
+      "name": "default replacement",
+      "input": {
+        "descriptor": {
+          "package": "agent.kit-probe",
+          "version": "0.1.0",
+          "bundle": "probe-concurrent.html",
+          "runtime": "native.html.v1",
+          "declaration": {
+            "needs": [
+              {
+                "need": "sql.snapshot.v1",
+                "key": "probe.list",
+                "label": "Open tasks, newest first",
+                "sql": "SELECT id, name FROM records WHERE type = 'WorkItem' ORDER BY last_activity_at_ms DESC, id LIMIT 200"
+              },
+              {
+                "need": "sql.snapshot.v1",
+                "key": "probe.body",
+                "label": "One record's body, read when opened",
+                "sql": "SELECT id, body FROM records WHERE id = ?1",
+                "params": [
+                  {
+                    "name": "id",
+                    "type": "text",
+                    "max_len": 64
+                  }
+                ]
+              },
+              {
+                "need": "sql.snapshot.v1",
+                "key": "probe.links",
+                "label": "One record's outgoing links, read when opened",
+                "sql": "SELECT target_id, relationship FROM links WHERE source_id = ?1 ORDER BY target_id LIMIT 50",
+                "params": [
+                  {
+                    "name": "id",
+                    "type": "text",
+                    "max_len": 64
+                  }
+                ]
+              }
+            ],
+            "effects": []
+          }
+        },
+        "html": "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n<title>Kit probe</title>\n</head>\n<body>\n<main>\n<h1>Kit probe</h1>\n<ul id=\"list\"></ul>\n<section id=\"detail\"><h2>Detail</h2><p id=\"body\">Nothing open</p><p id=\"links\"></p></section>\n</main>\n<script>\n// One read in flight, busy (or a synchronous bridge refusal) retried with\n// bounded backoff: the pattern the 0.1.1 tabs adopted.\nconst queue = [];\nlet active = false;\nfunction pump() {\n  if (active || !queue.length) return;\n  active = true;\n  const job = queue.shift();\n  const attempt = (tries) => {\n    let request;\n    try { request = window.nativeArtifact.read(job.need, job.params); } catch (error) { request = Promise.resolve({ status: \"busy\" }); }\n    request.then((reply) => {\n      if (reply && reply.status === \"busy\" && tries < 8) { setTimeout(() => attempt(tries + 1), 120 * (tries + 1)); return; }\n      active = false;\n      job.resolve(reply && reply.status === \"ok\" ? reply.result.rows : null);\n      pump();\n    }, () => { active = false; job.resolve(null); pump(); });\n  };\n  attempt(0);\n}\nconst read = (need, params) => new Promise((resolve) => { queue.push({ need, params, resolve }); pump(); });\nfunction open(id) {\n  document.getElementById(\"body\").textContent = \"Loading\";\n  read(\"probe.body\", { id }).then((rows) => { document.getElementById(\"body\").textContent = rows && rows[0] ? rows[0].body : \"The record body could not be read\"; });\n  read(\"probe.links\", { id }).then((rows) => { document.getElementById(\"links\").textContent = rows ? rows.length + \" links\" : \"Links could not be read\"; });\n}\nfunction render(input) {\n  const list = document.getElementById(\"list\");\n  list.textContent = \"\";\n  const section = input.sql && input.sql[\"probe.list\"];\n  for (const row of section ? section.rows : []) {\n    const item = document.createElement(\"li\");\n    const button = document.createElement(\"button\");\n    button.type = \"button\"; button.textContent = row.name; button.dataset.id = row.id;\n    button.addEventListener(\"click\", () => { open(row.id); window.nativeArtifact.setViewState({ open: row.id }); });\n    item.append(button);\n    list.append(item);\n  }\n  list.dataset.count = section ? section.row_count + (section.truncated ? \" truncated\" : \"\") : \"sample\";\n}\nwindow.nativeArtifact.ready.then((delivery) => render(delivery.input));\nwindow.nativeArtifact.onInput((delivery) => render(delivery.input));\n</script>\n</body>\n</html>\n",
+        "homeId": "home",
+        "reason": "Pinned immutable main oracle",
+        "chunkBytes": 700,
+        "replaceInstallEventId": "installed"
+      },
+      "plan": {
+        "package": "agent.kit-probe",
+        "version": "0.1.0",
+        "digests": {
+          "digest_version": "alpha-tab-digest.v1",
+          "bundle_sha256": "1c7811887596c0cd39dc9746bee08eb9424161b715585bfeec54a784f64ff976",
+          "declaration_digest": "7046960d2f71a024b142dda14cf51ce5616c8964b0782ab7f275a97078724c16",
+          "digest": "sha256:c593f94136e397ad144116428cdcdc9eb643ed186015c22a712d0b26913cd2c8"
+        },
+        "chunks": 1,
+        "steps": [
+          {
+            "step": "create-artifact",
+            "executor": "records_write",
+            "operation": "create_record",
+            "arguments": {
+              "type": "Document",
+              "kind": "artifact",
+              "name": "agent.kit-probe 0.1.0 (alpha tab source)",
+              "home_id": "home",
+              "summary": "Source bytes of alpha tab agent.kit-probe 0.1.0.",
+              "body": "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n<title>Kit probe</title>\n</head>\n<body>\n<main>\n<h1>Kit probe</h1>\n<ul id=\"list\"></ul>\n<section id=\"detail\"><h2>Detail</h2><p id=\"body\">Nothing open</p><p id=\"links\"></p></section>\n</main>\n<script>\n// One read in flight, busy (or a synchronous bridge refusal) retried with\n// bounded backoff: the pattern the 0.1.1 tabs adopted.\nconst queue = [];\nlet active = false;\nfunction pump() {\n  if (active || !queue.length) return;\n  active = true;\n  const job = queue.shift();\n  const attempt = (tries) => {\n    let request;\n    try { request = window.nativeArtifact.read(job.need, job.params); } catch (error) { request = Promise.resolve({ status: \"busy\" }); }\n    request.then((reply) => {\n      if (reply && reply.status === \"busy\" && tries < 8) { setTimeout(() => attempt(tries + 1), 120 * (tries + 1)); return; }\n      active = false;\n      job.resolve(reply && reply.status === \"ok\" ? reply.result.rows : null);\n      pump();\n    }, () => { active = false; job.resolve(null); pump(); });\n  };\n  attempt(0);\n}\nconst read = (need, params) => new Promise((resolve) => { queue.push({ need, params, resolve }); pump(); });\nfunction open(id) {\n  document.getElementById(\"body\").textContent = \"Loading\";\n  read(\"probe.body\", { id }).then((rows) => { document.getElementById(\"body\").textContent = rows && rows[0] ? rows[0].body : \"The record body could not be read\"; });\n  read(\"probe.links\", { id }).then((rows) => { document.getElementById(\"links\").textContent = rows ? rows.length + \" links\" : \"Links could not be read\"; });\n}\nfunction render(input) {\n  const list = document.getElementById(\"list\");\n  list.textContent = \"\";\n  const section = input.sql && input.sql[\"probe.list\"];\n  for (const row of section ? section.rows : []) {\n    const item = document.createElement(\"li\");\n    const button = document.createElement(\"button\");\n    button.type = \"button\"; button.textContent = row.name; button.dataset.id = row.id;\n    button.addEventListener(\"click\", () => { open(row.id); window.nativeArtifact.setViewState({ open: row.id }); });\n    item.append(button);\n    list.append(item);\n  }\n  list.dataset.count = section ? section.row_count + (section.truncated ? \" truncated\" : \"\") : \"sample\";\n}\nwindow.nativeArtifact.ready.then((delivery) => render(delivery.input));\nwindow.nativeArtifact.onInput((delivery) => render(delivery.input));\n</script>\n</body>\n</html>\n",
+              "facets": {
+                "runtime": "native.html.v1"
+              },
+              "reason": "Pinned immutable main oracle",
+              "sources": [],
+              "response_mode": "summary"
+            },
+            "expect": {
+              "body_digest": "1c7811887596c0cd39dc9746bee08eb9424161b715585bfeec54a784f64ff976",
+              "body_bytes": 2486
+            }
+          },
+          {
+            "step": "remove-previous-install",
+            "executor": "artifacts_write",
+            "operation": "manage_alpha_tabs.remove",
+            "arguments": {
+              "package": "agent.kit-probe",
+              "expected_install_event_id": "installed",
+              "reason": "Pinned immutable main oracle (install refuses a package that is already installed)"
+            }
+          },
+          {
+            "step": "install",
+            "executor": "artifacts_write",
+            "operation": "manage_alpha_tabs.install",
+            "arguments": {
+              "package": "agent.kit-probe",
+              "version": "0.1.0",
+              "digest": "sha256:c593f94136e397ad144116428cdcdc9eb643ed186015c22a712d0b26913cd2c8",
+              "artifact_id": "{{record_id}}",
+              "source_revision": "{{source_revision}}",
+              "declaration": {
+                "needs": [
+                  {
+                    "need": "sql.snapshot.v1",
+                    "key": "probe.list",
+                    "label": "Open tasks, newest first",
+                    "sql": "SELECT id, name FROM records WHERE type = 'WorkItem' ORDER BY last_activity_at_ms DESC, id LIMIT 200"
+                  },
+                  {
+                    "need": "sql.snapshot.v1",
+                    "key": "probe.body",
+                    "label": "One record's body, read when opened",
+                    "sql": "SELECT id, body FROM records WHERE id = ?1",
+                    "params": [
+                      {
+                        "name": "id",
+                        "type": "text",
+                        "max_len": 64
+                      }
+                    ]
+                  },
+                  {
+                    "need": "sql.snapshot.v1",
+                    "key": "probe.links",
+                    "label": "One record's outgoing links, read when opened",
+                    "sql": "SELECT target_id, relationship FROM links WHERE source_id = ?1 ORDER BY target_id LIMIT 50",
+                    "params": [
+                      {
+                        "name": "id",
+                        "type": "text",
+                        "max_len": 64
+                      }
+                    ]
+                  }
+                ],
+                "effects": []
+              },
+              "reason": "Pinned immutable main oracle",
+              "expected_install_event_id": "{{removed_event_id}}"
+            },
+            "expect": {
+              "digest": "sha256:c593f94136e397ad144116428cdcdc9eb643ed186015c22a712d0b26913cd2c8",
+              "declaration_digest": "7046960d2f71a024b142dda14cf51ce5616c8964b0782ab7f275a97078724c16"
+            }
+          },
+          {
+            "step": "inspect",
+            "executor": "artifacts_read",
+            "operation": "manage_alpha_tabs.inspect",
+            "arguments": {
+              "package": "agent.kit-probe"
+            },
+            "expect": {
+              "digest": "sha256:c593f94136e397ad144116428cdcdc9eb643ed186015c22a712d0b26913cd2c8",
+              "declaration_digest": "7046960d2f71a024b142dda14cf51ce5616c8964b0782ab7f275a97078724c16",
+              "version": "0.1.0"
+            },
+            "note": "Preview and adoption are the viewer's, in a signed-in browser at /alpha/: agents are refused preview receipts (preview_authority_missing)."
+          }
+        ]
+      }
+    },
+    {
+      "name": "chunked replacement",
+      "input": {
+        "descriptor": {
+          "package": "agent.kit-probe",
+          "version": "0.1.0",
+          "bundle": "probe-concurrent.html",
+          "runtime": "native.html.v1",
+          "declaration": {
+            "needs": [
+              {
+                "need": "sql.snapshot.v1",
+                "key": "probe.list",
+                "label": "Open tasks, newest first",
+                "sql": "SELECT id, name FROM records WHERE type = 'WorkItem' ORDER BY last_activity_at_ms DESC, id LIMIT 200"
+              },
+              {
+                "need": "sql.snapshot.v1",
+                "key": "probe.body",
+                "label": "One record's body, read when opened",
+                "sql": "SELECT id, body FROM records WHERE id = ?1",
+                "params": [
+                  {
+                    "name": "id",
+                    "type": "text",
+                    "max_len": 64
+                  }
+                ]
+              },
+              {
+                "need": "sql.snapshot.v1",
+                "key": "probe.links",
+                "label": "One record's outgoing links, read when opened",
+                "sql": "SELECT target_id, relationship FROM links WHERE source_id = ?1 ORDER BY target_id LIMIT 50",
+                "params": [
+                  {
+                    "name": "id",
+                    "type": "text",
+                    "max_len": 64
+                  }
+                ]
+              }
+            ],
+            "effects": []
+          }
+        },
+        "html": "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n<title>Kit probe</title>\n</head>\n<body>\n<main>\n<h1>Kit probe</h1>\n<ul id=\"list\"></ul>\n<section id=\"detail\"><h2>Detail</h2><p id=\"body\">Nothing open</p><p id=\"links\"></p></section>\n</main>\n<script>\n// One read in flight, busy (or a synchronous bridge refusal) retried with\n// bounded backoff: the pattern the 0.1.1 tabs adopted.\nconst queue = [];\nlet active = false;\nfunction pump() {\n  if (active || !queue.length) return;\n  active = true;\n  const job = queue.shift();\n  const attempt = (tries) => {\n    let request;\n    try { request = window.nativeArtifact.read(job.need, job.params); } catch (error) { request = Promise.resolve({ status: \"busy\" }); }\n    request.then((reply) => {\n      if (reply && reply.status === \"busy\" && tries < 8) { setTimeout(() => attempt(tries + 1), 120 * (tries + 1)); return; }\n      active = false;\n      job.resolve(reply && reply.status === \"ok\" ? reply.result.rows : null);\n      pump();\n    }, () => { active = false; job.resolve(null); pump(); });\n  };\n  attempt(0);\n}\nconst read = (need, params) => new Promise((resolve) => { queue.push({ need, params, resolve }); pump(); });\nfunction open(id) {\n  document.getElementById(\"body\").textContent = \"Loading\";\n  read(\"probe.body\", { id }).then((rows) => { document.getElementById(\"body\").textContent = rows && rows[0] ? rows[0].body : \"The record body could not be read\"; });\n  read(\"probe.links\", { id }).then((rows) => { document.getElementById(\"links\").textContent = rows ? rows.length + \" links\" : \"Links could not be read\"; });\n}\nfunction render(input) {\n  const list = document.getElementById(\"list\");\n  list.textContent = \"\";\n  const section = input.sql && input.sql[\"probe.list\"];\n  for (const row of section ? section.rows : []) {\n    const item = document.createElement(\"li\");\n    const button = document.createElement(\"button\");\n    button.type = \"button\"; button.textContent = row.name; button.dataset.id = row.id;\n    button.addEventListener(\"click\", () => { open(row.id); window.nativeArtifact.setViewState({ open: row.id }); });\n    item.append(button);\n    list.append(item);\n  }\n  list.dataset.count = section ? section.row_count + (section.truncated ? \" truncated\" : \"\") : \"sample\";\n}\nwindow.nativeArtifact.ready.then((delivery) => render(delivery.input));\nwindow.nativeArtifact.onInput((delivery) => render(delivery.input));\n</script>\n</body>\n</html>\n",
+        "homeId": "home",
+        "reason": "Pinned immutable main oracle",
+        "chunkBytes": 700,
+        "chunked": true,
+        "replaceInstallEventId": "installed"
+      },
+      "plan": {
+        "package": "agent.kit-probe",
+        "version": "0.1.0",
+        "digests": {
+          "digest_version": "alpha-tab-digest.v1",
+          "bundle_sha256": "1c7811887596c0cd39dc9746bee08eb9424161b715585bfeec54a784f64ff976",
+          "declaration_digest": "7046960d2f71a024b142dda14cf51ce5616c8964b0782ab7f275a97078724c16",
+          "digest": "sha256:c593f94136e397ad144116428cdcdc9eb643ed186015c22a712d0b26913cd2c8"
+        },
+        "chunks": 4,
+        "steps": [
+          {
+            "step": "create-note",
+            "executor": "records_write",
+            "operation": "create_record",
+            "arguments": {
+              "type": "Document",
+              "kind": "note",
+              "name": "agent.kit-probe 0.1.0 (alpha tab source)",
+              "home_id": "home",
+              "summary": "Source bytes of alpha tab agent.kit-probe 0.1.0; staged as a note, then switched to native.html.v1.",
+              "body": "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n<title>Kit probe</title>\n</head>\n<body>\n<main>\n<h1>Kit probe</h1>\n<ul id=\"list\"></ul>\n<section id=\"detail\"><h2>Detail</h2><p id=\"body\">Nothing open</p><p id=\"links\"></p></section>\n</main>\n<script>\n// One read in flight, busy (or a synchronous bridge refusal) retried with\n// bounded backoff: the pattern the 0.1.1 tabs adopted.\nconst queue = [];\nlet active = false;\nfunction pump() {\n  if (active || !queue.length) return;\n  active = true;\n  const job = queue.shift();\n  const attempt = (tries) => {\n    let request;\n    try { request = window.nativeArtifact.read(job.n",
+              "reason": "Pinned immutable main oracle",
+              "sources": []
+            },
+            "expect": {
+              "body_digest": "4ec685e918638f1206077bf32a17dd6ea61ef1a8540f1da491c87347f0b2395f",
+              "body_bytes": 700
+            }
+          },
+          {
+            "step": "append-2",
+            "executor": "records_write",
+            "operation": "update_record",
+            "arguments": {
+              "id": "{{record_id}}",
+              "body_append": "eed, job.params); } catch (error) { request = Promise.resolve({ status: \"busy\" }); }\n    request.then((reply) => {\n      if (reply && reply.status === \"busy\" && tries < 8) { setTimeout(() => attempt(tries + 1), 120 * (tries + 1)); return; }\n      active = false;\n      job.resolve(reply && reply.status === \"ok\" ? reply.result.rows : null);\n      pump();\n    }, () => { active = false; job.resolve(null); pump(); });\n  };\n  attempt(0);\n}\nconst read = (need, params) => new Promise((resolve) => { queue.push({ need, params, resolve }); pump(); });\nfunction open(id) {\n  document.getElementById(\"body\").textContent = \"Loading\";\n  read(\"probe.body\", { id }).then((rows) => { document.getElementById(\"bod",
+              "if_body_digest": "4ec685e918638f1206077bf32a17dd6ea61ef1a8540f1da491c87347f0b2395f",
+              "reason": "Pinned immutable main oracle (chunk 2 of 4)",
+              "sources": []
+            },
+            "expect": {
+              "body_digest": "481b63a7a687853512cac57785dcc3e35d24a75426f4c015456455d4445c6405",
+              "body_bytes": 1400
+            }
+          },
+          {
+            "step": "append-3",
+            "executor": "records_write",
+            "operation": "update_record",
+            "arguments": {
+              "id": "{{record_id}}",
+              "body_append": "y\").textContent = rows && rows[0] ? rows[0].body : \"The record body could not be read\"; });\n  read(\"probe.links\", { id }).then((rows) => { document.getElementById(\"links\").textContent = rows ? rows.length + \" links\" : \"Links could not be read\"; });\n}\nfunction render(input) {\n  const list = document.getElementById(\"list\");\n  list.textContent = \"\";\n  const section = input.sql && input.sql[\"probe.list\"];\n  for (const row of section ? section.rows : []) {\n    const item = document.createElement(\"li\");\n    const button = document.createElement(\"button\");\n    button.type = \"button\"; button.textContent = row.name; button.dataset.id = row.id;\n    button.addEventListener(\"click\", () => { open(row.id)",
+              "if_body_digest": "481b63a7a687853512cac57785dcc3e35d24a75426f4c015456455d4445c6405",
+              "reason": "Pinned immutable main oracle (chunk 3 of 4)",
+              "sources": []
+            },
+            "expect": {
+              "body_digest": "8a0d33cd33a7776489c2f4819b5cbe1c76edec53d5b9d4ef9ffc575e370822a4",
+              "body_bytes": 2100
+            }
+          },
+          {
+            "step": "append-4",
+            "executor": "records_write",
+            "operation": "update_record",
+            "arguments": {
+              "id": "{{record_id}}",
+              "body_append": "; window.nativeArtifact.setViewState({ open: row.id }); });\n    item.append(button);\n    list.append(item);\n  }\n  list.dataset.count = section ? section.row_count + (section.truncated ? \" truncated\" : \"\") : \"sample\";\n}\nwindow.nativeArtifact.ready.then((delivery) => render(delivery.input));\nwindow.nativeArtifact.onInput((delivery) => render(delivery.input));\n</script>\n</body>\n</html>\n",
+              "if_body_digest": "8a0d33cd33a7776489c2f4819b5cbe1c76edec53d5b9d4ef9ffc575e370822a4",
+              "reason": "Pinned immutable main oracle (chunk 4 of 4)",
+              "sources": []
+            },
+            "expect": {
+              "body_digest": "1c7811887596c0cd39dc9746bee08eb9424161b715585bfeec54a784f64ff976",
+              "body_bytes": 2486
+            }
+          },
+          {
+            "step": "source-revision",
+            "executor": "sql_read",
+            "operation": "query_sql",
+            "arguments": {
+              "sql": "SELECT id, type FROM content_events WHERE record_id = ?1 AND type IN ('record.created', 'record.updated', 'receipt.committed.v1') ORDER BY local_seq DESC, id LIMIT 1",
+              "parameters": [
+                {
+                  "type": "text",
+                  "value": "{{record_id}}"
+                }
+              ]
+            },
+            "capture": {
+              "source_revision": "rows[0].id"
+            },
+            "note": "Run before any other write to the record: the newest event is the last body-carrying write."
+          },
+          {
+            "step": "rekind-artifact",
+            "executor": "records_write",
+            "operation": "update_record",
+            "arguments": {
+              "id": "{{record_id}}",
+              "kind": "artifact",
+              "facets": {
+                "runtime": "native.html.v1"
+              },
+              "if_body_digest": "1c7811887596c0cd39dc9746bee08eb9424161b715585bfeec54a784f64ff976",
+              "reason": "Pinned immutable main oracle (switch to native.html.v1; validates the complete document)",
+              "sources": []
+            },
+            "expect": {
+              "body_digest": "1c7811887596c0cd39dc9746bee08eb9424161b715585bfeec54a784f64ff976"
+            }
+          },
+          {
+            "step": "remove-previous-install",
+            "executor": "artifacts_write",
+            "operation": "manage_alpha_tabs.remove",
+            "arguments": {
+              "package": "agent.kit-probe",
+              "expected_install_event_id": "installed",
+              "reason": "Pinned immutable main oracle (install refuses a package that is already installed)"
+            }
+          },
+          {
+            "step": "install",
+            "executor": "artifacts_write",
+            "operation": "manage_alpha_tabs.install",
+            "arguments": {
+              "package": "agent.kit-probe",
+              "version": "0.1.0",
+              "digest": "sha256:c593f94136e397ad144116428cdcdc9eb643ed186015c22a712d0b26913cd2c8",
+              "artifact_id": "{{record_id}}",
+              "source_revision": "{{source_revision}}",
+              "declaration": {
+                "needs": [
+                  {
+                    "need": "sql.snapshot.v1",
+                    "key": "probe.list",
+                    "label": "Open tasks, newest first",
+                    "sql": "SELECT id, name FROM records WHERE type = 'WorkItem' ORDER BY last_activity_at_ms DESC, id LIMIT 200"
+                  },
+                  {
+                    "need": "sql.snapshot.v1",
+                    "key": "probe.body",
+                    "label": "One record's body, read when opened",
+                    "sql": "SELECT id, body FROM records WHERE id = ?1",
+                    "params": [
+                      {
+                        "name": "id",
+                        "type": "text",
+                        "max_len": 64
+                      }
+                    ]
+                  },
+                  {
+                    "need": "sql.snapshot.v1",
+                    "key": "probe.links",
+                    "label": "One record's outgoing links, read when opened",
+                    "sql": "SELECT target_id, relationship FROM links WHERE source_id = ?1 ORDER BY target_id LIMIT 50",
+                    "params": [
+                      {
+                        "name": "id",
+                        "type": "text",
+                        "max_len": 64
+                      }
+                    ]
+                  }
+                ],
+                "effects": []
+              },
+              "reason": "Pinned immutable main oracle",
+              "expected_install_event_id": "{{removed_event_id}}"
+            },
+            "expect": {
+              "digest": "sha256:c593f94136e397ad144116428cdcdc9eb643ed186015c22a712d0b26913cd2c8",
+              "declaration_digest": "7046960d2f71a024b142dda14cf51ce5616c8964b0782ab7f275a97078724c16"
+            }
+          },
+          {
+            "step": "inspect",
+            "executor": "artifacts_read",
+            "operation": "manage_alpha_tabs.inspect",
+            "arguments": {
+              "package": "agent.kit-probe"
+            },
+            "expect": {
+              "digest": "sha256:c593f94136e397ad144116428cdcdc9eb643ed186015c22a712d0b26913cd2c8",
+              "declaration_digest": "7046960d2f71a024b142dda14cf51ce5616c8964b0782ab7f275a97078724c16",
+              "version": "0.1.0"
+            },
+            "note": "Preview and adoption are the viewer's, in a signed-in browser at /alpha/: agents are refused preview receipts (preview_authority_missing)."
+          }
+        ]
+      }
+    },
+    {
+      "name": "default after removal",
+      "input": {
+        "descriptor": {
+          "package": "agent.kit-probe",
+          "version": "0.1.0",
+          "bundle": "probe-concurrent.html",
+          "runtime": "native.html.v1",
+          "declaration": {
+            "needs": [
+              {
+                "need": "sql.snapshot.v1",
+                "key": "probe.list",
+                "label": "Open tasks, newest first",
+                "sql": "SELECT id, name FROM records WHERE type = 'WorkItem' ORDER BY last_activity_at_ms DESC, id LIMIT 200"
+              },
+              {
+                "need": "sql.snapshot.v1",
+                "key": "probe.body",
+                "label": "One record's body, read when opened",
+                "sql": "SELECT id, body FROM records WHERE id = ?1",
+                "params": [
+                  {
+                    "name": "id",
+                    "type": "text",
+                    "max_len": 64
+                  }
+                ]
+              },
+              {
+                "need": "sql.snapshot.v1",
+                "key": "probe.links",
+                "label": "One record's outgoing links, read when opened",
+                "sql": "SELECT target_id, relationship FROM links WHERE source_id = ?1 ORDER BY target_id LIMIT 50",
+                "params": [
+                  {
+                    "name": "id",
+                    "type": "text",
+                    "max_len": 64
+                  }
+                ]
+              }
+            ],
+            "effects": []
+          }
+        },
+        "html": "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n<title>Kit probe</title>\n</head>\n<body>\n<main>\n<h1>Kit probe</h1>\n<ul id=\"list\"></ul>\n<section id=\"detail\"><h2>Detail</h2><p id=\"body\">Nothing open</p><p id=\"links\"></p></section>\n</main>\n<script>\n// One read in flight, busy (or a synchronous bridge refusal) retried with\n// bounded backoff: the pattern the 0.1.1 tabs adopted.\nconst queue = [];\nlet active = false;\nfunction pump() {\n  if (active || !queue.length) return;\n  active = true;\n  const job = queue.shift();\n  const attempt = (tries) => {\n    let request;\n    try { request = window.nativeArtifact.read(job.need, job.params); } catch (error) { request = Promise.resolve({ status: \"busy\" }); }\n    request.then((reply) => {\n      if (reply && reply.status === \"busy\" && tries < 8) { setTimeout(() => attempt(tries + 1), 120 * (tries + 1)); return; }\n      active = false;\n      job.resolve(reply && reply.status === \"ok\" ? reply.result.rows : null);\n      pump();\n    }, () => { active = false; job.resolve(null); pump(); });\n  };\n  attempt(0);\n}\nconst read = (need, params) => new Promise((resolve) => { queue.push({ need, params, resolve }); pump(); });\nfunction open(id) {\n  document.getElementById(\"body\").textContent = \"Loading\";\n  read(\"probe.body\", { id }).then((rows) => { document.getElementById(\"body\").textContent = rows && rows[0] ? rows[0].body : \"The record body could not be read\"; });\n  read(\"probe.links\", { id }).then((rows) => { document.getElementById(\"links\").textContent = rows ? rows.length + \" links\" : \"Links could not be read\"; });\n}\nfunction render(input) {\n  const list = document.getElementById(\"list\");\n  list.textContent = \"\";\n  const section = input.sql && input.sql[\"probe.list\"];\n  for (const row of section ? section.rows : []) {\n    const item = document.createElement(\"li\");\n    const button = document.createElement(\"button\");\n    button.type = \"button\"; button.textContent = row.name; button.dataset.id = row.id;\n    button.addEventListener(\"click\", () => { open(row.id); window.nativeArtifact.setViewState({ open: row.id }); });\n    item.append(button);\n    list.append(item);\n  }\n  list.dataset.count = section ? section.row_count + (section.truncated ? \" truncated\" : \"\") : \"sample\";\n}\nwindow.nativeArtifact.ready.then((delivery) => render(delivery.input));\nwindow.nativeArtifact.onInput((delivery) => render(delivery.input));\n</script>\n</body>\n</html>\n",
+        "homeId": "home",
+        "reason": "Pinned immutable main oracle",
+        "chunkBytes": 700,
+        "afterRemovalEventId": "removed"
+      },
+      "plan": {
+        "package": "agent.kit-probe",
+        "version": "0.1.0",
+        "digests": {
+          "digest_version": "alpha-tab-digest.v1",
+          "bundle_sha256": "1c7811887596c0cd39dc9746bee08eb9424161b715585bfeec54a784f64ff976",
+          "declaration_digest": "7046960d2f71a024b142dda14cf51ce5616c8964b0782ab7f275a97078724c16",
+          "digest": "sha256:c593f94136e397ad144116428cdcdc9eb643ed186015c22a712d0b26913cd2c8"
+        },
+        "chunks": 1,
+        "steps": [
+          {
+            "step": "create-artifact",
+            "executor": "records_write",
+            "operation": "create_record",
+            "arguments": {
+              "type": "Document",
+              "kind": "artifact",
+              "name": "agent.kit-probe 0.1.0 (alpha tab source)",
+              "home_id": "home",
+              "summary": "Source bytes of alpha tab agent.kit-probe 0.1.0.",
+              "body": "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n<title>Kit probe</title>\n</head>\n<body>\n<main>\n<h1>Kit probe</h1>\n<ul id=\"list\"></ul>\n<section id=\"detail\"><h2>Detail</h2><p id=\"body\">Nothing open</p><p id=\"links\"></p></section>\n</main>\n<script>\n// One read in flight, busy (or a synchronous bridge refusal) retried with\n// bounded backoff: the pattern the 0.1.1 tabs adopted.\nconst queue = [];\nlet active = false;\nfunction pump() {\n  if (active || !queue.length) return;\n  active = true;\n  const job = queue.shift();\n  const attempt = (tries) => {\n    let request;\n    try { request = window.nativeArtifact.read(job.need, job.params); } catch (error) { request = Promise.resolve({ status: \"busy\" }); }\n    request.then((reply) => {\n      if (reply && reply.status === \"busy\" && tries < 8) { setTimeout(() => attempt(tries + 1), 120 * (tries + 1)); return; }\n      active = false;\n      job.resolve(reply && reply.status === \"ok\" ? reply.result.rows : null);\n      pump();\n    }, () => { active = false; job.resolve(null); pump(); });\n  };\n  attempt(0);\n}\nconst read = (need, params) => new Promise((resolve) => { queue.push({ need, params, resolve }); pump(); });\nfunction open(id) {\n  document.getElementById(\"body\").textContent = \"Loading\";\n  read(\"probe.body\", { id }).then((rows) => { document.getElementById(\"body\").textContent = rows && rows[0] ? rows[0].body : \"The record body could not be read\"; });\n  read(\"probe.links\", { id }).then((rows) => { document.getElementById(\"links\").textContent = rows ? rows.length + \" links\" : \"Links could not be read\"; });\n}\nfunction render(input) {\n  const list = document.getElementById(\"list\");\n  list.textContent = \"\";\n  const section = input.sql && input.sql[\"probe.list\"];\n  for (const row of section ? section.rows : []) {\n    const item = document.createElement(\"li\");\n    const button = document.createElement(\"button\");\n    button.type = \"button\"; button.textContent = row.name; button.dataset.id = row.id;\n    button.addEventListener(\"click\", () => { open(row.id); window.nativeArtifact.setViewState({ open: row.id }); });\n    item.append(button);\n    list.append(item);\n  }\n  list.dataset.count = section ? section.row_count + (section.truncated ? \" truncated\" : \"\") : \"sample\";\n}\nwindow.nativeArtifact.ready.then((delivery) => render(delivery.input));\nwindow.nativeArtifact.onInput((delivery) => render(delivery.input));\n</script>\n</body>\n</html>\n",
+              "facets": {
+                "runtime": "native.html.v1"
+              },
+              "reason": "Pinned immutable main oracle",
+              "sources": [],
+              "response_mode": "summary"
+            },
+            "expect": {
+              "body_digest": "1c7811887596c0cd39dc9746bee08eb9424161b715585bfeec54a784f64ff976",
+              "body_bytes": 2486
+            }
+          },
+          {
+            "step": "install",
+            "executor": "artifacts_write",
+            "operation": "manage_alpha_tabs.install",
+            "arguments": {
+              "package": "agent.kit-probe",
+              "version": "0.1.0",
+              "digest": "sha256:c593f94136e397ad144116428cdcdc9eb643ed186015c22a712d0b26913cd2c8",
+              "artifact_id": "{{record_id}}",
+              "source_revision": "{{source_revision}}",
+              "declaration": {
+                "needs": [
+                  {
+                    "need": "sql.snapshot.v1",
+                    "key": "probe.list",
+                    "label": "Open tasks, newest first",
+                    "sql": "SELECT id, name FROM records WHERE type = 'WorkItem' ORDER BY last_activity_at_ms DESC, id LIMIT 200"
+                  },
+                  {
+                    "need": "sql.snapshot.v1",
+                    "key": "probe.body",
+                    "label": "One record's body, read when opened",
+                    "sql": "SELECT id, body FROM records WHERE id = ?1",
+                    "params": [
+                      {
+                        "name": "id",
+                        "type": "text",
+                        "max_len": 64
+                      }
+                    ]
+                  },
+                  {
+                    "need": "sql.snapshot.v1",
+                    "key": "probe.links",
+                    "label": "One record's outgoing links, read when opened",
+                    "sql": "SELECT target_id, relationship FROM links WHERE source_id = ?1 ORDER BY target_id LIMIT 50",
+                    "params": [
+                      {
+                        "name": "id",
+                        "type": "text",
+                        "max_len": 64
+                      }
+                    ]
+                  }
+                ],
+                "effects": []
+              },
+              "reason": "Pinned immutable main oracle",
+              "expected_install_event_id": "removed"
+            },
+            "expect": {
+              "digest": "sha256:c593f94136e397ad144116428cdcdc9eb643ed186015c22a712d0b26913cd2c8",
+              "declaration_digest": "7046960d2f71a024b142dda14cf51ce5616c8964b0782ab7f275a97078724c16"
+            }
+          },
+          {
+            "step": "inspect",
+            "executor": "artifacts_read",
+            "operation": "manage_alpha_tabs.inspect",
+            "arguments": {
+              "package": "agent.kit-probe"
+            },
+            "expect": {
+              "digest": "sha256:c593f94136e397ad144116428cdcdc9eb643ed186015c22a712d0b26913cd2c8",
+              "declaration_digest": "7046960d2f71a024b142dda14cf51ce5616c8964b0782ab7f275a97078724c16",
+              "version": "0.1.0"
+            },
+            "note": "Preview and adoption are the viewer's, in a signed-in browser at /alpha/: agents are refused preview receipts (preview_authority_missing)."
+          }
+        ]
+      }
+    },
+    {
+      "name": "chunked after removal",
+      "input": {
+        "descriptor": {
+          "package": "agent.kit-probe",
+          "version": "0.1.0",
+          "bundle": "probe-concurrent.html",
+          "runtime": "native.html.v1",
+          "declaration": {
+            "needs": [
+              {
+                "need": "sql.snapshot.v1",
+                "key": "probe.list",
+                "label": "Open tasks, newest first",
+                "sql": "SELECT id, name FROM records WHERE type = 'WorkItem' ORDER BY last_activity_at_ms DESC, id LIMIT 200"
+              },
+              {
+                "need": "sql.snapshot.v1",
+                "key": "probe.body",
+                "label": "One record's body, read when opened",
+                "sql": "SELECT id, body FROM records WHERE id = ?1",
+                "params": [
+                  {
+                    "name": "id",
+                    "type": "text",
+                    "max_len": 64
+                  }
+                ]
+              },
+              {
+                "need": "sql.snapshot.v1",
+                "key": "probe.links",
+                "label": "One record's outgoing links, read when opened",
+                "sql": "SELECT target_id, relationship FROM links WHERE source_id = ?1 ORDER BY target_id LIMIT 50",
+                "params": [
+                  {
+                    "name": "id",
+                    "type": "text",
+                    "max_len": 64
+                  }
+                ]
+              }
+            ],
+            "effects": []
+          }
+        },
+        "html": "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n<title>Kit probe</title>\n</head>\n<body>\n<main>\n<h1>Kit probe</h1>\n<ul id=\"list\"></ul>\n<section id=\"detail\"><h2>Detail</h2><p id=\"body\">Nothing open</p><p id=\"links\"></p></section>\n</main>\n<script>\n// One read in flight, busy (or a synchronous bridge refusal) retried with\n// bounded backoff: the pattern the 0.1.1 tabs adopted.\nconst queue = [];\nlet active = false;\nfunction pump() {\n  if (active || !queue.length) return;\n  active = true;\n  const job = queue.shift();\n  const attempt = (tries) => {\n    let request;\n    try { request = window.nativeArtifact.read(job.need, job.params); } catch (error) { request = Promise.resolve({ status: \"busy\" }); }\n    request.then((reply) => {\n      if (reply && reply.status === \"busy\" && tries < 8) { setTimeout(() => attempt(tries + 1), 120 * (tries + 1)); return; }\n      active = false;\n      job.resolve(reply && reply.status === \"ok\" ? reply.result.rows : null);\n      pump();\n    }, () => { active = false; job.resolve(null); pump(); });\n  };\n  attempt(0);\n}\nconst read = (need, params) => new Promise((resolve) => { queue.push({ need, params, resolve }); pump(); });\nfunction open(id) {\n  document.getElementById(\"body\").textContent = \"Loading\";\n  read(\"probe.body\", { id }).then((rows) => { document.getElementById(\"body\").textContent = rows && rows[0] ? rows[0].body : \"The record body could not be read\"; });\n  read(\"probe.links\", { id }).then((rows) => { document.getElementById(\"links\").textContent = rows ? rows.length + \" links\" : \"Links could not be read\"; });\n}\nfunction render(input) {\n  const list = document.getElementById(\"list\");\n  list.textContent = \"\";\n  const section = input.sql && input.sql[\"probe.list\"];\n  for (const row of section ? section.rows : []) {\n    const item = document.createElement(\"li\");\n    const button = document.createElement(\"button\");\n    button.type = \"button\"; button.textContent = row.name; button.dataset.id = row.id;\n    button.addEventListener(\"click\", () => { open(row.id); window.nativeArtifact.setViewState({ open: row.id }); });\n    item.append(button);\n    list.append(item);\n  }\n  list.dataset.count = section ? section.row_count + (section.truncated ? \" truncated\" : \"\") : \"sample\";\n}\nwindow.nativeArtifact.ready.then((delivery) => render(delivery.input));\nwindow.nativeArtifact.onInput((delivery) => render(delivery.input));\n</script>\n</body>\n</html>\n",
+        "homeId": "home",
+        "reason": "Pinned immutable main oracle",
+        "chunkBytes": 700,
+        "chunked": true,
+        "afterRemovalEventId": "removed"
+      },
+      "plan": {
+        "package": "agent.kit-probe",
+        "version": "0.1.0",
+        "digests": {
+          "digest_version": "alpha-tab-digest.v1",
+          "bundle_sha256": "1c7811887596c0cd39dc9746bee08eb9424161b715585bfeec54a784f64ff976",
+          "declaration_digest": "7046960d2f71a024b142dda14cf51ce5616c8964b0782ab7f275a97078724c16",
+          "digest": "sha256:c593f94136e397ad144116428cdcdc9eb643ed186015c22a712d0b26913cd2c8"
+        },
+        "chunks": 4,
+        "steps": [
+          {
+            "step": "create-note",
+            "executor": "records_write",
+            "operation": "create_record",
+            "arguments": {
+              "type": "Document",
+              "kind": "note",
+              "name": "agent.kit-probe 0.1.0 (alpha tab source)",
+              "home_id": "home",
+              "summary": "Source bytes of alpha tab agent.kit-probe 0.1.0; staged as a note, then switched to native.html.v1.",
+              "body": "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n<title>Kit probe</title>\n</head>\n<body>\n<main>\n<h1>Kit probe</h1>\n<ul id=\"list\"></ul>\n<section id=\"detail\"><h2>Detail</h2><p id=\"body\">Nothing open</p><p id=\"links\"></p></section>\n</main>\n<script>\n// One read in flight, busy (or a synchronous bridge refusal) retried with\n// bounded backoff: the pattern the 0.1.1 tabs adopted.\nconst queue = [];\nlet active = false;\nfunction pump() {\n  if (active || !queue.length) return;\n  active = true;\n  const job = queue.shift();\n  const attempt = (tries) => {\n    let request;\n    try { request = window.nativeArtifact.read(job.n",
+              "reason": "Pinned immutable main oracle",
+              "sources": []
+            },
+            "expect": {
+              "body_digest": "4ec685e918638f1206077bf32a17dd6ea61ef1a8540f1da491c87347f0b2395f",
+              "body_bytes": 700
+            }
+          },
+          {
+            "step": "append-2",
+            "executor": "records_write",
+            "operation": "update_record",
+            "arguments": {
+              "id": "{{record_id}}",
+              "body_append": "eed, job.params); } catch (error) { request = Promise.resolve({ status: \"busy\" }); }\n    request.then((reply) => {\n      if (reply && reply.status === \"busy\" && tries < 8) { setTimeout(() => attempt(tries + 1), 120 * (tries + 1)); return; }\n      active = false;\n      job.resolve(reply && reply.status === \"ok\" ? reply.result.rows : null);\n      pump();\n    }, () => { active = false; job.resolve(null); pump(); });\n  };\n  attempt(0);\n}\nconst read = (need, params) => new Promise((resolve) => { queue.push({ need, params, resolve }); pump(); });\nfunction open(id) {\n  document.getElementById(\"body\").textContent = \"Loading\";\n  read(\"probe.body\", { id }).then((rows) => { document.getElementById(\"bod",
+              "if_body_digest": "4ec685e918638f1206077bf32a17dd6ea61ef1a8540f1da491c87347f0b2395f",
+              "reason": "Pinned immutable main oracle (chunk 2 of 4)",
+              "sources": []
+            },
+            "expect": {
+              "body_digest": "481b63a7a687853512cac57785dcc3e35d24a75426f4c015456455d4445c6405",
+              "body_bytes": 1400
+            }
+          },
+          {
+            "step": "append-3",
+            "executor": "records_write",
+            "operation": "update_record",
+            "arguments": {
+              "id": "{{record_id}}",
+              "body_append": "y\").textContent = rows && rows[0] ? rows[0].body : \"The record body could not be read\"; });\n  read(\"probe.links\", { id }).then((rows) => { document.getElementById(\"links\").textContent = rows ? rows.length + \" links\" : \"Links could not be read\"; });\n}\nfunction render(input) {\n  const list = document.getElementById(\"list\");\n  list.textContent = \"\";\n  const section = input.sql && input.sql[\"probe.list\"];\n  for (const row of section ? section.rows : []) {\n    const item = document.createElement(\"li\");\n    const button = document.createElement(\"button\");\n    button.type = \"button\"; button.textContent = row.name; button.dataset.id = row.id;\n    button.addEventListener(\"click\", () => { open(row.id)",
+              "if_body_digest": "481b63a7a687853512cac57785dcc3e35d24a75426f4c015456455d4445c6405",
+              "reason": "Pinned immutable main oracle (chunk 3 of 4)",
+              "sources": []
+            },
+            "expect": {
+              "body_digest": "8a0d33cd33a7776489c2f4819b5cbe1c76edec53d5b9d4ef9ffc575e370822a4",
+              "body_bytes": 2100
+            }
+          },
+          {
+            "step": "append-4",
+            "executor": "records_write",
+            "operation": "update_record",
+            "arguments": {
+              "id": "{{record_id}}",
+              "body_append": "; window.nativeArtifact.setViewState({ open: row.id }); });\n    item.append(button);\n    list.append(item);\n  }\n  list.dataset.count = section ? section.row_count + (section.truncated ? \" truncated\" : \"\") : \"sample\";\n}\nwindow.nativeArtifact.ready.then((delivery) => render(delivery.input));\nwindow.nativeArtifact.onInput((delivery) => render(delivery.input));\n</script>\n</body>\n</html>\n",
+              "if_body_digest": "8a0d33cd33a7776489c2f4819b5cbe1c76edec53d5b9d4ef9ffc575e370822a4",
+              "reason": "Pinned immutable main oracle (chunk 4 of 4)",
+              "sources": []
+            },
+            "expect": {
+              "body_digest": "1c7811887596c0cd39dc9746bee08eb9424161b715585bfeec54a784f64ff976",
+              "body_bytes": 2486
+            }
+          },
+          {
+            "step": "source-revision",
+            "executor": "sql_read",
+            "operation": "query_sql",
+            "arguments": {
+              "sql": "SELECT id, type FROM content_events WHERE record_id = ?1 AND type IN ('record.created', 'record.updated', 'receipt.committed.v1') ORDER BY local_seq DESC, id LIMIT 1",
+              "parameters": [
+                {
+                  "type": "text",
+                  "value": "{{record_id}}"
+                }
+              ]
+            },
+            "capture": {
+              "source_revision": "rows[0].id"
+            },
+            "note": "Run before any other write to the record: the newest event is the last body-carrying write."
+          },
+          {
+            "step": "rekind-artifact",
+            "executor": "records_write",
+            "operation": "update_record",
+            "arguments": {
+              "id": "{{record_id}}",
+              "kind": "artifact",
+              "facets": {
+                "runtime": "native.html.v1"
+              },
+              "if_body_digest": "1c7811887596c0cd39dc9746bee08eb9424161b715585bfeec54a784f64ff976",
+              "reason": "Pinned immutable main oracle (switch to native.html.v1; validates the complete document)",
+              "sources": []
+            },
+            "expect": {
+              "body_digest": "1c7811887596c0cd39dc9746bee08eb9424161b715585bfeec54a784f64ff976"
+            }
+          },
+          {
+            "step": "install",
+            "executor": "artifacts_write",
+            "operation": "manage_alpha_tabs.install",
+            "arguments": {
+              "package": "agent.kit-probe",
+              "version": "0.1.0",
+              "digest": "sha256:c593f94136e397ad144116428cdcdc9eb643ed186015c22a712d0b26913cd2c8",
+              "artifact_id": "{{record_id}}",
+              "source_revision": "{{source_revision}}",
+              "declaration": {
+                "needs": [
+                  {
+                    "need": "sql.snapshot.v1",
+                    "key": "probe.list",
+                    "label": "Open tasks, newest first",
+                    "sql": "SELECT id, name FROM records WHERE type = 'WorkItem' ORDER BY last_activity_at_ms DESC, id LIMIT 200"
+                  },
+                  {
+                    "need": "sql.snapshot.v1",
+                    "key": "probe.body",
+                    "label": "One record's body, read when opened",
+                    "sql": "SELECT id, body FROM records WHERE id = ?1",
+                    "params": [
+                      {
+                        "name": "id",
+                        "type": "text",
+                        "max_len": 64
+                      }
+                    ]
+                  },
+                  {
+                    "need": "sql.snapshot.v1",
+                    "key": "probe.links",
+                    "label": "One record's outgoing links, read when opened",
+                    "sql": "SELECT target_id, relationship FROM links WHERE source_id = ?1 ORDER BY target_id LIMIT 50",
+                    "params": [
+                      {
+                        "name": "id",
+                        "type": "text",
+                        "max_len": 64
+                      }
+                    ]
+                  }
+                ],
+                "effects": []
+              },
+              "reason": "Pinned immutable main oracle",
+              "expected_install_event_id": "removed"
+            },
+            "expect": {
+              "digest": "sha256:c593f94136e397ad144116428cdcdc9eb643ed186015c22a712d0b26913cd2c8",
+              "declaration_digest": "7046960d2f71a024b142dda14cf51ce5616c8964b0782ab7f275a97078724c16"
+            }
+          },
+          {
+            "step": "inspect",
+            "executor": "artifacts_read",
+            "operation": "manage_alpha_tabs.inspect",
+            "arguments": {
+              "package": "agent.kit-probe"
+            },
+            "expect": {
+              "digest": "sha256:c593f94136e397ad144116428cdcdc9eb643ed186015c22a712d0b26913cd2c8",
+              "declaration_digest": "7046960d2f71a024b142dda14cf51ce5616c8964b0782ab7f275a97078724c16",
+              "version": "0.1.0"
+            },
+            "note": "Preview and adoption are the viewer's, in a signed-in browser at /alpha/: agents are refused preview receipts (preview_authority_missing)."
+          }
+        ]
+      }
+    },
+    {
+      "name": "default icon",
+      "input": {
+        "descriptor": {
+          "package": "agent.kit-probe",
+          "version": "0.1.0",
+          "bundle": "probe-concurrent.html",
+          "runtime": "native.html.v1",
+          "declaration": {
+            "needs": [
+              {
+                "need": "sql.snapshot.v1",
+                "key": "probe.list",
+                "label": "Open tasks, newest first",
+                "sql": "SELECT id, name FROM records WHERE type = 'WorkItem' ORDER BY last_activity_at_ms DESC, id LIMIT 200"
+              },
+              {
+                "need": "sql.snapshot.v1",
+                "key": "probe.body",
+                "label": "One record's body, read when opened",
+                "sql": "SELECT id, body FROM records WHERE id = ?1",
+                "params": [
+                  {
+                    "name": "id",
+                    "type": "text",
+                    "max_len": 64
+                  }
+                ]
+              },
+              {
+                "need": "sql.snapshot.v1",
+                "key": "probe.links",
+                "label": "One record's outgoing links, read when opened",
+                "sql": "SELECT target_id, relationship FROM links WHERE source_id = ?1 ORDER BY target_id LIMIT 50",
+                "params": [
+                  {
+                    "name": "id",
+                    "type": "text",
+                    "max_len": 64
+                  }
+                ]
+              }
+            ],
+            "effects": []
+          },
+          "icon": "BookOpen"
+        },
+        "html": "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n<title>Kit probe</title>\n</head>\n<body>\n<main>\n<h1>Kit probe</h1>\n<ul id=\"list\"></ul>\n<section id=\"detail\"><h2>Detail</h2><p id=\"body\">Nothing open</p><p id=\"links\"></p></section>\n</main>\n<script>\n// One read in flight, busy (or a synchronous bridge refusal) retried with\n// bounded backoff: the pattern the 0.1.1 tabs adopted.\nconst queue = [];\nlet active = false;\nfunction pump() {\n  if (active || !queue.length) return;\n  active = true;\n  const job = queue.shift();\n  const attempt = (tries) => {\n    let request;\n    try { request = window.nativeArtifact.read(job.need, job.params); } catch (error) { request = Promise.resolve({ status: \"busy\" }); }\n    request.then((reply) => {\n      if (reply && reply.status === \"busy\" && tries < 8) { setTimeout(() => attempt(tries + 1), 120 * (tries + 1)); return; }\n      active = false;\n      job.resolve(reply && reply.status === \"ok\" ? reply.result.rows : null);\n      pump();\n    }, () => { active = false; job.resolve(null); pump(); });\n  };\n  attempt(0);\n}\nconst read = (need, params) => new Promise((resolve) => { queue.push({ need, params, resolve }); pump(); });\nfunction open(id) {\n  document.getElementById(\"body\").textContent = \"Loading\";\n  read(\"probe.body\", { id }).then((rows) => { document.getElementById(\"body\").textContent = rows && rows[0] ? rows[0].body : \"The record body could not be read\"; });\n  read(\"probe.links\", { id }).then((rows) => { document.getElementById(\"links\").textContent = rows ? rows.length + \" links\" : \"Links could not be read\"; });\n}\nfunction render(input) {\n  const list = document.getElementById(\"list\");\n  list.textContent = \"\";\n  const section = input.sql && input.sql[\"probe.list\"];\n  for (const row of section ? section.rows : []) {\n    const item = document.createElement(\"li\");\n    const button = document.createElement(\"button\");\n    button.type = \"button\"; button.textContent = row.name; button.dataset.id = row.id;\n    button.addEventListener(\"click\", () => { open(row.id); window.nativeArtifact.setViewState({ open: row.id }); });\n    item.append(button);\n    list.append(item);\n  }\n  list.dataset.count = section ? section.row_count + (section.truncated ? \" truncated\" : \"\") : \"sample\";\n}\nwindow.nativeArtifact.ready.then((delivery) => render(delivery.input));\nwindow.nativeArtifact.onInput((delivery) => render(delivery.input));\n</script>\n</body>\n</html>\n",
+        "homeId": "home",
+        "reason": "Pinned immutable main oracle",
+        "chunkBytes": 700
+      },
+      "plan": {
+        "package": "agent.kit-probe",
+        "version": "0.1.0",
+        "digests": {
+          "digest_version": "alpha-tab-digest.v1",
+          "bundle_sha256": "1c7811887596c0cd39dc9746bee08eb9424161b715585bfeec54a784f64ff976",
+          "declaration_digest": "7046960d2f71a024b142dda14cf51ce5616c8964b0782ab7f275a97078724c16",
+          "digest": "sha256:c593f94136e397ad144116428cdcdc9eb643ed186015c22a712d0b26913cd2c8"
+        },
+        "chunks": 1,
+        "steps": [
+          {
+            "step": "create-artifact",
+            "executor": "records_write",
+            "operation": "create_record",
+            "arguments": {
+              "type": "Document",
+              "kind": "artifact",
+              "name": "agent.kit-probe 0.1.0 (alpha tab source)",
+              "home_id": "home",
+              "summary": "Source bytes of alpha tab agent.kit-probe 0.1.0.",
+              "body": "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n<title>Kit probe</title>\n</head>\n<body>\n<main>\n<h1>Kit probe</h1>\n<ul id=\"list\"></ul>\n<section id=\"detail\"><h2>Detail</h2><p id=\"body\">Nothing open</p><p id=\"links\"></p></section>\n</main>\n<script>\n// One read in flight, busy (or a synchronous bridge refusal) retried with\n// bounded backoff: the pattern the 0.1.1 tabs adopted.\nconst queue = [];\nlet active = false;\nfunction pump() {\n  if (active || !queue.length) return;\n  active = true;\n  const job = queue.shift();\n  const attempt = (tries) => {\n    let request;\n    try { request = window.nativeArtifact.read(job.need, job.params); } catch (error) { request = Promise.resolve({ status: \"busy\" }); }\n    request.then((reply) => {\n      if (reply && reply.status === \"busy\" && tries < 8) { setTimeout(() => attempt(tries + 1), 120 * (tries + 1)); return; }\n      active = false;\n      job.resolve(reply && reply.status === \"ok\" ? reply.result.rows : null);\n      pump();\n    }, () => { active = false; job.resolve(null); pump(); });\n  };\n  attempt(0);\n}\nconst read = (need, params) => new Promise((resolve) => { queue.push({ need, params, resolve }); pump(); });\nfunction open(id) {\n  document.getElementById(\"body\").textContent = \"Loading\";\n  read(\"probe.body\", { id }).then((rows) => { document.getElementById(\"body\").textContent = rows && rows[0] ? rows[0].body : \"The record body could not be read\"; });\n  read(\"probe.links\", { id }).then((rows) => { document.getElementById(\"links\").textContent = rows ? rows.length + \" links\" : \"Links could not be read\"; });\n}\nfunction render(input) {\n  const list = document.getElementById(\"list\");\n  list.textContent = \"\";\n  const section = input.sql && input.sql[\"probe.list\"];\n  for (const row of section ? section.rows : []) {\n    const item = document.createElement(\"li\");\n    const button = document.createElement(\"button\");\n    button.type = \"button\"; button.textContent = row.name; button.dataset.id = row.id;\n    button.addEventListener(\"click\", () => { open(row.id); window.nativeArtifact.setViewState({ open: row.id }); });\n    item.append(button);\n    list.append(item);\n  }\n  list.dataset.count = section ? section.row_count + (section.truncated ? \" truncated\" : \"\") : \"sample\";\n}\nwindow.nativeArtifact.ready.then((delivery) => render(delivery.input));\nwindow.nativeArtifact.onInput((delivery) => render(delivery.input));\n</script>\n</body>\n</html>\n",
+              "facets": {
+                "runtime": "native.html.v1",
+                "app_icon": "BookOpen"
+              },
+              "reason": "Pinned immutable main oracle",
+              "sources": [],
+              "response_mode": "summary"
+            },
+            "expect": {
+              "body_digest": "1c7811887596c0cd39dc9746bee08eb9424161b715585bfeec54a784f64ff976",
+              "body_bytes": 2486
+            }
+          },
+          {
+            "step": "install",
+            "executor": "artifacts_write",
+            "operation": "manage_alpha_tabs.install",
+            "arguments": {
+              "package": "agent.kit-probe",
+              "version": "0.1.0",
+              "digest": "sha256:c593f94136e397ad144116428cdcdc9eb643ed186015c22a712d0b26913cd2c8",
+              "artifact_id": "{{record_id}}",
+              "source_revision": "{{source_revision}}",
+              "declaration": {
+                "needs": [
+                  {
+                    "need": "sql.snapshot.v1",
+                    "key": "probe.list",
+                    "label": "Open tasks, newest first",
+                    "sql": "SELECT id, name FROM records WHERE type = 'WorkItem' ORDER BY last_activity_at_ms DESC, id LIMIT 200"
+                  },
+                  {
+                    "need": "sql.snapshot.v1",
+                    "key": "probe.body",
+                    "label": "One record's body, read when opened",
+                    "sql": "SELECT id, body FROM records WHERE id = ?1",
+                    "params": [
+                      {
+                        "name": "id",
+                        "type": "text",
+                        "max_len": 64
+                      }
+                    ]
+                  },
+                  {
+                    "need": "sql.snapshot.v1",
+                    "key": "probe.links",
+                    "label": "One record's outgoing links, read when opened",
+                    "sql": "SELECT target_id, relationship FROM links WHERE source_id = ?1 ORDER BY target_id LIMIT 50",
+                    "params": [
+                      {
+                        "name": "id",
+                        "type": "text",
+                        "max_len": 64
+                      }
+                    ]
+                  }
+                ],
+                "effects": []
+              },
+              "reason": "Pinned immutable main oracle"
+            },
+            "expect": {
+              "digest": "sha256:c593f94136e397ad144116428cdcdc9eb643ed186015c22a712d0b26913cd2c8",
+              "declaration_digest": "7046960d2f71a024b142dda14cf51ce5616c8964b0782ab7f275a97078724c16"
+            }
+          },
+          {
+            "step": "inspect",
+            "executor": "artifacts_read",
+            "operation": "manage_alpha_tabs.inspect",
+            "arguments": {
+              "package": "agent.kit-probe"
+            },
+            "expect": {
+              "digest": "sha256:c593f94136e397ad144116428cdcdc9eb643ed186015c22a712d0b26913cd2c8",
+              "declaration_digest": "7046960d2f71a024b142dda14cf51ce5616c8964b0782ab7f275a97078724c16",
+              "version": "0.1.0"
+            },
+            "note": "Preview and adoption are the viewer's, in a signed-in browser at /alpha/: agents are refused preview receipts (preview_authority_missing)."
+          }
+        ]
+      }
+    },
+    {
+      "name": "chunked icon",
+      "input": {
+        "descriptor": {
+          "package": "agent.kit-probe",
+          "version": "0.1.0",
+          "bundle": "probe-concurrent.html",
+          "runtime": "native.html.v1",
+          "declaration": {
+            "needs": [
+              {
+                "need": "sql.snapshot.v1",
+                "key": "probe.list",
+                "label": "Open tasks, newest first",
+                "sql": "SELECT id, name FROM records WHERE type = 'WorkItem' ORDER BY last_activity_at_ms DESC, id LIMIT 200"
+              },
+              {
+                "need": "sql.snapshot.v1",
+                "key": "probe.body",
+                "label": "One record's body, read when opened",
+                "sql": "SELECT id, body FROM records WHERE id = ?1",
+                "params": [
+                  {
+                    "name": "id",
+                    "type": "text",
+                    "max_len": 64
+                  }
+                ]
+              },
+              {
+                "need": "sql.snapshot.v1",
+                "key": "probe.links",
+                "label": "One record's outgoing links, read when opened",
+                "sql": "SELECT target_id, relationship FROM links WHERE source_id = ?1 ORDER BY target_id LIMIT 50",
+                "params": [
+                  {
+                    "name": "id",
+                    "type": "text",
+                    "max_len": 64
+                  }
+                ]
+              }
+            ],
+            "effects": []
+          },
+          "icon": "BookOpen"
+        },
+        "html": "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n<title>Kit probe</title>\n</head>\n<body>\n<main>\n<h1>Kit probe</h1>\n<ul id=\"list\"></ul>\n<section id=\"detail\"><h2>Detail</h2><p id=\"body\">Nothing open</p><p id=\"links\"></p></section>\n</main>\n<script>\n// One read in flight, busy (or a synchronous bridge refusal) retried with\n// bounded backoff: the pattern the 0.1.1 tabs adopted.\nconst queue = [];\nlet active = false;\nfunction pump() {\n  if (active || !queue.length) return;\n  active = true;\n  const job = queue.shift();\n  const attempt = (tries) => {\n    let request;\n    try { request = window.nativeArtifact.read(job.need, job.params); } catch (error) { request = Promise.resolve({ status: \"busy\" }); }\n    request.then((reply) => {\n      if (reply && reply.status === \"busy\" && tries < 8) { setTimeout(() => attempt(tries + 1), 120 * (tries + 1)); return; }\n      active = false;\n      job.resolve(reply && reply.status === \"ok\" ? reply.result.rows : null);\n      pump();\n    }, () => { active = false; job.resolve(null); pump(); });\n  };\n  attempt(0);\n}\nconst read = (need, params) => new Promise((resolve) => { queue.push({ need, params, resolve }); pump(); });\nfunction open(id) {\n  document.getElementById(\"body\").textContent = \"Loading\";\n  read(\"probe.body\", { id }).then((rows) => { document.getElementById(\"body\").textContent = rows && rows[0] ? rows[0].body : \"The record body could not be read\"; });\n  read(\"probe.links\", { id }).then((rows) => { document.getElementById(\"links\").textContent = rows ? rows.length + \" links\" : \"Links could not be read\"; });\n}\nfunction render(input) {\n  const list = document.getElementById(\"list\");\n  list.textContent = \"\";\n  const section = input.sql && input.sql[\"probe.list\"];\n  for (const row of section ? section.rows : []) {\n    const item = document.createElement(\"li\");\n    const button = document.createElement(\"button\");\n    button.type = \"button\"; button.textContent = row.name; button.dataset.id = row.id;\n    button.addEventListener(\"click\", () => { open(row.id); window.nativeArtifact.setViewState({ open: row.id }); });\n    item.append(button);\n    list.append(item);\n  }\n  list.dataset.count = section ? section.row_count + (section.truncated ? \" truncated\" : \"\") : \"sample\";\n}\nwindow.nativeArtifact.ready.then((delivery) => render(delivery.input));\nwindow.nativeArtifact.onInput((delivery) => render(delivery.input));\n</script>\n</body>\n</html>\n",
+        "homeId": "home",
+        "reason": "Pinned immutable main oracle",
+        "chunkBytes": 700,
+        "chunked": true
+      },
+      "plan": {
+        "package": "agent.kit-probe",
+        "version": "0.1.0",
+        "digests": {
+          "digest_version": "alpha-tab-digest.v1",
+          "bundle_sha256": "1c7811887596c0cd39dc9746bee08eb9424161b715585bfeec54a784f64ff976",
+          "declaration_digest": "7046960d2f71a024b142dda14cf51ce5616c8964b0782ab7f275a97078724c16",
+          "digest": "sha256:c593f94136e397ad144116428cdcdc9eb643ed186015c22a712d0b26913cd2c8"
+        },
+        "chunks": 4,
+        "steps": [
+          {
+            "step": "create-note",
+            "executor": "records_write",
+            "operation": "create_record",
+            "arguments": {
+              "type": "Document",
+              "kind": "note",
+              "name": "agent.kit-probe 0.1.0 (alpha tab source)",
+              "home_id": "home",
+              "summary": "Source bytes of alpha tab agent.kit-probe 0.1.0; staged as a note, then switched to native.html.v1.",
+              "body": "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n<title>Kit probe</title>\n</head>\n<body>\n<main>\n<h1>Kit probe</h1>\n<ul id=\"list\"></ul>\n<section id=\"detail\"><h2>Detail</h2><p id=\"body\">Nothing open</p><p id=\"links\"></p></section>\n</main>\n<script>\n// One read in flight, busy (or a synchronous bridge refusal) retried with\n// bounded backoff: the pattern the 0.1.1 tabs adopted.\nconst queue = [];\nlet active = false;\nfunction pump() {\n  if (active || !queue.length) return;\n  active = true;\n  const job = queue.shift();\n  const attempt = (tries) => {\n    let request;\n    try { request = window.nativeArtifact.read(job.n",
+              "reason": "Pinned immutable main oracle",
+              "sources": []
+            },
+            "expect": {
+              "body_digest": "4ec685e918638f1206077bf32a17dd6ea61ef1a8540f1da491c87347f0b2395f",
+              "body_bytes": 700
+            }
+          },
+          {
+            "step": "append-2",
+            "executor": "records_write",
+            "operation": "update_record",
+            "arguments": {
+              "id": "{{record_id}}",
+              "body_append": "eed, job.params); } catch (error) { request = Promise.resolve({ status: \"busy\" }); }\n    request.then((reply) => {\n      if (reply && reply.status === \"busy\" && tries < 8) { setTimeout(() => attempt(tries + 1), 120 * (tries + 1)); return; }\n      active = false;\n      job.resolve(reply && reply.status === \"ok\" ? reply.result.rows : null);\n      pump();\n    }, () => { active = false; job.resolve(null); pump(); });\n  };\n  attempt(0);\n}\nconst read = (need, params) => new Promise((resolve) => { queue.push({ need, params, resolve }); pump(); });\nfunction open(id) {\n  document.getElementById(\"body\").textContent = \"Loading\";\n  read(\"probe.body\", { id }).then((rows) => { document.getElementById(\"bod",
+              "if_body_digest": "4ec685e918638f1206077bf32a17dd6ea61ef1a8540f1da491c87347f0b2395f",
+              "reason": "Pinned immutable main oracle (chunk 2 of 4)",
+              "sources": []
+            },
+            "expect": {
+              "body_digest": "481b63a7a687853512cac57785dcc3e35d24a75426f4c015456455d4445c6405",
+              "body_bytes": 1400
+            }
+          },
+          {
+            "step": "append-3",
+            "executor": "records_write",
+            "operation": "update_record",
+            "arguments": {
+              "id": "{{record_id}}",
+              "body_append": "y\").textContent = rows && rows[0] ? rows[0].body : \"The record body could not be read\"; });\n  read(\"probe.links\", { id }).then((rows) => { document.getElementById(\"links\").textContent = rows ? rows.length + \" links\" : \"Links could not be read\"; });\n}\nfunction render(input) {\n  const list = document.getElementById(\"list\");\n  list.textContent = \"\";\n  const section = input.sql && input.sql[\"probe.list\"];\n  for (const row of section ? section.rows : []) {\n    const item = document.createElement(\"li\");\n    const button = document.createElement(\"button\");\n    button.type = \"button\"; button.textContent = row.name; button.dataset.id = row.id;\n    button.addEventListener(\"click\", () => { open(row.id)",
+              "if_body_digest": "481b63a7a687853512cac57785dcc3e35d24a75426f4c015456455d4445c6405",
+              "reason": "Pinned immutable main oracle (chunk 3 of 4)",
+              "sources": []
+            },
+            "expect": {
+              "body_digest": "8a0d33cd33a7776489c2f4819b5cbe1c76edec53d5b9d4ef9ffc575e370822a4",
+              "body_bytes": 2100
+            }
+          },
+          {
+            "step": "append-4",
+            "executor": "records_write",
+            "operation": "update_record",
+            "arguments": {
+              "id": "{{record_id}}",
+              "body_append": "; window.nativeArtifact.setViewState({ open: row.id }); });\n    item.append(button);\n    list.append(item);\n  }\n  list.dataset.count = section ? section.row_count + (section.truncated ? \" truncated\" : \"\") : \"sample\";\n}\nwindow.nativeArtifact.ready.then((delivery) => render(delivery.input));\nwindow.nativeArtifact.onInput((delivery) => render(delivery.input));\n</script>\n</body>\n</html>\n",
+              "if_body_digest": "8a0d33cd33a7776489c2f4819b5cbe1c76edec53d5b9d4ef9ffc575e370822a4",
+              "reason": "Pinned immutable main oracle (chunk 4 of 4)",
+              "sources": []
+            },
+            "expect": {
+              "body_digest": "1c7811887596c0cd39dc9746bee08eb9424161b715585bfeec54a784f64ff976",
+              "body_bytes": 2486
+            }
+          },
+          {
+            "step": "source-revision",
+            "executor": "sql_read",
+            "operation": "query_sql",
+            "arguments": {
+              "sql": "SELECT id, type FROM content_events WHERE record_id = ?1 AND type IN ('record.created', 'record.updated', 'receipt.committed.v1') ORDER BY local_seq DESC, id LIMIT 1",
+              "parameters": [
+                {
+                  "type": "text",
+                  "value": "{{record_id}}"
+                }
+              ]
+            },
+            "capture": {
+              "source_revision": "rows[0].id"
+            },
+            "note": "Run before any other write to the record: the newest event is the last body-carrying write."
+          },
+          {
+            "step": "rekind-artifact",
+            "executor": "records_write",
+            "operation": "update_record",
+            "arguments": {
+              "id": "{{record_id}}",
+              "kind": "artifact",
+              "facets": {
+                "runtime": "native.html.v1",
+                "app_icon": "BookOpen"
+              },
+              "if_body_digest": "1c7811887596c0cd39dc9746bee08eb9424161b715585bfeec54a784f64ff976",
+              "reason": "Pinned immutable main oracle (switch to native.html.v1; validates the complete document)",
+              "sources": []
+            },
+            "expect": {
+              "body_digest": "1c7811887596c0cd39dc9746bee08eb9424161b715585bfeec54a784f64ff976"
+            }
+          },
+          {
+            "step": "install",
+            "executor": "artifacts_write",
+            "operation": "manage_alpha_tabs.install",
+            "arguments": {
+              "package": "agent.kit-probe",
+              "version": "0.1.0",
+              "digest": "sha256:c593f94136e397ad144116428cdcdc9eb643ed186015c22a712d0b26913cd2c8",
+              "artifact_id": "{{record_id}}",
+              "source_revision": "{{source_revision}}",
+              "declaration": {
+                "needs": [
+                  {
+                    "need": "sql.snapshot.v1",
+                    "key": "probe.list",
+                    "label": "Open tasks, newest first",
+                    "sql": "SELECT id, name FROM records WHERE type = 'WorkItem' ORDER BY last_activity_at_ms DESC, id LIMIT 200"
+                  },
+                  {
+                    "need": "sql.snapshot.v1",
+                    "key": "probe.body",
+                    "label": "One record's body, read when opened",
+                    "sql": "SELECT id, body FROM records WHERE id = ?1",
+                    "params": [
+                      {
+                        "name": "id",
+                        "type": "text",
+                        "max_len": 64
+                      }
+                    ]
+                  },
+                  {
+                    "need": "sql.snapshot.v1",
+                    "key": "probe.links",
+                    "label": "One record's outgoing links, read when opened",
+                    "sql": "SELECT target_id, relationship FROM links WHERE source_id = ?1 ORDER BY target_id LIMIT 50",
+                    "params": [
+                      {
+                        "name": "id",
+                        "type": "text",
+                        "max_len": 64
+                      }
+                    ]
+                  }
+                ],
+                "effects": []
+              },
+              "reason": "Pinned immutable main oracle"
+            },
+            "expect": {
+              "digest": "sha256:c593f94136e397ad144116428cdcdc9eb643ed186015c22a712d0b26913cd2c8",
+              "declaration_digest": "7046960d2f71a024b142dda14cf51ce5616c8964b0782ab7f275a97078724c16"
+            }
+          },
+          {
+            "step": "inspect",
+            "executor": "artifacts_read",
+            "operation": "manage_alpha_tabs.inspect",
+            "arguments": {
+              "package": "agent.kit-probe"
+            },
+            "expect": {
+              "digest": "sha256:c593f94136e397ad144116428cdcdc9eb643ed186015c22a712d0b26913cd2c8",
+              "declaration_digest": "7046960d2f71a024b142dda14cf51ce5616c8964b0782ab7f275a97078724c16",
+              "version": "0.1.0"
+            },
+            "note": "Preview and adoption are the viewer's, in a signed-in browser at /alpha/: agents are refused preview receipts (preview_authority_missing)."
+          }
+        ]
+      }
+    }
+  ],
+  "feature": [
+    {
+      "name": "descriptor only",
+      "input": {
+        "descriptor": {
+          "package": "example.reader",
+          "version": "1.0.0",
+          "runtime": "native.html.v1",
+          "declaration": {
+            "needs": [
+              {
+                "need": "records.body.read.v1",
+                "scope": "viewer-visible-current-bodies"
+              }
+            ],
+            "effects": []
+          }
+        },
+        "html": "﻿<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>Reader</title></head><body><main><h1>Reader😀€</h1></main></body></html>",
+        "homeId": "home",
+        "reason": "Pinned immutable feature oracle",
+        "chunkBytes": 100
+      },
+      "plan": {
+        "kind": "alpha-tab.body-feature-plan.v1",
+        "package": "example.reader",
+        "version": "1.0.0",
+        "digests": {
+          "digest_version": "alpha-tab-digest.v1",
+          "bundle_sha256": "eda7f844eb28a5393026fa23c71229c12ac744990e7b9a1448fde7c46e440b9b",
+          "declaration_digest": "b543054776df55c1cee9a703a50ea398e88ac3df40f322e437264ab6d450cae4",
+          "digest": "sha256:68ac6f23780476b5db6816c7179ce576f8ae549655f1de66fb51eb970794a356"
+        },
+        "sourceSteps": [
+          {
+            "step": "create-note",
+            "executor": "records_write",
+            "operation": "create_record",
+            "arguments": {
+              "type": "Document",
+              "kind": "note",
+              "name": "example.reader 1.0.0 (alpha tab source)",
+              "home_id": "home",
+              "summary": "Source bytes of alpha tab example.reader 1.0.0; staged as a note, then switched to native.html.v1.",
+              "body": "﻿<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>Reader</title></head><body><mai",
+              "reason": "Pinned immutable feature oracle",
+              "sources": []
+            },
+            "expect": {
+              "body_digest": "dbd0ede06088657380c994769f0e8aedb98d95628a5b9084161076154e4e85d5",
+              "body_bytes": 100
+            }
+          },
+          {
+            "step": "append-2",
+            "executor": "records_write",
+            "operation": "update_record",
+            "arguments": {
+              "id": "{{record_id}}",
+              "body_append": "n><h1>Reader😀€</h1></main></body></html>",
+              "if_body_digest": "dbd0ede06088657380c994769f0e8aedb98d95628a5b9084161076154e4e85d5",
+              "reason": "Pinned immutable feature oracle (chunk 2 of 2)",
+              "sources": []
+            },
+            "expect": {
+              "body_digest": "eda7f844eb28a5393026fa23c71229c12ac744990e7b9a1448fde7c46e440b9b",
+              "body_bytes": 145
+            }
+          },
+          {
+            "step": "source-revision",
+            "executor": "sql_read",
+            "operation": "query_sql",
+            "arguments": {
+              "sql": "SELECT id, type FROM content_events WHERE record_id = ?1 AND type IN ('record.created', 'record.updated', 'receipt.committed.v1') ORDER BY local_seq DESC, id LIMIT 1",
+              "parameters": [
+                {
+                  "type": "text",
+                  "value": "{{record_id}}"
+                }
+              ]
+            },
+            "capture": {
+              "source_revision": "rows[0].id"
+            },
+            "note": "Run before any other write to the record: the newest event is the last body-carrying write."
+          },
+          {
+            "step": "rekind-artifact",
+            "executor": "records_write",
+            "operation": "update_record",
+            "arguments": {
+              "id": "{{record_id}}",
+              "kind": "artifact",
+              "facets": {
+                "runtime": "native.html.v1"
+              },
+              "if_body_digest": "eda7f844eb28a5393026fa23c71229c12ac744990e7b9a1448fde7c46e440b9b",
+              "reason": "Pinned immutable feature oracle (switch to native.html.v1; validates the complete document)",
+              "sources": []
+            },
+            "expect": {
+              "body_digest": "eda7f844eb28a5393026fa23c71229c12ac744990e7b9a1448fde7c46e440b9b"
+            }
+          }
+        ],
+        "hostInstall": {
+          "operation": "alpha-tabs.body-feature",
+          "method": "POST",
+          "pathTemplate": "/databases/{db_id}/alpha-tabs/body-feature",
+          "arguments": {
+            "action": "install",
+            "package": "example.reader",
+            "version": "1.0.0",
+            "digest": "sha256:68ac6f23780476b5db6816c7179ce576f8ae549655f1de66fb51eb970794a356",
+            "artifact_id": "{{record_id}}",
+            "source_revision": "{{source_revision}}",
+            "declaration": {
+              "needs": [
+                {
+                  "need": "records.body.read.v1",
+                  "scope": "viewer-visible-current-bodies"
+                }
+              ],
+              "effects": []
+            },
+            "reason": "Pinned immutable feature oracle",
+            "idempotency_key": "ORIGINAL-UUID-SENTINEL"
+          }
+        },
+        "hostAvailability": {
+          "body": "viewer-visible-current-bodies",
+          "otherReads": false,
+          "effects": false,
+          "sessions": false
+        }
+      }
+    },
+    {
+      "name": "explicit replacement",
+      "input": {
+        "descriptor": {
+          "package": "example.reader",
+          "version": "1.0.0",
+          "runtime": "native.html.v1",
+          "declaration": {
+            "needs": [
+              {
+                "need": "records.body.read.v1",
+                "scope": "viewer-visible-current-bodies"
+              }
+            ],
+            "effects": []
+          }
+        },
+        "html": "﻿<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>Reader</title></head><body><main><h1>Reader😀€</h1></main></body></html>",
+        "homeId": "home",
+        "reason": "Pinned immutable feature oracle",
+        "chunkBytes": 100,
+        "replaceInstallEventId": "installed"
+      },
+      "plan": {
+        "kind": "alpha-tab.body-feature-plan.v1",
+        "package": "example.reader",
+        "version": "1.0.0",
+        "digests": {
+          "digest_version": "alpha-tab-digest.v1",
+          "bundle_sha256": "eda7f844eb28a5393026fa23c71229c12ac744990e7b9a1448fde7c46e440b9b",
+          "declaration_digest": "b543054776df55c1cee9a703a50ea398e88ac3df40f322e437264ab6d450cae4",
+          "digest": "sha256:68ac6f23780476b5db6816c7179ce576f8ae549655f1de66fb51eb970794a356"
+        },
+        "sourceSteps": [
+          {
+            "step": "create-note",
+            "executor": "records_write",
+            "operation": "create_record",
+            "arguments": {
+              "type": "Document",
+              "kind": "note",
+              "name": "example.reader 1.0.0 (alpha tab source)",
+              "home_id": "home",
+              "summary": "Source bytes of alpha tab example.reader 1.0.0; staged as a note, then switched to native.html.v1.",
+              "body": "﻿<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>Reader</title></head><body><mai",
+              "reason": "Pinned immutable feature oracle",
+              "sources": []
+            },
+            "expect": {
+              "body_digest": "dbd0ede06088657380c994769f0e8aedb98d95628a5b9084161076154e4e85d5",
+              "body_bytes": 100
+            }
+          },
+          {
+            "step": "append-2",
+            "executor": "records_write",
+            "operation": "update_record",
+            "arguments": {
+              "id": "{{record_id}}",
+              "body_append": "n><h1>Reader😀€</h1></main></body></html>",
+              "if_body_digest": "dbd0ede06088657380c994769f0e8aedb98d95628a5b9084161076154e4e85d5",
+              "reason": "Pinned immutable feature oracle (chunk 2 of 2)",
+              "sources": []
+            },
+            "expect": {
+              "body_digest": "eda7f844eb28a5393026fa23c71229c12ac744990e7b9a1448fde7c46e440b9b",
+              "body_bytes": 145
+            }
+          },
+          {
+            "step": "source-revision",
+            "executor": "sql_read",
+            "operation": "query_sql",
+            "arguments": {
+              "sql": "SELECT id, type FROM content_events WHERE record_id = ?1 AND type IN ('record.created', 'record.updated', 'receipt.committed.v1') ORDER BY local_seq DESC, id LIMIT 1",
+              "parameters": [
+                {
+                  "type": "text",
+                  "value": "{{record_id}}"
+                }
+              ]
+            },
+            "capture": {
+              "source_revision": "rows[0].id"
+            },
+            "note": "Run before any other write to the record: the newest event is the last body-carrying write."
+          },
+          {
+            "step": "rekind-artifact",
+            "executor": "records_write",
+            "operation": "update_record",
+            "arguments": {
+              "id": "{{record_id}}",
+              "kind": "artifact",
+              "facets": {
+                "runtime": "native.html.v1"
+              },
+              "if_body_digest": "eda7f844eb28a5393026fa23c71229c12ac744990e7b9a1448fde7c46e440b9b",
+              "reason": "Pinned immutable feature oracle (switch to native.html.v1; validates the complete document)",
+              "sources": []
+            },
+            "expect": {
+              "body_digest": "eda7f844eb28a5393026fa23c71229c12ac744990e7b9a1448fde7c46e440b9b"
+            }
+          },
+          {
+            "step": "remove-previous-install",
+            "executor": "artifacts_write",
+            "operation": "manage_alpha_tabs.remove",
+            "arguments": {
+              "package": "example.reader",
+              "expected_install_event_id": "installed",
+              "reason": "Pinned immutable feature oracle (install refuses a package that is already installed)"
+            }
+          }
+        ],
+        "hostInstall": {
+          "operation": "alpha-tabs.body-feature",
+          "method": "POST",
+          "pathTemplate": "/databases/{db_id}/alpha-tabs/body-feature",
+          "arguments": {
+            "action": "install",
+            "package": "example.reader",
+            "version": "1.0.0",
+            "digest": "sha256:68ac6f23780476b5db6816c7179ce576f8ae549655f1de66fb51eb970794a356",
+            "artifact_id": "{{record_id}}",
+            "source_revision": "{{source_revision}}",
+            "declaration": {
+              "needs": [
+                {
+                  "need": "records.body.read.v1",
+                  "scope": "viewer-visible-current-bodies"
+                }
+              ],
+              "effects": []
+            },
+            "reason": "Pinned immutable feature oracle",
+            "idempotency_key": "ORIGINAL-UUID-SENTINEL",
+            "expected_install_event_id": "{{removed_event_id}}"
+          }
+        },
+        "hostAvailability": {
+          "body": "viewer-visible-current-bodies",
+          "otherReads": false,
+          "effects": false,
+          "sessions": false
+        }
+      }
+    },
+    {
+      "name": "mixed qualified declaration",
+      "input": {
+        "descriptor": {
+          "package": "example.reader",
+          "version": "1.0.0",
+          "runtime": "native.html.v1",
+          "declaration": {
+            "needs": [
+              {
+                "need": "records.body.read.v1",
+                "scope": "viewer-visible-current-bodies"
+              },
+              {
+                "need": "sql.snapshot.v1",
+                "key": "rows",
+                "label": "Visible records",
+                "sql": "SELECT id FROM records WHERE name = ?1 ORDER BY id",
+                "params": [
+                  {
+                    "name": "name",
+                    "type": "text"
+                  }
+                ]
+              }
+            ],
+            "effects": [
+              {
+                "effect": "records.facet-set.v1",
+                "key": "priority",
+                "values": [
+                  "z",
+                  "a"
+                ],
+                "target": {
+                  "need": "rows"
+                }
+              },
+              {
+                "effect": "comment.create.v1",
+                "positions": [
+                  "root",
+                  "reply"
+                ],
+                "max_body_bytes": 4096,
+                "target": {
+                  "need": "rows"
+                }
+              },
+              {
+                "effect": "message.react.v1",
+                "emoji": [
+                  "👀",
+                  "👍"
+                ],
+                "target": {
+                  "need": "rows"
+                }
+              },
+              {
+                "effect": "records.title-set.v1",
+                "target": {
+                  "need": "rows"
+                }
+              }
+            ],
+            "sessions": [
+              {
+                "session": "session.body.v1",
+                "key": "z",
+                "scope": {
+                  "type": "Document",
+                  "kind": "*"
+                },
+                "mode": "view",
+                "presence": false
+              },
+              {
+                "session": "session.body.v1",
+                "key": "a",
+                "scope": {
+                  "type": "Document",
+                  "kind": "note"
+                },
+                "mode": "edit",
+                "presence": true
+              }
+            ]
+          }
+        },
+        "html": "﻿<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>Reader</title></head><body><main><h1>Reader😀€</h1></main></body></html>",
+        "homeId": "home",
+        "reason": "Pinned immutable feature oracle",
+        "chunkBytes": 100
+      },
+      "plan": {
+        "kind": "alpha-tab.body-feature-plan.v1",
+        "package": "example.reader",
+        "version": "1.0.0",
+        "digests": {
+          "digest_version": "alpha-tab-digest.v1",
+          "bundle_sha256": "eda7f844eb28a5393026fa23c71229c12ac744990e7b9a1448fde7c46e440b9b",
+          "declaration_digest": "15220762b37599ea97b31be1a3c1de9aefa57d153d03496a52536dde28a7851b",
+          "digest": "sha256:8f574485e5f3a9394c13be5309292f83ef0cdbcbc78fa1a5dcdf4a42031b829f"
+        },
+        "sourceSteps": [
+          {
+            "step": "create-note",
+            "executor": "records_write",
+            "operation": "create_record",
+            "arguments": {
+              "type": "Document",
+              "kind": "note",
+              "name": "example.reader 1.0.0 (alpha tab source)",
+              "home_id": "home",
+              "summary": "Source bytes of alpha tab example.reader 1.0.0; staged as a note, then switched to native.html.v1.",
+              "body": "﻿<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>Reader</title></head><body><mai",
+              "reason": "Pinned immutable feature oracle",
+              "sources": []
+            },
+            "expect": {
+              "body_digest": "dbd0ede06088657380c994769f0e8aedb98d95628a5b9084161076154e4e85d5",
+              "body_bytes": 100
+            }
+          },
+          {
+            "step": "append-2",
+            "executor": "records_write",
+            "operation": "update_record",
+            "arguments": {
+              "id": "{{record_id}}",
+              "body_append": "n><h1>Reader😀€</h1></main></body></html>",
+              "if_body_digest": "dbd0ede06088657380c994769f0e8aedb98d95628a5b9084161076154e4e85d5",
+              "reason": "Pinned immutable feature oracle (chunk 2 of 2)",
+              "sources": []
+            },
+            "expect": {
+              "body_digest": "eda7f844eb28a5393026fa23c71229c12ac744990e7b9a1448fde7c46e440b9b",
+              "body_bytes": 145
+            }
+          },
+          {
+            "step": "source-revision",
+            "executor": "sql_read",
+            "operation": "query_sql",
+            "arguments": {
+              "sql": "SELECT id, type FROM content_events WHERE record_id = ?1 AND type IN ('record.created', 'record.updated', 'receipt.committed.v1') ORDER BY local_seq DESC, id LIMIT 1",
+              "parameters": [
+                {
+                  "type": "text",
+                  "value": "{{record_id}}"
+                }
+              ]
+            },
+            "capture": {
+              "source_revision": "rows[0].id"
+            },
+            "note": "Run before any other write to the record: the newest event is the last body-carrying write."
+          },
+          {
+            "step": "rekind-artifact",
+            "executor": "records_write",
+            "operation": "update_record",
+            "arguments": {
+              "id": "{{record_id}}",
+              "kind": "artifact",
+              "facets": {
+                "runtime": "native.html.v1"
+              },
+              "if_body_digest": "eda7f844eb28a5393026fa23c71229c12ac744990e7b9a1448fde7c46e440b9b",
+              "reason": "Pinned immutable feature oracle (switch to native.html.v1; validates the complete document)",
+              "sources": []
+            },
+            "expect": {
+              "body_digest": "eda7f844eb28a5393026fa23c71229c12ac744990e7b9a1448fde7c46e440b9b"
+            }
+          }
+        ],
+        "hostInstall": {
+          "operation": "alpha-tabs.body-feature",
+          "method": "POST",
+          "pathTemplate": "/databases/{db_id}/alpha-tabs/body-feature",
+          "arguments": {
+            "action": "install",
+            "package": "example.reader",
+            "version": "1.0.0",
+            "digest": "sha256:8f574485e5f3a9394c13be5309292f83ef0cdbcbc78fa1a5dcdf4a42031b829f",
+            "artifact_id": "{{record_id}}",
+            "source_revision": "{{source_revision}}",
+            "declaration": {
+              "needs": [
+                {
+                  "need": "records.body.read.v1",
+                  "scope": "viewer-visible-current-bodies"
+                },
+                {
+                  "need": "sql.snapshot.v1",
+                  "key": "rows",
+                  "label": "Visible records",
+                  "sql": "SELECT id FROM records WHERE name = ?1 ORDER BY id",
+                  "params": [
+                    {
+                      "name": "name",
+                      "type": "text"
+                    }
+                  ]
+                }
+              ],
+              "effects": [
+                {
+                  "effect": "records.facet-set.v1",
+                  "key": "priority",
+                  "values": [
+                    "z",
+                    "a"
+                  ],
+                  "target": {
+                    "need": "rows"
+                  }
+                },
+                {
+                  "effect": "comment.create.v1",
+                  "positions": [
+                    "root",
+                    "reply"
+                  ],
+                  "max_body_bytes": 4096,
+                  "target": {
+                    "need": "rows"
+                  }
+                },
+                {
+                  "effect": "message.react.v1",
+                  "emoji": [
+                    "👀",
+                    "👍"
+                  ],
+                  "target": {
+                    "need": "rows"
+                  }
+                },
+                {
+                  "effect": "records.title-set.v1",
+                  "target": {
+                    "need": "rows"
+                  }
+                }
+              ],
+              "sessions": [
+                {
+                  "session": "session.body.v1",
+                  "key": "z",
+                  "scope": {
+                    "type": "Document",
+                    "kind": "*"
+                  },
+                  "mode": "view",
+                  "presence": false
+                },
+                {
+                  "session": "session.body.v1",
+                  "key": "a",
+                  "scope": {
+                    "type": "Document",
+                    "kind": "note"
+                  },
+                  "mode": "edit",
+                  "presence": true
+                }
+              ]
+            },
+            "reason": "Pinned immutable feature oracle",
+            "idempotency_key": "ORIGINAL-UUID-SENTINEL"
+          }
+        },
+        "hostAvailability": {
+          "body": "viewer-visible-current-bodies",
+          "otherReads": false,
+          "effects": false,
+          "sessions": false
+        }
+      }
+    }
+  ]
+}

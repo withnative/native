@@ -22,6 +22,87 @@ async fn db() -> Db {
     db
 }
 
+#[tokio::test]
+async fn relationship_rebuild_preserves_historical_content_link_with_exact_compatibility_id() {
+    let db = db().await;
+    let registry = registry();
+    let source = create_record(
+        &db,
+        json!({"type":"WorkItem","kind":"task","name":"Source"}),
+    )
+    .await
+    .unwrap();
+    let target = create_record(
+        &db,
+        json!({"type":"Outcome","kind":"target","name":"Target"}),
+    )
+    .await
+    .unwrap();
+    let asserted = call(
+        &registry,
+        &db,
+        Caller::local(),
+        json!({"action":"assert","relationship_type":"depends_on",
+            "endpoints":[{"role":"subject","record_id":source},
+                         {"role":"object","record_id":target}],
+            "idempotency_key":"exact-compatibility-id"}),
+    )
+    .await
+    .unwrap();
+    let id = format!(
+        "rel:{}:{}",
+        asserted["relationship_origin_db_id"].as_str().unwrap(),
+        asserted["relationship_id"].as_str().unwrap()
+    );
+    let pool = crate::common::fixture_write_pool(&db).await;
+    let existing: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM links WHERE id=?1")
+        .bind(&id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(existing, 1);
+
+    // Model a pre-reservation content add that occupied the compatibility id.
+    // A real relationship ledger remains, so ledger membership alone would
+    // misclassify this physical link during scratch replay.
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query("DELETE FROM links WHERE id=?1")
+        .bind(&id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO content_events(id,record_id,type,payload,causal_envelope_version,causal_status)
+         VALUES('historical-exact-collision',?1,'link.added',?2,1,'legacy_unknown')",
+    )
+    .bind(&source)
+    .bind(json!({"id":id,"source_id":source,"target_id":target,"relationship":"supersedes"}).to_string())
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO links(id,source_id,target_id,relationship) VALUES(?1,?2,?3,'supersedes')",
+    )
+    .bind(&id)
+    .bind(&source)
+    .bind(&target)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    let rebuilt = native_ce::conformance::rebuild_and_diff_relationship(&db)
+        .await
+        .unwrap();
+    assert!(rebuilt.equal, "{rebuilt:#?}");
+    let retained: String = sqlx::query_scalar("SELECT relationship FROM links WHERE id=?1")
+        .bind(&id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(retained, "supersedes");
+}
+
 fn registry() -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     register_surface_tools(&mut registry).unwrap();
@@ -1778,6 +1859,187 @@ async fn find_omits_unviewable_counterparts_indistinguishably() {
     )
     .await;
     assert_eq!(local["returned"], 2);
+}
+
+/// `effective_relationship_endpoints` rows as `(ordinal, role, record_id)`.
+fn endpoint_rows(response: &Value) -> Vec<(i64, String, Option<String>)> {
+    response["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| {
+            (
+                row["ordinal"].as_i64().unwrap(),
+                row["role"].as_str().unwrap().to_owned(),
+                row["record_id"].as_str().map(str::to_owned),
+            )
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn effective_relationship_endpoints_match_the_json_and_fence_hidden_endpoints() {
+    let db = db().await;
+    let registry = registry();
+    let visible_task = task(&db, "Visible task", "open").await;
+    let assignee = person_record(&db, "Endpoint assignee").await;
+    let secret_task = task(&db, "Secret task", "open").await;
+    visible_to(&db, &visible_task, &["acct:viewer"]).await;
+    visible_to(&db, &assignee, &["acct:viewer"]).await;
+    hidden(&db, &secret_task).await;
+
+    let shown = assign(
+        &registry,
+        &db,
+        &visible_task,
+        &assignee,
+        "endpoints-visible",
+    )
+    .await;
+    let fenced = assign(&registry, &db, &secret_task, &assignee, "endpoints-hidden").await;
+    let viewer = Caller::authenticated("acct:viewer");
+
+    let endpoints = query_sql(
+        &registry,
+        &db,
+        viewer.clone(),
+        "SELECT ordinal,role,record_id FROM effective_relationship_endpoints WHERE relationship_id=?1 ORDER BY ordinal",
+        json!([{"type":"text", "value": shown["relationship_id"]}]),
+    )
+    .await;
+    assert_eq!(endpoints["row_count"], 2, "{endpoints}");
+
+    // The typed rows are exactly the JSON array `effective_relationships.endpoints`
+    // carries for the same relationship.
+    let projected = query_sql(
+        &registry,
+        &db,
+        viewer.clone(),
+        "SELECT endpoints FROM effective_relationships WHERE relationship_id=?1",
+        json!([{"type":"text", "value": shown["relationship_id"]}]),
+    )
+    .await;
+    assert_eq!(projected["row_count"], 1, "{projected}");
+    let parsed: Value =
+        serde_json::from_str(projected["rows"][0]["endpoints"].as_str().unwrap()).unwrap();
+    let expected: Vec<(i64, String, Option<String>)> = parsed
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|endpoint| {
+            (
+                endpoint["ordinal"].as_i64().unwrap(),
+                endpoint["role"].as_str().unwrap().to_owned(),
+                endpoint["record_id"].as_str().map(str::to_owned),
+            )
+        })
+        .collect();
+    assert_eq!(endpoint_rows(&endpoints), expected);
+
+    // Any hidden endpoint removes the whole relationship, including its
+    // visible endpoint, exactly as the parent view's fence does.
+    let fenced_rows = query_sql(
+        &registry,
+        &db,
+        viewer.clone(),
+        "SELECT ordinal,role,record_id FROM effective_relationship_endpoints WHERE relationship_id=?1 ORDER BY ordinal",
+        json!([{"type":"text", "value": fenced["relationship_id"]}]),
+    )
+    .await;
+    assert_eq!(fenced_rows["row_count"], 0, "{fenced_rows}");
+    let fenced_parent = query_sql(
+        &registry,
+        &db,
+        viewer,
+        "SELECT endpoints FROM effective_relationships WHERE relationship_id=?1",
+        json!([{"type":"text", "value": fenced["relationship_id"]}]),
+    )
+    .await;
+    assert_eq!(fenced_parent["row_count"], 0, "{fenced_parent}");
+}
+
+#[tokio::test]
+async fn effective_relationship_endpoints_is_empty_for_a_zero_endpoint_relationship() {
+    let db = db().await;
+    let registry = registry();
+    let task = task(&db, "Orphan task", "open").await;
+    let assignee = person_record(&db, "Orphan assignee").await;
+    let asserted = assign(&registry, &db, &task, &assignee, "endpoints-orphan").await;
+    // Corrupt fixture: a relationship row with no endpoints. The write funnel
+    // cannot produce this state; the projection must still hide it.
+    let pool = crate::common::fixture_write_pool(&db).await;
+    sqlx::query(
+        "DELETE FROM relationship_endpoints WHERE relationship_origin_db_id=?1 AND relationship_id=?2",
+    )
+    .bind(asserted["relationship_origin_db_id"].as_str().unwrap())
+    .bind(asserted["relationship_id"].as_str().unwrap())
+    .execute(&pool)
+    .await
+    .unwrap();
+    let rows = query_sql(
+        &registry,
+        &db,
+        Caller::local(),
+        "SELECT ordinal FROM effective_relationship_endpoints WHERE relationship_id=?1",
+        json!([{"type":"text", "value": asserted["relationship_id"]}]),
+    )
+    .await;
+    assert_eq!(rows["row_count"], 0, "{rows}");
+    let parent = query_sql(
+        &registry,
+        &db,
+        Caller::local(),
+        "SELECT endpoints FROM effective_relationships WHERE relationship_id=?1",
+        json!([{"type":"text", "value": asserted["relationship_id"]}]),
+    )
+    .await;
+    assert_eq!(parent["row_count"], 0, "{parent}");
+}
+
+#[tokio::test]
+async fn effective_relationship_endpoints_is_catalogued() {
+    let db = db().await;
+    let registry = registry();
+    let relation = query_sql(
+        &registry,
+        &db,
+        Caller::local(),
+        "SELECT semantic_version,caller_relative,completeness,profiles FROM catalog_relations WHERE relation_name='effective_relationship_endpoints'",
+        json!([]),
+    )
+    .await;
+    assert_eq!(relation["row_count"], 1, "{relation}");
+    assert_eq!(relation["rows"][0]["semantic_version"], 1);
+    assert_eq!(relation["rows"][0]["caller_relative"], 1);
+    assert_eq!(relation["rows"][0]["completeness"], "complete");
+    assert_eq!(relation["rows"][0]["profiles"], "sqlite-local");
+    let columns = query_sql(
+        &registry,
+        &db,
+        Caller::local(),
+        "SELECT column_name FROM catalog_columns WHERE relation_name='effective_relationship_endpoints' ORDER BY column_position",
+        json!([]),
+    )
+    .await;
+    let names: Vec<&str> = columns["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["column_name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "relationship_origin_db_id",
+            "relationship_id",
+            "ordinal",
+            "role",
+            "portable_ref",
+            "record_type",
+            "record_kind",
+            "record_id",
+        ]
+    );
 }
 
 #[tokio::test]

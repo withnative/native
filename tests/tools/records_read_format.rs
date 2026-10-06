@@ -169,53 +169,44 @@ fn records_read_format_discovery_representation_and_one_step_recovery() {
         }
     }
 
+    // A nested-only `format` is normalised onto the envelope and honoured
+    // exactly as an envelope format would, with no caller round trip.
     let mut nested = base.clone();
     nested["arguments"]["format"] = json!("json");
-    let error = client.call("records_read", nested.clone());
-    assert_eq!(error["isError"], true, "{error}");
-    assert!(text(&error).contains("arguments.format"), "{error}");
-    assert!(text(&error).contains("envelope"), "{error}");
-    let repair = &error["structuredContent"]["repair"];
-    assert_eq!(repair["retry_ready"], true, "{error}");
-    let example = &repair["expected_shape"]["request_example"];
-    assert!(validator.is_valid(example), "{example}");
-    assert_eq!(example["arguments"]["ids"], json!(["<record-reference>"]));
-    let mut corrected = nested.clone();
-    for correction in repair["corrections"].as_array().unwrap() {
-        let pointer = correction["pointer"].as_str().unwrap();
-        let (parent, field) = pointer.rsplit_once('/').unwrap();
-        let object = corrected
-            .pointer_mut(parent)
-            .unwrap()
-            .as_object_mut()
-            .unwrap();
-        if correction["remove"] == true {
-            object.remove(field);
-        } else {
-            let value = if let Some(from) = correction["from"].as_str() {
-                nested.pointer(from).unwrap().clone()
-            } else {
-                correction["value"].clone()
-            };
-            object.insert(field.into(), value);
-        }
-    }
-    assert_eq!(corrected["run_key"], run_key);
-    assert_eq!(corrected["format"], "json");
-    assert!(corrected["arguments"].get("format").is_none());
-    assert!(validator.is_valid(&corrected));
-    let retry = client.call("records_read", corrected);
-    assert_eq!(retry["isError"], false, "{retry}");
+    let hoisted = client.call("records_read", nested.clone());
+    assert_eq!(hoisted["isError"], false, "{hoisted}");
     assert_eq!(
-        serde_json::from_str::<Value>(text(&retry)).unwrap(),
-        retry["structuredContent"]
+        serde_json::from_str::<Value>(text(&hoisted)).unwrap(),
+        hoisted["structuredContent"]
     );
     assert_eq!(
-        retry["structuredContent"]["records"][0]["id"],
+        hoisted["structuredContent"]["records"][0]["id"],
         "native:root"
     );
-    // Text reads and the recovery path must not alter the exact JSON read.
-    assert_eq!(text(&retry), exact_json.as_deref().unwrap());
+    // Text reads and a hoisted nested format must not alter the exact JSON read.
+    assert_eq!(text(&hoisted), exact_json.as_deref().unwrap());
+
+    // A nested format that conflicts with an envelope format still rejects,
+    // naming the field rather than silently choosing one.
+    let mut conflict = base.clone();
+    conflict["format"] = json!("text");
+    conflict["arguments"]["format"] = json!("json");
+    let conflict_error = client.call("records_read", conflict);
+    assert_eq!(conflict_error["isError"], true, "{conflict_error}");
+    assert!(
+        text(&conflict_error).contains("arguments.format conflicts with envelope format"),
+        "{conflict_error}"
+    );
+    let conflict_repair = &conflict_error["structuredContent"]["repair"];
+    assert_eq!(
+        conflict_repair["failing_pointer"], "/arguments/format",
+        "{conflict_error}"
+    );
+    assert_eq!(conflict_repair["retry_ready"], false, "{conflict_error}");
+    assert!(
+        conflict_repair.get("corrections").is_none(),
+        "a conflict must not advertise an automatic correction: {conflict_error}"
+    );
 
     for invalid in [json!("yaml"), json!(17), Value::Null] {
         let mut request = base.clone();
@@ -249,13 +240,38 @@ fn records_read_format_discovery_representation_and_one_step_recovery() {
         );
     }
 
+    // A nested-only format with an unsupported value hoists and then fails
+    // exactly as the envelope value would, never quietly falling back to JSON.
     let mut nested_invalid = base.clone();
     nested_invalid["arguments"]["format"] = json!("yaml");
     let error = client.call("records_read", nested_invalid);
     assert_eq!(error["isError"], true, "{error}");
+    assert!(
+        text(&error).contains("must be \"text\" or \"json\""),
+        "{error}"
+    );
+    assert_format_contract_error(&error, json!(["text", "json"]));
     assert_eq!(
         error["structuredContent"]["repair"]["retry_ready"], false,
         "{error}"
+    );
+
+    // A nested non-string format is a targeted misplacement, not a hoist.
+    let mut nested_non_string = base.clone();
+    nested_non_string["arguments"]["format"] = json!(17);
+    let error = client.call("records_read", nested_non_string);
+    assert_eq!(error["isError"], true, "{error}");
+    assert!(text(&error).contains("arguments.format"), "{error}");
+    assert!(text(&error).contains("must be a string"), "{error}");
+    let non_string_repair = &error["structuredContent"]["repair"];
+    assert_eq!(
+        non_string_repair["failing_pointer"], "/arguments/format",
+        "{error}"
+    );
+    assert_eq!(non_string_repair["retry_ready"], false, "{error}");
+    assert!(
+        non_string_repair.get("corrections").is_none(),
+        "a non-string format must not advertise an automatic correction: {error}"
     );
 
     // JSON-only operations stay JSON-only in discovery and runtime, including

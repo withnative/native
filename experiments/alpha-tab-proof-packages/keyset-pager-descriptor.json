@@ -1,0 +1,28 @@
+{
+  "package": "agent.keyset-pager",
+  "version": "0.1.0",
+  "bundle": "keyset-pager.html",
+  "runtime": "native.html.v1",
+  "declaration": {
+    "needs": [
+      {
+        "need": "sql.snapshot.v1",
+        "key": "pager.page",
+        "label": "Names of every record you can see, in id order; pages of 200, at most 25 page reads",
+        "sql": "SELECT id, name FROM records WHERE deleted_at IS NULL AND id > ?1 ORDER BY id ASC LIMIT 200",
+        "params": [
+          {
+            "name": "after_key",
+            "type": "text",
+            "max_len": 128
+          }
+        ]
+      }
+    ],
+    "effects": []
+  },
+  "digest_version": "alpha-tab-digest.v1",
+  "bundle_sha256": "3b0a67fffaa41264664e5759f7f3e6d02c52fe652e7c1faa35b436777f3ef3d4",
+  "declaration_digest": "01dc5a0fdf198d255be7934ab0fe337203f885119d5c82b5b60245f0800dd83a",
+  "digest": "sha256:6fb4ee43846fda43d3f3f1af4a96473750efafbacdeb8d3a85522822f2cde2ab"
+}

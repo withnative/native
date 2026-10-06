@@ -46,10 +46,11 @@
 //!     infrastructure failures become JSON-RPC `-32603` with the message.
 
 pub mod action_evidence;
+pub mod advisors;
 pub mod apps;
 pub mod authority_act;
 pub mod builtin;
-mod deployment_read_only;
+pub(crate) mod deployment_read_only;
 pub mod evidence;
 #[cfg(feature = "mcp-executor-prototype")]
 #[doc(hidden)]
@@ -67,6 +68,10 @@ pub mod lens_dispatch;
 mod lens_surface;
 #[doc(hidden)]
 pub mod mdx_verification;
+pub(crate) mod member_scope;
+pub(crate) mod member_serving;
+#[doc(hidden)]
+pub mod member_stdio;
 pub mod product_model;
 mod protocol;
 pub(crate) mod record_ref;
@@ -75,6 +80,8 @@ pub mod render;
 #[doc(hidden)]
 pub mod request_timing;
 pub mod snapshot;
+#[doc(hidden)]
+pub mod standby_stdio;
 pub mod status_only;
 pub mod stdio;
 mod surface;
@@ -84,7 +91,8 @@ pub use authority_act::{AuthorityActDeltaRequest, AuthorityActSource, AuthorityA
 pub use builtin::{register_builtin_tools, register_standby_status_tool};
 pub use deployment_read_only::{
     DeploymentAdmission, DeploymentFreezeLease, DeploymentMutationBarrier,
-    DeploymentPersistenceLease, OperationAccess, DEPLOYMENT_READ_ONLY_ERROR,
+    DeploymentPersistenceLease, OperationAccess, DEPLOYMENT_DRAINING_ERROR,
+    DEPLOYMENT_DRAINING_RECOVERY, DEPLOYMENT_READ_ONLY_ERROR,
 };
 pub use evidence::{EvidenceKind, EvidenceStoreOptions, ToolResult, TransientEvidence};
 #[cfg(feature = "mcp-executor-prototype")]
@@ -94,7 +102,9 @@ pub use executor_prototype::{
 };
 #[cfg(feature = "mcp-executor-prototype")]
 #[doc(hidden)]
-pub use executor_prototype::{ExecutorPrototypeStdioServer, HostedExecutorRuntime};
+pub use executor_prototype::{
+    ExecutorPrototypeStdioServer, HostedExecutorAdmission, HostedExecutorRuntime,
+};
 #[cfg(feature = "mcp-executor-prototype")]
 pub use executor_prototype::{
     ExecutorTelemetryContext, ExecutorTelemetryHealth, ExecutorTelemetrySink,
@@ -112,6 +122,8 @@ pub use lens_surface::{
     lens_descriptor_projection, lens_descriptor_projection_for_policy, lens_local_tool_exposures,
     lens_tool_policy, validate_lens_policy_budget, validate_lens_profile_budgets, LensToolPolicy,
 };
+#[doc(hidden)]
+pub use member_stdio::{MemberServedSnapshot, MemberStdioSession};
 pub use protocol::{DATABASE_POOL_TIMEOUT, DATABASE_POOL_TIMEOUT_RECOVERY, PROTOCOL_VERSION};
 #[cfg(feature = "mcp-executor-prototype")]
 #[doc(hidden)]
@@ -145,3 +157,5 @@ pub use tools::{
     authority_act::{register_authority_act_tool_schema, register_authority_act_tools},
     register_snapshot_tool, register_surface_tools,
 };
+
+pub use deployment_read_only::scope_deployment_persistence;

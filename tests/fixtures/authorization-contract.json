@@ -2135,18 +2135,34 @@
       "access": "mutation",
       "non_disclosure": true,
       "no_write_on_deny": true,
-      "positive_evidence": {
-        "status": "test",
-        "file": "tests/records/artifact_interactions.rs",
-        "test": "a_declared_entry_writes_an_open_facet_on_a_bound_record",
-        "claim": "Authorized invoke_artifact_interaction.$tool succeeds at threshold view-artifact-and-edit-target-record."
-      },
-      "negative_evidence": {
-        "status": "test",
-        "file": "tests/records/artifact_interactions.rs",
-        "test": "a_caller_without_edit_permission_is_refused",
-        "claim": "invoke_artifact_interaction.$tool rejects a caller below view-artifact-and-edit-target-record and leaves the target facet unchanged."
-      },
+      "positive_evidence": [
+        {
+          "status": "test",
+          "file": "tests/records/artifact_interactions.rs",
+          "test": "a_declared_entry_writes_an_open_facet_on_a_bound_record",
+          "claim": "Authorized invoke_artifact_interaction.$tool succeeds at threshold view-artifact-and-edit-target-record."
+        },
+        {
+          "status": "test",
+          "file": "tests/records/artifact_reversal.rs",
+          "test": "reversal_through_the_public_tool_commits",
+          "claim": "A reversal-mode invoke_artifact_interaction.$tool with reverses succeeds for a holder of Edit on the target record."
+        }
+      ],
+      "negative_evidence": [
+        {
+          "status": "test",
+          "file": "tests/records/artifact_interactions.rs",
+          "test": "a_caller_without_edit_permission_is_refused",
+          "claim": "invoke_artifact_interaction.$tool rejects a caller below view-artifact-and-edit-target-record and leaves the target facet unchanged."
+        },
+        {
+          "status": "test",
+          "file": "tests/records/artifact_reversal.rs",
+          "test": "reversal_by_a_caller_below_edit_is_refused_without_writing",
+          "claim": "A reversal-mode invoke_artifact_interaction.$tool rejects a caller below Edit on the target record and leaves the target unchanged."
+        }
+      ],
       "rationale": "The caller's Edit on the target record and the artifact's own granted, root-exposed binding are two separate authorities, and both are required before one declared facet write commits."
     },
     {
@@ -3346,6 +3362,38 @@
         "claim": "manage_instructions.list rejects a caller below caller-filtered-member-or-host-owner."
       },
       "rationale": "Member-scoped bindings and workspace controls have distinct identity and host-owner authority."
+    },
+    {
+      "tool": "manage_instructions",
+      "action": "resolve",
+      "disposition": "specialized",
+      "risk_tier": "specialized",
+      "fixture": "instruction-control",
+      "expected_threshold": "caller-filtered-member-or-host-owner",
+      "access": "read",
+      "non_disclosure": true,
+      "no_write_on_deny": false,
+      "positive_evidence": {
+        "status": "test",
+        "file": "tests/tools/bootstrap_instructions.rs",
+        "test": "manage_instructions_resolve_returns_current_effective_stack",
+        "claim": "Authorized manage_instructions.resolve returns the current effective stack at threshold caller-filtered-member-or-host-owner."
+      },
+      "negative_evidence": [
+        {
+          "status": "test",
+          "file": "tests/tools/bootstrap_instructions.rs",
+          "test": "manage_instructions_resolve_refuses_new_sentinel_before_issuance",
+          "claim": "manage_instructions.resolve refuses a caller without an existing run key before any key is issued."
+        },
+        {
+          "status": "test",
+          "file": "tests/tools/bootstrap_instructions.rs",
+          "test": "manage_instructions_resolve_hides_other_member_sources",
+          "claim": "Another member's ready resolve omits Alice's member-scoped source while her own resolve includes it."
+        }
+      ],
+      "rationale": "Resolve rejoins the caller's own run: member scope is account-confined, workspace sources resolve only when readable, and the run key must already exist because issuance never happens here."
     },
     {
       "tool": "manage_instructions",
@@ -5053,6 +5101,30 @@
     },
     {
       "tool": "manage_alpha_tabs",
+      "action": "update",
+      "disposition": "specialized",
+      "risk_tier": "specialized",
+      "fixture": "alpha-tab-install",
+      "expected_threshold": "install-event-cas-and-view-artifact",
+      "access": "mutation",
+      "non_disclosure": true,
+      "no_write_on_deny": true,
+      "positive_evidence": {
+        "status": "test",
+        "file": "tests/tools/alpha_tabs.rs",
+        "test": "update_carries_canonical_permutations_and_launches_new_bytes_with_original_review",
+        "claim": "An authorized update validates the replacement pin and carries proven same-declaration consent onto the new source, preserving the original review provenance."
+      },
+      "negative_evidence": {
+        "status": "test",
+        "file": "tests/tools/alpha_tabs.rs",
+        "test": "update_refusals_and_key_reuse_leave_every_write_count_unchanged",
+        "claim": "Stale tokens, cross-account key reuse, unknown declaration keys, reads, source/digest mismatches and lost View refuse without control events or acts."
+      },
+      "rationale": "Updates address only the caller account and require current generation CAS plus View on a live artifact; the shared fold derives consent continuity."
+    },
+    {
+      "tool": "manage_alpha_tabs",
       "action": "disable",
       "disposition": "specialized",
       "risk_tier": "specialized",
@@ -5187,6 +5259,62 @@
     },
     {
       "tool": "manage_alpha_tabs",
+      "action": "admit_reveal_target",
+      "disposition": "specialized",
+      "risk_tier": "specialized",
+      "fixture": "alpha-tab-install",
+      "expected_threshold": "verified-install-and-declared-reveal-and-target-view",
+      "access": "read",
+      "non_disclosure": true,
+      "no_write_on_deny": false,
+      "positive_evidence": {
+        "status": "test",
+        "file": "tests/tools/alpha_tabs.rs",
+        "test": "reveal_admits_exact_visible_id_with_minimal_receipt",
+        "claim": "An adopted, current, reveal-declaring install admits an exact visible target with only its canonical id and install pin provenance."
+      },
+      "negative_evidence": [
+        {
+          "status": "test",
+          "file": "tests/tools/alpha_tabs.rs",
+          "test": "reveal_hidden_and_missing_share_not_visible",
+          "claim": "A hidden or missing target receives the same not_visible refusal without an id echo."
+        },
+        {
+          "status": "test",
+          "file": "tests/tools/alpha_tabs.rs",
+          "test": "reveal_refusal_precedence_gate_declaration_params_target",
+          "claim": "A stale install or undeclared reveal need refuses before target parsing or prefix resolution."
+        }
+      ],
+      "rationale": "The host reads one exact target under the viewer's current View authority only after the verified install, event token and declared push-only reveal need pass in the same deferred transaction; refusal discloses no target details and folds no event."
+    },
+    {
+      "tool": "manage_alpha_tabs",
+      "action": "live_unsubscribe",
+      "disposition": "specialized",
+      "risk_tier": "specialized",
+      "fixture": "alpha-tab-install",
+      "expected_threshold": "account-database-and-connection-bound-stream-token",
+      "access": "mutation",
+      "non_disclosure": true,
+      "no_write_on_deny": true,
+      "positive_evidence": {
+        "status": "test",
+        "file": "tests/tools/alpha_tabs_subscribe.rs",
+        "test": "unsubscribe_is_scoped_and_idempotent",
+        "claim": "The subscription's own connection token removes its in-memory registry entry; repeating the unsubscribe remains successful."
+      },
+      "negative_evidence": {
+        "status": "test",
+        "file": "tests/tools/alpha_tabs_subscribe.rs",
+        "test": "unsubscribe_is_scoped_and_idempotent",
+        "claim": "A sibling connection token, unknown subscription id, or malformed stream token has no effect on another connection's subscription."
+      },
+      "rationale": "Unsubscribe mutates only a connection-scoped in-memory registry entry and never reveals whether another account or connection has a subscription."
+    },
+    {
+      "tool": "manage_alpha_tabs",
       "action": "preview",
       "disposition": "specialized",
       "risk_tier": "specialized",
@@ -5232,6 +5360,62 @@
         "claim": "A stale compare-and-set token or a replayed receipt is refused without state change and without spending a live receipt on CAS refusal."
       },
       "rationale": "Adopt binds the exact account plus pin through the hosted cookie-session attestation and the single-use server-held receipt, compare-and-set on the install's current event token within the caller's own account rows."
+    },
+    {
+      "tool": "manage_alpha_tabs",
+      "action": "adopt_authored",
+      "disposition": "specialized",
+      "risk_tier": "specialized",
+      "fixture": "alpha-tab-install",
+      "expected_threshold": "install-event-cas",
+      "access": "mutation",
+      "non_disclosure": true,
+      "no_write_on_deny": true,
+      "positive_evidence": {
+        "status": "test",
+        "file": "tests/tools/alpha_tabs.rs",
+        "test": "adopt_authored_flips_to_shell_auto_echoes_request_and_launches",
+        "claim": "Authorized manage_alpha_tabs.adopt_authored flips a caller-asserted install to shell_auto.v1 adoption under the hosted authored-adopt attestation for the exact pin at threshold install-event-cas, spending no receipt."
+      },
+      "negative_evidence": [
+        {
+          "status": "test",
+          "file": "tests/tools/alpha_tabs.rs",
+          "test": "adopt_authored_refuses_without_hosted_authority",
+          "claim": "A caller without the hosted authored-adopt attestation is refused before any verification work and moves no state."
+        },
+        {
+          "status": "test",
+          "file": "tests/tools/alpha_tabs.rs",
+          "test": "adopt_authored_rejects_pin_mismatch_and_stale_cas",
+          "claim": "A cross-pin attestation or a stale compare-and-set token is refused without state change."
+        }
+      ],
+      "rationale": "Authored adopt binds the exact account plus pin through the hosted cookie-session and trusted-Origin attestation, which only the hosted adapter mints, compare-and-set on the install's current event token within the caller's own account rows. No preview receipt exists or is spent; pane binding is the desktop app's, and launch provenance is recorded as asserted."
+    },
+    {
+      "tool": "manage_alpha_tabs",
+      "action": "reorder",
+      "disposition": "specialized",
+      "risk_tier": "specialized",
+      "fixture": "alpha-tab-install",
+      "expected_threshold": "own-account-order",
+      "access": "mutation",
+      "non_disclosure": true,
+      "no_write_on_deny": true,
+      "positive_evidence": {
+        "status": "test",
+        "file": "tests/tools/alpha_tabs.rs",
+        "test": "reorder_stores_interleaved_order_and_list_reports_it",
+        "claim": "Authorized manage_alpha_tabs.reorder stores the interleaved strip order in the caller's own account rows at threshold own-account-order, and list/inspect report it."
+      },
+      "negative_evidence": {
+        "status": "test",
+        "file": "tests/tools/alpha_tabs.rs",
+        "test": "reorder_refuses_unknown_duplicate_and_uninstalled_tabs",
+        "claim": "Unknown, duplicated, or uninstalled tabs are refused with a named error and store nothing."
+      },
+      "rationale": "Reorder writes only the caller's own account order row: authenticated personal scope plus a reason and a vocabulary-valid order (all four built-ins present, installed-or-disabled packages only, no duplicates). Complete-state last-writer-wins with no CAS token, so there is no token to steal."
     },
     {
       "tool": "advance_artifact_port_pin",

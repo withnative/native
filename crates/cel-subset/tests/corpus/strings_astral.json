@@ -1,0 +1,20 @@
+[
+{"name":"size_astral","expr":"size('\\U0001F600')","bindings":{},"expect":{"value":{"int":"1"}},"spec":"Abstract Sizes: string size is its number of code points"},
+{"name":"size_astral_pair","expr":"size('\\U0001F600\\U0001F601')","bindings":{},"expect":{"value":{"int":"2"}}},
+{"name":"size_mixed_astral","expr":"size('a\\U0001F600b')","bindings":{},"expect":{"value":{"int":"3"}}},
+{"name":"size_uFFFF","expr":"size('\\uFFFF')","bindings":{},"expect":{"value":{"int":"1"}}},
+{"name":"size_combining","expr":"size('e\\u0301')","bindings":{},"expect":{"value":{"int":"2"}},"spec":"String and Bytes Values: no Unicode normalization"},
+{"name":"order_astral_lt_bmp","expr":"'\\U0001F600' < '\\uFFFF'","bindings":{},"expect":{"value":{"bool":false}},"spec":"Ordering: strings ordered lexicographically by code point (UTF-8 byte order)"},
+{"name":"order_bmp_lt_astral","expr":"'\\uFFFF' < '\\U0001F600'","bindings":{},"expect":{"value":{"bool":true}},"spec":"Ordering: strings ordered lexicographically by code point (UTF-8 byte order)"},
+{"name":"order_astral_gt_bmp","expr":"'\\U0001F600' > '\\uFFFF'","bindings":{},"expect":{"value":{"bool":true}},"spec":"Ordering: strings ordered lexicographically by code point (UTF-8 byte order)"},
+{"name":"order_u10000_lt_uFFFF","expr":"'\\U00010000' < '\\uFFFF'","bindings":{},"expect":{"value":{"bool":false}},"spec":"Ordering: strings ordered lexicographically by code point (UTF-8 byte order)"},
+{"name":"order_uFFFF_lt_u10000","expr":"'\\uFFFF' < '\\U00010000'","bindings":{},"expect":{"value":{"bool":true}},"spec":"Ordering: strings ordered lexicographically by code point (UTF-8 byte order)"},
+{"name":"order_uE000_lt_u10000","expr":"'\\uE000' < '\\U00010000'","bindings":{},"expect":{"value":{"bool":true}},"spec":"Ordering: strings ordered lexicographically by code point (UTF-8 byte order)"},
+{"name":"order_astral_pairs","expr":"'\\U0001F600' < '\\U0001F601'","bindings":{},"expect":{"value":{"bool":true}},"spec":"Ordering: strings ordered lexicographically by code point (UTF-8 byte order)"},
+{"name":"order_ascii_lt_astral","expr":"'z' < '\\U0001F600'","bindings":{},"expect":{"value":{"bool":true}},"spec":"Ordering: strings ordered lexicographically by code point (UTF-8 byte order)"},
+{"name":"order_astral_gt_ascii","expr":"'\\U0001F600' > 'z'","bindings":{},"expect":{"value":{"bool":true}},"spec":"Ordering: strings ordered lexicographically by code point (UTF-8 byte order)"},
+{"name":"eq_astral","expr":"'\\U0001F600' == '\\U0001F600'","bindings":{},"expect":{"value":{"bool":true}}},
+{"name":"concat_astral_size","expr":"size('\\U0001F600' + 'x')","bindings":{},"expect":{"value":{"int":"2"}}},
+{"name":"contains_astral","expr":"'\\U0001F600a'.contains('\\U0001F600')","bindings":{},"expect":{"value":{"bool":true}}},
+{"name":"surrogate_escape_err","expr":"'\\uD83D\\uDE00' == '\\U0001F600'","bindings":{},"expect":{"error":"parse_error"},"spec":"String and Bytes Values: a UTF-16 surrogate code point is syntactically invalid"}
+]

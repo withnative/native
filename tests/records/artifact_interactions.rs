@@ -9,6 +9,7 @@ use std::sync::{Arc, OnceLock};
 
 use native_ce::authorization::{replace_explicit_policy, AllowEntry, Capability};
 use native_ce::mcp::{register_surface_tools, Caller, ToolRegistry};
+use native_ce::schema::{ROOT_RECORD_ID, UNFILED_RECORD_ID};
 use native_ce::{create_database, Db};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -21,6 +22,8 @@ const COLLECTION: &str = "0a5e0000-0000-4000-8000-000000000001";
 const RELATION_COLLECTION: &str = "0a5e0000-0000-4000-8000-000000000005";
 const REFERENCE_COLLECTION: &str = "0a5e0000-0000-4000-8000-000000000010";
 const CLEARING_ARTIFACT: &str = "0a5e0000-0000-4000-8000-000000000004";
+const COMMENT_PERSON: &str = "0a5e0000-0000-4000-8000-000000000011";
+const COMMENT_SEED_ARTIFACT: &str = "0a5e0000-0000-4000-8000-000000000012";
 const INVOCATION_VERSION: &str = "native.artifact-invocation.v1";
 
 /// The MDX v2 parser and its caches are process-wide, as the module suite's
@@ -153,6 +156,46 @@ fn create_artifact_source() -> String {
     .into()
 }
 
+/// A real MDX artifact whose single cited entry is a `comment.create`
+/// declaration. Public activation is deliberately absent, so every invocation
+/// of this entry must refuse without writing.
+fn comment_artifact_source(entry_id: &str) -> String {
+    format!(
+        r#"export const nativeArtifact = {{
+  schema: "native.mdx.artifact.v2",
+  inputs: {{ orders: {{ envelope: "native.collection-envelope.v1", required: true, expose_to_root: true }} }},
+  module_inputs: {{}},
+  capability_requests: [{{ capability: "input.read", scope: {{ port: "orders" }} }}],
+  interactions: [{{ id: {entry_id:?}, label: "Post", effect: "comment.create",
+    slots: {{ bearer: {{ domain: {{ kind: "bound_input", port: "orders" }} }} }},
+    comment: {{ position: "root", body: {{ input: "text", max_bytes: 100 }} }} }}]
+}}
+
+<Metric label="Total" value={{1}} />
+"#
+    )
+}
+
+/// A real MDX artifact whose single cited entry is a `message.react`
+/// declaration (task `07ae879` I1, declaration only). Every invocation of
+/// this entry must refuse without writing until I2 lands the path.
+fn react_artifact_source(entry_id: &str) -> String {
+    format!(
+        r#"export const nativeArtifact = {{
+  schema: "native.mdx.artifact.v2",
+  inputs: {{ orders: {{ envelope: "native.collection-envelope.v1", required: true, expose_to_root: true }} }},
+  module_inputs: {{}},
+  capability_requests: [{{ capability: "input.read", scope: {{ port: "orders" }} }}],
+  interactions: [{{ id: {entry_id:?}, label: "React", effect: "message.react",
+    slots: {{ message: {{ domain: {{ kind: "bound_input", port: "orders" }} }} }},
+    react: {{ emoji: ["👍"] }} }}]
+}}
+
+<Metric label="Total" value={{1}} />
+"#
+    )
+}
+
 fn digest_of(source: &str) -> String {
     hex::encode(Sha256::digest(source.as_bytes()))
 }
@@ -259,13 +302,7 @@ async fn fixture_with_source(
 
 #[tokio::test]
 async fn html_interactions_share_scope_domains_cas_replay_attribution_and_host_plan() {
-    native_ce::artifact_html::configure(
-        native_ce::artifact_html::RuntimeConfig::new(
-            "https://workbench.test",
-            "https://artifacts.test",
-        )
-        .unwrap(),
-    );
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
     let source = html_interaction_source(&artifact_source("Orders"));
     let (db, registry, digest, _guard) = fixture_with_source(source, "native.html.v1").await;
     let rendered = call(&registry, &db, "render_artifact", json!({"id":ARTIFACT})).await;
@@ -463,15 +500,9 @@ async fn create_fixture_with_source(
 
 #[tokio::test]
 async fn html_interactions_record_create_is_governed_and_idempotent() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
     let source = html_interaction_source(&create_artifact_source());
     let (db, registry, digest, _guard) = create_fixture_with_source(source, "native.html.v1").await;
-    native_ce::artifact_html::configure(
-        native_ce::artifact_html::RuntimeConfig::new(
-            "https://workbench.test",
-            "https://artifacts.test",
-        )
-        .unwrap(),
-    );
     let rendered = call(&registry, &db, "render_artifact", json!({"id":ARTIFACT})).await;
     assert_eq!(rendered["status"], "rendered", "{rendered:#}");
     let availability = &rendered["plan"]["interaction_availability"];
@@ -515,15 +546,9 @@ async fn html_interactions_record_create_is_governed_and_idempotent() {
 /// row IS the changed input.
 #[tokio::test]
 async fn html_creation_with_the_flag_set_refreshes_record_plan_and_input() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
     let source = html_interaction_source(&create_artifact_source());
     let (db, registry, digest, _guard) = create_fixture_with_source(source, "native.html.v1").await;
-    native_ce::artifact_html::configure(
-        native_ce::artifact_html::RuntimeConfig::new(
-            "https://workbench.test",
-            "https://artifacts.test",
-        )
-        .unwrap(),
-    );
     let before = call(&registry, &db, "render_artifact", json!({"id":ARTIFACT})).await;
     assert_eq!(before["status"], "rendered", "{before:#}");
     let committed = call(
@@ -582,6 +607,7 @@ async fn html_creation_with_the_flag_set_refreshes_record_plan_and_input() {
 
 #[tokio::test]
 async fn html_interactions_attestation_replay_rejects_forged_or_omitted_entries() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
     let (db, _registry, _digest, _guard) = fixture_with_source(
         html_interaction_source(&artifact_source("Orders")),
         "native.html.v1",
@@ -677,6 +703,7 @@ async fn grant_input_read_port(registry: &ToolRegistry, db: &Db, port: &str) {
 
 #[tokio::test]
 async fn record_create_commits_once_with_initial_facets_and_an_authoritative_refresh() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
     let (db, registry, digest, _guard) = create_fixture().await;
     let invocation = json!({
         "version": INVOCATION_VERSION,
@@ -794,8 +821,91 @@ async fn record_create_commits_once_with_initial_facets_and_an_authoritative_ref
     assert!(reused.to_string().contains("conflicting action input"));
 }
 
+/// A comment citation is classified from its actual immutable source and
+/// refused publicly (`comment_unavailable`); it must never fall through to the
+/// generic creation kernel or write anything.
+///
+/// Fixture note (setup-only repair, root session61376): uses the single-orders
+/// `fixture_with_source` helper because this source declares only `orders`;
+/// the dual-port `create_fixture_with_source` would bind an undeclared `refs`
+/// port and fail before invoke.
+#[tokio::test]
+async fn a_declared_comment_entry_is_publicly_unavailable_without_writing() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
+    let source = comment_artifact_source("post");
+    let (db, registry, digest, _guard) = fixture_with_source(source, "native.mdx.v2").await;
+    let rejected = call(
+        &registry,
+        &db,
+        "invoke_artifact_interaction",
+        json!({
+            "version": INVOCATION_VERSION,
+            "artifact_id": ARTIFACT,
+            "entry_id": "post",
+            "source_digest": digest,
+            "slots": { "bearer": INSIDE },
+            "values": { "text": "hello" },
+            "idempotency_key": "comment:unavailable",
+            "gesture": "submit"
+        }),
+    )
+    .await;
+    assert_eq!(rejected["status"], "rejected", "{rejected:#}");
+    assert_eq!(
+        rejected["error"]["code"], "comment_unavailable",
+        "{rejected:#}"
+    );
+    let comments: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM records WHERE type='Annotation'")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        comments, 0,
+        "a refused comment writes nothing: {rejected:#}"
+    );
+}
+
+/// A declared `message.react` entry is declaration-only (task `07ae879`
+/// I1): invocation refuses publicly (`react_unavailable`) and writes
+/// nothing, even with a well-formed desired-state payload.
+#[tokio::test]
+async fn a_declared_react_entry_is_publicly_unavailable_without_writing() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
+    let source = react_artifact_source("react");
+    let (db, registry, digest, _guard) = fixture_with_source(source, "native.mdx.v2").await;
+    let rejected = call(
+        &registry,
+        &db,
+        "invoke_artifact_interaction",
+        json!({
+            "version": INVOCATION_VERSION,
+            "artifact_id": ARTIFACT,
+            "entry_id": "react",
+            "source_digest": digest,
+            "slots": { "message": INSIDE },
+            "values": { "emoji": "👍", "reacted": true },
+            "idempotency_key": "react:unavailable",
+            "gesture": "submit"
+        }),
+    )
+    .await;
+    assert_eq!(rejected["status"], "rejected", "{rejected:#}");
+    assert_eq!(
+        rejected["error"]["code"], "react_unavailable",
+        "{rejected:#}"
+    );
+    let reactions: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM content_events WHERE type LIKE 'message.reaction.%'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(reactions, 0, "a refused react writes nothing: {rejected:#}");
+}
+
 #[tokio::test]
 async fn record_create_rejects_out_of_domain_values_without_leaving_a_bearer() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
     let (db, registry, digest, _guard) = create_fixture().await;
     let rejected = call(
         &registry,
@@ -852,6 +962,7 @@ async fn record_create_rejects_out_of_domain_values_without_leaving_a_bearer() {
 
 #[tokio::test]
 async fn record_create_rechecks_destination_authority_at_invocation() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
     let (db, registry, digest, _guard) = create_fixture().await;
     let caller = Caller::authenticated("acct:bea");
     for record_id in [ARTIFACT, COLLECTION] {
@@ -907,6 +1018,7 @@ async fn record_create_rechecks_destination_authority_at_invocation() {
 
 #[tokio::test]
 async fn record_create_is_general_and_render_availability_is_creation_aware() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
     let (db, registry, digest, _guard) = create_fixture().await;
     let rendered = call(&registry, &db, "render_artifact", json!({ "id": ARTIFACT })).await;
     assert_eq!(rendered["status"], "rendered", "{rendered:#}");
@@ -976,6 +1088,7 @@ async fn record_create_is_general_and_render_availability_is_creation_aware() {
 
 #[tokio::test]
 async fn record_create_resolves_bound_references_inside_the_named_port_only() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
     const ALLOWED: &str = "0a5e0000-0000-4000-8000-000000000011";
     const OUTSIDE_REF: &str = "0a5e0000-0000-4000-8000-000000000012";
     let (db, registry, digest, _guard) = create_fixture().await;
@@ -1045,6 +1158,7 @@ async fn record_create_resolves_bound_references_inside_the_named_port_only() {
 /// proves the host's phases are actually reported.
 #[tokio::test]
 async fn a_v2_render_reaches_the_telemetry_snapshot_with_its_phases() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
     let (db, registry, _digest, _guard) = fixture().await;
     // Read under the fixture's guard, which every test in this file holds for
     // its whole body. The ring and its counters are process-global, so a
@@ -1139,6 +1253,7 @@ async fn a_v2_render_reaches_the_telemetry_snapshot_with_its_phases() {
 /// pinned here rather than left to reading.
 #[tokio::test]
 async fn a_failed_v2_render_charges_its_cost_to_failed_not_to_the_teardown() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
     let (db, registry, _digest, _guard) = fixture().await;
     // Revoking `input.read` fails the render at the capability preflight, which
     // is deep enough to have real phases behind it and a clear set that must
@@ -1208,6 +1323,7 @@ async fn a_failed_v2_render_charges_its_cost_to_failed_not_to_the_teardown() {
 
 #[tokio::test]
 async fn render_plan_carries_declared_entries_and_same_snapshot_versions() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
     let (db, registry, _digest, _guard) = fixture().await;
     call(
         &registry,
@@ -1280,6 +1396,7 @@ async fn render_plan_carries_declared_entries_and_same_snapshot_versions() {
 /// leaving records outside the bound-input domain absent altogether.
 #[tokio::test]
 async fn render_plan_restores_zero_tokens_for_missing_grouped_rows() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
     let (db, registry, _digest, _guard) = fixture().await;
     let second_inside = "0a5e0000-0000-4000-8000-000000000005";
     call(
@@ -1415,6 +1532,7 @@ async fn record_version(registry: &ToolRegistry, db: &Db, id: &str) -> String {
 
 #[tokio::test]
 async fn a_declared_entry_writes_an_open_facet_on_a_bound_record() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
     let (db, registry, digest, _guard) = fixture().await;
     let mut invocation = envelope("mark_triaged", &digest, "k-1");
     invocation["slots"] = json!({ "record": INSIDE });
@@ -1471,8 +1589,99 @@ async fn a_declared_entry_writes_an_open_facet_on_a_bound_record() {
     assert_eq!(writes, 1);
 }
 
+/// An artifact whose interactions write typed time facets (task fef3469):
+/// an instant with an offset, and a value that is not a date.
+fn typed_time_artifact_source() -> String {
+    r#"export const nativeArtifact = {
+  schema: "native.mdx.artifact.v2",
+  inputs: { orders: { envelope: "native.collection-envelope.v1", required: true, expose_to_root: true } },
+  module_inputs: {},
+  capability_requests: [{ capability: "input.read", scope: { port: "orders" } }],
+  interactions: [
+    { id: "log_now", label: "Log", effect: "facet.set",
+      slots: { record: { domain: { kind: "bound_input", port: "orders" } } },
+      facet: "logged_at", value: { from: "literal", value: "2026-10-05T10:00:00+01:00" } },
+    { id: "due_someday", label: "Someday", effect: "facet.set",
+      slots: { record: { domain: { kind: "bound_input", port: "orders" } } },
+      facet: "due", value: { from: "literal", value: "someday" } }
+  ]
+}
+
+<Metric label="Typed time" value={1} />
+"#
+    .into()
+}
+
+/// A tab effect writes typed time facets through the same governance as
+/// every other writer: a declared `instant` is stored normalised to UTC,
+/// carries `time_kind` into `facet_times`, and the receipt reports the
+/// stored value; a value a declared `date` cannot hold is refused and
+/// nothing is written.
+#[tokio::test]
+async fn a_declared_time_facet_written_by_an_interaction_is_normalised_or_refused() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
+    let (db, registry, digest, _guard) =
+        fixture_with_source(typed_time_artifact_source(), "native.mdx.v2").await;
+    call(
+        &registry,
+        &db,
+        "manage_schema_config",
+        json!({ "action": "write", "data": { "shapes": { "WorkItem:task": { "facets": {
+            "logged_at": { "type": "instant" },
+            "due": { "type": "date" },
+        } } } } }),
+    )
+    .await;
+
+    let mut log = envelope("log_now", &digest, "typed-1");
+    log["slots"] = json!({ "record": INSIDE });
+    log["observed"] = observed(&registry, &db, INSIDE, "logged_at").await;
+    let result = call(&registry, &db, "invoke_artifact_interaction", log).await;
+    assert_eq!(result["status"], "committed", "{result:#}");
+    assert_eq!(result["changes"][0]["after"], "2026-10-05T09:00:00.000Z");
+    let facet = facet_of(&registry, &db, INSIDE, "logged_at")
+        .await
+        .expect("the typed facet was written");
+    assert_eq!(facet["value"], "2026-10-05T09:00:00.000Z");
+    let (kind, start_ms): (String, Option<i64>) = sqlx::query_as(
+        "SELECT kind, start_ms FROM facet_times WHERE record_id = ? AND key = 'logged_at'",
+    )
+    .bind(INSIDE)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(kind, "instant");
+    assert_eq!(start_ms, Some(1_791_190_800_000));
+    let payload: String = sqlx::query_scalar(
+        "SELECT payload FROM content_events WHERE record_id = ? AND type = 'facet.set'
+          AND json_extract(payload, '$.key') = 'logged_at'",
+    )
+    .bind(INSIDE)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    let payload: Value = serde_json::from_str(&payload).unwrap();
+    assert_eq!(payload["time_kind"], "instant");
+    assert_eq!(payload["origin"]["entry_id"], "log_now");
+
+    let mut due = envelope("due_someday", &digest, "typed-2");
+    due["slots"] = json!({ "record": INSIDE });
+    due["observed"] = observed(&registry, &db, INSIDE, "due").await;
+    let refused = call(&registry, &db, "invoke_artifact_interaction", due).await;
+    assert_eq!(refused["status"], "rejected", "{refused:#}");
+    assert_eq!(refused["error"]["code"], "schema_violation", "{refused:#}");
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("declared type 'date'")),
+        "{refused:#}"
+    );
+    assert!(facet_of(&registry, &db, INSIDE, "due").await.is_none());
+}
+
 #[tokio::test]
 async fn the_commit_origin_still_names_artifact_entry_digest_key_and_gesture() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
     // The durable origin is the entire ground `6f99174` rests on: removing the
     // Apply step must not weaken it. One facet write's event payload must still
     // name the exact artifact, entry, source digest, idempotency key and
@@ -1504,6 +1713,7 @@ async fn the_commit_origin_still_names_artifact_entry_digest_key_and_gesture() {
 
 #[tokio::test]
 async fn a_corrected_open_observation_keeps_its_old_token_authentic() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
     let (db, registry, digest, _guard) = fixture().await;
     let as_of = "2026-08-01T00:00:00Z";
     let first = call(
@@ -1559,6 +1769,7 @@ async fn a_corrected_open_observation_keeps_its_old_token_authentic() {
 
 #[tokio::test]
 async fn a_value_outside_the_declared_domain_is_refused_rather_than_confirmed() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
     let (db, registry, digest, _guard) = fixture().await;
     let precondition = observed(&registry, &db, INSIDE, "triage").await;
     let mut invocation = envelope("set_triage", &digest, "k-domain");
@@ -1598,6 +1809,7 @@ async fn a_value_outside_the_declared_domain_is_refused_rather_than_confirmed() 
 
 #[tokio::test]
 async fn an_invocation_without_a_precondition_is_refused() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
     let (db, registry, digest, _guard) = fixture().await;
     // Omitting `observed` used to mean "write unconditionally", which is
     // exactly the silent last-write-wins the facet-scoped compare-and-set
@@ -1699,6 +1911,7 @@ async fn an_invocation_without_a_precondition_is_refused() {
 
 #[tokio::test]
 async fn an_artifact_naming_an_engine_dispatched_facet_or_an_unwritable_value_never_attests() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
     let (db, registry, _digest, _guard) = fixture().await;
     // `archive_record` owns `archived` and requires Manage; a declared entry
     // naming it would emit the byte-identical event after an Edit check. The
@@ -1753,6 +1966,7 @@ async fn an_artifact_naming_an_engine_dispatched_facet_or_an_unwritable_value_ne
 
 #[tokio::test]
 async fn a_required_facet_cannot_be_cleared_by_an_unset_entry() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
     let (db, registry, digest, _guard) = fixture().await;
     let mut set = envelope("note_effort", &digest, "k-effort");
     set["slots"] = json!({ "record": INSIDE });
@@ -1831,6 +2045,7 @@ async fn a_required_facet_cannot_be_cleared_by_an_unset_entry() {
 
 #[tokio::test]
 async fn an_idempotency_key_is_scoped_to_its_caller_artifact_and_entry() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
     let (db, registry, digest, _guard) = fixture().await;
     // The key is client-chosen. Scoped by record alone, one caller could
     // pre-burn a predictable key and silently null another principal's later
@@ -1881,6 +2096,7 @@ async fn an_idempotency_key_is_scoped_to_its_caller_artifact_and_entry() {
 
 #[tokio::test]
 async fn spine_clears_and_governed_identity_are_refused() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
     let (db, registry, digest, _guard) = fixture().await;
     for (entry, key) in [("clear_lifecycle", "lifecycle"), ("hand_over", "owner")] {
         let mut invocation = envelope(entry, &digest, &format!("k-{entry}"));
@@ -1896,6 +2112,7 @@ async fn spine_clears_and_governed_identity_are_refused() {
 
 #[tokio::test]
 async fn unfilled_and_undeclared_slots_are_refused() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
     let (db, registry, digest, _guard) = fixture().await;
     let mut unfilled = envelope("mark_triaged", &digest, "k-unfilled");
     unfilled["observed"] = observed(&registry, &db, INSIDE, "triage").await;
@@ -1917,6 +2134,7 @@ async fn unfilled_and_undeclared_slots_are_refused() {
 
 #[tokio::test]
 async fn a_revoked_input_read_grant_stops_writing_as_it_stops_rendering() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
     let (db, registry, digest, _guard) = fixture().await;
     let subjects = call(
         &registry,
@@ -1986,6 +2204,7 @@ async fn a_revoked_input_read_grant_stops_writing_as_it_stops_rendering() {
 
 #[tokio::test]
 async fn an_unbound_required_port_refuses_the_write_as_it_refuses_the_render() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
     let (db, registry, digest, _guard) = fixture().await;
     let bindings = call(
         &registry,
@@ -2021,6 +2240,7 @@ async fn an_unbound_required_port_refuses_the_write_as_it_refuses_the_render() {
 
 #[tokio::test]
 async fn a_record_outside_the_bound_input_is_refused() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
     let (db, registry, digest, _guard) = fixture().await;
     let mut invocation = envelope("mark_triaged", &digest, "k-2");
     invocation["slots"] = json!({ "record": OUTSIDE });
@@ -2033,6 +2253,7 @@ async fn a_record_outside_the_bound_input_is_refused() {
 
 #[tokio::test]
 async fn an_unqualified_interaction_cannot_write_through_a_relation_port() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
     let (db, registry, digest, _guard) = fixture().await;
     let source = artifact_source("Mixed read and write inputs")
         .replace(
@@ -2128,6 +2349,7 @@ async fn an_unqualified_interaction_cannot_write_through_a_relation_port() {
 
 #[tokio::test]
 async fn a_caller_without_edit_permission_is_refused() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
     let (db, registry, digest, _guard) = fixture().await;
     // The caller may SEE the record — so it resolves inside the bound input —
     // and still may not write it. Permission comes from the authenticated
@@ -2162,6 +2384,7 @@ async fn a_caller_without_edit_permission_is_refused() {
 
 #[tokio::test]
 async fn a_stale_source_digest_cannot_invoke_against_an_edited_manifest() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
     let (db, registry, digest, _guard) = fixture().await;
     let precondition = observed(&registry, &db, INSIDE, "triage").await;
     let edited = artifact_source("Orders (revised)");
@@ -2285,6 +2508,7 @@ async fn a_stale_source_digest_cannot_invoke_against_an_edited_manifest() {
 
 #[tokio::test]
 async fn changing_one_input_declaration_drops_all_exact_input_state() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
     let (db, registry, digest, _guard) = fixture().await;
     let changed = artifact_source("Orders").replace("required: true", "required: false");
     let updated = call(
@@ -2457,6 +2681,7 @@ async fn two_port_nav_fixture() -> (Db, ToolRegistry, String, tokio::sync::Owned
 
 #[tokio::test]
 async fn adding_a_port_carries_every_existing_binding_and_grant() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
     let (db, registry, digest, _guard) = two_port_nav_fixture().await;
     let added = two_port_nav_source("Two ports")
         .replace(
@@ -2517,6 +2742,7 @@ async fn adding_a_port_carries_every_existing_binding_and_grant() {
 
 #[tokio::test]
 async fn changing_one_port_declaration_drops_only_that_port() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
     let (db, registry, digest, _guard) = two_port_nav_fixture().await;
     let changed = two_port_nav_source("Two ports").replace(
         "orders: { envelope: \"native.collection-envelope.v1\", required: true",
@@ -2615,6 +2841,7 @@ async fn changing_one_port_declaration_drops_only_that_port() {
 
 #[tokio::test]
 async fn a_navigation_grant_survives_an_input_declaration_change() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
     let (db, registry, digest, _guard) = two_port_nav_fixture().await;
     // Change every input port declaration while keeping the requests: both
     // bindings and both input.read grants must drop, the navigation grant
@@ -2677,6 +2904,7 @@ async fn a_navigation_grant_survives_an_input_declaration_change() {
 
 #[tokio::test]
 async fn a_grant_from_revision_n_is_not_honoured_at_revision_n_plus_one() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
     let (db, registry, digest, _guard) = two_port_nav_fixture().await;
     let revision_n_event: String = sqlx::query_scalar(
         "SELECT id FROM content_events WHERE record_id=?
@@ -2740,6 +2968,7 @@ async fn a_grant_from_revision_n_is_not_honoured_at_revision_n_plus_one() {
 
 #[tokio::test]
 async fn a_forged_carry_for_a_changed_port_is_rejected() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
     let (db, registry, digest, _guard) = two_port_nav_fixture().await;
     // The revision-0 binding and its content-event sequence: the predecessor
     // a forged carry would have to name.
@@ -2917,6 +3146,7 @@ async fn a_forged_carry_for_a_changed_port_is_rejected() {
 
 #[tokio::test]
 async fn a_v2_body_edit_without_an_exact_snapshot_reports_no_existing_state() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
     let (db, registry, digest, _guard) = fixture().await;
     let write_pool = crate::common::fixture_write_pool(&db).await;
     sqlx::query("DELETE FROM artifact_module_grants WHERE artifact_id=?")
@@ -2955,6 +3185,7 @@ async fn a_v2_body_edit_without_an_exact_snapshot_reports_no_existing_state() {
 
 #[tokio::test]
 async fn carry_events_cannot_skip_an_incompatible_intervening_revision() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
     let (db, registry, digest, _guard) = fixture().await;
     let compatible = artifact_source("Compatible A prime");
     call(
@@ -3222,6 +3453,7 @@ async fn carry_events_cannot_skip_an_incompatible_intervening_revision() {
 
 #[tokio::test]
 async fn an_entry_absent_from_the_declared_manifest_is_refused() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
     let (db, registry, digest, _guard) = fixture().await;
     let mut invocation = envelope("archive_everything", &digest, "k-6");
     invocation["slots"] = json!({ "record": INSIDE });
@@ -3233,6 +3465,7 @@ async fn an_entry_absent_from_the_declared_manifest_is_refused() {
 
 #[tokio::test]
 async fn an_open_facet_that_moved_underneath_conflicts_instead_of_overwriting() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
     let (db, registry, digest, _guard) = fixture().await;
     let mut first = envelope("mark_triaged", &digest, "k-7");
     first["slots"] = json!({ "record": INSIDE });
@@ -3307,6 +3540,7 @@ async fn an_open_facet_that_moved_underneath_conflicts_instead_of_overwriting() 
 
 #[tokio::test]
 async fn conflict_omits_an_actor_the_caller_may_not_identify() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
     let (db, registry, digest, _guard) = fixture().await;
     replace_explicit_policy(
         &db,
@@ -3354,6 +3588,7 @@ async fn conflict_omits_an_actor_the_caller_may_not_identify() {
 
 #[tokio::test]
 async fn a_spine_facet_conflicts_at_record_level_and_that_difference_is_intended() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
     let (db, registry, digest, _guard) = fixture().await;
     // A spine facet NEVER produces an observation row: the projector updates
     // the `records` column and returns. So there is no per-facet version to
@@ -3440,6 +3675,7 @@ async fn a_spine_facet_conflicts_at_record_level_and_that_difference_is_intended
 
 #[tokio::test]
 async fn a_spine_value_is_judged_by_the_same_governance_as_an_open_one() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
     let (db, registry, digest, _guard) = fixture().await;
     // A spine facet leaves as `record.updated`, so it never reaches
     // `facet_set_spec` — but it carries the same governing vocabulary and the
@@ -3534,6 +3770,7 @@ async fn a_spine_value_is_judged_by_the_same_governance_as_an_open_one() {
 
 #[tokio::test]
 async fn an_unset_entry_clears_the_facet_it_declared() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
     let (db, registry, digest, _guard) = fixture().await;
     let mut set = envelope("mark_triaged", &digest, "k-13");
     set["slots"] = json!({ "record": INSIDE });
@@ -3576,6 +3813,7 @@ fn clearing_artifact() -> String {
 /// what the precondition exists to prevent.
 #[tokio::test]
 async fn a_committed_open_facet_change_carries_the_token_its_own_write_left() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
     let (db, registry, digest, _guard) = fixture().await;
     let mut first = envelope("mark_triaged", &digest, "k-token-open-1");
     first["slots"] = json!({ "record": INSIDE });
@@ -3644,6 +3882,7 @@ async fn a_committed_open_facet_change_carries_the_token_its_own_write_left() {
 /// an observation row.
 #[tokio::test]
 async fn a_committed_spine_change_carries_the_record_token_its_own_write_left() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
     let (db, registry, digest, _guard) = fixture().await;
     let mut first = envelope("start_work", &digest, "k-token-spine-1");
     first["slots"] = json!({ "record": INSIDE });
@@ -3720,6 +3959,7 @@ async fn a_committed_spine_change_carries_the_record_token_its_own_write_left() 
 /// and the guarantee is that a stale token authorizes nothing.
 #[tokio::test]
 async fn a_replayed_open_facet_token_cannot_authorize_overwriting_a_competing_edit() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
     let (db, registry, digest, _guard) = fixture().await;
     let mut first = envelope("mark_triaged", &digest, "k-replay-open-1");
     first["slots"] = json!({ "record": INSIDE });
@@ -3789,6 +4029,7 @@ async fn a_replayed_open_facet_token_cannot_authorize_overwriting_a_competing_ed
 /// guarantee has to hold here too, and it is the branch with no other coverage.
 #[tokio::test]
 async fn a_replayed_spine_token_cannot_authorize_overwriting_a_competing_edit() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
     let (db, registry, digest, _guard) = fixture().await;
     let mut first = envelope("start_work", &digest, "k-replay-spine-1");
     first["slots"] = json!({ "record": INSIDE });
@@ -3858,6 +4099,7 @@ async fn a_replayed_spine_token_cannot_authorize_overwriting_a_competing_edit() 
 /// explicit `false`, both of which must behave identically.
 #[tokio::test]
 async fn an_omitted_next_plan_flag_keeps_the_fast_receipt() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
     let (db, registry, digest, _guard) = fixture().await;
     let mut invocation = envelope("mark_triaged", &digest, "k-no-plan-1");
     invocation["slots"] = json!({ "record": INSIDE });
@@ -3884,6 +4126,7 @@ async fn an_omitted_next_plan_flag_keeps_the_fast_receipt() {
 /// the next authoritative plan, and that plan already reflects the write.
 #[tokio::test]
 async fn a_committed_facet_write_returns_the_next_plan_when_asked() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
     let (db, registry, digest, _guard) = fixture().await;
     let mut invocation = envelope("mark_triaged", &digest, "k-next-plan-1");
     invocation["slots"] = json!({ "record": INSIDE });
@@ -3918,6 +4161,7 @@ async fn a_committed_facet_write_returns_the_next_plan_when_asked() {
 /// did not happen, so the plan the caller already holds is still current.
 #[tokio::test]
 async fn a_conflict_with_the_flag_set_carries_no_plan() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
     let (db, registry, digest, _guard) = fixture().await;
     let mut first = envelope("mark_triaged", &digest, "k-conflict-plan-1");
     first["slots"] = json!({ "record": INSIDE });
@@ -3941,6 +4185,7 @@ async fn a_conflict_with_the_flag_set_carries_no_plan() {
 /// plan joins it under the same `refresh`, rather than displacing it.
 #[tokio::test]
 async fn a_creation_with_the_flag_set_refreshes_both_record_and_plan() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
     let (db, registry, digest, _guard) = create_fixture().await;
     let committed = call(
         &registry,
@@ -3976,6 +4221,7 @@ async fn a_creation_with_the_flag_set_refreshes_both_record_and_plan() {
 /// boundary — it exercises create, render, rewrite and launch delivery.
 #[tokio::test]
 async fn html_view_state_body_renders_and_its_launch_carries_the_handoff_bridge() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
     use axum::body::{to_bytes, Body};
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
@@ -4003,13 +4249,6 @@ async fn html_view_state_body_renders_and_its_launch_carries_the_handoff_bridge(
         )
     }
 
-    native_ce::artifact_html::configure(
-        native_ce::artifact_html::RuntimeConfig::new(
-            "https://workbench.test",
-            "https://artifacts.test",
-        )
-        .unwrap(),
-    );
     let guard = Arc::clone(integration_guard()).lock_owned().await;
     let db = create_database(":memory:").await.unwrap();
     let mut registry = ToolRegistry::new();
@@ -4074,17 +4313,23 @@ async fn html_view_state_body_renders_and_its_launch_carries_the_handoff_bridge(
     // The real delivery path: validate, mint the one-use launch, redeem it
     // over HTTP, and prove the delivered bytes carry the handoff surface.
     let manifest = native_ce::artifact_html::validate(&second).unwrap();
-    let config = native_ce::artifact_html::configuration().unwrap();
-    let issued = native_ce::artifact_html::issue_launch(
-        &second,
-        &manifest,
-        "principal",
-        Some("db:test"),
-        VIEW_ARTIFACT,
+    let config = native_ce::artifact_html::RuntimeConfig::new(
+        "https://workbench.test",
+        "https://artifacts.test",
     )
     .unwrap();
+    let delivery = native_ce::artifact_html::LaunchDelivery::new(config);
+    let issued = delivery
+        .issue_launch(
+            &second,
+            &manifest,
+            "principal",
+            Some("db:test"),
+            VIEW_ARTIFACT,
+        )
+        .unwrap();
     let token = issued.url.rsplit('/').next().unwrap().to_string();
-    let app = native_ce::artifact_html::router(config);
+    let app = delivery.router();
     let request = || {
         Request::builder()
             .uri(format!("/artifact-runtime/v1/launch/{token}"))
@@ -4092,8 +4337,22 @@ async fn html_view_state_body_renders_and_its_launch_carries_the_handoff_bridge(
             .body(Body::empty())
             .unwrap()
     };
+    let wrong_host = Request::builder()
+        .uri(format!("/artifact-runtime/v1/launch/{token}"))
+        .header("host", "artifact.localhost:8080")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(wrong_host).await.unwrap().status(),
+        StatusCode::NOT_FOUND,
+        "a wrong host must not consume the instance ticket"
+    );
     let response = app.clone().oneshot(request()).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+    assert!(response.headers()["content-security-policy"]
+        .to_str()
+        .unwrap()
+        .contains("frame-ancestors https://workbench.test;"));
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     let delivered = String::from_utf8_lossy(&body);
     for marker in [
@@ -4135,16 +4394,6 @@ fn alpha_guard_declaration_no_effect() -> Value {
     json!({"needs": ["attention.query.v1"], "effects": []})
 }
 
-fn alpha_guard_configure_html() {
-    native_ce::artifact_html::configure(
-        native_ce::artifact_html::RuntimeConfig::new(
-            "https://workbench.test",
-            "https://artifacts.test",
-        )
-        .unwrap(),
-    );
-}
-
 async fn alpha_guard_source_revision(db: &Db, artifact_id: &str) -> String {
     sqlx::query_scalar(
         "SELECT id FROM content_events WHERE record_id=? AND json_type(payload,'$.body') IS NOT NULL ORDER BY seq DESC LIMIT 1",
@@ -4159,7 +4408,8 @@ fn alpha_guard_pin_for(body: &str, declaration: &Value) -> (String, String) {
     use native_ce::mcp::tools::alpha_tabs::{
         alpha_tab_bundle_digest, alpha_tab_declaration_digest, alpha_tab_digest,
     };
-    let declaration_digest = alpha_tab_declaration_digest(declaration);
+    let declaration_digest =
+        alpha_tab_declaration_digest(declaration).expect("fixture declaration is well-formed");
     let digest = alpha_tab_digest(
         &alpha_tab_bundle_digest(body),
         &declaration_digest,
@@ -4172,30 +4422,36 @@ fn alpha_guard_preview_caller(account: &str, args: &Value) -> Caller {
     use native_ce::mcp::tools::alpha_tabs::alpha_tab_preview_authority_for;
     let field = |key: &str| args.get(key).and_then(Value::as_str).unwrap_or_default();
     let declaration = args.get("declaration").cloned().unwrap_or(Value::Null);
-    Caller::authenticated(account).with_verified_alpha_tab_preview(alpha_tab_preview_authority_for(
-        account,
-        field("package"),
-        field("version"),
-        field("digest"),
-        field("artifact_id"),
-        field("source_revision"),
-        &declaration,
-    ))
+    Caller::authenticated(account).with_verified_alpha_tab_preview(
+        alpha_tab_preview_authority_for(
+            account,
+            field("package"),
+            field("version"),
+            field("digest"),
+            field("artifact_id"),
+            field("source_revision"),
+            &declaration,
+        )
+        .expect("fixture declaration is well-formed"),
+    )
 }
 
 fn alpha_guard_adopt_caller(account: &str, args: &Value) -> Caller {
     use native_ce::mcp::tools::alpha_tabs::alpha_tab_preview_authority_for;
     let field = |key: &str| args.get(key).and_then(Value::as_str).unwrap_or_default();
     let declaration = args.get("declaration").cloned().unwrap_or(Value::Null);
-    Caller::authenticated(account).with_verified_alpha_tab_adopt(alpha_tab_preview_authority_for(
-        account,
-        field("package"),
-        field("version"),
-        field("digest"),
-        field("artifact_id"),
-        field("source_revision"),
-        &declaration,
-    ))
+    Caller::authenticated(account).with_verified_alpha_tab_adopt(
+        alpha_tab_preview_authority_for(
+            account,
+            field("package"),
+            field("version"),
+            field("digest"),
+            field("artifact_id"),
+            field("source_revision"),
+            &declaration,
+        )
+        .expect("fixture declaration is well-formed"),
+    )
 }
 
 async fn alpha_guard_grants(db: &Db, account: &str) {
@@ -4362,7 +4618,7 @@ async fn alpha_guard_keyed_writes(db: &Db, key: &str) -> i64 {
 
 #[tokio::test]
 async fn alpha_guard_commits_guarded_facet_set_and_preserves_unguarded_path() {
-    alpha_guard_configure_html();
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
     let body = html_interaction_source(&artifact_source("Orders"));
     let (db, registry, body_digest, _lock) =
         fixture_with_source(body.clone(), "native.html.v1").await;
@@ -4439,7 +4695,7 @@ async fn alpha_guard_commits_guarded_facet_set_and_preserves_unguarded_path() {
 
 #[tokio::test]
 async fn alpha_guard_refuses_disabled_and_stale_generation_before_write() {
-    alpha_guard_configure_html();
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
     let body = html_interaction_source(&artifact_source("Orders"));
     let (db, registry, body_digest, _lock) =
         fixture_with_source(body.clone(), "native.html.v1").await;
@@ -4610,7 +4866,7 @@ async fn alpha_guard_refuses_disabled_and_stale_generation_before_write() {
 
 #[tokio::test]
 async fn alpha_guard_sibling_install_stays_independent() {
-    alpha_guard_configure_html();
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
     let body = html_interaction_source(&artifact_source("Orders"));
     let (db, registry, body_digest, _lock) =
         fixture_with_source(body.clone(), "native.html.v1").await;
@@ -4721,10 +4977,10 @@ async fn alpha_guard_sibling_install_stays_independent() {
 
 #[tokio::test]
 async fn alpha_guard_refuses_unconsented_effect_before_write() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
     // An otherwise valid verified pin whose consented effects omit
     // task.triage-set.v1 refuses: a declared v2 interaction or a matching
     // bundle digest alone is never effect consent.
-    alpha_guard_configure_html();
     let body = html_interaction_source(&artifact_source("Orders"));
     let (db, registry, body_digest, _lock) =
         fixture_with_source(body.clone(), "native.html.v1").await;
@@ -4773,8 +5029,651 @@ async fn alpha_guard_refuses_unconsented_effect_before_write() {
     assert_eq!(alpha_guard_facet_value(&db).await, None);
 }
 
+fn alpha_guard_lifecycle_declaration() -> Value {
+    json!({"needs": ["attention.query.v1"], "effects": ["tasks.lifecycle-set.v1"]})
+}
+
+async fn alpha_guard_lifecycle_token(db: &Db, registry: &ToolRegistry) -> String {
+    let rendered = call(registry, db, "render_artifact", json!({"id": ARTIFACT})).await;
+    assert_eq!(rendered["status"], "rendered", "{rendered:#}");
+    rendered["plan"]["observed"][INSIDE]["lifecycle"]
+        .as_str()
+        .expect("the plan versions the lifecycle spine key")
+        .to_string()
+}
+
+async fn alpha_guard_lifecycle(db: &Db) -> Option<String> {
+    sqlx::query_scalar("SELECT lifecycle FROM records WHERE id=?")
+        .bind(INSIDE)
+        .fetch_optional(db.pool())
+        .await
+        .unwrap()
+        .flatten()
+}
+
+#[tokio::test]
+async fn unguarded_lifecycle_start_keeps_declared_interaction_semantics() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
+    // The Tasks open-only rule belongs to the personal-install guard. An
+    // ordinary artifact with the same declared literal can still move a
+    // blocked record to in_progress under its existing permissions and CAS.
+    let body = html_interaction_source(&artifact_source("Orders"));
+    let (db, registry, body_digest, _lock) = fixture_with_source(body, "native.html.v1").await;
+    let changed = call(
+        &registry,
+        &db,
+        "update_record",
+        json!({"record_id": INSIDE, "lifecycle": "blocked", "reason": "Set up unguarded transition."}),
+    )
+    .await;
+    assert_eq!(
+        changed["lifecycle_interpretation"]["value"]["canonical"], "blocked",
+        "{changed:#}"
+    );
+    let token = alpha_guard_lifecycle_token(&db, &registry).await;
+    let committed = call(
+        &registry,
+        &db,
+        "invoke_artifact_interaction",
+        json!({
+            "version": INVOCATION_VERSION,
+            "artifact_id": ARTIFACT,
+            "entry_id": "start_work",
+            "source_digest": body_digest,
+            "slots": { "record": INSIDE },
+            "values": {},
+            "observed": { INSIDE: { "lifecycle": token } },
+            "idempotency_key": "alpha:tasks:unguarded",
+        }),
+    )
+    .await;
+    assert_eq!(committed["status"], "committed", "{committed:#}");
+    assert_eq!(
+        committed["changes"][0]["before"], "blocked",
+        "{committed:#}"
+    );
+    assert_eq!(
+        committed["changes"][0]["after"], "in_progress",
+        "{committed:#}"
+    );
+}
+
+#[tokio::test]
+async fn alpha_guard_tasks_click_commits_open_to_in_progress_once() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
+    // The Tasks click slice (21f44fc): a guarded facet.set on the lifecycle
+    // spine key with a declared literal in_progress commits open →
+    // in_progress exactly once per idempotency key, then replays and
+    // conflicts like any spine write.
+    let body = html_interaction_source(&artifact_source("Orders"));
+    let (db, registry, body_digest, _lock) =
+        fixture_with_source(body.clone(), "native.html.v1").await;
+    alpha_guard_grants(&db, ALPHA_GUARD_ACCOUNT).await;
+    let alice = Caller::authenticated(ALPHA_GUARD_ACCOUNT);
+    assert_eq!(alpha_guard_lifecycle(&db).await.as_deref(), Some("open"));
+    let (verified, source_revision, digest, declaration_digest) = alpha_guard_verified_install(
+        &db,
+        &registry,
+        ALPHA_GUARD_ACCOUNT,
+        ALPHA_GUARD_PACKAGE_A,
+        &body,
+        alpha_guard_lifecycle_declaration(),
+    )
+    .await;
+    let guard = alpha_guard_json(
+        ALPHA_GUARD_PACKAGE_A,
+        &verified,
+        &source_revision,
+        &digest,
+        &declaration_digest,
+    );
+    let invoke = |token: &str, key: &str| {
+        json!({
+            "version": INVOCATION_VERSION,
+            "artifact_id": ARTIFACT,
+            "entry_id": "start_work",
+            "source_digest": body_digest,
+            "slots": { "record": INSIDE },
+            "values": {},
+            "observed": { INSIDE: { "lifecycle": token } },
+            "idempotency_key": key,
+            "alpha_install_guard": guard,
+        })
+    };
+    let token = alpha_guard_lifecycle_token(&db, &registry).await;
+    let committed = call_as(
+        &registry,
+        &db,
+        alice.clone(),
+        "invoke_artifact_interaction",
+        invoke(&token, "alpha:tasks:one"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(committed["status"], "committed", "{committed:#}");
+    assert_eq!(committed["changes"][0]["key"], "lifecycle", "{committed:#}");
+    assert_eq!(committed["changes"][0]["before"], "open", "{committed:#}");
+    assert_eq!(
+        committed["changes"][0]["after"], "in_progress",
+        "{committed:#}"
+    );
+    assert_eq!(
+        alpha_guard_lifecycle(&db).await.as_deref(),
+        Some("in_progress")
+    );
+    assert_eq!(alpha_guard_keyed_writes(&db, "alpha:tasks:one").await, 1);
+    // Same key replays without a second append.
+    let replayed = call_as(
+        &registry,
+        &db,
+        alice.clone(),
+        "invoke_artifact_interaction",
+        invoke(&token, "alpha:tasks:one"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(replayed["status"], "committed", "{replayed:#}");
+    assert_eq!(alpha_guard_keyed_writes(&db, "alpha:tasks:one").await, 1);
+    // A fresh key on the stale token conflicts instead of overwriting.
+    let fresh = alpha_guard_lifecycle_token(&db, &registry).await;
+    assert_ne!(fresh, token);
+    let conflicted = call_as(
+        &registry,
+        &db,
+        alice.clone(),
+        "invoke_artifact_interaction",
+        invoke(&token, "alpha:tasks:two"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(conflicted["status"], "conflict", "{conflicted:#}");
+    assert_eq!(
+        alpha_guard_lifecycle(&db).await.as_deref(),
+        Some("in_progress")
+    );
+    // A second Start from the new state refuses: the transition source is
+    // fixed to open, so the record cannot be moved twice.
+    let refused = call_as(
+        &registry,
+        &db,
+        alice.clone(),
+        "invoke_artifact_interaction",
+        invoke(&fresh, "alpha:tasks:three"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(refused["status"], "rejected", "{refused:#}");
+    assert_eq!(
+        refused["error"]["code"], "lifecycle_unexpected_state",
+        "{refused:#}"
+    );
+    assert_eq!(alpha_guard_keyed_writes(&db, "alpha:tasks:three").await, 0);
+}
+
+#[tokio::test]
+async fn authored_tasks_start_uses_real_bound_items_and_viewer_authority() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
+    // Model the authored Tasks Start declaration here: the public root-test
+    // source boundary cannot embed a file from experiments/. Input and grant
+    // changes still go through the public tools that a hosted owner uses.
+    let _lock = Arc::clone(integration_guard()).lock_owned().await;
+    let body = r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Tasks Start</title><script type="application/json" id="native-artifact-manifest">{"schema":"native.html.artifact.v2","inputs":{"items":{"envelope":"native.collection-envelope.v1","expose_to_root":true,"required":true}},"capability_requests":[{"capability":"input.read","scope":{"port":"items"}}],"interactions":[{"id":"lifecycle_start","label":"Start work","effect":"facet.set","facet":"lifecycle","slots":{"record":{"domain":{"kind":"bound_input","port":"items"}}},"value":{"from":"literal","value":"in_progress"}}]}</script></head><body><main><h1>Tasks Start</h1></main></body></html>"#;
+    let db = create_database(":memory:").await.unwrap();
+    let mut registry = ToolRegistry::new();
+    register_surface_tools(&mut registry).unwrap();
+    for args in [
+        json!({"id": ARTIFACT, "type": "Document", "kind": "artifact",
+            "name": "Authored Tasks", "body": body,
+            "facets": {"runtime": "native.html.v1"}, "reason": "Prove the authored Tasks source."}),
+        json!({"id": COLLECTION, "type": "Collection", "kind": "selection",
+            "name": "Tasks items", "reason": "Govern the Tasks input."}),
+        json!({"id": INSIDE, "type": "WorkItem", "kind": "task",
+            "name": "Start this task", "reason": "Populate the governed input."}),
+    ] {
+        call(&registry, &db, "create_record", args).await;
+    }
+    call(
+        &registry,
+        &db,
+        "manage_links",
+        json!({
+            "action": "add", "source_id": INSIDE, "target_id": COLLECTION,
+            "relationship": "member_of"
+        }),
+    )
+    .await;
+    let bound = call(
+        &registry,
+        &db,
+        "manage_artifact_inputs",
+        json!({
+            "action": "bind", "artifact_id": ARTIFACT, "port_name": "items",
+            "collection_id": COLLECTION
+        }),
+    )
+    .await;
+    assert_eq!(bound["status"], "bound", "{bound:#}");
+    let subjects = call(
+        &registry,
+        &db,
+        "manage_artifact_module_grants",
+        json!({
+            "action": "read", "artifact_id": ARTIFACT
+        }),
+    )
+    .await;
+    let subject = subjects["subjects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["subject_kind"] == "artifact_source")
+        .expect("authored source requests input.read");
+    let granted = call(
+        &registry,
+        &db,
+        "manage_artifact_module_grants",
+        json!({
+            "action": "grant", "artifact_id": ARTIFACT,
+            "subject_kind": "artifact_source", "subject_record_id": ARTIFACT,
+            "subject_event_id": subject["subject_event_id"],
+            "source_sha256": subject["source_sha256"], "capability": "input.read",
+            "scope": {"artifact_port": "items"}
+        }),
+    )
+    .await;
+    assert_eq!(granted["status"], "granted", "{granted:#}");
+
+    const BEA: &str = "bea";
+    for id in [ARTIFACT, COLLECTION] {
+        replace_explicit_policy(
+            &db,
+            "test:tasks-viewers",
+            id,
+            vec![
+                AllowEntry::account(ALPHA_GUARD_ACCOUNT, Capability::View),
+                AllowEntry::account(BEA, Capability::View),
+            ],
+        )
+        .await
+        .unwrap();
+    }
+    replace_explicit_policy(
+        &db,
+        "test:tasks-viewers",
+        INSIDE,
+        vec![
+            AllowEntry::account(ALPHA_GUARD_ACCOUNT, Capability::View),
+            AllowEntry::account(ALPHA_GUARD_ACCOUNT, Capability::Edit),
+            AllowEntry::account(BEA, Capability::View),
+        ],
+    )
+    .await
+    .unwrap();
+    let alice = Caller::authenticated(ALPHA_GUARD_ACCOUNT);
+    let bea = Caller::authenticated(BEA);
+    for (viewer, may_edit) in [(alice.clone(), true), (bea.clone(), false)] {
+        let rendered = call_as(
+            &registry,
+            &db,
+            viewer,
+            "render_artifact",
+            json!({"id": ARTIFACT}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(rendered["status"], "rendered", "{rendered:#}");
+        assert_eq!(
+            rendered["input"]["inputs"]["items"]["version"], "native.collection-envelope.v1",
+            "{rendered:#}"
+        );
+        assert_eq!(
+            rendered["input"]["inputs"]["items"]["collection"]["id"],
+            COLLECTION
+        );
+        assert!(rendered["input"]["inputs"]["items"]["projection"]["binding_event_seq"].is_i64());
+        assert_eq!(
+            rendered["plan"]["interaction_availability"]["editable_records"]
+                .as_array()
+                .unwrap()
+                .contains(&json!(INSIDE)),
+            may_edit,
+            "fresh render must distinguish View from Edit for host confirmation"
+        );
+        assert!(
+            rendered["input"]["inputs"]["items"]["records"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r["id"] == INSIDE),
+            "{rendered:#}"
+        );
+        assert!(
+            rendered["plan"]["interaction_availability"]["supported_entries"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("lifecycle_start")),
+            "{rendered:#}"
+        );
+        assert!(
+            rendered["plan"]["interaction_availability"]["records_by_port"]["items"]
+                .as_array()
+                .unwrap()
+                .contains(&json!(INSIDE)),
+            "{rendered:#}"
+        );
+    }
+
+    let (verified, source_revision, digest, declaration_digest) = alpha_guard_verified_install(
+        &db,
+        &registry,
+        ALPHA_GUARD_ACCOUNT,
+        "agent.tasks",
+        body,
+        alpha_guard_lifecycle_declaration(),
+    )
+    .await;
+    let rendered = call_as(
+        &registry,
+        &db,
+        alice.clone(),
+        "render_artifact",
+        json!({"id": ARTIFACT}),
+    )
+    .await
+    .unwrap();
+    let token = rendered["plan"]["observed"][INSIDE]["lifecycle"]
+        .as_str()
+        .expect("render supplies the CAS token");
+    let (bea_event, bea_revision, bea_digest, bea_declaration_digest) =
+        alpha_guard_verified_install(
+            &db,
+            &registry,
+            BEA,
+            "agent.tasks",
+            body,
+            alpha_guard_lifecycle_declaration(),
+        )
+        .await;
+    let refused = call_as(
+        &registry,
+        &db,
+        bea,
+        "invoke_artifact_interaction",
+        json!({
+            "version": INVOCATION_VERSION, "artifact_id": ARTIFACT,
+            "entry_id": "lifecycle_start", "source_digest": digest_of(body),
+            "slots": {"record": INSIDE}, "values": {},
+            "observed": {INSIDE: {"lifecycle": token}},
+            "idempotency_key": "authored:tasks:bea",
+            "alpha_install_guard": alpha_guard_json("agent.tasks", &bea_event,
+                &bea_revision, &bea_digest, &bea_declaration_digest),
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(refused["status"], "rejected", "{refused:#}");
+    assert_eq!(refused["error"]["code"], "permission_denied", "{refused:#}");
+    assert_eq!(alpha_guard_keyed_writes(&db, "authored:tasks:bea").await, 0);
+    assert_eq!(alpha_guard_lifecycle(&db).await.as_deref(), Some("open"));
+    // A host may have displayed this exact source/CAS while Alice could Edit.
+    // Revocation leaves the target visible and the CAS unchanged, but fresh
+    // availability must withhold Edit and the transaction must refuse the
+    // captured invocation as well. ARM itself is browser-only and writes none.
+    replace_explicit_policy(
+        &db,
+        "test:tasks-confirmation-revocation",
+        INSIDE,
+        vec![
+            AllowEntry::account(ALPHA_GUARD_ACCOUNT, Capability::View),
+            AllowEntry::account(BEA, Capability::View),
+        ],
+    )
+    .await
+    .unwrap();
+    let narrowed = call_as(
+        &registry,
+        &db,
+        alice.clone(),
+        "render_artifact",
+        json!({"id": ARTIFACT}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(narrowed["status"], "rendered", "{narrowed:#}");
+    assert_eq!(narrowed["plan"]["observed"][INSIDE]["lifecycle"], token);
+    assert!(
+        !narrowed["plan"]["interaction_availability"]["editable_records"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(INSIDE))
+    );
+    let revoked = call_as(
+        &registry,
+        &db,
+        alice.clone(),
+        "invoke_artifact_interaction",
+        json!({
+            "version": INVOCATION_VERSION, "artifact_id": ARTIFACT,
+            "entry_id": "lifecycle_start", "source_digest": digest_of(body),
+            "slots": {"record": INSIDE}, "values": {},
+            "observed": {INSIDE: {"lifecycle": token}},
+            "idempotency_key": "authored:tasks:revoked",
+            "alpha_install_guard": alpha_guard_json("agent.tasks", &verified,
+                &source_revision, &digest, &declaration_digest),
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(revoked["status"], "rejected", "{revoked:#}");
+    assert_eq!(revoked["error"]["code"], "permission_denied", "{revoked:#}");
+    assert_eq!(
+        alpha_guard_keyed_writes(&db, "authored:tasks:revoked").await,
+        0
+    );
+    assert_eq!(alpha_guard_lifecycle(&db).await.as_deref(), Some("open"));
+    replace_explicit_policy(
+        &db,
+        "test:tasks-confirmation-restoration",
+        INSIDE,
+        vec![
+            AllowEntry::account(ALPHA_GUARD_ACCOUNT, Capability::View),
+            AllowEntry::account(ALPHA_GUARD_ACCOUNT, Capability::Edit),
+            AllowEntry::account(BEA, Capability::View),
+        ],
+    )
+    .await
+    .unwrap();
+    let invocation = json!({
+        "version": INVOCATION_VERSION, "artifact_id": ARTIFACT,
+        "entry_id": "lifecycle_start", "source_digest": digest_of(body),
+        "slots": {"record": INSIDE}, "values": {},
+        "observed": {INSIDE: {"lifecycle": token}},
+        "idempotency_key": "authored:tasks:start",
+        "alpha_install_guard": alpha_guard_json("agent.tasks", &verified,
+            &source_revision, &digest, &declaration_digest),
+    });
+    let committed = call_as(
+        &registry,
+        &db,
+        alice.clone(),
+        "invoke_artifact_interaction",
+        invocation.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(committed["status"], "committed", "{committed:#}");
+    assert_eq!(
+        alpha_guard_lifecycle(&db).await.as_deref(),
+        Some("in_progress")
+    );
+    let replay = call_as(
+        &registry,
+        &db,
+        alice,
+        "invoke_artifact_interaction",
+        invocation,
+    )
+    .await
+    .unwrap();
+    assert_eq!(replay["status"], "committed", "{replay:#}");
+    assert_eq!(
+        alpha_guard_keyed_writes(&db, "authored:tasks:start").await,
+        1
+    );
+}
+
+#[tokio::test]
+async fn alpha_guard_tasks_click_narrows_effect_authority_per_viewer() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
+    let body = html_interaction_source(&artifact_source("Orders"));
+    let (db, registry, body_digest, _lock) =
+        fixture_with_source(body.clone(), "native.html.v1").await;
+    const BEA: &str = "bea";
+    for id in [ARTIFACT, COLLECTION] {
+        replace_explicit_policy(
+            &db,
+            "test:policy",
+            id,
+            vec![
+                AllowEntry::account(ALPHA_GUARD_ACCOUNT, Capability::View),
+                AllowEntry::account(BEA, Capability::View),
+            ],
+        )
+        .await
+        .unwrap();
+    }
+    replace_explicit_policy(
+        &db,
+        "test:policy",
+        INSIDE,
+        vec![
+            AllowEntry::account(ALPHA_GUARD_ACCOUNT, Capability::View),
+            AllowEntry::account(ALPHA_GUARD_ACCOUNT, Capability::Edit),
+            AllowEntry::account(BEA, Capability::View),
+        ],
+    )
+    .await
+    .unwrap();
+    let (alice_event, source_revision, digest, declaration_digest) = alpha_guard_verified_install(
+        &db,
+        &registry,
+        ALPHA_GUARD_ACCOUNT,
+        ALPHA_GUARD_PACKAGE_A,
+        &body,
+        alpha_guard_lifecycle_declaration(),
+    )
+    .await;
+    let (bea_event, _, _, _) = alpha_guard_verified_install(
+        &db,
+        &registry,
+        BEA,
+        ALPHA_GUARD_PACKAGE_A,
+        &body,
+        alpha_guard_lifecycle_declaration(),
+    )
+    .await;
+    let token = alpha_guard_lifecycle_token(&db, &registry).await;
+    let invoke = |event: &str, key: &str| {
+        json!({
+            "version": INVOCATION_VERSION,
+            "artifact_id": ARTIFACT,
+            "entry_id": "start_work",
+            "source_digest": body_digest,
+            "slots": { "record": INSIDE },
+            "values": {},
+            "observed": { INSIDE: { "lifecycle": token } },
+            "idempotency_key": key,
+            "alpha_install_guard": alpha_guard_json(
+                ALPHA_GUARD_PACKAGE_A, event, &source_revision, &digest, &declaration_digest),
+        })
+    };
+    let refused = call_as(
+        &registry,
+        &db,
+        Caller::authenticated(BEA),
+        "invoke_artifact_interaction",
+        invoke(&bea_event, "alpha:tasks:bea"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(refused["status"], "rejected", "{refused:#}");
+    assert_eq!(refused["error"]["code"], "permission_denied", "{refused:#}");
+    assert_eq!(alpha_guard_keyed_writes(&db, "alpha:tasks:bea").await, 0);
+    assert_eq!(alpha_guard_lifecycle(&db).await.as_deref(), Some("open"));
+    let committed = call_as(
+        &registry,
+        &db,
+        Caller::authenticated(ALPHA_GUARD_ACCOUNT),
+        "invoke_artifact_interaction",
+        invoke(&alice_event, "alpha:tasks:alice"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(committed["status"], "committed", "{committed:#}");
+    assert_eq!(
+        alpha_guard_lifecycle(&db).await.as_deref(),
+        Some("in_progress")
+    );
+}
+
+#[tokio::test]
+async fn alpha_guard_tasks_click_refuses_triage_consented_install() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
+    // Triage consent never authorizes the lifecycle arm: the install must
+    // consent to tasks.lifecycle-set.v1 specifically.
+    let body = html_interaction_source(&artifact_source("Orders"));
+    let (db, registry, body_digest, _lock) =
+        fixture_with_source(body.clone(), "native.html.v1").await;
+    alpha_guard_grants(&db, ALPHA_GUARD_ACCOUNT).await;
+    let alice = Caller::authenticated(ALPHA_GUARD_ACCOUNT);
+    let (verified, source_revision, digest, declaration_digest) = alpha_guard_verified_install(
+        &db,
+        &registry,
+        ALPHA_GUARD_ACCOUNT,
+        ALPHA_GUARD_PACKAGE_A,
+        &body,
+        alpha_guard_declaration(),
+    )
+    .await;
+    let triage_guard = alpha_guard_json(
+        ALPHA_GUARD_PACKAGE_A,
+        &verified,
+        &source_revision,
+        &digest,
+        &declaration_digest,
+    );
+    let token = alpha_guard_lifecycle_token(&db, &registry).await;
+    let refused = call_as(
+        &registry,
+        &db,
+        alice.clone(),
+        "invoke_artifact_interaction",
+        json!({
+            "version": INVOCATION_VERSION,
+            "artifact_id": ARTIFACT,
+            "entry_id": "start_work",
+            "source_digest": body_digest,
+            "slots": { "record": INSIDE },
+            "values": {},
+            "observed": { INSIDE: { "lifecycle": token } },
+            "idempotency_key": "alpha:tasks:cross",
+            "alpha_install_guard": triage_guard,
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(refused["status"], "rejected", "{refused:#}");
+    assert_eq!(
+        refused["error"]["code"], "alpha_guard_effect_unconsented",
+        "{refused:#}"
+    );
+    assert_eq!(alpha_guard_keyed_writes(&db, "alpha:tasks:cross").await, 0);
+    assert_eq!(alpha_guard_lifecycle(&db).await.as_deref(), Some("open"));
+}
+
 #[tokio::test]
 async fn alpha_guard_absent_preserves_existing_invocation() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
     // No install at all: the pre-guard envelope commits exactly as before.
     let (db, registry, digest, _lock) = fixture().await;
     let invocation = json!({
@@ -4808,6 +5707,7 @@ fn alpha_guard_dummy() -> Value {
 
 #[tokio::test]
 async fn alpha_guard_refuses_record_create_with_guard() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
     // Consent to triage-set never authorizes record.create: the guarded
     // creation refuses before any write, even with a well-formed guard.
     let (db, registry, digest, _lock) = create_fixture().await;
@@ -4843,10 +5743,12 @@ async fn alpha_guard_refuses_record_create_with_guard() {
 
 #[tokio::test]
 async fn alpha_guard_refuses_non_triage_facet_with_guard() {
-    // A verified triage-consented pin plus a declared non-triage entry
-    // (lifecycle) still refuses: effect consent is not facet consent.
-    // Scope is checked on the actual parsed entry before any write.
-    alpha_guard_configure_html();
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
+    // A verified triage-consented pin plus the tasks lifecycle entry
+    // still refuses: consent is per effect arm, so triage-set consent
+    // never authorizes the lifecycle arm (which requires
+    // tasks.lifecycle-set.v1). Scope is checked on the actual parsed
+    // entry before any write.
     let body = html_interaction_source(&artifact_source("Orders"));
     let (db, registry, body_digest, _lock) =
         fixture_with_source(body.clone(), "native.html.v1").await;
@@ -4888,7 +5790,7 @@ async fn alpha_guard_refuses_non_triage_facet_with_guard() {
     .unwrap();
     assert_eq!(refused["status"], "rejected", "{refused:#}");
     assert_eq!(
-        refused["error"]["code"], "alpha_guard_facet_unconsented",
+        refused["error"]["code"], "alpha_guard_effect_unconsented",
         "{refused:#}"
     );
     assert_eq!(
@@ -4898,7 +5800,64 @@ async fn alpha_guard_refuses_non_triage_facet_with_guard() {
 }
 
 #[tokio::test]
+async fn alpha_guard_refuses_undeclared_lifecycle_value_with_guard() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
+    // Lifecycle consent with a bogus-state entry still refuses on scope:
+    // the tasks arm admits only the declared literal in_progress, so a
+    // widened value fails before any write even when the effect is
+    // consented.
+    let body = html_interaction_source(&artifact_source("Orders"));
+    let (db, registry, body_digest, _lock) =
+        fixture_with_source(body.clone(), "native.html.v1").await;
+    alpha_guard_grants(&db, ALPHA_GUARD_ACCOUNT).await;
+    let alice = Caller::authenticated(ALPHA_GUARD_ACCOUNT);
+    let (verified, source_revision, digest, declaration_digest) = alpha_guard_verified_install(
+        &db,
+        &registry,
+        ALPHA_GUARD_ACCOUNT,
+        ALPHA_GUARD_PACKAGE_A,
+        &body,
+        alpha_guard_lifecycle_declaration(),
+    )
+    .await;
+    let guard = alpha_guard_json(
+        ALPHA_GUARD_PACKAGE_A,
+        &verified,
+        &source_revision,
+        &digest,
+        &declaration_digest,
+    );
+    let token = alpha_guard_lifecycle_token(&db, &registry).await;
+    let refused = call_as(
+        &registry,
+        &db,
+        alice,
+        "invoke_artifact_interaction",
+        json!({
+            "version": INVOCATION_VERSION,
+            "artifact_id": ARTIFACT,
+            "entry_id": "stall",
+            "source_digest": body_digest,
+            "slots": { "record": INSIDE },
+            "values": {},
+            "observed": { INSIDE: { "lifecycle": token } },
+            "idempotency_key": "alpha:scope:bogus",
+            "alpha_install_guard": guard,
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(refused["status"], "rejected", "{refused:#}");
+    assert_eq!(
+        refused["error"]["code"], "alpha_guard_facet_unconsented",
+        "{refused:#}"
+    );
+    assert_eq!(alpha_guard_keyed_writes(&db, "alpha:scope:bogus").await, 0);
+}
+
+#[tokio::test]
 async fn alpha_guard_refuses_non_html_runtime_with_guard() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
     // Guarded writes require native.html.v1, matching the alpha launch path.
     // An MDX artifact with a well-formed guard refuses before any write,
     // even though the same entry commits unguarded.
@@ -4952,10 +5911,10 @@ async fn alpha_guard_refuses_non_html_runtime_with_guard() {
 
 #[tokio::test]
 async fn alpha_guard_replay_guarded_to_unguarded_conflicts() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
     // A guarded commit followed by an unguarded retry under the same key must
     // conflict: the unguarded call must not inherit the guarded commit's
     // receipt and version token.
-    alpha_guard_configure_html();
     let body = html_interaction_source(&artifact_source("Orders"));
     let (db, registry, body_digest, _lock) =
         fixture_with_source(body.clone(), "native.html.v1").await;
@@ -5038,9 +5997,9 @@ async fn alpha_guard_replay_guarded_to_unguarded_conflicts() {
 
 #[tokio::test]
 async fn alpha_guard_replay_distinct_guard_contexts_conflict() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
     // Two valid installs, one key: the second package's guard must not replay
     // the first package's commit, even though its own guard verifies.
-    alpha_guard_configure_html();
     let body = html_interaction_source(&artifact_source("Orders"));
     let (db, registry, body_digest, _lock) =
         fixture_with_source(body.clone(), "native.html.v1").await;
@@ -5140,9 +6099,9 @@ async fn alpha_guard_replay_distinct_guard_contexts_conflict() {
 
 #[tokio::test]
 async fn alpha_guard_replay_same_guard_stays_idempotent() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
     // The identical guard context under the same key still replays idempotent:
     // committed, no second write, and the original version token is returned.
-    alpha_guard_configure_html();
     let body = html_interaction_source(&artifact_source("Orders"));
     let (db, registry, body_digest, _lock) =
         fixture_with_source(body.clone(), "native.html.v1").await;
@@ -5220,13 +6179,13 @@ async fn alpha_guard_replay_same_guard_stays_idempotent() {
 
 #[tokio::test]
 async fn alpha_guard_replay_unguarded_to_unguarded_still_replays() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
     // Ordinary replay is untouched by the guard comparison: the same
     // unguarded invocation under the same key replays committed with the
     // original token and no second write. (Pre-guard legacy rows, whose origin
     // lacks the guard key entirely, normalize to the same null context; that
     // branch is pinned by the `facet_guard_context_matches` unit test, since
     // the test pool is read-only and cannot rewrite a row to legacy shape.)
-    alpha_guard_configure_html();
     let body = html_interaction_source(&artifact_source("Orders"));
     let (db, registry, body_digest, _lock) =
         fixture_with_source(body.clone(), "native.html.v1").await;
@@ -5283,3 +6242,2922 @@ async fn alpha_guard_replay_unguarded_to_unguarded_still_replays() {
         "a replay commits nothing"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Facet-set object bounds (task `81372d1`): narrowed key/values/target need.
+// ---------------------------------------------------------------------------
+
+const FACET_SET_THIRD: &str = "0a5e0000-0000-4000-8000-000000000009";
+
+fn facet_set_member_sql() -> String {
+    format!(
+        "SELECT w.id FROM links l JOIN records w ON w.id = l.source_id \
+         WHERE l.relationship = 'member_of' AND l.target_id = '{COLLECTION}' \
+         AND w.deleted_at IS NULL ORDER BY w.id ASC LIMIT 40"
+    )
+}
+
+fn facet_set_need(key: &str, sql: &str) -> Value {
+    json!({"need": "sql.snapshot.v1", "key": key, "label": "Grid", "sql": sql})
+}
+
+fn facet_set_bound(key: &str, values: Value, need: &str) -> Value {
+    json!({"effect": "records.facet-set.v1", "key": key, "values": values,
+        "target": {"need": need}})
+}
+
+fn facet_set_declaration(effects: Value, needs: Value) -> Value {
+    json!({"needs": needs, "effects": effects})
+}
+
+fn facet_set_grid_declaration() -> Value {
+    facet_set_declaration(
+        json!([facet_set_bound(
+            "effort",
+            json!(["large", "small"]),
+            "grid.items"
+        )]),
+        json!([
+            "attention.query.v1",
+            facet_set_need("grid.items", &facet_set_member_sql()),
+        ]),
+    )
+}
+
+async fn facet_set_effort_value(db: &Db) -> Option<String> {
+    sqlx::query_scalar("SELECT value FROM facet_values WHERE record_id=? AND key='effort'")
+        .bind(INSIDE)
+        .fetch_optional(db.pool())
+        .await
+        .unwrap()
+        .flatten()
+}
+
+struct FacetSetSetup {
+    db: Db,
+    registry: ToolRegistry,
+    body_digest: String,
+    guard: Value,
+    alice: Caller,
+    _lock: tokio::sync::OwnedMutexGuard<()>,
+}
+
+async fn facet_set_setup(declaration: Value) -> FacetSetSetup {
+    let body = html_interaction_source(&artifact_source("Orders"));
+    let (db, registry, body_digest, lock) =
+        fixture_with_source(body.clone(), "native.html.v1").await;
+    alpha_guard_grants(&db, ALPHA_GUARD_ACCOUNT).await;
+    let alice = Caller::authenticated(ALPHA_GUARD_ACCOUNT);
+    let (verified, source_revision, digest, declaration_digest) = alpha_guard_verified_install(
+        &db,
+        &registry,
+        ALPHA_GUARD_ACCOUNT,
+        ALPHA_GUARD_PACKAGE_A,
+        &body,
+        declaration,
+    )
+    .await;
+    let guard = alpha_guard_json(
+        ALPHA_GUARD_PACKAGE_A,
+        &verified,
+        &source_revision,
+        &digest,
+        &declaration_digest,
+    );
+    FacetSetSetup {
+        db,
+        registry,
+        body_digest,
+        guard,
+        alice,
+        _lock: lock,
+    }
+}
+
+async fn facet_set_invoke(
+    setup: &FacetSetSetup,
+    entry_id: &str,
+    record_id: &str,
+    observed: Value,
+    key: &str,
+) -> Value {
+    call_as(
+        &setup.registry,
+        &setup.db,
+        setup.alice.clone(),
+        "invoke_artifact_interaction",
+        json!({
+            "version": INVOCATION_VERSION,
+            "artifact_id": ARTIFACT,
+            "entry_id": entry_id,
+            "source_digest": setup.body_digest,
+            "slots": { "record": record_id },
+            "observed": { record_id: observed },
+            "idempotency_key": key,
+            "alpha_install_guard": setup.guard,
+        }),
+    )
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn facet_set_guard_commits_narrowed_literal() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
+    let setup = facet_set_setup(facet_set_grid_declaration()).await;
+    let committed = facet_set_invoke(
+        &setup,
+        "note_effort",
+        INSIDE,
+        json!({ "effort": "obs:0" }),
+        "facet:admit:one",
+    )
+    .await;
+    assert_eq!(committed["status"], "committed", "{committed:#}");
+    assert_eq!(committed["changes"][0]["after"], "large");
+    assert_eq!(
+        facet_set_effort_value(&setup.db).await.as_deref(),
+        Some("large")
+    );
+    assert_eq!(
+        alpha_guard_keyed_writes(&setup.db, "facet:admit:one").await,
+        1
+    );
+}
+
+#[tokio::test]
+async fn facet_set_guard_refuses_undeclared_value() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
+    let declaration = facet_set_declaration(
+        json!([facet_set_bound("effort", json!(["small"]), "grid.items")]),
+        json!([
+            "attention.query.v1",
+            facet_set_need("grid.items", &facet_set_member_sql()),
+        ]),
+    );
+    let setup = facet_set_setup(declaration).await;
+    let refused = facet_set_invoke(
+        &setup,
+        "note_effort",
+        INSIDE,
+        json!({ "effort": "obs:0" }),
+        "facet:value:no",
+    )
+    .await;
+    assert_eq!(refused["status"], "rejected", "{refused:#}");
+    assert_eq!(
+        refused["error"]["code"], "alpha_guard_effect_unconsented",
+        "{refused:#}"
+    );
+    assert_eq!(
+        alpha_guard_keyed_writes(&setup.db, "facet:value:no").await,
+        0
+    );
+    assert_eq!(facet_set_effort_value(&setup.db).await, None);
+}
+
+#[tokio::test]
+async fn facet_set_guard_refuses_undeclared_key() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
+    let declaration = facet_set_declaration(
+        json!([facet_set_bound("priority", json!(["large"]), "grid.items")]),
+        json!([
+            "attention.query.v1",
+            facet_set_need("grid.items", &facet_set_member_sql()),
+        ]),
+    );
+    let setup = facet_set_setup(declaration).await;
+    let refused = facet_set_invoke(
+        &setup,
+        "note_effort",
+        INSIDE,
+        json!({ "effort": "obs:0" }),
+        "facet:key:no",
+    )
+    .await;
+    assert_eq!(refused["status"], "rejected", "{refused:#}");
+    assert_eq!(
+        refused["error"]["code"], "alpha_guard_effect_unconsented",
+        "{refused:#}"
+    );
+    assert_eq!(alpha_guard_keyed_writes(&setup.db, "facet:key:no").await, 0);
+}
+
+#[tokio::test]
+async fn facet_set_install_refuses_bare_string_and_missing_need() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
+    let body = html_interaction_source(&artifact_source("Orders"));
+    let (db, registry, _digest, _lock) = fixture_with_source(body.clone(), "native.html.v1").await;
+    alpha_guard_grants(&db, ALPHA_GUARD_ACCOUNT).await;
+    for effects in [
+        json!(["records.facet-set.v1"]),
+        json!([facet_set_bound("effort", json!(["large"]), "grid.absent")]),
+        json!([facet_set_bound(
+            "owner",
+            json!(["acct:someone"]),
+            "grid.items"
+        )]),
+        json!([facet_set_bound(
+            "lifecycle",
+            json!(["in_progress"]),
+            "grid.items"
+        )]),
+        json!([facet_set_bound("name", json!(["x"]), "grid.items")]),
+        json!([facet_set_bound("archived", json!(["x"]), "grid.items")]),
+    ] {
+        let declaration = facet_set_declaration(
+            effects,
+            json!([
+                "attention.query.v1",
+                facet_set_need("grid.items", &facet_set_member_sql()),
+            ]),
+        );
+        // Use a well-formed pin to reach the install parser with invalid
+        // consent; the pin helper itself rejects protected-key bounds.
+        let (digest, _declaration_digest) =
+            alpha_guard_pin_for(&body, &facet_set_grid_declaration());
+        let source_revision = alpha_guard_source_revision(&db, ARTIFACT).await;
+        let error = registry
+            .call(
+                db.clone(),
+                Caller::authenticated(ALPHA_GUARD_ACCOUNT),
+                "manage_alpha_tabs",
+                json!({
+                    "action": "install",
+                    "package": ALPHA_GUARD_PACKAGE_A,
+                    "version": "0.1.0",
+                    "digest": digest,
+                    "artifact_id": ARTIFACT,
+                    "source_revision": source_revision,
+                    "declaration": declaration,
+                    "reason": "Install the facet-set tab.",
+                }),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("invalid_effect"),
+            "bare strings, missing needs and out-of-scope keys fail closed: {error}"
+        );
+    }
+    let installs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM alpha_tab_installs")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(installs, 0, "refused installs write nothing");
+}
+
+#[tokio::test]
+async fn facet_set_guard_refuses_outside_need_rows() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
+    // INSIDE sits in the bound input, but the need delivers no rows, so the
+    // target is outside the consented need while inside the binding.
+    let declaration = facet_set_declaration(
+        json!([facet_set_bound("effort", json!(["large"]), "grid.empty")]),
+        json!([
+            "attention.query.v1",
+            facet_set_need(
+                "grid.empty",
+                "SELECT w.id FROM links l JOIN records w ON w.id = l.source_id \
+                 WHERE l.relationship = 'member_of' AND w.lifecycle = 'completed' \
+                 ORDER BY w.id ASC LIMIT 40",
+            ),
+        ]),
+    );
+    let setup = facet_set_setup(declaration).await;
+    let refused = facet_set_invoke(
+        &setup,
+        "note_effort",
+        INSIDE,
+        json!({ "effort": "obs:0" }),
+        "facet:need:no",
+    )
+    .await;
+    assert_eq!(refused["status"], "rejected", "{refused:#}");
+    assert_eq!(
+        refused["error"]["code"], "record_outside_need",
+        "{refused:#}"
+    );
+    assert_eq!(
+        alpha_guard_keyed_writes(&setup.db, "facet:need:no").await,
+        0
+    );
+}
+
+#[tokio::test]
+async fn facet_set_membership_never_queries_beyond_delivered_rows() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
+    // A third member exists in the binding, but the need delivers only the
+    // first row: an unbounded re-query would admit it, the capped check
+    // must not.
+    let setup = facet_set_setup(facet_set_declaration(
+        json!([facet_set_bound("effort", json!(["large"]), "grid.first")]),
+        json!([
+            "attention.query.v1",
+            facet_set_need(
+                "grid.first",
+                &format!(
+                    "SELECT w.id FROM links l JOIN records w ON w.id = l.source_id \
+                     WHERE l.relationship = 'member_of' AND l.target_id = '{COLLECTION}' \
+                     AND w.deleted_at IS NULL ORDER BY w.id ASC LIMIT 1"
+                ),
+            ),
+        ]),
+    ))
+    .await;
+    call(
+        &setup.registry,
+        &setup.db,
+        "create_record",
+        json!({ "id": FACET_SET_THIRD, "type": "WorkItem", "kind": "task",
+                "name": FACET_SET_THIRD, "reason": "Second bound member." }),
+    )
+    .await;
+    call(
+        &setup.registry,
+        &setup.db,
+        "manage_links",
+        json!({ "action": "add", "source_id": FACET_SET_THIRD, "target_id": COLLECTION,
+                "relationship": "member_of" }),
+    )
+    .await;
+    replace_explicit_policy(
+        &setup.db,
+        "test:policy",
+        FACET_SET_THIRD,
+        vec![
+            AllowEntry::account(ALPHA_GUARD_ACCOUNT, Capability::View),
+            AllowEntry::account(ALPHA_GUARD_ACCOUNT, Capability::Edit),
+        ],
+    )
+    .await
+    .unwrap();
+    let refused = facet_set_invoke(
+        &setup,
+        "note_effort",
+        FACET_SET_THIRD,
+        json!({ "effort": "obs:0" }),
+        "facet:cap:no",
+    )
+    .await;
+    assert_eq!(refused["status"], "rejected", "{refused:#}");
+    assert_eq!(
+        refused["error"]["code"], "record_outside_need",
+        "{refused:#}"
+    );
+}
+
+#[tokio::test]
+async fn facet_set_guard_refuses_parameterized_and_time_dependent_needs() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
+    let param_declaration = facet_set_declaration(
+        json!([facet_set_bound("effort", json!(["large"]), "grid.param")]),
+        json!([
+            "attention.query.v1",
+            json!({"need": "sql.snapshot.v1", "key": "grid.param", "label": "Param",
+                "sql": "SELECT w.id FROM links l JOIN records w ON w.id = l.source_id \
+                 WHERE l.relationship = 'member_of' AND w.id = ?1 ORDER BY w.id ASC LIMIT 40",
+                "params": [{"name": "target", "type": "text", "required": true}]}),
+        ]),
+    );
+    let setup = facet_set_setup(param_declaration).await;
+    let refused = facet_set_invoke(
+        &setup,
+        "note_effort",
+        INSIDE,
+        json!({ "effort": "obs:0" }),
+        "facet:param:no",
+    )
+    .await;
+    assert_eq!(refused["status"], "rejected", "{refused:#}");
+    assert_eq!(
+        refused["error"]["code"], "facet_need_parameterized",
+        "{refused:#}"
+    );
+    // Release the shared fixture guard before building a second fixture:
+    // shadowing `setup` while the first still holds `_lock` deadlocks.
+    drop(setup);
+    let clock_declaration = facet_set_declaration(
+        json!([facet_set_bound("effort", json!(["large"]), "grid.clock")]),
+        json!([
+            "attention.query.v1",
+            facet_set_need(
+                "grid.clock",
+                "SELECT id FROM records WHERE deleted_at IS NULL AND last_activity_at_ms < now_ms() ORDER BY id ASC LIMIT 40",
+            ),
+        ]),
+    );
+    let setup = facet_set_setup(clock_declaration).await;
+    let refused = facet_set_invoke(
+        &setup,
+        "note_effort",
+        INSIDE,
+        json!({ "effort": "obs:0" }),
+        "facet:clock:no",
+    )
+    .await;
+    assert_eq!(refused["status"], "rejected", "{refused:#}");
+    assert_eq!(
+        refused["error"]["code"], "facet_need_time_dependent",
+        "{refused:#}"
+    );
+}
+
+#[tokio::test]
+async fn facet_set_guard_conflicts_on_stale_cas_and_replays_once() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
+    let setup = facet_set_setup(facet_set_grid_declaration()).await;
+    let committed = facet_set_invoke(
+        &setup,
+        "note_effort",
+        INSIDE,
+        json!({ "effort": "obs:0" }),
+        "facet:cas:one",
+    )
+    .await;
+    assert_eq!(committed["status"], "committed", "{committed:#}");
+    let version = committed["changes"][0]["version"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(version, "obs:0");
+    let replay = facet_set_invoke(
+        &setup,
+        "note_effort",
+        INSIDE,
+        json!({ "effort": "obs:0" }),
+        "facet:cas:one",
+    )
+    .await;
+    assert_eq!(replay["status"], "committed", "{replay:#}");
+    assert_eq!(
+        alpha_guard_keyed_writes(&setup.db, "facet:cas:one").await,
+        1,
+        "a replay commits nothing"
+    );
+    // The initial token is now genuinely stale: the write above moved the
+    // facet, so quoting obs:0 on a new key conflicts.
+    let conflict = facet_set_invoke(
+        &setup,
+        "note_effort",
+        INSIDE,
+        json!({ "effort": "obs:0" }),
+        "facet:cas:two",
+    )
+    .await;
+    assert_eq!(conflict["status"], "conflict", "{conflict:#}");
+    assert_eq!(
+        alpha_guard_keyed_writes(&setup.db, "facet:cas:two").await,
+        0
+    );
+    // A forged token the engine never issued is not a CAS mismatch: it is
+    // an invalid precondition, and it also writes nothing.
+    let forged = facet_set_invoke(
+        &setup,
+        "note_effort",
+        INSIDE,
+        json!({ "effort": "obs:999999" }),
+        "facet:cas:three",
+    )
+    .await;
+    assert_eq!(forged["status"], "rejected", "{forged:#}");
+    assert_eq!(
+        forged["error"]["code"], "invalid_precondition",
+        "{forged:#}"
+    );
+    assert_eq!(
+        alpha_guard_keyed_writes(&setup.db, "facet:cas:three").await,
+        0
+    );
+}
+
+#[tokio::test]
+async fn facet_set_consent_cannot_drive_the_lifecycle_arm() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
+    // A facet-set install admits ordinary facets only: invoking the
+    // lifecycle arm under it refuses, so no generic bound bypasses the
+    // dedicated Start transition.
+    let setup = facet_set_setup(facet_set_grid_declaration()).await;
+    let refused = facet_set_invoke(
+        &setup,
+        "start_work",
+        INSIDE,
+        json!({ "lifecycle": "rec:0" }),
+        "facet:lifecycle:no",
+    )
+    .await;
+    assert_eq!(refused["status"], "rejected", "{refused:#}");
+    assert_eq!(
+        refused["error"]["code"], "alpha_guard_effect_unconsented",
+        "{refused:#}"
+    );
+    assert_eq!(
+        alpha_guard_keyed_writes(&setup.db, "facet:lifecycle:no").await,
+        0
+    );
+}
+
+#[tokio::test]
+async fn facet_set_widened_declaration_breaks_the_guard_pin() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
+    let setup = facet_set_setup(facet_set_grid_declaration()).await;
+    let body = html_interaction_source(&artifact_source("Orders"));
+    let wide = facet_set_declaration(
+        json!([facet_set_bound(
+            "effort",
+            json!(["large", "small", "urgent"]),
+            "grid.items"
+        )]),
+        json!([
+            "attention.query.v1",
+            facet_set_need("grid.items", &facet_set_member_sql()),
+        ]),
+    );
+    let (_, wide_declaration_digest) = alpha_guard_pin_for(&body, &wide);
+    let mut widened_guard = setup.guard.clone();
+    widened_guard["declaration_digest"] = json!(wide_declaration_digest);
+    let refused = call_as(
+        &setup.registry,
+        &setup.db,
+        setup.alice.clone(),
+        "invoke_artifact_interaction",
+        json!({
+            "version": INVOCATION_VERSION,
+            "artifact_id": ARTIFACT,
+            "entry_id": "note_effort",
+            "source_digest": setup.body_digest,
+            "slots": { "record": INSIDE },
+            "observed": { INSIDE: { "effort": "obs:0" } },
+            "idempotency_key": "facet:pin:no",
+            "alpha_install_guard": widened_guard,
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(refused["status"], "rejected", "{refused:#}");
+    assert_eq!(
+        refused["error"]["code"], "alpha_guard_pin_mismatch",
+        "{refused:#}"
+    );
+}
+
+#[tokio::test]
+async fn facet_set_commit_leaves_reads_working_after_temp_cleanup() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
+    let setup = facet_set_setup(facet_set_grid_declaration()).await;
+    let committed = facet_set_invoke(
+        &setup,
+        "note_effort",
+        INSIDE,
+        json!({ "effort": "obs:0" }),
+        "facet:clean:one",
+    )
+    .await;
+    assert_eq!(committed["status"], "committed", "{committed:#}");
+    let read = call_as(
+        &setup.registry,
+        &setup.db,
+        setup.alice.clone(),
+        "get_record",
+        json!({ "id": INSIDE }),
+    )
+    .await
+    .unwrap();
+    assert!(read.get("error").is_none(), "{read:#}");
+    let queried = call_as(
+        &setup.registry,
+        &setup.db,
+        setup.alice.clone(),
+        "query_sql",
+        json!({ "sql": "SELECT id FROM records WHERE id = '0a5e0000-0000-4000-8000-000000000002'" }),
+    )
+    .await
+    .unwrap();
+    assert!(queried.get("error").is_none(), "{queried:#}");
+}
+
+#[tokio::test]
+async fn facet_set_replay_settles_after_target_leaves_need() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
+    // The dynamic need gate runs after the replay branch: a target that has
+    // since left the delivered rows still settles its prior receipt on an
+    // identical retry, while a fresh key refuses.
+    let setup = facet_set_setup(facet_set_declaration(
+        json!([facet_set_bound("effort", json!(["large"]), "grid.named")]),
+        json!([
+            "attention.query.v1",
+            facet_set_need(
+                "grid.named",
+                &format!(
+                    "SELECT w.id FROM links l JOIN records w ON w.id = l.source_id \
+                     WHERE l.relationship = 'member_of' AND l.target_id = '{COLLECTION}' \
+                     AND w.name = '{INSIDE}' ORDER BY w.id ASC LIMIT 40"
+                ),
+            ),
+        ]),
+    ))
+    .await;
+    let committed = facet_set_invoke(
+        &setup,
+        "note_effort",
+        INSIDE,
+        json!({ "effort": "obs:0" }),
+        "facet:replay:gone",
+    )
+    .await;
+    assert_eq!(committed["status"], "committed", "{committed:#}");
+    let renamed = call(
+        &setup.registry,
+        &setup.db,
+        "update_record",
+        json!({ "record_id": INSIDE, "name": "Moved", "reason": "Leave the declared need." }),
+    )
+    .await;
+    assert!(renamed.get("error").is_none(), "{renamed:#}");
+    let replay = facet_set_invoke(
+        &setup,
+        "note_effort",
+        INSIDE,
+        json!({ "effort": "obs:0" }),
+        "facet:replay:gone",
+    )
+    .await;
+    assert_eq!(replay["status"], "committed", "{replay:#}");
+    assert_eq!(
+        alpha_guard_keyed_writes(&setup.db, "facet:replay:gone").await,
+        1,
+        "a replay commits nothing"
+    );
+    let fresh = facet_set_invoke(
+        &setup,
+        "note_effort",
+        INSIDE,
+        json!({ "effort": "obs:0" }),
+        "facet:replay:fresh",
+    )
+    .await;
+    assert_eq!(fresh["status"], "rejected", "{fresh:#}");
+    assert_eq!(fresh["error"]["code"], "record_outside_need", "{fresh:#}");
+}
+
+#[tokio::test]
+async fn facet_set_outside_binding_refuses_before_write() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
+    // A facet-set entry traverses the same pre-transaction binding gate: a
+    // record outside the bound input refuses before any transaction work.
+    // (In-transaction mapping divergence is not deterministically
+    // interleavable headless; the in-txn re-proof covers the race.)
+    let setup = facet_set_setup(facet_set_grid_declaration()).await;
+    let refused = facet_set_invoke(
+        &setup,
+        "note_effort",
+        OUTSIDE,
+        json!({ "effort": "obs:0" }),
+        "facet:binding:no",
+    )
+    .await;
+    assert_eq!(refused["status"], "rejected", "{refused:#}");
+    assert_eq!(
+        refused["error"]["code"], "record_outside_binding",
+        "{refused:#}"
+    );
+    assert_eq!(
+        alpha_guard_keyed_writes(&setup.db, "facet:binding:no").await,
+        0
+    );
+}
+
+#[tokio::test]
+async fn facet_set_guard_refuses_revoked_consent_before_write() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
+    let setup = facet_set_setup(facet_set_grid_declaration()).await;
+    let event_id = setup.guard["expected_install_event_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let disabled = call_as(
+        &setup.registry,
+        &setup.db,
+        setup.alice.clone(),
+        "manage_alpha_tabs",
+        json!({
+            "action": "disable",
+            "package": ALPHA_GUARD_PACKAGE_A,
+            "expected_install_event_id": event_id,
+            "reason": "Pause the facet-set tab.",
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(disabled["install"]["status"], "disabled");
+    // The pre-disable guard generation is stale: CAS mismatch fires before
+    // the disabled gate, per validation order.
+    let stale = facet_set_invoke(
+        &setup,
+        "note_effort",
+        INSIDE,
+        json!({ "effort": "obs:0" }),
+        "facet:revoked:stale",
+    )
+    .await;
+    assert_eq!(stale["status"], "rejected", "{stale:#}");
+    assert_eq!(
+        stale["error"]["code"], "alpha_guard_cas_mismatch",
+        "{stale:#}"
+    );
+    assert_eq!(
+        alpha_guard_keyed_writes(&setup.db, "facet:revoked:stale").await,
+        0
+    );
+    // A guard refreshed to the disabled generation reaches the disabled
+    // gate instead.
+    let disabled_event = disabled["install"]["event_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let mut refreshed = setup.guard.clone();
+    refreshed["expected_install_event_id"] = json!(disabled_event);
+    let refused = call_as(
+        &setup.registry,
+        &setup.db,
+        setup.alice.clone(),
+        "invoke_artifact_interaction",
+        json!({
+            "version": INVOCATION_VERSION,
+            "artifact_id": ARTIFACT,
+            "entry_id": "note_effort",
+            "source_digest": setup.body_digest,
+            "slots": { "record": INSIDE },
+            "observed": { INSIDE: { "effort": "obs:0" } },
+            "idempotency_key": "facet:revoked:no",
+            "alpha_install_guard": refreshed,
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(refused["status"], "rejected", "{refused:#}");
+    assert_eq!(
+        refused["error"]["code"], "alpha_guard_disabled",
+        "{refused:#}"
+    );
+    assert_eq!(
+        alpha_guard_keyed_writes(&setup.db, "facet:revoked:no").await,
+        0
+    );
+}
+
+#[tokio::test]
+async fn facet_set_legacy_string_install_keeps_legacy_refusal() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
+    // An ordinary facet.set entry under a legacy string-only install (no
+    // object bounds) keeps the historical scope refusal exactly — the
+    // generic consent path never sees it.
+    let body = html_interaction_source(&artifact_source("Orders"));
+    let (db, registry, body_digest, _lock) =
+        fixture_with_source(body.clone(), "native.html.v1").await;
+    alpha_guard_grants(&db, ALPHA_GUARD_ACCOUNT).await;
+    let alice = Caller::authenticated(ALPHA_GUARD_ACCOUNT);
+    let (verified, source_revision, digest, declaration_digest) = alpha_guard_verified_install(
+        &db,
+        &registry,
+        ALPHA_GUARD_ACCOUNT,
+        ALPHA_GUARD_PACKAGE_A,
+        &body,
+        alpha_guard_declaration(),
+    )
+    .await;
+    let guard = alpha_guard_json(
+        ALPHA_GUARD_PACKAGE_A,
+        &verified,
+        &source_revision,
+        &digest,
+        &declaration_digest,
+    );
+    let refused = call_as(
+        &registry,
+        &db,
+        alice,
+        "invoke_artifact_interaction",
+        json!({
+            "version": INVOCATION_VERSION,
+            "artifact_id": ARTIFACT,
+            "entry_id": "note_effort",
+            "source_digest": body_digest,
+            "slots": { "record": INSIDE },
+            "observed": { INSIDE: { "effort": "obs:0" } },
+            "idempotency_key": "facet:legacy:no",
+            "alpha_install_guard": guard,
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(refused["status"], "rejected", "{refused:#}");
+    assert_eq!(
+        refused["error"]["code"], "alpha_guard_facet_unconsented",
+        "{refused:#}"
+    );
+    assert_eq!(alpha_guard_keyed_writes(&db, "facet:legacy:no").await, 0);
+}
+
+// ---------------------------------------------------------------------------
+// b9fb9fd family1 public comment activation (three-file packet, base 4598).
+//
+// Real registry + genuine commands only; no fake receipts. Synthetic
+// corruption rows are explicitly labeled and never seed successful receipts.
+// ---------------------------------------------------------------------------
+
+fn comment_public_mdx_source() -> String {
+    r#"export const nativeArtifact = {
+  schema: "native.mdx.artifact.v2",
+  inputs: {
+    orders: { envelope: "native.collection-envelope.v1", required: true, expose_to_root: true }
+  },
+  module_inputs: {},
+  capability_requests: [
+    { capability: "input.read", scope: { port: "orders" } }
+  ],
+  interactions: [
+    { id: "post_root", label: "Post root", effect: "comment.create",
+      slots: { bearer: { domain: { kind: "bound_input", port: "orders" } } },
+      comment: { position: "root", body: { input: "text", max_bytes: 100 } } },
+    { id: "post_reply", label: "Post reply", effect: "comment.create",
+      slots: { bearer: { domain: { kind: "bound_input", port: "orders" } } },
+      comment: { position: "reply", body: { input: "text", max_bytes: 100 } } }
+  ]
+}
+
+<Metric label="Total" value={1} />
+"#
+    .into()
+}
+
+fn comment_public_need_sql() -> String {
+    "SELECT id FROM records WHERE deleted_at IS NULL AND ((type='Document' AND kind='note') OR (type='Annotation' AND kind='comment')) ORDER BY id ASC LIMIT 200".into()
+}
+
+fn comment_public_declaration() -> Value {
+    json!({
+        "needs": [
+            "attention.query.v1",
+            {"need": "sql.snapshot.v1", "key": "thread.items", "label": "Thread", "sql": comment_public_need_sql()}
+        ],
+        "effects": [{
+            "effect": "comment.create.v1",
+            "positions": ["root", "reply"],
+            "max_body_bytes": 100,
+            "target": {"need": "thread.items"}
+        }]
+    })
+}
+
+struct CommentPublicSetup {
+    db: Db,
+    registry: ToolRegistry,
+    body_digest: String,
+    guard: Value,
+    alice: Caller,
+    _lock: tokio::sync::OwnedMutexGuard<()>,
+}
+
+async fn comment_public_setup() -> CommentPublicSetup {
+    let lock = Arc::clone(integration_guard()).lock_owned().await;
+    let db = create_database(":memory:").await.unwrap();
+    let mut registry = ToolRegistry::new();
+    register_surface_tools(&mut registry).unwrap();
+    let mdx = comment_public_mdx_source();
+    let html = html_interaction_source(&mdx);
+    let created = call(
+        &registry,
+        &db,
+        "create_record",
+        json!({
+            "id": ARTIFACT, "type": "Document", "kind": "artifact", "name": "Comment thread",
+            "body": html, "facets": { "runtime": "native.html.v1" },
+            "reason": "Declare public comment entries against a bound Collection."
+        }),
+    )
+    .await;
+    assert!(created.get("error").is_none(), "{created:#}");
+    call(
+        &registry,
+        &db,
+        "create_record",
+        json!({ "id": COLLECTION, "type": "Collection", "kind": "folder", "name": "Threads",
+                "persistence": "enduring", "reason": "Genuine folder filing home." }),
+    )
+    .await;
+    call(
+        &registry,
+        &db,
+        "create_record",
+        json!({ "id": INSIDE, "type": "Document", "kind": "note", "name": "Thread root",
+                "home_id": COLLECTION, "reason": "Note bearer inside the folder home." }),
+    )
+    .await;
+    let thread_query = json!({
+        "v": "0.2",
+        "query": { "steps": [{
+            "step": "filter",
+            "kinds": ["note", "comment"],
+            "home_id": COLLECTION,
+        }]},
+    })
+    .to_string();
+    call(
+        &registry,
+        &db,
+        "create_record",
+        json!({ "id": REFERENCE_COLLECTION, "type": "Collection", "kind": "query",
+                "name": "Threads", "home_id": COLLECTION,
+                "facets": { "query": thread_query },
+                "reason": "Separate binding scope over the folder home." }),
+    )
+    .await;
+    let bound = call(
+        &registry,
+        &db,
+        "manage_artifact_inputs",
+        json!({ "action": "bind", "artifact_id": ARTIFACT, "port_name": "orders",
+                "collection_id": REFERENCE_COLLECTION }),
+    )
+    .await;
+    assert_eq!(bound["status"], "bound", "{bound:#}");
+    grant_input_read(&registry, &db).await;
+    // Explicitly labeled identity seed (test setup only, following the
+    // private kernel fixture): the canonical portable person/account binding
+    // the comment kernel requires (lifecycle3083). Seeds no receipts.
+    let write_pool = crate::common::fixture_write_pool(&db).await;
+    sqlx::query(
+        "INSERT INTO records (id,type,kind,name,home_id,policy_anchor_id,persistence) \
+         VALUES (?,'Entity','person','Comment viewer',?,?,'enduring')",
+    )
+    .bind(COMMENT_PERSON)
+    .bind(UNFILED_RECORD_ID)
+    .bind(ROOT_RECORD_ID)
+    .execute(&write_pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO bindings (record_id,system,identifier,is_canonical) VALUES (?,'account',?,1)",
+    )
+    .bind(COMMENT_PERSON)
+    .bind(ALPHA_GUARD_ACCOUNT)
+    .execute(&write_pool)
+    .await
+    .unwrap();
+    for (id, edit) in [
+        (ARTIFACT, false),
+        (COLLECTION, true),
+        (REFERENCE_COLLECTION, false),
+        (INSIDE, true),
+    ] {
+        let mut allows = vec![AllowEntry::account(ALPHA_GUARD_ACCOUNT, Capability::View)];
+        if edit {
+            allows.push(AllowEntry::account(ALPHA_GUARD_ACCOUNT, Capability::Edit));
+        }
+        replace_explicit_policy(&db, "test:policy", id, allows)
+            .await
+            .unwrap();
+    }
+    let declaration = comment_public_declaration();
+    let (verified, source_revision, digest, declaration_digest) = alpha_guard_verified_install(
+        &db,
+        &registry,
+        ALPHA_GUARD_ACCOUNT,
+        ALPHA_GUARD_PACKAGE_A,
+        &html,
+        declaration,
+    )
+    .await;
+    let guard = alpha_guard_json(
+        ALPHA_GUARD_PACKAGE_A,
+        &verified,
+        &source_revision,
+        &digest,
+        &declaration_digest,
+    );
+    let alice = Caller::authenticated(ALPHA_GUARD_ACCOUNT);
+    let body_digest = digest_of(&html);
+    CommentPublicSetup {
+        db,
+        registry,
+        body_digest,
+        guard,
+        alice,
+        _lock: lock,
+    }
+}
+
+async fn comment_count(db: &Db) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM records WHERE type='Annotation' AND kind='comment'")
+        .fetch_one(db.pool())
+        .await
+        .unwrap()
+}
+
+/// Pins the specific outer Sqlx Database error for malformed stored JSON
+/// (SQLite code 1) without masking it into a generic refusal. Returns the
+/// message so old and absent keys assert the identical specific error.
+fn malformed_json_message(err: &native_ce::Error) -> &str {
+    match err {
+        native_ce::Error::Sqlx(sqlx::Error::Database(db)) => {
+            assert_eq!(db.code().as_deref(), Some("1"), "{err:?}");
+            assert!(db.message().contains("malformed JSON"), "{err:?}");
+            db.message()
+        }
+        other => panic!("expected outer Sqlx Database error, got {other:?}"),
+    }
+}
+
+/// Rows the registry wrapper can find for one operation: proves genuine
+/// invoke history exists instead of assuming a commit leaves it.
+async fn invoke_attestation_rows(db: &Db) -> i64 {
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM provenance_action_attestations WHERE operation='invoke_artifact_interaction'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap()
+}
+
+/// Minimal generic seed source: one `record.create` entry with a
+/// source-supported literal destination on the granted real folder. Seeds
+/// genuine `invoke_artifact_interaction` history under a chosen key with no
+/// bindings or grants of its own.
+fn comment_history_seed_source() -> String {
+    format!(
+        r#"export const nativeArtifact = {{
+  schema: "native.mdx.artifact.v2",
+  inputs: {{}},
+  module_inputs: {{}},
+  capability_requests: [],
+  interactions: [
+    {{ id: "seed_note", label: "Seed", effect: "record.create",
+      create: {{ destination: {{ from: "literal", record_id: "{COLLECTION}" }}, shape: {{
+        type: {{ source: {{ from: "literal", value: "Document" }}, domain: {{ kind: "enum", values: ["Document"] }} }},
+        kind: {{ source: {{ from: "literal", value: "note" }}, domain: {{ kind: "enum", values: ["note"] }} }},
+        fields: {{ name: {{ label: "Title", source: {{ from: "input", input: "title" }}, domain: {{ kind: "string", min_length: 1, max_length: 80 }} }} }},
+        facets: {{}}
+      }} }} }}
+  ]
+}}
+
+<Metric label="Seed" value={{1}} />
+"#
+    )
+}
+
+fn assert_minimal_comment_receipt(result: &Value) {
+    assert!(result.get("action_attestation_ids").is_none(), "{result:#}");
+    assert!(result.get("act").is_none(), "{result:#}");
+    assert!(result.get("refresh").is_none(), "{result:#}");
+    assert!(result.get("account").is_none(), "{result:#}");
+    let text = result.to_string();
+    assert!(!text.contains("\"seq\""), "{result:#}");
+}
+
+#[tokio::test]
+async fn comment_public_guarded_root_and_reply_with_minimal_receipts() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
+    let setup = comment_public_setup().await;
+    let rendered = call_as(
+        &setup.registry,
+        &setup.db,
+        setup.alice.clone(),
+        "render_artifact",
+        json!({"id": ARTIFACT}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(rendered["status"], "rendered", "{rendered:#}");
+    let supported = rendered["plan"]["interaction_availability"]["supported_entries"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(supported.iter().any(|e| e == "post_root"), "{rendered:#}");
+    assert!(supported.iter().any(|e| e == "post_reply"), "{rendered:#}");
+    let token = rendered["plan"]["observed"][INSIDE]["comment_target"]
+        .as_str()
+        .expect("real render mints a comment target token")
+        .to_owned();
+    assert!(token.starts_with("ct:"), "{rendered:#}");
+    let base = json!({
+        "version": INVOCATION_VERSION,
+        "artifact_id": ARTIFACT,
+        "entry_id": "post_root",
+        "source_digest": setup.body_digest,
+        "slots": { "bearer": INSIDE },
+        "values": { "text": "First root" },
+        "observed": { INSIDE: { "comment_target": token } },
+        "idempotency_key": "comment:root:one",
+        "gesture": "submit",
+        "alpha_install_guard": setup.guard,
+    });
+    let first = call_as(
+        &setup.registry,
+        &setup.db,
+        setup.alice.clone(),
+        "invoke_artifact_interaction",
+        base.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(first["status"], "committed", "{first:#}");
+    assert_eq!(first["changes"][0]["key"], "comment", "{first:#}");
+    assert!(first["changes"][0]["before"].is_null(), "{first:#}");
+    assert_eq!(first["changes"][0]["after"]["created"], true, "{first:#}");
+    assert_eq!(
+        first["changes"][0]["after"]["bearer_id"], INSIDE,
+        "{first:#}"
+    );
+    assert_eq!(
+        first["changes"][0]["after"]["position"], "root",
+        "{first:#}"
+    );
+    assert_minimal_comment_receipt(&first);
+    let root_id = first["changes"][0]["record_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(comment_count(&setup.db).await, 1);
+    let replay = call_as(
+        &setup.registry,
+        &setup.db,
+        setup.alice.clone(),
+        "invoke_artifact_interaction",
+        base.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(replay["status"], "committed", "{replay:#}");
+    assert_eq!(replay["changes"][0]["record_id"], root_id, "{replay:#}");
+    assert_minimal_comment_receipt(&replay);
+    assert_eq!(
+        comment_count(&setup.db).await,
+        1,
+        "replay must not duplicate"
+    );
+    let mut omitted = base.clone();
+    omitted.as_object_mut().unwrap().remove("observed");
+    let omitted_replay = call_as(
+        &setup.registry,
+        &setup.db,
+        setup.alice.clone(),
+        "invoke_artifact_interaction",
+        omitted,
+    )
+    .await
+    .unwrap();
+    assert_eq!(omitted_replay["status"], "committed", "{omitted_replay:#}");
+    assert_eq!(
+        omitted_replay["changes"][0]["record_id"], root_id,
+        "{omitted_replay:#}"
+    );
+    assert_minimal_comment_receipt(&omitted_replay);
+    assert_eq!(comment_count(&setup.db).await, 1);
+    let mut changed = base.clone();
+    changed["values"]["text"] = json!("A different intent");
+    let changed_result = call_as(
+        &setup.registry,
+        &setup.db,
+        setup.alice.clone(),
+        "invoke_artifact_interaction",
+        changed,
+    )
+    .await
+    .unwrap();
+    assert_eq!(changed_result["status"], "rejected", "{changed_result:#}");
+    assert_eq!(
+        changed_result["error"]["code"], "idempotency_conflict",
+        "{changed_result:#}"
+    );
+    assert_minimal_comment_receipt(&changed_result);
+    assert_eq!(comment_count(&setup.db).await, 1);
+    let rerendered = call_as(
+        &setup.registry,
+        &setup.db,
+        setup.alice.clone(),
+        "render_artifact",
+        json!({"id": ARTIFACT}),
+    )
+    .await
+    .unwrap();
+    let reply_token = rerendered["plan"]["observed"][root_id.as_str()]["comment_target"]
+        .as_str()
+        .expect("flat reply bearer gets a real render token")
+        .to_owned();
+    let reply = call_as(
+        &setup.registry,
+        &setup.db,
+        setup.alice.clone(),
+        "invoke_artifact_interaction",
+        json!({
+            "version": INVOCATION_VERSION,
+            "artifact_id": ARTIFACT,
+            "entry_id": "post_reply",
+            "source_digest": setup.body_digest,
+            "slots": { "bearer": root_id.clone() },
+            "values": { "text": "Flat reply" },
+            "observed": { root_id: { "comment_target": reply_token } },
+            "idempotency_key": "comment:reply:one",
+            "gesture": "submit",
+            "alpha_install_guard": setup.guard,
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(reply["status"], "committed", "{reply:#}");
+    assert_eq!(
+        reply["changes"][0]["after"]["position"], "reply",
+        "{reply:#}"
+    );
+    assert_minimal_comment_receipt(&reply);
+    assert_eq!(comment_count(&setup.db).await, 2);
+    let reply_id = reply["changes"][0]["record_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let rerendered2 = call_as(
+        &setup.registry,
+        &setup.db,
+        setup.alice.clone(),
+        "render_artifact",
+        json!({"id": ARTIFACT}),
+    )
+    .await
+    .unwrap();
+    let nested_token = rerendered2["plan"]["observed"][reply_id.as_str()]["comment_target"]
+        .as_str()
+        .unwrap_or("")
+        .to_owned();
+    if !nested_token.is_empty() {
+        let nested = call_as(
+            &setup.registry,
+            &setup.db,
+            setup.alice.clone(),
+            "invoke_artifact_interaction",
+            json!({
+                "version": INVOCATION_VERSION,
+                "artifact_id": ARTIFACT,
+                "entry_id": "post_reply",
+                "source_digest": setup.body_digest,
+                "slots": { "bearer": reply_id.clone() },
+                "values": { "text": "Reply to reply" },
+                "observed": { reply_id: { "comment_target": nested_token } },
+                "idempotency_key": "comment:reply:nested",
+                "gesture": "submit",
+                "alpha_install_guard": setup.guard,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(nested["status"], "rejected", "{nested:#}");
+        assert_minimal_comment_receipt(&nested);
+        assert_eq!(
+            comment_count(&setup.db).await,
+            2,
+            "reply-to-flat-reply writes nothing"
+        );
+    }
+}
+
+#[tokio::test]
+async fn comment_public_post_gate_conflict_is_honest_without_leak() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
+    let setup = comment_public_setup().await;
+    let rendered = call_as(
+        &setup.registry,
+        &setup.db,
+        setup.alice.clone(),
+        "render_artifact",
+        json!({"id": ARTIFACT}),
+    )
+    .await
+    .unwrap();
+    let token = rendered["plan"]["observed"][INSIDE]["comment_target"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let base = json!({
+        "version": INVOCATION_VERSION,
+        "artifact_id": ARTIFACT,
+        "entry_id": "post_root",
+        "source_digest": setup.body_digest,
+        "slots": { "bearer": INSIDE },
+        "values": { "text": "Conflict probe" },
+        "observed": { INSIDE: { "comment_target": token } },
+        "idempotency_key": "comment:conflict:one",
+        "gesture": "submit",
+        "alpha_install_guard": setup.guard,
+    });
+    let first = call_as(
+        &setup.registry,
+        &setup.db,
+        setup.alice.clone(),
+        "invoke_artifact_interaction",
+        base.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(first["status"], "committed", "{first:#}");
+    let mut omitted_same_key = base.clone();
+    omitted_same_key.as_object_mut().unwrap().remove("observed");
+    omitted_same_key["values"]["text"] = json!("Changed under same key");
+    let same_key = call_as(
+        &setup.registry,
+        &setup.db,
+        setup.alice.clone(),
+        "invoke_artifact_interaction",
+        omitted_same_key,
+    )
+    .await
+    .unwrap();
+    assert_eq!(same_key["status"], "rejected", "{same_key:#}");
+    assert_eq!(
+        same_key["error"]["code"], "idempotency_conflict",
+        "{same_key:#}"
+    );
+    assert_minimal_comment_receipt(&same_key);
+    let mut absent_key = base.clone();
+    absent_key.as_object_mut().unwrap().remove("observed");
+    absent_key["values"]["text"] = json!("Fresh key without CAS");
+    absent_key["idempotency_key"] = json!("comment:conflict:absent");
+    let absent = call_as(
+        &setup.registry,
+        &setup.db,
+        setup.alice.clone(),
+        "invoke_artifact_interaction",
+        absent_key,
+    )
+    .await
+    .unwrap();
+    assert_eq!(absent["status"], "rejected", "{absent:#}");
+    assert_eq!(
+        absent["error"]["code"], "invalid_precondition",
+        "{absent:#}"
+    );
+    assert_minimal_comment_receipt(&absent);
+    assert_ne!(
+        same_key["error"]["code"], absent["error"]["code"],
+        "post-gate stages pin honestly: legacy same-key conflicts while absent-key needs CAS"
+    );
+}
+
+#[tokio::test]
+async fn comment_public_parent_edit_new_key_cas_conflict_is_minimal() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
+    // Genuine public parent edit, then a stale NEW key: the kernel's
+    // post-gate replay finds nothing, and the fresh CAS recomputation
+    // conflicts with the current opaque ct and the actual parent event
+    // UUID — a minimal receipt with zero added comments. The edited parent
+    // stays delivered and in-cohort throughout.
+    let setup = comment_public_setup().await;
+    let rendered = call_as(
+        &setup.registry,
+        &setup.db,
+        setup.alice.clone(),
+        "render_artifact",
+        json!({"id": ARTIFACT}),
+    )
+    .await
+    .unwrap();
+    let token = rendered["plan"]["observed"][INSIDE]["comment_target"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let first = call_as(
+        &setup.registry,
+        &setup.db,
+        setup.alice.clone(),
+        "invoke_artifact_interaction",
+        json!({
+            "version": INVOCATION_VERSION,
+            "artifact_id": ARTIFACT,
+            "entry_id": "post_root",
+            "source_digest": setup.body_digest,
+            "slots": { "bearer": INSIDE },
+            "values": { "text": "CAS probe root" },
+            "observed": { INSIDE: { "comment_target": token } },
+            "idempotency_key": "comment:cas:one",
+            "gesture": "submit",
+            "alpha_install_guard": setup.guard,
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(first["status"], "committed", "{first:#}");
+    assert_eq!(comment_count(&setup.db).await, 1);
+    let edited = call_as(
+        &setup.registry,
+        &setup.db,
+        setup.alice.clone(),
+        "update_record",
+        json!({
+            "id": INSIDE,
+            "name": "Thread root, edited",
+            "reason": "Genuine public parent edit moving the thread CAS.",
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(edited.get("error").is_none(), "{edited:#}");
+    let rerendered = call_as(
+        &setup.registry,
+        &setup.db,
+        setup.alice.clone(),
+        "render_artifact",
+        json!({"id": ARTIFACT}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(rerendered["status"], "rendered", "{rerendered:#}");
+    let cohort = rerendered["plan"]["interaction_availability"]["records_by_port"]["orders"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        cohort.iter().any(|record| record == INSIDE),
+        "edited parent stays delivered and in-cohort: {rerendered:#}"
+    );
+    let stale = call_as(
+        &setup.registry,
+        &setup.db,
+        setup.alice.clone(),
+        "invoke_artifact_interaction",
+        json!({
+            "version": INVOCATION_VERSION,
+            "artifact_id": ARTIFACT,
+            "entry_id": "post_root",
+            "source_digest": setup.body_digest,
+            "slots": { "bearer": INSIDE },
+            "values": { "text": "Stale CAS new key" },
+            "observed": { INSIDE: { "comment_target": token } },
+            "idempotency_key": "comment:cas:stale-new",
+            "gesture": "submit",
+            "alpha_install_guard": setup.guard,
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(stale["status"], "conflict", "{stale:#}");
+    assert_eq!(stale["error"]["code"], "comment_conflict", "{stale:#}");
+    let current_version = stale["current_version"].as_str().unwrap_or("");
+    assert!(
+        current_version.starts_with("ct:"),
+        "conflict carries the current opaque ct: {stale:#}"
+    );
+    // Actual identity, not format alone: the conflict version equals the
+    // freshly rerendered host-minted token for the edited parent.
+    let fresh_token = rerendered["plan"]["observed"][INSIDE]["comment_target"]
+        .as_str()
+        .unwrap_or("");
+    assert_eq!(
+        current_version, fresh_token,
+        "conflict version is the actual current host-minted token: {stale:#}"
+    );
+    let conflicting_event_id = stale["conflicting_event_id"].as_str().unwrap_or("");
+    assert_eq!(
+        conflicting_event_id.len(),
+        36,
+        "conflict carries the actual parent event UUID: {stale:#}"
+    );
+    // Actual identity per the state helper's latest-event selection (ids, no
+    // seq outward): the fresh parent content event after the genuine update.
+    let latest_parent_event: String = sqlx::query_scalar(
+        "SELECT id FROM content_events WHERE record_id=? ORDER BY seq DESC LIMIT 1",
+    )
+    .bind(INSIDE)
+    .fetch_one(setup.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        conflicting_event_id, latest_parent_event,
+        "conflict names the actual latest parent event: {stale:#}"
+    );
+    assert_minimal_comment_receipt(&stale);
+    assert_eq!(comment_count(&setup.db).await, 1);
+}
+
+#[tokio::test]
+async fn comment_public_generic_preservation_and_create_control() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
+    let (db, registry, digest, _guard) = create_fixture().await;
+    let invocation = json!({
+        "version": INVOCATION_VERSION,
+        "artifact_id": ARTIFACT,
+        "entry_id": "create_task",
+        "source_digest": digest,
+        "values": { "title": "Preserve me", "triage": "ready" },
+        "idempotency_key": "generic:preserve:one",
+        "gesture": "submit"
+    });
+    let first = call(
+        &registry,
+        &db,
+        "invoke_artifact_interaction",
+        invocation.clone(),
+    )
+    .await;
+    assert_eq!(first["status"], "committed", "{first:#}");
+    let created_id = first["refresh"]["record"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(
+        first.get("action_attestation_ids").is_none() || first["action_attestation_ids"].is_array()
+    );
+    let control = call(
+        &registry,
+        &db,
+        "create_record",
+        json!({ "type": "Document", "kind": "note", "name": "Control",
+                "reason": "Control proves the generic wrapper still attaches ids." }),
+    )
+    .await;
+    assert!(
+        control.get("action_attestation_ids").is_some()
+            || control.get("action_attestation_id").is_some(),
+        "create_record control still attaches ids: {control:#}"
+    );
+    let comment_source = comment_artifact_source("post");
+    call(
+        &registry,
+        &db,
+        "update_record",
+        json!({
+            "id": ARTIFACT,
+            "body": format!("{}\n", comment_source),
+            "if_body_digest": digest,
+            "reason": "Edit source to Comment after generic commit."
+        }),
+    )
+    .await;
+    let write_pool = crate::common::fixture_write_pool(&db).await;
+    sqlx::query("DELETE FROM artifact_source_attestations WHERE artifact_id=?")
+        .bind(ARTIFACT)
+        .execute(&write_pool)
+        .await
+        .unwrap();
+    let replay = call(
+        &registry,
+        &db,
+        "invoke_artifact_interaction",
+        invocation.clone(),
+    )
+    .await;
+    assert_eq!(replay["status"], "committed", "{replay:#}");
+    assert_eq!(replay["refresh"]["record"]["id"], created_id, "{replay:#}");
+    let mut changed = invocation.clone();
+    changed["values"]["title"] = json!("A different intent");
+    let reused = call_as(
+        &registry,
+        &db,
+        Caller::local(),
+        "invoke_artifact_interaction",
+        changed,
+    )
+    .await
+    .expect_err("the tool idempotency boundary rejects changed action input");
+    assert!(reused.to_string().contains("conflicting action input"));
+}
+
+#[tokio::test]
+async fn comment_public_pregate_equality_no_guard_revoked_and_corrupt() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
+    // Pre-gate no-history pins with GENUINE registry history: a separate
+    // generic literal-destination artifact commits under the SAME caller and
+    // old key first, and the provenance row is asserted (never assumed).
+    // Missing guard, genuine Edit revocation (View kept), wrong-source
+    // digest, and real storage corruption then refuse old and absent keys
+    // equivalently with zero added comments and minimal receipts. All
+    // successful creations are genuine registry/kernel writes.
+    const OLD_KEY: &str = "comment:pregate:one";
+    let setup = comment_public_setup().await;
+    let seed_source = comment_history_seed_source();
+    let seed_created = call(
+        &setup.registry,
+        &setup.db,
+        "create_record",
+        json!({
+            "id": COMMENT_SEED_ARTIFACT, "type": "Document", "kind": "artifact",
+            "name": "History seed", "body": seed_source,
+            "facets": { "runtime": "native.mdx.v2" },
+            "reason": "Separate generic artifact seeding genuine invoke history under the old key.",
+        }),
+    )
+    .await;
+    assert!(seed_created.get("error").is_none(), "{seed_created:#}");
+    replace_explicit_policy(
+        &setup.db,
+        "test:policy",
+        COMMENT_SEED_ARTIFACT,
+        vec![AllowEntry::account(ALPHA_GUARD_ACCOUNT, Capability::View)],
+    )
+    .await
+    .unwrap();
+    let history_before = invoke_attestation_rows(&setup.db).await;
+    let seed = call_as(
+        &setup.registry,
+        &setup.db,
+        setup.alice.clone(),
+        "invoke_artifact_interaction",
+        json!({
+            "version": INVOCATION_VERSION,
+            "artifact_id": COMMENT_SEED_ARTIFACT,
+            "entry_id": "seed_note",
+            "source_digest": digest_of(&seed_source),
+            "values": { "title": "History seed" },
+            "idempotency_key": OLD_KEY,
+            "gesture": "submit",
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(seed["status"], "committed", "{seed:#}");
+    assert!(
+        invoke_attestation_rows(&setup.db).await > history_before,
+        "the old key must genuinely own registry history before the probes"
+    );
+    let rendered = call_as(
+        &setup.registry,
+        &setup.db,
+        setup.alice.clone(),
+        "render_artifact",
+        json!({"id": ARTIFACT}),
+    )
+    .await
+    .unwrap();
+    let token = rendered["plan"]["observed"][INSIDE]["comment_target"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    // (a) Missing guard: the composer refuses before any write, identically.
+    let no_guard_old = json!({
+        "version": INVOCATION_VERSION,
+        "artifact_id": ARTIFACT,
+        "entry_id": "post_root",
+        "source_digest": setup.body_digest,
+        "slots": { "bearer": INSIDE },
+        "values": { "text": "No guard old key" },
+        "observed": { INSIDE: { "comment_target": token } },
+        "idempotency_key": OLD_KEY,
+        "gesture": "submit"
+    });
+    let mut no_guard_new = no_guard_old.clone();
+    no_guard_new["idempotency_key"] = json!("comment:pregate:absent");
+    let old = call_as(
+        &setup.registry,
+        &setup.db,
+        setup.alice.clone(),
+        "invoke_artifact_interaction",
+        no_guard_old,
+    )
+    .await
+    .unwrap();
+    let fresh = call_as(
+        &setup.registry,
+        &setup.db,
+        setup.alice.clone(),
+        "invoke_artifact_interaction",
+        no_guard_new,
+    )
+    .await
+    .unwrap();
+    assert_eq!(old["status"], "rejected", "{old:#}");
+    assert_eq!(fresh["status"], "rejected", "{fresh:#}");
+    assert_eq!(old["error"]["code"], "alpha_guard_required", "{old:#}");
+    assert_eq!(
+        old["error"]["code"], fresh["error"]["code"],
+        "{old:#} vs {fresh:#}"
+    );
+    assert_minimal_comment_receipt(&old);
+    assert_minimal_comment_receipt(&fresh);
+    assert_eq!(comment_count(&setup.db).await, 0);
+    // (b) Genuine mounted-target Edit revocation with View kept: the kernel
+    // refuses inside its write transaction, identically for both keys.
+    replace_explicit_policy(
+        &setup.db,
+        "test:policy",
+        INSIDE,
+        vec![AllowEntry::account(ALPHA_GUARD_ACCOUNT, Capability::View)],
+    )
+    .await
+    .unwrap();
+    let revoked_old = json!({
+        "version": INVOCATION_VERSION,
+        "artifact_id": ARTIFACT,
+        "entry_id": "post_root",
+        "source_digest": setup.body_digest,
+        "slots": { "bearer": INSIDE },
+        "values": { "text": "Revoked old key" },
+        "observed": { INSIDE: { "comment_target": token } },
+        "idempotency_key": OLD_KEY,
+        "gesture": "submit",
+        "alpha_install_guard": setup.guard,
+    });
+    let mut revoked_new = revoked_old.clone();
+    revoked_new["idempotency_key"] = json!("comment:revoke:absent");
+    let revoked = call_as(
+        &setup.registry,
+        &setup.db,
+        setup.alice.clone(),
+        "invoke_artifact_interaction",
+        revoked_old,
+    )
+    .await
+    .unwrap();
+    let revoked_absent = call_as(
+        &setup.registry,
+        &setup.db,
+        setup.alice.clone(),
+        "invoke_artifact_interaction",
+        revoked_new,
+    )
+    .await
+    .unwrap();
+    assert_eq!(revoked["status"], "rejected", "{revoked:#}");
+    assert_eq!(revoked["error"]["code"], "permission_denied", "{revoked:#}");
+    assert_eq!(
+        revoked["error"]["code"], revoked_absent["error"]["code"],
+        "{revoked:#} vs {revoked_absent:#}"
+    );
+    assert_minimal_comment_receipt(&revoked);
+    assert_minimal_comment_receipt(&revoked_absent);
+    assert_eq!(comment_count(&setup.db).await, 0);
+    replace_explicit_policy(
+        &setup.db,
+        "test:policy",
+        INSIDE,
+        vec![
+            AllowEntry::account(ALPHA_GUARD_ACCOUNT, Capability::View),
+            AllowEntry::account(ALPHA_GUARD_ACCOUNT, Capability::Edit),
+        ],
+    )
+    .await
+    .unwrap();
+    // (c) Wrong-source digest: Unresolved, stale before any write, identical.
+    let wrong_old = json!({
+        "version": INVOCATION_VERSION,
+        "artifact_id": ARTIFACT,
+        "entry_id": "post_root",
+        "source_digest": "0".repeat(64),
+        "slots": { "bearer": INSIDE },
+        "values": { "text": "Wrong source old" },
+        "observed": { INSIDE: { "comment_target": token } },
+        "idempotency_key": OLD_KEY,
+        "gesture": "submit",
+        "alpha_install_guard": setup.guard,
+    });
+    let mut wrong_new = wrong_old.clone();
+    wrong_new["idempotency_key"] = json!("comment:wrong:absent");
+    let wrong = call_as(
+        &setup.registry,
+        &setup.db,
+        setup.alice.clone(),
+        "invoke_artifact_interaction",
+        wrong_old,
+    )
+    .await
+    .unwrap();
+    let wrong_absent = call_as(
+        &setup.registry,
+        &setup.db,
+        setup.alice.clone(),
+        "invoke_artifact_interaction",
+        wrong_new,
+    )
+    .await
+    .unwrap();
+    assert_eq!(wrong["status"], "rejected", "{wrong:#}");
+    assert_eq!(wrong["error"]["code"], "stale_source_digest", "{wrong:#}");
+    assert_eq!(
+        wrong["error"]["code"], wrong_absent["error"]["code"],
+        "{wrong:#} vs {wrong_absent:#}"
+    );
+    assert_minimal_comment_receipt(&wrong);
+    assert_minimal_comment_receipt(&wrong_absent);
+    assert_eq!(comment_count(&setup.db).await, 0);
+    // (d) Explicitly labeled negative STORAGE corruption (test-only): the
+    // artifact's actual body-bearing content_events.payload is set to SQL
+    // NULL and then to syntactically invalid JSON through the held write
+    // pool, dropping only the update guard around the edits and restoring
+    // guard bytes afterwards. The classifier's json_valid boundary reads
+    // both as absent (Unresolved) and resolution diagnoses
+    // invalid_artifact_body — never a commit, never attestation enrichment.
+    let write_pool = crate::common::fixture_write_pool(&setup.db).await;
+    let mut conn = write_pool.acquire().await.unwrap();
+    let (event_id, original): (String, String) = sqlx::query_as(
+        "SELECT id, payload FROM content_events WHERE record_id=? AND json_type(payload,'$.body') IS NOT NULL ORDER BY seq DESC LIMIT 1",
+    )
+    .bind(ARTIFACT)
+    .fetch_one(&mut *conn)
+    .await
+    .unwrap();
+    let update_guard: String = sqlx::query_scalar(
+        "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='content_events_no_update'",
+    )
+    .fetch_one(&mut *conn)
+    .await
+    .unwrap();
+    sqlx::query("DROP TRIGGER content_events_no_update")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    // SQL NULL stays a typed diagnostic; syntactically invalid stored JSON
+    // raises the actual outer Sqlx Database error (code 1, malformed JSON)
+    // through ordinary resolution — pinned specifically for BOTH keys, never
+    // masked into a generic refusal, with zero writes either way.
+    for (label, set, typed) in [
+        (
+            "null-payload",
+            "UPDATE content_events SET payload = NULL WHERE id = ?",
+            true,
+        ),
+        (
+            "invalid-payload",
+            "UPDATE content_events SET payload = '{corrupt' WHERE id = ?",
+            false,
+        ),
+    ] {
+        sqlx::query(set)
+            .bind(&event_id)
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        let corrupt_old = json!({
+            "version": INVOCATION_VERSION,
+            "artifact_id": ARTIFACT,
+            "entry_id": "post_root",
+            "source_digest": setup.body_digest,
+            "slots": { "bearer": INSIDE },
+            "values": { "text": "Corrupt old key" },
+            "observed": { INSIDE: { "comment_target": token } },
+            "idempotency_key": OLD_KEY,
+            "gesture": "submit",
+            "alpha_install_guard": setup.guard,
+        });
+        let mut corrupt_new = corrupt_old.clone();
+        corrupt_new["idempotency_key"] = json!(format!("comment:corrupt:{label}:absent"));
+        if typed {
+            let corrupt = call_as(
+                &setup.registry,
+                &setup.db,
+                setup.alice.clone(),
+                "invoke_artifact_interaction",
+                corrupt_old,
+            )
+            .await
+            .unwrap();
+            let corrupt_absent = call_as(
+                &setup.registry,
+                &setup.db,
+                setup.alice.clone(),
+                "invoke_artifact_interaction",
+                corrupt_new,
+            )
+            .await
+            .unwrap();
+            assert_eq!(corrupt["status"], "rejected", "{label} {corrupt:#}");
+            assert_eq!(
+                corrupt["error"]["code"], "invalid_artifact_body",
+                "{label} {corrupt:#}"
+            );
+            assert_eq!(
+                corrupt["error"]["code"], corrupt_absent["error"]["code"],
+                "{label} {corrupt:#} vs {corrupt_absent:#}"
+            );
+            assert_minimal_comment_receipt(&corrupt);
+            assert_minimal_comment_receipt(&corrupt_absent);
+        } else {
+            let err_old = call_as(
+                &setup.registry,
+                &setup.db,
+                setup.alice.clone(),
+                "invoke_artifact_interaction",
+                corrupt_old,
+            )
+            .await
+            .expect_err("invalid stored JSON must surface, never mask");
+            let err_absent = call_as(
+                &setup.registry,
+                &setup.db,
+                setup.alice.clone(),
+                "invoke_artifact_interaction",
+                corrupt_new,
+            )
+            .await
+            .expect_err("invalid stored JSON must surface, never mask");
+            assert_eq!(
+                malformed_json_message(&err_old),
+                malformed_json_message(&err_absent),
+                "{label} {err_old:?} vs {err_absent:?}"
+            );
+        }
+        assert_eq!(comment_count(&setup.db).await, 0);
+    }
+    sqlx::query("UPDATE content_events SET payload = ? WHERE id = ?")
+        .bind(&original)
+        .bind(&event_id)
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    sqlx::query(&update_guard)
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    let restored: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name='content_events_no_update'",
+    )
+    .fetch_one(&mut *conn)
+    .await
+    .unwrap();
+    assert_eq!(restored, 1);
+    // Source-derived per-case value pins (not storage corruption): a null
+    // body fails envelope shape (typed invalid/invalid_invocation), while a
+    // non-string array body passes shape but lies outside the string domain
+    // (rejected/value_outside_domain from the composer).
+    for (label, values, status, code) in [
+        (
+            "null-body",
+            json!({ "text": Value::Null }),
+            "invalid",
+            "invalid_invocation",
+        ),
+        (
+            "non-string-value",
+            json!({ "text": json!([]) }),
+            "rejected",
+            "value_outside_domain",
+        ),
+    ] {
+        let attempt = call_as(
+            &setup.registry,
+            &setup.db,
+            setup.alice.clone(),
+            "invoke_artifact_interaction",
+            json!({
+                "version": INVOCATION_VERSION,
+                "artifact_id": ARTIFACT,
+                "entry_id": "post_root",
+                "source_digest": setup.body_digest,
+                "slots": { "bearer": INSIDE },
+                "values": values,
+                "observed": { INSIDE: { "comment_target": token } },
+                "idempotency_key": format!("comment:shape:{label}"),
+                "gesture": "submit",
+                "alpha_install_guard": setup.guard,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(attempt["status"], status, "{attempt:#}");
+        assert_eq!(attempt["error"]["code"], code, "{attempt:#}");
+        assert_minimal_comment_receipt(&attempt);
+    }
+    assert_eq!(
+        comment_count(&setup.db).await,
+        0,
+        "corruption refusals write nothing"
+    );
+}
+
+#[tokio::test]
+async fn comment_public_malformed_ct_old_vs_absent_key_preadmission() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
+    // Pre-admission pin (required, no-history): a malformed observed
+    // comment_target token fails envelope shape, but the host still
+    // requires artifact View and classifies the actual cited source before
+    // answering `invalid_invocation`. Actual Comment/Unresolved marks
+    // DomainOwned, so an old key and an absent key refuse identically with
+    // zero writes and a minimal receipt (no wrapper attach/Err).
+    let setup = comment_public_setup().await;
+    let rendered = call_as(
+        &setup.registry,
+        &setup.db,
+        setup.alice.clone(),
+        "render_artifact",
+        json!({"id": ARTIFACT}),
+    )
+    .await
+    .unwrap();
+    let token = rendered["plan"]["observed"][INSIDE]["comment_target"]
+        .as_str()
+        .expect("real render mints a comment target token")
+        .to_owned();
+    let valid = json!({
+        "version": INVOCATION_VERSION,
+        "artifact_id": ARTIFACT,
+        "entry_id": "post_root",
+        "source_digest": setup.body_digest,
+        "slots": { "bearer": INSIDE },
+        "values": { "text": "Malformed probe root" },
+        "observed": { INSIDE: { "comment_target": token } },
+        "idempotency_key": "comment:malformed:old",
+        "gesture": "submit",
+        "alpha_install_guard": setup.guard,
+    });
+    let history_before = invoke_attestation_rows(&setup.db).await;
+    let committed = call_as(
+        &setup.registry,
+        &setup.db,
+        setup.alice.clone(),
+        "invoke_artifact_interaction",
+        valid.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(committed["status"], "committed", "{committed:#}");
+    assert_eq!(comment_count(&setup.db).await, 1);
+    assert!(
+        invoke_attestation_rows(&setup.db).await > history_before,
+        "the old key must genuinely own registry history before the malformed probes"
+    );
+    let mut old_malformed = valid.clone();
+    old_malformed["observed"] = json!({ INSIDE: { "comment_target": "ct:dead" } });
+    let mut absent_malformed = old_malformed.clone();
+    absent_malformed["idempotency_key"] = json!("comment:malformed:absent");
+    let old = call_as(
+        &setup.registry,
+        &setup.db,
+        setup.alice.clone(),
+        "invoke_artifact_interaction",
+        old_malformed,
+    )
+    .await
+    .unwrap();
+    let absent = call_as(
+        &setup.registry,
+        &setup.db,
+        setup.alice.clone(),
+        "invoke_artifact_interaction",
+        absent_malformed,
+    )
+    .await
+    .unwrap();
+    assert_eq!(old["status"], "invalid", "{old:#}");
+    assert_eq!(absent["status"], "invalid", "{absent:#}");
+    assert_eq!(old["error"]["code"], "invalid_invocation", "{old:#}");
+    assert_eq!(
+        old["error"]["code"], absent["error"]["code"],
+        "{old:#} vs {absent:#}"
+    );
+    assert_minimal_comment_receipt(&old);
+    assert_minimal_comment_receipt(&absent);
+    assert_eq!(
+        comment_count(&setup.db).await,
+        1,
+        "pre-admission malformed-ct refusals write nothing"
+    );
+}
+
+#[tokio::test]
+async fn comment_public_verified_other_malformed_shape_stays_legacy() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
+    // Legacy control (not a no-history requirement): a malformed shape on a
+    // verified non-comment citation stays Legacy, so the existing wrapper
+    // behavior is unchanged — an old key errs history-dependently while an
+    // absent key stays typed-invalid. This pins that the refined placement
+    // did not alter the generic valid retry/Err path.
+    let (db, registry, digest, _guard) = create_fixture().await;
+    let valid = json!({
+        "version": INVOCATION_VERSION,
+        "artifact_id": ARTIFACT,
+        "entry_id": "create_task",
+        "source_digest": digest,
+        "values": { "title": "Legacy control", "triage": "ready" },
+        "idempotency_key": "generic:malformed:old",
+        "gesture": "submit"
+    });
+    let first = call(&registry, &db, "invoke_artifact_interaction", valid.clone()).await;
+    assert_eq!(first["status"], "committed", "{first:#}");
+    let mut old_malformed = valid.clone();
+    old_malformed["observed"] = json!({ INSIDE: { "triage": "bogus-token" } });
+    let mut absent_malformed = old_malformed.clone();
+    absent_malformed["idempotency_key"] = json!("generic:malformed:absent");
+    let old = call_as(
+        &registry,
+        &db,
+        Caller::local(),
+        "invoke_artifact_interaction",
+        old_malformed,
+    )
+    .await
+    .expect_err("verified-Other malformed shape stays Legacy: old key errs");
+    assert!(old.to_string().contains("conflicting action input"));
+    let absent = call(
+        &registry,
+        &db,
+        "invoke_artifact_interaction",
+        absent_malformed,
+    )
+    .await;
+    assert_eq!(absent["status"], "invalid", "{absent:#}");
+    assert_eq!(absent["error"]["code"], "invalid_invocation", "{absent:#}");
+}
+
+#[tokio::test]
+async fn comment_public_view_denied_malformed_shape_has_no_history() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
+    // Fail-closed View: a caller who cannot see the artifact gets the
+    // ordinary View failure (Err, never an Ok result the wrapper could
+    // enrich), with zero writes — before any source/history diagnosis.
+    let setup = comment_public_setup().await;
+    let denied = call_as(
+        &setup.registry,
+        &setup.db,
+        Caller::authenticated("bob-no-view"),
+        "invoke_artifact_interaction",
+        json!({
+            "version": INVOCATION_VERSION,
+            "artifact_id": ARTIFACT,
+            "entry_id": "post_root",
+            "source_digest": setup.body_digest,
+            "slots": { "bearer": INSIDE },
+            "values": { "text": "Unseen" },
+            "observed": { INSIDE: { "comment_target": "ct:dead" } },
+            "idempotency_key": "comment:view:denied",
+            "gesture": "submit",
+            "alpha_install_guard": setup.guard,
+        }),
+    )
+    .await
+    .expect_err("an unreadable artifact propagates View failure, never an Ok result");
+    assert_eq!(comment_count(&setup.db).await, 0);
+    let _ = denied;
+}
+
+/// The stored `origin` object of the event carrying one idempotency key.
+async fn stored_origin(db: &Db, key: &str) -> Value {
+    let payload: String = sqlx::query_scalar(
+        "SELECT payload FROM content_events WHERE record_id=?
+          AND json_extract(payload,'$.origin.idempotency_key')=?",
+    )
+    .bind(INSIDE)
+    .bind(key)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    serde_json::from_str::<Value>(&payload).unwrap()["origin"].clone()
+}
+
+#[tokio::test]
+async fn a_valid_effect_gesture_token_records_evidence_and_its_absence_does_not() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
+    let (db, registry, digest, _guard) = fixture().await;
+    // No token: the stored origin stays the ordinary shape.
+    let mut plain = envelope("mark_triaged", &digest, "gesture:plain");
+    plain["slots"] = json!({ "record": INSIDE });
+    plain["observed"] = observed(&registry, &db, INSIDE, "triage").await;
+    let committed = call(&registry, &db, "invoke_artifact_interaction", plain).await;
+    assert_eq!(committed["status"], "committed", "{committed:#}");
+    let origin = stored_origin(&db, "gesture:plain").await;
+    assert!(origin.get("gesture_evidence").is_none(), "{origin:#}");
+
+    // A valid token for exactly this binding records evidence, additively.
+    let issuer = native_ce::awareness::HumanInteractionTokenIssuer::random("test-host");
+    let ids = native_ce::awareness::effect_gesture_binding_ids(
+        "local",
+        ARTIFACT,
+        None,
+        None,
+        "mark_triaged",
+        &[INSIDE.to_string()],
+        "gesture:token",
+        &empty_values_digest(),
+        native_ce::awareness::EffectGestureKind::Click,
+    );
+    let token = issuer
+        .issue(
+            "local",
+            native_ce::awareness::EFFECT_GESTURE_ACTION,
+            &ids,
+            30,
+        )
+        .unwrap();
+    let caller = Caller::local().with_effect_gesture_token(
+        &issuer,
+        token,
+        native_ce::awareness::EffectGestureKind::Click,
+    );
+    let mut invocation = envelope("mark_triaged", &digest, "gesture:token");
+    invocation["slots"] = json!({ "record": INSIDE });
+    invocation["observed"] = observed(&registry, &db, INSIDE, "triage").await;
+    let committed = call_as(
+        &registry,
+        &db,
+        caller,
+        "invoke_artifact_interaction",
+        invocation,
+    )
+    .await
+    .unwrap();
+    assert_eq!(committed["status"], "committed", "{committed:#}");
+    let origin = stored_origin(&db, "gesture:token").await;
+    assert_eq!(origin["gesture_evidence"]["kind"], "click", "{origin:#}");
+    assert_eq!(
+        origin["gesture_evidence"]["verifier"], "effect_gesture.v1",
+        "{origin:#}"
+    );
+}
+
+async fn event_count(db: &Db) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM content_events")
+        .fetch_one(db.pool())
+        .await
+        .unwrap()
+}
+
+/// Mint a token for exactly this binding and attach it with `kind`. `kind` is
+/// both what the token binds and the kind the Caller reports.
+#[allow(clippy::too_many_arguments)] // The binding elements are explicit so each case reads as its one difference.
+fn gesture_caller(
+    issuer: &native_ce::awareness::HumanInteractionTokenIssuer,
+    action: &str,
+    package: Option<(&str, &str)>,
+    generation: Option<&str>,
+    entry: &str,
+    target: &[String],
+    key: &str,
+    kind: native_ce::awareness::EffectGestureKind,
+) -> Caller {
+    gesture_caller_full(
+        issuer,
+        action,
+        ARTIFACT,
+        package,
+        generation,
+        entry,
+        target,
+        key,
+        &empty_values_digest(),
+        kind,
+    )
+}
+
+/// Canonical digest of the empty value-domain fillings (the `mark_triaged`
+/// arm carries a literal value, so its `values` map is empty).
+fn empty_values_digest() -> String {
+    canonical_digest(&json!({}))
+}
+
+#[allow(clippy::too_many_arguments)] // Every bound element is an argument on purpose.
+fn gesture_caller_full(
+    issuer: &native_ce::awareness::HumanInteractionTokenIssuer,
+    action: &str,
+    artifact: &str,
+    package: Option<(&str, &str)>,
+    generation: Option<&str>,
+    entry: &str,
+    target: &[String],
+    key: &str,
+    values_digest: &str,
+    kind: native_ce::awareness::EffectGestureKind,
+) -> Caller {
+    let ids = native_ce::awareness::effect_gesture_binding_ids(
+        "local",
+        artifact,
+        package,
+        generation,
+        entry,
+        target,
+        key,
+        values_digest,
+        kind,
+    );
+    let token = issuer.issue("local", action, &ids, 30).unwrap();
+    Caller::local().with_effect_gesture_token(issuer, token, kind)
+}
+
+fn gesture_target() -> Vec<String> {
+    vec![INSIDE.to_string()]
+}
+
+#[tokio::test]
+async fn effect_gesture_element_mismatch_refuses_with_zero_writes() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
+    let (db, registry, digest, _guard) = fixture().await;
+    // A committed baseline, so a refusal must not move the target.
+    let mut base = envelope("mark_triaged", &digest, "gesture:base");
+    base["slots"] = json!({ "record": INSIDE });
+    base["observed"] = observed(&registry, &db, INSIDE, "triage").await;
+    let committed = call(&registry, &db, "invoke_artifact_interaction", base).await;
+    assert_eq!(committed["status"], "committed", "{committed:#}");
+
+    let issuer = native_ce::awareness::HumanInteractionTokenIssuer::random("test-host");
+    let action = native_ce::awareness::EFFECT_GESTURE_ACTION;
+    let key = "gesture:mismatch";
+    let entry = "mark_triaged";
+    let gesture_click: native_ce::awareness::EffectGestureKind =
+        native_ce::awareness::EffectGestureKind::Click;
+    // Each token's binding differs from the engine's computed binding in one
+    // element only.
+    let cases: Vec<(&str, Caller)> = vec![
+        (
+            "package",
+            gesture_caller(
+                &issuer,
+                action,
+                Some(("alpha", "wrong")),
+                None,
+                entry,
+                &gesture_target(),
+                key,
+                gesture_click,
+            ),
+        ),
+        (
+            "install",
+            gesture_caller(
+                &issuer,
+                action,
+                None,
+                Some("wrong"),
+                entry,
+                &gesture_target(),
+                key,
+                gesture_click,
+            ),
+        ),
+        (
+            "entry",
+            gesture_caller(
+                &issuer,
+                action,
+                None,
+                None,
+                "set_triage",
+                &gesture_target(),
+                key,
+                gesture_click,
+            ),
+        ),
+        (
+            "target",
+            gesture_caller(
+                &issuer,
+                action,
+                None,
+                None,
+                entry,
+                &[OUTSIDE.to_string()],
+                key,
+                gesture_click,
+            ),
+        ),
+        (
+            "key",
+            gesture_caller(
+                &issuer,
+                action,
+                None,
+                None,
+                entry,
+                &gesture_target(),
+                "gesture:other",
+                gesture_click,
+            ),
+        ),
+        (
+            "action",
+            gesture_caller(
+                &issuer,
+                native_ce::awareness::EFFECT_GESTURE_REVERSAL_ACTION,
+                None,
+                None,
+                entry,
+                &gesture_target(),
+                key,
+                gesture_click,
+            ),
+        ),
+    ];
+    for (name, caller) in cases {
+        let before = event_count(&db).await;
+        let mut invocation = envelope(entry, &digest, key);
+        invocation["slots"] = json!({ "record": INSIDE });
+        invocation["observed"] = observed(&registry, &db, INSIDE, "triage").await;
+        let refused = call_as(
+            &registry,
+            &db,
+            caller,
+            "invoke_artifact_interaction",
+            invocation,
+        )
+        .await
+        .unwrap();
+        assert_eq!(refused["status"], "rejected", "{name}: {refused:#}");
+        assert_eq!(
+            refused["error"]["code"], "gesture_attestation_invalid",
+            "{name}: {refused:#}"
+        );
+        assert_eq!(event_count(&db).await, before, "{name} wrote");
+    }
+
+    // The Caller's gesture kind is part of the binding: a token minted for a
+    // click but presented with a drop is invalid.
+    let drop_mismatch = {
+        let ids = native_ce::awareness::effect_gesture_binding_ids(
+            "local",
+            ARTIFACT,
+            None,
+            None,
+            entry,
+            &gesture_target(),
+            key,
+            &empty_values_digest(),
+            gesture_click,
+        );
+        let token = issuer.issue("local", action, &ids, 30).unwrap();
+        Caller::local().with_effect_gesture_token(
+            &issuer,
+            token,
+            native_ce::awareness::EffectGestureKind::Drop,
+        )
+    };
+    let before = event_count(&db).await;
+    let mut invocation = envelope(entry, &digest, key);
+    invocation["slots"] = json!({ "record": INSIDE });
+    invocation["observed"] = observed(&registry, &db, INSIDE, "triage").await;
+    let refused = call_as(
+        &registry,
+        &db,
+        drop_mismatch,
+        "invoke_artifact_interaction",
+        invocation,
+    )
+    .await
+    .unwrap();
+    assert_eq!(refused["status"], "rejected", "gesture: {refused:#}");
+    assert_eq!(
+        refused["error"]["code"], "gesture_attestation_invalid",
+        "gesture: {refused:#}"
+    );
+    assert_eq!(event_count(&db).await, before, "gesture wrote");
+}
+
+#[tokio::test]
+async fn an_expired_effect_gesture_token_refuses_with_zero_writes() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
+    let (db, registry, digest, _guard) = fixture().await;
+    let issuer = native_ce::awareness::HumanInteractionTokenIssuer::random("test-host");
+    let ids = native_ce::awareness::effect_gesture_binding_ids(
+        "local",
+        ARTIFACT,
+        None,
+        None,
+        "mark_triaged",
+        &gesture_target(),
+        "gesture:expired",
+        &empty_values_digest(),
+        native_ce::awareness::EffectGestureKind::Click,
+    );
+    // TTL 1s, the shortest the issuer admits; wait past it.
+    let token = issuer
+        .issue(
+            "local",
+            native_ce::awareness::EFFECT_GESTURE_ACTION,
+            &ids,
+            1,
+        )
+        .unwrap();
+    let caller = Caller::local().with_effect_gesture_token(
+        &issuer,
+        token,
+        native_ce::awareness::EffectGestureKind::Click,
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(2200)).await;
+    let before = event_count(&db).await;
+    let mut invocation = envelope("mark_triaged", &digest, "gesture:expired");
+    invocation["slots"] = json!({ "record": INSIDE });
+    invocation["observed"] = observed(&registry, &db, INSIDE, "triage").await;
+    let refused = call_as(
+        &registry,
+        &db,
+        caller,
+        "invoke_artifact_interaction",
+        invocation,
+    )
+    .await
+    .unwrap();
+    assert_eq!(refused["status"], "rejected", "{refused:#}");
+    assert_eq!(
+        refused["error"]["code"], "gesture_attestation_invalid",
+        "{refused:#}"
+    );
+    assert_eq!(event_count(&db).await, before, "expired wrote");
+}
+
+#[tokio::test]
+async fn effect_gesture_enforcement_on_requires_a_token() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
+    let (db, registry, digest, _guard) = fixture().await;
+    let before = event_count(&db).await;
+    let mut invocation = envelope("mark_triaged", &digest, "gesture:required");
+    invocation["slots"] = json!({ "record": INSIDE });
+    invocation["observed"] = observed(&registry, &db, INSIDE, "triage").await;
+    let refused = call_as(
+        &registry,
+        &db,
+        Caller::local().with_effect_gesture_enforcement(true),
+        "invoke_artifact_interaction",
+        invocation,
+    )
+    .await
+    .unwrap();
+    assert_eq!(refused["status"], "rejected", "{refused:#}");
+    assert_eq!(
+        refused["error"]["code"], "gesture_attestation_required",
+        "{refused:#}"
+    );
+    assert_eq!(event_count(&db).await, before, "enforcement wrote");
+}
+
+#[tokio::test]
+async fn effect_gesture_guarded_only_enforcement_scopes_to_guarded_invokes() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
+    use native_ce::awareness::EffectGestureKind;
+    let (db, registry, digest, _guard) = fixture().await;
+    // Unguarded without a token takes the ordinary path and commits.
+    let mut plain = envelope("mark_triaged", &digest, "gesture:scoped-plain");
+    plain["slots"] = json!({ "record": INSIDE });
+    plain["observed"] = observed(&registry, &db, INSIDE, "triage").await;
+    let committed = call_as(
+        &registry,
+        &db,
+        Caller::local().with_effect_gesture_enforcement_guarded_only(),
+        "invoke_artifact_interaction",
+        plain,
+    )
+    .await
+    .unwrap();
+    assert_eq!(committed["status"], "committed", "{committed:#}");
+    // Guarded without a token is refused before any write, ahead of the
+    // guard-scope checks (the dummy guard names no install).
+    let before = event_count(&db).await;
+    let mut guarded = envelope("mark_triaged", &digest, "gesture:scoped-guarded");
+    guarded["slots"] = json!({ "record": INSIDE });
+    guarded["observed"] = observed(&registry, &db, INSIDE, "triage").await;
+    guarded["alpha_install_guard"] = alpha_guard_dummy();
+    let refused = call_as(
+        &registry,
+        &db,
+        Caller::local().with_effect_gesture_enforcement_guarded_only(),
+        "invoke_artifact_interaction",
+        guarded,
+    )
+    .await
+    .unwrap();
+    assert_eq!(refused["status"], "rejected", "{refused:#}");
+    assert_eq!(
+        refused["error"]["code"], "gesture_attestation_required",
+        "{refused:#}"
+    );
+    assert_eq!(event_count(&db).await, before, "scoped enforcement wrote");
+    // A present-but-invalid token still fails, even on an unguarded invoke.
+    let issuer = native_ce::awareness::HumanInteractionTokenIssuer::random("test-host");
+    let target = gesture_target();
+    let bad = gesture_caller(
+        &issuer,
+        native_ce::awareness::EFFECT_GESTURE_ACTION,
+        None,
+        None,
+        "mark_triaged",
+        &target,
+        "gesture:scoped-other-key",
+        EffectGestureKind::Click,
+    )
+    .with_effect_gesture_enforcement_guarded_only();
+    let mut mismatched = envelope("mark_triaged", &digest, "gesture:scoped-invalid");
+    mismatched["slots"] = json!({ "record": INSIDE });
+    mismatched["observed"] = observed(&registry, &db, INSIDE, "triage").await;
+    let refused = call_as(
+        &registry,
+        &db,
+        bad,
+        "invoke_artifact_interaction",
+        mismatched,
+    )
+    .await
+    .unwrap();
+    assert_eq!(refused["status"], "rejected", "{refused:#}");
+    assert_eq!(
+        refused["error"]["code"], "gesture_attestation_invalid",
+        "{refused:#}"
+    );
+    assert_eq!(event_count(&db).await, before, "invalid token wrote");
+}
+
+#[tokio::test]
+async fn the_invocation_body_gesture_field_is_not_in_the_binding() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
+    let (db, registry, digest, _guard) = fixture().await;
+    let issuer = native_ce::awareness::HumanInteractionTokenIssuer::random("test-host");
+    // Token bound for a click; the body says "drop", which is not part of the
+    // binding, so it verifies. The stored origin reflects the body; the
+    // evidence reflects the Caller.
+    let caller = gesture_caller(
+        &issuer,
+        native_ce::awareness::EFFECT_GESTURE_ACTION,
+        None,
+        None,
+        "mark_triaged",
+        &gesture_target(),
+        "gesture:body",
+        native_ce::awareness::EffectGestureKind::Click,
+    );
+    let mut invocation = envelope("mark_triaged", &digest, "gesture:body");
+    invocation["slots"] = json!({ "record": INSIDE });
+    invocation["gesture"] = json!("drop");
+    invocation["observed"] = observed(&registry, &db, INSIDE, "triage").await;
+    let committed = call_as(
+        &registry,
+        &db,
+        caller,
+        "invoke_artifact_interaction",
+        invocation,
+    )
+    .await
+    .unwrap();
+    assert_eq!(committed["status"], "committed", "{committed:#}");
+    let origin = stored_origin(&db, "gesture:body").await;
+    assert_eq!(origin["gesture"], "drop", "{origin:#}");
+    assert_eq!(origin["gesture_evidence"]["kind"], "click", "{origin:#}");
+}
+
+#[tokio::test]
+async fn effect_gesture_artifact_and_value_mismatch_refuse_with_zero_writes() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
+    let (db, registry, digest, _guard) = fixture().await;
+    let issuer = native_ce::awareness::HumanInteractionTokenIssuer::random("test-host");
+    let click = native_ce::awareness::EffectGestureKind::Click;
+    let action = native_ce::awareness::EFFECT_GESTURE_ACTION;
+    // A token minted for a different artifact must not verify on this one.
+    let cross_artifact = gesture_caller_full(
+        &issuer,
+        action,
+        "00000000-0000-4000-8000-000000000099",
+        None,
+        None,
+        "set_triage",
+        &gesture_target(),
+        "gesture:swap",
+        &canonical_digest(&json!({ "choice": "triaged" })),
+        click,
+    );
+    // A token minted for one written value must not verify for another.
+    let cross_value = gesture_caller_full(
+        &issuer,
+        action,
+        ARTIFACT,
+        None,
+        None,
+        "set_triage",
+        &gesture_target(),
+        "gesture:swap",
+        &canonical_digest(&json!({ "choice": "triaged" })),
+        click,
+    );
+    for (name, caller) in [("artifact", cross_artifact), ("value", cross_value)] {
+        let before = event_count(&db).await;
+        let mut invocation = envelope("set_triage", &digest, "gesture:swap");
+        invocation["slots"] = json!({ "record": INSIDE });
+        // The real value differs from the token's bound value in the second case.
+        invocation["values"] = json!({ "choice": "blocked" });
+        invocation["observed"] = observed(&registry, &db, INSIDE, "triage").await;
+        let refused = call_as(
+            &registry,
+            &db,
+            caller,
+            "invoke_artifact_interaction",
+            invocation,
+        )
+        .await
+        .unwrap();
+        assert_eq!(refused["status"], "rejected", "{name}: {refused:#}");
+        assert_eq!(
+            refused["error"]["code"], "gesture_attestation_invalid",
+            "{name}: {refused:#}"
+        );
+        assert_eq!(event_count(&db).await, before, "{name} wrote");
+    }
+}
+
+#[tokio::test]
+async fn effect_gesture_cross_viewer_refuses_with_zero_writes() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
+    let (db, registry, digest, _guard) = fixture().await;
+    // Bob may see the artifact (so the View preflight passes) but the token
+    // was minted for alice.
+    replace_explicit_policy(
+        &db,
+        "test:gesture-viewer",
+        ARTIFACT,
+        vec![AllowEntry::account("acct:bob", Capability::View)],
+    )
+    .await
+    .unwrap();
+    let issuer = native_ce::awareness::HumanInteractionTokenIssuer::random("test-host");
+    let ids = native_ce::awareness::effect_gesture_binding_ids(
+        "acct:alice",
+        ARTIFACT,
+        None,
+        None,
+        "mark_triaged",
+        &gesture_target(),
+        "gesture:viewer",
+        &empty_values_digest(),
+        native_ce::awareness::EffectGestureKind::Click,
+    );
+    let token = issuer
+        .issue(
+            "acct:alice",
+            native_ce::awareness::EFFECT_GESTURE_ACTION,
+            &ids,
+            30,
+        )
+        .unwrap();
+    let caller = Caller::authenticated("acct:bob").with_effect_gesture_token(
+        &issuer,
+        token,
+        native_ce::awareness::EffectGestureKind::Click,
+    );
+    let before = event_count(&db).await;
+    let mut invocation = envelope("mark_triaged", &digest, "gesture:viewer");
+    invocation["slots"] = json!({ "record": INSIDE });
+    invocation["observed"] = observed(&registry, &db, INSIDE, "triage").await;
+    let refused = call_as(
+        &registry,
+        &db,
+        caller,
+        "invoke_artifact_interaction",
+        invocation,
+    )
+    .await
+    .unwrap();
+    assert_eq!(refused["status"], "rejected", "{refused:#}");
+    assert_eq!(
+        refused["error"]["code"], "gesture_attestation_invalid",
+        "{refused:#}"
+    );
+    assert_eq!(event_count(&db).await, before, "cross-viewer wrote");
+}
+
+#[tokio::test]
+async fn effect_gesture_invalid_on_create_refuses_with_zero_writes() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
+    let (db, registry, digest, _guard) = create_fixture().await;
+    let issuer = native_ce::awareness::HumanInteractionTokenIssuer::random("test-host");
+    // Wrong artifact id: guaranteed invalid regardless of the create values.
+    let caller = gesture_caller_full(
+        &issuer,
+        native_ce::awareness::EFFECT_GESTURE_ACTION,
+        "00000000-0000-4000-8000-000000000098",
+        None,
+        None,
+        "create_task",
+        &[],
+        "gesture:create",
+        &canonical_digest(&json!({ "title": "x" })),
+        native_ce::awareness::EffectGestureKind::Click,
+    );
+    let before: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM records WHERE home_id=? AND type='WorkItem'")
+            .bind(COLLECTION)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    let invocation = json!({
+        "version": INVOCATION_VERSION,
+        "artifact_id": ARTIFACT,
+        "entry_id": "create_task",
+        "source_digest": digest,
+        "values": { "title": "Should not land", "triage": "ready" },
+        "idempotency_key": "gesture:create",
+        "gesture": "submit",
+    });
+    let refused = call_as(
+        &registry,
+        &db,
+        caller,
+        "invoke_artifact_interaction",
+        invocation,
+    )
+    .await
+    .unwrap();
+    assert_eq!(refused["status"], "rejected", "{refused:#}");
+    assert_eq!(
+        refused["error"]["code"], "gesture_attestation_invalid",
+        "{refused:#}"
+    );
+    let after: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM records WHERE home_id=? AND type='WorkItem'")
+            .bind(COLLECTION)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(after, before, "an invalid token created a record");
+}
+
+#[tokio::test]
+async fn effect_gesture_invalid_on_comment_refuses_with_zero_writes() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
+    let setup = comment_public_setup().await;
+    let issuer = native_ce::awareness::HumanInteractionTokenIssuer::random("test-host");
+    // A malformed token is invalid on any binding.
+    let caller = setup.alice.clone().with_effect_gesture_token(
+        &issuer,
+        "not-a-token",
+        native_ce::awareness::EffectGestureKind::Click,
+    );
+    let before = comment_count(&setup.db).await;
+    let refused = call_as(
+        &setup.registry,
+        &setup.db,
+        caller,
+        "invoke_artifact_interaction",
+        json!({
+            "version": INVOCATION_VERSION,
+            "artifact_id": ARTIFACT,
+            "entry_id": "post_root",
+            "source_digest": setup.body_digest,
+            "slots": { "bearer": INSIDE },
+            "values": { "text": "Should not land" },
+            "observed": { INSIDE: { "comment_target": "ct:00000000000000000000000000000000" } },
+            "idempotency_key": "gesture:comment",
+            "gesture": "submit",
+            "alpha_install_guard": setup.guard,
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(refused["status"], "rejected", "{refused:#}");
+    assert_eq!(
+        refused["error"]["code"], "gesture_attestation_invalid",
+        "{refused:#}"
+    );
+    assert_eq!(
+        comment_count(&setup.db).await,
+        before,
+        "an invalid token posted a comment"
+    );
+}
+#[tokio::test]
+async fn an_unguarded_artifact_token_binds_artifact_not_package() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
+    // An unguarded Workbench artifact has no package claim, so its token binds
+    // `pkg`/`gen` absent and relies on viewer, artifact, entry, target, values,
+    // key and gesture. That is the whole invocation it authorizes: the token
+    // cannot be replayed on another artifact (bound id) or with another value
+    // (bound digest), which is sufficient without a package.
+    let (db, registry, digest, _guard) = fixture().await;
+    let issuer = native_ce::awareness::HumanInteractionTokenIssuer::random("test-host");
+    let ids = native_ce::awareness::effect_gesture_binding_ids(
+        "local",
+        ARTIFACT,
+        None,
+        None,
+        "mark_triaged",
+        &gesture_target(),
+        "gesture:unguarded",
+        &empty_values_digest(),
+        native_ce::awareness::EffectGestureKind::Click,
+    );
+    assert!(!ids.iter().any(|id| id.starts_with("pkg=")), "{ids:?}");
+    assert!(!ids.iter().any(|id| id.starts_with("gen=")), "{ids:?}");
+    assert!(
+        ids.iter().any(|id| id == &format!("artifact={ARTIFACT}")),
+        "{ids:?}"
+    );
+    let token = issuer
+        .issue(
+            "local",
+            native_ce::awareness::EFFECT_GESTURE_ACTION,
+            &ids,
+            30,
+        )
+        .unwrap();
+    let caller = Caller::local().with_effect_gesture_token(
+        &issuer,
+        token,
+        native_ce::awareness::EffectGestureKind::Click,
+    );
+    let mut invocation = envelope("mark_triaged", &digest, "gesture:unguarded");
+    invocation["slots"] = json!({ "record": INSIDE });
+    invocation["observed"] = observed(&registry, &db, INSIDE, "triage").await;
+    let committed = call_as(
+        &registry,
+        &db,
+        caller,
+        "invoke_artifact_interaction",
+        invocation,
+    )
+    .await
+    .unwrap();
+    assert_eq!(committed["status"], "committed", "{committed:#}");
+    let origin = stored_origin(&db, "gesture:unguarded").await;
+    assert_eq!(origin["gesture_evidence"]["kind"], "click", "{origin:#}");
+}
+
+#[path = "comment_thread_sql.rs"]
+mod comment_thread_sql;

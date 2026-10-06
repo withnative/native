@@ -694,3 +694,141 @@ async fn replay_after_intervening_update_returns_the_attested_receipt() {
         "replay must append nothing"
     );
 }
+
+#[tokio::test]
+async fn html_replay_from_fresh_same_intent_survives_history_and_edits() {
+    let db = db().await;
+    let registry = std::sync::Arc::new(registry());
+    async fn run(registry: &ToolRegistry, db: &Db, intent: &str) -> String {
+        let boot = call(registry, db, Caller::local(), "bootstrap", json!({}))
+            .await
+            .unwrap();
+        let key = boot["run"]["run_key"].as_str().unwrap().to_owned();
+        call(
+            registry,
+            db,
+            Caller::local(),
+            "set_intent",
+            json!({"run_key": key, "intent": intent}),
+        )
+        .await
+        .unwrap();
+        key
+    }
+    let intent = "Stage a keyed HTML artifact";
+    let args = json!({
+        "type":"Document", "kind":"artifact", "name":"HTML replay regression",
+        "body":"<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Fixture</title></head><body><main><h1>Original</h1></main></body></html>",
+        "facets":{"runtime":"native.html.v1"}, "idempotency_key":"html-fresh-intent", "response_mode":"summary"
+    });
+    let mut first_args = args.clone();
+    first_args["run_key"] = json!(run(&registry, &db, intent).await);
+    let first = create(&registry, &db, Caller::local(), first_args)
+        .await
+        .unwrap();
+    assert_eq!(first["run_context"]["intent"], intent);
+    for index in 0..32 {
+        create(
+            &registry,
+            &db,
+            Caller::local(),
+            json!({"type":"Document", "kind":"note", "name":format!("unrelated {index}")}),
+        )
+        .await
+        .unwrap();
+    }
+    call(&registry, &db, Caller::local(), "update_record", json!({
+        "id":first["id"], "body_set":args["body"].as_str().unwrap().replace("Original", "Later edit"),
+        "if_body_digest":first["body_digest"], "name":"Changed name"
+    })).await.unwrap();
+    let mut same = args.clone();
+    same["run_key"] = json!(run(&registry, &db, intent).await);
+    let mut other = args.clone();
+    other["run_key"] = json!(run(&registry, &db, "A different staging intent").await);
+    let events = content_event_count(&db).await;
+    let replay = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        create(&registry, &db, Caller::local(), same),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    fn receipt(mut value: Value) -> Value {
+        // Run context is the current caller's envelope; the attested receipt is stable.
+        value.as_object_mut().unwrap().remove("run_context");
+        value
+    }
+    assert_eq!(receipt(replay.clone()), receipt(first.clone()));
+    for key in ["id", "source_event_id", "body_digest", "act"] {
+        assert!(!first[key].is_null(), "fixture must carry {key}");
+        assert_eq!(replay[key], first[key]);
+    }
+    assert_eq!(
+        replay["html_body_write"]["sha256"],
+        first["html_body_write"]["sha256"]
+    );
+    assert!(!first["html_body_write"]["sha256"].is_null());
+    let error = create(&registry, &db, Caller::local(), other)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("different resolved intent"), "{error}");
+    assert_eq!(content_event_count(&db).await, events);
+
+    // Replaying and an independent writer must both complete; replay never
+    // keeps BEGIN IMMEDIATE through a historical fold.
+    let mut same = args.clone();
+    same["run_key"] = json!(run(&registry, &db, intent).await);
+    let (retry, writer) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        tokio::join!(
+            create(&registry, &db, Caller::local(), same),
+            create(
+                &registry,
+                &db,
+                Caller::local(),
+                keyed("writer progress", "writer-progress")
+            )
+        )
+    })
+    .await
+    .unwrap();
+    assert_eq!(receipt(retry.unwrap()), receipt(first));
+    assert_eq!(writer.unwrap()["name"], "writer progress");
+    db.close().await;
+}
+
+#[tokio::test]
+async fn hosted_verbose_replay_enrichment_allows_concurrent_writer_progress() {
+    let db = db().await;
+    let registry = registry();
+    hosted_person(&registry, &db, "Alice", "acct:verbose-alice").await;
+    let mut args = keyed("hosted verbose", "hosted-verbose");
+    args["response_mode"] = json!("verbose");
+    let first = create(&registry, &db, hosted("acct:verbose-alice"), args.clone())
+        .await
+        .unwrap();
+    create(
+        &registry,
+        &db,
+        Caller::local(),
+        keyed("unrelated", "unrelated-verbose"),
+    )
+    .await
+    .unwrap();
+    let (replay, writer) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        tokio::join!(
+            create(&registry, &db, hosted("acct:verbose-alice"), args),
+            create(
+                &registry,
+                &db,
+                Caller::local(),
+                keyed("parallel writer", "parallel-verbose")
+            )
+        )
+    })
+    .await
+    .expect("live enrichment/contribution/filter reads must not self-lock or stall the writer");
+    assert_eq!(replay.unwrap(), first);
+    assert_eq!(writer.unwrap()["name"], "parallel writer");
+    db.close().await;
+}

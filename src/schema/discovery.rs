@@ -14,7 +14,7 @@ use super::{
     PROJECTION_TABLES,
 };
 
-pub(crate) const AUTHORITY_MODEL: &str = "event-authoritative: content_events is authoritative for content projections; meta_events is authoritative for vocabularies, vocabulary_values, and schema_config; policy_events is authoritative for portable policy; control_events is authoritative for portable control state; projections are replayable and must never be written directly";
+pub(crate) const AUTHORITY_MODEL: &str = "event-authoritative: content_events is authoritative for content projections; meta_events is authoritative for vocabularies, vocabulary_values, schema_config, and workspace_rule_installations; policy_events is authoritative for portable policy; control_events is authoritative for portable control state; projections are replayable and must never be written directly";
 
 pub(crate) fn table_role(table: &str) -> &'static str {
     if matches!(
@@ -117,6 +117,7 @@ pub(crate) fn logical_column_type(table: &str, column: &str, physical: &str) -> 
             | ("facet_values", "value")
             | ("vocabulary_values", "metadata")
             | ("schema_config", "data")
+            | ("workspace_rule_installations", "snapshot_json")
             | ("control_projections", "payload")
             | ("request_interactions", "arguments")
             | ("request_interactions", "run_context")

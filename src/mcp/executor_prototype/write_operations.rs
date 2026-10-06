@@ -17,6 +17,9 @@ use crate::error::{Error, Result};
 
 use super::*;
 
+#[path = "sql_selected_write/mod.rs"]
+mod selected;
+
 const ACCESS_EXECUTOR: &str = "access_admin";
 const POLICY_GRANT_OPERATION: &str = "manage_record_policy.grant";
 const POLICY_REPLACE_OPERATION: &str = "manage_record_policy.replace";
@@ -416,7 +419,15 @@ pub(super) fn validate(
         // Preview-only SQL writes: the shape is validated by the preview
         // preparer's own argument parsing during preparation, which is the
         // dry run. The preparer stays authoritative for bounds and parity.
-        (SQL_WRITE_EXECUTOR, SQL_WRITE_OPERATION) => Ok(()),
+        (SQL_WRITE_EXECUTOR, SQL_WRITE_OPERATION) => {
+            if source.get("selection_contract").is_some() {
+                selected::validate(source)
+            } else if source.get("folder_id").is_some() || source.get("write").is_some() {
+                Err(Error::conflict("sql_write: folder_id/write require selection_contract native.sql-write-selection.v1"))
+            } else {
+                Ok(())
+            }
+        }
         (executor, operation) if is_membership_operation(executor, operation) => hosted_authority
             .ok_or_else(|| {
                 Error::engine("hosted membership plans require an authoritative catalogue context")
@@ -486,6 +497,10 @@ pub(super) struct WriteRuntime {
     dispatch_gate: Option<Arc<DispatchGate>>,
     #[cfg(test)]
     revalidation_gate: Option<Arc<DispatchGate>>,
+    #[cfg(test)]
+    claim_attempts: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    dispatch_attempts: std::sync::atomic::AtomicUsize,
 }
 
 #[cfg(test)]
@@ -513,6 +528,10 @@ impl WriteRuntime {
             dispatch_gate: None,
             #[cfg(test)]
             revalidation_gate: None,
+            #[cfg(test)]
+            claim_attempts: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            dispatch_attempts: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -523,6 +542,8 @@ impl WriteRuntime {
             ttl_ms,
             dispatch_gate: None,
             revalidation_gate: None,
+            claim_attempts: std::sync::atomic::AtomicUsize::new(0),
+            dispatch_attempts: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -563,7 +584,30 @@ impl WriteRuntime {
     }
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    static SQL_RELOAD_GATE: Arc<DispatchGate>;
+    static SQL_TEST_CLOCK: Arc<std::sync::atomic::AtomicI64>;
+}
+#[cfg(test)]
+async fn wait_sql_reload_gate(executor: &str) {
+    if executor == SQL_WRITE_EXECUTOR {
+        if let Ok(gate) = SQL_RELOAD_GATE.try_with(Arc::clone) {
+            gate.entered.add_permits(1);
+            gate.release
+                .acquire()
+                .await
+                .expect("SQL reload gate open")
+                .forget();
+        }
+    }
+}
+
 fn now_ms() -> i64 {
+    #[cfg(test)]
+    if let Ok(clock) = SQL_TEST_CLOCK.try_with(Arc::clone) {
+        return clock.load(std::sync::atomic::Ordering::Relaxed);
+    }
     Utc::now().timestamp_millis()
 }
 
@@ -694,10 +738,20 @@ fn canonical_source_arguments(executor: &str, operation: &str, arguments: Value)
     };
     if (executor, operation) == (SQL_WRITE_EXECUTOR, SQL_WRITE_OPERATION) {
         for field in object.keys() {
-            if !["statement", "parameters", "reason", "expected_version"].contains(&field.as_str())
+            if ![
+                "statement",
+                "parameters",
+                "reason",
+                "expected_version",
+                "link_note",
+                "selection_contract",
+                "folder_id",
+                "write",
+            ]
+            .contains(&field.as_str())
             {
                 return Err(Error::engine(format!(
-                    "sql_write.sql_write has no field '{field}'; known fields are statement, parameters, reason, expected_version"
+                    "sql_write.sql_write has no field '{field}'; known fields are statement, parameters, reason, expected_version, link_note, selection_contract, folder_id, write"
                 )));
             }
         }
@@ -891,10 +945,21 @@ fn artifact_grant_effect_summary(
 
 /// Request shape for the preview-only `sql_write` preparer (E4 M1).
 ///
-/// One portable read SELECT yielding typed `set_field` operation rows over the
+/// One portable read SELECT yielding typed operation rows
+/// (`set_field`/`set_facet`/`unset_facet`/`archive`/`add_link`) over the
 /// caller-visible logical catalog, plus the caller-visible `reason` and an
 /// optional expected content sequence. Unknown fields are rejected; submitted
 /// SQL is never authority for physical writes.
+///
+/// `link_note` is an optional directed note carried with an `add_link`
+/// candidate. It is admitted only when non-blank and within
+/// [`SQL_WRITE_MAX_LINK_NOTE_CHARS`] Unicode scalar values, and only when the
+/// selection actually contains an `add_link` row; a note without a link
+/// refuses rather than silently signing into nothing. The note is effective
+/// only when the preview would create a new directed proposition; re-adding an
+/// existing one appends support and ignores it. A `remove_link` selection
+/// never carries a note: the singular remove passes `None` unconditionally,
+/// so a note alongside a removal refuses.
 ///
 /// `expected_version` pins exactly one record. A multi-target selection has no
 /// single revision, so supplying it alongside more than one distinct target is
@@ -905,11 +970,19 @@ fn artifact_grant_effect_summary(
 #[serde(deny_unknown_fields)]
 struct SqlWritePreviewArgs {
     statement: String,
+    // Coupling note (Native b0b7419): this shares `QuerySqlParameter`'s
+    // deserializer, so the parse layer accepts bare scalars here too — but
+    // the sql_write source schema stays typed-only by design, and the
+    // executor validates arguments against that schema before parsing. Net
+    // behaviour is unchanged: bare scalars are still rejected at the schema
+    // layer with the typed-only repair. Widening sql_write is out of scope.
     #[serde(default)]
     parameters: Vec<crate::query::sql_contract::QuerySqlParameter>,
     reason: String,
     #[serde(default)]
     expected_version: Option<i64>,
+    #[serde(default)]
+    link_note: Option<String>,
 }
 
 #[derive(Debug)]
@@ -924,16 +997,108 @@ struct SqlWritePreparation {
     operation_evidence: Value,
 }
 
+/// The admitted typed-operation kinds. `set_field` edits `name`/`summary`;
+/// `set_facet` sets one open facet's current value, matching
+/// `update_record.facets` and never an observation-only write; `unset_facet`
+/// clears one open facet (SQL NULL value), matching `update_record.facets`
+/// with an explicit null (absent facet has `changed:false` projected state);
+/// `archive` is the whole-record lifecycle transition matching
+/// `archive_record`/`batch_write`, never a `set_facet` of the
+/// engine-reserved `archived` key; `add_link` is the directed
+/// `legacy_link.v1` compatibility proposition over `relates_to`, matching
+/// `manage_links.add`'s relationship-owned route (never the content/Message
+/// content/Message `link.added` fallback); `remove_link` contests that same
+/// directed proposition, matching `manage_links.remove`'s relationship-owned
+/// route (never the content-owned `link.removed` fallback).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SqlWriteOpKind {
+    SetField,
+    SetFacet,
+    UnsetFacet,
+    Archive,
+    AddLink,
+    RemoveLink,
+}
+
+impl SqlWriteOpKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            SqlWriteOpKind::SetField => "set_field",
+            SqlWriteOpKind::SetFacet => "set_facet",
+            SqlWriteOpKind::UnsetFacet => "unset_facet",
+            SqlWriteOpKind::Archive => "archive",
+            SqlWriteOpKind::AddLink => "add_link",
+            SqlWriteOpKind::RemoveLink => "remove_link",
+        }
+    }
+}
+
+/// One parsed typed operation row before per-record resolution. Row order is
+/// canonicalized after parsing, so this is also the sort unit.
+#[derive(Debug)]
+struct ParsedSqlWriteOp {
+    record_id: String,
+    kind: SqlWriteOpKind,
+    key: String,
+    value: String,
+}
+
 /// One resolved governed operation. `before`/`after` are the exact signed
 /// values; neither is ever clipped, and the target's `previous_seq` pins the
-/// revision it was read at.
+/// revision it was read at. Facet operations additionally sign the exact
+/// before/after vocabulary references, so a value-equal but reference-different
+/// write is not mistaken for a no-op. Archive operations sign the exact archived
+/// before/after booleans and carry no vocabulary reference. Field operations
+/// leave both `None` and are emitted without those keys, preserving the existing
+/// field effect shape.
 #[derive(Debug)]
 struct SqlWriteResolvedOp {
-    key: &'static str,
+    kind: SqlWriteOpKind,
+    key: String,
     value: String,
     before: Value,
     after: Value,
+    before_vocab_ref: Option<String>,
+    after_vocab_ref: Option<String>,
     changed: bool,
+    /// Present only for `add_link`. Field/facet/archive operations leave this
+    /// `None` and emit exactly their existing effect shape.
+    link: Option<SqlWriteResolvedLink>,
+}
+
+/// One observed directed `legacy_link.v1` proposition and the guaranteed
+/// mutation intent, read in the same governed snapshot as the endpoints.
+///
+/// It signs the *observed* relationship state (identity, status, effective and
+/// epistemic state, the assertion-set digest and support/contest counts) plus
+/// the guaranteed intent. It deliberately does **not** sign a projected
+/// post-append `effective_state`: appending support to an existing active
+/// proposition can leave effective/epistemic state unchanged and does not
+/// bump an endpoint content seq, so only the assertion-set digest (and counts)
+/// make that drift observable on revalidation.
+#[derive(Debug)]
+struct SqlWriteResolvedLink {
+    route: &'static str,
+    source_id: String,
+    source_previous_seq: i64,
+    target_id: String,
+    target_previous_seq: i64,
+    proposition_key: String,
+    existing: Option<SqlWriteObservedRelationship>,
+    intent: &'static str,
+    note: Option<String>,
+    note_applied: bool,
+}
+
+#[derive(Debug)]
+struct SqlWriteObservedRelationship {
+    relationship_id: String,
+    status: String,
+    effective_state: Option<String>,
+    epistemic_state: Option<String>,
+    assertion_set_digest: Option<String>,
+    support_count: Option<i64>,
+    contest_count: Option<i64>,
 }
 
 #[derive(Debug)]
@@ -951,16 +1116,37 @@ struct SqlWriteTarget {
 /// these are preview policy, not reused limits; the statement and
 /// parameters are already capped by the governed request validator.
 const SQL_WRITE_MAX_VALUE_CHARS: usize = 1024;
+/// Facet-key bound. Keys are caller-controlled text and enter the signed effect
+/// and summary; a query cell can be far larger than any value bound, so a 50-op
+/// plan is only bounded once the key itself is bounded too. This is preview
+/// policy, not a singular-tool limit.
+const SQL_WRITE_MAX_FACET_KEY_CHARS: usize = 120;
+/// Vocabulary references are engine-resident text (`rec:<vocabulary_id>`), so
+/// they are bounded before signing exactly like a facet value; an oversized
+/// stored or derived reference refuses rather than inflating the effect.
+const SQL_WRITE_MAX_VOCAB_REF_CHARS: usize = 1024;
 const SQL_WRITE_MAX_REASON_CHARS: usize = 1024;
+/// Directed-note bound for an `add_link` candidate. The note enters the signed
+/// envelope, so it is refused rather than clipped past this bound, exactly like
+/// a proposed value. Like the other bounds here it is preview policy, not a
+/// singular-tool limit.
+const SQL_WRITE_MAX_LINK_NOTE_CHARS: usize = 1024;
 /// Display bound for target/effect text built from engine-resident record
 /// text (unbounded physical TEXT). Clipping is explicit (`...`) and
 /// char-boundary safe; semantic `effect` values are never clipped.
 const SQL_WRITE_MAX_DISPLAY_CHARS: usize = 120;
-/// Distinct record cap. `set_field` admits only `name` and `summary`, and a
-/// duplicate `(record_id, key)` is refused, so each target carries at most two
-/// operations; 25 targets bound the total operation set at 50.
+/// Distinct record cap. The total typed-operation set is independently capped
+/// at [`SQL_WRITE_MAX_OPS`], and the distinct-target count is derived from that
+/// complete set, so this is exact regardless of how many rows one record
+/// contributes.
 const SQL_WRITE_MAX_TARGETS: usize = 25;
-const SQL_WRITE_MAX_OPS: usize = SQL_WRITE_MAX_TARGETS * 2;
+/// Fixed policy cap on the complete typed-operation set. This is deliberately
+/// not `SQL_WRITE_MAX_TARGETS * 2`: `set_field` alone admitted two keys per
+/// record, but `set_facet` admits any open facet key, so one record can carry
+/// more than two operations. Completeness is still proved by the single
+/// `LIMIT SQL_WRITE_OP_ROW_LIMIT` probe, and the distinct-target cap is derived
+/// from the complete ≤50-row result rather than a rows-per-record ratio.
+const SQL_WRITE_MAX_OPS: usize = 50;
 /// Overflow probe: request one row beyond the complete-operation bound so a
 /// truncated selection is refused, never digested. A complete 50-row result
 /// fixes the distinct ID set, so counting its distinct IDs is exact and needs
@@ -973,6 +1159,31 @@ const SQL_WRITE_TARGET_DOMAIN: &str = "native.sql-write.target-set.v1";
 /// the human-readable summary samples at most this many and then says how many
 /// it omitted, explicitly.
 const SQL_WRITE_SUMMARY_SAMPLE_OPS: usize = 3;
+/// Internal identity for an `archive` row. Archive carries SQL NULL `key` and
+/// `value` (there is no caller facet), so this sentinel participates only in
+/// duplicate detection and canonical ordering and is never signed into the
+/// effect or the summary.
+const SQL_WRITE_ARCHIVE_KEY: &str = "\u{0}archive";
+/// The only admitted `add_link` operation and relation key. W2's note-carrying
+/// `manage_links.add` relationship is the directed `legacy_link.v1`
+/// compatibility proposition, not the symmetric core `relates_to.v1` assertion
+/// path. [`resolve_sql_write_add_link`] admits and resolves the op through that
+/// same relationship-owned route; the content/Message `link.added` fallback is
+/// refused.
+const SQL_WRITE_ADD_LINK_OP: &str = "add_link";
+const SQL_WRITE_REMOVE_LINK_OP: &str = "remove_link";
+const SQL_WRITE_ADD_LINK_KEY: &str = "relates_to";
+/// Signed route marker for the directed compatibility proposition. The
+/// content/Message `link.added` fallback is refused, so this is the only route.
+const SQL_WRITE_LINK_ROUTE: &str = "directed_legacy_link";
+/// Guaranteed intent: a new proposition is created, or an existing active one
+/// gains another support assertion. Neither is ever a no-op.
+const SQL_WRITE_LINK_INTENT_CREATE: &str = "would_create_relationship";
+const SQL_WRITE_LINK_INTENT_APPEND: &str = "would_append_support";
+/// Guaranteed intent for a directed removal: the existing active proposition
+/// gains another contest assertion. Absent or inactive propositions refuse
+/// rather than previewing a no-op, exactly as the singular route does.
+const SQL_WRITE_LINK_INTENT_CONTEST: &str = "would_contest";
 
 fn sql_write_display(text: &str) -> String {
     if text.chars().count() > SQL_WRITE_MAX_DISPLAY_CHARS {
@@ -1005,13 +1216,89 @@ fn sql_write_effect_summary(targets: &[SqlWriteTarget], op_count: usize) -> Stri
         for op in &target.ops {
             if sampled < SQL_WRITE_SUMMARY_SAMPLE_OPS {
                 sampled += 1;
-                parts.push(format!(
-                    "{} of {} ({}) -> {}",
-                    op.key,
-                    sql_write_display(&target.name),
-                    target.record_id,
-                    sql_write_display(&op.value),
-                ));
+                // Field rendering is kept byte-identical to the pre-facet
+                // summary so existing field-only plans do not move.
+                match op.kind {
+                    SqlWriteOpKind::SetField => parts.push(format!(
+                        "{} of {} ({}) -> {}",
+                        op.key,
+                        sql_write_display(&target.name),
+                        target.record_id,
+                        sql_write_display(&op.value),
+                    )),
+                    SqlWriteOpKind::SetFacet => parts.push(format!(
+                        "set_facet '{}' of {} ({}) -> {}",
+                        op.key,
+                        sql_write_display(&target.name),
+                        target.record_id,
+                        sql_write_display(&op.value),
+                    )),
+                    // An unset names the cleared facet; the signed effect
+                    // carries the before/after absence, so the summary stays
+                    // identical for changed and already-absent projected-state unsets.
+                    SqlWriteOpKind::UnsetFacet => parts.push(format!(
+                        "unset_facet '{}' of {} ({})",
+                        op.key,
+                        sql_write_display(&target.name),
+                        target.record_id,
+                    )),
+                    // Archive is lifecycle, not a facet assertion, so it has
+                    // no key or value to render; the target name and ID carry
+                    // the identity, and the signed effect carries the
+                    // before/after archived state.
+                    SqlWriteOpKind::Archive => parts.push(format!(
+                        "archive of {} ({})",
+                        sql_write_display(&target.name),
+                        target.record_id,
+                    )),
+                    // A directed link is a pair, so the summary names the
+                    // source and the (bounded) target id, and states the
+                    // guaranteed intent. An existing proposition appends
+                    // support and ignores the passed note; that is stated
+                    // rather than presented as a no-op.
+                    SqlWriteOpKind::AddLink => {
+                        let link = op
+                            .link
+                            .as_ref()
+                            .expect("add_link op carries its resolved link detail");
+                        let target_display = sql_write_display(&link.target_id);
+                        let suffix = if link.intent == SQL_WRITE_LINK_INTENT_APPEND {
+                            if link.note.is_some() {
+                                "appends support; note ignored"
+                            } else {
+                                "appends support"
+                            }
+                        } else if link.note_applied {
+                            "new relationship with note"
+                        } else {
+                            "new relationship"
+                        };
+                        parts.push(format!(
+                            "add_link {} {} ({}) -> {} ({suffix})",
+                            op.key,
+                            sql_write_display(&target.name),
+                            target.record_id,
+                            target_display,
+                        ))
+                    }
+                    // A directed removal is a pair like an add, so the summary
+                    // names the source and the bounded target id and states the
+                    // guaranteed contest intent. It is never a no-op: absent or
+                    // inactive propositions refuse rather than previewing one.
+                    SqlWriteOpKind::RemoveLink => {
+                        let link = op
+                            .link
+                            .as_ref()
+                            .expect("remove_link op carries its resolved link detail");
+                        parts.push(format!(
+                            "remove_link {} {} ({}) -> {} (would contest relationship)",
+                            op.key,
+                            sql_write_display(&target.name),
+                            target.record_id,
+                            sql_write_display(&link.target_id),
+                        ))
+                    }
+                }
             } else {
                 omitted += 1;
             }
@@ -1027,24 +1314,46 @@ fn sql_write_effect_summary(targets: &[SqlWriteTarget], op_count: usize) -> Stri
     summary
 }
 
-/// Truthful non-mutating preparation for a bounded `set_field` operation set.
+/// Truthful non-mutating preparation for a bounded typed-operation set.
 ///
 /// Runs the caller's SELECT through the governed in-transaction read path
 /// (portable validator plus caller-relative catalog relations), then checks
 /// every target's version and Edit authorization in that same transaction
 /// before rolling it back. Appends no event and calls no mutation handler.
 ///
-/// The first compiler admits only `set_field` on `name` or `summary`, at most
-/// 25 distinct visible records, at most one operation per `(record_id, key)`,
-/// and no extra columns. A complete result is proved by requesting one row
-/// beyond the 50-operation cap: either that row arrives or the engine reports
-/// truncation. Rows are canonically sorted so caller row order cannot change
-/// the signed target, effect, or digest.
+/// M1 admits `set_field` on `name` or `summary`, string-valued `set_facet`
+/// on any open facet key (a current assertion matching `update_record.facets`,
+/// never an observation-only write), `unset_facet` on any open facet key with
+/// a SQL NULL `value` (matching `update_record.facets` with an explicit null;
+/// absent facet prepares `changed:false` projected state), whole-record `archive`
+/// (its `key` and `value` are SQL NULL; it requires Manage), and directed
+/// `add_link` (`key` is `relates_to`, `value` is a non-blank target id, with
+/// an optional top-level `link_note`), and directed `remove_link` (`key` is
+/// `relates_to`, `value` is a non-blank target id, never with a `link_note`)
+/// over at most 25
+/// distinct visible records, at most one operation per `(record_id, key)`, and
+/// no extra columns. Archive never mixes with another operation on the same
+/// record, and a link never mixes with a content edit on the same source. Each
+/// `add_link` mirrors the singular `manage_links.add` relationship-owned route
+/// in the same transaction: Edit source, View target, bearer immutability, the
+/// directed proposition probe, and the same retired refusal. Each `remove_link`
+/// mirrors the singular `manage_links.remove` relationship-owned route the
+/// same way: Edit source, View target, bearer immutability, the directed
+/// proposition probe, and the same absent, inactive, retired, and
+/// content-owned refusals. Facet values are governed through the shared
+/// schema/vocabulary fold in the same transaction; the exact governed
+/// `vocab_ref` is signed. A complete result is proved by requesting one row
+/// beyond the 50-operation policy cap: either that row arrives or the engine
+/// reports truncation. Rows are canonically sorted so caller row order cannot
+/// change the signed target, effect, or digest.
 async fn prepare_sql_write_preview(
     db: &crate::Db,
     caller: &Caller,
     arguments: Value,
 ) -> Result<SqlWritePreparation> {
+    if arguments.get("selection_contract").is_some() {
+        return selected::prepare(db, caller, arguments).await;
+    }
     const TOOL: &str = "sql_write";
     let args: SqlWritePreviewArgs = super::super::tools::parse_args(TOOL, arguments)?;
     super::super::tools::require_nonblank_reason(TOOL, &args.reason)?;
@@ -1057,6 +1366,21 @@ async fn prepare_sql_write_preview(
         return Err(Error::engine(format!(
             "{TOOL}: 'statement' must be a portable read SELECT"
         )));
+    }
+    // A supplied note is bounded before the selection runs: it can only matter
+    // with an `add_link` row, but the bound is unconditional so a malformed
+    // note never depends on what the caller's SQL happens to return.
+    if let Some(note) = args.link_note.as_deref() {
+        if note.trim().is_empty() {
+            return Err(Error::engine(format!(
+                "{TOOL}: 'link_note' must be non-blank when supplied"
+            )));
+        }
+        if note.chars().count() > SQL_WRITE_MAX_LINK_NOTE_CHARS {
+            return Err(Error::engine(format!(
+                "{TOOL}: 'link_note' exceeds {SQL_WRITE_MAX_LINK_NOTE_CHARS} characters"
+            )));
+        }
     }
     let mut tx = db.write_pool().begin().await?;
     let request = crate::query::sql_contract::QuerySqlRequest {
@@ -1074,8 +1398,8 @@ async fn prepare_sql_write_preview(
     .await
     .map_err(|error| Error::engine(format!("{TOOL}: selection rejected: {error}")))?;
     // The probe row beyond the operation cap is how completeness is proved:
-    // 50 valid operations are the most two keys can produce on 25 distinct
-    // records, so anything past the cap refuses instead of digesting a
+    // 50 typed rows is the fixed policy cap over any mix of admitted
+    // operations, so anything past the cap refuses instead of digesting a
     // truncation. The distinct-ID cap below is then exact over a complete set.
     if result.truncated || result.rows.len() > SQL_WRITE_MAX_OPS {
         return Err(Error::conflict(format!(
@@ -1090,7 +1414,7 @@ async fn prepare_sql_write_preview(
     // Parse and canonicalize the typed rows before any per-record check, so a
     // malformed or duplicate row refuses even when another target is fine.
     let mut seen = std::collections::HashSet::new();
-    let mut parsed: Vec<(String, &'static str, String)> = Vec::with_capacity(result.rows.len());
+    let mut parsed: Vec<ParsedSqlWriteOp> = Vec::with_capacity(result.rows.len());
     for row in &result.rows {
         let object = row
             .as_object()
@@ -1108,55 +1432,252 @@ async fn prepare_sql_write_preview(
             .get("record_id")
             .and_then(Value::as_str)
             .ok_or_else(|| missing("record_id"))?;
+        // Every row field is validated, including rows the previous contract
+        // increment skipped: a blank source id is malformed shape, and must not
+        // reach the not-found path as if it were a missing record.
+        if record_id.trim().is_empty() {
+            return Err(Error::conflict(format!(
+                "{TOOL}: operation row 'record_id' must be non-blank"
+            )));
+        }
         let op = object
             .get("op")
             .and_then(Value::as_str)
             .ok_or_else(|| missing("op"))?;
-        let key = object
-            .get("key")
-            .and_then(Value::as_str)
-            .ok_or_else(|| missing("key"))?;
-        let value = object
-            .get("value")
-            .and_then(Value::as_str)
-            .ok_or_else(|| missing("value"))?;
-        if op != "set_field" {
-            return Err(Error::conflict(format!(
-                "{TOOL}: unsupported operation '{op}'; the first compiler admits only set_field"
-            )));
-        }
-        let key = match key {
-            "name" => "name",
-            "summary" => "summary",
+        let kind = match op {
+            "set_field" => SqlWriteOpKind::SetField,
+            "set_facet" => SqlWriteOpKind::SetFacet,
+            "unset_facet" => SqlWriteOpKind::UnsetFacet,
+            "archive" => SqlWriteOpKind::Archive,
+            SQL_WRITE_ADD_LINK_OP => SqlWriteOpKind::AddLink,
+            SQL_WRITE_REMOVE_LINK_OP => SqlWriteOpKind::RemoveLink,
             other => {
                 return Err(Error::conflict(format!(
-                    "{TOOL}: unsupported set_field key '{other}'; the first compiler admits only name and summary"
-                )))
+                    "{TOOL}: unsupported operation '{other}'; M1 admits only set_field, set_facet, unset_facet, archive, add_link, and remove_link"
+                )));
             }
         };
-        if key == "name" && value.trim().is_empty() {
+        // `value` must be present on every admitted row. Extra columns already
+        // refused above, so `key` and `value` are the only payload columns.
+        let value_cell = object.get("value").ok_or_else(|| missing("value"))?;
+        let (key, value) = if kind == SqlWriteOpKind::Archive {
+            // Archive is the whole-record lifecycle transition matching
+            // `archive_record`/`batch_write`, never a `set_facet` of the
+            // engine-reserved `archived` key. It carries no payload, so both
+            // `key` and `value` must be present SQL NULL; a non-null cell
+            // refuses rather than being reinterpreted as a facet write.
+            let key_cell = object.get("key").ok_or_else(|| missing("key"))?;
+            if !key_cell.is_null() {
+                return Err(Error::conflict(format!(
+                    "{TOOL}: archive row requires a SQL NULL 'key'; got {key_cell}"
+                )));
+            }
+            if !value_cell.is_null() {
+                return Err(Error::conflict(format!(
+                    "{TOOL}: archive row requires a SQL NULL 'value'; got {value_cell}"
+                )));
+            }
+            (SQL_WRITE_ARCHIVE_KEY.to_string(), "true".to_string())
+        } else if kind == SqlWriteOpKind::UnsetFacet {
+            // `unset_facet` clears one open facet, matching
+            // `update_record.facets` with an explicit null. It carries no
+            // value, so `value` must be present SQL NULL; a non-null cell
+            // refuses rather than being reinterpreted as a set.
+            if !value_cell.is_null() {
+                return Err(Error::conflict(format!(
+                    "{TOOL}: unset_facet row requires a SQL NULL 'value'; got {value_cell}"
+                )));
+            }
+            let key_cell = object.get("key").ok_or_else(|| missing("key"))?;
+            let raw_key = key_cell.as_str().ok_or_else(|| {
+                Error::conflict(format!(
+                    "{TOOL}: unset_facet row requires a string 'key'; got {key_cell}"
+                ))
+            })?;
+            crate::domain_transaction::assert_open_facet_key(TOOL, raw_key)
+                .map_err(|error| Error::conflict(error.to_string()))?;
+            if raw_key.chars().count() > SQL_WRITE_MAX_FACET_KEY_CHARS {
+                return Err(Error::conflict(format!(
+                    "{TOOL}: facet key exceeds {SQL_WRITE_MAX_FACET_KEY_CHARS} characters"
+                )));
+            }
+            (raw_key.to_string(), String::new())
+        } else {
+            // `value` must be a present JSON string for every field/set-facet
+            // and link M1 op. A SQL NULL (or any non-string) refuses rather
+            // than silently folding.
+            let value = value_cell.as_str().ok_or_else(|| {
+                Error::conflict(format!(
+                    "{TOOL}: operation row 'value' must be a JSON string; got {value_cell}"
+                ))
+            })?;
+            let raw_key = object
+                .get("key")
+                .and_then(Value::as_str)
+                .ok_or_else(|| missing("key"))?;
+            let key = match kind {
+                SqlWriteOpKind::SetField => match raw_key {
+                    "name" => "name".to_string(),
+                    "summary" => "summary".to_string(),
+                    other => {
+                        return Err(Error::conflict(format!(
+                            "{TOOL}: unsupported set_field key '{other}'; the compiler admits only name and summary"
+                        )));
+                    }
+                },
+                SqlWriteOpKind::SetFacet => {
+                    // Reuse the singular-tool open-key guard so engine-reserved,
+                    // spine, and exact governed-relationship names refuse here
+                    // exactly as they do in `update_record.facets`.
+                    crate::domain_transaction::assert_open_facet_key(TOOL, raw_key)
+                        .map_err(|error| Error::conflict(error.to_string()))?;
+                    // The key is caller-controlled and is signed into the effect
+                    // and summary; bound it before admission.
+                    if raw_key.chars().count() > SQL_WRITE_MAX_FACET_KEY_CHARS {
+                        return Err(Error::conflict(format!(
+                            "{TOOL}: facet key exceeds {SQL_WRITE_MAX_FACET_KEY_CHARS} characters"
+                        )));
+                    }
+                    raw_key.to_string()
+                }
+                SqlWriteOpKind::AddLink => {
+                    // The only admitted directed relationship token. Self-links
+                    // are allowed by the singular tool, so none is refused here.
+                    if raw_key != SQL_WRITE_ADD_LINK_KEY {
+                        return Err(Error::conflict(format!(
+                            "{TOOL}: unsupported add_link key '{raw_key}'; the directed compiler admits only {SQL_WRITE_ADD_LINK_KEY}"
+                        )));
+                    }
+                    raw_key.to_string()
+                }
+                SqlWriteOpKind::RemoveLink => {
+                    // The only admitted directed relationship token, shared
+                    // with `add_link`. Self-links are allowed by the singular
+                    // remove route, so none is refused here either.
+                    if raw_key != SQL_WRITE_ADD_LINK_KEY {
+                        return Err(Error::conflict(format!(
+                            "{TOOL}: unsupported remove_link key '{raw_key}'; the directed compiler admits only {SQL_WRITE_ADD_LINK_KEY}"
+                        )));
+                    }
+                    raw_key.to_string()
+                }
+                // Handled by the archive/unset branches above.
+                SqlWriteOpKind::Archive | SqlWriteOpKind::UnsetFacet => {
+                    unreachable!("archive/unset parse their NULL value shape above")
+                }
+            };
+            (key, value.to_string())
+        };
+        if kind == SqlWriteOpKind::SetField && key == "name" && value.trim().is_empty() {
             return Err(Error::conflict(format!(
                 "{TOOL}: set_field name must be non-blank"
             )));
         }
+        if kind == SqlWriteOpKind::AddLink && value.trim().is_empty() {
+            return Err(Error::conflict(format!(
+                "{TOOL}: add_link value must be a non-blank target id"
+            )));
+        }
+        if kind == SqlWriteOpKind::RemoveLink && value.trim().is_empty() {
+            return Err(Error::conflict(format!(
+                "{TOOL}: remove_link value must be a non-blank target id"
+            )));
+        }
         if value.chars().count() > SQL_WRITE_MAX_VALUE_CHARS {
             return Err(Error::conflict(format!(
-                "{TOOL}: set_field value exceeds {SQL_WRITE_MAX_VALUE_CHARS} characters"
+                "{TOOL}: {op} value exceeds {SQL_WRITE_MAX_VALUE_CHARS} characters"
             )));
         }
-        if !seen.insert((record_id.to_string(), key)) {
+        if !seen.insert((record_id.to_string(), key.clone())) {
             return Err(Error::conflict(format!(
-                "{TOOL}: duplicate set_field '{key}' for record {record_id}; each record admits at most one operation per field"
+                "{TOOL}: duplicate '{key}' for record {record_id}; each record admits at most one operation per key"
             )));
         }
-        parsed.push((record_id.to_string(), key, value.to_string()));
+        parsed.push(ParsedSqlWriteOp {
+            record_id: record_id.to_string(),
+            kind,
+            key,
+            value,
+        });
+    }
+    let has_add_link = parsed.iter().any(|op| op.kind == SqlWriteOpKind::AddLink);
+    let has_remove_link = parsed
+        .iter()
+        .any(|op| op.kind == SqlWriteOpKind::RemoveLink);
+    // A removal carries no note: the singular `manage_links.remove` passes
+    // `None` unconditionally, so a note alongside a `remove_link` row refuses
+    // with its own message rather than the generic orphan-note one below.
+    if args.link_note.is_some() && has_remove_link {
+        return Err(Error::conflict(format!(
+            "{TOOL}: 'link_note' is only valid with an add_link selection; remove_link carries no note"
+        )));
+    }
+    // A note has no meaning without a link to carry it, so it refuses rather
+    // than being silently dropped from an ordinary preparation.
+    if args.link_note.is_some() && !has_add_link {
+        return Err(Error::conflict(format!(
+            "{TOOL}: 'link_note' is only valid when the selection includes an add_link operation"
+        )));
+    }
+    // A directed link assertion and a content edit on the same source are not
+    // proved atomic against the singular tools, so the combination refuses.
+    // Both link kinds share the source set; the message names the link op on
+    // that source so an `add_link` mix keeps its existing wording.
+    let link_records: std::collections::HashSet<&str> = parsed
+        .iter()
+        .filter(|op| {
+            matches!(
+                op.kind,
+                SqlWriteOpKind::AddLink | SqlWriteOpKind::RemoveLink
+            )
+        })
+        .map(|op| op.record_id.as_str())
+        .collect();
+    if let Some(mixed) = parsed.iter().find(|op| {
+        !matches!(
+            op.kind,
+            SqlWriteOpKind::AddLink | SqlWriteOpKind::RemoveLink
+        ) && link_records.contains(op.record_id.as_str())
+    }) {
+        let record_id = mixed.record_id.as_str();
+        let link_op = if parsed
+            .iter()
+            .any(|op| op.record_id.as_str() == record_id && op.kind == SqlWriteOpKind::RemoveLink)
+        {
+            "remove_link"
+        } else {
+            "add_link"
+        };
+        return Err(Error::conflict(format!(
+            "{TOOL}: record {record_id} mixes '{link_op}' with another operation; M1 does not prove that combination atomic against the singular tools"
+        )));
+    }
+    // Archive is a whole-record lifecycle transition. M1 has not proved that
+    // mixing it with a field or facet operation on the same record is atomic
+    // against the singular tools, so the combination refuses. A duplicate
+    // archive row for one record is already refused by the `(record_id, key)`
+    // uniqueness check above, since both rows share the archive sentinel key.
+    let archive_records: std::collections::HashSet<&str> = parsed
+        .iter()
+        .filter(|op| op.kind == SqlWriteOpKind::Archive)
+        .map(|op| op.record_id.as_str())
+        .collect();
+    if let Some(record_id) = parsed
+        .iter()
+        .find(|op| {
+            op.kind != SqlWriteOpKind::Archive && archive_records.contains(op.record_id.as_str())
+        })
+        .map(|op| op.record_id.as_str())
+    {
+        return Err(Error::conflict(format!(
+            "{TOOL}: record {record_id} mixes 'archive' with another operation; M1 does not prove that combination atomic against the singular tools"
+        )));
     }
     // Canonical sort makes caller row order irrelevant to every signed field.
-    parsed.sort();
-    let mut distinct_targets: Vec<String> = parsed
-        .iter()
-        .map(|(record_id, _, _)| record_id.clone())
-        .collect();
+    // `(record_id, key)` is unique after the duplicate refusal above, so the
+    // sort is total and deterministic.
+    parsed.sort_by(|left, right| (&left.record_id, &left.key).cmp(&(&right.record_id, &right.key)));
+    let mut distinct_targets: Vec<String> = parsed.iter().map(|op| op.record_id.clone()).collect();
     distinct_targets.dedup();
     if distinct_targets.len() > SQL_WRITE_MAX_TARGETS {
         return Err(Error::conflict(format!(
@@ -1170,35 +1691,99 @@ async fn prepare_sql_write_preview(
             distinct_targets.len()
         )));
     }
+    // Facet rows resolve through the shared schema/vocabulary fold, which reads
+    // the declaration cascade; read it once inside this same transaction.
+    // Field-only selections never pay for it.
+    let schema_rows = if parsed.iter().any(|op| {
+        matches!(
+            op.kind,
+            SqlWriteOpKind::SetFacet | SqlWriteOpKind::UnsetFacet
+        )
+    }) {
+        Some(crate::query::cascade::schema_config_rows_in(&mut tx).await?)
+    } else {
+        None
+    };
     let mut targets: Vec<SqlWriteTarget> = Vec::with_capacity(distinct_targets.len());
     for record_id in &distinct_targets {
-        super::super::tools::require_record_in(
-            &mut tx,
-            caller,
-            TOOL,
-            record_id,
-            crate::authorization::Capability::Edit,
-        )
-        .await
-        .map_err(|error| match error {
-            // Infrastructure failures stay non-stale; lost visibility or Edit is
-            // selection drift. The message is preserved verbatim, so hidden and
-            // missing targets keep refusing identically.
-            Error::Sqlx(_) => error,
-            other => Error::conflict(other.to_string()),
-        })?;
-        let archived: i64 = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM facet_values WHERE record_id = ? AND key = ?)",
+        // Archive is a lifecycle transition and requires Manage, exactly as
+        // `archive_record` and `batch_write`'s archive item do. Field and facet
+        // edits keep the weaker Edit requirement.
+        let target_has_archive = parsed
+            .iter()
+            .any(|op| &op.record_id == record_id && op.kind == SqlWriteOpKind::Archive);
+        // Both link kinds skip the archived-source refusal below: neither
+        // singular link route has one, so this preview mirrors those routes
+        // rather than inventing a narrower one.
+        let target_has_link = parsed.iter().any(|op| {
+            &op.record_id == record_id
+                && matches!(
+                    op.kind,
+                    SqlWriteOpKind::AddLink | SqlWriteOpKind::RemoveLink
+                )
+        });
+        let required = if target_has_archive {
+            crate::authorization::Capability::Manage
+        } else {
+            crate::authorization::Capability::Edit
+        };
+        super::super::tools::require_record_in(&mut tx, caller, TOOL, record_id, required)
+            .await
+            .map_err(|error| match error {
+                // Infrastructure failures stay non-stale; lost visibility,
+                // Edit, or Manage is selection drift. The message is preserved
+                // verbatim, so hidden and missing targets keep refusing
+                // identically.
+                Error::Sqlx(_) => error,
+                other => Error::conflict(other.to_string()),
+            })?;
+        // Temporary ambiguity guard (E4 M1; E3 M1 stays open): a live
+        // incoming `supersedes` link means the preview cannot establish the
+        // target as current. This refuses rather than proving whole-record
+        // supersession. It runs after authorization so hidden and missing
+        // targets keep refusing identically above, and it never names the
+        // successor (id, name, or count), so a visible target with a hidden
+        // successor refuses with the same stable string as one with a
+        // visible successor. A tombstoned successor discloses nothing, and
+        // the same probe re-runs on revalidation, where this `Conflict`
+        // maps to `plan_stale`.
+        let superseded: i64 = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM links l JOIN records s ON s.id = l.source_id WHERE l.relationship = 'supersedes' AND l.target_id = ? AND s.deleted_at IS NULL)",
         )
         .bind(record_id)
-        .bind(crate::schema::ARCHIVED_FACET_KEY)
         .fetch_one(&mut *tx)
         .await?;
-        if archived != 0 {
+        if superseded != 0 {
             return Err(Error::conflict(format!(
-                "{TOOL}: selected record {record_id} is archived; restore it before preparing an edit"
+                "{TOOL}: selected record {record_id} has an incoming supersedes link; SQL write preview cannot establish current target"
             )));
         }
+        // Link sources deliberately skip the archived-source refusal: neither
+        // singular link route has one, so this preview mirrors those routes
+        // rather than inventing a narrower one. A tombstoned or missing
+        // source still refuses through `require_record_in` above and
+        // `previous_record_seq_in` below.
+        let was_archived = if target_has_link {
+            false
+        } else {
+            let archived: i64 = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM facet_values WHERE record_id = ? AND key = ?)",
+            )
+            .bind(record_id)
+            .bind(crate::schema::ARCHIVED_FACET_KEY)
+            .fetch_one(&mut *tx)
+            .await?;
+            // An already-archived target refuses every edit/facet operation,
+            // but an archive op is the transition itself: it prepares as a
+            // `changed:false` no-op rather than refusing, matching
+            // `archive_record` and the batch archive item.
+            if archived != 0 && !target_has_archive {
+                return Err(Error::conflict(format!(
+                    "{TOOL}: selected record {record_id} is archived; restore it before preparing an edit"
+                )));
+            }
+            archived != 0
+        };
         let previous_seq = super::super::tools::previous_record_seq_in(&mut tx, record_id)
             .await?
             .ok_or_else(|| Error::conflict(format!("{TOOL}: record {record_id} does not exist")))?;
@@ -1210,42 +1795,151 @@ async fn prepare_sql_write_preview(
                 "{TOOL}: content revision conflict; get the record and prepare again"
             )));
         }
-        let current: (String, Option<String>) = sqlx::query_as::<_, (String, Option<String>)>(
-            "SELECT name, summary FROM records WHERE id = ? AND deleted_at IS NULL",
-        )
-        .bind(record_id)
-        .fetch_optional(&mut *tx)
-        .await?
-        .ok_or_else(|| Error::conflict(format!("{TOOL}: record {record_id} does not exist")))?;
-        let (current_name, current_summary) = current;
+        let current: (String, Option<String>, String, Option<String>) =
+            sqlx::query_as::<_, (String, Option<String>, String, Option<String>)>(
+                "SELECT name, summary, type, kind FROM records WHERE id = ? AND deleted_at IS NULL",
+            )
+            .bind(record_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| Error::conflict(format!("{TOOL}: record {record_id} does not exist")))?;
+        let (current_name, current_summary, record_type, record_kind) = current;
         let mut ops = Vec::new();
-        for (_, key, value) in parsed.iter().filter(|(id, _, _)| id == record_id) {
-            let before = if *key == "name" {
-                json!(current_name.clone())
-            } else {
-                json!(current_summary.clone())
-            };
-            let existing = if *key == "name" {
-                current_name.as_str()
-            } else {
-                current_summary.as_deref().unwrap_or("")
-            };
-            // The signed `before` carries the exact stored value, so an
-            // oversized stored field is refused like an oversized proposal: no
-            // clipping of semantic fields, ever.
-            if existing.chars().count() > SQL_WRITE_MAX_VALUE_CHARS {
-                return Err(Error::conflict(format!(
-                    "{TOOL}: existing {key} exceeds {SQL_WRITE_MAX_VALUE_CHARS} characters; the preview bound covers the replaced value too"
-                )));
+        for parsed_op in parsed.iter().filter(|op| &op.record_id == record_id) {
+            match parsed_op.kind {
+                SqlWriteOpKind::SetField => {
+                    let before = if parsed_op.key == "name" {
+                        json!(current_name.clone())
+                    } else {
+                        json!(current_summary.clone())
+                    };
+                    let existing = if parsed_op.key == "name" {
+                        current_name.as_str()
+                    } else {
+                        current_summary.as_deref().unwrap_or("")
+                    };
+                    // The signed `before` carries the exact stored value, so an
+                    // oversized stored field is refused like an oversized
+                    // proposal: no clipping of semantic fields, ever.
+                    if existing.chars().count() > SQL_WRITE_MAX_VALUE_CHARS {
+                        return Err(Error::conflict(format!(
+                            "{TOOL}: existing {} exceeds {SQL_WRITE_MAX_VALUE_CHARS} characters; the preview bound covers the replaced value too",
+                            parsed_op.key
+                        )));
+                    }
+                    let after = json!(parsed_op.value);
+                    ops.push(SqlWriteResolvedOp {
+                        kind: SqlWriteOpKind::SetField,
+                        key: parsed_op.key.clone(),
+                        value: parsed_op.value.clone(),
+                        before: before.clone(),
+                        after: after.clone(),
+                        before_vocab_ref: None,
+                        after_vocab_ref: None,
+                        changed: before != after,
+                        link: None,
+                    });
+                }
+                SqlWriteOpKind::SetFacet => {
+                    // Exact parity with `update_record.facets`: a Message's
+                    // sender-authored expectation facet is immutable in place.
+                    if parsed_op.key == crate::message_expectation::EXPECTATION_FACET_KEY
+                        && record_type == "Message"
+                    {
+                        return Err(Error::conflict(format!(
+                            "{TOOL}: Message expectation is immutable sender-authored content; create a superseding Message to correct it"
+                        )));
+                    }
+                    let op = resolve_sql_write_facet(
+                        &mut tx,
+                        schema_rows
+                            .as_ref()
+                            .expect("a facet row implies schema rows were read"),
+                        record_id,
+                        &record_type,
+                        record_kind.as_deref(),
+                        &parsed_op.key,
+                        &parsed_op.value,
+                    )
+                    .await?;
+                    ops.push(op);
+                }
+                SqlWriteOpKind::UnsetFacet => {
+                    // Exact parity with `update_record.facets` explicit-null
+                    // unset: a Message's expectation facet is immutable in
+                    // place, whether set or cleared.
+                    if parsed_op.key == crate::message_expectation::EXPECTATION_FACET_KEY
+                        && record_type == "Message"
+                    {
+                        return Err(Error::conflict(format!(
+                            "{TOOL}: Message expectation is immutable sender-authored content; create a superseding Message to correct it"
+                        )));
+                    }
+                    let op = resolve_sql_write_facet_unset(
+                        &mut tx,
+                        schema_rows
+                            .as_ref()
+                            .expect("a facet row implies schema rows were read"),
+                        record_id,
+                        &record_type,
+                        record_kind.as_deref(),
+                        &parsed_op.key,
+                    )
+                    .await?;
+                    ops.push(op);
+                }
+                SqlWriteOpKind::Archive => {
+                    // Lifecycle transition, never a facet assertion: the signed
+                    // before/after are the exact archived state read in this
+                    // snapshot, and the proposed event matches `archive_record`
+                    // (`facet.set` on the engine-reserved `archived` key). An
+                    // already-archived target signs `changed:false`.
+                    ops.push(SqlWriteResolvedOp {
+                        kind: SqlWriteOpKind::Archive,
+                        key: SQL_WRITE_ARCHIVE_KEY.to_string(),
+                        value: "true".to_string(),
+                        before: json!(was_archived),
+                        after: json!(true),
+                        before_vocab_ref: None,
+                        after_vocab_ref: None,
+                        changed: !was_archived,
+                        link: None,
+                    });
+                }
+                SqlWriteOpKind::AddLink => {
+                    // Directed `legacy_link.v1` compatibility proposition,
+                    // resolved in this same transaction. A re-add is never a
+                    // no-op: it appends another support assertion, and the
+                    // passed note is ignored by the singular route.
+                    ops.push(
+                        resolve_sql_write_add_link(
+                            &mut tx,
+                            caller,
+                            record_id,
+                            previous_seq,
+                            &parsed_op.value,
+                            args.link_note.as_deref(),
+                        )
+                        .await?,
+                    );
+                }
+                SqlWriteOpKind::RemoveLink => {
+                    // Directed `legacy_link.v1` compatibility contest, resolved
+                    // in this same transaction. Absent or inactive propositions
+                    // refuse rather than previewing a no-op, exactly as the
+                    // singular remove route does.
+                    ops.push(
+                        resolve_sql_write_remove_link(
+                            &mut tx,
+                            caller,
+                            record_id,
+                            previous_seq,
+                            &parsed_op.value,
+                        )
+                        .await?,
+                    );
+                }
             }
-            let after = json!(value);
-            ops.push(SqlWriteResolvedOp {
-                key,
-                value: value.clone(),
-                before: before.clone(),
-                after: after.clone(),
-                changed: before != after,
-            });
         }
         targets.push(SqlWriteTarget {
             record_id: record_id.clone(),
@@ -1286,14 +1980,113 @@ async fn prepare_sql_write_preview(
             .ops
             .iter()
             .map(|op| {
-                json!({
-                    "op": "set_field",
-                    "key": op.key,
-                    "value": &op.value,
-                    "before": &op.before,
-                    "after": &op.after,
-                    "changed": op.changed,
-                })
+                // Field operations keep exactly their pre-facet keys; facet
+                // operations add the two exact vocabulary references. Archive is
+                // deliberately its own shape: the typed row's `key`/`value` were
+                // SQL NULL, so the effect signs the exact archived before/after
+                // rather than inventing a facet payload.
+                match op.kind {
+                    SqlWriteOpKind::SetField => json!({
+                        "op": op.kind.as_str(),
+                        "key": &op.key,
+                        "value": &op.value,
+                        "before": &op.before,
+                        "after": &op.after,
+                        "changed": op.changed,
+                    }),
+                    SqlWriteOpKind::SetFacet => json!({
+                        "op": op.kind.as_str(),
+                        "key": &op.key,
+                        "value": &op.value,
+                        "before": &op.before,
+                        "after": &op.after,
+                        "before_vocab_ref": &op.before_vocab_ref,
+                        "after_vocab_ref": &op.after_vocab_ref,
+                        "changed": op.changed,
+                    }),
+                    // An unset carries a SQL NULL value by construction, so
+                    // the effect signs an explicit null `value`/`after`/
+                    // `after_vocab_ref`; `before`/`before_vocab_ref` sign the
+                    // exact current absence or stored pair.
+                    SqlWriteOpKind::UnsetFacet => json!({
+                        "op": op.kind.as_str(),
+                        "key": &op.key,
+                        "value": Value::Null,
+                        "before": &op.before,
+                        "after": Value::Null,
+                        "before_vocab_ref": &op.before_vocab_ref,
+                        "after_vocab_ref": Value::Null,
+                        "changed": op.changed,
+                    }),
+                    SqlWriteOpKind::Archive => json!({
+                        "op": op.kind.as_str(),
+                        "before": &op.before,
+                        "after": &op.after,
+                        "changed": op.changed,
+                    }),
+                    SqlWriteOpKind::AddLink => {
+                        let link = op
+                            .link
+                            .as_ref()
+                            .expect("add_link op carries its resolved link detail");
+                        json!({
+                            "op": op.kind.as_str(),
+                            "relationship": &op.key,
+                            "route": link.route,
+                            "source_id": &link.source_id,
+                            "source_previous_seq": link.source_previous_seq,
+                            "target_id": &link.target_id,
+                            "target_previous_seq": link.target_previous_seq,
+                            "proposition_key": &link.proposition_key,
+                            "existing": link.existing.as_ref().map(|existing| json!({
+                                "relationship_id": &existing.relationship_id,
+                                "status": &existing.status,
+                                "effective_state": &existing.effective_state,
+                                "epistemic_state": &existing.epistemic_state,
+                                "assertion_set_digest": &existing.assertion_set_digest,
+                                "support_count": existing.support_count,
+                                "contest_count": existing.contest_count,
+                            })),
+                            "intent": link.intent,
+                            "note": &link.note,
+                            "note_applied": link.note_applied,
+                            "changed": op.changed,
+                        })
+                    }
+                    SqlWriteOpKind::RemoveLink => {
+                        // Same signed shape as an add: the observed before
+                        // state plus the guaranteed contest intent. A removal
+                        // carries no note, so both note fields sign their
+                        // absent values rather than being omitted.
+                        let link = op
+                            .link
+                            .as_ref()
+                            .expect("remove_link op carries its resolved link detail");
+                        json!({
+                            "op": op.kind.as_str(),
+                            "relationship": &op.key,
+                            "route": link.route,
+                            "source_id": &link.source_id,
+                            "source_previous_seq": link.source_previous_seq,
+                            "target_id": &link.target_id,
+                            "target_previous_seq": link.target_previous_seq,
+                            "proposition_key": &link.proposition_key,
+                            "existing": link.existing.as_ref().map(|existing| json!({
+                                "relationship_id": &existing.relationship_id,
+                                "status": &existing.status,
+                                "effective_state": &existing.effective_state,
+                                "epistemic_state": &existing.epistemic_state,
+                                "assertion_set_digest": &existing.assertion_set_digest,
+                                "support_count": existing.support_count,
+                                "contest_count": existing.contest_count,
+                            })),
+                            "intent": link.intent,
+                            "note": &link.note,
+                            "note_applied": link.note_applied,
+                            "changed": op.changed,
+                        })
+                    }
+                }
             })
             .collect();
         effect_targets.push(json!({
@@ -1317,13 +2110,22 @@ async fn prepare_sql_write_preview(
     } else {
         None
     };
+    let mut canonical_arguments = json!({
+        "statement": &args.statement,
+        "parameters": &args.parameters,
+        "reason": &args.reason,
+        "expected_version": canonical_expected_version,
+    });
+    // Only present when supplied, so a link-free envelope canonicalizes to the
+    // exact four-field object it always did. A link selection carries its note
+    // here and into the signed revalidation arguments, so re-adding with a
+    // different note is a different plan even though the singular route ignores
+    // that note when the proposition already exists.
+    if let Some(note) = args.link_note.as_deref() {
+        canonical_arguments["link_note"] = json!(note);
+    }
     let preparation = SqlWritePreparation {
-        canonical_source_arguments: json!({
-            "statement": &args.statement,
-            "parameters": &args.parameters,
-            "reason": &args.reason,
-            "expected_version": canonical_expected_version,
-        }),
+        canonical_source_arguments: canonical_arguments,
         // A single target keeps its real record ID (unchanged from the
         // one-row contract). A multi-target plan has no single record ID, so
         // it uses a deterministic namespaced digest of the sorted set rather
@@ -1345,6 +2147,529 @@ async fn prepare_sql_write_preview(
     };
     tx.rollback().await?;
     Ok(preparation)
+}
+
+/// Resolve one `set_facet` operation against one target's current state in the
+/// same governed transaction.
+///
+/// Reuses the singular `update_record.facets` semantics: the open-key guard is
+/// applied at parse time, the shared schema/vocabulary fold derives the exact
+/// post-governance `vocab_ref`, and the signed `(value, vocab_ref)` pair is
+/// compared for `changed`, so a value-equal but reference-different write is
+/// not mistaken for a no-op. Stored and derived text is bounded before it is
+/// signed. Appends no event.
+async fn resolve_sql_write_facet(
+    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    schema_rows: &[crate::query::cascade::SchemaConfigRow],
+    record_id: &str,
+    record_type: &str,
+    record_kind: Option<&str>,
+    key: &str,
+    value: &str,
+) -> Result<SqlWriteResolvedOp> {
+    const TOOL: &str = "sql_write";
+    // Current-state read in the same snapshot; mirrors `facet_state_in`.
+    let current: Option<(String, Option<String>)> =
+        sqlx::query_as("SELECT value, vocab_ref FROM facet_values WHERE record_id = ? AND key = ?")
+            .bind(record_id)
+            .bind(key)
+            .fetch_optional(&mut **tx)
+            .await?;
+    if let Some((stored, _)) = &current {
+        if stored.chars().count() > SQL_WRITE_MAX_VALUE_CHARS {
+            return Err(Error::conflict(format!(
+                "{TOOL}: existing facet '{key}' exceeds {SQL_WRITE_MAX_VALUE_CHARS} characters; the preview bound covers the replaced value too"
+            )));
+        }
+    }
+    if let Some(vocab_ref) = current
+        .as_ref()
+        .and_then(|(_, vocab_ref)| vocab_ref.as_ref())
+    {
+        if vocab_ref.chars().count() > SQL_WRITE_MAX_VOCAB_REF_CHARS {
+            return Err(Error::conflict(format!(
+                "{TOOL}: existing facet '{key}' vocabulary reference exceeds {SQL_WRITE_MAX_VOCAB_REF_CHARS} characters"
+            )));
+        }
+    }
+    // A string-only typed row never supplies a vocab_ref; the shared fold
+    // derives the canonical one from the facet's governing vocabulary, exactly
+    // as `update_record.facets` does.
+    let mut facet = crate::domain_transaction::FacetWrite {
+        key: key.to_string(),
+        value: Value::String(value.to_string()),
+        vocab_ref: None,
+        time_type: None,
+    };
+    {
+        let mut executor = crate::portable_sql::BorrowedSqliteStatementExecutor::new(&mut *tx);
+        crate::domain_transaction::govern_facet_writes(
+            &mut executor,
+            schema_rows,
+            TOOL,
+            record_type,
+            record_kind,
+            std::slice::from_mut(&mut facet),
+        )
+        .await
+        .map_err(|error| match error {
+            // The shared governance fold reports rejected shape and vocabulary
+            // rules as Engine. During revalidation those are changed plan facts.
+            // Preserve transport and storage failures as infrastructure errors.
+            Error::Engine(message) => Error::conflict(message),
+            other => other,
+        })?;
+    }
+    if let Some(vocab_ref) = &facet.vocab_ref {
+        if vocab_ref.chars().count() > SQL_WRITE_MAX_VOCAB_REF_CHARS {
+            return Err(Error::conflict(format!(
+                "{TOOL}: facet '{key}' governing vocabulary reference exceeds {SQL_WRITE_MAX_VOCAB_REF_CHARS} characters"
+            )));
+        }
+    }
+    let before = current.as_ref().map(|(stored, _)| stored.clone());
+    let before_vocab_ref = current
+        .as_ref()
+        .and_then(|(_, vocab_ref)| vocab_ref.clone());
+    let changed = (before.as_deref(), before_vocab_ref.as_deref())
+        != (Some(value), facet.vocab_ref.as_deref());
+    Ok(SqlWriteResolvedOp {
+        kind: SqlWriteOpKind::SetFacet,
+        key: key.to_string(),
+        value: value.to_string(),
+        before: match before {
+            Some(stored) => json!(stored),
+            None => Value::Null,
+        },
+        after: json!(value),
+        before_vocab_ref,
+        after_vocab_ref: facet.vocab_ref.clone(),
+        changed,
+        link: None,
+    })
+}
+
+/// Resolve one `unset_facet` operation against one target's current state in
+/// the same governed transaction.
+///
+/// Mirrors the singular `update_record.facets` explicit-null unset: the
+/// open-key guard is applied at parse time, the current `(value, vocab_ref)`
+/// pair is read in this snapshot, and `changed` is whether a facet row
+/// exists. A present facet prepares `changed:true` with the exact stored
+/// before pair; an absent facet prepares `changed:false` because the projected
+/// facet state would stay absent. The singular route still appends an unset
+/// event for that case. A present required open facet refuses rather
+/// than signing a new required violation, matching `required_violations_in`
+/// before/after plus `assert_required_not_worsened` without mutating to
+/// simulate: presence implies no current violation for this key, so clearing
+/// it would introduce one. No vocabulary governance runs (there is no
+/// desired value to govern). Appends no event.
+async fn resolve_sql_write_facet_unset(
+    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    schema_rows: &[crate::query::cascade::SchemaConfigRow],
+    record_id: &str,
+    record_type: &str,
+    record_kind: Option<&str>,
+    key: &str,
+) -> Result<SqlWriteResolvedOp> {
+    const TOOL: &str = "sql_write";
+    let current: Option<(String, Option<String>)> =
+        sqlx::query_as("SELECT value, vocab_ref FROM facet_values WHERE record_id = ? AND key = ?")
+            .bind(record_id)
+            .bind(key)
+            .fetch_optional(&mut **tx)
+            .await?;
+    if let Some((stored, _)) = &current {
+        if stored.chars().count() > SQL_WRITE_MAX_VALUE_CHARS {
+            return Err(Error::conflict(format!(
+                "{TOOL}: existing facet '{key}' exceeds {SQL_WRITE_MAX_VALUE_CHARS} characters; the preview bound covers the replaced value too"
+            )));
+        }
+    }
+    if let Some(vocab_ref) = current
+        .as_ref()
+        .and_then(|(_, vocab_ref)| vocab_ref.as_ref())
+    {
+        if vocab_ref.chars().count() > SQL_WRITE_MAX_VOCAB_REF_CHARS {
+            return Err(Error::conflict(format!(
+                "{TOOL}: existing facet '{key}' vocabulary reference exceeds {SQL_WRITE_MAX_VOCAB_REF_CHARS} characters"
+            )));
+        }
+    }
+    let changed = current.is_some();
+    if changed {
+        let shapes = crate::query::cascade::facets_for_record_context(
+            schema_rows,
+            record_type,
+            record_kind,
+            None,
+        );
+        if shapes
+            .get(key)
+            .is_some_and(|shape| shape.get("required") == Some(&Value::Bool(true)))
+        {
+            let kind_suffix = record_kind
+                .map(|kind| format!(":{kind}"))
+                .unwrap_or_default();
+            return Err(Error::conflict(format!(
+                "{TOOL}: batch would worsen required-facet conformance: record {record_id} missing required facet '{key}' for {record_type}{kind_suffix}"
+            )));
+        }
+    }
+    let (before, before_vocab_ref) = match current {
+        Some((stored, vocab_ref)) => (json!(stored), vocab_ref),
+        None => (Value::Null, None),
+    };
+    Ok(SqlWriteResolvedOp {
+        kind: SqlWriteOpKind::UnsetFacet,
+        key: key.to_string(),
+        value: String::new(),
+        before,
+        after: Value::Null,
+        before_vocab_ref,
+        after_vocab_ref: None,
+        changed,
+        link: None,
+    })
+}
+
+/// Resolve one `add_link` row into the guaranteed directed `legacy_link.v1`
+/// mutation intent, read entirely inside the governed preparation
+/// transaction.
+///
+/// Mirrors `manage_links.add`'s relationship-owned route in this same
+/// snapshot: `assert_bearer_immutable_on`, the relationship/content classifier
+/// (`relationship_owned_in`), `View(target)`, both endpoint content seqs, the
+/// canonical proposition key, and the `relationships`/`effective_relationships`
+/// probe. A retired proposition refuses exactly as the singular route does.
+///
+/// The signed evidence is the *observed before state* plus the guaranteed
+/// intent: a new proposition would be created (the note is effective), or an
+/// existing active proposition would gain another support assertion (the note
+/// is ignored). It never invents a projected post-append `effective_state`:
+/// appending support can leave effective/epistemic state and both endpoint seqs
+/// unchanged, so the assertion-set digest and support/contest counts are signed
+/// to make that drift revalidate as `plan_stale`.
+async fn resolve_sql_write_add_link(
+    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    caller: &Caller,
+    source_id: &str,
+    source_previous_seq: i64,
+    target_id: &str,
+    note: Option<&str>,
+) -> Result<SqlWriteResolvedOp> {
+    const TOOL: &str = "sql_write";
+    super::super::tools::require_record_in(
+        tx,
+        caller,
+        TOOL,
+        target_id,
+        crate::authorization::Capability::View,
+    )
+    .await
+    .map_err(|error| match error {
+        Error::Sqlx(_) => error,
+        other => Error::conflict(other.to_string()),
+    })?;
+    // `manage_links.add` checks `assert_bearer_immutable_on(source)` before the
+    // route classifier; the relationship-owned path never reaches the
+    // content-owned `link.added` fallback, which `relationship_owned_in`
+    // rejects below. Storage failures stay non-stale (`Sqlx` is preserved);
+    // only a semantic bearer refusal is drift.
+    crate::comments::assert_bearer_immutable_on(tx, TOOL, source_id, SQL_WRITE_ADD_LINK_KEY)
+        .await
+        .map_err(|error| match error {
+            Error::Sqlx(_) => error,
+            other => Error::conflict(other.to_string()),
+        })?;
+    let relationship_owned = crate::mcp::tools::links::relationship_owned_in(
+        tx,
+        source_id,
+        target_id,
+        SQL_WRITE_ADD_LINK_KEY,
+    )
+    .await?;
+    if !relationship_owned {
+        // A Message endpoint or a content-owned token takes the singular
+        // `link.added` fallback, whose event semantics differ; this preview
+        // refuses that route rather than signing a link event it cannot mirror.
+        return Err(Error::conflict(format!(
+            "{TOOL}: add_link {SQL_WRITE_ADD_LINK_KEY} from {source_id} to {target_id} is content-owned; the directed compatibility relationship route is required"
+        )));
+    }
+    let target_previous_seq = super::super::tools::previous_record_seq_in(tx, target_id)
+        .await?
+        .ok_or_else(|| {
+            Error::conflict(format!("{TOOL}: link target {target_id} does not exist"))
+        })?;
+    let origin: String =
+        sqlx::query_scalar("SELECT origin_db_id FROM database_identity WHERE singleton=1")
+            .fetch_one(&mut **tx)
+            .await?;
+    let source_ref = crate::identity::encode_native_record(&origin, source_id)?;
+    let target_ref = crate::identity::encode_native_record(&origin, target_id)?;
+    let proposition = crate::relationship::legacy::proposition_key(
+        &source_ref,
+        &target_ref,
+        SQL_WRITE_ADD_LINK_KEY,
+    );
+    // The same probe `mutate_with_reserved_attestation_in` runs
+    // (`legacy.rs`): look up the proposition by origin, definition, and
+    // canonical key, then read its receiver-local reduction. `assertion_set_digest`
+    // and the counts are what move when another support assertion is appended.
+    type ExistingRelationshipRow = (
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        Option<i64>,
+    );
+    let existing: Option<ExistingRelationshipRow> = sqlx::query_as(
+        "SELECT r.relationship_id,r.status,e.effective_state,e.epistemic_state,
+                    e.assertion_set_digest,e.support_count,e.contest_count
+               FROM relationships r LEFT JOIN effective_relationships e
+                 ON e.relationship_origin_db_id=r.relationship_origin_db_id
+                AND e.relationship_id=r.relationship_id
+              WHERE r.relationship_origin_db_id=? AND r.type_definition_id=?
+                AND r.canonical_proposition_key=?",
+    )
+    .bind(&origin)
+    .bind(crate::relationship::legacy::LEGACY_LINK_DEFINITION_ID)
+    .bind(&proposition)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let existing = match existing {
+        None => None,
+        Some((
+            relationship_id,
+            status,
+            effective_state,
+            epistemic_state,
+            assertion_set_digest,
+            support_count,
+            contest_count,
+        )) => {
+            // Exactly the singular refusal: a retired proposition is not
+            // re-addable through the compatibility route.
+            if status != "active" {
+                return Err(Error::conflict(format!(
+                    "{TOOL}: compatibility relationship is retired; use manage_relationships"
+                )));
+            }
+            Some(SqlWriteObservedRelationship {
+                relationship_id,
+                status,
+                effective_state,
+                epistemic_state,
+                assertion_set_digest,
+                support_count,
+                contest_count,
+            })
+        }
+    };
+    let intent = if existing.is_some() {
+        SQL_WRITE_LINK_INTENT_APPEND
+    } else {
+        SQL_WRITE_LINK_INTENT_CREATE
+    };
+    // The note is written only when a relationship is created (create-time /
+    // first-wins). Appending support ignores it, exactly as the singular path.
+    let note_applied = existing.is_none() && note.is_some();
+    Ok(SqlWriteResolvedOp {
+        kind: SqlWriteOpKind::AddLink,
+        key: SQL_WRITE_ADD_LINK_KEY.to_string(),
+        value: target_id.to_string(),
+        before: Value::Null,
+        after: Value::Null,
+        before_vocab_ref: None,
+        after_vocab_ref: None,
+        // A link add is never a no-op: it creates a proposition or appends a
+        // support assertion.
+        changed: true,
+        link: Some(SqlWriteResolvedLink {
+            route: SQL_WRITE_LINK_ROUTE,
+            source_id: source_id.to_string(),
+            source_previous_seq,
+            target_id: target_id.to_string(),
+            target_previous_seq,
+            proposition_key: proposition,
+            existing,
+            intent,
+            note: note.map(str::to_string),
+            note_applied,
+        }),
+    })
+}
+
+/// Resolve one `remove_link` row into the guaranteed directed `legacy_link.v1`
+/// contest intent, read entirely inside the governed preparation transaction.
+///
+/// Mirrors `manage_links.remove`'s relationship-owned route in this same
+/// snapshot, in the singular order: `View(target)`,
+/// `assert_bearer_immutable_on(source)`, the relationship/content classifier
+/// (`relationship_owned_in`), both endpoint content seqs, the canonical
+/// proposition key, and the `relationships`/`effective_relationships` probe.
+/// Absent, inactive, retired, and content-owned propositions refuse exactly as
+/// the singular route does, so each of those drifts revalidates as
+/// `plan_stale`.
+///
+/// The signed evidence is the *observed before state* plus the guaranteed
+/// `would_contest` intent. It never invents a projected post-contest
+/// `effective_state`: contesting can leave effective/epistemic state and both
+/// endpoint seqs unchanged, so the assertion-set digest and support/contest
+/// counts are signed to make that drift observable on revalidation. A removal
+/// carries no note: the singular route passes `None` unconditionally.
+async fn resolve_sql_write_remove_link(
+    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    caller: &Caller,
+    source_id: &str,
+    source_previous_seq: i64,
+    target_id: &str,
+) -> Result<SqlWriteResolvedOp> {
+    const TOOL: &str = "sql_write";
+    super::super::tools::require_record_in(
+        tx,
+        caller,
+        TOOL,
+        target_id,
+        crate::authorization::Capability::View,
+    )
+    .await
+    .map_err(|error| match error {
+        Error::Sqlx(_) => error,
+        other => Error::conflict(other.to_string()),
+    })?;
+    // `manage_links.remove` checks `assert_bearer_immutable_on(source)` before
+    // the route classifier; the relationship-owned path never reaches the
+    // content-owned `link.removed` fallback, which `relationship_owned_in`
+    // rejects below. Storage failures stay non-stale (`Sqlx` is preserved);
+    // only a semantic bearer refusal is drift.
+    crate::comments::assert_bearer_immutable_on(tx, TOOL, source_id, SQL_WRITE_ADD_LINK_KEY)
+        .await
+        .map_err(|error| match error {
+            Error::Sqlx(_) => error,
+            other => Error::conflict(other.to_string()),
+        })?;
+    let relationship_owned = crate::mcp::tools::links::relationship_owned_in(
+        tx,
+        source_id,
+        target_id,
+        SQL_WRITE_ADD_LINK_KEY,
+    )
+    .await?;
+    if !relationship_owned {
+        // A Message endpoint or a content-owned token takes the singular
+        // `link.removed` content-event fallback, whose event semantics differ;
+        // this preview refuses that route rather than signing a relationship
+        // contest it cannot mirror.
+        return Err(Error::conflict(format!(
+            "{TOOL}: remove_link {SQL_WRITE_ADD_LINK_KEY} from {source_id} to {target_id} is content-owned; the directed compatibility relationship route is required"
+        )));
+    }
+    let target_previous_seq = super::super::tools::previous_record_seq_in(tx, target_id)
+        .await?
+        .ok_or_else(|| {
+            Error::conflict(format!("{TOOL}: link target {target_id} does not exist"))
+        })?;
+    let origin: String =
+        sqlx::query_scalar("SELECT origin_db_id FROM database_identity WHERE singleton=1")
+            .fetch_one(&mut **tx)
+            .await?;
+    let source_ref = crate::identity::encode_native_record(&origin, source_id)?;
+    let target_ref = crate::identity::encode_native_record(&origin, target_id)?;
+    let proposition = crate::relationship::legacy::proposition_key(
+        &source_ref,
+        &target_ref,
+        SQL_WRITE_ADD_LINK_KEY,
+    );
+    // The same probe `mutate_with_reserved_attestation_in` runs for a removal
+    // (`legacy.rs`): look up the proposition by origin, definition, and
+    // canonical key, then read its receiver-local reduction. `assertion_set_digest`
+    // and the counts are what move when another contest assertion is appended.
+    type ExistingRelationshipRow = (
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        Option<i64>,
+    );
+    let existing: Option<ExistingRelationshipRow> = sqlx::query_as(
+        "SELECT r.relationship_id,r.status,e.effective_state,e.epistemic_state,
+                    e.assertion_set_digest,e.support_count,e.contest_count
+               FROM relationships r LEFT JOIN effective_relationships e
+                 ON e.relationship_origin_db_id=r.relationship_origin_db_id
+                AND e.relationship_id=r.relationship_id
+              WHERE r.relationship_origin_db_id=? AND r.type_definition_id=?
+                AND r.canonical_proposition_key=?",
+    )
+    .bind(&origin)
+    .bind(crate::relationship::legacy::LEGACY_LINK_DEFINITION_ID)
+    .bind(&proposition)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some((
+        relationship_id,
+        status,
+        effective_state,
+        epistemic_state,
+        assertion_set_digest,
+        support_count,
+        contest_count,
+    )) = existing
+    else {
+        // Exactly the singular refusal: nothing to contest.
+        return Err(Error::conflict(format!(
+            "{TOOL}: cannot remove link: no '{SQL_WRITE_ADD_LINK_KEY}' link from {source_id} to {target_id}"
+        )));
+    };
+    // Exactly the singular refusal: only an active proposition can be
+    // contested through the compatibility route.
+    if effective_state.as_deref() != Some("active") {
+        return Err(Error::conflict(format!(
+            "{TOOL}: compatibility state is inactive or causally unresolved; use manage_relationships to inspect the assertion frontier"
+        )));
+    }
+    if status != "active" {
+        return Err(Error::conflict(format!(
+            "{TOOL}: compatibility relationship is retired; use manage_relationships"
+        )));
+    }
+    Ok(SqlWriteResolvedOp {
+        kind: SqlWriteOpKind::RemoveLink,
+        key: SQL_WRITE_ADD_LINK_KEY.to_string(),
+        value: target_id.to_string(),
+        before: Value::Null,
+        after: Value::Null,
+        before_vocab_ref: None,
+        after_vocab_ref: None,
+        // A link removal is never a no-op: absent or inactive propositions
+        // refuse above, so reaching here always appends a contest assertion.
+        changed: true,
+        link: Some(SqlWriteResolvedLink {
+            route: SQL_WRITE_LINK_ROUTE,
+            source_id: source_id.to_string(),
+            source_previous_seq,
+            target_id: target_id.to_string(),
+            target_previous_seq,
+            proposition_key: proposition,
+            existing: Some(SqlWriteObservedRelationship {
+                relationship_id,
+                status,
+                effective_state,
+                epistemic_state,
+                assertion_set_digest,
+                support_count,
+                contest_count,
+            }),
+            intent: SQL_WRITE_LINK_INTENT_CONTEST,
+            note: None,
+            note_applied: false,
+        }),
+    })
 }
 
 async fn prepare_operation(
@@ -1911,6 +3236,11 @@ impl ExecutorPrototypeStdioServer {
         envelope: Value,
         telemetry_request: Option<super::telemetry::TelemetryRequest>,
     ) -> Value {
+        // Dispatch refuses standby mutations before plan access; this fails
+        // the same closed refusal if a plan path is ever reached without one.
+        let Some(write_runtime) = self.write_runtime.as_ref() else {
+            return self.standby_read_only_response(id, modern, &envelope).await;
+        };
         let started = Instant::now();
         let mut format_arguments = envelope.clone();
         if let Err(error) = render::take_format("executor_write_plan", &mut format_arguments) {
@@ -2085,10 +3415,8 @@ impl ExecutorPrototypeStdioServer {
             contract_digest: contract.digest.clone(),
             catalogue_digest: self.manifest_digest.clone(),
             server_version: server_version(),
-            expires_at_ms: created_at_ms.saturating_add(
-                self.write_runtime
-                    .ttl_for(&contract.executor, &contract.operation),
-            ),
+            expires_at_ms: created_at_ms
+                .saturating_add(write_runtime.ttl_for(&contract.executor, &contract.operation)),
             nonce: Uuid::new_v4().to_string(),
             signing_key_id: String::new(),
             integrity: String::new(),
@@ -2153,7 +3481,7 @@ impl ExecutorPrototypeStdioServer {
                     .await
             }
         };
-        plan.signing_key_id = match self.write_runtime.store.active_key_id().await {
+        plan.signing_key_id = match write_runtime.store.active_key_id().await {
             Ok(key_id) => key_id,
             Err(error) => {
                 return self
@@ -2168,8 +3496,7 @@ impl ExecutorPrototypeStdioServer {
                     .await
             }
         };
-        plan.integrity = match self
-            .write_runtime
+        plan.integrity = match write_runtime
             .store
             .seal(&plan.signing_key_id, &integrity_payload(&plan))
             .await
@@ -2239,8 +3566,7 @@ impl ExecutorPrototypeStdioServer {
         };
         let expires_at_ms = plan.expires_at_ms;
         let signing_key_id = plan.signing_key_id.clone();
-        if let Err(error) = self
-            .write_runtime
+        if let Err(error) = write_runtime
             .store
             .insert_prepared(
                 &plan_id,
@@ -2347,7 +3673,12 @@ impl ExecutorPrototypeStdioServer {
         telemetry_request: Option<&super::telemetry::TelemetryRequest>,
         started: Instant,
     ) -> Value {
-        let reloaded = match self.write_runtime.store.load(plan_id, now_ms()).await {
+        let Some(write_runtime) = self.write_runtime.as_ref() else {
+            return self.standby_read_only_response(id, modern, envelope).await;
+        };
+        #[cfg(test)]
+        wait_sql_reload_gate(&plan.executor).await;
+        let reloaded = match write_runtime.store.load(plan_id, now_ms()).await {
             Ok(Some(reloaded)) => reloaded,
             Ok(None) => {
                 return self
@@ -2530,6 +3861,9 @@ impl ExecutorPrototypeStdioServer {
         telemetry_request: Option<super::telemetry::TelemetryRequest>,
         persistence_lease: Option<DeploymentPersistenceLease>,
     ) -> Value {
+        let Some(write_runtime) = self.write_runtime.as_ref() else {
+            return self.standby_read_only_response(id, modern, &envelope).await;
+        };
         let started = Instant::now();
         let mut format_arguments = envelope.clone();
         if let Err(error) = render::take_format("executor_write_plan", &mut format_arguments) {
@@ -2611,7 +3945,7 @@ impl ExecutorPrototypeStdioServer {
                     .await
             }
         };
-        let stored = match self.write_runtime.store.load(&plan_id, now_ms()).await {
+        let stored = match write_runtime.store.load(&plan_id, now_ms()).await {
             Ok(Some(plan)) => plan,
             Ok(None) => {
                 return self
@@ -2727,7 +4061,7 @@ impl ExecutorPrototypeStdioServer {
                 )
                 .await;
         }
-        if let Err(error) = self.write_runtime.verify(&plan).await {
+        if let Err(error) = write_runtime.verify(&plan).await {
             return self
                 .write_plan_error(
                     id,
@@ -2809,7 +4143,7 @@ impl ExecutorPrototypeStdioServer {
             StoredState::Prepared => {}
         }
         #[cfg(test)]
-        if let Some(gate) = &self.write_runtime.revalidation_gate {
+        if let Some(gate) = &write_runtime.revalidation_gate {
             gate.entered.add_permits(1);
             let permit = gate
                 .release
@@ -2817,6 +4151,35 @@ impl ExecutorPrototypeStdioServer {
                 .await
                 .expect("revalidation gate open");
             permit.forget();
+        }
+        if plan.executor == SQL_WRITE_EXECUTOR
+            && plan.operation == SQL_WRITE_OPERATION
+            && plan
+                .revalidation_arguments
+                .get("selection_contract")
+                .is_some()
+            && !selected::supported_evidence(&plan.operation_evidence)
+        {
+            return self
+                .write_revalidation_error_or_advanced(
+                    RevalidationContext {
+                        id,
+                        modern,
+                        contract: &contract,
+                        envelope: &envelope,
+                        plan_id: &plan_id,
+                        initially_loaded: &stored,
+                        plan: &plan,
+                        telemetry_request: telemetry_request.as_ref(),
+                        started,
+                    },
+                    PlanError::new(
+                        "plan_contract_mismatch",
+                        "unsupported or missing selection evidence version; prepare again",
+                        false,
+                    ),
+                )
+                .await;
         }
         let current = prepare_operation(
             &self.engine,
@@ -2832,9 +4195,9 @@ impl ExecutorPrototypeStdioServer {
             Err(error) => {
                 // Preview-only SQL writes classify drift by error type, never
                 // by message: the preparer raises `Conflict` for selection,
-                // shape, visibility, authorization, version, and bound drift,
-                // while governed validator, engine, Sqlx, and digest failures
-                // stay non-stale. Every other pair keeps its existing
+                // shape, visibility, authorization, version, bound, and facet
+                // governance drift, while validator, storage, and digest
+                // failures stay non-stale. Every other pair keeps its existing
                 // diagnostic-substring classification untouched.
                 let code = if (plan.executor.as_str(), plan.operation.as_str())
                     == (SQL_WRITE_EXECUTOR, SQL_WRITE_OPERATION)
@@ -3007,7 +4370,11 @@ impl ExecutorPrototypeStdioServer {
         let attempt_id = if hosted_atomic_membership {
             Uuid::new_v4().to_string()
         } else {
-            match self.write_runtime.store.claim(&plan_id, now_ms()).await {
+            #[cfg(test)]
+            write_runtime
+                .claim_attempts
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            match write_runtime.store.claim(&plan_id, now_ms()).await {
                 Ok(ClaimOutcome::Claimed {
                     attempt_id,
                     plan: claimed,
@@ -3016,8 +4383,7 @@ impl ExecutorPrototypeStdioServer {
                         || claimed.key_id != stored.key_id
                         || claimed.catalogue_payload_sha256 != stored.catalogue_payload_sha256
                     {
-                        let _ = self
-                            .write_runtime
+                        let _ = write_runtime
                             .store
                             .mark_indeterminate(
                                 &plan_id,
@@ -3178,7 +4544,7 @@ impl ExecutorPrototypeStdioServer {
             params.insert("arguments".into(), legacy_arguments);
         }
         #[cfg(test)]
-        if let Some(gate) = &self.write_runtime.dispatch_gate {
+        if let Some(gate) = &write_runtime.dispatch_gate {
             gate.entered.add_permits(1);
             let permit = gate
                 .release
@@ -3224,6 +4590,10 @@ impl ExecutorPrototypeStdioServer {
             executor: plan.executor.clone(),
             operation: plan.operation.clone(),
         });
+        #[cfg(test)]
+        write_runtime
+            .dispatch_attempts
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let outcome = self
             .delegate_with_caller_and_persistence(message, caller, persistence_lease)
             .await;
@@ -3266,7 +4636,7 @@ impl ExecutorPrototypeStdioServer {
             }
         }
         if hosted_atomic_membership {
-            match self.write_runtime.store.load(&plan_id, now_ms()).await {
+            match write_runtime.store.load(&plan_id, now_ms()).await {
                 Ok(Some(StoredPlan {
                     state: StoredState::Executing { attempt_id: owner, .. },
                     ..
@@ -3441,14 +4811,12 @@ impl ExecutorPrototypeStdioServer {
         } else {
             stored_result.clone()
         };
-        if let Err(error) = self
-            .write_runtime
+        if let Err(error) = write_runtime
             .store
             .complete(&plan_id, &attempt_id, &persisted_result, now_ms())
             .await
         {
-            let _ = self
-                .write_runtime
+            let _ = write_runtime
                 .store
                 .mark_indeterminate(
                     &plan_id,
@@ -3592,7 +4960,12 @@ impl ExecutorPrototypeStdioServer {
             telemetry_request,
             started,
         } = context;
-        let reloaded = match self.write_runtime.store.load(plan_id, now_ms()).await {
+        let Some(write_runtime) = self.write_runtime.as_ref() else {
+            return self.standby_read_only_response(id, modern, envelope).await;
+        };
+        #[cfg(test)]
+        wait_sql_reload_gate(&plan.executor).await;
+        let reloaded = match write_runtime.store.load(plan_id, now_ms()).await {
             Ok(Some(reloaded)) => reloaded,
             Ok(None) => {
                 return self
@@ -4221,6 +5594,1262 @@ mod tests {
             None,
         )
         .expect_err("validate must surface the strict-field refusal");
+        // The directed note is a known field and survives canonicalization, but
+        // it never changes an unrelated field/facet/archive canonical shape.
+        let with_note = canonical_source_arguments(
+            SQL_WRITE_EXECUTOR,
+            SQL_WRITE_OPERATION,
+            json!({"statement": "SELECT 1", "reason": "probe", "link_note": "e0-harness"}),
+        )
+        .expect("link_note is a known field");
+        assert_eq!(with_note["link_note"], json!("e0-harness"));
+        validate(
+            SQL_WRITE_EXECUTOR,
+            SQL_WRITE_OPERATION,
+            json!({"statement": "SELECT 1", "reason": "probe", "link_note": "e0-harness"}),
+            None,
+        )
+        .expect("validate accepts the known link_note field");
+        let selected = json!({"selection_contract":"native.sql-write-selection.v1","folder_id":"c0510000-0000-4000-8000-000000000001","statement":"SELECT id FROM children WHERE archived=false","write":{"op":"archive"},"reason":"Canonical selected facade route."});
+        assert_eq!(
+            canonical_source_arguments(SQL_WRITE_EXECUTOR, SQL_WRITE_OPERATION, selected.clone())
+                .unwrap(),
+            selected
+        );
+        validate(SQL_WRITE_EXECUTOR, SQL_WRITE_OPERATION, selected, None).unwrap();
+    }
+
+    #[tokio::test]
+    async fn sql_selected_write_never_attempts_claim_or_dispatch_with_live_control() {
+        use std::sync::atomic::Ordering;
+        let db = create_database(":memory:").await.unwrap();
+        let folder = "ec00b000-0000-4000-8000-000000000bd1";
+        let target = "ec00b000-0000-4000-8000-000000000bd2";
+        // Independently fixed protocol probe manifest, public setup BEFORE compiler.
+        let mut r = ToolRegistry::new();
+        register_builtin_tools(&mut r).unwrap();
+        register_surface_tools(&mut r).unwrap();
+        let experimental =
+            crate::mcp::ExperimentalExecutors::from_env_value(Some("sql_write".into())).unwrap();
+        crate::mcp::register_allowlisted_experimental_tools(&mut r, &experimental).unwrap();
+        for record in [
+            json!({"id":folder,"type":"Collection","kind":"folder","name":"Counter scope","persistence":"enduring","reason":"Public protocol scope setup."}),
+            json!({"id":target,"type":"Document","kind":"note","name":"Counter target","home_id":folder,"reason":"Public protocol target setup."}),
+        ] {
+            r.call(db.clone(), Caller::local(), "create_record", record)
+                .await
+                .unwrap();
+        }
+        let server = ExecutorPrototypeStdioServer::new_with_telemetry_and_experimental(
+            Arc::new(r),
+            db.clone(),
+            Caller::local(),
+            None,
+            ExecutorTelemetryContext::new(
+                Arc::new(super::telemetry::TestTelemetrySink::default()),
+                7,
+            )
+            .unwrap(),
+            experimental,
+        )
+        .await
+        .unwrap();
+        let runtime = server.write_runtime.as_ref().unwrap();
+        let before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM content_events")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        let prepared=server.handle_message(executor_call_message(1,SQL_WRITE_EXECUTOR,json!({"operation":"sql_write","arguments":{"selection_contract":selected::CONTRACT,"folder_id":folder,"statement":"SELECT id FROM children","write":{"op":"archive"},"reason":"Observe counters on preview only."}}))).await.unwrap();
+        assert!(response_succeeded(&prepared), "{prepared}");
+        for id in 2..5 {
+            let confirmed = server
+                .handle_message(executor_call_message(
+                    id,
+                    SQL_WRITE_EXECUTOR,
+                    execution_arguments_for(SQL_WRITE_OPERATION, &prepared),
+                ))
+                .await
+                .unwrap();
+            assert!(response_succeeded(&confirmed), "{confirmed}");
+            assert_eq!(runtime.claim_attempts.load(Ordering::Relaxed), 0);
+            assert_eq!(runtime.dispatch_attempts.load(Ordering::Relaxed), 0);
+        }
+        let after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM content_events")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(before, after);
+        let refused=server.handle_message(executor_call_message(10,SQL_WRITE_EXECUTOR,json!({"operation":"sql_write","arguments":{"selection_contract":selected::CONTRACT,"folder_id":folder,"statement":"SELECT id FROM children WHERE name='absent'","write":{"op":"archive"},"reason":"Refused prepare counter probe."}}))).await.unwrap();
+        assert_eq!(
+            refused["result"]["structuredContent"]["plan_error"]["code"],
+            "preparation_rejected"
+        );
+        let mut misuse = execution_arguments_for(SQL_WRITE_OPERATION, &prepared);
+        misuse["arguments"] = json!({"statement":"SELECT id FROM children"});
+        let misuse = server
+            .handle_message(executor_call_message(11, SQL_WRITE_EXECUTOR, misuse))
+            .await
+            .unwrap();
+        assert!(!response_succeeded(&misuse));
+        assert_eq!(
+            before,
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM content_events")
+                .fetch_one(db.pool())
+                .await
+                .unwrap()
+        );
+        // Deliberate public delta is outside the before/after refusal audit.
+        server.registry.call(db.clone(),Caller::local(),"update_record",json!({"id":target,"name":"Changed counter target","reason":"Public scoped drift counter probe."})).await.unwrap();
+        let drift_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM content_events")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        let stale = server
+            .handle_message(executor_call_message(
+                12,
+                SQL_WRITE_EXECUTOR,
+                execution_arguments_for(SQL_WRITE_OPERATION, &prepared),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            stale["result"]["structuredContent"]["plan_error"]["code"],
+            "plan_stale"
+        );
+        let fresh=server.handle_message(executor_call_message(13,SQL_WRITE_EXECUTOR,json!({"operation":"sql_write","arguments":{"selection_contract":selected::CONTRACT,"folder_id":folder,"statement":"SELECT id FROM children","write":{"op":"archive"},"reason":"Expired confirmation counter probe."}}))).await.unwrap();
+        assert!(response_succeeded(&fresh), "{fresh}");
+        use sqlx::Connection;
+        let path = db.path().canonicalize().unwrap();
+        let file = path.file_name().unwrap().to_str().unwrap();
+        let mut plan_db = sqlx::SqliteConnection::connect_with(
+            &sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(path.with_file_name(format!("{file}.write-plans.sqlite3"))),
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE write_plans SET state='expired' WHERE plan_id=?")
+            .bind(
+                fresh["result"]["structuredContent"]["plan_id"]
+                    .as_str()
+                    .unwrap(),
+            )
+            .execute(&mut plan_db)
+            .await
+            .unwrap();
+        plan_db.close().await.unwrap();
+        let expired = server
+            .handle_message(executor_call_message(
+                14,
+                SQL_WRITE_EXECUTOR,
+                execution_arguments_for(SQL_WRITE_OPERATION, &fresh),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            expired["result"]["structuredContent"]["plan_error"]["code"],
+            "plan_expired"
+        );
+        assert_eq!(
+            drift_before,
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM content_events")
+                .fetch_one(db.pool())
+                .await
+                .unwrap()
+        );
+        assert_eq!(runtime.claim_attempts.load(Ordering::Relaxed), 0);
+        assert_eq!(runtime.dispatch_attempts.load(Ordering::Relaxed), 0);
+        // Positive control proves these are executed boundary counters, not
+        // response constants: a separate ordinary policy plan claims/dispatches.
+        let revision = policy_revision(&server.registry, &db, Caller::local(), target).await;
+        let control = server
+            .handle_message(call_message(5, preparation_arguments(target, &revision)))
+            .await
+            .unwrap();
+        assert!(response_succeeded(&control), "{control}");
+        let executed = server
+            .handle_message(call_message(6, execution_arguments(&control)))
+            .await
+            .unwrap();
+        assert!(response_succeeded(&executed), "{executed}");
+        assert_eq!(runtime.claim_attempts.load(Ordering::Relaxed), 1);
+        assert_eq!(runtime.dispatch_attempts.load(Ordering::Relaxed), 1);
+    }
+
+    /// Grant `plan-author` Edit (which implies View) on each id, so the link
+    /// preview's `require_record_in` checks pass.
+    async fn grant_link_edit(db: &crate::Db, ids: &[&str]) {
+        for id in ids {
+            replace_explicit_policy(
+                db,
+                "test:sql-write-link",
+                id,
+                vec![AllowEntry::account("plan-author", Capability::Edit)],
+            )
+            .await
+            .unwrap();
+        }
+    }
+
+    /// Run the singular relationship-owned `manage_links.add`, so the preview
+    /// is compared against the real route rather than a stand-in.
+    async fn singular_add_link(
+        db: &crate::Db,
+        caller: &Caller,
+        source: &str,
+        target: &str,
+        note: Option<&str>,
+    ) {
+        let mut arguments = json!({
+            "action":"add","source_id":source,"target_id":target,"relationship":"relates_to"
+        });
+        if let Some(note) = note {
+            arguments["note"] = json!(note);
+        }
+        let receipt = registry()
+            .call(db.clone(), caller.clone(), "manage_links", arguments)
+            .await
+            .unwrap();
+        assert_eq!(receipt["action"], json!("add"));
+    }
+
+    async fn preview_link(
+        db: &crate::Db,
+        caller: &Caller,
+        statement: String,
+        note: Option<&str>,
+    ) -> Result<SqlWritePreparation> {
+        let mut arguments = json!({"statement": statement, "reason": "link probe"});
+        if let Some(note) = note {
+            arguments["link_note"] = json!(note);
+        }
+        prepare_sql_write_preview(db, caller, arguments).await
+    }
+
+    fn link_row(source: &str, key: &str, value_expr: &str) -> String {
+        format!(
+            "SELECT id AS record_id, 'add_link' AS op, '{key}' AS key, {value_expr} AS value FROM records WHERE id = '{source}'"
+        )
+    }
+
+    /// A directed `add_link` previews the singular relationship-owned route: a
+    /// first add signs a would-create intent with a note that is effective, and
+    /// re-adding signs a would-append-support intent that ignores the passed
+    /// note. `e0-harness` is a W2 test fixture value only; production never
+    /// names it.
+    #[tokio::test]
+    async fn sql_write_link_preview_signs_create_then_append_support() {
+        let db = create_database(":memory:").await.unwrap();
+        let source = create_record(
+            &db,
+            json!({"id":"ec00b000-0000-4000-8000-0000000000e0","type":"Document","kind":"note","name":"Link source"}),
+        )
+        .await
+        .unwrap();
+        let target = create_record(
+            &db,
+            json!({"id":"ec00b000-0000-4000-8000-0000000000e2","type":"Document","kind":"note","name":"Link target"}),
+        )
+        .await
+        .unwrap();
+        grant_link_edit(&db, &[&source, &target]).await;
+        let caller = Caller::authenticated("plan-author");
+        let statement = link_row(&source, "relates_to", &format!("'{target}'"));
+        let events_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM content_events")
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap();
+
+        let created = preview_link(&db, &caller, statement.clone(), Some("e0-harness"))
+            .await
+            .expect("a fresh directed link must prepare");
+        let created_op = &created.effect["targets"][0]["ops"][0];
+        assert_eq!(created_op["op"], json!("add_link"));
+        assert_eq!(created_op["relationship"], json!("relates_to"));
+        assert_eq!(created_op["route"], json!("directed_legacy_link"));
+        assert_eq!(created_op["intent"], json!("would_create_relationship"));
+        assert_eq!(created_op["note"], json!("e0-harness"));
+        assert_eq!(created_op["note_applied"], json!(true));
+        assert_eq!(created_op["existing"], Value::Null);
+        assert_eq!(created_op["changed"], json!(true));
+        assert_eq!(created_op["source_id"], json!(source));
+        assert_eq!(created_op["target_id"], json!(target));
+        assert!(created_op["source_previous_seq"].is_i64());
+        assert!(created_op["target_previous_seq"].is_i64());
+        assert!(created_op["proposition_key"].is_string());
+        assert!(
+            created
+                .effect_summary
+                .contains("new relationship with note"),
+            "{}",
+            created.effect_summary
+        );
+
+        // The singular tool asserts the same relationship-owned route.
+        singular_add_link(&db, &caller, &source, &target, Some("first-wins")).await;
+
+        // Re-add is never a no-op: it appends another support assertion, and
+        // the passed note is ignored by the singular route.
+        let appended = preview_link(&db, &caller, statement, Some("second-note"))
+            .await
+            .expect("a re-add must prepare, never a no-op");
+        let appended_op = &appended.effect["targets"][0]["ops"][0];
+        assert_eq!(appended_op["intent"], json!("would_append_support"));
+        assert_eq!(appended_op["note"], json!("second-note"));
+        assert_eq!(appended_op["note_applied"], json!(false));
+        assert_eq!(appended_op["changed"], json!(true));
+        assert_eq!(appended_op["existing"]["status"], json!("active"));
+        assert!(
+            appended_op["existing"]["relationship_id"].is_string(),
+            "{appended_op}"
+        );
+        assert!(
+            appended_op["existing"]["assertion_set_digest"].is_string(),
+            "the assertion-set digest is the drift signal: {appended_op}"
+        );
+        assert!(
+            appended.effect_summary.contains("note ignored"),
+            "{}",
+            appended.effect_summary
+        );
+        // Appending support does not move an endpoint content seq, so the two
+        // target-state digests agree; only the signed effect (assertion-set
+        // digest) distinguishes them. That is exactly why the effect is signed.
+        assert_eq!(created.target_state_digest, appended.target_state_digest);
+        assert_ne!(created.effect, appended.effect);
+
+        let events_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM content_events")
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            events_before, events_after,
+            "preparation must append no content event"
+        );
+    }
+
+    /// A self-link is allowed by the singular tool, so the preview must not
+    /// invent a self-link refusal.
+    #[tokio::test]
+    async fn sql_write_link_preview_allows_self_link() {
+        let db = create_database(":memory:").await.unwrap();
+        let record = create_record(
+            &db,
+            json!({"id":"ec00b000-0000-4000-8000-0000000000e8","type":"Document","kind":"note","name":"Self"}),
+        )
+        .await
+        .unwrap();
+        grant_link_edit(&db, &[&record]).await;
+        let caller = Caller::authenticated("plan-author");
+        let prepared = preview_link(
+            &db,
+            &caller,
+            link_row(&record, "relates_to", &format!("'{record}'")),
+            Some("self"),
+        )
+        .await
+        .expect("a self-link must prepare");
+        let op = &prepared.effect["targets"][0]["ops"][0];
+        assert_eq!(op["intent"], json!("would_create_relationship"));
+        assert_eq!(op["source_id"], json!(record));
+        assert_eq!(op["target_id"], json!(record));
+        assert_eq!(op["note_applied"], json!(true));
+    }
+
+    /// Strict four-column shape refusals, including the fields B1 skipped:
+    /// blank record ids, mixing a link with a content edit, duplicates, and the
+    /// shared distinct-target overflow bound.
+    #[tokio::test]
+    async fn sql_write_link_preview_shape_refusals() {
+        let db = create_database(":memory:").await.unwrap();
+        let source = create_record(
+            &db,
+            json!({"id":"ec00b000-0000-4000-8000-0000000000e4","type":"Document","kind":"note","name":"Shape source"}),
+        )
+        .await
+        .unwrap();
+        let target = create_record(
+            &db,
+            json!({"id":"ec00b000-0000-4000-8000-0000000000e5","type":"Document","kind":"note","name":"Shape target"}),
+        )
+        .await
+        .unwrap();
+        grant_link_edit(&db, &[&source, &target]).await;
+        let caller = Caller::authenticated("plan-author");
+        let events_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM content_events")
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap();
+        let probe = |statement: String, note: Option<&str>| {
+            let db = db.clone();
+            let caller = caller.clone();
+            let note = note.map(str::to_string);
+            async move { preview_link(&db, &caller, statement, note.as_deref()).await }
+        };
+
+        let bad_key = probe(
+            link_row(&source, "target", &format!("'{target}'")),
+            Some("n"),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(bad_key.contains("unsupported add_link key"), "{bad_key}");
+
+        let null_value = probe(link_row(&source, "relates_to", "NULL"), Some("n"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            null_value.contains("must be a JSON string"),
+            "a SQL NULL value must refuse: {null_value}"
+        );
+
+        let blank_value = probe(link_row(&source, "relates_to", "''"), Some("n"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(blank_value.contains("non-blank target id"), "{blank_value}");
+
+        let fifth_column = probe(
+            format!(
+                "SELECT id AS record_id, 'add_link' AS op, 'relates_to' AS key, '{target}' AS value, 1 AS extra FROM records WHERE id = '{source}'"
+            ),
+            Some("n"),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            fifth_column.contains("unknown operation field 'extra'"),
+            "{fifth_column}"
+        );
+
+        let blank_record = probe(
+            format!(
+                "SELECT '' AS record_id, 'add_link' AS op, 'relates_to' AS key, '{target}' AS value FROM records WHERE id = '{source}'"
+            ),
+            Some("n"),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            blank_record.contains("'record_id' must be non-blank"),
+            "{blank_record}"
+        );
+
+        let orphan_note = probe(
+            format!(
+                "SELECT id AS record_id, 'set_field' AS op, 'name' AS key, 'Renamed' AS value FROM records WHERE id = '{source}'"
+            ),
+            Some("orphan"),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            orphan_note.contains("only valid when the selection includes an add_link"),
+            "{orphan_note}"
+        );
+
+        let blank_note = probe(
+            link_row(&source, "relates_to", &format!("'{target}'")),
+            Some("   "),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            blank_note.contains("'link_note' must be non-blank"),
+            "{blank_note}"
+        );
+
+        let oversize_note = probe(
+            link_row(&source, "relates_to", &format!("'{target}'")),
+            Some(&"e".repeat(1025)),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            oversize_note.contains("exceeds 1024 characters"),
+            "{oversize_note}"
+        );
+
+        let mixed = probe(
+            format!(
+                "SELECT id AS record_id, 'add_link' AS op, 'relates_to' AS key, '{target}' AS value FROM records WHERE id = '{source}' \
+                 UNION ALL \
+                 SELECT id AS record_id, 'set_field' AS op, 'name' AS key, 'Renamed' AS value FROM records WHERE id = '{source}'"
+            ),
+            Some("n"),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            mixed.contains("mixes 'add_link' with another operation"),
+            "{mixed}"
+        );
+
+        let duplicate = probe(
+            format!(
+                "SELECT id AS record_id, 'add_link' AS op, 'relates_to' AS key, '{target}' AS value FROM records WHERE id = '{source}' \
+                 UNION ALL \
+                 SELECT id AS record_id, 'add_link' AS op, 'relates_to' AS key, '{target}' AS value FROM records WHERE id = '{source}'"
+            ),
+            Some("n"),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(duplicate.contains("duplicate 'relates_to'"), "{duplicate}");
+
+        let events_after_refusals: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM content_events")
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            events_before, events_after_refusals,
+            "shape refusals must append no content event"
+        );
+
+        // The distinct-source cap is shared with the other operations: 26 links
+        // exceed the 25-target bound and refuse before any per-source check.
+        for index in 0..26 {
+            let id = format!("ec00b000-0000-4000-8000-0000000001{index:02}");
+            create_record(
+                &db,
+                json!({
+                    "id": id,
+                    "type":"Document","kind":"note","name":"Link overflow"
+                }),
+            )
+            .await
+            .unwrap();
+            grant_link_edit(&db, &[id.as_str()]).await;
+        }
+        let events_before_overflow: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM content_events")
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap();
+        let overflow = probe(
+            format!(
+                "SELECT id AS record_id, 'add_link' AS op, 'relates_to' AS key, '{target}' AS value FROM records WHERE name = 'Link overflow'"
+            ),
+            Some("n"),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(overflow.contains("distinct records"), "{overflow}");
+        let events_after_overflow: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM content_events")
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            events_before_overflow, events_after_overflow,
+            "the overflow refusal must append no content event"
+        );
+    }
+
+    /// The preview mirrors the singular route and endpoint guard: a Message
+    /// endpoint is content-owned and refuses, a hidden target is
+    /// indistinguishable from a missing one, and a visible View-only source
+    /// keeps its capability error.
+    #[tokio::test]
+    async fn sql_write_link_preview_route_and_endpoint_denials() {
+        let db = create_database(":memory:").await.unwrap();
+        let source = create_record(
+            &db,
+            json!({"id":"ec00b000-0000-4000-8000-0000000000e6","type":"Document","kind":"note","name":"Denial source"}),
+        )
+        .await
+        .unwrap();
+        let target = create_record(
+            &db,
+            json!({"id":"ec00b000-0000-4000-8000-0000000000e7","type":"Document","kind":"note","name":"Denial target"}),
+        )
+        .await
+        .unwrap();
+        let message = create_record(
+            &db,
+            json!({"id":"ec00b000-0000-4000-8000-0000000000e9","type":"Message","kind":"text","body":"fallback","addressed_to":[],"facets":{"expectation":"none"}}),
+        )
+        .await
+        .unwrap();
+        let hidden = create_record(
+            &db,
+            json!({"id":"ec00b000-0000-4000-8000-0000000000ea","type":"Document","kind":"note","name":"Hidden target"}),
+        )
+        .await
+        .unwrap();
+        let view_only = create_record(
+            &db,
+            json!({"id":"ec00b000-0000-4000-8000-0000000000eb","type":"Document","kind":"note","name":"View only"}),
+        )
+        .await
+        .unwrap();
+        grant_link_edit(&db, &[&source, &target, &message]).await;
+        // A View-only source cannot be linked from; a hidden target is not
+        // visible; a View-only target still satisfies the link's View check.
+        replace_explicit_policy(
+            &db,
+            "test:sql-write-link-view",
+            &view_only,
+            vec![AllowEntry::account("plan-author", Capability::View)],
+        )
+        .await
+        .unwrap();
+        replace_explicit_policy(&db, "test:sql-write-link-hidden", &hidden, vec![])
+            .await
+            .unwrap();
+        let caller = Caller::authenticated("plan-author");
+
+        let content_owned = preview_link(
+            &db,
+            &caller,
+            link_row(&source, "relates_to", &format!("'{message}'")),
+            Some("n"),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            content_owned.contains("content-owned"),
+            "a Message endpoint must take the refused content route: {content_owned}"
+        );
+
+        let hidden_error = preview_link(
+            &db,
+            &caller,
+            link_row(&source, "relates_to", &format!("'{hidden}'")),
+            Some("n"),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        let missing = "ec00b000-0000-4000-8000-00000000dead";
+        let missing_error = preview_link(
+            &db,
+            &caller,
+            link_row(&source, "relates_to", &format!("'{missing}'")),
+            Some("n"),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(hidden_error.contains("does not exist"), "{hidden_error}");
+        assert!(missing_error.contains("does not exist"), "{missing_error}");
+        assert!(
+            !hidden_error.contains("capability"),
+            "a hidden target must not leak a capability distinction: {hidden_error}"
+        );
+
+        let view_only_error = preview_link(
+            &db,
+            &caller,
+            link_row(&view_only, "relates_to", &format!("'{target}'")),
+            Some("n"),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            view_only_error.contains("requires edit capability"),
+            "a visible View-only source keeps its capability error: {view_only_error}"
+        );
+
+        // A View-only target satisfies the link's View requirement.
+        preview_link(
+            &db,
+            &caller,
+            link_row(&source, "relates_to", &format!("'{view_only}'")),
+            Some("n"),
+        )
+        .await
+        .expect("a View-only target is linkable");
+    }
+
+    /// Archived-source parity: the preview deliberately adds no archived-source
+    /// refusal the singular `manage_links.add` lacks. Archive the source through
+    /// the public `archive_record` tool, then both the singular add and the
+    /// preview must succeed from that source.
+    #[tokio::test]
+    async fn sql_write_link_preview_archived_source_matches_singular_route() {
+        let db = create_database(":memory:").await.unwrap();
+        let source = create_record(
+            &db,
+            json!({"id":"ec00b000-0000-4000-8000-0000000000ec","type":"Document","kind":"note","name":"Archived source"}),
+        )
+        .await
+        .unwrap();
+        let target = create_record(
+            &db,
+            json!({"id":"ec00b000-0000-4000-8000-0000000000ed","type":"Document","kind":"note","name":"Archived target"}),
+        )
+        .await
+        .unwrap();
+        // Manage on the source so the public archive tool is allowed; Edit on
+        // the target (Manage implies Edit/View).
+        replace_explicit_policy(
+            &db,
+            "test:sql-write-link-archived",
+            &source,
+            vec![AllowEntry::account("plan-author", Capability::Manage)],
+        )
+        .await
+        .unwrap();
+        grant_link_edit(&db, &[&target]).await;
+        let caller = Caller::authenticated("plan-author");
+        let archived = registry()
+            .call(
+                db.clone(),
+                caller.clone(),
+                "archive_record",
+                json!({"id": source, "reason": "archived-source link parity fixture"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(archived["archived"], json!(true));
+        // The singular route still adds a link from the archived source.
+        singular_add_link(&db, &caller, &source, &target, Some("archived")).await;
+        // The preview does the same and signs the append intent rather than
+        // inventing an archived-source refusal.
+        let prepared = preview_link(
+            &db,
+            &caller,
+            link_row(&source, "relates_to", &format!("'{target}'")),
+            Some("archived"),
+        )
+        .await
+        .expect("an archived source is linkable, matching the singular route");
+        let op = &prepared.effect["targets"][0]["ops"][0];
+        assert_eq!(op["intent"], json!("would_append_support"));
+        assert_eq!(op["existing"]["status"], json!("active"));
+    }
+
+    /// Run the singular relationship-owned `manage_links.remove`, so the
+    /// preview is compared against the real route rather than a stand-in.
+    async fn singular_remove_link(db: &crate::Db, caller: &Caller, source: &str, target: &str) {
+        let receipt = registry()
+            .call(
+                db.clone(),
+                caller.clone(),
+                "manage_links",
+                json!({
+                    "action":"remove","source_id":source,"target_id":target,
+                    "relationship":"relates_to"
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(receipt["action"], json!("remove"));
+    }
+
+    fn remove_row(source: &str, key: &str, value_expr: &str) -> String {
+        format!(
+            "SELECT id AS record_id, 'remove_link' AS op, '{key}' AS key, {value_expr} AS value FROM records WHERE id = '{source}'"
+        )
+    }
+
+    /// A directed `remove_link` previews the singular relationship-owned
+    /// removal route: an existing active proposition signs the observed
+    /// before state plus a guaranteed `would_contest` intent, with no note
+    /// and no projected post-contest state. Preparation appends no event.
+    #[tokio::test]
+    async fn sql_write_remove_link_preview_signs_contest() {
+        let db = create_database(":memory:").await.unwrap();
+        let source = create_record(
+            &db,
+            json!({"id":"ec00b000-0000-4000-8000-0000000000f0","type":"Document","kind":"note","name":"Remove source"}),
+        )
+        .await
+        .unwrap();
+        let target = create_record(
+            &db,
+            json!({"id":"ec00b000-0000-4000-8000-0000000000f2","type":"Document","kind":"note","name":"Remove target"}),
+        )
+        .await
+        .unwrap();
+        grant_link_edit(&db, &[&source, &target]).await;
+        let caller = Caller::authenticated("plan-author");
+        // The proposition must exist before it can be contested.
+        singular_add_link(&db, &caller, &source, &target, Some("first-wins")).await;
+        let events_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM content_events")
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap();
+        let relationship_events_before: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM relationship_events")
+                .fetch_one(db.write_pool())
+                .await
+                .unwrap();
+
+        let prepared = preview_link(
+            &db,
+            &caller,
+            remove_row(&source, "relates_to", &format!("'{target}'")),
+            None,
+        )
+        .await
+        .expect("an existing directed link must prepare a removal");
+        let op = &prepared.effect["targets"][0]["ops"][0];
+        assert_eq!(op["op"], json!("remove_link"));
+        assert_eq!(op["relationship"], json!("relates_to"));
+        assert_eq!(op["route"], json!("directed_legacy_link"));
+        assert_eq!(op["intent"], json!("would_contest"));
+        assert_eq!(op["changed"], json!(true));
+        assert_eq!(op["note"], Value::Null);
+        assert_eq!(op["note_applied"], json!(false));
+        assert_eq!(op["source_id"], json!(source));
+        assert_eq!(op["target_id"], json!(target));
+        assert!(op["source_previous_seq"].is_i64());
+        assert!(op["target_previous_seq"].is_i64());
+        assert!(op["proposition_key"].is_string());
+        assert_eq!(op["existing"]["status"], json!("active"));
+        assert_eq!(op["existing"]["effective_state"], json!("active"));
+        assert!(op["existing"]["relationship_id"].is_string());
+        assert!(
+            prepared
+                .effect_summary
+                .contains("would contest relationship"),
+            "{}",
+            prepared.effect_summary
+        );
+        // The canonical envelope carries no note key for a removal.
+        assert!(
+            prepared
+                .canonical_source_arguments
+                .get("link_note")
+                .is_none(),
+            "{}",
+            prepared.canonical_source_arguments
+        );
+
+        let events_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM content_events")
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            events_before, events_after,
+            "preparation must append no event"
+        );
+        let relationship_events_after: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM relationship_events")
+                .fetch_one(db.write_pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            relationship_events_before, relationship_events_after,
+            "preparation must append no relationship event"
+        );
+    }
+
+    /// Strict shape refusals for `remove_link`: absent propositions, bad keys,
+    /// blank or NULL target ids, a note alongside a removal, mixing a removal
+    /// with a content edit, and duplicates. Every refusal appends no event.
+    #[tokio::test]
+    async fn sql_write_remove_link_preview_shape_refusals() {
+        let db = create_database(":memory:").await.unwrap();
+        let source = create_record(
+            &db,
+            json!({"id":"ec00b000-0000-4000-8000-0000000000f4","type":"Document","kind":"note","name":"Remove shape source"}),
+        )
+        .await
+        .unwrap();
+        let target = create_record(
+            &db,
+            json!({"id":"ec00b000-0000-4000-8000-0000000000f5","type":"Document","kind":"note","name":"Remove shape target"}),
+        )
+        .await
+        .unwrap();
+        grant_link_edit(&db, &[&source, &target]).await;
+        let caller = Caller::authenticated("plan-author");
+        let events_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM content_events")
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap();
+        let probe = |statement: String, note: Option<&str>| {
+            let db = db.clone();
+            let caller = caller.clone();
+            let note = note.map(str::to_string);
+            async move { preview_link(&db, &caller, statement, note.as_deref()).await }
+        };
+
+        // No proposition exists yet: removal refuses, it never previews a
+        // no-op.
+        let absent = probe(
+            remove_row(&source, "relates_to", &format!("'{target}'")),
+            None,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            absent.contains("cannot remove link"),
+            "an absent proposition must refuse: {absent}"
+        );
+
+        let bad_key = probe(remove_row(&source, "target", &format!("'{target}'")), None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(bad_key.contains("unsupported remove_link key"), "{bad_key}");
+
+        let null_value = probe(remove_row(&source, "relates_to", "NULL"), None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            null_value.contains("must be a JSON string"),
+            "a SQL NULL value must refuse: {null_value}"
+        );
+
+        let blank_value = probe(remove_row(&source, "relates_to", "''"), None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(blank_value.contains("non-blank target id"), "{blank_value}");
+
+        // Establish the proposition for the remaining shape probes.
+        singular_add_link(&db, &caller, &source, &target, Some("first-wins")).await;
+
+        // A removal carries no note: the singular remove passes `None`.
+        let noted = probe(
+            remove_row(&source, "relates_to", &format!("'{target}'")),
+            Some("n"),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(noted.contains("remove_link carries no note"), "{noted}");
+
+        let mixed = probe(
+            format!(
+                "SELECT id AS record_id, 'remove_link' AS op, 'relates_to' AS key, '{target}' AS value FROM records WHERE id = '{source}' \
+                 UNION ALL \
+                 SELECT id AS record_id, 'set_field' AS op, 'name' AS key, 'Renamed' AS value FROM records WHERE id = '{source}'"
+            ),
+            None,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            mixed.contains("mixes 'remove_link' with another operation"),
+            "{mixed}"
+        );
+
+        let duplicate = probe(
+            format!(
+                "SELECT id AS record_id, 'remove_link' AS op, 'relates_to' AS key, '{target}' AS value FROM records WHERE id = '{source}' \
+                 UNION ALL \
+                 SELECT id AS record_id, 'remove_link' AS op, 'relates_to' AS key, '{target}' AS value FROM records WHERE id = '{source}'"
+            ),
+            None,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(duplicate.contains("duplicate 'relates_to'"), "{duplicate}");
+
+        let events_after_refusals: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM content_events")
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap();
+        // The mid-test fixture add is relationship-only and moves no endpoint
+        // content seq, so the count still equals the pre-probe baseline: every
+        // refusal appended no content event.
+        assert_eq!(
+            events_before, events_after_refusals,
+            "shape refusals must append no content event"
+        );
+    }
+
+    /// The removal preview mirrors the singular route and endpoint guard: a
+    /// Message endpoint is content-owned and refuses, a hidden target is
+    /// indistinguishable from a missing one, and a visible View-only source
+    /// keeps its capability error.
+    #[tokio::test]
+    async fn sql_write_remove_link_preview_route_and_endpoint_denials() {
+        let db = create_database(":memory:").await.unwrap();
+        let source = create_record(
+            &db,
+            json!({"id":"ec00b000-0000-4000-8000-0000000000f6","type":"Document","kind":"note","name":"Remove denial source"}),
+        )
+        .await
+        .unwrap();
+        let target = create_record(
+            &db,
+            json!({"id":"ec00b000-0000-4000-8000-0000000000f7","type":"Document","kind":"note","name":"Remove denial target"}),
+        )
+        .await
+        .unwrap();
+        let message = create_record(
+            &db,
+            json!({"id":"ec00b000-0000-4000-8000-0000000000f9","type":"Message","kind":"text","body":"fallback","addressed_to":[],"facets":{"expectation":"none"}}),
+        )
+        .await
+        .unwrap();
+        let hidden = create_record(
+            &db,
+            json!({"id":"ec00b000-0000-4000-8000-0000000000fa","type":"Document","kind":"note","name":"Hidden remove target"}),
+        )
+        .await
+        .unwrap();
+        let view_only = create_record(
+            &db,
+            json!({"id":"ec00b000-0000-4000-8000-0000000000fb","type":"Document","kind":"note","name":"Remove view only"}),
+        )
+        .await
+        .unwrap();
+        grant_link_edit(&db, &[&source, &target, &message]).await;
+        replace_explicit_policy(
+            &db,
+            "test:sql-write-remove-link-view",
+            &view_only,
+            vec![AllowEntry::account("plan-author", Capability::View)],
+        )
+        .await
+        .unwrap();
+        replace_explicit_policy(&db, "test:sql-write-remove-link-hidden", &hidden, vec![])
+            .await
+            .unwrap();
+        let caller = Caller::authenticated("plan-author");
+
+        let content_owned = preview_link(
+            &db,
+            &caller,
+            remove_row(&source, "relates_to", &format!("'{message}'")),
+            None,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            content_owned.contains("content-owned"),
+            "a Message endpoint must take the refused content route: {content_owned}"
+        );
+
+        let hidden_error = preview_link(
+            &db,
+            &caller,
+            remove_row(&source, "relates_to", &format!("'{hidden}'")),
+            None,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        let missing = "ec00b000-0000-4000-8000-00000000dead";
+        let missing_error = preview_link(
+            &db,
+            &caller,
+            remove_row(&source, "relates_to", &format!("'{missing}'")),
+            None,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(hidden_error.contains("does not exist"), "{hidden_error}");
+        assert!(missing_error.contains("does not exist"), "{missing_error}");
+        assert!(
+            !hidden_error.contains("capability"),
+            "a hidden target must not leak a capability distinction: {hidden_error}"
+        );
+
+        let view_only_error = preview_link(
+            &db,
+            &caller,
+            remove_row(&view_only, "relates_to", &format!("'{target}'")),
+            None,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            view_only_error.contains("requires edit capability"),
+            "a visible View-only source keeps its capability error: {view_only_error}"
+        );
+
+        // A View-only target satisfies the removal's View requirement, once a
+        // link to it exists through an authorized route.
+        singular_add_link(&db, &caller, &source, &target, Some("first-wins")).await;
+        let view_target_error = preview_link(
+            &db,
+            &caller,
+            remove_row(&source, "relates_to", &format!("'{view_only}'")),
+            None,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            view_target_error.contains("cannot remove link"),
+            "a View-only target with no proposition still refuses as absent: {view_target_error}"
+        );
+    }
+
+    /// Contesting the proposition through the public singular route flips its
+    /// effective state, and the removal preview then refuses exactly as the
+    /// singular second removal does. The retired-proposition fixture stays
+    /// deferred: `retired` is set only by a federation-origin event with no
+    /// public setter, so it is exercised by inspection, not manufacture.
+    #[tokio::test]
+    async fn sql_write_remove_link_preview_inactive_after_contest_refuses() {
+        let db = create_database(":memory:").await.unwrap();
+        let source = create_record(
+            &db,
+            json!({"id":"ec00b000-0000-4000-8000-0000000000fc","type":"Document","kind":"note","name":"Inactive source"}),
+        )
+        .await
+        .unwrap();
+        let target = create_record(
+            &db,
+            json!({"id":"ec00b000-0000-4000-8000-0000000000fd","type":"Document","kind":"note","name":"Inactive target"}),
+        )
+        .await
+        .unwrap();
+        grant_link_edit(&db, &[&source, &target]).await;
+        let caller = Caller::authenticated("plan-author");
+        singular_add_link(&db, &caller, &source, &target, Some("first-wins")).await;
+        // Contest through the real singular route: the reducer deactivates the
+        // support, so the proposition is no longer effectively active.
+        singular_remove_link(&db, &caller, &source, &target).await;
+        let singular_second = registry()
+            .call(
+                db.clone(),
+                caller.clone(),
+                "manage_links",
+                json!({
+                    "action":"remove","source_id":source,"target_id":target,
+                    "relationship":"relates_to"
+                }),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            singular_second.contains("inactive or causally unresolved"),
+            "the singular second removal proves the inactive state: {singular_second}"
+        );
+
+        let preview_second = preview_link(
+            &db,
+            &caller,
+            remove_row(&source, "relates_to", &format!("'{target}'")),
+            None,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            preview_second.contains("inactive or causally unresolved"),
+            "the preview must refuse the same inactive state: {preview_second}"
+        );
+    }
+
+    /// Archived-source parity: the preview deliberately adds no
+    /// archived-source refusal the singular `manage_links.remove` lacks.
+    /// Archive the source through the public `archive_record` tool, then both
+    /// the singular removal and the preview must succeed from that source.
+    #[tokio::test]
+    async fn sql_write_remove_link_preview_archived_source_matches_singular_route() {
+        let db = create_database(":memory:").await.unwrap();
+        let source = create_record(
+            &db,
+            json!({"id":"ec00b000-0000-4000-8000-0000000000fe","type":"Document","kind":"note","name":"Archived remove source"}),
+        )
+        .await
+        .unwrap();
+        let target = create_record(
+            &db,
+            json!({"id":"ec00b000-0000-4000-8000-0000000000ff","type":"Document","kind":"note","name":"Archived remove target"}),
+        )
+        .await
+        .unwrap();
+        // Manage on the source so the public archive tool is allowed; Edit on
+        // the target (Manage implies Edit/View).
+        replace_explicit_policy(
+            &db,
+            "test:sql-write-remove-link-archived",
+            &source,
+            vec![AllowEntry::account("plan-author", Capability::Manage)],
+        )
+        .await
+        .unwrap();
+        grant_link_edit(&db, &[&target]).await;
+        let caller = Caller::authenticated("plan-author");
+        singular_add_link(&db, &caller, &source, &target, Some("archived")).await;
+        let archived = registry()
+            .call(
+                db.clone(),
+                caller.clone(),
+                "archive_record",
+                json!({"id": source, "reason": "archived-source remove parity fixture"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(archived["archived"], json!(true));
+        // The singular route still removes a link from the archived source.
+        singular_remove_link(&db, &caller, &source, &target).await;
+        // Re-establish so the preview has an active proposition to contest:
+        // the point is that the archived source itself never refuses.
+        singular_add_link(&db, &caller, &source, &target, Some("archived-again")).await;
+        let prepared = preview_link(
+            &db,
+            &caller,
+            remove_row(&source, "relates_to", &format!("'{target}'")),
+            None,
+        )
+        .await
+        .expect("an archived source is removable, matching the singular route");
+        let op = &prepared.effect["targets"][0]["ops"][0];
+        assert_eq!(op["intent"], json!("would_contest"));
+        assert_eq!(op["existing"]["status"], json!("active"));
+    }
+
+    /// A link-free envelope keeps the exact pre-link canonical contract: the
+    /// optional note is absent, no `link_note` key is synthesized, and an
+    /// ordinary field selection still prepares.
+    #[tokio::test]
+    async fn sql_write_preview_without_link_note_keeps_canonical_shape() {
+        let db = create_database(":memory:").await.unwrap();
+        let target = create_record(
+            &db,
+            json!({"id":"ec00b000-0000-4000-8000-0000000000e1","type":"Document","kind":"note","name":"No note"}),
+        )
+        .await
+        .unwrap();
+        replace_explicit_policy(
+            &db,
+            "test:sql-write-no-link-note",
+            &target,
+            vec![AllowEntry::account("plan-author", Capability::Edit)],
+        )
+        .await
+        .unwrap();
+        let caller = Caller::authenticated("plan-author");
+        let prepared = prepare_sql_write_preview(
+            &db,
+            &caller,
+            json!({
+                "statement": format!("SELECT id AS record_id, 'set_field' AS op, 'name' AS key, 'Renamed' AS value FROM records WHERE id = '{target}'"),
+                "reason": "link-free probe",
+            }),
+        )
+        .await
+        .expect("a link-free field selection still prepares");
+        let canonical = prepared.canonical_source_arguments;
+        assert!(
+            canonical.get("link_note").is_none(),
+            "an absent note must not appear in the canonical object: {canonical}"
+        );
+        assert_eq!(
+            canonical.as_object().expect("canonical object").len(),
+            4,
+            "a link-free canonical envelope keeps exactly its four fields: {canonical}"
+        );
     }
 
     /// Governed validator rejections are infrastructure failures, not drift:
@@ -4241,6 +6870,27 @@ mod tests {
             !matches!(error, Error::Conflict(_)),
             "validator failure must stay non-stale: {error}"
         );
+    }
+
+    #[tokio::test]
+    async fn sql_write_preview_refuses_unordered_limit_without_default() {
+        // E2 scope: the server default ORDER BY is ad-hoc-`query_sql`-only.
+        // A sql_write selection with an unordered top-level LIMIT is refused
+        // with today's repair — a mutation's target set must be stated by
+        // the author, never assumed, and nothing is disclosed.
+        let db = create_database(":memory:").await.unwrap();
+        let caller = Caller::authenticated("plan-author");
+        let error = prepare_sql_write_preview(
+            &db,
+            &caller,
+            json!({"statement": "SELECT id FROM records LIMIT 2", "reason": "probe"}),
+        )
+        .await
+        .expect_err("unordered LIMIT selection must be rejected");
+        let message = error.to_string();
+        assert!(message.contains("selection rejected"), "{message}");
+        assert!(message.contains("LIMIT without ORDER BY"), "{message}");
+        assert!(!message.contains("ad-hoc default"), "{message}");
     }
 
     /// The complete classification table, written out independently of the
@@ -4880,19 +7530,26 @@ mod tests {
             predicate_after.target_state_digest,
             predicate_before.target_state_digest
         );
-        // Unknown op rows are refused, never interpreted.
+        // Unknown op rows are refused, never interpreted. `set_facet` and
+        // `unset_facet` are now admitted, so the probe uses an op the
+        // compiler still refuses.
         let op_error = prepare_sql_write_preview(
             &db,
             &caller,
             json!({
-                "statement": format!("SELECT id AS record_id, 'set_facet' AS op, 'triage' AS key, 'done' AS value FROM records WHERE id = '{target}'"),
+                "statement": format!("SELECT id AS record_id, 'bogus_op' AS op, 'triage' AS key, 'done' AS value FROM records WHERE id = '{target}'"),
                 "reason": "Unknown-op probe",
             }),
         )
         .await
         .unwrap_err()
         .to_string();
-        assert!(op_error.contains("only set_field"), "{op_error}");
+        assert!(
+            op_error.contains(
+                "M1 admits only set_field, set_facet, unset_facet, archive, add_link, and remove_link"
+            ),
+            "{op_error}"
+        );
         // Unknown field keys refuse the same way.
         let field_error = prepare_sql_write_preview(
             &db,
@@ -5088,6 +7745,1922 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(duplicate_error.contains("duplicate"), "{duplicate_error}");
+    }
+
+    /// E0 W1 shape: a folder-containment selection prepares a `set_facet`
+    /// `e0probe=done` row on every visible child and only the visible child
+    /// set. This establishes the prepared target set, not an executed landing
+    /// (M1 has no commit path). A hidden child in the same folder does not
+    /// perturb the signed target, effect, or digest, and no preparation
+    /// appends an event.
+    #[tokio::test]
+    async fn sql_write_preview_prepares_string_set_facet_over_folder_target_set() {
+        let db = create_database(":memory:").await.unwrap();
+        let folder = create_record(
+            &db,
+            json!({"id":"ec00b000-0000-4000-8000-0000000000a1","type":"Collection","kind":"folder","name":"W1 folder"}),
+        )
+        .await
+        .unwrap();
+        // The children's `home_id` is disclosed only while the folder is
+        // visible to the caller, so the folder needs View.
+        replace_explicit_policy(
+            &db,
+            "test:sql-write-w1-folder",
+            &folder,
+            vec![AllowEntry::account("plan-author", Capability::View)],
+        )
+        .await
+        .unwrap();
+        let first = create_record(
+            &db,
+            json!({"id":"ec00b000-0000-4000-8000-0000000000a2","type":"Document","kind":"note","name":"W1 child one","home_id":&folder}),
+        )
+        .await
+        .unwrap();
+        let second = create_record(
+            &db,
+            json!({"id":"ec00b000-0000-4000-8000-0000000000a3","type":"Document","kind":"note","name":"W1 child two","home_id":&folder}),
+        )
+        .await
+        .unwrap();
+        let hidden = create_record(
+            &db,
+            json!({"id":"ec00b000-0000-4000-8000-0000000000a4","type":"Document","kind":"note","name":"W1 hidden child","home_id":&folder}),
+        )
+        .await
+        .unwrap();
+        let outside = create_record(
+            &db,
+            json!({"id":"ec00b000-0000-4000-8000-0000000000a5","type":"Document","kind":"note","name":"W1 outside"}),
+        )
+        .await
+        .unwrap();
+        for id in [first.as_str(), second.as_str(), outside.as_str()] {
+            replace_explicit_policy(
+                &db,
+                "test:sql-write-w1-visible",
+                id,
+                vec![AllowEntry::account("plan-author", Capability::Manage)],
+            )
+            .await
+            .unwrap();
+        }
+        replace_explicit_policy(&db, "test:sql-write-w1-hidden", &hidden, vec![])
+            .await
+            .unwrap();
+        let caller = Caller::authenticated("plan-author");
+        let statement = format!(
+            "SELECT id AS record_id, 'set_facet' AS op, 'e0probe' AS key, 'done' AS value FROM records WHERE home_id = '{folder}'"
+        );
+        let args = || json!({ "statement": statement, "reason": "Preview the W1 bulk facet set" });
+        let events_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM content_events")
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap();
+        let prepared = prepare_sql_write_preview(&db, &caller, args())
+            .await
+            .unwrap();
+        assert_eq!(prepared.effect["target_count"], json!(2));
+        assert_eq!(prepared.effect["op_count"], json!(2));
+        assert_eq!(prepared.effect["changed"], json!(true));
+        let mut target_ids: Vec<&str> = prepared.effect["targets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|target| target["record_id"].as_str().unwrap())
+            .collect();
+        target_ids.sort();
+        let mut expected = vec![first.as_str(), second.as_str()];
+        expected.sort();
+        assert_eq!(
+            target_ids, expected,
+            "the W1 target set is exactly the visible children"
+        );
+        for target in prepared.effect["targets"].as_array().unwrap() {
+            let ops = target["ops"].as_array().unwrap();
+            assert_eq!(ops.len(), 1);
+            assert_eq!(ops[0]["op"], json!("set_facet"));
+            assert_eq!(ops[0]["key"], json!("e0probe"));
+            assert_eq!(ops[0]["value"], json!("done"));
+            assert_eq!(ops[0]["before"], json!(null));
+            assert_eq!(ops[0]["after"], json!("done"));
+            assert_eq!(ops[0]["before_vocab_ref"], json!(null));
+            assert_eq!(ops[0]["after_vocab_ref"], json!(null));
+            assert_eq!(ops[0]["changed"], json!(true));
+        }
+        assert!(
+            prepared.target.starts_with("2 records ["),
+            "{}",
+            prepared.target
+        );
+        assert!(prepared.effect_summary.contains("set_facet 'e0probe'"));
+        // Hidden-member nonperturbation: a further hidden child in the same
+        // folder changes nothing signed.
+        let perturbative = create_record(
+            &db,
+            json!({"id":"ec00b000-0000-4000-8000-0000000000a6","type":"Document","kind":"note","name":"W1 hidden two","home_id":&folder}),
+        )
+        .await
+        .unwrap();
+        replace_explicit_policy(
+            &db,
+            "test:sql-write-w1-hidden-perturbative",
+            &perturbative,
+            vec![],
+        )
+        .await
+        .unwrap();
+        let after = prepare_sql_write_preview(&db, &caller, args())
+            .await
+            .unwrap();
+        assert_eq!(after.effect, prepared.effect);
+        assert_eq!(after.effect_summary, prepared.effect_summary);
+        assert_eq!(after.target, prepared.target);
+        assert_eq!(after.target_state_digest, prepared.target_state_digest);
+        let events_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM content_events")
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap();
+        // Only the deliberate hidden fixture write appended; both preparations
+        // appended nothing.
+        assert_eq!(events_after, events_before + 1);
+    }
+
+    /// E0 W2 shape: an open-standby source selection prepares one `add_link`
+    /// `relates_to` row per visible open work item mentioning standby, all
+    /// pointing at the deciding record with note `e0-harness`. In-progress,
+    /// closed, non-matching, hidden, and non-WorkItem rows are excluded.
+    #[tokio::test]
+    async fn sql_write_preview_prepares_w2_open_standby_link_target_set() {
+        let db = create_database(":memory:").await.unwrap();
+        let deciding = create_record(
+            &db,
+            json!({"id":"ec00b000-0000-4000-8000-0000000000c0","type":"Document","kind":"note","name":"W2 deciding record"}),
+        )
+        .await
+        .unwrap();
+        let open_body = create_record(
+            &db,
+            json!({"id":"ec00b000-0000-4000-8000-0000000000c1","type":"WorkItem","kind":"task","lifecycle":"open","name":"W2 open one","body":"covers standby rotation"}),
+        )
+        .await
+        .unwrap();
+        let open_summary = create_record(
+            &db,
+            json!({"id":"ec00b000-0000-4000-8000-0000000000c2","type":"WorkItem","kind":"task","lifecycle":"open","name":"W2 open two","body":"routine","summary":"standby follow-up"}),
+        )
+        .await
+        .unwrap();
+        let in_progress = create_record(
+            &db,
+            json!({"id":"ec00b000-0000-4000-8000-0000000000c3","type":"WorkItem","kind":"task","lifecycle":"in_progress","name":"W2 underway","body":"standby escalation"}),
+        )
+        .await
+        .unwrap();
+        let open_plain = create_record(
+            &db,
+            json!({"id":"ec00b000-0000-4000-8000-0000000000c4","type":"WorkItem","kind":"task","lifecycle":"open","name":"W2 plain","body":"routine rotation"}),
+        )
+        .await
+        .unwrap();
+        let closed = create_record(
+            &db,
+            json!({"id":"ec00b000-0000-4000-8000-0000000000c5","type":"WorkItem","kind":"task","lifecycle":"closed","name":"W2 closed","body":"standby handoff"}),
+        )
+        .await
+        .unwrap();
+        let hidden = create_record(
+            &db,
+            json!({"id":"ec00b000-0000-4000-8000-0000000000c6","type":"WorkItem","kind":"task","lifecycle":"open","name":"W2 hidden","body":"standby hidden"}),
+        )
+        .await
+        .unwrap();
+        grant_link_edit(
+            &db,
+            &[
+                &open_body,
+                &open_summary,
+                &in_progress,
+                &open_plain,
+                &closed,
+                &deciding,
+            ],
+        )
+        .await;
+        replace_explicit_policy(&db, "test:sql-write-w2-hidden", &hidden, vec![])
+            .await
+            .unwrap();
+        let caller = Caller::authenticated("plan-author");
+        let statement = format!(
+            "SELECT id AS record_id, 'add_link' AS op, 'relates_to' AS key, '{deciding}' AS value FROM records WHERE type = 'WorkItem' AND lifecycle = 'open' AND (name LIKE '%standby%' OR body LIKE '%standby%' OR summary LIKE '%standby%')"
+        );
+        let args = json!({"statement": statement, "reason": "Preview the W2 bulk link", "link_note": "e0-harness"});
+        let events_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM content_events")
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap();
+        let prepared = prepare_sql_write_preview(&db, &caller, args).await.unwrap();
+        assert_eq!(prepared.effect["target_count"], json!(2));
+        assert_eq!(prepared.effect["op_count"], json!(2));
+        let mut target_ids: Vec<&str> = prepared.effect["targets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["record_id"].as_str().unwrap())
+            .collect();
+        target_ids.sort();
+        let mut expected = vec![open_body.as_str(), open_summary.as_str()];
+        expected.sort();
+        assert_eq!(
+            target_ids, expected,
+            "W2 sources are exactly the open standby set"
+        );
+        for target in prepared.effect["targets"].as_array().unwrap() {
+            let ops = target["ops"].as_array().unwrap();
+            assert_eq!(ops.len(), 1);
+            assert_eq!(ops[0]["op"], json!("add_link"));
+            assert_eq!(ops[0]["relationship"], json!("relates_to"));
+            assert_eq!(ops[0]["route"], json!("directed_legacy_link"));
+            assert_eq!(ops[0]["intent"], json!("would_create_relationship"));
+            assert_eq!(ops[0]["note"], json!("e0-harness"));
+            assert_eq!(ops[0]["note_applied"], json!(true));
+            assert_eq!(ops[0]["target_id"], json!(deciding));
+            assert_eq!(ops[0]["changed"], json!(true));
+        }
+        assert!(
+            prepared.target.starts_with("2 records ["),
+            "{}",
+            prepared.target
+        );
+        assert!(
+            prepared
+                .effect_summary
+                .contains("new relationship with note"),
+            "{}",
+            prepared.effect_summary
+        );
+        let events_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM content_events")
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            events_before, events_after,
+            "preparation must append no content event"
+        );
+    }
+
+    /// E4 M1 strict W3 exact-set fixture over the E3 task relation
+    /// (Native records dbb9bc1, c26f553, 194fef5, d519925) with the E3
+    /// currency guard (Native #1713 exposes caller-visible
+    /// `records.is_current`).
+    ///
+    /// Strict rule pinned here, never relaxed: real unchecked `- [ ]`,
+    /// `* [ ]`, `+ [ ]` items with text are INCLUDED; quotes, fences,
+    /// checked, ordered, bare checkbox-only, inline-only, non-draft,
+    /// superseded, and hidden/soft-deleted rows are EXCLUDED; an archived
+    /// draft with a real task stays INCLUDED with archive preview
+    /// `changed:false`.
+    const W3_STRICT_ARCHIVE_STATEMENT: &str = "SELECT id AS record_id, 'archive' AS op, NULL AS key, NULL AS value FROM records WHERE maturity = 'draft' AND records.is_current = 1 AND EXISTS (SELECT 1 FROM body_task_items WHERE body_task_items.record_id = records.id AND checked = 0 AND in_quote = 0 AND marker IN ('-', '*', '+')) ORDER BY id";
+
+    #[tokio::test]
+    async fn sql_write_preview_w3_strict_selection_uses_visible_task_items() {
+        let db = create_database(":memory:").await.unwrap();
+        let body_for: std::collections::HashMap<&str, &str> = [
+            ("ec00b000-0000-4000-8000-0000000000f0", "- [ ] real dash\n"),
+            ("ec00b000-0000-4000-8000-0000000000f1", "* [ ] real star\n"),
+            ("ec00b000-0000-4000-8000-0000000000f2", "+ [ ] real plus\n"),
+            (
+                "ec00b000-0000-4000-8000-0000000000f3",
+                "- [ ] real\n```\n- [ ] fake\n```\n> - [ ] quoted\n",
+            ),
+            (
+                "ec00b000-0000-4000-8000-0000000000f4",
+                "```\n- [ ] fake\n```\n",
+            ),
+            (
+                "ec00b000-0000-4000-8000-0000000000f5",
+                "> - [ ] quoted only\n",
+            ),
+            ("ec00b000-0000-4000-8000-0000000000f6", "see `- [ ]` here\n"),
+            ("ec00b000-0000-4000-8000-0000000000f7", "1. [ ] o-task\n"),
+            ("ec00b000-0000-4000-8000-0000000000f8", "- [ ]\n"),
+            ("ec00b000-0000-4000-8000-0000000000f9", "- [x] done\n"),
+            (
+                "ec00b000-0000-4000-8000-0000000000fa",
+                "- [ ] real but decided\n",
+            ),
+            (
+                "ec00b000-0000-4000-8000-0000000000fb",
+                "- [ ] hidden real\n",
+            ),
+            (
+                "ec00b000-0000-4000-8000-0000000000fc",
+                "- [ ] deleted real\n",
+            ),
+            (
+                "ec00b000-0000-4000-8000-0000000000fd",
+                "- [ ] archived real\n",
+            ),
+            (
+                "ec00b000-0000-4000-8000-0000000000fe",
+                "- [ ] superseded real\n",
+            ),
+            (
+                "ec00b000-0000-4000-8000-0000000000ff",
+                "W3 successor has no task\n",
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let mut visible: Vec<String> = Vec::new();
+        for (id, body) in &body_for {
+            let maturity = if *id == "ec00b000-0000-4000-8000-0000000000fa" {
+                "decided"
+            } else {
+                "draft"
+            };
+            let created = create_record(
+                &db,
+                json!({"id": id, "type": "Document", "kind": "note", "name": format!("W3 {id}"), "body": body, "maturity": maturity}),
+            )
+            .await
+            .unwrap();
+            if *id != "ec00b000-0000-4000-8000-0000000000fb" {
+                visible.push(created);
+            }
+        }
+        for id in &visible {
+            replace_explicit_policy(
+                &db,
+                "test:sql-write-w3-strict",
+                id,
+                vec![AllowEntry::account("plan-author", Capability::Manage)],
+            )
+            .await
+            .unwrap();
+        }
+        replace_explicit_policy(
+            &db,
+            "test:sql-write-w3-hidden",
+            "ec00b000-0000-4000-8000-0000000000fb",
+            vec![],
+        )
+        .await
+        .unwrap();
+        crate::store::delete_record(&db, "ec00b000-0000-4000-8000-0000000000fc")
+            .await
+            .unwrap();
+        crate::store::archive_record(&db, "ec00b000-0000-4000-8000-0000000000fd")
+            .await
+            .unwrap();
+        // Supersede the fe draft through the supported domain event path, so
+        // the E3 currency projector nulls `records.is_current` (never a raw
+        // projection forgery). The successor carries no task, so the shape
+        // set below grows by exactly the superseded draft.
+        crate::store::add_link(
+            &db,
+            crate::events::LinkAddedPayload {
+                id: None,
+                source_id: "ec00b000-0000-4000-8000-0000000000ff".to_string(),
+                target_id: "ec00b000-0000-4000-8000-0000000000fe".to_string(),
+                relationship: "supersedes".to_string(),
+                note: None,
+            },
+        )
+        .await
+        .unwrap();
+        let mut parser_hits: Vec<&str> = body_for
+            .iter()
+            .filter(|(id, body)| {
+                let maturity = if **id == "ec00b000-0000-4000-8000-0000000000fa" {
+                    "decided"
+                } else {
+                    "draft"
+                };
+                if maturity != "draft" {
+                    return false;
+                }
+                if **id == "ec00b000-0000-4000-8000-0000000000fb"
+                    || **id == "ec00b000-0000-4000-8000-0000000000fc"
+                {
+                    return false;
+                }
+                crate::body_task_items::extract_task_items(body)
+                    .expect("fixture body must parse")
+                    .iter()
+                    .any(|item| item.is_w3_candidate())
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        parser_hits.sort_unstable();
+        assert_eq!(
+            parser_hits,
+            vec![
+                "ec00b000-0000-4000-8000-0000000000f0",
+                "ec00b000-0000-4000-8000-0000000000f1",
+                "ec00b000-0000-4000-8000-0000000000f2",
+                "ec00b000-0000-4000-8000-0000000000f3",
+                "ec00b000-0000-4000-8000-0000000000fd",
+                "ec00b000-0000-4000-8000-0000000000fe",
+            ],
+            "parser shape set: dash/star/plus + mixed + archived-draft real + superseded-draft real"
+        );
+        let caller = Caller::authenticated("plan-author");
+        // Currency proof through the caller-visible lens, before preview: the
+        // superseded draft must read non-current while the exact-five stay
+        // current, so the preview exclusion below is not vacuous.
+        let currency_probe = crate::query::sql::query_sql_request_owned(
+            db.clone(),
+            (&caller).into(),
+            crate::query::sql_contract::QuerySqlRequest {
+                sql: "SELECT id, is_current, successor_count FROM records WHERE id IN ('ec00b000-0000-4000-8000-0000000000f0', 'ec00b000-0000-4000-8000-0000000000f1', 'ec00b000-0000-4000-8000-0000000000f2', 'ec00b000-0000-4000-8000-0000000000f3', 'ec00b000-0000-4000-8000-0000000000fd', 'ec00b000-0000-4000-8000-0000000000fe', 'ec00b000-0000-4000-8000-0000000000ff') ORDER BY id"
+                    .to_string(),
+                parameters: vec![],
+            },
+        )
+        .await
+        .expect("caller-visible currency probe must serve");
+        let row_by_id = |id: &str| {
+            currency_probe
+                .rows
+                .iter()
+                .find(|row| row["id"] == json!(id))
+                .unwrap_or_else(|| panic!("currency probe must return {id}"))
+                .clone()
+        };
+        let superseded_row = row_by_id("ec00b000-0000-4000-8000-0000000000fe");
+        assert_eq!(superseded_row["is_current"], json!(null));
+        assert_eq!(superseded_row["successor_count"], json!(1));
+        for id in [
+            "ec00b000-0000-4000-8000-0000000000f0",
+            "ec00b000-0000-4000-8000-0000000000f1",
+            "ec00b000-0000-4000-8000-0000000000f2",
+            "ec00b000-0000-4000-8000-0000000000f3",
+            "ec00b000-0000-4000-8000-0000000000fd",
+        ] {
+            let row = row_by_id(id);
+            assert_eq!(row["is_current"], json!(1), "{id} must stay current");
+            assert_eq!(
+                row["successor_count"],
+                json!(0),
+                "{id} must have no successor"
+            );
+        }
+        let successor_row = row_by_id("ec00b000-0000-4000-8000-0000000000ff");
+        assert_eq!(successor_row["is_current"], json!(1));
+        let events_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM content_events")
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap();
+        let prepared = prepare_sql_write_preview(
+            &db,
+            &caller,
+            json!({"statement": W3_STRICT_ARCHIVE_STATEMENT, "reason": "W3 strict target-set probe"}),
+        )
+        .await
+        .expect("W3 task relation must serve the strict selection");
+        let expected_selected = vec![
+            "ec00b000-0000-4000-8000-0000000000f0",
+            "ec00b000-0000-4000-8000-0000000000f1",
+            "ec00b000-0000-4000-8000-0000000000f2",
+            "ec00b000-0000-4000-8000-0000000000f3",
+            "ec00b000-0000-4000-8000-0000000000fd",
+        ];
+        assert_eq!(
+            prepared.effect["target_count"],
+            json!(expected_selected.len())
+        );
+        assert_eq!(prepared.effect["op_count"], json!(expected_selected.len()));
+        let targets = prepared.effect["targets"].as_array().unwrap();
+        let selected: Vec<&str> = targets
+            .iter()
+            .map(|target| target["record_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            selected, expected_selected,
+            "preview must preserve the exact currency-aware W3 set"
+        );
+        assert!(
+            !selected.contains(&"ec00b000-0000-4000-8000-0000000000fe"),
+            "superseded draft must be excluded by the currency guard"
+        );
+        for target in targets {
+            let op = &target["ops"][0];
+            assert_eq!(op["op"], json!("archive"));
+            assert_eq!(target["ops"].as_array().unwrap().len(), 1);
+            let already_archived = target["record_id"] == "ec00b000-0000-4000-8000-0000000000fd";
+            assert_eq!(op["before"], json!(already_archived));
+            assert_eq!(op["after"], json!(true));
+            assert_eq!(op["changed"], json!(!already_archived));
+        }
+        let unavailable =
+            W3_STRICT_ARCHIVE_STATEMENT.replace("body_task_items", "body_task_items_unavailable");
+        let error = prepare_sql_write_preview(
+            &db,
+            &caller,
+            json!({"statement": unavailable, "reason": "W3 unavailable-relation probe"}),
+        )
+        .await
+        .expect_err("an unavailable task relation must fail closed");
+        let detail = error.to_string();
+        assert!(detail.contains("selection rejected"), "{detail}");
+        assert!(detail.contains("body_task_items_unavailable"), "{detail}");
+        let events_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM content_events")
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            events_before, events_after,
+            "preview preparation and refused selection append nothing"
+        );
+    }
+
+    /// `set_facet` compares the full `(value, vocab_ref)` pair: a value-equal
+    /// but reference-different write is `changed: true`, and a same-pair write
+    /// is a true no-op. The governed reference is derived by the shared fold,
+    /// never supplied by the string-only row.
+    #[tokio::test]
+    async fn sql_write_preview_facet_vocab_ref_drift_is_changed_and_same_pair_is_noop() {
+        let db = create_database(":memory:").await.unwrap();
+        crate::meta::seed_pack_schema_config(
+            &db,
+            "@test/sql-write-facet",
+            json!({ "shapes": { "Document": { "facets": { "e4mw1": { "vocab": "e4mw1" } } } } }),
+            crate::meta::SchemaConfigOptions::default(),
+        )
+        .await
+        .unwrap();
+        crate::meta::create_vocabulary(&db, "e4mw1", None)
+            .await
+            .unwrap();
+        let active = crate::meta::propose_value(&db, "e4mw1", "done", None)
+            .await
+            .unwrap();
+        crate::meta::promote_value(&db, &active).await.unwrap();
+        let target = create_record(
+            &db,
+            json!({"id":"ec00b000-0000-4000-8000-0000000000b1","type":"Document","kind":"note","name":"Facet drift"}),
+        )
+        .await
+        .unwrap();
+        replace_explicit_policy(
+            &db,
+            "test:sql-write-facet-drift",
+            &target,
+            vec![AllowEntry::account("plan-author", Capability::Manage)],
+        )
+        .await
+        .unwrap();
+        let facet = |value: &str, vocab_ref: Option<String>| crate::events::FacetSetPayload {
+            key: "e4mw1".into(),
+            value: Some(value.into()),
+            vocab_ref,
+            as_of: None,
+            observation_only: false,
+        };
+        // Current value equal to the proposal, stored without the governed
+        // reference (the pre-governance / legacy state).
+        crate::store::set_facet(&db, &target, facet("done", None))
+            .await
+            .unwrap();
+        let caller = Caller::authenticated("plan-author");
+        let args = || {
+            json!({
+                "statement": format!("SELECT id AS record_id, 'set_facet' AS op, 'e4mw1' AS key, 'done' AS value FROM records WHERE id = '{target}'"),
+                "reason": "Preview a governed facet assertion",
+            })
+        };
+        let drifted = prepare_sql_write_preview(&db, &caller, args())
+            .await
+            .unwrap();
+        let op = &drifted.effect["targets"][0]["ops"][0];
+        assert_eq!(op["value"], json!("done"));
+        assert_eq!(op["before"], json!("done"));
+        assert_eq!(op["after"], json!("done"));
+        assert_eq!(op["before_vocab_ref"], json!(null));
+        let derived = op["after_vocab_ref"]
+            .as_str()
+            .expect("governance must derive a vocab_ref");
+        assert!(derived.starts_with("rec:"), "{derived}");
+        assert_eq!(
+            op["changed"],
+            json!(true),
+            "value-equal but reference-different must be changed"
+        );
+        // Persist the governed reference, then re-prepare: an exact same-pair
+        // write is a true no-op.
+        crate::store::set_facet(&db, &target, facet("done", Some(derived.to_string())))
+            .await
+            .unwrap();
+        let noop = prepare_sql_write_preview(&db, &caller, args())
+            .await
+            .unwrap();
+        let op = &noop.effect["targets"][0]["ops"][0];
+        assert_eq!(op["before_vocab_ref"], json!(derived));
+        assert_eq!(op["after_vocab_ref"], json!(derived));
+        assert_eq!(
+            op["changed"],
+            json!(false),
+            "same (value, vocab_ref) pair is a no-op"
+        );
+        assert_eq!(noop.effect["changed"], json!(false));
+    }
+
+    /// Facet keys the singular writer refuses are refused here too: spine
+    /// facets, engine-reserved facets, and non-string values never sign.
+    #[tokio::test]
+    async fn sql_write_preview_refuses_reserved_spine_and_non_string_facet_rows() {
+        let db = create_database(":memory:").await.unwrap();
+        let target = create_record(
+            &db,
+            json!({"id":"ec00b000-0000-4000-8000-0000000000c1","type":"Document","kind":"note","name":"Key guard"}),
+        )
+        .await
+        .unwrap();
+        let caller = Caller::local();
+        let facet_stmt = |key: &str| {
+            json!({
+                "statement": format!("SELECT id AS record_id, 'set_facet' AS op, '{key}' AS key, 'x' AS value FROM records WHERE id = '{target}'"),
+                "reason": "Facet key guard probe",
+            })
+        };
+        for (key, expected) in [
+            ("lifecycle", "spine facet"),
+            ("persistence", "spine facet"),
+            ("archived", "engine-reserved"),
+        ] {
+            let error = prepare_sql_write_preview(&db, &caller, facet_stmt(key))
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(expected), "{key}: {error}");
+        }
+        // A non-string value cell (SQL INTEGER) refuses rather than folding.
+        let typed = prepare_sql_write_preview(
+            &db,
+            &caller,
+            json!({
+                "statement": format!("SELECT id AS record_id, 'set_facet' AS op, 'e0probe' AS key, 7 AS value FROM records WHERE id = '{target}'"),
+                "reason": "Non-string facet value probe",
+            }),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(typed.contains("must be a JSON string"), "{typed}");
+        // A caller-supplied key is bounded before it enters the signed effect
+        // and summary; a query cell can be far larger than any value bound.
+        let oversized_key: String = std::iter::repeat_n('k', 121).collect();
+        let oversized = prepare_sql_write_preview(&db, &caller, facet_stmt(&oversized_key))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(oversized.contains("facet key exceeds 120"), "{oversized}");
+    }
+
+    /// `unset_facet` clears an existing open facet (`changed:true`) and signs
+    /// an absent facet as `changed:false` projected state with the same effect keys,
+    /// matching `update_record.facets` explicit-null parity. The typed row
+    /// requires a SQL NULL value; preparation appends no event.
+    #[tokio::test]
+    async fn sql_write_preview_unset_facet_existing_and_missing_sign_noop_parity() {
+        let db = create_database(":memory:").await.unwrap();
+        let existing = create_record(
+            &db,
+            json!({"id":"ec00b000-0000-4000-8000-0000000000e1","type":"Document","kind":"note","name":"Unset existing"}),
+        )
+        .await
+        .unwrap();
+        let absent = create_record(
+            &db,
+            json!({"id":"ec00b000-0000-4000-8000-0000000000e2","type":"Document","kind":"note","name":"Unset absent"}),
+        )
+        .await
+        .unwrap();
+        for id in [&existing, &absent] {
+            replace_explicit_policy(
+                &db,
+                "test:sql-write-unset-visible",
+                id,
+                vec![AllowEntry::account("plan-author", Capability::Manage)],
+            )
+            .await
+            .unwrap();
+        }
+        crate::store::set_facet(
+            &db,
+            &existing,
+            crate::events::FacetSetPayload {
+                key: "e0probe".into(),
+                value: Some("done".into()),
+                vocab_ref: None,
+                as_of: None,
+                observation_only: false,
+            },
+        )
+        .await
+        .unwrap();
+        let caller = Caller::authenticated("plan-author");
+        let unset_args = |id: &str| {
+            json!({
+                "statement": format!("SELECT id AS record_id, 'unset_facet' AS op, 'e0probe' AS key, NULL AS value FROM records WHERE id = '{id}'"),
+                "reason": "Preview the facet clear",
+            })
+        };
+        let events_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM content_events")
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap();
+        let prepared = prepare_sql_write_preview(&db, &caller, unset_args(&existing))
+            .await
+            .unwrap();
+        assert_eq!(prepared.effect["target_count"], json!(1));
+        assert_eq!(prepared.effect["op_count"], json!(1));
+        assert_eq!(prepared.effect["changed"], json!(true));
+        let ops = prepared.effect["targets"][0]["ops"].as_array().unwrap();
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0]["op"], json!("unset_facet"));
+        assert_eq!(ops[0]["key"], json!("e0probe"));
+        assert_eq!(ops[0]["value"], json!(null));
+        assert_eq!(ops[0]["before"], json!("done"));
+        assert_eq!(ops[0]["after"], json!(null));
+        assert_eq!(ops[0]["before_vocab_ref"], json!(null));
+        assert_eq!(ops[0]["after_vocab_ref"], json!(null));
+        assert_eq!(ops[0]["changed"], json!(true));
+        assert!(prepared.effect_summary.contains("unset_facet 'e0probe'"));
+        assert!(prepared.target.starts_with("1 record ["));
+        assert_eq!(prepared.target_state_digest.len(), 64);
+        let missing = prepare_sql_write_preview(&db, &caller, unset_args(&absent))
+            .await
+            .unwrap();
+        let missing_ops = missing.effect["targets"][0]["ops"].as_array().unwrap();
+        assert_eq!(missing.effect["changed"], json!(false));
+        assert_eq!(missing_ops[0]["op"], json!("unset_facet"));
+        assert_eq!(missing_ops[0]["before"], json!(null));
+        assert_eq!(missing_ops[0]["after"], json!(null));
+        assert_eq!(missing_ops[0]["changed"], json!(false));
+        assert!(missing.effect_summary.contains("unset_facet 'e0probe'"));
+        let repeat = prepare_sql_write_preview(&db, &caller, unset_args(&existing))
+            .await
+            .unwrap();
+        assert_eq!(repeat.effect, prepared.effect);
+        assert_eq!(repeat.target_state_digest, prepared.target_state_digest);
+        let non_null = prepare_sql_write_preview(
+            &db,
+            &caller,
+            json!({
+                "statement": format!("SELECT id AS record_id, 'unset_facet' AS op, 'e0probe' AS key, 'done' AS value FROM records WHERE id = '{existing}'"),
+                "reason": "Non-null unset value probe",
+            }),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            non_null.contains("requires a SQL NULL 'value'"),
+            "{non_null}"
+        );
+        let events_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM content_events")
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap();
+        assert_eq!(events_after, events_before);
+    }
+
+    /// `unset_facet` uses the same snapshot for visibility, Edit, and version
+    /// pinning: hidden and missing refuse identically, View-only refuses Edit,
+    /// and a concurrent clear changes the signed effect so revalidation sees
+    /// drift. Preparations append no event.
+    #[tokio::test]
+    async fn sql_write_preview_unset_facet_hidden_edit_and_stale_drift() {
+        let db = create_database(":memory:").await.unwrap();
+        let target = create_record(
+            &db,
+            json!({"id":"ec00b000-0000-4000-8000-0000000000e3","type":"Document","kind":"note","name":"Unset drift"}),
+        )
+        .await
+        .unwrap();
+        let hidden = create_record(
+            &db,
+            json!({"id":"ec00b000-0000-4000-8000-0000000000e4","type":"Document","kind":"note","name":"Unset hidden"}),
+        )
+        .await
+        .unwrap();
+        let view_only = create_record(
+            &db,
+            json!({"id":"ec00b000-0000-4000-8000-0000000000e5","type":"Document","kind":"note","name":"Unset view"}),
+        )
+        .await
+        .unwrap();
+        replace_explicit_policy(
+            &db,
+            "test:sql-write-unset-manage",
+            &target,
+            vec![AllowEntry::account("plan-author", Capability::Manage)],
+        )
+        .await
+        .unwrap();
+        replace_explicit_policy(&db, "test:sql-write-unset-hidden", &hidden, vec![])
+            .await
+            .unwrap();
+        replace_explicit_policy(
+            &db,
+            "test:sql-write-unset-view",
+            &view_only,
+            vec![AllowEntry::account("plan-author", Capability::View)],
+        )
+        .await
+        .unwrap();
+        crate::store::set_facet(
+            &db,
+            &target,
+            crate::events::FacetSetPayload {
+                key: "e0probe".into(),
+                value: Some("done".into()),
+                vocab_ref: None,
+                as_of: None,
+                observation_only: false,
+            },
+        )
+        .await
+        .unwrap();
+        let caller = Caller::authenticated("plan-author");
+        let unset_args = |id: &str| {
+            json!({
+                "statement": format!("SELECT id AS record_id, 'unset_facet' AS op, 'e0probe' AS key, NULL AS value FROM records WHERE id = '{id}'"),
+                "reason": "Preview the facet clear",
+            })
+        };
+        let hidden_error = prepare_sql_write_preview(&db, &caller, unset_args(&hidden))
+            .await
+            .unwrap_err()
+            .to_string();
+        let missing_error = prepare_sql_write_preview(
+            &db,
+            &caller,
+            unset_args("ec00b000-0000-4000-8000-00000000ffff"),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert_eq!(hidden_error, missing_error);
+        let view_error = prepare_sql_write_preview(&db, &caller, unset_args(&view_only))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(view_error.contains("capability"), "{view_error}");
+        let events_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM content_events")
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap();
+        let prepared = prepare_sql_write_preview(&db, &caller, unset_args(&target))
+            .await
+            .unwrap();
+        assert_eq!(prepared.effect["changed"], json!(true));
+        let previous_seq = prepared.effect["targets"][0]["previous_seq"]
+            .as_i64()
+            .unwrap();
+        crate::store::unset_facet(&db, &target, "e0probe")
+            .await
+            .unwrap();
+        let drifted = prepare_sql_write_preview(&db, &caller, unset_args(&target))
+            .await
+            .unwrap();
+        assert_eq!(drifted.effect["changed"], json!(false));
+        assert_ne!(drifted.effect, prepared.effect);
+        assert_ne!(drifted.target_state_digest, prepared.target_state_digest);
+        let stale = prepare_sql_write_preview(
+            &db,
+            &caller,
+            json!({
+                "statement": format!("SELECT id AS record_id, 'unset_facet' AS op, 'e0probe' AS key, NULL AS value FROM records WHERE id = '{target}'"),
+                "reason": "Stale version probe",
+                "expected_version": previous_seq,
+            }),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(stale.contains("content revision conflict"), "{stale}");
+        let events_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM content_events")
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap();
+        assert_eq!(events_after, events_before + 1);
+    }
+
+    /// `unset_facet` refuses a present required open facet read-only, matching
+    /// the singular `update_record` before/after `required_violations_in` plus
+    /// `assert_required_not_worsened` without mutating to simulate. A
+    /// nonrequired present facet still prepares, and an absent required facet
+    /// (already-violating state) still prepares a no-op.
+    #[tokio::test]
+    async fn sql_write_preview_unset_facet_required_refuses_while_nonrequired_and_absent_prepare() {
+        let db = create_database(":memory:").await.unwrap();
+        let required_target = create_record(
+            &db,
+            json!({"id":"ec00b000-0000-4000-8000-0000000000e6","type":"Document","kind":"note","name":"Unset required"}),
+        )
+        .await
+        .unwrap();
+        let plain_target = create_record(
+            &db,
+            json!({"id":"ec00b000-0000-4000-8000-0000000000e7","type":"Document","kind":"note","name":"Unset plain"}),
+        )
+        .await
+        .unwrap();
+        let req_facet = || crate::events::FacetSetPayload {
+            key: "e4req".into(),
+            value: Some("done".into()),
+            vocab_ref: None,
+            as_of: None,
+            observation_only: false,
+        };
+        crate::store::set_facet(&db, &required_target, req_facet())
+            .await
+            .unwrap();
+        crate::store::set_facet(
+            &db,
+            &required_target,
+            crate::events::FacetSetPayload {
+                key: "e0probe".into(),
+                value: Some("done".into()),
+                vocab_ref: None,
+                as_of: None,
+                observation_only: false,
+            },
+        )
+        .await
+        .unwrap();
+        crate::meta::seed_pack_schema_config(
+            &db,
+            "@test/sql-write-unset-required",
+            json!({ "shapes": { "Document": { "facets": { "e4req": { "required": true } } } } }),
+            crate::meta::SchemaConfigOptions::default(),
+        )
+        .await
+        .unwrap();
+        let caller = Caller::local();
+        let unset_args = |id: &str, key: &str| {
+            json!({
+                "statement": format!("SELECT id AS record_id, 'unset_facet' AS op, '{key}' AS key, NULL AS value FROM records WHERE id = '{id}'"),
+                "reason": "Preview the required facet clear",
+            })
+        };
+        let events_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM content_events")
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap();
+        let preview_error =
+            prepare_sql_write_preview(&db, &caller, unset_args(&required_target, "e4req"))
+                .await
+                .unwrap_err()
+                .to_string();
+        assert!(
+            preview_error.contains("would worsen required-facet conformance"),
+            "{preview_error}"
+        );
+        assert!(
+            preview_error.contains("missing required facet 'e4req'"),
+            "{preview_error}"
+        );
+        let singular_error = registry()
+            .call(
+                db.clone(),
+                caller.clone(),
+                "update_record",
+                json!({"id": required_target, "facets": {"e4req": null}, "reason": "Clear the required facet"}),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            singular_error.contains("would worsen required-facet conformance"),
+            "{singular_error}"
+        );
+        assert!(
+            singular_error.contains("missing required facet 'e4req'"),
+            "{singular_error}"
+        );
+        let nonrequired =
+            prepare_sql_write_preview(&db, &caller, unset_args(&required_target, "e0probe"))
+                .await
+                .unwrap();
+        assert_eq!(nonrequired.effect["changed"], json!(true));
+        let absent = prepare_sql_write_preview(&db, &caller, unset_args(&plain_target, "e4req"))
+            .await
+            .unwrap();
+        assert_eq!(absent.effect["changed"], json!(false));
+        let events_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM content_events")
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap();
+        assert_eq!(events_after, events_before);
+    }
+
+    /// `set_field` and `set_facet` rows share one total operation cap: 25
+    /// targets × (one field + one facet) prepares 50 rows, and a 51st row
+    /// refuses overflow. Duplicate facet keys refuse per `(record_id, key)`.
+    #[tokio::test]
+    async fn sql_write_preview_mixed_field_and_facet_share_one_operation_bound() {
+        let db = create_database(":memory:").await.unwrap();
+        let mut ids = Vec::new();
+        for index in 0..25u32 {
+            let id = format!("ec00b000-0000-4000-8000-{:012}", 0x300 + index);
+            create_record(
+                &db,
+                json!({"id": id, "type":"Document","kind":"note","name": format!("Mix {index}")}),
+            )
+            .await
+            .unwrap();
+            ids.push(id);
+        }
+        let caller = Caller::local();
+        let at_bound = json!({
+            "statement": "SELECT id AS record_id, 'set_field' AS op, 'name' AS key, 'Mixed' AS value FROM records WHERE name LIKE 'Mix %' \
+                          UNION ALL \
+                          SELECT id AS record_id, 'set_facet' AS op, 'e0probe' AS key, 'done' AS value FROM records WHERE name LIKE 'Mix %'",
+            "reason": "Mixed boundary probe",
+        });
+        let accepted = prepare_sql_write_preview(&db, &caller, at_bound)
+            .await
+            .unwrap();
+        assert_eq!(accepted.effect["target_count"], json!(25));
+        assert_eq!(accepted.effect["op_count"], json!(50));
+        let overflow = json!({
+            "statement": "SELECT id AS record_id, 'set_field' AS op, 'name' AS key, 'Mixed' AS value FROM records WHERE name LIKE 'Mix %' \
+                          UNION ALL \
+                          SELECT id AS record_id, 'set_field' AS op, 'summary' AS key, 'Mixed summary' AS value FROM records WHERE name LIKE 'Mix %' \
+                          UNION ALL \
+                          SELECT id AS record_id, 'set_facet' AS op, 'e0probe' AS key, 'done' AS value FROM records WHERE name LIKE 'Mix %'",
+            "reason": "Mixed overflow probe",
+        });
+        let overflow_error = prepare_sql_write_preview(&db, &caller, overflow)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            overflow_error.contains("50-operation preview bound"),
+            "{overflow_error}"
+        );
+        let first = ids[0].clone();
+        let duplicate = json!({
+            "statement": format!(
+                "SELECT id AS record_id, 'set_facet' AS op, 'e0probe' AS key, 'a' AS value FROM records WHERE id = '{first}' \
+                 UNION ALL \
+                 SELECT id AS record_id, 'set_facet' AS op, 'e0probe' AS key, 'b' AS value FROM records WHERE id = '{first}'"
+            ),
+            "reason": "Duplicate facet probe",
+        });
+        let duplicate_error = prepare_sql_write_preview(&db, &caller, duplicate)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(duplicate_error.contains("duplicate"), "{duplicate_error}");
+    }
+
+    /// E4 M1 archive slice: an `archive` typed row requires Manage (unlike
+    /// field/facet Edit), signs the exact archived before/after as
+    /// `changed:true` on an unarchived target, and never writes the facet during
+    /// preparation. Edit-only callers keep field/facet access but cannot
+    /// archive.
+    #[tokio::test]
+    async fn sql_write_preview_archive_requires_manage_and_signs_archived_transition() {
+        let db = create_database(":memory:").await.unwrap();
+        let managed = create_record(
+            &db,
+            json!({"id":"ec00b000-0000-4000-8000-0000000000d1","type":"Document","kind":"note","name":"Managed archive"}),
+        )
+        .await
+        .unwrap();
+        let edit_only = create_record(
+            &db,
+            json!({"id":"ec00b000-0000-4000-8000-0000000000d2","type":"Document","kind":"note","name":"Edit only"}),
+        )
+        .await
+        .unwrap();
+        replace_explicit_policy(
+            &db,
+            "test:sql-write-archive-manage",
+            &managed,
+            vec![AllowEntry::account("plan-author", Capability::Manage)],
+        )
+        .await
+        .unwrap();
+        replace_explicit_policy(
+            &db,
+            "test:sql-write-archive-edit",
+            &edit_only,
+            vec![AllowEntry::account("plan-author", Capability::Edit)],
+        )
+        .await
+        .unwrap();
+        let caller = Caller::authenticated("plan-author");
+        let archive_args = |id: &str| {
+            json!({
+                "statement": format!("SELECT id AS record_id, 'archive' AS op, NULL AS key, NULL AS value FROM records WHERE id = '{id}'"),
+                "reason": "Preview the archive lifecycle transition",
+            })
+        };
+        let events_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM content_events")
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap();
+        let prepared = prepare_sql_write_preview(&db, &caller, archive_args(&managed))
+            .await
+            .unwrap();
+        assert_eq!(
+            prepared.target_id, managed,
+            "one target keeps its record id"
+        );
+        assert_eq!(prepared.effect["target_count"], json!(1));
+        assert_eq!(prepared.effect["op_count"], json!(1));
+        assert_eq!(prepared.effect["changed"], json!(true));
+        let ops = prepared.effect["targets"][0]["ops"]
+            .as_array()
+            .expect("target ops array");
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0]["op"], json!("archive"));
+        assert_eq!(ops[0]["before"], json!(false));
+        assert_eq!(ops[0]["after"], json!(true));
+        assert_eq!(ops[0]["changed"], json!(true));
+        assert!(
+            ops[0].get("key").is_none() && ops[0].get("value").is_none(),
+            "archive must not invent a facet key/value payload: {}",
+            ops[0]
+        );
+        assert!(
+            prepared.effect_summary.contains("archive of"),
+            "{}",
+            prepared.effect_summary
+        );
+        // Preparation never writes the archived facet: the preview is not the
+        // transition.
+        let archived_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM facet_values WHERE record_id = ? AND key = 'archived'",
+        )
+        .bind(&managed)
+        .fetch_one(db.write_pool())
+        .await
+        .unwrap();
+        assert_eq!(archived_rows, 0, "preparation must not archive");
+        // Archive requires Manage: the Edit-only record refuses archive.
+        let edit_error = prepare_sql_write_preview(&db, &caller, archive_args(&edit_only))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            edit_error.contains("requires manage capability"),
+            "{edit_error}"
+        );
+        // Edit still admits a field edit on that same Edit-only record.
+        let field = prepare_sql_write_preview(
+            &db,
+            &caller,
+            json!({
+                "statement": format!("SELECT id AS record_id, 'set_field' AS op, 'name' AS key, 'Renamed' AS value FROM records WHERE id = '{edit_only}'"),
+                "reason": "Edit-only field probe",
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            field.effect["targets"][0]["ops"][0]["op"],
+            json!("set_field")
+        );
+        let events_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM content_events")
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap();
+        assert_eq!(events_after, events_before, "preparation appends no event");
+    }
+
+    /// An already-archived target prepares as a `changed:false` no-op, matching
+    /// `archive_record` and the batch archive item, rather than refusing like a
+    /// field/facet edit on an archived record.
+    #[tokio::test]
+    async fn sql_write_preview_archive_on_archived_target_is_changed_false_noop() {
+        let db = create_database(":memory:").await.unwrap();
+        let target = create_record(
+            &db,
+            json!({"id":"ec00b000-0000-4000-8000-0000000000d3","type":"Document","kind":"note","name":"Already archived"}),
+        )
+        .await
+        .unwrap();
+        replace_explicit_policy(
+            &db,
+            "test:sql-write-archive-already",
+            &target,
+            vec![AllowEntry::account("plan-author", Capability::Manage)],
+        )
+        .await
+        .unwrap();
+        crate::store::archive_record(&db, &target).await.unwrap();
+        let caller = Caller::authenticated("plan-author");
+        let events_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM content_events")
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap();
+        let prepared = prepare_sql_write_preview(
+            &db,
+            &caller,
+            json!({
+                "statement": format!("SELECT id AS record_id, 'archive' AS op, NULL AS key, NULL AS value FROM records WHERE id = '{target}'"),
+                "reason": "Preview an archive no-op",
+            }),
+        )
+        .await
+        .unwrap();
+        let op = &prepared.effect["targets"][0]["ops"][0];
+        assert_eq!(op["op"], json!("archive"));
+        assert_eq!(op["before"], json!(true));
+        assert_eq!(op["after"], json!(true));
+        assert_eq!(op["changed"], json!(false));
+        assert_eq!(prepared.effect["changed"], json!(false));
+        let events_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM content_events")
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            events_after, events_before,
+            "no-op preparation appends nothing"
+        );
+    }
+
+    /// Archive shape and composition refusals: a non-null key or value, an
+    /// extra column, a duplicate archive row, archive mixed with another op on
+    /// the same record, and a tombstoned target all refuse with nothing
+    /// written.
+    #[tokio::test]
+    async fn sql_write_preview_archive_refuses_bad_shape_tombstone_duplicate_and_mixed() {
+        let db = create_database(":memory:").await.unwrap();
+        let target = create_record(
+            &db,
+            json!({"id":"ec00b000-0000-4000-8000-0000000000d4","type":"Document","kind":"note","name":"Archive shape"}),
+        )
+        .await
+        .unwrap();
+        let tombstoned = create_record(
+            &db,
+            json!({"id":"ec00b000-0000-4000-8000-0000000000d5","type":"Document","kind":"note","name":"Tombstoned"}),
+        )
+        .await
+        .unwrap();
+        for id in [target.as_str(), tombstoned.as_str()] {
+            replace_explicit_policy(
+                &db,
+                "test:sql-write-archive-shape",
+                id,
+                vec![AllowEntry::account("plan-author", Capability::Manage)],
+            )
+            .await
+            .unwrap();
+        }
+        crate::store::delete_record(&db, &tombstoned).await.unwrap();
+        let caller = Caller::authenticated("plan-author");
+        let probe = |statement: String| {
+            let db = db.clone();
+            let caller = caller.clone();
+            async move {
+                prepare_sql_write_preview(
+                    &db,
+                    &caller,
+                    json!({
+                        "statement": statement,
+                        "reason": "Archive shape probe",
+                    }),
+                )
+                .await
+            }
+        };
+        let nonnull_key = probe(format!(
+            "SELECT id AS record_id, 'archive' AS op, 'archived' AS key, NULL AS value FROM records WHERE id = '{target}'"
+        ))
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(nonnull_key.contains("SQL NULL 'key'"), "{nonnull_key}");
+        let nonnull_value = probe(format!(
+            "SELECT id AS record_id, 'archive' AS op, NULL AS key, 'true' AS value FROM records WHERE id = '{target}'"
+        ))
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            nonnull_value.contains("SQL NULL 'value'"),
+            "{nonnull_value}"
+        );
+        let extra_column = probe(format!(
+            "SELECT id AS record_id, 'archive' AS op, NULL AS key, NULL AS value, 1 AS extra FROM records WHERE id = '{target}'"
+        ))
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            extra_column.contains("unknown operation field 'extra'"),
+            "{extra_column}"
+        );
+        let duplicate = probe(format!(
+            "SELECT id AS record_id, 'archive' AS op, NULL AS key, NULL AS value FROM records WHERE id = '{target}' \
+             UNION ALL \
+             SELECT id AS record_id, 'archive' AS op, NULL AS key, NULL AS value FROM records WHERE id = '{target}'"
+        ))
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(duplicate.contains("duplicate"), "{duplicate}");
+        let mixed = probe(format!(
+            "SELECT id AS record_id, 'archive' AS op, NULL AS key, NULL AS value FROM records WHERE id = '{target}' \
+             UNION ALL \
+             SELECT id AS record_id, 'set_field' AS op, 'name' AS key, 'Renamed' AS value FROM records WHERE id = '{target}'"
+        ))
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            mixed.contains("mixes 'archive' with another operation"),
+            "{mixed}"
+        );
+        // A tombstoned target refuses; the refusal is drift-shaped (Conflict),
+        // never a successful preview.
+        let tombstone_error = probe(format!(
+            "SELECT id AS record_id, 'archive' AS op, NULL AS key, NULL AS value FROM records WHERE id = '{tombstoned}'"
+        ))
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&tombstone_error, Error::Conflict(_)),
+            "tombstone refusal must be drift-shaped: {tombstone_error}"
+        );
+        // The target is still live and unarchived: every refusal above appended
+        // no event and did not archive.
+        let archived_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM facet_values WHERE record_id = ? AND key = 'archived'",
+        )
+        .bind(&target)
+        .fetch_one(db.write_pool())
+        .await
+        .unwrap();
+        assert_eq!(archived_rows, 0);
+    }
+
+    /// A hidden record that a predicate also matches does not perturb the
+    /// archive target set, signed effect, summary, or digest, and preparation
+    /// appends no event.
+    #[tokio::test]
+    async fn sql_write_preview_archive_hidden_match_does_not_perturb() {
+        let db = create_database(":memory:").await.unwrap();
+        let visible = create_record(
+            &db,
+            json!({"id":"ec00b000-0000-4000-8000-0000000000d6","type":"Document","kind":"note","name":"Archivable visible"}),
+        )
+        .await
+        .unwrap();
+        replace_explicit_policy(
+            &db,
+            "test:sql-write-archive-visible",
+            &visible,
+            vec![AllowEntry::account("plan-author", Capability::Manage)],
+        )
+        .await
+        .unwrap();
+        let hidden = create_record(
+            &db,
+            json!({"id":"ec00b000-0000-4000-8000-0000000000d7","type":"Document","kind":"note","name":"Archivable hidden"}),
+        )
+        .await
+        .unwrap();
+        replace_explicit_policy(&db, "test:sql-write-archive-hidden", &hidden, vec![])
+            .await
+            .unwrap();
+        let caller = Caller::authenticated("plan-author");
+        let args = || {
+            json!({
+                "statement": "SELECT id AS record_id, 'archive' AS op, NULL AS key, NULL AS value FROM records WHERE name LIKE 'Archivable %'",
+                "reason": "Archive hidden-match probe",
+            })
+        };
+        let events_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM content_events")
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap();
+        let before = prepare_sql_write_preview(&db, &caller, args())
+            .await
+            .unwrap();
+        assert_eq!(before.effect["target_count"], json!(1));
+        assert_eq!(
+            before.effect["targets"][0]["record_id"],
+            json!(visible),
+            "the hidden match must not enter the target set"
+        );
+        // A further hidden match changes nothing signed.
+        let perturbative = create_record(
+            &db,
+            json!({"id":"ec00b000-0000-4000-8000-0000000000d8","type":"Document","kind":"note","name":"Archivable hidden two"}),
+        )
+        .await
+        .unwrap();
+        replace_explicit_policy(
+            &db,
+            "test:sql-write-archive-hidden-two",
+            &perturbative,
+            vec![],
+        )
+        .await
+        .unwrap();
+        let after = prepare_sql_write_preview(&db, &caller, args())
+            .await
+            .unwrap();
+        assert_eq!(after.effect, before.effect);
+        assert_eq!(after.effect_summary, before.effect_summary);
+        assert_eq!(after.target, before.target);
+        assert_eq!(after.target_state_digest, before.target_state_digest);
+        let events_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM content_events")
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            events_after,
+            events_before + 1,
+            "only the deliberate hidden fixture write appends; preparations add nothing"
+        );
+    }
+
+    /// Temporary ambiguity guard (E4 M1; E3 M1 stays open): a live incoming
+    /// `supersedes` link refuses the preview before any signed effect exists.
+    /// Visible and hidden successors refuse with the same stable string and
+    /// never leak the successor; a tombstoned successor discloses nothing.
+    #[tokio::test]
+    async fn sql_write_preview_refuses_superseded_target() {
+        let db = create_database(":memory:").await.unwrap();
+        let mk = |id: &str, name: &str| {
+            let db = db.clone();
+            let body = json!({"id":id,"type":"Document","kind":"note","name":name});
+            async move { create_record(&db, body).await.unwrap() }
+        };
+        let target_v = mk("ec00b000-0000-4000-8000-000000000aa1", "Superseded visible").await;
+        let succ_visible = mk("ec00b000-0000-4000-8000-000000000aa2", "Visible successor").await;
+        let target_h = mk("ec00b000-0000-4000-8000-000000000aa3", "Superseded hidden").await;
+        let succ_hidden = mk("ec00b000-0000-4000-8000-000000000aa4", "Hidden successor").await;
+        let target_t = mk(
+            "ec00b000-0000-4000-8000-000000000aa5",
+            "Tombstoned successor target",
+        )
+        .await;
+        let succ_tomb = mk(
+            "ec00b000-0000-4000-8000-000000000aa6",
+            "Tombstoned successor",
+        )
+        .await;
+        for (id, cap) in [
+            (target_v.as_str(), Capability::Edit),
+            (succ_visible.as_str(), Capability::View),
+            (target_h.as_str(), Capability::Edit),
+            (target_t.as_str(), Capability::Edit),
+            (succ_tomb.as_str(), Capability::View),
+        ] {
+            replace_explicit_policy(
+                &db,
+                "test:sql-write-superseded",
+                id,
+                vec![AllowEntry::account("plan-author", cap)],
+            )
+            .await
+            .unwrap();
+        }
+        // succ_hidden gets an explicitly empty policy: hidden by decision,
+        // not by the absence of a fixture grant.
+        replace_explicit_policy(
+            &db,
+            "test:sql-write-superseded-hidden",
+            &succ_hidden,
+            vec![],
+        )
+        .await
+        .unwrap();
+        for (n, source, target) in [
+            (
+                "supersede-visible",
+                succ_visible.as_str(),
+                target_v.as_str(),
+            ),
+            ("supersede-hidden", succ_hidden.as_str(), target_h.as_str()),
+            ("supersede-tomb", succ_tomb.as_str(), target_t.as_str()),
+        ] {
+            sqlx::query("INSERT INTO links(id,source_id,target_id,relationship) VALUES (?,?,?,'supersedes')")
+                .bind(n)
+                .bind(source)
+                .bind(target)
+                .execute(db.write_pool())
+                .await
+                .unwrap();
+        }
+        crate::store::delete_record(&db, &succ_tomb).await.unwrap();
+        let caller = Caller::authenticated("plan-author");
+        let args = |id: &str| {
+            json!({
+                "statement": format!("SELECT id AS record_id, 'set_field' AS op, 'name' AS key, 'Renamed' AS value FROM records WHERE id = '{id}'"),
+                "reason": "Superseded-target probe",
+            })
+        };
+        // Hiddenness proof through the same governed lens the probe runs
+        // under: selecting the hidden successor itself refuses
+        // byte-identically to a missing record, so the refusal comparison
+        // below is genuinely visible-vs-hidden, not visible-vs-unasserted.
+        let hidden_direct = prepare_sql_write_preview(&db, &caller, args(&succ_hidden))
+            .await
+            .unwrap_err()
+            .to_string();
+        let missing_direct =
+            prepare_sql_write_preview(&db, &caller, args("ec00b000-0000-4000-8000-00000000ffff"))
+                .await
+                .unwrap_err()
+                .to_string();
+        assert_eq!(
+            hidden_direct, missing_direct,
+            "succ_hidden must be hidden to plan-author"
+        );
+        // The tombstoned-successor case is vacuous unless the link row
+        // survives the successor's deletion (links cascade only on hard
+        // delete) while the successor itself reads tombstoned.
+        let tomb_link: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM links WHERE id = 'supersede-tomb'")
+                .fetch_one(db.write_pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            tomb_link, 1,
+            "delete_record must tombstone, not remove the link row"
+        );
+        let tomb_deleted: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM records WHERE id = ? AND deleted_at IS NOT NULL",
+        )
+        .bind(succ_tomb.as_str())
+        .fetch_one(db.write_pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            tomb_deleted, 1,
+            "the tombstoned successor must read tombstoned"
+        );
+        let events_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM content_events")
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap();
+        let err_v = prepare_sql_write_preview(&db, &caller, args(&target_v))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err_v.contains("has an incoming supersedes link"), "{err_v}");
+        assert!(err_v.contains(&target_v), "{err_v}");
+        assert!(!err_v.contains(&succ_visible), "{err_v}");
+        assert!(!err_v.contains("Visible successor"), "{err_v}");
+        let err_h = prepare_sql_write_preview(&db, &caller, args(&target_h))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err_h.contains("has an incoming supersedes link"), "{err_h}");
+        assert!(!err_h.contains(&succ_hidden), "{err_h}");
+        assert!(!err_h.contains("Hidden successor"), "{err_h}");
+        assert_eq!(
+            err_h.replace(target_h.as_str(), "ID"),
+            err_v.replace(target_v.as_str(), "ID"),
+            "visible and hidden successors must refuse identically"
+        );
+        prepare_sql_write_preview(&db, &caller, args(&target_t))
+            .await
+            .expect("a tombstoned successor discloses nothing and must prepare");
+        let events_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM content_events")
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            events_after, events_before,
+            "refusals and preparations append nothing"
+        );
+    }
+
+    /// A `supersedes` link added after prepare makes the execute-shaped
+    /// call revalidate as `plan_stale` (never `plan_revalidation_failed`)
+    /// with no dispatch: the full plan prepare + execute path, not just a
+    /// second preparer call.
+    #[tokio::test]
+    async fn sql_write_preview_supersede_after_prepare_is_stale() {
+        use crate::mcp::{
+            register_allowlisted_experimental_tools, ExperimentalExecutors,
+            EXPERIMENTAL_SQL_WRITE_EXECUTOR,
+        };
+
+        let db = create_database(":memory:").await.unwrap();
+        let target = create_record(
+            &db,
+            json!({"id":"ec00b000-0000-4000-8000-000000000ab1","type":"Document","kind":"note","name":"Drift target"}),
+        )
+        .await
+        .unwrap();
+        let telemetry = ExecutorTelemetryContext::new(
+            Arc::new(super::telemetry::TestTelemetrySink::default()),
+            super::telemetry::DEFAULT_RETENTION_DAYS,
+        )
+        .unwrap();
+        let experimental = ExperimentalExecutors::from_env_value(Some(
+            EXPERIMENTAL_SQL_WRITE_EXECUTOR.to_string(),
+        ))
+        .unwrap();
+        // The executor contract requires the allowlisted source tool in the
+        // registry, exactly as production registers it: without the source
+        // there is no contract and the execute-shaped call cannot route.
+        let mut allowlisted = ToolRegistry::new();
+        register_builtin_tools(&mut allowlisted).unwrap();
+        register_surface_tools(&mut allowlisted).unwrap();
+        register_allowlisted_experimental_tools(&mut allowlisted, &experimental).unwrap();
+        let server = ExecutorPrototypeStdioServer::new_with_telemetry_and_experimental(
+            Arc::new(allowlisted),
+            db.clone(),
+            Caller::local(),
+            None,
+            telemetry,
+            experimental,
+        )
+        .await
+        .unwrap();
+        assert!(server
+            .contracts
+            .contains_key(&(SQL_WRITE_EXECUTOR.into(), SQL_WRITE_OPERATION.into())));
+        let statement = format!("SELECT id AS record_id, 'set_field' AS op, 'name' AS key, 'Renamed' AS value FROM records WHERE id = '{target}'");
+        let prepared = server
+            .handle_message(executor_call_message(
+                1,
+                SQL_WRITE_EXECUTOR,
+                json!({"operation":SQL_WRITE_OPERATION,"arguments":{"statement":statement,"reason":"Supersede-drift probe"}}),
+            ))
+            .await
+            .unwrap();
+        assert!(response_succeeded(&prepared), "{prepared}");
+        let successor = create_record(
+            &db,
+            json!({"id":"ec00b000-0000-4000-8000-000000000ab2","type":"Document","kind":"note","name":"Late successor"}),
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO links(id,source_id,target_id,relationship) VALUES (?,?,?,'supersedes')",
+        )
+        .bind("supersede-drift")
+        .bind(successor.as_str())
+        .bind(target.as_str())
+        .execute(db.write_pool())
+        .await
+        .unwrap();
+        let events_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM content_events")
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap();
+        let executed = server
+            .handle_message(executor_call_message(
+                2,
+                SQL_WRITE_EXECUTOR,
+                execution_arguments_for(SQL_WRITE_OPERATION, &prepared),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            executed["result"]["structuredContent"]["plan_error"]["code"],
+            json!("plan_stale"),
+            "{executed}"
+        );
+        assert!(
+            executed["result"]["structuredContent"]["preview_current"].is_null(),
+            "a stale plan must not confirm current: {executed}"
+        );
+        let events_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM content_events")
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            events_after, events_before,
+            "the stale execution dispatches nothing"
+        );
+    }
+
+    /// The positive counterpart to the stale test: an execute-shaped call on a
+    /// preview whose signed target has not drifted is a revalidate-only
+    /// confirmation. It reports `preview_current`, claims no execution fence,
+    /// dispatches nothing, and leaves the plan `Prepared` — on the first call
+    /// and identically on a repeated call. Only once the target changes
+    /// through an ordinary domain write does the same call go `plan_stale`.
+    #[tokio::test]
+    async fn sql_write_preview_execute_confirms_current_without_claim_or_dispatch() {
+        use crate::mcp::{
+            register_allowlisted_experimental_tools, ExperimentalExecutors,
+            EXPERIMENTAL_SQL_WRITE_EXECUTOR,
+        };
+
+        let db = create_database(":memory:").await.unwrap();
+        let target = create_record(
+            &db,
+            json!({"id":"ec00b000-0000-4000-8000-000000000ac1","type":"Document","kind":"note","name":"Confirm target"}),
+        )
+        .await
+        .unwrap();
+        let telemetry = ExecutorTelemetryContext::new(
+            Arc::new(super::telemetry::TestTelemetrySink::default()),
+            super::telemetry::DEFAULT_RETENTION_DAYS,
+        )
+        .unwrap();
+        let experimental = ExperimentalExecutors::from_env_value(Some(
+            EXPERIMENTAL_SQL_WRITE_EXECUTOR.to_string(),
+        ))
+        .unwrap();
+        // Production registers the allowlisted source tool alongside the
+        // ordinary surface; without it there is no contract and the
+        // execute-shaped call cannot route.
+        let mut allowlisted = ToolRegistry::new();
+        register_builtin_tools(&mut allowlisted).unwrap();
+        register_surface_tools(&mut allowlisted).unwrap();
+        register_allowlisted_experimental_tools(&mut allowlisted, &experimental).unwrap();
+        let server = ExecutorPrototypeStdioServer::new_with_telemetry_and_experimental(
+            Arc::new(allowlisted),
+            db.clone(),
+            Caller::local(),
+            None,
+            telemetry,
+            experimental,
+        )
+        .await
+        .unwrap();
+        assert!(server
+            .contracts
+            .contains_key(&(SQL_WRITE_EXECUTOR.into(), SQL_WRITE_OPERATION.into())));
+
+        let name_before: String = sqlx::query_scalar("SELECT name FROM records WHERE id = ?")
+            .bind(target.as_str())
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap();
+        let events_before_prepare: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM content_events")
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap();
+
+        let statement = format!(
+            "SELECT id AS record_id, 'set_field' AS op, 'name' AS key, 'Renamed' AS value FROM records WHERE id = '{target}'"
+        );
+        let prepared = server
+            .handle_message(executor_call_message(
+                1,
+                SQL_WRITE_EXECUTOR,
+                json!({"operation":SQL_WRITE_OPERATION,"arguments":{"statement":statement,"reason":"Confirmation proof"}}),
+            ))
+            .await
+            .unwrap();
+        assert!(response_succeeded(&prepared), "{prepared}");
+        let signed = prepared["result"]["structuredContent"].clone();
+        assert!(signed["plan_error"].is_null(), "{prepared}");
+        let plan_id = signed["plan_id"].as_str().unwrap().to_string();
+        let signed_target = signed["target"].clone();
+        let signed_effect_summary = signed["effect_summary"].clone();
+        let signed_effect = signed["effect"].clone();
+        assert_eq!(signed["preparation_mutated"], false, "{prepared}");
+        // Preserve the returned effect as a whole value; confirmation must
+        // echo it without assuming an object shape at the protocol boundary.
+        assert!(!signed_effect.is_null(), "{prepared}");
+        let events_after_prepare: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM content_events")
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            events_after_prepare, events_before_prepare,
+            "signing a preview plan appends no domain event"
+        );
+        let name_after_prepare: String =
+            sqlx::query_scalar("SELECT name FROM records WHERE id = ?")
+                .bind(target.as_str())
+                .fetch_one(db.write_pool())
+                .await
+                .unwrap();
+        assert_eq!(name_after_prepare, name_before);
+
+        let execute = execution_arguments_for(SQL_WRITE_OPERATION, &prepared);
+        let write_runtime = server
+            .write_runtime
+            .as_ref()
+            .expect("the local executor server holds a write runtime");
+        let stored_prepared = write_runtime
+            .store
+            .load(&plan_id, now_ms())
+            .await
+            .unwrap()
+            .expect("preparation persists the signed preview plan");
+        // The local store's Prepared constraint also requires attempt_id,
+        // execution_owner and started_at_ms to be NULL. Operational plan and
+        // telemetry bookkeeping is separate from the domain assertions above.
+        assert!(matches!(stored_prepared.state, StoredState::Prepared));
+
+        // The same execute-shaped arguments, twice: each call re-confirms
+        // rather than replaying a claim or a committed result.
+        for round in 0..2u64 {
+            let confirmed = server
+                .handle_message(executor_call_message(
+                    10 + round,
+                    SQL_WRITE_EXECUTOR,
+                    execute.clone(),
+                ))
+                .await
+                .unwrap();
+            assert!(response_succeeded(&confirmed), "{confirmed}");
+            let content = &confirmed["result"]["structuredContent"];
+            assert!(content["plan_error"].is_null(), "{confirmed}");
+            assert_eq!(content["plan_id"], plan_id, "{confirmed}");
+            assert_eq!(content["preview_current"], json!(true), "{confirmed}");
+            assert_eq!(content["committed"], json!(false), "{confirmed}");
+            assert_eq!(content["preparation_mutated"], json!(false), "{confirmed}");
+            assert_eq!(content["source_dispatch_count"], json!(0), "{confirmed}");
+            assert_eq!(content["target"], signed_target, "{confirmed}");
+            assert_eq!(
+                content["effect_summary"], signed_effect_summary,
+                "{confirmed}"
+            );
+            assert_eq!(content["effect"], signed_effect, "{confirmed}");
+            let stored = write_runtime
+                .store
+                .load(&plan_id, now_ms())
+                .await
+                .unwrap()
+                .expect("a confirmed preview plan stays persisted");
+            assert!(
+                matches!(stored.state, StoredState::Prepared),
+                "confirmation round {round} must leave the plan Prepared, never Executing: {stored:?}"
+            );
+            assert_eq!(stored.payload, stored_prepared.payload);
+            let events_after_confirmation: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM content_events")
+                    .fetch_one(db.write_pool())
+                    .await
+                    .unwrap();
+            assert_eq!(
+                events_after_confirmation, events_before_prepare,
+                "confirmation round {round} appends no domain event"
+            );
+            let name_now: String = sqlx::query_scalar("SELECT name FROM records WHERE id = ?")
+                .bind(target.as_str())
+                .fetch_one(db.write_pool())
+                .await
+                .unwrap();
+            assert_eq!(
+                name_now, name_before,
+                "confirmation round {round} must not mutate the target"
+            );
+        }
+
+        // An ordinary domain write changes the signed target's state, so the
+        // same execute-shaped call must now refuse as stale and dispatch
+        // nothing.
+        update_record(&db, &target, json!({"name":"Drifted after signing"}))
+            .await
+            .unwrap();
+        let events_after_domain_edit: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM content_events")
+                .fetch_one(db.write_pool())
+                .await
+                .unwrap();
+        assert!(events_after_domain_edit > events_before_prepare);
+        let stale = server
+            .handle_message(executor_call_message(20, SQL_WRITE_EXECUTOR, execute))
+            .await
+            .unwrap();
+        assert_eq!(
+            stale["result"]["structuredContent"]["plan_error"]["code"],
+            json!("plan_stale"),
+            "{stale}"
+        );
+        assert!(
+            stale["result"]["structuredContent"]["preview_current"].is_null(),
+            "a stale plan must not confirm current: {stale}"
+        );
+        let events_after_stale: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM content_events")
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            events_after_stale, events_after_domain_edit,
+            "the stale execute dispatches no domain event"
+        );
+        let name_after_stale: String = sqlx::query_scalar("SELECT name FROM records WHERE id = ?")
+            .bind(target.as_str())
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap();
+        assert_eq!(name_after_stale, "Drifted after signing");
+        let stored_stale = write_runtime
+            .store
+            .load(&plan_id, now_ms())
+            .await
+            .unwrap()
+            .expect("a stale confirmation leaves the signed preview persisted");
+        assert!(matches!(stored_stale.state, StoredState::Prepared));
+        assert_eq!(stored_stale.payload, stored_prepared.payload);
     }
 
     #[test]
@@ -5719,7 +10292,7 @@ mod tests {
             .unwrap();
         let plan_count = || async {
             sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM write_plans")
-                .fetch_one(server.write_runtime.store.local_pool())
+                .fetch_one(server.write_runtime.as_ref().unwrap().store.local_pool())
                 .await
                 .unwrap()
         };
@@ -5766,7 +10339,7 @@ mod tests {
         );
         let state: String = sqlx::query_scalar("SELECT state FROM write_plans WHERE plan_id = ?")
             .bind(&plan_id)
-            .fetch_one(server.write_runtime.store.local_pool())
+            .fetch_one(server.write_runtime.as_ref().unwrap().store.local_pool())
             .await
             .unwrap();
         assert_eq!(state, "prepared");
@@ -5780,7 +10353,7 @@ mod tests {
         assert!(response_succeeded(&executed), "{executed}");
         let state: String = sqlx::query_scalar("SELECT state FROM write_plans WHERE plan_id = ?")
             .bind(plan_id)
-            .fetch_one(server.write_runtime.store.local_pool())
+            .fetch_one(server.write_runtime.as_ref().unwrap().store.local_pool())
             .await
             .unwrap();
         assert_eq!(state, "completed");
@@ -5814,7 +10387,7 @@ mod tests {
             .unwrap();
         assert!(response_succeeded(&prepared), "{prepared}");
         let gate = DispatchGate::new();
-        server.write_runtime.dispatch_gate = Some(Arc::clone(&gate));
+        server.write_runtime.as_mut().unwrap().dispatch_gate = Some(Arc::clone(&gate));
         let server = Arc::new(server);
 
         let running = {
@@ -5923,6 +10496,8 @@ mod tests {
             .unwrap();
         let stored = server
             .write_runtime
+            .as_ref()
+            .unwrap()
             .store
             .load(plan_id, now_ms())
             .await
@@ -6320,7 +10895,7 @@ mod tests {
                 .await
                 .unwrap();
         let gate = DispatchGate::new();
-        server.write_runtime.dispatch_gate = Some(Arc::clone(&gate));
+        server.write_runtime.as_mut().unwrap().dispatch_gate = Some(Arc::clone(&gate));
         let server = Arc::new(server);
         let events_before = policy_event_count(&db).await;
         let prepared = server
@@ -6576,7 +11151,11 @@ mod tests {
                 .await
                 .unwrap();
         let revalidation_gate = DispatchGate::new();
-        revalidation_server.write_runtime.revalidation_gate = Some(Arc::clone(&revalidation_gate));
+        revalidation_server
+            .write_runtime
+            .as_mut()
+            .unwrap()
+            .revalidation_gate = Some(Arc::clone(&revalidation_gate));
         let revalidation_server = Arc::new(revalidation_server);
         for operation in [
             IDENTITY_ADD_OPERATION,
@@ -7253,6 +11832,8 @@ mod tests {
             .unwrap();
         let stored_row = server
             .write_runtime
+            .as_ref()
+            .unwrap()
             .store
             .load(schema_plan_id, now_ms())
             .await
@@ -7599,7 +12180,7 @@ mod tests {
                 .await
                 .unwrap();
         let independent_gate = DispatchGate::new();
-        server.write_runtime.dispatch_gate = Some(Arc::clone(&independent_gate));
+        server.write_runtime.as_mut().unwrap().dispatch_gate = Some(Arc::clone(&independent_gate));
         let server = Arc::new(server);
         let preparation = json!({
             "operation":VOCABULARY_REORDER_OPERATION,
@@ -7685,6 +12266,8 @@ mod tests {
             .unwrap();
         let failed_stored = server
             .write_runtime
+            .as_ref()
+            .unwrap()
             .store
             .load(failed_plan_id, now_ms())
             .await
@@ -7727,7 +12310,7 @@ mod tests {
                 .await
                 .unwrap();
         let gate = DispatchGate::new();
-        gated_server.write_runtime.dispatch_gate = Some(Arc::clone(&gate));
+        gated_server.write_runtime.as_mut().unwrap().dispatch_gate = Some(Arc::clone(&gate));
         let gated_server = Arc::new(gated_server);
         let guarded_plan = gated_server
             .handle_message(executor_call_message(
@@ -7866,7 +12449,7 @@ mod tests {
                 .await
                 .unwrap();
         let independent_gate = DispatchGate::new();
-        server.write_runtime.dispatch_gate = Some(Arc::clone(&independent_gate));
+        server.write_runtime.as_mut().unwrap().dispatch_gate = Some(Arc::clone(&independent_gate));
         let server = Arc::new(server);
         let independent_args = json!({
             "operation":IDENTITY_ADD_OPERATION,
@@ -7961,7 +12544,7 @@ mod tests {
                 .await
                 .unwrap();
         let gate = DispatchGate::new();
-        gated_server.write_runtime.dispatch_gate = Some(Arc::clone(&gate));
+        gated_server.write_runtime.as_mut().unwrap().dispatch_gate = Some(Arc::clone(&gate));
         let gated_server = Arc::new(gated_server);
         let guarded_plan = gated_server
             .handle_message(executor_call_message(
@@ -8032,7 +12615,7 @@ mod tests {
             .await
             .unwrap();
         let gate = DispatchGate::new();
-        server.write_runtime.dispatch_gate = Some(Arc::clone(&gate));
+        server.write_runtime.as_mut().unwrap().dispatch_gate = Some(Arc::clone(&gate));
         let server = Arc::new(server);
         let events_before = policy_event_count(&db).await;
         let prepared = server
@@ -8167,7 +12750,7 @@ mod tests {
         .await
         .unwrap();
         let gate = DispatchGate::new();
-        first.write_runtime.dispatch_gate = Some(Arc::clone(&gate));
+        first.write_runtime.as_mut().unwrap().dispatch_gate = Some(Arc::clone(&gate));
         let first = Arc::new(first);
         let reopened = open_database_at(db.path()).await.unwrap();
         let second = ExecutorPrototypeStdioServer::new(registry, reopened, caller, None)
@@ -8249,6 +12832,8 @@ mod tests {
             .unwrap();
         let stored = server
             .write_runtime
+            .as_ref()
+            .unwrap()
             .store
             .load(plan_id, now_ms())
             .await
@@ -8258,12 +12843,16 @@ mod tests {
         plan.server_version = "older-server".into();
         plan.integrity = server
             .write_runtime
+            .as_ref()
+            .unwrap()
             .store
             .seal(&plan.signing_key_id, &integrity_payload(&plan))
             .await
             .unwrap();
         server
             .write_runtime
+            .as_ref()
+            .unwrap()
             .store
             .replace_payload(
                 plan_id,
@@ -8431,8 +13020,10 @@ mod tests {
             ExecutorPrototypeStdioServer::new(registry, db.clone(), caller, None)
                 .await
                 .unwrap();
-        expiry_server.write_runtime =
-            WriteRuntime::with_ttl_ms(Arc::clone(&expiry_server.write_runtime.store), 0);
+        expiry_server.write_runtime = Some(WriteRuntime::with_ttl_ms(
+            Arc::clone(&expiry_server.write_runtime.as_ref().unwrap().store),
+            0,
+        ));
         let expired_plan = expiry_server
             .handle_message(call_message(
                 18,
@@ -8601,7 +13192,11 @@ mod tests {
                 .await
                 .unwrap();
         let revalidation_gate = DispatchGate::new();
-        revalidation_server.write_runtime.revalidation_gate = Some(Arc::clone(&revalidation_gate));
+        revalidation_server
+            .write_runtime
+            .as_mut()
+            .unwrap()
+            .revalidation_gate = Some(Arc::clone(&revalidation_gate));
         let revalidation_server = Arc::new(revalidation_server);
 
         let cases = [
@@ -8822,6 +13417,8 @@ mod tests {
                 let plan_id = structured["plan_id"].as_str().unwrap();
                 let stored = server
                     .write_runtime
+                    .as_ref()
+                    .unwrap()
                     .store
                     .load(plan_id, now_ms())
                     .await
@@ -8905,4 +13502,697 @@ mod tests {
             0
         );
     }
+
+    const STANDBY_RECORD_ID: &str = "ec00b000-0000-4000-8000-000000000031";
+    const STANDBY_RUN_KEY: &str = "scout-chair-a748b2";
+
+    fn standby_registry() -> Arc<ToolRegistry> {
+        let mut registry = ToolRegistry::new();
+        register_builtin_tools(&mut registry).unwrap();
+        register_surface_tools(&mut registry).unwrap();
+        registry.set_standby_read_only(true);
+        Arc::new(registry)
+    }
+
+    fn directory_entry_names(path: &std::path::Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(path)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    async fn standby_server_with_record() -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        crate::Db,
+        ExecutorPrototypeStdioServer,
+    ) {
+        standby_server_with_registry(standby_registry()).await
+    }
+
+    async fn standby_server_with_registry(
+        registry: Arc<ToolRegistry>,
+    ) -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        crate::Db,
+        ExecutorPrototypeStdioServer,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("standby.db");
+        let url = path.to_str().unwrap().to_string();
+        let source = create_database(&url).await.unwrap();
+        let created = create_record(
+            &source,
+            json!({"id": STANDBY_RECORD_ID, "type": "Document", "kind": "note", "name": "Standby fixture"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(created, STANDBY_RECORD_ID);
+        crate::db::checkpoint_and_close_hosted_adoption_database(source)
+            .await
+            .unwrap();
+        let db = crate::db::open_existing_database_standby_read_only(&url)
+            .await
+            .unwrap();
+        assert_eq!(db.open_mode(), crate::db::DatabaseOpenMode::StandbyReadOnly);
+        let server = ExecutorPrototypeStdioServer::new_standby_read_only(
+            registry,
+            EngineHandle::Sqlite(db.clone()),
+            Caller::local(),
+        )
+        .await
+        .unwrap();
+        (directory, path, db, server)
+    }
+
+    #[tokio::test]
+    async fn standby_constructor_rejects_writable_registry() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("standby.db");
+        let url = path.to_str().unwrap();
+        let source = create_database(url).await.unwrap();
+        crate::db::checkpoint_and_close_hosted_adoption_database(source)
+            .await
+            .unwrap();
+        let db = crate::db::open_existing_database_standby_read_only(url)
+            .await
+            .unwrap();
+        let error = match ExecutorPrototypeStdioServer::new_standby_read_only(
+            registry(),
+            EngineHandle::Sqlite(db),
+            Caller::local(),
+        )
+        .await
+        {
+            Ok(_) => panic!("standby constructor admitted a writable registry"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("standby read-only registry"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn standby_constructor_rejects_physically_writable_engine() {
+        // :memory: is never a standby open.
+        let memory = create_database(":memory:").await.unwrap();
+        let error = match ExecutorPrototypeStdioServer::new_standby_read_only(
+            standby_registry(),
+            EngineHandle::Sqlite(memory),
+            Caller::local(),
+        )
+        .await
+        {
+            Ok(_) => panic!("standby constructor admitted a writable :memory: engine"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("physically read-only standby engine"),
+            "{error}"
+        );
+        // A file-backed database that was never checkpointed into an
+        // immutable standby open is rejected before any catalogue, runtime,
+        // or sidecar construction.
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("writable.db");
+        let writable = create_database(path.to_str().unwrap()).await.unwrap();
+        let error = match ExecutorPrototypeStdioServer::new_standby_read_only(
+            standby_registry(),
+            EngineHandle::Sqlite(writable),
+            Caller::local(),
+        )
+        .await
+        {
+            Ok(_) => panic!("standby constructor admitted a writable file engine"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("physically read-only standby engine"),
+            "{error}"
+        );
+        assert!(
+            !path
+                .with_file_name("writable.db.write-plans.sqlite3")
+                .exists(),
+            "rejected construction must not create a plan sidecar"
+        );
+    }
+
+    #[tokio::test]
+    async fn standby_server_holds_no_write_state() {
+        let (_directory, path, _db, server) = standby_server_with_record().await;
+        assert!(server.write_runtime.is_none());
+        assert!(server.telemetry.is_none());
+        assert!(server.trace.file.is_none());
+        assert!(
+            !path
+                .with_file_name("standby.db.write-plans.sqlite3")
+                .exists(),
+            "standby construction must not create a plan sidecar"
+        );
+    }
+
+    #[tokio::test]
+    async fn standby_discovery_advertises_only_admitted_reads() {
+        let (_directory, _path, _db, server) = standby_server_with_record().await;
+        let listed = server
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/list",
+                "params": {}
+            }))
+            .await
+            .unwrap();
+        let tools = listed["result"]["tools"].as_array().unwrap();
+        let names: Vec<&str> = tools
+            .iter()
+            .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+            .collect();
+        assert!(names.contains(&"bootstrap"), "{names:?}");
+        assert!(names.contains(&"describe_operation"), "{names:?}");
+        assert_eq!(
+            listed["result"]["_meta"]["nativeExecutor"]["surface"],
+            json!("standby-read-only")
+        );
+        // Catalogue honesty: dispatch refuses every mutation and every
+        // plan-backed operation before plan access, so discovery must not
+        // advertise any of them as callable reads.
+        for (executor, operations) in &server.operations_by_executor {
+            assert!(!operations.is_empty(), "{executor}");
+            for operation in operations {
+                let contract = server
+                    .contracts
+                    .get(&(executor.clone(), operation.clone()))
+                    .unwrap_or_else(|| {
+                        panic!("advertised {executor}.{operation} lacks a contract")
+                    });
+                assert_eq!(
+                    contract.access,
+                    OperationAccess::Read,
+                    "{executor}.{operation}"
+                );
+                assert!(
+                    !requires_plan(executor, operation),
+                    "advertised {executor}.{operation} requires a plan yet standby dispatch refuses plan-backed calls"
+                );
+            }
+        }
+        let advertised = server
+            .operations_by_executor
+            .get(EXECUTOR)
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            !advertised.contains(&OPERATION.to_string()),
+            "plan-backed {EXECUTOR}.{OPERATION} must not be advertised"
+        );
+        assert!(
+            !server
+                .operations_by_executor
+                .contains_key(WORKSPACE_EXECUTOR),
+            "hosted workspace reads must not leak without hosted authority"
+        );
+    }
+
+    #[tokio::test]
+    async fn standby_bootstrap_reports_truthful_surface_in_both_eras() {
+        let (_directory, _path, _db, server) = standby_server_with_record().await;
+        let legacy = server
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "bootstrap", "arguments": {}}
+            }))
+            .await
+            .unwrap();
+        assert!(response_succeeded(&legacy), "{legacy}");
+        assert_eq!(
+            legacy["result"]["_meta"]["nativeExecutor"]["surface"],
+            json!("standby-read-only")
+        );
+        assert_eq!(
+            legacy["result"]["_meta"]["nativeExecutor"]["manifestSha256"],
+            json!(server.manifest_digest)
+        );
+        let modern = server
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "bootstrap",
+                    "arguments": {"format": "json"},
+                    "_meta": {
+                        "io.modelcontextprotocol/protocolVersion": protocol::PROTOCOL_VERSION,
+                        "io.modelcontextprotocol/clientCapabilities": {},
+                        "io.modelcontextprotocol/clientInfo": {"name": "test", "version": "1"}
+                    }
+                }
+            }))
+            .await
+            .unwrap();
+        assert!(response_succeeded(&modern), "{modern}");
+        assert_eq!(
+            modern["result"]["structuredContent"]["tool_exposure"]["scope"],
+            json!("standby-read-only")
+        );
+        assert_eq!(
+            modern["result"]["structuredContent"]["tool_exposure"]["advertised_count"],
+            json!(server.descriptors.len())
+        );
+        assert_eq!(
+            modern["result"]["_meta"]["nativeExecutor"]["surface"],
+            json!("standby-read-only")
+        );
+    }
+
+    fn standby_status_provider_fixture(
+    ) -> (tempfile::TempDir, crate::standby::StandbyStatusProvider) {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("provider");
+        std::fs::create_dir_all(&root).unwrap();
+        let origin = "ndb_00000000000000000000000000000000";
+        let config = crate::standby::StandbyRuntimeConfig::from_json(
+            json!({
+                "replica_root": root.to_str().unwrap(),
+                "hosted_route_database_id": "standby-fixture-route",
+                "origin_database_id": origin,
+            })
+            .to_string()
+            .as_bytes(),
+        )
+        .unwrap();
+        let store = crate::standby::GenerationStore::open(
+            root.join("store"),
+            "standby-fixture-route",
+            Some(origin.to_string()),
+        )
+        .unwrap();
+        let provider = crate::standby::StandbyStatusProvider::for_status_only_reason(
+            config,
+            store,
+            None,
+            crate::standby::StandbyStatusOnly {
+                reason: "fixture-no-candidate".into(),
+                candidate_count: 0,
+                unusable_candidate_count: 0,
+            },
+            false,
+            false,
+        );
+        (directory, provider)
+    }
+
+    #[tokio::test]
+    async fn standby_bootstrap_preserves_provider_runtime_status() {
+        let (_provider_dir, provider) = standby_status_provider_fixture();
+        let mut inner = ToolRegistry::new();
+        register_builtin_tools(&mut inner).unwrap();
+        register_surface_tools(&mut inner).unwrap();
+        inner.set_standby_status_provider(provider);
+        let (_directory, _path, _db, server) = standby_server_with_registry(Arc::new(inner)).await;
+        // Modern JSON keeps the authentic provider-generated runtime block.
+        let modern = server
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "bootstrap",
+                    "arguments": {"format": "json"},
+                    "_meta": {
+                        "io.modelcontextprotocol/protocolVersion": protocol::PROTOCOL_VERSION,
+                        "io.modelcontextprotocol/clientCapabilities": {},
+                        "io.modelcontextprotocol/clientInfo": {"name": "test", "version": "1"}
+                    }
+                }
+            }))
+            .await
+            .unwrap();
+        assert!(response_succeeded(&modern), "{modern}");
+        let runtime = &modern["result"]["structuredContent"]["tool_exposure"]["runtime"];
+        assert_eq!(runtime["read_only"], json!(true));
+        assert_eq!(runtime["writes_supported"], json!(false));
+        // The status-only provider reports its own authentic mutation
+        // error, not the generic standby one: assert what it generates.
+        assert_eq!(runtime["mutation_error"], json!("STANDBY_STATUS_ONLY"));
+        assert_eq!(
+            runtime["status_only"]["reason"],
+            json!("fixture-no-candidate")
+        );
+        // Legacy text renders the same authentic status block.
+        let legacy = server
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {"name": "bootstrap", "arguments": {}}
+            }))
+            .await
+            .unwrap();
+        assert!(response_succeeded(&legacy), "{legacy}");
+        // Legacy text renders the same authentic status block through
+        // `/tool_exposure/runtime`: the renderer prints mode and serving
+        // state, not the status-only reason string.
+        let text = legacy["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("# Local standby status"), "{text}");
+        assert!(text.contains("Serving generation: none"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn standby_read_contract_matches_authoritative_schema() {
+        let (_directory, _path, _db, server) = standby_server_with_record().await;
+        let memory = create_database(":memory:").await.unwrap();
+        let writable = ExecutorPrototypeStdioServer::new(registry(), memory, Caller::local(), None)
+            .await
+            .unwrap();
+        // Sampled reads only: full-descriptor equality is not claimed. The
+        // hosted/ordinary source flag must not disturb the cached read contract.
+        for (executor, operation) in [
+            ("records_read", "get_record"),
+            ("records_read", "query_record"),
+        ] {
+            assert!(
+                server
+                    .contracts
+                    .contains_key(&(executor.to_string(), operation.to_string())),
+                "{executor}.{operation}"
+            );
+            let arguments = json!({"executor": executor, "operation": operation});
+            let standby_described = server
+                .handle_message(executor_call_message(
+                    1,
+                    "describe_operation",
+                    arguments.clone(),
+                ))
+                .await
+                .unwrap();
+            let writable_described = writable
+                .handle_message(executor_call_message(1, "describe_operation", arguments))
+                .await
+                .unwrap();
+            assert!(
+                response_succeeded(&standby_described),
+                "{standby_described}"
+            );
+            assert_eq!(
+                standby_described["result"]["structuredContent"],
+                writable_described["result"]["structuredContent"]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn standby_describe_withholds_unavailable_contracts_but_dispatch_refuses() {
+        let (_directory, _path, _db, server) = standby_server_with_record().await;
+        // describe follows the advertised index: the retained plan-backed
+        // mutation contract is withheld, with no plan_required writable
+        // guidance leaked for the unavailable operation.
+        let withheld = server
+            .handle_message(executor_call_message(
+                1,
+                "describe_operation",
+                json!({"executor": EXECUTOR, "operation": OPERATION}),
+            ))
+            .await
+            .unwrap();
+        assert!(!response_succeeded(&withheld), "{withheld}");
+        let serialized = serde_json::to_string(&withheld).unwrap();
+        assert!(
+            serialized.contains("unknown (executor, operation)"),
+            "{serialized}"
+        );
+        assert!(!serialized.contains("plan_required"), "{serialized}");
+        // Dispatch of the same retained pair still refuses with the stable
+        // read-only error rather than a selection error.
+        let refused = server
+            .handle_message(executor_call_message(
+                2,
+                EXECUTOR,
+                json!({"operation": OPERATION, "arguments": {}}),
+            ))
+            .await
+            .unwrap();
+        assert!(!response_succeeded(&refused), "{refused}");
+        assert_eq!(
+            refused["result"]["structuredContent"]["error_code"],
+            crate::mcp::registry::STANDBY_READ_ONLY_ERROR
+        );
+        // The advertised bootstrap self-description still resolves.
+        let bootstrap_described = server
+            .handle_message(executor_call_message(
+                3,
+                "describe_operation",
+                json!({"executor": "bootstrap", "operation": "bootstrap"}),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            response_succeeded(&bootstrap_described),
+            "{bootstrap_described}"
+        );
+    }
+
+    #[tokio::test]
+    async fn standby_refuses_mutations_with_stable_error_and_echoes_run_key() {
+        let (_directory, _path, _db, server) = standby_server_with_record().await;
+        // One directly-dispatched mutation from the retained full contract
+        // map: lookup succeeds, then dispatch refuses before plan access.
+        let (direct_executor, direct_operation) = server
+            .contracts
+            .iter()
+            .find(|((executor, operation), contract)| {
+                contract.access == OperationAccess::Mutation && !requires_plan(executor, operation)
+            })
+            .map(|((executor, operation), _)| (executor.clone(), operation.clone()))
+            .expect("catalogue must retain a direct mutation for refusal");
+        let keyed = |arguments: Value| {
+            let mut envelope = arguments.as_object().cloned().unwrap();
+            envelope.insert("run_key".into(), json!(STANDBY_RUN_KEY));
+            Value::Object(envelope)
+        };
+        let envelopes = [
+            // Cached prepare envelope for the plan-backed fixture.
+            executor_call_message(
+                1,
+                EXECUTOR,
+                keyed(
+                    json!({"operation": OPERATION, "arguments": {"record_id": "probe", "reason": "standby refusal probe"}}),
+                ),
+            ),
+            // Forged execute envelope: refused before any plan load.
+            executor_call_message(
+                2,
+                EXECUTOR,
+                keyed(
+                    json!({"operation": OPERATION, "plan_id": "forged", "target": "probe", "effect_summary": "probe"}),
+                ),
+            ),
+            // Direct mutation from the retained contract map.
+            executor_call_message(
+                3,
+                &direct_executor,
+                keyed(json!({"operation": direct_operation, "arguments": {}})),
+            ),
+        ];
+        for envelope in envelopes {
+            let refused = server.handle_message(envelope).await.unwrap();
+            assert!(!response_succeeded(&refused), "{refused}");
+            let structured = &refused["result"]["structuredContent"];
+            assert_eq!(
+                structured["error_code"],
+                crate::mcp::registry::STANDBY_READ_ONLY_ERROR
+            );
+            assert_eq!(structured["run_context"]["run_key"], json!(STANDBY_RUN_KEY));
+            let serialized = serde_json::to_string(&refused).unwrap();
+            assert!(!serialized.contains("selection_error"), "{serialized}");
+            assert!(!serialized.contains("unknown executor"), "{serialized}");
+        }
+        // Same closed refusal in the modern era.
+        let modern = server
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 9,
+                "method": "tools/call",
+                "params": {
+                    "name": EXECUTOR,
+                    "arguments": {"operation": OPERATION, "arguments": {}, "run_key": STANDBY_RUN_KEY},
+                    "_meta": {
+                        "io.modelcontextprotocol/protocolVersion": protocol::PROTOCOL_VERSION,
+                        "io.modelcontextprotocol/clientCapabilities": {},
+                        "io.modelcontextprotocol/clientInfo": {"name": "test", "version": "1"}
+                    }
+                }
+            }))
+            .await
+            .unwrap();
+        assert!(!response_succeeded(&modern), "{modern}");
+        assert_eq!(
+            modern["result"]["structuredContent"]["error_code"],
+            crate::mcp::registry::STANDBY_READ_ONLY_ERROR
+        );
+        // The closed refusal echoes the supplied key in the modern era too.
+        assert_eq!(
+            modern["result"]["structuredContent"]["run_context"]["run_key"],
+            json!(STANDBY_RUN_KEY)
+        );
+    }
+
+    #[tokio::test]
+    async fn standby_calls_leave_database_and_directory_unchanged() {
+        let (directory, path, db, server) = standby_server_with_record().await;
+        db.drain_captures().await;
+        let runs_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_runs")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        let read_log_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM read_log_calls")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        let interactions_before: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM provenance_interaction_receipts")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        let bytes_before = std::fs::read(&path).unwrap();
+        let entries_before = directory_entry_names(directory.path());
+        // A real delegated read, bootstrap, describe, and a keyed refusal.
+        let read = server
+            .handle_message(executor_call_message(
+                1,
+                "records_read",
+                json!({"operation": "get_record", "arguments": {"ids": [STANDBY_RECORD_ID]}, "run_key": STANDBY_RUN_KEY, "format": "json"}),
+            ))
+            .await
+            .unwrap();
+        assert!(response_succeeded(&read), "{read}");
+        // The envelope `run_key` is hoisted and forwarded into the source-tool
+        // arguments by `translate_arguments`; the registry validates it,
+        // attaches `run_context`, and `attach_run_context` lands the echo in
+        // `structuredContent.run_context`. The record body proves real
+        // delegation over the immutable open.
+        assert_eq!(
+            read["result"]["structuredContent"]["run_context"]["run_key"],
+            json!(STANDBY_RUN_KEY),
+            "{read}"
+        );
+        let serialized_read = serde_json::to_string(&read).unwrap();
+        assert!(
+            serialized_read.contains(STANDBY_RECORD_ID),
+            "{serialized_read}"
+        );
+        // The same read twice: a cached read contract is unaffected by source flags.
+        let reread = server
+            .handle_message(executor_call_message(
+                2,
+                "records_read",
+                json!({"operation": "get_record", "arguments": {"ids": [STANDBY_RECORD_ID]}}),
+            ))
+            .await
+            .unwrap();
+        assert!(response_succeeded(&reread), "{reread}");
+        // The same read in the modern era: success, engine data, and the
+        // standby surface marker, still with no persistent writes below.
+        let modern_read = server
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/call",
+                "params": {
+                    "name": "records_read",
+                    "arguments": {"operation": "get_record", "arguments": {"ids": [STANDBY_RECORD_ID]}, "run_key": STANDBY_RUN_KEY, "format": "json"},
+                    "_meta": {
+                        "io.modelcontextprotocol/protocolVersion": protocol::PROTOCOL_VERSION,
+                        "io.modelcontextprotocol/clientCapabilities": {},
+                        "io.modelcontextprotocol/clientInfo": {"name": "test", "version": "1"}
+                    }
+                }
+            }))
+            .await
+            .unwrap();
+        assert!(response_succeeded(&modern_read), "{modern_read}");
+        assert_eq!(
+            modern_read["result"]["structuredContent"]["run_context"]["run_key"],
+            json!(STANDBY_RUN_KEY)
+        );
+        let serialized_modern = serde_json::to_string(&modern_read).unwrap();
+        assert!(
+            serialized_modern.contains(STANDBY_RECORD_ID),
+            "{serialized_modern}"
+        );
+        assert_eq!(
+            modern_read["result"]["_meta"]["nativeExecutor"]["surface"],
+            json!("standby-read-only")
+        );
+        let refused = server
+            .handle_message(executor_call_message(
+                3,
+                EXECUTOR,
+                json!({"operation": OPERATION, "arguments": {}, "run_key": STANDBY_RUN_KEY}),
+            ))
+            .await
+            .unwrap();
+        assert!(!response_succeeded(&refused), "{refused}");
+        db.drain_captures().await;
+        let runs_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_runs")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        let read_log_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM read_log_calls")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        let interactions_after: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM provenance_interaction_receipts")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(runs_after, runs_before);
+        assert_eq!(read_log_after, read_log_before);
+        assert_eq!(interactions_after, interactions_before);
+        assert_eq!(std::fs::read(&path).unwrap(), bytes_before);
+        assert_eq!(directory_entry_names(directory.path()), entries_before);
+    }
+
+    #[tokio::test]
+    async fn writable_prepare_execute_lifecycle_still_binds_some_runtime() {
+        let db = create_database(":memory:").await.unwrap();
+        let target = create_record(
+            &db,
+            json!({"id": PLAN_ONCE_ID, "type": "Document", "kind": "note", "name": "Once"}),
+        )
+        .await
+        .unwrap();
+        let server =
+            ExecutorPrototypeStdioServer::new(registry(), db.clone(), Caller::local(), None)
+                .await
+                .unwrap();
+        assert!(server.write_runtime.is_some());
+        let revision = policy_revision(&server.registry, &db, Caller::local(), &target).await;
+        let prepared = server
+            .handle_message(call_message(1, preparation_arguments(&target, &revision)))
+            .await
+            .unwrap();
+        assert!(response_succeeded(&prepared), "{prepared}");
+        let executed = server
+            .handle_message(call_message(2, execution_arguments(&prepared)))
+            .await
+            .unwrap();
+        assert!(response_succeeded(&executed), "{executed}");
+    }
 }
+
+#[cfg(test)]
+#[path = "sql_selected_write/qualification.rs"]
+mod selected_qualification;

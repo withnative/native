@@ -238,8 +238,8 @@ pub struct SelectionContext {
     pub decision_id: String,
     pub decision_name: Option<String>,
     pub decided_at: String,
-    /// Whether the decision is the currently effective one, i.e. nothing
-    /// supersedes it.
+    /// Whether the decision is the currently effective one, i.e. no live
+    /// `supersedes` source visible to the caller names it.
     pub effective: bool,
 }
 
@@ -856,6 +856,10 @@ pub async fn alternative_set_context_in(
 /// Newest first; a later decision choosing a different candidate supersedes an
 /// earlier one, and both remain inspectable. Nothing here removes or hides the
 /// unchosen members.
+///
+/// A selecting decision is effective unless a LIVE `supersedes` source VISIBLE
+/// to the caller names it — mirroring the briefing assembler. Hidden and
+/// deleted superseders are ignored so a standing flip never leaks them.
 pub async fn selection_context_in(
     tx: &mut Transaction<'_, Sqlite>,
     caller: &Caller,
@@ -880,17 +884,30 @@ pub async fn selection_context_in(
         if !crate::mcp::tools::can_record_in(tx, caller, &decision_id, Capability::View).await? {
             continue;
         }
-        let superseded: i64 = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM links WHERE target_id = ? AND relationship = 'supersedes')",
+        let superseder_ids: Vec<String> = sqlx::query_scalar(
+            "SELECT l.source_id FROM links l
+               JOIN records s ON s.id = l.source_id
+              WHERE l.target_id = ?
+                AND l.relationship = 'supersedes'
+                AND s.deleted_at IS NULL",
         )
         .bind(&decision_id)
-        .fetch_one(&mut **tx)
+        .fetch_all(&mut **tx)
         .await?;
+        let mut effective = true;
+        for superseder_id in superseder_ids {
+            if crate::mcp::tools::can_record_in(tx, caller, &superseder_id, Capability::View)
+                .await?
+            {
+                effective = false;
+                break;
+            }
+        }
         return Ok(Some(SelectionContext {
             decision_name: row.try_get("name")?,
             decided_at: row.try_get("created_at")?,
             decision_id,
-            effective: superseded == 0,
+            effective,
         }));
     }
     Ok(None)
@@ -1342,6 +1359,162 @@ mod tests {
             "nothing was asserted, so nothing is reported — not an empty object"
         );
         tx.rollback().await.unwrap();
+        db.close().await;
+    }
+
+    fn sel_id(n: u32) -> String {
+        format!("7e5b{n:04}-0000-4000-8000-{n:012}")
+    }
+
+    async fn sel_mk(db: &crate::db::Db, id: &str, typ: &str, kind: &str, name: &str) {
+        crate::store::create_record(
+            db,
+            serde_json::json!({"id": id, "type": typ, "kind": kind, "name": name}),
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn sel_grant(db: &crate::db::Db, id: &str, accounts: &[&str]) {
+        crate::authorization::replace_explicit_policy(
+            db,
+            "test:policy",
+            id,
+            accounts
+                .iter()
+                .map(|a| {
+                    crate::authorization::AllowEntry::account(
+                        *a,
+                        crate::authorization::Capability::View,
+                    )
+                })
+                .collect(),
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn sel_select(db: &crate::db::Db, decision: &str, candidate: &str) {
+        let mut registry = crate::mcp::ToolRegistry::new();
+        crate::mcp::register_surface_tools(&mut registry).unwrap();
+        registry
+            .call(
+                db.clone(),
+                crate::mcp::registry::Caller::local(),
+                "manage_links",
+                serde_json::json!({"action": "add", "source_id": decision,
+                    "target_id": candidate, "relationship": "selects"}),
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn sel_supersede(db: &crate::db::Db, n: u32, source: &str, target: &str) {
+        crate::store::add_link(
+            db,
+            crate::events::LinkAddedPayload {
+                id: Some(sel_id(n)),
+                source_id: source.to_string(),
+                target_id: target.to_string(),
+                relationship: "supersedes".to_string(),
+                note: None,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn sel_ctx(
+        db: &crate::db::Db,
+        caller: &crate::mcp::registry::Caller,
+        id: &str,
+    ) -> Option<SelectionContext> {
+        let mut tx = db.write_pool().begin().await.unwrap();
+        let out = selection_context_in(&mut tx, caller, id).await.unwrap();
+        tx.rollback().await.unwrap();
+        out
+    }
+
+    #[tokio::test]
+    async fn deleted_superseder_leaves_selecting_decision_effective() {
+        let db = crate::db::create_database(":memory:").await.unwrap();
+        let (cand, dec, dead) = (sel_id(9101), sel_id(9102), sel_id(9103));
+        sel_mk(&db, &cand, "Document", "note", "candidate").await;
+        sel_mk(&db, &dec, "Resolution", "decision", "decision").await;
+        sel_mk(&db, &dead, "Document", "note", "dead-head").await;
+        for id in [&cand, &dec, &dead] {
+            sel_grant(&db, id, &["alice"]).await;
+        }
+        sel_select(&db, &dec, &cand).await;
+        sel_supersede(&db, 9191, &dead, &dec).await;
+        crate::store::delete_record(&db, &dead).await.unwrap();
+        let ctx = sel_ctx(
+            &db,
+            &crate::mcp::registry::Caller::authenticated("alice"),
+            &cand,
+        )
+        .await
+        .expect("selecting decision stays visible");
+        assert_eq!(ctx.decision_id, dec);
+        assert!(
+            ctx.effective,
+            "deleted superseder must not flip effectiveness"
+        );
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn hidden_superseder_leaves_selecting_decision_effective() {
+        let db = crate::db::create_database(":memory:").await.unwrap();
+        let (cand, dec, hidden) = (sel_id(9201), sel_id(9202), sel_id(9203));
+        sel_mk(&db, &cand, "Document", "note", "candidate").await;
+        sel_mk(&db, &dec, "Resolution", "decision", "decision").await;
+        sel_mk(&db, &hidden, "Document", "note", "hidden-head").await;
+        for id in [&cand, &dec] {
+            sel_grant(&db, id, &["alice", "bea"]).await;
+        }
+        sel_grant(&db, &hidden, &["alice"]).await;
+        sel_select(&db, &dec, &cand).await;
+        sel_supersede(&db, 9291, &hidden, &dec).await;
+        let ctx = sel_ctx(
+            &db,
+            &crate::mcp::registry::Caller::authenticated("bea"),
+            &cand,
+        )
+        .await
+        .expect("selecting decision stays visible");
+        assert_eq!(ctx.decision_id, dec);
+        assert!(
+            ctx.effective,
+            "hidden superseder must not flip effectiveness"
+        );
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn visible_live_superseder_makes_selecting_decision_ineffective() {
+        let db = crate::db::create_database(":memory:").await.unwrap();
+        let (cand, dec, head) = (sel_id(9301), sel_id(9302), sel_id(9303));
+        sel_mk(&db, &cand, "Document", "note", "candidate").await;
+        sel_mk(&db, &dec, "Resolution", "decision", "decision").await;
+        sel_mk(&db, &head, "Document", "note", "live-head").await;
+        for id in [&cand, &dec, &head] {
+            sel_grant(&db, id, &["alice"]).await;
+        }
+        sel_select(&db, &dec, &cand).await;
+        sel_supersede(&db, 9391, &head, &dec).await;
+        let ctx = sel_ctx(
+            &db,
+            &crate::mcp::registry::Caller::authenticated("alice"),
+            &cand,
+        )
+        .await
+        .expect("selecting decision stays visible");
+        assert_eq!(ctx.decision_id, dec);
+        assert!(
+            !ctx.effective,
+            "visible live superseder must flip effectiveness"
+        );
         db.close().await;
     }
 }

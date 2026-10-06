@@ -1345,11 +1345,14 @@ mod tests {
         read_authority_act_head(db).await.unwrap().head_act
     }
 
+    /// Bootstrap the same workspace from a primary file snapshot, preserving consent.
     async fn destination_at_current_head(source: &crate::Db, dir: &Path, name: &str) -> crate::Db {
-        let bytes = crate::interchange::export_canonical_interchange(source)
+        let export = crate::export::export_connected_db(source, Some(dir))
             .await
             .unwrap();
-        crate::interchange::import_canonical_interchange(&bytes, &dir.join(name))
+        let path = dir.join(name);
+        std::fs::copy(export.path(), &path).unwrap();
+        crate::db::open_existing_database(path.to_str().unwrap())
             .await
             .unwrap()
     }
@@ -2681,9 +2684,146 @@ mod tests {
         source.close().await;
     }
 
-    /// Finding 5: real writers for meta, awareness, notification candidates,
-    /// derivation and control produce carried events that materialise exactly,
-    /// with non-vacuous conformance for each domain.
+    /// A foreign import boundary propagates only through pinned primary deltas.
+    #[tokio::test]
+    async fn alpha_tab_provenance_import_reset_materialises_only_from_pinned_authority() {
+        use crate::control::alpha_tab_provenance_tests as alpha;
+        use crate::control::{ALPHA_TAB_ADOPTION_CALLER_ASSERTED, ALPHA_TAB_ADOPTION_VERIFIED};
+        let (original, mut pin, _) = alpha::fixture(Some(ALPHA_TAB_ADOPTION_VERIFIED)).await;
+        let dir = tempfile::tempdir().unwrap();
+        let base = head_act(&original).await;
+        let destination = destination_at_current_head(&original, dir.path(), "standby.db").await;
+        let bytes = crate::interchange::export_canonical_interchange(&original)
+            .await
+            .unwrap();
+        let imported = crate::interchange::import_canonical_interchange(
+            &bytes,
+            &dir.path().join("primary.db"),
+            crate::interchange::ImportContinuity::ForeignBoundary,
+        )
+        .await
+        .unwrap();
+        let (delta, _) = build_delta(&imported, base).await;
+        let parsed = validate_authority_act_delta(&delta).unwrap();
+        let from = parsed.act_cut().from_exclusive_act();
+        let to = parsed.act_cut().to_inclusive_act();
+        assert!(TrustedAuthorityActDelta::assume_trusted_for_test(
+            parsed,
+            "non-primary-origin",
+            from,
+            to
+        )
+        .is_err());
+        assert!(alpha::provenance(&destination).await.is_some());
+        apply_authority_act_delta_and_finalize_head(
+            &destination,
+            &trust(validate_authority_act_delta(&delta).unwrap()),
+        )
+        .await
+        .unwrap();
+        assert!(alpha::provenance(&destination).await.is_none());
+        assert!(
+            crate::conformance::rebuild_and_diff_control(&destination)
+                .await
+                .unwrap()
+                .equal
+        );
+        let token: String = sqlx::query_scalar("SELECT event_id FROM alpha_tab_installs")
+            .fetch_one(imported.write_pool())
+            .await
+            .unwrap();
+        pin.adoption = ALPHA_TAB_ADOPTION_CALLER_ASSERTED.into();
+        let base = head_act(&imported).await;
+        let pending =
+            alpha::update(&imported, &pin, &token, pin.consented_declaration.clone()).await;
+        let token = alpha::append_update(&imported, &pending).await;
+        pin = alpha::updated_pin(&pending);
+        let root = alpha::adopt(&imported, &pin, &token, ALPHA_TAB_ADOPTION_VERIFIED).await;
+        pin.adoption = ALPHA_TAB_ADOPTION_VERIFIED.into();
+        let carry = alpha::update(&imported, &pin, &root, pin.consented_declaration.clone()).await;
+        alpha::append_update(&imported, &carry).await;
+        let (delta, _) = build_delta(&imported, base).await;
+        apply_authority_act_delta_and_finalize_head(
+            &destination,
+            &trust(validate_authority_act_delta(&delta).unwrap()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            alpha::provenance(&destination).await,
+            alpha::provenance(&imported).await
+        );
+        assert_eq!(
+            alpha::provenance(&destination)
+                .await
+                .unwrap()
+                .original_adoption_event_id,
+            root
+        );
+        assert!(
+            crate::conformance::rebuild_and_diff_control(&destination)
+                .await
+                .unwrap()
+                .equal
+        );
+        original.close().await;
+        imported.close().await;
+        destination.close().await;
+    }
+
+    #[tokio::test]
+    async fn alpha_tab_provenance_updates_and_restore_materialise_exactly() {
+        use crate::control::alpha_tab_provenance_tests as alpha;
+        use crate::control::ALPHA_TAB_ADOPTION_VERIFIED;
+        let (source, mut pin, token) = alpha::fixture(Some(ALPHA_TAB_ADOPTION_VERIFIED)).await;
+        let dir = tempfile::tempdir().unwrap();
+        let base = head_act(&source).await;
+        let destination = destination_at_current_head(&source, dir.path(), "alpha.db").await;
+        let disabled = alpha::transition(&source, &pin, &token, "disable").await;
+        let update =
+            alpha::update(&source, &pin, &disabled, pin.consented_declaration.clone()).await;
+        let carried = alpha::append_update(&source, &update).await;
+        pin = alpha::updated_pin(&update);
+        let (bytes, _) = build_delta(&source, base).await;
+        apply_authority_act_delta_and_finalize_head(
+            &destination,
+            &trust(validate_authority_act_delta(&bytes).unwrap()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            alpha::provenance(&destination).await,
+            alpha::provenance(&source).await
+        );
+        assert!(alpha::provenance(&destination)
+            .await
+            .unwrap()
+            .carried_from_event_id
+            .is_some());
+        let base = head_act(&source).await;
+        let restored = alpha::transition(&source, &pin, &carried, "restore").await;
+        pin.adoption = crate::control::ALPHA_TAB_ADOPTION_CALLER_ASSERTED.into();
+        let pending =
+            alpha::update(&source, &pin, &restored, pin.consented_declaration.clone()).await;
+        alpha::append_update(&source, &pending).await;
+        let (bytes, _) = build_delta(&source, base).await;
+        apply_authority_act_delta_and_finalize_head(
+            &destination,
+            &trust(validate_authority_act_delta(&bytes).unwrap()),
+        )
+        .await
+        .unwrap();
+        assert!(alpha::provenance(&destination).await.is_none());
+        assert!(
+            crate::conformance::rebuild_and_diff_control(&destination)
+                .await
+                .unwrap()
+                .equal
+        );
+        source.close().await;
+        destination.close().await;
+    }
+
     #[tokio::test]
     async fn real_writer_domains_materialise_exactly() {
         let dir = tempfile::tempdir().unwrap();
@@ -2784,6 +2924,7 @@ mod tests {
                         activity_id: "activity-r31".into(),
                         account_id: "acct:r31".into(),
                         started_at: "2026-01-02T00:00:00.000Z".into(),
+                        channel: None,
                         reported_mcp_client_name: None,
                         reported_mcp_client_version: None,
                         reported_model: None,

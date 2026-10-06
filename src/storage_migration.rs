@@ -38,6 +38,12 @@ const SQLITE_PROFILE: &str = "sqlite-local";
 const SQLITE_PROFILE_REVISION: u64 = 2;
 const LEASE_TTL_SECONDS: i64 = 30;
 
+/// Sealed identity continuity for the same-workspace storage mover. Its
+/// constructor is private to this module, so foreign imports cannot select
+/// consent-preserving behavior accidentally.
+#[derive(Debug)]
+pub struct StorageMigrationIdentity(());
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StorageTarget {
@@ -381,7 +387,7 @@ async fn migrate_storage_inner(
         atomic_json(&options.report, &report)?;
 
         lease.assert_owned()?;
-        let destination_db = import_canonical_interchange(&canonical, &report.import_anchor)
+        let destination_db = import_canonical_interchange(&canonical, &report.import_anchor, crate::interchange::ImportContinuity::PreserveIdentity(StorageMigrationIdentity(())))
             .await?;
         report.imported_at = Some(now());
         report.state = MigrationState::Verifying;
@@ -2307,6 +2313,88 @@ mod tests {
         (directory, options)
     }
 
+    #[tokio::test]
+    async fn adopted_alpha_tab_storage_migration_preserves_identity_and_canonical_bytes() {
+        use crate::control::alpha_tab_provenance_tests as alpha;
+        use crate::control::{ALPHA_TAB_ADOPTION_SHELL_AUTO, ALPHA_TAB_ADOPTION_VERIFIED};
+        for method in [ALPHA_TAB_ADOPTION_VERIFIED, ALPHA_TAB_ADOPTION_SHELL_AUTO] {
+            // Start with a never-opened path: replacing only an existing main
+            // SQLite file can leave its old WAL/SHM shadowing the new database.
+            let directory = tempfile::tempdir().unwrap();
+            let root = fs::canonicalize(directory.path()).unwrap();
+            let options = MigrationOptions {
+                source: StorageTarget::sqlite_local(root.join("source.db")),
+                destination: StorageTarget::sqlite_local(root.join("destination.db")),
+                target_config: root.join("target.json"),
+                report: root.join("migration.json"),
+                rollback_window: Duration::from_secs(3600),
+            };
+            let (seed, pin, token) = alpha::fixture(Some(method)).await;
+            let carried =
+                alpha::update(&seed, &pin, &token, pin.consented_declaration.clone()).await;
+            alpha::append_update(&seed, &carried).await;
+            let canonical = export_canonical_interchange(&seed).await.unwrap();
+            let expected = alpha::provenance(&seed).await;
+            // Populate this owned fixture with the exact same workspace, as an
+            // identity-preserving storage operation rather than a foreign import.
+            let source = import_canonical_interchange(
+                &canonical,
+                &options.source.path,
+                crate::interchange::ImportContinuity::PreserveIdentity(
+                    StorageMigrationIdentity(()),
+                ),
+            )
+            .await
+            .unwrap();
+            let source_bytes = export_canonical_interchange(&source).await.unwrap();
+            assert!(
+                source_bytes == canonical,
+                "setup canonical bytes differ: {} != {}",
+                sha256(&source_bytes),
+                sha256(&canonical)
+            );
+            assert_eq!(alpha::provenance(&source).await, expected);
+            source.close().await;
+            initialize_target_config(&options.target_config, &options.source.path).unwrap();
+            let report = migrate_storage(options.clone()).await.unwrap();
+            assert_eq!(report.projection_conformance_ok, Some(true));
+            assert_eq!(report.canonical_sha256, report.destination_sha256);
+            let destination = open_existing_database_at(&options.destination.path)
+                .await
+                .unwrap();
+            let destination_bytes = export_canonical_interchange(&destination).await.unwrap();
+            assert!(
+                destination_bytes == canonical,
+                "migration canonical bytes differ: {} != {}",
+                sha256(&destination_bytes),
+                sha256(&canonical)
+            );
+            let adoption: String = sqlx::query_scalar("SELECT adoption FROM alpha_tab_installs")
+                .fetch_one(destination.pool())
+                .await
+                .unwrap();
+            assert_eq!(adoption, method);
+            assert_eq!(alpha::provenance(&destination).await, expected);
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM control_events WHERE type='alpha_tab.import_reset'"
+                )
+                .fetch_one(destination.pool())
+                .await
+                .unwrap(),
+                0
+            );
+            assert!(
+                crate::conformance::rebuild_and_diff_control(&destination)
+                    .await
+                    .unwrap()
+                    .equal
+            );
+            destination.close().await;
+            seed.close().await;
+        }
+    }
+
     #[cfg(feature = "storage-recovery-tests")]
     fn identity_race_fixture(name: &str) -> (tempfile::TempDir, PathBuf, [PathBuf; 2]) {
         let directory = tempfile::tempdir().unwrap();
@@ -2658,8 +2746,25 @@ mod tests {
     }
 
     #[cfg(all(unix, feature = "storage-recovery-tests"))]
-    #[tokio::test]
-    async fn destination_restore_failure_reseals_source_and_is_durable() {
+    #[test]
+    fn destination_restore_failure_reseals_source_and_is_durable() {
+        std::thread::Builder::new()
+            .name("destination-restore-failure-test".into())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(destination_restore_failure_reseals_source_and_is_durable_body());
+            })
+            .unwrap()
+            .join()
+            .expect("destination restore failure test thread must not panic");
+    }
+
+    #[cfg(all(unix, feature = "storage-recovery-tests"))]
+    async fn destination_restore_failure_reseals_source_and_is_durable_body() {
         use std::os::unix::fs::PermissionsExt as _;
 
         let (_directory, options) = fixture().await;
@@ -2978,9 +3083,13 @@ mod tests {
             .unwrap();
         let canonical = export_canonical_interchange(&source).await.unwrap();
         source.close().await;
-        let destination = import_canonical_interchange(&canonical, &options.destination.path)
-            .await
-            .unwrap();
+        let destination = import_canonical_interchange(
+            &canonical,
+            &options.destination.path,
+            crate::interchange::ImportContinuity::PreserveIdentity(StorageMigrationIdentity(())),
+        )
+        .await
+        .unwrap();
         destination.close().await;
         let malicious_sidecar =
             PathBuf::from(format!("{}-wal", options.destination.path.display()));

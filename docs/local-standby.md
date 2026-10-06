@@ -226,6 +226,33 @@ The refresh configuration has this strict non-secret shape:
 fragment; HTTP is accepted only for loopback qualification. The controller
 constructs the scoped `/mcp/<hosted route database ID>` endpoint itself.
 
+Every full snapshot acquisition, including delta fallback, uses the binary
+route and allows up to 30 minutes for hosted capture,
+filtering, verification and hashing. The local refresh attempt allows 45
+minutes including transfer and local verification. Individual HTTP requests
+remain bounded to 10 seconds, range retries remain bounded, and capture
+single-flight, retained-export limits and owner checks still apply. These are
+acquisition budgets, not measured HQ timings or a five-minute freshness promise.
+An expired handle does not interrupt SQLite capture; its resource lease lasts
+until capture and cleanup finish. Do not repeatedly start new full captures
+when seeding fails.
+
+An initial capture may outlast an OAuth access token. Binary polling, range
+requests, retries and cancellation re-read the guarded credential file, so a
+separate owner credential controller can atomically renew it without restarting
+the capture. The runtime does not itself hold an OAuth refresh grant.
+
+A long-running host should use a separate owner-authorized credential controller
+with its own refresh grant. Do not share a rotating OAuth grant with an active
+MCP client. Renewals should be serialized, private and atomically published;
+revoked grants require owner sign-in again. Authentication renewal must not
+capture snapshots or change canonical workspace data.
+
+Enable recurring snapshot refresh only after seeding and measuring subsequent
+refresh cost. If delta compatibility is refused, a refresh may fall back to
+another full capture; a two-minute timer must not repeatedly impose unmeasured
+database-sized capture work on production.
+
 `refresh/state.json` is the durable, atomically replaced non-secret status
 projection. It distinguishes the active and last completed attempt from the
 last successful refresh, records attempt and success times, the successful
@@ -450,6 +477,317 @@ Failure boundaries are independent:
 - Restoring hosted service advances accepted state only through another
   verified refresh. Milestone 1 performs no reverse upload or SQLite file
   synchronization.
+
+## Recovering a downloaded snapshot offline
+
+If a refresh finishes downloading but its overall time budget expires during
+admission, retain the original producer manifest and snapshot in a private
+directory before staging cleanup. A retained download is not an admitted
+generation and must not be served directly.
+
+The maintainer example can admit those same bytes without a hosted request:
+
+```bash
+cargo run --example standby_admit --features dev-tools -- \
+  /absolute/runtime.json /absolute/installed/mcp-stdio \
+  /absolute/preserved/snapshot.db /absolute/preserved/manifest.json
+```
+
+The example observes the installed executable's `--standby-identity`, hashes
+its actual bytes before and after that observation, and requires its engine
+schema and DDL to match the admission helper. It passes that evidence to
+`GenerationStore::install_staged`: route, origin, consumer, snapshot identity,
+full conformance, awareness, continuity, and atomic publication checks remain
+in force. It never rewrites the manifest or marks history qualified. An
+identity mismatch is a refusal, not permission to relabel the download.
+
+Offline admission writes aggregate verification progress to stderr while retaining
+its final JSON receipt on stdout. Named phases distinguish the candidate,
+predecessor, snapshot identity/state/integrity checks, observational conformance,
+awareness replay, and successor fence. The standby consumer also writes these
+safe tracing events to stderr for retained startup generations. Its final startup
+verification receipt reports `serving=false` when no generation can serve. Each
+check records elapsed milliseconds in report order. A start identifies executing work; a finish records `ok=true` or
+`ok=false` for that check or phase only. It does not establish admission or
+serving readiness. Only the complete successful operation does so; cancellation
+leaves started work without a completion receipt. Diagnostics contain names,
+durations and outcomes, never database rows or raw error contents.
+
+Full history replay can outlast transfer. `TMPDIR` may be set to a private,
+adequately sized memory-backed directory for disposable replay databases;
+accepted snapshots and durable publication remain in the configured store.
+This changes scratch storage only and does not remove checks. Measure admission
+and fresh MCP startup before activating clients or choosing refresh cadence.
+
+## Acquiring a snapshot before offline admission
+
+For large workspaces, a maintainer can explicitly split one full download from
+admission. This avoids spending the network attempt's 45-minute budget on full
+history replay. It does not shorten replay or qualify history for delta refresh.
+
+```bash
+cargo run --example standby_admit --features dev-tools -- \
+  --acquire-only /absolute/runtime.json /absolute/installed/mcp-stdio \
+  /absolute/refresh.json
+```
+
+This mode observes the actual installed consumer, obtains an authenticated
+producer-bound binary snapshot, and retains the existing transfer range,
+manifest, route/origin/consumer binding, digest and credential-rotation checks.
+It refuses an active refresh
+daemon or attempt before starting a capture. The result has `acquired: true`
+and `admitted: false`, with private snapshot and manifest paths under staging.
+The canonical producer fields and downloaded snapshot bytes are preserved;
+no current pointer, refresh-success state, admission or retention pass is run.
+Failures clean up the attempt's owned files; successful files remain for the
+separate offline admission command above. These acquisition files are excluded
+from normal interrupted-refresh cleanup; remove them after use. A process crash
+can also leave acquisition files behind, so operators must account for their
+disk space. Producer cancellation is best-effort on timeout or process exit;
+the producer expiry bound remains the backstop. Do not assume an immediate
+server-side cancellation or blindly start another capture.
+
+Run the default offline command with those returned paths, keeping the existing
+verified reader running. Complete kernel admission remains mandatory before
+publication. Admission atomically updates the current pointer; an already warm
+reader keeps its leased old generation until a separately verified replacement
+is ready. Neither acquisition nor admission automatically replaces that process
+or enables a refresh timer. Measure download, admission and replacement startup
+before choosing any sustainable cadence. Refused delta authority still requires
+an independently justified history qualification route; this command does not
+stamp provenance or certify unknown history.
+
+## External scheduled FULL refresh
+
+`scripts/native-local-refresh.py` provides the narrowed full-copy scheduling
+path. It invokes an **already installed, compatible** `standby_admit` helper:
+one authenticated `--acquire-only <runtime> <consumer> <refresh>` call, then
+offline `<runtime> <consumer> <snapshot> <manifest>` admission. Every existing
+FULL acceptance check remains mandatory. This path does not probe act heads,
+enable delta refresh, qualify history, rewrite manifests, or read credentials.
+The existing refresh config names the guarded credential file; do not put a
+token in controller config, argv, or environment.
+
+Use a private mode 0700 config directory and mode 0600 JSON files. Paths must
+be absolute without symlinks. Example controller config (paths are illustrative):
+
+```json
+{
+  "admit_executable": "/private/installed/standby_admit",
+  "runtime_config": "/private/standby/runtime.json",
+  "consumer": "/private/installed/mcp-stdio",
+  "refresh_config": "/private/standby/refresh.json",
+  "daemon_path": "/private/source/scripts/native-local-daemon.py",
+  "activation_socket": "/private/run/control.sock",
+  "cadence_seconds": 21600
+}
+```
+
+Run `python3 scripts/native-local-refresh.py once --config /private/standby/controller.json`
+for one due attempt, or use `serve` for an asynchronous scheduling loop. `once`
+honours cadence; it has no force/retry option. The first invocation is due
+immediately; subsequent attempts wait **six hours after completion**, including
+failures, with no catch-up captures on wake or network recovery. Cadence is
+configurable. This conservative policy supersedes the earlier two-minute target
+for this external full-copy path; it is not a measured hosted-load or RPO claim.
+Hosted capture cost and deployed acceptance measurement remain separate work.
+
+A nonblocking cross-process `flock` at
+`<replica_root>/refresh/scheduled-controller.lock` covers acquisition, FULL
+admission, activation, status and cleanup. Children inherit the lock so a
+surviving phase continues to exclude another controller. Use one controller
+config/status path per replica: the lock binds that path and refuses another
+status history. The existing helper separately refuses competing built-in
+acquisition/refresh attempts. Do not run a built-in refresh daemon alongside
+this controller. Helper wrappers must retain inherited descriptors and remain
+in their process group; detaching work breaks that lifetime contract.
+
+Default phase deadlines are 46 minutes for acquisition (the helper retains its
+own 45-minute network budget), two hours for offline admission, and three hours
+for activation. Optional `acquire_timeout_seconds`, `admit_timeout_seconds` and
+`activate_timeout_seconds` override them. Timeout or cancellation kills the
+owned phase process group before releasing the lock and starts the same cooldown.
+Remote producer cancellation remains best-effort, with expiry as the backstop;
+there is no immediate retry. If a prior status is still `running` after its
+lock becomes free, the controller records `interrupted` and waits a fresh
+cooldown instead of replaying any phase. A crash may leave private acquisition
+files; inspect and remove only that attempt's owned `acquire-*` files offline.
+Normal completion/refusal removes the validated acquired pair. This is bounded
+operational recovery, not a restart-proof or live acceptance qualification.
+
+### Candidate-ready / relay activation seam
+
+Admission publishes the kernel's accepted pointer. A warm reader still leases
+its old generation. The controller therefore invokes a separate command,
+without a shell, after a successful admission result:
+
+```sh
+python3 /private/source/scripts/native-local-daemon.py activate \
+  --socket /private/run/control.sock --expected-generation GENERATION_ID
+```
+
+The controller awaits completion asynchronously while the relay continues old
+reads. The activation implementation must start the configured confined official
+consumer, wait for actual readiness at the expected generation, check actual
+read-only refusal, swap under the relay's request lock, and drain old exchanges
+before closing the old reader. It must preserve the old reader on refusal.
+Success is exit zero with one bounded JSON object on stdout:
+`{"activated":true,"serving_generation_id":"<expected 64-character generation ID>"}`.
+Only that acknowledgement makes controller state `succeeded`; accepted-pointer
+publication alone never establishes serving readiness. On activation failure,
+the newer generation may already be accepted, but the old reader remains the
+serving generation. The controller neither rolls that pointer back nor stops
+the old relay. A lost acknowledgement after a switch is conservatively a
+controller failure; actual serving freshness still comes from the kernel.
+Relay/service wiring is a separate delivery slice; this controller adds no
+service unit, deployment, or automatic installation.
+
+### Lightweight controller status
+
+Default status is `refresh-status.json` beside controller config; optional
+`status_file` selects another private absolute path. It is atomically replaced
+mode 0600 and is independent of kernel refresh state and serving freshness.
+The relay may expose its whitelisted fields alongside kernel provenance:
+
+| Field | Meaning |
+| --- | --- |
+| `contract` | `native.local-refresh-status.v1` |
+| `state` | `running`, `failed`, or `succeeded` |
+| `phase`, `completed_phase` | Current/last attempted phase and last completed phase (`acquire`, `admit`, `activate`); completion may be null |
+| `last_attempt_at`, `finished_at` | UTC attempt-start and completion timestamps; completion is null while running |
+| `last_failed_attempt_at` | Start of latest failed attempt, retained after later success |
+| `last_failure_phase`, `last_failure_error_code` | Retained failure phase and fixed safe controller code; no raw child errors |
+| `last_successful_attempt_at` | Start of latest fully activated attempt, initially null |
+| `cadence_seconds`, `next_due_at` | Configured cooldown and next eligible UTC time; next due is null during work |
+| `durations_seconds` | Measured subprocess elapsed times by phase, including failures, plus total elapsed time |
+| `download_bytes` | Acquired snapshot file size from stat, initially null; not inferred from helper output |
+| `generation_id` | Admitted generation, initially null; does not imply that it is serving |
+
+Child stderr is discarded; bounded stdout is parsed for phase results only and
+never persisted. Process failure, timeout, malformed result, semantic refusal
+and local error use safe codes rather than copied diagnostics. Failed attempts
+leave the reader alone and wait for the next due attempt; credential rotation
+and compatibility checks remain in the helper. Do not delete status to force
+another capture. Changed cadence applies on the next controller start; the
+persisted `next_due_at` describes the cadence recorded at the last attempt.
+
+The helper, consumer and producer must have compatible identities. A frozen
+schema78 consumer cannot be paired with a main/schema80 helper; configure a
+compatible installed pair in an isolated root and retain the old warm reader
+until that new candidate is ready. This PR supplies fake-process orchestration
+tests, not actual hosted captures, source-history qualification, restart proof,
+live audits, or deployed acceptance measurements.
+
+## Keeping a verified Linux standby warm
+
+Full startup admission repeats the history checks. On large databases, start
+one owner-only local process ahead of an outage rather than starting it for
+each agent. The Linux maintainer relay is:
+
+```bash
+python3 scripts/native-local-daemon.py serve \
+  --socket /absolute/private/run/standby.sock \
+  --consumer /absolute/installed/mcp-stdio \
+  --config /absolute/runtime.json \
+  --scratch /absolute/private/scratch \
+  --account "<canonical-owner-account-token>"
+```
+
+The run and scratch directories must be mode 0700 and owned by the current
+user. The relay holds an exclusive owner-only lock, starts the official
+consumer with socket/connect syscalls denied, and listens on a mode 0600 Unix
+socket only after startup completes and `records_read` is available. It refuses
+a status-only consumer. Select the owner canonical account explicitly with
+`--account`; HQ contains multiple accounts. Missing selection is refused before
+starting expensive admission; the official consumer validates the selection.
+Data reads and write refusals go unchanged through the official kernel;
+the relay serializes requests to keep responses with the correct client even
+when clients reuse JSON-RPC IDs. Engine EOF or a lost response stops the relay
+rather than routing subsequent responses incorrectly. Startup allows 90 minutes, accommodating the measured 42-minute HQ admission;
+ordinary requests allow 120 seconds.
+
+The relay owns a deliberately limited discovery/metadata frontend. Its local
+`bootstrap` calls an authorised kernel `records_read.get_record` for
+`native:root`, returning the kernel's `standby_context` unchanged alongside
+`bootstrap_scope: local_serving_metadata_only`. It reports mode, read-only
+availability and actual serving snapshot age. It creates no run key, intent,
+personal orientation or durable context, and is not canonical Native bootstrap.
+Optional string `run_key` and `parent_key` are accepted but ignored for this
+metadata-only call. The fresh stdio connection strips those keys on bootstrap
+before sending to the socket, allowing a warm older daemon to keep serving
+while the client compatibility fix is installed; all data-call envelopes remain
+unchanged. Older warm daemons may still advertise only the format field until
+their next planned restart.
+Missing context or an authorisation failure produces an error, never an invented
+healthy status. Discovery and initialization explicitly describe this scope.
+
+In the current official consumer, full `standby_status` and
+`system_read.engine_info` repeat complete verification of all retained
+generations. The relay replaces `standby_status` with bounded local metadata
+and refuses engine-info calls with `LOCAL_FULL_AUDIT_SEPARATE`, so full audits
+cannot block the shared read connection for tens of minutes. Other system reads
+(including ping), record reads and writes retain kernel handling. The context's
+`full_status_tool` still names the official tool; the local bootstrap's
+`full_status_route` explains that it requires a separate official consumer:
+start the installed consumer with `--standby --account <owner> <runtime-config>`
+and call `standby_status`. That process has its own full startup and audit cost.
+
+Configure each agent's `native-local` MCP command as:
+
+```bash
+python3 scripts/native-local-daemon.py stdio \
+  --socket /absolute/private/run/standby.sock
+```
+
+The server leases one immutable generation. Its status reports that serving
+generation's actual age even if a newer one has been accepted. A refresh
+controller can request a replacement through a separate owner-only control
+socket. The relay starts a new network-denied official consumer, waits for
+kernel readiness, requires the requested serving generation and a real
+`STANDBY_READ_ONLY` write refusal, then swaps readers between requests.
+Existing client connections stay open. Failed startup or verification keeps
+the old reader serving. Restarting the daemon revalidates and selects a
+generation; the relay does not bypass that startup check. Keep
+hosted Native as the normal canonical connection. An unavailable relay must
+remain unavailable, with no raw database or hosted proxy fallback.
+
+### Running scheduled refresh on Linux
+
+Use the external full-copy controller described above with the service
+templates in `scripts/systemd/`. The default cadence is six hours after an
+attempt finishes, configurable as `cadence_seconds` in `scheduled-refresh.json`.
+There is no catch-up queue or overlapping attempt. Full acquisition still
+loads hosted Native, so record the first refresh's acquisition, admission and
+activation durations, snapshot bytes and visible hosted latency
+before shortening the cadence. This route does not promise a five-minute RPO.
+
+Prepare a compatible installed consumer and admission helper, a private
+runtime root, and private `run/live` and `scratch` directories.
+Keep the independent credential-renewal service running. Install the daemon,
+controller and service templates under the paths named in the templates.
+The owner-only `reader.env` supplies `NATIVE_LOCAL_CONSUMER`,
+`NATIVE_LOCAL_RUNTIME_CONFIG` and `NATIVE_LOCAL_OWNER_ACCOUNT`; it contains no
+hosted bearer token. Set `NATIVE_LOCAL_SEED_SOCKET` to the existing warm
+owner-only relay socket for the first installation, or to an empty string for
+ordinary kernel startup. The seed supplies actual kernel reads; a status file
+cannot certify it. Use the seed only during installation and clear that
+setting after the first successful refresh, before enabling the reader at boot.
+
+Add `activation_socket` pointing to `run/live/control.sock` and `status_file`
+pointing to `refresh-status.json` to the controller configuration. Start the
+new reader service and verify local metadata while the original service stays
+available. Configure new MCP sessions to use the stable `run/live/standby.sock`.
+Then disable the old snapshot timer and start `native-local-refresh.service`;
+it performs the first attempt and subsequently observes the persisted
+cooldown. Enable both services for boot after the first successful activation.
+Leave existing agent sessions on the old relay until they reconnect.
+
+Bootstrap and the local `standby_status` return the serving kernel's actual
+`freshness.age_seconds`, alongside advisory `refresh` information including
+`last_failed_attempt_at` and the failed phase. That failure timestamp survives
+a later successful attempt. Missing or malformed status reports
+`status_available: false` while kernel reads and truthful age remain available.
+The separate official consumer remains the route for exhaustive status audits.
 
 ## Rejected first-release alternatives
 

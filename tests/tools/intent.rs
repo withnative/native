@@ -4,12 +4,93 @@ use native_ce::meta::{
     create_vocabulary, promote_value, propose_value_with_metadata_as, write_user_schema_config,
     SchemaConfigOptions, VocabularyValueTerminality,
 };
+use native_ce::provenance::Channel;
 use native_ce::{create_database, Db};
 use serde_json::{json, Value};
 use sqlx::Row;
 
 const RUN: &str = "scout-chair-a748b2";
 const OTHER_RUN: &str = "scout-chair-b748b2";
+
+#[tokio::test]
+async fn run_discovery_reports_first_declaration_transport_without_record_writes() {
+    let db = create_database(":memory:").await.unwrap();
+    let registry = registry();
+    let run = "scout-chair-c748b2";
+    // Discovery is scoped to a bound account; establish the same fixture
+    // footing used by the other intent tests before issuing direct calls.
+    let _ = call(&registry, &db, "get_run_activity", json!({})).await;
+    for channel in [Channel::Mcp, Channel::Web] {
+        registry
+            .call(
+                db.clone(),
+                Caller::authenticated("acct:test").with_channel(channel),
+                "set_intent",
+                crate::common::with_test_reason(
+                    "set_intent",
+                    json!({ "intent": "Investigate without changing records.", "run_key": run }),
+                ),
+            )
+            .await
+            .unwrap();
+    }
+    for (run_key, channel) in [
+        ("scout-chair-d748b2", Channel::Web),
+        ("scout-chair-e748b2", Channel::Unknown),
+    ] {
+        registry
+            .call(
+                db.clone(),
+                Caller::authenticated("acct:test").with_channel(channel),
+                "set_intent",
+                crate::common::with_test_reason(
+                    "set_intent",
+                    json!({ "intent": "Declare without changing records.", "run_key": run_key }),
+                ),
+            )
+            .await
+            .unwrap();
+    }
+    let discovered = registry
+        .call(
+            db.clone(),
+            Caller::authenticated("acct:test"),
+            "get_run_activity",
+            json!({}),
+        )
+        .await
+        .unwrap();
+    let channels = discovered["runs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| (item["run_key"].as_str().unwrap(), item["channel"].clone()))
+        .collect::<std::collections::HashMap<_, _>>();
+    assert!(
+        channels.contains_key(run),
+        "unexpected discovery: {discovered}"
+    );
+    assert_eq!(
+        channels[run],
+        json!({ "kind": "mcp", "assurance": "server_observed" })
+    );
+    assert_eq!(
+        channels["scout-chair-d748b2"],
+        json!({ "kind": "web", "assurance": "server_observed" })
+    );
+    assert_eq!(
+        channels["scout-chair-e748b2"],
+        json!({
+            "kind": "unknown", "assurance": "unknown_or_withheld"
+        })
+    );
+    let writes: i64 = sqlx::query_scalar("SELECT count(*) FROM content_events WHERE run_key=?")
+        .bind(run)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(writes, 0);
+}
 
 fn registry() -> ToolRegistry {
     let mut registry = ToolRegistry::new();
@@ -2435,6 +2516,31 @@ async fn an_episode_folds_declared_sources_and_ignores_mere_touches() {
         !ids.contains(&opened_only),
         "a touched-only record is not a declared source: {ids:?}"
     );
+    db.close().await;
+}
+
+#[tokio::test]
+async fn an_episode_folds_a_bare_source_without_inventing_a_reason() {
+    let db = create_database(":memory:").await.unwrap();
+    let registry = registry();
+    let run = "scout-chair-a748b2";
+
+    let source = declare_write(&registry, &db, run, "cited-source", json!([])).await;
+    declare_intent(&registry, &db, run, "Episode").await;
+    declare_write(&registry, &db, run, "citing-write", json!([source.clone()])).await;
+    let result = declare_intent(&registry, &db, run, "Next").await;
+
+    let items = episode_items(&result);
+    assert_eq!(items.len(), 2);
+    let item = &items[0]["touched_records"]["items"][0];
+    assert_eq!(item["id"], json!(source), "{item}");
+    assert_eq!(
+        item["reason"],
+        json!(null),
+        "a bare id folds with no reason, never a placeholder: {item}"
+    );
+    assert!(item["revision_event_id"].as_str().is_some(), "{item}");
+    assert_eq!(item["revision_supplied_by"], json!("engine"), "{item}");
     db.close().await;
 }
 

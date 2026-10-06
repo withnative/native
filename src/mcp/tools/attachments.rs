@@ -414,6 +414,7 @@ pub(crate) async fn fetch_attachment_from_url(
             key: SOURCE_URL_FACET_KEY.into(),
             value: Value::String(url.clone()),
             vocab_ref: None,
+            time_type: None,
         });
     }
     Ok(PreparedAttachmentFromUrl {
@@ -882,9 +883,19 @@ async fn attach_from_url(
 // Tool 24 — read_attachment
 // ---------------------------------------------------------------------------
 
+fn ensure_member_attachment_profile(db: &Db, caller: &Caller) -> Result<()> {
+    if caller.is_member_copy() && db.open_mode() != crate::db::DatabaseOpenMode::MemberReadOnly {
+        return Err(Error::engine(
+            "member attachment reads require a member database profile",
+        ));
+    }
+    Ok(())
+}
+
 async fn read_attachment(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
     const TOOL: &str = "read_attachment";
     let args: ReadAttachmentArgs = parse_args(TOOL, arguments)?;
+    ensure_member_attachment_profile(&db, &caller)?;
     let attachment_id = args.attachment_id;
     let offset = args.offset.unwrap_or(0);
     let length = args.length.unwrap_or(DEFAULT_READ_LENGTH);
@@ -906,6 +917,17 @@ async fn read_attachment(db: Db, caller: Caller, arguments: Value) -> Result<Val
                     tx: transaction,
                     act_alloc: &mut act_alloc,
                 };
+                if context.1.is_member_copy() {
+                    return crate::domain_transaction::read_member_attachment(
+                        &mut port,
+                        TOOL,
+                        &context.2,
+                        context.3,
+                        context.4,
+                        MAX_READ_LENGTH,
+                    )
+                    .await;
+                }
                 crate::domain_transaction::read_attachment(
                     &mut port,
                     super::principal(context.1),
@@ -975,6 +997,7 @@ async fn manage_attachments(db: Db, caller: Caller, arguments: Value) -> Result<
     const TOOL: &str = "manage_attachments";
     match parse_args(TOOL, arguments)? {
         ManageAttachmentsArgs::List { record_id } => {
+            ensure_member_attachment_profile(&db, &caller)?;
             let control = ExecutionControl::default();
             let mut lifecycle = SqliteAttachmentLifecycle {
                 db: &db,
@@ -993,6 +1016,12 @@ async fn manage_attachments(db: Db, caller: Caller, arguments: Value) -> Result<
                             tx: transaction,
                             act_alloc: &mut act_alloc,
                         };
+                        if context.1.is_member_copy() {
+                            return crate::domain_transaction::list_member_attachments(
+                                &mut port, TOOL, &context.2,
+                            )
+                            .await;
+                        }
                         crate::domain_transaction::list_attachments(
                             &mut port,
                             super::principal(context.1),
@@ -1007,6 +1036,7 @@ async fn manage_attachments(db: Db, caller: Caller, arguments: Value) -> Result<
             .map_err(|error| error.stable("list attachments"))
         }
         ManageAttachmentsArgs::Inspect { attachment_id } => {
+            ensure_member_attachment_profile(&db, &caller)?;
             let control = ExecutionControl::default();
             let mut lifecycle = SqliteAttachmentLifecycle {
                 db: &db,
@@ -1025,6 +1055,12 @@ async fn manage_attachments(db: Db, caller: Caller, arguments: Value) -> Result<
                             tx: transaction,
                             act_alloc: &mut act_alloc,
                         };
+                        if context.1.is_member_copy() {
+                            return crate::domain_transaction::inspect_member_attachment(
+                                &mut port, TOOL, &context.2,
+                            )
+                            .await;
+                        }
                         crate::domain_transaction::inspect_attachment(
                             &mut port,
                             super::principal(context.1),

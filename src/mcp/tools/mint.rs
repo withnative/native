@@ -239,6 +239,7 @@ pub(super) async fn mint_record_in(
             key: "lifecycle".into(),
             value: Value::String(lifecycle.into()),
             vocab_ref: None,
+            time_type: None,
         });
     }
     assert_facet_value_predicates_in(
@@ -252,10 +253,11 @@ pub(super) async fn mint_record_in(
     )
     .await?;
     for facet in &mut facets {
-        facet.vocab_ref = governed_writes
-            .iter()
-            .find(|checked| checked.key == facet.key)
-            .and_then(|checked| checked.vocab_ref.clone());
+        facet.adopt_governed(
+            governed_writes
+                .iter()
+                .find(|checked| checked.key == facet.key),
+        );
     }
 
     append_in(

@@ -1,0 +1,10 @@
+[
+{"name":"eq_null_literal","expr":"null == null","bindings":{},"expect":{"value":{"bool":true}}},
+{"name":"eq_null_binding_true","expr":"x == null","bindings":{"x":{"null":true}},"expect":{"value":{"bool":true}},"spec":"Booleans and Null: null has type null_type"},
+{"name":"eq_null_binding_false","expr":"x == null","bindings":{"x":{"int":"5"}},"expect":{"value":{"bool":false}},"spec":"Equality: heterogeneous equality to null yields false, not error"},
+{"name":"null_plus_int_err","expr":"null + 1","bindings":{},"expect":{"error":"no_matching_overload","note":"no_matching_overload"},"spec":"Evaluation: null has no built-in meaning; arithmetic without null overload errors"},
+{"name":"null_index_err","expr":"null[0]","bindings":{},"expect":{"error":"any","note":"langdef Field Selection step 4: e.f / e[k] on a non-list/map errors; no category named"}},
+{"name":"null_field_err","expr":"null.foo","bindings":{},"expect":{"error":"any","note":"langdef Field Selection step 4: e.f / e[k] on a non-list/map errors; no category named"}},
+{"name":"null_bool_err","expr":"null && true","bindings":{},"expect":{"error":"no_matching_overload","note":"no_matching_overload"}},
+{"name":"null_ternary","expr":"x == null ? 'none' : 'some'","bindings":{"x":{"null":true}},"expect":{"value":{"string":"none"}}}
+]

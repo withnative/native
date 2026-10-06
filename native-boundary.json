@@ -69,6 +69,14 @@
         },
         {
           "kind": "tree",
+          "source": "crates/cel-subset"
+        },
+        {
+          "kind": "tree",
+          "source": "crates/coedit-core-fixture"
+        },
+        {
+          "kind": "tree",
           "source": "crates/policy-kernel"
         },
         {
@@ -86,6 +94,10 @@
         {
           "kind": "tree",
           "source": "src/change_summary"
+        },
+        {
+          "kind": "tree",
+          "source": "src/coedit"
         },
         {
           "kind": "tree",
@@ -149,6 +161,10 @@
         },
         {
           "kind": "file",
+          "source": "src/alpha_tab_sessions.rs"
+        },
+        {
+          "kind": "file",
           "source": "src/attribution.rs"
         },
         {
@@ -161,7 +177,15 @@
         },
         {
           "kind": "file",
+          "source": "src/authorization_grant.rs"
+        },
+        {
+          "kind": "file",
           "source": "src/authorization_revision.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/authorization_trigger_coverage.rs"
         },
         {
           "kind": "file",
@@ -173,7 +197,23 @@
         },
         {
           "kind": "file",
+          "source": "src/bare_kernel_probe.rs"
+        },
+        {
+          "kind": "file",
           "source": "src/blob.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/body_blocks.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/body_blocks_projection.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/body_task_items.rs"
         },
         {
           "kind": "file",
@@ -201,11 +241,55 @@
         },
         {
           "kind": "file",
+          "source": "src/control/alpha_tab_provenance.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/control/alpha_tab_provenance_tests.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/credential_file.rs"
+        },
+        {
+          "kind": "file",
           "source": "src/control_tests.rs"
         },
         {
           "kind": "file",
           "source": "src/db.rs"
+        },
+        {
+          "kind": "tree",
+          "source": "src/db"
+        },
+        {
+          "kind": "file",
+          "source": "src/managed_custody.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/definition_registry.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/dependency.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/dependency_authority_tests.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/dependency_tests.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/dependency_rule_tests.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/dependency_transition_tests.rs"
         },
         {
           "kind": "file",
@@ -226,6 +310,10 @@
         {
           "kind": "file",
           "source": "src/export.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/facet_value_json_nodes.rs"
         },
         {
           "kind": "file",
@@ -261,7 +349,71 @@
         },
         {
           "kind": "file",
+          "source": "src/json_nodes.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/json_nodes_projection.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/keyed_freshness.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/kernel.rs"
+        },
+        {
+          "kind": "file",
           "source": "src/lib.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/member_copy_admission.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/member_copy_client.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/member_copy_driver.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/member_copy_lifecycle.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/member_copy_producer.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/member_copy_registry.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/member_copy_runtime.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/member_copy_serving.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/member_copy_transport.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/member_digest.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/member_offline_fixtures.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/member_offline_qualification.rs"
         },
         {
           "kind": "file",
@@ -277,7 +429,27 @@
         },
         {
           "kind": "file",
+          "source": "src/need_metrics.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/need_subscriptions.rs"
+        },
+        {
+          "kind": "file",
           "source": "src/policy.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/package_adopt_tests.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/package_manifest.rs"
+        },
+        {
+          "kind": "tree",
+          "source": "src/plugins"
         },
         {
           "kind": "file",
@@ -296,6 +468,10 @@
           "source": "src/realtime.rs"
         },
         {
+          "kind": "tree",
+          "source": "src/realtime"
+        },
+        {
           "kind": "file",
           "source": "src/record_body.rs"
         },
@@ -306,6 +482,10 @@
         {
           "kind": "file",
           "source": "src/recipe.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/replica_generation.rs"
         },
         {
           "kind": "file",
@@ -321,7 +501,19 @@
         },
         {
           "kind": "file",
+          "source": "src/rule_registry.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/rule_registry_tests.rs"
+        },
+        {
+          "kind": "file",
           "source": "src/runkey.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/schema_config_json_nodes.rs"
         },
         {
           "kind": "file",
@@ -349,11 +541,39 @@
         },
         {
           "kind": "file",
+          "source": "src/specimen_probe.rs"
+        },
+        {
+          "kind": "file",
           "source": "src/surface_binding.rs"
         },
         {
           "kind": "file",
+          "source": "src/surface_read_tests.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/surface_view_tests.rs"
+        },
+        {
+          "kind": "file",
           "source": "src/turso_local.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/typed_time.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/v2_slice1_probe.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/v2_slice2_probe.rs"
+        },
+        {
+          "kind": "tree",
+          "source": "src/v2_standard"
         },
         {
           "kind": "file",
@@ -406,6 +626,14 @@
         {
           "kind": "file",
           "source": "src/bin/tool_types.rs"
+        },
+        {
+          "kind": "file",
+          "source": "examples/v2_contract.rs"
+        },
+        {
+          "kind": "file",
+          "source": "examples/standby_admit.rs"
         },
         {
           "kind": "tree",
@@ -464,8 +692,40 @@
           "source": "experiments/alpha-tab-proof-packages/attention-cockpit.html"
         },
         {
+          "kind": "tree",
+          "source": "experiments/alpha-tab-proof-packages/attention-cockpit"
+        },
+        {
           "kind": "file",
           "source": "experiments/alpha-tab-proof-packages/team-pulse.html"
+        },
+        {
+          "kind": "tree",
+          "source": "experiments/alpha-tab-proof-packages/team-pulse"
+        },
+        {
+          "kind": "file",
+          "source": "experiments/alpha-tab-proof-packages/keyset-pager.html"
+        },
+        {
+          "kind": "file",
+          "source": "experiments/alpha-tab-proof-packages/keyset-pager-descriptor.json"
+        },
+        {
+          "kind": "tree",
+          "source": "packages/alpha-tab-kit"
+        },
+        {
+          "kind": "tree",
+          "source": "packages/native-coedit"
+        },
+        {
+          "kind": "file",
+          "source": "experiments/demo-shell/fixtures/folders-sql.mjs"
+        },
+        {
+          "kind": "file",
+          "source": "experiments/demo-shell/fixtures/folders-browse-sql.mjs"
         },
         {
           "kind": "file",
@@ -494,6 +754,22 @@
         {
           "kind": "tree",
           "source": "vendor"
+        },
+        {
+          "kind": "tree",
+          "source": "src/alpha_tab_body_admission_v1"
+        },
+        {
+          "kind": "tree",
+          "source": "src/body_read"
+        },
+        {
+          "kind": "file",
+          "source": "src/body_read.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/storage_profile/body_admission_tests.rs"
         }
       ],
       "binaries": [
@@ -537,6 +813,14 @@
         {
           "kind": "file",
           "source": "scripts/generate-federation-fixtures.mjs"
+        },
+        {
+          "kind": "file",
+          "source": "scripts/native-local-daemon.py"
+        },
+        {
+          "kind": "file",
+          "source": "scripts/tests/test_native_local_daemon.py"
         },
         {
           "kind": "tree",
@@ -700,6 +984,10 @@
         {
           "kind": "file",
           "source": "docs/local-standby.md"
+        },
+        {
+          "kind": "file",
+          "source": "docs/member-offline/qualification-matrix.md"
         },
         {
           "kind": "file",

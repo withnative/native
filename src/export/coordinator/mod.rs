@@ -15,6 +15,8 @@ use crate::mcp::{SnapshotPage, SNAPSHOT_COMPLETED_CACHE_CAP};
 
 use super::Export;
 
+pub mod binary;
+
 const STREAM_CHUNK_BYTES: usize = 64 * 1024;
 const SQLITE_MEDIA_TYPE: &str = "application/vnd.sqlite3";
 const TOOL_EXPORT_IDLE_TTL: Duration = Duration::from_secs(5 * 60);
@@ -35,6 +37,10 @@ struct ExportCoordinatorInner {
     tool_export_idle_ttl: Duration,
     tool_expiry_workers: Arc<AtomicUsize>,
     completed_cache_workers: Arc<AtomicUsize>,
+    binary: Mutex<binary::BinaryRegistry>,
+    binary_capacity: usize,
+    binary_idle_ttl: Duration,
+    binary_capture_timeout: Duration,
 }
 
 struct ExportCoordinatorState {
@@ -48,6 +54,20 @@ impl ExportCoordinator {
     }
 
     fn with_options(tool_export_idle_ttl: Duration) -> Self {
+        Self::with_binary_options(
+            tool_export_idle_ttl,
+            binary::BINARY_DEFAULT_CAPACITY,
+            binary::BINARY_DEFAULT_IDLE_TTL,
+            binary::BINARY_DEFAULT_CAPTURE_TIMEOUT,
+        )
+    }
+
+    fn with_binary_options(
+        tool_export_idle_ttl: Duration,
+        binary_capacity: usize,
+        binary_idle_ttl: Duration,
+        binary_capture_timeout: Duration,
+    ) -> Self {
         Self {
             inner: Arc::new(ExportCoordinatorInner {
                 state: Mutex::new(ExportCoordinatorState {
@@ -61,6 +81,10 @@ impl ExportCoordinator {
                 tool_export_idle_ttl,
                 tool_expiry_workers: Arc::new(AtomicUsize::new(0)),
                 completed_cache_workers: Arc::new(AtomicUsize::new(0)),
+                binary: Mutex::new(binary::BinaryRegistry::new()),
+                binary_capacity,
+                binary_idle_ttl,
+                binary_capture_timeout,
             }),
         }
     }
@@ -68,6 +92,20 @@ impl ExportCoordinator {
     #[cfg(test)]
     fn with_tool_export_idle_ttl(tool_export_idle_ttl: Duration) -> Self {
         Self::with_options(tool_export_idle_ttl)
+    }
+
+    #[cfg(test)]
+    fn with_binary_test_bounds(
+        binary_capacity: usize,
+        binary_idle_ttl: Duration,
+        binary_capture_timeout: Duration,
+    ) -> Self {
+        Self::with_binary_options(
+            Duration::from_millis(30),
+            binary_capacity,
+            binary_idle_ttl,
+            binary_capture_timeout,
+        )
     }
 
     /// Wait until every export has finished generation, delivery, and cleanup.
@@ -124,6 +162,7 @@ impl ExportCoordinator {
                 export.cleanup().await;
             }
         }
+        self.drain_binary().await;
         self.wait_for_idle().await;
     }
 
@@ -151,6 +190,15 @@ impl ExportCoordinator {
         } else {
             None
         }
+    }
+
+    /// Canonical singleflight key shared by every export frontend.
+    ///
+    /// Hosted `snapshot.rs` and `download.rs` both use `format!("{user}:{db}")`
+    /// as the `try_begin` principal; the binary path uses this same key so one
+    /// account+database cannot run concurrent exports across frontends.
+    pub(crate) fn export_lease_key(principal: &str, db_key: &str) -> String {
+        format!("{principal}:{db_key}")
     }
 
     /// Produce one page of a tool-owned export, starting a new consistent
@@ -210,51 +258,19 @@ impl ExportCoordinator {
                 "export_snapshot: an export is already in progress for this account; retry after it completes",
             )
         })?;
-        let mut export = create().await?;
-        // Filter before the file is opened, hashed or described: the manifest
-        // must cover exactly the bytes that ship.
-        if let Err(err) = export.filter_disposable_for_standby().await {
-            export.cleanup().await;
-            drop(activity);
-            return Err(err);
-        }
-        let mut file = match tokio::fs::File::open(export.path()).await {
-            Ok(file) => file,
-            Err(err) => {
-                export.cleanup().await;
-                drop(activity);
-                return Err(err.into());
-            }
-        };
-        let sha256 = match sha256_file(&mut file).await {
-            Ok(sha256) => sha256,
-            Err(err) => {
-                drop(file);
+        let export = create().await?;
+        let FinalizedExport {
+            export,
+            mut file,
+            sha256,
+            manifest,
+        } = match finalize_standby_export(export).await {
+            Ok(finalized) => finalized,
+            Err((export, err)) => {
                 export.cleanup().await;
                 drop(activity);
                 return Err(err);
             }
-        };
-        let manifest = match export.hosted_standby_context() {
-            Some(context) => match crate::standby_snapshot::manifest_from_completed_export(
-                &export.path(),
-                export.size_bytes(),
-                sha256.clone(),
-                export.captured_at().to_string(),
-                export.snapshot_completed_at().to_string(),
-                context,
-            )
-            .await
-            {
-                Ok(manifest) => Some(manifest),
-                Err(err) => {
-                    drop(file);
-                    export.cleanup().await;
-                    drop(activity);
-                    return Err(err);
-                }
-            },
-            None => None,
         };
         if let Err(err) = file.seek(std::io::SeekFrom::Start(0)).await {
             drop(file);
@@ -566,6 +582,16 @@ impl ExportCoordinator {
             .entries
             .len()
     }
+
+    #[cfg(test)]
+    fn active_lease_len(&self) -> usize {
+        self.inner
+            .state
+            .lock()
+            .expect("export coordinator poisoned")
+            .active
+            .len()
+    }
 }
 
 impl Default for ExportCoordinator {
@@ -668,6 +694,68 @@ impl Drop for WorkerCountGuard {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::SeqCst);
     }
+}
+
+/// A completed export with its open file, SHA-256 and optional manifest.
+///
+/// Produced by [`finalize_standby_export`], shared by the paged tool path and
+/// the binary acquisition path so the filter-before-hash-and-manifest order
+/// stays in one place. Cleanup on error stays with the caller, which also
+/// owns the concurrency lease.
+struct FinalizedExport {
+    export: Export,
+    file: tokio::fs::File,
+    sha256: String,
+    manifest: Option<crate::standby_snapshot::StandbySnapshotManifest>,
+}
+
+/// Filter, hash and describe a completed export.
+///
+/// The disposable-bookkeeping filter runs before the file is opened, hashed or
+/// described, so a manifest covers exactly the bytes that ship. Ordinary
+/// exports (no hosted standby context) skip the filter and yield no manifest.
+async fn finalize_standby_export(
+    mut export: Export,
+) -> Result<FinalizedExport, (Box<Export>, Error)> {
+    if let Err(err) = export.filter_disposable_for_standby().await {
+        return Err((Box::new(export), err));
+    }
+    let mut file = match tokio::fs::File::open(export.path()).await {
+        Ok(file) => file,
+        Err(err) => return Err((Box::new(export), err.into())),
+    };
+    let sha256 = match sha256_file(&mut file).await {
+        Ok(sha256) => sha256,
+        Err(err) => {
+            drop(file);
+            return Err((Box::new(export), err));
+        }
+    };
+    let manifest = match export.hosted_standby_context() {
+        Some(context) => match crate::standby_snapshot::manifest_from_completed_export(
+            &export.path(),
+            export.size_bytes(),
+            sha256.clone(),
+            export.captured_at().to_string(),
+            export.snapshot_completed_at().to_string(),
+            context,
+        )
+        .await
+        {
+            Ok(manifest) => Some(manifest),
+            Err(err) => {
+                drop(file);
+                return Err((Box::new(export), err));
+            }
+        },
+        None => None,
+    };
+    Ok(FinalizedExport {
+        export,
+        file,
+        sha256,
+        manifest,
+    })
 }
 
 struct ToolExport {

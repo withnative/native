@@ -679,10 +679,129 @@ pub(crate) fn validate_canonical_interchange(bytes: &[u8]) -> Result<ValidatedIn
         upgrade_revision_4_bundle(&mut bundle)?;
     }
     validate_bundle(&bundle)?;
+    // v73 appends caller-independent currency columns to records. Validate
+    // the original canonical bytes before deriving those columns from the
+    // imported record and link sections; historical exports stay admissible.
+    if bundle.manifest.source_engine_schema < 73 {
+        upgrade_pre_73_currency(&mut bundle)?;
+        validate_bundle(&bundle)?;
+    }
     Ok(ValidatedInterchange {
         bundle,
         source_revision,
     })
+}
+
+fn upgrade_pre_73_currency(bundle: &mut Bundle) -> Result<()> {
+    fn text_cell(row: &[Cell], index: usize) -> Result<&str> {
+        match row.get(index) {
+            Some(Cell::Text(value)) => Ok(value.as_str()),
+            _ => Err(Error::engine(
+                "historical currency input has a non-text identity",
+            )),
+        }
+    }
+
+    let records = bundle
+        .sections
+        .iter()
+        .find(|section| section.name == "records")
+        .ok_or_else(|| Error::engine("historical interchange is missing records"))?;
+    let has_current = records
+        .columns
+        .iter()
+        .any(|column| column.name == "is_current");
+    let has_count = records
+        .columns
+        .iter()
+        .any(|column| column.name == "successor_count");
+    ensure(
+        has_current == has_count,
+        "historical interchange has an incomplete currency column pair",
+    )?;
+    if has_current {
+        return Ok(());
+    }
+    let column_index = |section: &Section, name: &str| {
+        section
+            .columns
+            .iter()
+            .position(|column| column.name == name)
+            .ok_or_else(|| Error::engine(format!("historical {} is missing {name}", section.name)))
+    };
+    let record_id = column_index(records, "id")?;
+    let deleted_at = column_index(records, "deleted_at")?;
+    let mut live_sources = BTreeSet::new();
+    for row in &records.rows {
+        if matches!(row.get(deleted_at), Some(Cell::Null)) {
+            live_sources.insert(text_cell(row, record_id)?.to_owned());
+        }
+    }
+
+    let links = bundle
+        .sections
+        .iter()
+        .find(|section| section.name == "links")
+        .ok_or_else(|| Error::engine("historical interchange is missing links"))?;
+    let source_id = column_index(links, "source_id")?;
+    let target_id = column_index(links, "target_id")?;
+    let relationship = column_index(links, "relationship")?;
+    let mut counts = BTreeMap::<String, i64>::new();
+    for row in &links.rows {
+        if text_cell(row, relationship)? != "supersedes"
+            || !live_sources.contains(text_cell(row, source_id)?)
+        {
+            continue;
+        }
+        let count = counts
+            .entry(text_cell(row, target_id)?.to_owned())
+            .or_default();
+        *count = count
+            .checked_add(1)
+            .ok_or_else(|| Error::engine("historical successor count overflow"))?;
+    }
+
+    let records = bundle
+        .sections
+        .iter_mut()
+        .find(|section| section.name == "records")
+        .expect("records section checked above");
+    for row in &mut records.rows {
+        let count = counts
+            .get(text_cell(row, record_id)?)
+            .copied()
+            .unwrap_or_default();
+        row.push(if count == 0 {
+            Cell::Integer(1)
+        } else {
+            Cell::Null
+        });
+        row.push(Cell::Integer(count));
+    }
+    records.columns.extend([
+        Column {
+            name: "is_current".into(),
+            declared_type: "INTEGER".into(),
+        },
+        Column {
+            name: "successor_count".into(),
+            declared_type: "INTEGER".into(),
+        },
+    ]);
+    bundle.manifest.sections = bundle
+        .sections
+        .iter()
+        .map(|section| {
+            Ok(SectionDescriptor {
+                name: section.name.clone(),
+                revision: section.revision,
+                row_count: section.rows.len() as u64,
+                sha256: sha256_json(section)?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    bundle.manifest.content_sha256 = sha256_json(&bundle.sections)?;
+    Ok(())
 }
 
 fn upgrade_legacy_bundle(bundle: &mut Bundle) -> Result<()> {
@@ -1397,12 +1516,29 @@ pub async fn export_canonical_interchange(db: &Db) -> Result<Vec<u8>> {
     Ok(serde_json::to_vec(&bundle)?)
 }
 
+/// Sealed authority to append receiver consent boundaries. Only the canonical
+/// importer can construct it; structural interchange validation cannot mint it.
+pub(crate) struct CanonicalImportConsentBoundary(());
+
+/// Whether import preserves one workspace or establishes a foreign consent
+/// boundary. Every caller must choose explicitly; only storage migration can
+/// construct the witness needed to preserve identity.
+#[derive(Debug)]
+pub enum ImportContinuity {
+    ForeignBoundary,
+    PreserveIdentity(crate::storage_migration::StorageMigrationIdentity),
+}
+
 /// Validate and import a canonical document into a new SQLite database.
 ///
 /// The destination must not exist. All parsing and portable schema validation
 /// happen before a staging database is created; database-level validation and
 /// full conformance run before the staged file is atomically published.
-pub async fn import_canonical_interchange(bytes: &[u8], destination: &Path) -> Result<Db> {
+pub async fn import_canonical_interchange(
+    bytes: &[u8],
+    destination: &Path,
+    continuity: ImportContinuity,
+) -> Result<Db> {
     if path_is_occupied(destination) {
         return Err(Error::engine(format!(
             "canonical interchange destination already exists: {}",
@@ -1454,10 +1590,37 @@ pub async fn import_canonical_interchange(bytes: &[u8], destination: &Path) -> R
         .await?;
         let derivation_events = crate::derivation::read_all_derivation_events(&mut tx).await?;
         crate::derivation::replay_derivations_in(&mut tx, &derivation_events).await?;
+        crate::control::rebuild_alpha_tab_projections_in(&mut tx).await?;
+        match continuity {
+            ImportContinuity::ForeignBoundary => {
+                crate::control::reset_imported_alpha_tabs_in(
+                    &mut tx,
+                    CanonicalImportConsentBoundary(()),
+                )
+                .await?;
+            }
+            ImportContinuity::PreserveIdentity(_) => {}
+        }
         crate::relationship::initialize_receiver_local_state_after_import_in(&mut tx).await?;
+        // `facet_times` is derived state, not a section: rebuild it from the
+        // imported content log so the rebuild-and-diff below agrees.
+        crate::projector::rebuild_facet_times(&mut tx).await?;
+        // `body_blocks` is also derived rather than carried on the wire.
+        // Rebuild from the imported current body and its exact source event
+        // before conformance compares the staged database with replay.
+        crate::body_blocks_projection::backfill_sqlite(&mut tx).await?;
+        // Vocabulary metadata nodes are derived from the imported stored
+        // metadata bytes; they are not carried as an interchange section.
+        crate::json_nodes_projection::backfill_sqlite(&mut tx).await?;
+        // Schema-config nodes are another derived carrier: rebuild from the
+        // imported source bytes in this transaction before conformance.
+        crate::schema_config_json_nodes::backfill(&mut tx).await?;
+        // Facet-value nodes are derived from the imported current facet values,
+        // never carried as a section; rebuild them before conformance too.
+        crate::facet_value_json_nodes::backfill(&mut tx).await?;
         tx.commit().await?;
 
-        let report = crate::conformance::run_conformance(&staging).await;
+        let report = crate::conformance::run_conformance_with_progress(&staging, |_, _| {}).await;
         if !report.ok {
             let failures = report
                 .checks
@@ -1802,10 +1965,39 @@ fn validate_bundle(bundle: &Bundle) -> Result<()> {
     // Accepted engine stamps are explicit. Older wire revisions upgrade
     // their section inventory and keep their source-history revision so a
     // re-export cannot claim exhaustive authority for a legacy source.
+    //
+    // Engine 68 through 72 exports are revision-5 documents. The 68→69
+    // edge adds only `content_event_claim_meta`,
+    // which its insert trigger derives as imported events land, the 69→70
+    // edge adds only `facet_times`, which import rebuilds from the content
+    // log, the 70→71 edge adds only the field-change partial index, which
+    // derives from the imported rows, and the 71→72 edge rebuilds only the
+    // `alpha_tab_installs` projection (task f1d80b0). The 72→73 edge appends
+    // records currency columns, derived during the validated import upgrade.
+    // Engine 76→77 adds only trigger-derived reaction metadata, which is
+    // regenerated from imported events and never serialized as canonical state.
     ensure(
         matches!(
             bundle.manifest.source_engine_schema,
-            45 | 53 | 55 | 56 | 57 | 58 | 59 | 60 | 61 | 62 | 63 | CURRENT_ENGINE_SCHEMA_VERSION
+            45 | 53
+                | 55
+                | 56
+                | 57
+                | 58
+                | 59
+                | 60
+                | 61
+                | 62
+                | 63
+                | 68
+                | 69
+                | 70
+                | 71
+                | 72
+                | 75
+                | 76
+                | 77
+                | CURRENT_ENGINE_SCHEMA_VERSION
         ),
         "unsupported source engine schema revision",
     )?;
@@ -2454,6 +2646,7 @@ fn quote_identifier(identifier: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlx::Row as _;
 
     fn refresh_bundle_integrity(bundle: &mut Bundle, section_index: usize) {
         bundle.manifest.sections[section_index].row_count =
@@ -2714,9 +2907,13 @@ mod tests {
         );
 
         let destination = temp.path().join("imported.db");
-        let imported = import_canonical_interchange(&bytes, &destination)
-            .await
-            .unwrap();
+        let imported = import_canonical_interchange(
+            &bytes,
+            &destination,
+            crate::interchange::ImportContinuity::ForeignBoundary,
+        )
+        .await
+        .unwrap();
         let imported_acts: Vec<Option<i64>> = sqlx::query_scalar(
             "SELECT act FROM provenance_attestation_validity_events
               WHERE status='invalidated' ORDER BY ordinal",
@@ -2946,9 +3143,13 @@ mod tests {
         }
 
         let destination = temp.path().join("imported.db");
-        let imported = import_canonical_interchange(&bytes, &destination)
-            .await
-            .unwrap();
+        let imported = import_canonical_interchange(
+            &bytes,
+            &destination,
+            crate::interchange::ImportContinuity::ForeignBoundary,
+        )
+        .await
+        .unwrap();
         for table in ["read_log_calls", "read_log_touches", "read_log_record_ids"] {
             let rows: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
                 .fetch_one(imported.write_pool())
@@ -3114,13 +3315,920 @@ mod tests {
         let bytes = export_canonical_interchange(&source).await.unwrap();
         let mut bundle: Bundle = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(bundle.manifest.revision, REVISION);
-        for version in [62, 63, CURRENT_ENGINE_SCHEMA_VERSION] {
+        for version in [62, 63, 68, 69, 70, CURRENT_ENGINE_SCHEMA_VERSION] {
             bundle.manifest.source_engine_schema = version;
             validate_bundle(&bundle).unwrap();
         }
         bundle.manifest.source_engine_schema = CURRENT_ENGINE_SCHEMA_VERSION + 1;
         assert!(validate_bundle(&bundle).is_err());
         source.close().await;
+    }
+
+    #[tokio::test]
+    async fn reaction_metadata_rebuilds_and_imports_from_engine_76() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = crate::create_database(temp.path().join("reactions.db").to_str().unwrap())
+            .await
+            .unwrap();
+        let message = crate::store::create_record(
+            &source,
+            serde_json::json!({"type":"Message","kind":"message","name":"reactions","body":"body"}),
+        )
+        .await
+        .unwrap();
+        for (actor, emoji, command) in [
+            ("alice", "👍", "add_reaction"),
+            ("bea", "👍", "add_reaction"),
+            ("alice", "👍", "remove_reaction"),
+            ("alice", "👍", "add_reaction"),
+            ("bea", "👀", "add_reaction"),
+        ] {
+            crate::store::append(&source,crate::store::AppendSpec {
+                record_id:message.clone(),
+                event_type:if command=="remove_reaction" {"message.reaction.removed.v1"} else {"message.reaction.added.v1"}.into(),
+                actor:Some(actor.into()),
+                payload:serde_json::json!({"format":"native.message-reaction.v1","emoji":emoji,"command":command,"changed":true,"actor_account_id":actor,"executor_kind":"local","reason":"r".repeat(40_000),"idempotency_key":"k".repeat(40_000)}),
+            }).await.unwrap();
+        }
+        // Sequence structs are accepted by the existing projector. Their
+        // historical $.emoji partition is NULL, independently of emitted emoji.
+        for (emoji, command, origin) in [
+            ("🎉", "add_reaction", None),
+            ("😂", "remove_reaction", Some(serde_json::Value::Null)),
+            (
+                "❤️",
+                "add_reaction",
+                Some(serde_json::json!({"gesture":"undo"})),
+            ),
+        ] {
+            let mut payload = serde_json::json!([
+                "native.message-reaction.v1",
+                emoji,
+                "key",
+                command,
+                true,
+                "alice",
+                "local",
+                null,
+                "reason"
+            ]);
+            if let Some(origin) = origin {
+                payload.as_array_mut().unwrap().push(origin);
+            }
+            crate::store::append(
+                &source,
+                crate::store::AppendSpec {
+                    record_id: message.clone(),
+                    event_type: if command == "remove_reaction" {
+                        "message.reaction.removed.v1"
+                    } else {
+                        "message.reaction.added.v1"
+                    }
+                    .into(),
+                    actor: Some("alice".into()),
+                    payload,
+                },
+            )
+            .await
+            .unwrap();
+        }
+        for (kind, reference) in [
+            ("local", None),
+            ("authenticated_principal", None),
+            ("human_attested", Some("human:ref")),
+            ("agent", Some("agent:ref")),
+            ("delegated_service", Some("service:ref")),
+        ] {
+            let payload = serde_json::json!([
+                "native.message-reaction.v1",
+                "👀",
+                "key",
+                "add_reaction",
+                false,
+                kind,
+                kind,
+                reference,
+                "reason",
+                null
+            ]);
+            crate::store::append(
+                &source,
+                crate::store::AppendSpec {
+                    record_id: message.clone(),
+                    event_type: "message.reaction.added.v1".into(),
+                    actor: Some(kind.into()),
+                    payload,
+                },
+            )
+            .await
+            .unwrap();
+        }
+        for mutation in 0..5 {
+            let mut payload = serde_json::json!([
+                "native.message-reaction.v1",
+                "👍",
+                "key",
+                "add_reaction",
+                true,
+                "alice",
+                "local",
+                null,
+                "reason"
+            ]);
+            match mutation {
+                0 => payload[4] = serde_json::json!("true"),
+                1 => {
+                    payload.as_array_mut().unwrap().pop();
+                }
+                2 => {
+                    payload
+                        .as_array_mut()
+                        .unwrap()
+                        .extend([serde_json::Value::Null, serde_json::Value::Null]);
+                }
+                3 => payload[7] = serde_json::json!("forbidden"),
+                _ => payload[1] = serde_json::json!("invalid"),
+            }
+            assert!(crate::store::append(
+                &source,
+                crate::store::AppendSpec {
+                    record_id: message.clone(),
+                    event_type: "message.reaction.added.v1".into(),
+                    actor: Some("alice".into()),
+                    payload
+                }
+            )
+            .await
+            .is_err());
+        }
+        let old: Vec<(String,String,String)>=sqlx::query_as("WITH ranked AS (SELECT actor,payload,created_at,type,ROW_NUMBER() OVER (PARTITION BY actor,json_extract(payload,'$.emoji') ORDER BY seq DESC) recency FROM content_events WHERE record_id=? AND type IN ('message.reaction.added.v1','message.reaction.removed.v1')) SELECT actor,payload,created_at FROM ranked WHERE recency=1 AND type='message.reaction.added.v1'").bind(&message).fetch_all(source.write_pool()).await.unwrap();
+        let mut old: Vec<(String, String, String, String)> = old
+            .into_iter()
+            .map(|(actor, raw, time)| {
+                let payload: crate::events::MessageReactionPayload =
+                    serde_json::from_str(&raw).unwrap();
+                payload.validate(Some(&actor)).unwrap();
+                (actor, payload.emoji, payload.executor_kind, time)
+            })
+            .collect();
+        old.sort();
+        let mut projected:Vec<(String,String,String,String)>=sqlx::query_as("WITH ranked AS (SELECT actor,emoji,executor_kind,created_at,reaction_class,ROW_NUMBER() OVER (PARTITION BY actor,legacy_emoji ORDER BY event_seq DESC) recency FROM content_event_reaction_meta WHERE record_id=?) SELECT actor,emoji,executor_kind,created_at FROM ranked WHERE recency=1 AND reaction_class='added'").bind(&message).fetch_all(source.write_pool()).await.unwrap();
+        projected.sort();
+        assert_eq!(projected, old);
+        assert!(old
+            .iter()
+            .any(|(actor, emoji, _, _)| actor == "alice" && emoji == "❤️"));
+        assert!(!old
+            .iter()
+            .any(|(actor, emoji, _, _)| actor == "alice" && emoji == "🎉"));
+        let dump="SELECT event_seq,record_id,actor,legacy_emoji,emoji,executor_kind,reaction_class,created_at FROM content_event_reaction_meta ORDER BY event_seq";
+        type Meta = (
+            i64,
+            String,
+            String,
+            Option<String>,
+            String,
+            String,
+            String,
+            String,
+        );
+        let expected: Vec<Meta> = sqlx::query_as(dump)
+            .fetch_all(source.write_pool())
+            .await
+            .unwrap();
+        assert_eq!(expected.len(), 13);
+        assert!(
+            crate::conformance::rebuild_and_diff(&source)
+                .await
+                .unwrap()
+                .equal
+        );
+        let bytes = export_canonical_interchange(&source).await.unwrap();
+        let mut bundle: Bundle = serde_json::from_slice(&bytes).unwrap();
+        assert!(!bundle
+            .sections
+            .iter()
+            .any(|section| section.name == "content_event_reaction_meta"));
+        for version in [CURRENT_ENGINE_SCHEMA_VERSION, 76, 75] {
+            bundle.manifest.source_engine_schema = version;
+            let imported = import_canonical_interchange(
+                &serde_json::to_vec(&bundle).unwrap(),
+                &temp.path().join(format!("imported-{version}.db")),
+                crate::interchange::ImportContinuity::ForeignBoundary,
+            )
+            .await
+            .unwrap();
+            let actual: Vec<Meta> = sqlx::query_as(dump)
+                .fetch_all(imported.write_pool())
+                .await
+                .unwrap();
+            assert_eq!(actual, expected);
+            assert!(
+                crate::conformance::rebuild_and_diff(&imported)
+                    .await
+                    .unwrap()
+                    .equal
+            );
+            let exported: Bundle =
+                serde_json::from_slice(&export_canonical_interchange(&imported).await.unwrap())
+                    .unwrap();
+            assert_sections_unchanged(&bundle, &exported);
+            imported.close().await;
+        }
+        source.close().await;
+    }
+
+    type FacetTimeDump = (
+        String,
+        String,
+        String,
+        i64,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        Option<i64>,
+        Option<String>,
+        Option<String>,
+    );
+
+    async fn facet_time_rows(db: &crate::Db) -> Vec<FacetTimeDump> {
+        sqlx::query_as(
+            "SELECT record_id, key, kind, all_day, start_date, end_date, start_ms, end_ms, tz, tzdb_version
+               FROM facet_times ORDER BY record_id, key",
+        )
+        .fetch_all(db.write_pool())
+        .await
+        .unwrap()
+    }
+
+    /// Every section of `after` equals the same section of `before` after
+    /// deriving the v73 currency columns for historical exports.
+    fn assert_sections_unchanged(before: &Bundle, after: &Bundle) {
+        let mut expected = before.clone();
+        if expected.manifest.source_engine_schema < 73 {
+            upgrade_pre_73_currency(&mut expected).unwrap();
+        }
+        assert_eq!(expected.sections.len(), after.sections.len());
+        for (left, right) in expected.sections.iter().zip(&after.sections) {
+            assert_eq!(left.name, right.name);
+            assert_eq!(
+                sha256_json(left).unwrap(),
+                sha256_json(right).unwrap(),
+                "section {} changed across import and re-export",
+                left.name
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn engine_72_interchange_derives_currency_from_live_successors() {
+        let source = crate::create_database(":memory:").await.unwrap();
+        let target = crate::store::create_record(
+            &source,
+            serde_json::json!({"type":"Document","kind":"note","name":"target"}),
+        )
+        .await
+        .unwrap();
+        let successor = crate::store::create_record(
+            &source,
+            serde_json::json!({"type":"Document","kind":"note","name":"successor"}),
+        )
+        .await
+        .unwrap();
+        crate::store::add_link(
+            &source,
+            crate::events::LinkAddedPayload {
+                id: None,
+                source_id: successor,
+                target_id: target.clone(),
+                relationship: "supersedes".into(),
+                note: None,
+            },
+        )
+        .await
+        .unwrap();
+        let bytes = export_canonical_interchange(&source).await.unwrap();
+        let mut historical: Bundle = serde_json::from_slice(&bytes).unwrap();
+        historical.manifest.source_engine_schema = 72;
+        let records = historical
+            .sections
+            .iter_mut()
+            .find(|section| section.name == "records")
+            .unwrap();
+        assert_eq!(records.columns.pop().unwrap().name, "successor_count");
+        assert_eq!(records.columns.pop().unwrap().name, "is_current");
+        for row in &mut records.rows {
+            row.pop();
+            row.pop();
+        }
+        historical.manifest.sections = historical
+            .sections
+            .iter()
+            .map(|section| SectionDescriptor {
+                name: section.name.clone(),
+                revision: section.revision,
+                row_count: section.rows.len() as u64,
+                sha256: sha256_json(section).unwrap(),
+            })
+            .collect();
+        historical.manifest.content_sha256 = sha256_json(&historical.sections).unwrap();
+        let historical_bytes = serde_json::to_vec(&historical).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let imported = import_canonical_interchange(
+            &historical_bytes,
+            &temp.path().join("v72.db"),
+            crate::interchange::ImportContinuity::ForeignBoundary,
+        )
+        .await
+        .unwrap();
+        let currency: (Option<i64>, i64) =
+            sqlx::query_as("SELECT is_current,successor_count FROM records WHERE id=?1")
+                .bind(target)
+                .fetch_one(imported.write_pool())
+                .await
+                .unwrap();
+        assert_eq!(currency, (None, 1));
+        imported.close().await;
+        source.close().await;
+    }
+
+    /// Review finding (fef3469 T2): the importer's explicit engine stamps
+    /// must keep admitting engine 68 once this build has moved past it. The fixture is
+    /// a genuine engine-68 export, written by main `134b18247` (the last tree
+    /// compiling engine 68) from a database holding one note with an
+    /// untyped `due` facet. The 68→69, 69→70 and 70→71 edges add no section and
+    /// change no section's columns, so the document imports as it stands,
+    /// and its re-export differs only in the manifest's engine stamp.
+    #[tokio::test]
+    async fn genuine_engine_68_export_imports_and_re_exports_unchanged() {
+        const FIXTURE: &[u8] =
+            include_bytes!("../tests/fixtures/interchange/engine-68-export.json");
+        let source: Bundle = serde_json::from_slice(FIXTURE).unwrap();
+        assert_eq!(source.manifest.source_engine_schema, 68);
+        assert_eq!(source.manifest.revision, REVISION);
+        let temp = tempfile::tempdir().unwrap();
+        let imported = import_canonical_interchange(
+            FIXTURE,
+            &temp.path().join("imported.db"),
+            crate::interchange::ImportContinuity::ForeignBoundary,
+        )
+        .await
+        .unwrap();
+        let due: String = sqlx::query_scalar(
+            "SELECT value FROM facet_values WHERE record_id = ? AND key = 'due'",
+        )
+        .bind("7e0e6800-0000-4000-8000-000000000001")
+        .fetch_one(imported.write_pool())
+        .await
+        .unwrap();
+        assert_eq!(due, "2026-10-05");
+        // No engine-68 event carries `time_kind`, so nothing is typed.
+        assert!(facet_time_rows(&imported).await.is_empty());
+        let re_exported = export_canonical_interchange(&imported).await.unwrap();
+        let re_exported: Bundle = serde_json::from_slice(&re_exported).unwrap();
+        assert_eq!(
+            re_exported.manifest.source_engine_schema,
+            CURRENT_ENGINE_SCHEMA_VERSION
+        );
+        assert_sections_unchanged(&source, &re_exported);
+        imported.close().await;
+    }
+
+    /// The same for engine 69: a genuine export written by main `ad13d26b1`
+    /// (the last tree compiling engine 69, after the 68→69 claim-metadata
+    /// edge) from a database holding one note with an untyped `due` facet.
+    /// Its claim metadata is rebuilt by the insert trigger as events land,
+    /// and `facet_times` by the import rebuild, so the document imports as
+    /// it stands and its re-export differs only in the engine stamp.
+    #[tokio::test]
+    async fn genuine_engine_69_export_imports_and_re_exports_unchanged() {
+        const FIXTURE: &[u8] =
+            include_bytes!("../tests/fixtures/interchange/engine-69-export.json");
+        let source: Bundle = serde_json::from_slice(FIXTURE).unwrap();
+        assert_eq!(source.manifest.source_engine_schema, 69);
+        assert_eq!(source.manifest.revision, REVISION);
+        let temp = tempfile::tempdir().unwrap();
+        let imported = import_canonical_interchange(
+            FIXTURE,
+            &temp.path().join("imported.db"),
+            crate::interchange::ImportContinuity::ForeignBoundary,
+        )
+        .await
+        .unwrap();
+        let due: String = sqlx::query_scalar(
+            "SELECT value FROM facet_values WHERE record_id = ? AND key = 'due'",
+        )
+        .bind("7e0e6900-0000-4000-8000-000000000069")
+        .fetch_one(imported.write_pool())
+        .await
+        .unwrap();
+        assert_eq!(due, "2026-10-05");
+        assert!(facet_time_rows(&imported).await.is_empty());
+        let classified: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM content_event_claim_meta")
+            .fetch_one(imported.write_pool())
+            .await
+            .unwrap();
+        let events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM content_events")
+            .fetch_one(imported.write_pool())
+            .await
+            .unwrap();
+        assert_eq!(classified, events, "every imported event is classified");
+        let re_exported = export_canonical_interchange(&imported).await.unwrap();
+        let re_exported: Bundle = serde_json::from_slice(&re_exported).unwrap();
+        assert_eq!(
+            re_exported.manifest.source_engine_schema,
+            CURRENT_ENGINE_SCHEMA_VERSION
+        );
+        assert_sections_unchanged(&source, &re_exported);
+        imported.close().await;
+    }
+
+    /// The same for engine 70: a genuine export written by main `2e03ecc05`
+    /// (the last tree compiling engine 70, after the 69→70 `facet_times`
+    /// edge) from a database holding one note with an untyped `due` facet.
+    /// The 70→71 edge adds only the field-change partial index, which
+    /// derives from the imported rows, so the document imports as it stands
+    /// and its re-export differs only in the engine stamp.
+    #[tokio::test]
+    async fn genuine_engine_70_export_imports_and_re_exports_unchanged() {
+        const FIXTURE: &[u8] =
+            include_bytes!("../tests/fixtures/interchange/engine-70-export.json");
+        let source: Bundle = serde_json::from_slice(FIXTURE).unwrap();
+        assert_eq!(source.manifest.source_engine_schema, 70);
+        assert_eq!(source.manifest.revision, REVISION);
+        let temp = tempfile::tempdir().unwrap();
+        let imported = import_canonical_interchange(
+            FIXTURE,
+            &temp.path().join("imported.db"),
+            crate::interchange::ImportContinuity::ForeignBoundary,
+        )
+        .await
+        .unwrap();
+        let due: String = sqlx::query_scalar(
+            "SELECT value FROM facet_values WHERE record_id = ? AND key = 'due'",
+        )
+        .bind("7e0e7000-0000-4000-8000-000000000070")
+        .fetch_one(imported.write_pool())
+        .await
+        .unwrap();
+        assert_eq!(due, "2026-10-05");
+        assert!(facet_time_rows(&imported).await.is_empty());
+        let indexed: i64 = sqlx::query_scalar(&format!(
+            "SELECT COUNT(*) FROM content_events INDEXED BY {} WHERE record_id = ? AND {}",
+            crate::query::events::FIELD_CHANGE_ROWS_INDEX,
+            crate::query::events::FIELD_CHANGE_ROWS_PREDICATE
+        ))
+        .bind("7e0e7000-0000-4000-8000-000000000070")
+        .fetch_one(imported.write_pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            indexed, 2,
+            "the note's events are in the field-change index"
+        );
+        let re_exported = export_canonical_interchange(&imported).await.unwrap();
+        let re_exported: Bundle = serde_json::from_slice(&re_exported).unwrap();
+        assert_eq!(
+            re_exported.manifest.source_engine_schema,
+            CURRENT_ENGINE_SCHEMA_VERSION
+        );
+        assert_sections_unchanged(&source, &re_exported);
+        imported.close().await;
+    }
+
+    /// The same for engine 71 (task f1d80b0): a genuine export written by
+    /// main `17f35ed1a` (the last tree compiling engine 71, after the 70→71
+    /// field-change index) from a database holding one note with an untyped
+    /// `due` facet. The 71→72 edge rebuilds only the `alpha_tab_installs`
+    /// projection, which is not a section, so the document imports as it
+    /// stands and its re-export differs only in the engine stamp.
+    #[tokio::test]
+    async fn genuine_engine_71_export_imports_and_re_exports_unchanged() {
+        const FIXTURE: &[u8] =
+            include_bytes!("../tests/fixtures/interchange/engine-71-export.json");
+        let source: Bundle = serde_json::from_slice(FIXTURE).unwrap();
+        assert_eq!(source.manifest.source_engine_schema, 71);
+        assert_eq!(source.manifest.revision, REVISION);
+        let temp = tempfile::tempdir().unwrap();
+        let imported = import_canonical_interchange(
+            FIXTURE,
+            &temp.path().join("imported.db"),
+            crate::interchange::ImportContinuity::ForeignBoundary,
+        )
+        .await
+        .unwrap();
+        let due: String = sqlx::query_scalar(
+            "SELECT value FROM facet_values WHERE record_id = ? AND key = 'due'",
+        )
+        .bind("7e0e7100-0000-4000-8000-000000000071")
+        .fetch_one(imported.write_pool())
+        .await
+        .unwrap();
+        assert_eq!(due, "2026-10-05");
+        assert!(facet_time_rows(&imported).await.is_empty());
+        let re_exported = export_canonical_interchange(&imported).await.unwrap();
+        let re_exported: Bundle = serde_json::from_slice(&re_exported).unwrap();
+        assert_eq!(
+            re_exported.manifest.source_engine_schema,
+            CURRENT_ENGINE_SCHEMA_VERSION
+        );
+        assert_sections_unchanged(&source, &re_exported);
+        imported.close().await;
+    }
+
+    async fn schema_config_node_rows(db: &Db, config_id: &str) -> Vec<serde_json::Value> {
+        sqlx::query(
+            "SELECT config_id,ordinal,path,parent_path,parent_ordinal,member_key,
+                    array_index,depth,node_type,text_value,number_text,bool_value
+               FROM schema_config_json_nodes WHERE config_id = ? ORDER BY ordinal",
+        )
+        .bind(config_id)
+        .fetch_all(db.write_pool())
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| {
+            serde_json::json!([
+                row.get::<String, _>("config_id"),
+                row.get::<i64, _>("ordinal"),
+                row.get::<String, _>("path"),
+                row.get::<Option<String>, _>("parent_path"),
+                row.get::<Option<i64>, _>("parent_ordinal"),
+                row.get::<Option<String>, _>("member_key"),
+                row.get::<Option<i64>, _>("array_index"),
+                row.get::<i64, _>("depth"),
+                row.get::<String, _>("node_type"),
+                row.get::<Option<String>, _>("text_value"),
+                row.get::<Option<String>, _>("number_text"),
+                row.get::<Option<i64>, _>("bool_value"),
+            ])
+        })
+        .collect()
+    }
+
+    #[tokio::test]
+    async fn schema_config_nodes_import_from_exact_carriers_without_wire_rows() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = crate::create_database(temp.path().join("source.db").to_str().unwrap())
+            .await
+            .unwrap();
+        let data = r#" {"d":{"n":9007199254740993},"d":{"n":1.2300e+04},"a\u002fb~c":[{},[],true,null,"x"],"empty":{}} "#;
+        for (id, text) in [("json-empty", " { } "), ("json-import", data)] {
+            crate::meta::write_user_schema_config(
+                &source,
+                text,
+                crate::meta::SchemaConfigOptions {
+                    id: Some(id.into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        }
+        // Literal occurrence identities: the two /d/n paths have distinct
+        // parents despite their duplicate member names. Numbers retain tokens.
+        let expected: Vec<serde_json::Value> = serde_json::from_str(
+            r#"[
+            ["json-import",0,"",null,null,null,null,0,"object",null,null,null],
+            ["json-import",1,"/d","",0,"d",null,1,"object",null,null,null],
+            ["json-import",2,"/d/n","/d",1,"n",null,2,"number",null,"9007199254740993",null],
+            ["json-import",3,"/d","",0,"d",null,1,"object",null,null,null],
+            ["json-import",4,"/d/n","/d",3,"n",null,2,"number",null,"1.2300e+04",null],
+            ["json-import",5,"/a~1b~0c","",0,"a/b~c",null,1,"array",null,null,null],
+            ["json-import",6,"/a~1b~0c/0","/a~1b~0c",5,null,0,2,"object",null,null,null],
+            ["json-import",7,"/a~1b~0c/1","/a~1b~0c",5,null,1,2,"array",null,null,null],
+            ["json-import",8,"/a~1b~0c/2","/a~1b~0c",5,null,2,2,"boolean",null,null,1],
+            ["json-import",9,"/a~1b~0c/3","/a~1b~0c",5,null,3,2,"null",null,null,null],
+            ["json-import",10,"/a~1b~0c/4","/a~1b~0c",5,null,4,2,"string","x",null,null],
+            ["json-import",11,"/empty","",0,"empty",null,1,"object",null,null,null]
+        ]"#,
+        )
+        .unwrap();
+        let empty: Vec<serde_json::Value> = serde_json::from_str(
+            r#"[["json-empty",0,"",null,null,null,null,0,"object",null,null,null]]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            schema_config_node_rows(&source, "json-import").await,
+            expected
+        );
+        let bytes = export_canonical_interchange(&source).await.unwrap();
+        let bundle: Bundle = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(bundle.manifest.revision, 5);
+        assert!(bundle
+            .sections
+            .iter()
+            .all(|section| section.name != "schema_config_json_nodes"));
+        let imported = import_canonical_interchange(
+            &bytes,
+            &temp.path().join("imported.db"),
+            ImportContinuity::ForeignBoundary,
+        )
+        .await
+        .unwrap();
+        for db in [&source, &imported] {
+            assert_eq!(schema_config_node_rows(db, "json-import").await, expected);
+            assert_eq!(schema_config_node_rows(db, "json-empty").await, empty);
+            for (id, text) in [("json-empty", " { } "), ("json-import", data)] {
+                let stored: String =
+                    sqlx::query_scalar("SELECT data FROM schema_config WHERE id = ?")
+                        .bind(id)
+                        .fetch_one(db.write_pool())
+                        .await
+                        .unwrap();
+                assert_eq!(stored, text);
+                let payload: String = sqlx::query_scalar("SELECT payload FROM meta_events WHERE subject_id = ? AND type = 'schema_config.set'")
+                    .bind(id).fetch_one(db.write_pool()).await.unwrap();
+                let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+                assert_eq!(payload["data"].as_str(), Some(text));
+            }
+        }
+        let replay = crate::conformance::rebuild_and_diff_meta(&imported)
+            .await
+            .unwrap();
+        assert!(replay.equal, "{:?}", replay.tables);
+        let reexported = export_canonical_interchange(&imported).await.unwrap();
+        assert_eq!(
+            reexported, bytes,
+            "source rows and events must round-trip byte-exactly"
+        );
+        let again = import_canonical_interchange(
+            &reexported,
+            &temp.path().join("again.db"),
+            ImportContinuity::ForeignBoundary,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            schema_config_node_rows(&again, "json-import").await,
+            expected
+        );
+        assert_eq!(schema_config_node_rows(&again, "json-empty").await, empty);
+        assert_eq!(export_canonical_interchange(&again).await.unwrap(), bytes);
+        again.close().await;
+        imported.close().await;
+        source.close().await;
+    }
+
+    #[tokio::test]
+    async fn invalid_schema_config_carriers_refuse_import_before_publication() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = crate::create_database(temp.path().join("source.db").to_str().unwrap())
+            .await
+            .unwrap();
+        crate::meta::write_user_schema_config(
+            &source,
+            " { } ",
+            crate::meta::SchemaConfigOptions {
+                id: Some("invalid-import".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let original = export_canonical_interchange(&source).await.unwrap();
+        let original_bundle: Bundle = serde_json::from_slice(&original).unwrap();
+        // Reuse the existing source/root/depth/node/projection/UTF-8-cell
+        // refusal fixtures. Both wire carriers describe the same bad source;
+        // refreshed hashes ensure admission reaches the staging backfill.
+        for (index, (data, message)) in crate::schema_config_json_nodes::invalid_sources()
+            .into_iter()
+            .enumerate()
+        {
+            let mut bundle = original_bundle.clone();
+            for (name, key, column) in [
+                ("schema_config", "id", "data"),
+                ("meta_events", "subject_id", "payload"),
+            ] {
+                let section_index = bundle
+                    .sections
+                    .iter()
+                    .position(|section| section.name == name)
+                    .unwrap();
+                let section = &mut bundle.sections[section_index];
+                let key_index = section
+                    .columns
+                    .iter()
+                    .position(|candidate| candidate.name == key)
+                    .unwrap();
+                let column_index = section
+                    .columns
+                    .iter()
+                    .position(|candidate| candidate.name == column)
+                    .unwrap();
+                let row = section
+                    .rows
+                    .iter_mut()
+                    .find(|row| row[key_index] == Cell::Text("invalid-import".into()))
+                    .unwrap();
+                row[column_index] = if name == "schema_config" {
+                    Cell::Text(data.clone())
+                } else {
+                    let Cell::Text(payload) = &row[column_index] else {
+                        panic!("fixture meta payload must be text")
+                    };
+                    let mut payload: serde_json::Value = serde_json::from_str(payload).unwrap();
+                    payload["data"] = serde_json::Value::String(data.clone());
+                    Cell::Text(serde_json::to_string(&payload).unwrap())
+                };
+                refresh_bundle_integrity(&mut bundle, section_index);
+            }
+            let bytes = serde_json::to_vec(&bundle).unwrap();
+            validate_canonical_interchange(&bytes).expect("wire integrity must be valid");
+            let destination = temp.path().join(format!("refused-{index}.db"));
+            let error = import_canonical_interchange(
+                &bytes,
+                &destination,
+                ImportContinuity::ForeignBoundary,
+            )
+            .await
+            .expect_err("invalid source or projection must refuse publication")
+            .to_string();
+            assert!(error.contains(message), "fixture {index}: {error}");
+            assert!(
+                !error.contains("failed conformance"),
+                "backfill must refuse before commit: {error}"
+            );
+            assert!(!destination.exists());
+            assert!(!std::fs::read_dir(temp.path()).unwrap().any(|entry| entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".native-interchange-")));
+        }
+        assert_eq!(
+            export_canonical_interchange(&source).await.unwrap(),
+            original,
+            "failed imports must preserve source rows and authoritative events"
+        );
+        let replay = crate::conformance::rebuild_and_diff_meta(&source)
+            .await
+            .unwrap();
+        assert!(replay.equal, "{:?}", replay.tables);
+        source.close().await;
+    }
+
+    /// Typed time survives the portable format: `facet_times` is derived
+    /// state rather than a section, so import rebuilds it from the imported
+    /// content log, and a second export and import reproduce the same
+    /// sections and rows.
+    #[tokio::test]
+    async fn typed_time_facets_round_trip_through_interchange() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = crate::create_database(temp.path().join("source.db").to_str().unwrap())
+            .await
+            .unwrap();
+        let mut registry = crate::mcp::ToolRegistry::new();
+        crate::mcp::register_surface_tools(&mut registry).unwrap();
+        let caller = crate::mcp::Caller::local();
+        registry
+            .call(
+                source.clone(),
+                caller.clone(),
+                "manage_schema_config",
+                serde_json::json!({ "action": "write", "data": { "shapes": { "Document:note": { "facets": {
+                    "due": { "type": "date" },
+                    "slot": { "type": "when" },
+                    "call": { "type": "zoned" },
+                } } } } }),
+            )
+            .await
+            .unwrap();
+        registry
+            .call(
+                source.clone(),
+                caller,
+                "create_record",
+                serde_json::json!({
+                    "id": "7e0e6900-0000-4000-8000-000000000001",
+                    "type": "Document", "kind": "note", "name": "Typed time round trip",
+                    "reason": "Interchange round-trip fixture.",
+                    "facets": {
+                        "due": "2026-10-05",
+                        "slot": { "all_day": false, "start": { "local": "2026-10-24T10:00", "tz": "Europe/London" }, "duration": "P1D" },
+                        "call": { "local": "2026-10-25T01:30", "tz": "Europe/London", "offset": "+00:00" },
+                    },
+                }),
+            )
+            .await
+            .unwrap();
+        let rows = facet_time_rows(&source).await;
+        assert_eq!(rows.len(), 3);
+
+        let first = export_canonical_interchange(&source).await.unwrap();
+        let first_bundle: Bundle = serde_json::from_slice(&first).unwrap();
+        assert!(first_bundle
+            .sections
+            .iter()
+            .all(|section| section.name != "facet_times"));
+        let imported = import_canonical_interchange(
+            &first,
+            &temp.path().join("imported.db"),
+            crate::interchange::ImportContinuity::ForeignBoundary,
+        )
+        .await
+        .unwrap();
+        assert_eq!(facet_time_rows(&imported).await, rows);
+
+        let second = export_canonical_interchange(&imported).await.unwrap();
+        let second_bundle: Bundle = serde_json::from_slice(&second).unwrap();
+        assert_sections_unchanged(&first_bundle, &second_bundle);
+        let again = import_canonical_interchange(
+            &second,
+            &temp.path().join("again.db"),
+            crate::interchange::ImportContinuity::ForeignBoundary,
+        )
+        .await
+        .unwrap();
+        assert_eq!(facet_time_rows(&again).await, rows);
+        source.close().await;
+        imported.close().await;
+        again.close().await;
+    }
+
+    /// Review finding (fef3469 T2): `"time\u005fkind"` is the same JSON
+    /// member as `"time_kind"`. An imported log that spells it escaped must
+    /// rebuild the same `facet_times` rows replay folds, or import
+    /// conformance fails. The rebuild therefore selects typed events by JSON
+    /// semantics, never by searching the payload bytes.
+    #[tokio::test]
+    async fn escaped_time_kind_member_imports_and_replays_identically() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = crate::create_database(temp.path().join("source.db").to_str().unwrap())
+            .await
+            .unwrap();
+        let record = crate::store::create_record(
+            &source,
+            serde_json::json!({
+                "id": "7e0e7000-0000-4000-8000-000000000001",
+                "type": "Document", "kind": "note", "name": "Escaped member"
+            }),
+        )
+        .await
+        .unwrap();
+        crate::store::append(
+            &source,
+            crate::store::AppendSpec {
+                record_id: record.clone(),
+                event_type: "facet.set".into(),
+                payload: serde_json::json!({"key": "due", "value": "2026-10-05", "time_kind": "date"}),
+                actor: None,
+            },
+        )
+        .await
+        .unwrap();
+        let rows = facet_time_rows(&source).await;
+        assert_eq!(rows.len(), 1);
+
+        let bytes = export_canonical_interchange(&source).await.unwrap();
+        let mut bundle: Bundle = serde_json::from_slice(&bytes).unwrap();
+        let events = bundle
+            .sections
+            .iter()
+            .position(|section| section.name == "content_events")
+            .unwrap();
+        let payload = bundle.sections[events]
+            .columns
+            .iter()
+            .position(|column| column.name == "payload")
+            .unwrap();
+        let mut escaped = 0;
+        for row in &mut bundle.sections[events].rows {
+            if let Cell::Text(text) = &mut row[payload] {
+                if text.contains(r#""time_kind""#) {
+                    *text = text.replace(r#""time_kind""#, r#""time\u005fkind""#);
+                    escaped += 1;
+                }
+            }
+        }
+        assert_eq!(escaped, 1, "exactly the typed facet.set is rewritten");
+        refresh_bundle_integrity(&mut bundle, events);
+        let escaped_bytes = serde_json::to_vec(&bundle).unwrap();
+
+        // Import runs the rebuild, then replay-based conformance over the
+        // same log; both must see the escaped member.
+        let imported = import_canonical_interchange(
+            &escaped_bytes,
+            &temp.path().join("imported.db"),
+            crate::interchange::ImportContinuity::ForeignBoundary,
+        )
+        .await
+        .unwrap();
+        assert_eq!(facet_time_rows(&imported).await, rows);
+        let stored: String = sqlx::query_scalar(
+            "SELECT payload FROM content_events WHERE type = 'facet.set' AND record_id = ?",
+        )
+        .bind(&record)
+        .fetch_one(imported.write_pool())
+        .await
+        .unwrap();
+        assert!(stored.contains(r#""time\u005fkind""#), "{stored}");
+        let replay = crate::conformance::rebuild_and_diff(&imported)
+            .await
+            .unwrap();
+        assert!(replay.equal, "{:?}", replay.tables);
+        source.close().await;
+        imported.close().await;
     }
 
     /// Canonical interchange round-trips at revision 5 preserving act
@@ -3157,9 +4265,13 @@ mod tests {
         assert!(source_acts.iter().all(|act| act.is_some()));
 
         let destination = temp.path().join("destination.db");
-        let imported = import_canonical_interchange(&bytes, &destination)
-            .await
-            .unwrap();
+        let imported = import_canonical_interchange(
+            &bytes,
+            &destination,
+            crate::interchange::ImportContinuity::ForeignBoundary,
+        )
+        .await
+        .unwrap();
         let imported_acts: Vec<Option<i64>> =
             sqlx::query_scalar("SELECT act FROM content_events ORDER BY seq")
                 .fetch_all(imported.write_pool())
@@ -3272,9 +4384,13 @@ mod tests {
                 .unwrap();
 
         let destination = temp.path().join("obs-intent-imported.db");
-        let imported = import_canonical_interchange(&bytes, &destination)
-            .await
-            .unwrap();
+        let imported = import_canonical_interchange(
+            &bytes,
+            &destination,
+            crate::interchange::ImportContinuity::ForeignBoundary,
+        )
+        .await
+        .unwrap();
         let imported_observation_act: Option<i64> =
             sqlx::query_scalar("SELECT act FROM external_observations WHERE id = ?")
                 .bind(&observation.observation_id)
@@ -3366,9 +4482,13 @@ mod tests {
 
         let bytes = export_canonical_interchange(&source).await.unwrap();
         let destination = temp.path().join("whole-act-imported.db");
-        let imported = import_canonical_interchange(&bytes, &destination)
-            .await
-            .unwrap();
+        let imported = import_canonical_interchange(
+            &bytes,
+            &destination,
+            crate::interchange::ImportContinuity::ForeignBoundary,
+        )
+        .await
+        .unwrap();
         let imported_content_act: i64 =
             sqlx::query_scalar("SELECT act FROM content_events WHERE id=?")
                 .bind(&content.id)
@@ -3405,6 +4525,16 @@ mod tests {
             crate::create_database(temp.path().join("revision-3-source.db").to_str().unwrap())
                 .await
                 .unwrap();
+        crate::meta::write_user_schema_config(
+            &source,
+            r#" {"legacy":1.00} "#,
+            crate::meta::SchemaConfigOptions {
+                id: Some("legacy-json-import".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
         let (_, attestation_id, _) = populated_provenance_bundle(&source).await;
         let mut tx = crate::db::begin_write(source.write_pool()).await.unwrap();
         let mut act_alloc = crate::act::ActAllocation::new();
@@ -3453,9 +4583,21 @@ mod tests {
         let imported = import_canonical_interchange(
             &serde_json::to_vec(&revision_3).unwrap(),
             &temp.path().join("revision-3-imported.db"),
+            crate::interchange::ImportContinuity::ForeignBoundary,
         )
         .await
         .unwrap();
+        let expected_nodes: Vec<serde_json::Value> = serde_json::from_str(
+            r#"[
+            ["legacy-json-import",0,"",null,null,null,null,0,"object",null,null,null],
+            ["legacy-json-import",1,"/legacy","",0,"legacy",null,1,"number",null,"1.00",null]
+        ]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            schema_config_node_rows(&imported, "legacy-json-import").await,
+            expected_nodes
+        );
         let validity_acts: Vec<Option<i64>> = sqlx::query_scalar(
             "SELECT act FROM provenance_attestation_validity_events ORDER BY attestation_id,ordinal",
         )
@@ -3471,12 +4613,17 @@ mod tests {
         let reimported = import_canonical_interchange(
             &reexported,
             &temp.path().join("revision-3-reimported.db"),
+            crate::interchange::ImportContinuity::ForeignBoundary,
         )
         .await
         .unwrap();
         assert!(crate::standby::read_authority_act_head(&reimported)
             .await
             .is_err());
+        assert_eq!(
+            schema_config_node_rows(&reimported, "legacy-json-import").await,
+            expected_nodes
+        );
         reimported.close().await;
         imported.close().await;
         source.close().await;
@@ -3567,10 +4714,13 @@ mod tests {
                 !mentions.rows.is_empty(),
                 "{label} rev4 upgrade lost mentions"
             );
-            let imported =
-                import_canonical_interchange(&bytes, &temp.path().join(format!("{label}.db")))
-                    .await
-                    .unwrap();
+            let imported = import_canonical_interchange(
+                &bytes,
+                &temp.path().join(format!("{label}.db")),
+                crate::interchange::ImportContinuity::ForeignBoundary,
+            )
+            .await
+            .unwrap();
             let count: i64 =
                 sqlx::query_scalar("SELECT COUNT(*) FROM record_mentions WHERE source_id = ?")
                     .bind(&record_id)
@@ -3687,6 +4837,7 @@ mod tests {
         let imported = import_canonical_interchange(
             &serde_json::to_vec(&revision_4).unwrap(),
             &temp.path().join("revision-4-imported.db"),
+            crate::interchange::ImportContinuity::ForeignBoundary,
         )
         .await
         .unwrap();
@@ -3778,10 +4929,13 @@ mod tests {
         assert_eq!(cell_integer(&content_row[3]), Some(55));
 
         let destination = temp.path().join("legacy-imported.db");
-        let imported =
-            import_canonical_interchange(&serde_json::to_vec(&legacy).unwrap(), &destination)
-                .await
-                .unwrap();
+        let imported = import_canonical_interchange(
+            &serde_json::to_vec(&legacy).unwrap(),
+            &destination,
+            crate::interchange::ImportContinuity::ForeignBoundary,
+        )
+        .await
+        .unwrap();
         let stamped: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM content_events WHERE act IS NOT NULL")
                 .fetch_one(imported.write_pool())
@@ -3822,9 +4976,13 @@ mod tests {
         assert!(!bundle.sections[1].rows.is_empty());
 
         let destination = temp.path().join("destination.db");
-        let imported = import_canonical_interchange(&bytes, &destination)
-            .await
-            .unwrap();
+        let imported = import_canonical_interchange(
+            &bytes,
+            &destination,
+            crate::interchange::ImportContinuity::ForeignBoundary,
+        )
+        .await
+        .unwrap();
         let source_edges: Vec<(String, String)> = sqlx::query_as(
             "SELECT event_id,parent_event_id FROM content_event_causal_frontier
               ORDER BY event_id,parent_event_id",
@@ -3974,10 +5132,13 @@ mod tests {
         bundle.manifest.content_sha256 = sha256_json(&bundle.sections).unwrap();
 
         let destination = temp.path().join("must-not-exist.db");
-        let error =
-            import_canonical_interchange(&serde_json::to_vec(&bundle).unwrap(), &destination)
-                .await
-                .expect_err("database constraint failure must reject the import");
+        let error = import_canonical_interchange(
+            &serde_json::to_vec(&bundle).unwrap(),
+            &destination,
+            crate::interchange::ImportContinuity::ForeignBoundary,
+        )
+        .await
+        .expect_err("database constraint failure must reject the import");
         assert!(
             error.to_string().contains("CHECK constraint failed")
                 || error.to_string().contains("conformance")
@@ -4026,10 +5187,13 @@ mod tests {
         assert!(source_inspection.attestation.has_verified_interaction);
         assert!(source_inspection.interaction.is_some());
         let destination = temp.path().join("imported.db");
-        let imported =
-            import_canonical_interchange(&serde_json::to_vec(&bundle).unwrap(), &destination)
-                .await
-                .unwrap();
+        let imported = import_canonical_interchange(
+            &serde_json::to_vec(&bundle).unwrap(),
+            &destination,
+            crate::interchange::ImportContinuity::ForeignBoundary,
+        )
+        .await
+        .unwrap();
         let attestations: Vec<(String, String)> = sqlx::query_as(
             "SELECT id,issuer_origin_database_id FROM provenance_action_attestations ORDER BY id",
         )
@@ -4243,9 +5407,13 @@ mod tests {
             "canonical relationship export must be byte-stable on repetition"
         );
         let destination = temp.path().join("relationship-imported.db");
-        let imported = import_canonical_interchange(&bundle, &destination)
-            .await
-            .unwrap();
+        let imported = import_canonical_interchange(
+            &bundle,
+            &destination,
+            crate::interchange::ImportContinuity::ForeignBoundary,
+        )
+        .await
+        .unwrap();
         let coordinate: (String, String, i64) = sqlx::query_as(
             "SELECT issuer_origin_db_id,assertion_id,relationship_revision
                FROM relationship_assertion_heads",
@@ -4313,6 +5481,7 @@ mod tests {
         let imported = import_canonical_interchange(
             &serde_json::to_vec(&bundle).unwrap(),
             &temp.path().join("fabricated.db"),
+            crate::interchange::ImportContinuity::ForeignBoundary,
         )
         .await
         .unwrap();
@@ -4360,6 +5529,7 @@ mod tests {
         let error = import_canonical_interchange(
             &serde_json::to_vec(&bundle).unwrap(),
             &temp.path().join("principal-mismatch.db"),
+            crate::interchange::ImportContinuity::ForeignBoundary,
         )
         .await
         .unwrap_err();
@@ -4409,6 +5579,7 @@ mod tests {
         let error = import_canonical_interchange(
             &serde_json::to_vec(&extra).unwrap(),
             &temp.path().join("extra.db"),
+            crate::interchange::ImportContinuity::ForeignBoundary,
         )
         .await
         .unwrap_err();
@@ -4425,6 +5596,7 @@ mod tests {
         let error = import_canonical_interchange(
             &serde_json::to_vec(&missing).unwrap(),
             &temp.path().join("missing.db"),
+            crate::interchange::ImportContinuity::ForeignBoundary,
         )
         .await
         .unwrap_err();

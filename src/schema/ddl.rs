@@ -266,6 +266,13 @@
 //! turso_core 0.7.2 refuses CREATE INDEX on WITHOUT ROWID. Logical columns,
 //! PK, FK, and the secondary index stay identical.
 //!
+//! ENGINE SCHEMA 70 (28 Sep 2026, task fef3469 / D2 slice T2): the content
+//! tier gains `facet_times` ([`FACET_TIMES_DDL`]), the range-queryable
+//! projection of typed time facet values. It is a fold of `facet.set` events
+//! that carry `time_kind`, a payload member no binary below engine 70
+//! writes. The 69→70 edge creates the table and runs the shared rebuild,
+//! which returns at once on a database with no such marker.
+//!
 //! ENGINE SCHEMA 54 (12 Sep 2026): exact historical TEXT IDs move to the
 //! per-database `read_log_record_ids` dictionary. Touches use an INTEGER
 //! `record_ref` with a dictionary FK; there is still no FK to `records`.
@@ -359,8 +366,193 @@ pub const CONTENT_EVENTS_APPEND_ONLY_TRIGGERS: [&str; 2] = [
        BEGIN SELECT RAISE(ABORT, 'content_events is append-only'); END"#,
 ];
 
+/// The `facet_times` projection (engine 70, D2 slice T2), byte-identical
+/// everywhere it is installed. `DDL_STATEMENTS` embeds these entries, and the
+/// engine-69-to-70 migration executes this same constant, so fresh and
+/// migrated databases cannot drift apart.
+///
+/// One row per current typed time facet value (declared `date`, `instant`,
+/// `zoned` or `when`), folded by the content projector from `facet.set`
+/// events that carry `time_kind`. All-day rows fill the floating
+/// `start_date`/`end_date` (end exclusive) and timed rows the UTC epoch
+/// milliseconds `start_ms`/`end_ms` (end exclusive, equal to start for a
+/// point), because governed SQL has no date functions to range-query the JSON
+/// value. `tzdb_version` records the tz database a zoned offset was resolved
+/// with, so a later tz database can find the values it would move.
+pub const FACET_TIMES_DDL: [&str; 3] = [
+    r#"CREATE TABLE facet_times (
+     record_id    TEXT NOT NULL REFERENCES records(id) ON DELETE CASCADE,
+     key          TEXT NOT NULL,
+     kind         TEXT NOT NULL CHECK (kind IN ('date','instant','zoned','when')),
+     all_day      INTEGER NOT NULL CHECK (all_day IN (0,1)),
+     start_date   TEXT,
+     end_date     TEXT,
+     start_ms     INTEGER,
+     end_ms       INTEGER,
+     tz           TEXT,
+     tzdb_version TEXT,
+     PRIMARY KEY (record_id, key),
+     CHECK ((all_day = 1 AND start_date IS NOT NULL AND end_date > start_date
+             AND start_ms IS NULL AND end_ms IS NULL)
+         OR (all_day = 0 AND start_ms IS NOT NULL AND end_ms >= start_ms
+             AND start_date IS NULL AND end_date IS NULL))
+    )"#,
+    r#"CREATE INDEX idx_facet_times_timed ON facet_times(start_ms, end_ms) WHERE all_day = 0"#,
+    r#"CREATE INDEX idx_facet_times_all_day ON facet_times(start_date, end_date) WHERE all_day = 1"#,
+];
+
+/// Engine 77 reaction metadata, derived once at event insertion under write limits.
+/// Only accepted source events are projected. Exact serde validation remains the
+/// projectors' admission authority; SQL guards defend the stored field shape.
+/// Migration refuses every invalid historical payload using that Rust validator,
+/// including shadowed events, rather than inventing a lossy validity sentinel.
+/// `legacy_emoji` preserves the old SQL partition key: sequences have NULL
+/// even though their decoded emitted `emoji` is valid. Never coalesce the keys.
+pub const REACTION_META_DDL: [&str; 3] = [
+    r#"CREATE TABLE content_event_reaction_meta (
+     event_seq       INTEGER PRIMARY KEY REFERENCES content_events(seq) ON DELETE CASCADE,
+     record_id       TEXT NOT NULL,
+     actor           TEXT NOT NULL,
+     legacy_emoji    TEXT,
+     emoji           TEXT NOT NULL,
+     executor_kind   TEXT NOT NULL,
+     reaction_class  TEXT NOT NULL CHECK (reaction_class IN ('added','removed')),
+     created_at      TEXT NOT NULL
+    )"#,
+    r#"CREATE INDEX idx_content_event_reaction_meta_record ON content_event_reaction_meta(record_id, event_seq)"#,
+    r#"CREATE TRIGGER content_event_reaction_meta_insert AFTER INSERT ON content_events
+     WHEN NEW.type IN ('message.reaction.added.v1','message.reaction.removed.v1')
+     BEGIN
+      SELECT CASE WHEN json_valid(NEW.payload) IS NOT 1
+       THEN RAISE(ABORT, 'invalid Message reaction JSON') END;
+      SELECT CASE WHEN (
+       (json_type(NEW.payload) = 'object' OR (json_type(NEW.payload) = 'array' AND json_array_length(NEW.payload) IN (9,10)))
+       AND json_type(NEW.payload,format_path) = 'text'
+       AND json_extract(NEW.payload,format_path) = 'native.message-reaction.v1'
+       AND json_type(NEW.payload,emoji_path) = 'text'
+       AND json_extract(NEW.payload,emoji_path) IN ('👍','❤️','😂','🎉','👀')
+       AND json_type(NEW.payload,idempotency_key_path) = 'text'
+       AND trim(json_extract(NEW.payload,idempotency_key_path),char(9,10,11,12,13,32,133,160,5760,8192,8193,8194,8195,8196,8197,8198,8199,8200,8201,8202,8232,8233,8239,8287,12288)) <> ''
+       AND json_type(NEW.payload,reason_path) = 'text'
+       AND trim(json_extract(NEW.payload,reason_path),char(9,10,11,12,13,32,133,160,5760,8192,8193,8194,8195,8196,8197,8198,8199,8200,8201,8202,8232,8233,8239,8287,12288)) <> ''
+       AND json_type(NEW.payload,command_path) = 'text'
+       AND json_extract(NEW.payload,command_path) IN ('add_reaction','remove_reaction','satisfy_acknowledgement_expectation_with_reaction')
+       AND json_type(NEW.payload,changed_path) IN ('true','false')
+       AND json_type(NEW.payload,actor_account_id_path) = 'text'
+       AND trim(json_extract(NEW.payload,actor_account_id_path),char(9,10,11,12,13,32,133,160,5760,8192,8193,8194,8195,8196,8197,8198,8199,8200,8201,8202,8232,8233,8239,8287,12288)) <> ''
+       AND json_extract(NEW.payload,actor_account_id_path) = NEW.actor
+       AND json_type(NEW.payload,executor_kind_path) = 'text'
+       AND json_extract(NEW.payload,executor_kind_path) IN ('human_attested','agent','delegated_service','local','authenticated_principal')
+       AND (json_type(NEW.payload) = 'array' OR NOT EXISTS (SELECT 1 FROM json_each(NEW.payload)
+         WHERE key NOT IN ('format','emoji','idempotency_key','command','changed','actor_account_id','executor_kind','executor_ref','reason','origin')))
+       AND (json_type(NEW.payload) = 'array' OR NOT EXISTS (SELECT 1 FROM json_each(NEW.payload) GROUP BY key HAVING count(*) > 1))
+      ) IS NOT 1 THEN RAISE(ABORT, 'invalid Message reaction payload') END
+      FROM (SELECT CASE WHEN json_type(NEW.payload) = 'array' THEN '$[0]' ELSE '$.format' END AS format_path,
+       CASE WHEN json_type(NEW.payload) = 'array' THEN '$[1]' ELSE '$.emoji' END AS emoji_path,
+       CASE WHEN json_type(NEW.payload) = 'array' THEN '$[2]' ELSE '$.idempotency_key' END AS idempotency_key_path,
+       CASE WHEN json_type(NEW.payload) = 'array' THEN '$[3]' ELSE '$.command' END AS command_path,
+       CASE WHEN json_type(NEW.payload) = 'array' THEN '$[4]' ELSE '$.changed' END AS changed_path,
+       CASE WHEN json_type(NEW.payload) = 'array' THEN '$[5]' ELSE '$.actor_account_id' END AS actor_account_id_path,
+       CASE WHEN json_type(NEW.payload) = 'array' THEN '$[6]' ELSE '$.executor_kind' END AS executor_kind_path,
+       CASE WHEN json_type(NEW.payload) = 'array' THEN '$[7]' ELSE '$.executor_ref' END AS executor_ref_path,
+       CASE WHEN json_type(NEW.payload) = 'array' THEN '$[8]' ELSE '$.reason' END AS reason_path);
+      SELECT CASE WHEN json_extract(NEW.payload,executor_kind_path) IN ('human_attested','agent','delegated_service')
+       AND (json_type(NEW.payload,executor_ref_path) = 'text'
+        AND trim(json_extract(NEW.payload,executor_ref_path),char(9,10,11,12,13,32,133,160,5760,8192,8193,8194,8195,8196,8197,8198,8199,8200,8201,8202,8232,8233,8239,8287,12288)) <> '') IS NOT 1
+       THEN RAISE(ABORT, 'attested Message reaction executors require a nonblank executor_ref')
+       WHEN json_extract(NEW.payload,executor_kind_path) IN ('local','authenticated_principal')
+        AND (json_type(NEW.payload,executor_ref_path) IS NULL OR json_type(NEW.payload,executor_ref_path) = 'null') IS NOT 1
+       THEN RAISE(ABORT, 'unattested Message reaction executors cannot carry executor_ref') END
+      FROM (SELECT CASE WHEN json_type(NEW.payload) = 'array' THEN '$[6]' ELSE '$.executor_kind' END AS executor_kind_path,
+       CASE WHEN json_type(NEW.payload) = 'array' THEN '$[7]' ELSE '$.executor_ref' END AS executor_ref_path);
+      SELECT CASE WHEN (json_extract(NEW.payload,command_path) <> 'satisfy_acknowledgement_expectation_with_reaction'
+       OR json_extract(NEW.payload,emoji_path) = '👍') IS NOT 1
+       THEN RAISE(ABORT, 'acknowledgement reactions must use 👍') END
+      FROM (SELECT CASE WHEN json_type(NEW.payload) = 'array' THEN '$[3]' ELSE '$.command' END AS command_path,
+       CASE WHEN json_type(NEW.payload) = 'array' THEN '$[1]' ELSE '$.emoji' END AS emoji_path);
+      INSERT INTO content_event_reaction_meta(event_seq,record_id,actor,legacy_emoji,emoji,executor_kind,reaction_class,created_at)
+      VALUES (NEW.seq,NEW.record_id,NEW.actor,json_extract(NEW.payload,'$.emoji'),
+       json_extract(NEW.payload,CASE WHEN json_type(NEW.payload)='array' THEN '$[1]' ELSE '$.emoji' END),
+       json_extract(NEW.payload,CASE WHEN json_type(NEW.payload)='array' THEN '$[6]' ELSE '$.executor_kind' END),
+       CASE NEW.type WHEN 'message.reaction.added.v1' THEN 'added' ELSE 'removed' END,NEW.created_at);
+     END"#,
+];
+
 /// The ordered, frozen v1 DDL. One statement per entry.
-pub const DDL_STATEMENTS: [&str; 321] = [
+/// Exact stored metadata syntax, projected as ordered JSON node occurrences.
+/// The value foreign key makes vocabulary and value deletion cascade together.
+pub const VOCABULARY_VALUE_JSON_NODES_DDL: &str = r#"CREATE TABLE vocabulary_value_json_nodes (
+     value_id       TEXT NOT NULL REFERENCES vocabulary_values(id) ON DELETE CASCADE,
+     ordinal        INTEGER NOT NULL CHECK (ordinal >= 0),
+     path           TEXT NOT NULL,
+     parent_path    TEXT,
+     parent_ordinal INTEGER CHECK (parent_ordinal >= 0),
+     member_key     TEXT,
+     array_index    INTEGER CHECK (array_index >= 0),
+     depth          INTEGER NOT NULL CHECK (depth >= 0),
+     node_type      TEXT NOT NULL CHECK (node_type IN ('object','array','string','number','boolean','null')),
+     text_value     TEXT,
+     number_text    TEXT,
+     bool_value     INTEGER CHECK (bool_value IN (0,1)),
+     PRIMARY KEY (value_id, ordinal)
+   )"#;
+
+/// Engine80 production workspace installation projection. No cross-log FKs:
+/// meta replay runs before current root/account/content/policy reconstruction.
+/// Frozen79→80 statements, shared verbatim by fresh DDL and migration.
+pub(crate) const WORKSPACE_RULE_INSTALLATION_DDL: [&str; 2] = [
+    r#"CREATE TABLE workspace_rule_installations (
+     root             TEXT NOT NULL CHECK (root = 'native:root'),
+     namespace        TEXT NOT NULL,
+     name             TEXT NOT NULL,
+     snapshot_json    TEXT NOT NULL CHECK (json_valid(snapshot_json)),
+     snapshot_digest  TEXT NOT NULL CHECK (length(snapshot_digest) = 64),
+     event_seq        INTEGER NOT NULL CHECK (event_seq > 0),
+     actor            TEXT NOT NULL CHECK (length(actor) > 0),
+     created_at       TEXT NOT NULL,
+     PRIMARY KEY (root, namespace, name)
+   )"#,
+    r#"CREATE INDEX idx_workspace_rule_installations_root
+       ON workspace_rule_installations(root, namespace, name)"#,
+];
+
+/// Stored schema-config JSON occurrences; deletion follows the source row.
+pub const SCHEMA_CONFIG_JSON_NODES_DDL: &str = r#"CREATE TABLE schema_config_json_nodes (
+     config_id      TEXT NOT NULL REFERENCES schema_config(id) ON DELETE CASCADE,
+     ordinal        INTEGER NOT NULL CHECK (ordinal >= 0),
+     path           TEXT NOT NULL,
+     parent_path    TEXT,
+     parent_ordinal INTEGER CHECK (parent_ordinal >= 0),
+     member_key     TEXT,
+     array_index    INTEGER CHECK (array_index >= 0),
+     depth          INTEGER NOT NULL CHECK (depth >= 0),
+     node_type      TEXT NOT NULL CHECK (node_type IN ('object','array','string','number','boolean','null')),
+     text_value     TEXT,
+     number_text    TEXT,
+     bool_value     INTEGER CHECK (bool_value IN (0,1)),
+     PRIMARY KEY (config_id, ordinal)
+   )"#;
+
+/// Stored facet-value JSON occurrences; deletion follows the source row. Only
+/// object/array roots project, every node is a `parsed_text_candidate`, and
+/// malformed or over-budget text keeps the facet write with no nodes.
+pub const FACET_VALUE_JSON_NODES_DDL: &str = r#"CREATE TABLE facet_value_json_nodes (
+     facet_id       TEXT NOT NULL REFERENCES facet_values(id) ON DELETE CASCADE,
+     ordinal        INTEGER NOT NULL CHECK (ordinal >= 0),
+     path           TEXT NOT NULL,
+     parent_path    TEXT,
+     parent_ordinal INTEGER CHECK (parent_ordinal >= 0),
+     member_key     TEXT,
+     array_index    INTEGER CHECK (array_index >= 0),
+     depth          INTEGER NOT NULL CHECK (depth >= 0),
+     node_type      TEXT NOT NULL CHECK (node_type IN ('object','array','string','number','boolean','null')),
+     text_value     TEXT,
+     number_text    TEXT,
+     bool_value     INTEGER CHECK (bool_value IN (0,1)),
+     PRIMARY KEY (facet_id, ordinal)
+   )"#;
+
+pub const DDL_STATEMENTS: [&str; 358] = [
     r#"CREATE TABLE content_events (
      seq                     INTEGER PRIMARY KEY AUTOINCREMENT,
      id                      TEXT NOT NULL UNIQUE,
@@ -378,8 +570,34 @@ pub const DDL_STATEMENTS: [&str; 321] = [
     r#"CREATE INDEX idx_content_events_record ON content_events(record_id, seq)"#,
     r#"CREATE INDEX idx_content_events_run ON content_events(run_key, seq)"#,
     r#"CREATE INDEX idx_content_events_act ON content_events(act) WHERE act IS NOT NULL"#,
+    r#"CREATE INDEX idx_content_events_record_changes ON content_events(record_id, seq) WHERE type NOT IN ('occurrence.bound.v1','receipt.dependency_audited.v1','reconciliation.recorded.v1','unit.superseded.v1')"#,
     CONTENT_EVENTS_APPEND_ONLY_TRIGGERS[0],
     CONTENT_EVENTS_APPEND_ONLY_TRIGGERS[1],
+    r#"CREATE TABLE content_event_claim_meta (
+     event_seq          INTEGER PRIMARY KEY REFERENCES content_events(seq) ON DELETE CASCADE,
+     has_claimed_by     INTEGER NOT NULL CHECK (has_claimed_by IN (0,1)),
+     has_claimed_run    INTEGER NOT NULL CHECK (has_claimed_run IN (0,1)),
+     has_released_from  INTEGER NOT NULL CHECK (has_released_from IN (0,1)),
+     claim_class        TEXT NOT NULL CHECK (claim_class IN ('claim','release','other'))
+    )"#,
+    r#"CREATE TRIGGER content_event_claim_meta_insert AFTER INSERT ON content_events
+     BEGIN
+      INSERT INTO content_event_claim_meta(event_seq, has_claimed_by, has_claimed_run, has_released_from, claim_class)
+      VALUES (
+       NEW.seq,
+       (NEW.payload -> 'claimed_by_account') IS NOT NULL,
+       (NEW.payload -> 'claimed_run_key') IS NOT NULL,
+       (NEW.payload -> 'released_from_run_key') IS NOT NULL,
+       CASE WHEN (NEW.payload -> 'claimed_by_account') LIKE '"%"'
+                 AND (NEW.payload -> 'claimed_run_key') LIKE '"%"' THEN 'claim'
+            WHEN (NEW.payload -> 'claimed_by_account') = 'null'
+                 AND (NEW.payload -> 'claimed_run_key') = 'null' THEN 'release'
+            ELSE 'other' END
+      );
+     END"#,
+    REACTION_META_DDL[0],
+    REACTION_META_DDL[1],
+    REACTION_META_DDL[2],
     r#"CREATE TABLE content_event_causal_frontier (
      event_id        TEXT NOT NULL REFERENCES content_events(id) ON DELETE CASCADE,
      parent_event_id TEXT NOT NULL CHECK (length(trim(parent_event_id)) > 0),
@@ -517,6 +735,18 @@ pub const DDL_STATEMENTS: [&str; 321] = [
      created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
      updated_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
      deleted_at    TEXT,
+     archived      INTEGER NOT NULL DEFAULT 0 CHECK (archived IN (0,1)),
+      -- E3 M1 currency counts (v73): caller-independent currency. is_current
+      -- is tri-state: 1 iff zero live incoming `supersedes`, NULL when >=1
+      -- live incoming leaves whole/partial scope unknown. 0 is reserved for
+      -- a future explicit whole-record assertion and is never written here
+      -- (the CHECK admits it so that assertion needs no migration).
+      -- DEFAULT 1 because a created record has no incoming links yet;
+      -- creation omits both columns so defaults apply. successor_count is
+      -- the live incoming `supersedes` count (deleted source excluded); it
+      -- may include an invisible successor but never stores/displays names.
+      is_current      INTEGER NULL DEFAULT 1 CHECK (is_current IS NULL OR is_current IN (0,1)),
+      successor_count INTEGER NOT NULL DEFAULT 0 CHECK (successor_count >= 0),
 
      CHECK (type IN ('Document','Program','WorkItem','Outcome','Entity','Collection','Resolution','Conversation','Message','Annotation')),
      CHECK ((claimed_by_account IS NULL AND claimed_run_key IS NULL AND claimed_at IS NULL)
@@ -786,6 +1016,32 @@ pub const DDL_STATEMENTS: [&str; 321] = [
         ON record_mentions(lookup_key, source_id)"#,
     r#"CREATE INDEX idx_record_mentions_source
         ON record_mentions(source_id)"#,
+    r#"CREATE TABLE body_task_items (
+      record_id          TEXT NOT NULL REFERENCES records(id) ON DELETE CASCADE,
+      item_index         INTEGER NOT NULL,
+      source_event_seq   INTEGER NOT NULL REFERENCES content_events(seq),
+      marker             TEXT NOT NULL CHECK (marker IN ('-', '*', '+', 'ordered')),
+      checked            INTEGER NOT NULL CHECK (checked IN (0,1)),
+      in_quote           INTEGER NOT NULL CHECK (in_quote IN (0,1)),
+      start_offset       INTEGER NOT NULL CHECK (start_offset >= 0),
+      end_offset         INTEGER NOT NULL CHECK (end_offset >= 0),
+      PRIMARY KEY (record_id, item_index)
+    )"#,
+    r#"CREATE INDEX idx_body_task_items_record
+        ON body_task_items(record_id)"#,
+    r#"CREATE TABLE body_blocks (
+      record_id          TEXT NOT NULL REFERENCES records(id) ON DELETE CASCADE,
+      block_index        INTEGER NOT NULL CHECK (block_index >= 0),
+      chunk_index        INTEGER NOT NULL CHECK (chunk_index >= 0),
+      chunk_count        INTEGER NOT NULL CHECK (chunk_count > 0 AND chunk_index < chunk_count),
+      source_event_seq   INTEGER NOT NULL REFERENCES content_events(seq),
+      heading_path       TEXT NOT NULL CHECK (json_valid(heading_path) AND json_type(heading_path) = 'array'),
+      block_kind         TEXT NOT NULL CHECK (block_kind IN ('heading','paragraph','code','blockquote','list','table','html','thematic_break','definition','footnote_definition','other','interstitial','opaque')),
+      text               TEXT NOT NULL CHECK (length(CAST(text AS BLOB)) BETWEEN 1 AND 32768),
+      start_offset       INTEGER NOT NULL CHECK (start_offset >= 0),
+      end_offset         INTEGER NOT NULL CHECK (end_offset > start_offset),
+      PRIMARY KEY (record_id, block_index, chunk_index)
+    )"#,
     r#"CREATE TABLE notification_candidate_events (
      seq                INTEGER PRIMARY KEY AUTOINCREMENT,
      id                 TEXT NOT NULL UNIQUE,
@@ -942,6 +1198,9 @@ pub const DDL_STATEMENTS: [&str; 321] = [
     )"#,
     r#"CREATE INDEX idx_facet_observations_series ON facet_observations(record_id, key, as_of)"#,
     r#"CREATE INDEX idx_facet_observations_key ON facet_observations(key, as_of)"#,
+    FACET_TIMES_DDL[0],
+    FACET_TIMES_DDL[1],
+    FACET_TIMES_DDL[2],
     r#"CREATE TABLE bindings (
      record_id     TEXT NOT NULL REFERENCES records(id) ON DELETE CASCADE,
      system        TEXT NOT NULL,
@@ -1173,6 +1432,7 @@ pub const DDL_STATEMENTS: [&str; 321] = [
      alias_of       TEXT REFERENCES vocabulary_values(id),
      UNIQUE (vocabulary_id, value)
    )"#,
+    VOCABULARY_VALUE_JSON_NODES_DDL,
     r#"CREATE TABLE schema_config (
      id                       TEXT PRIMARY KEY,
      layer                    TEXT NOT NULL CHECK (layer IN ('pack','user')),
@@ -1182,6 +1442,8 @@ pub const DDL_STATEMENTS: [&str; 321] = [
      version_lineage          TEXT,
      created_at               TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
    )"#,
+    SCHEMA_CONFIG_JSON_NODES_DDL,
+    FACET_VALUE_JSON_NODES_DDL,
     r#"CREATE TABLE jobs (
      id          TEXT PRIMARY KEY,
      kind        TEXT NOT NULL,
@@ -1448,14 +1710,24 @@ pub const DDL_STATEMENTS: [&str; 321] = [
      consented_source_revision TEXT NOT NULL CHECK (length(trim(consented_source_revision)) > 0),
      declaration_digest        TEXT NOT NULL CHECK (length(declaration_digest) = 64),
      consented_declaration     TEXT NOT NULL CHECK (json_valid(consented_declaration) AND json_type(consented_declaration) = 'object'),
-     adoption                  TEXT NOT NULL CHECK (adoption IN ('caller_asserted','shell_adopt.v1')),
+     adoption                  TEXT NOT NULL CHECK (adoption IN ('caller_asserted','shell_adopt.v1','shell_auto.v1')),
+     request                   TEXT CHECK (request IS NULL OR (length(trim(request)) > 0 AND length(request) <= 500)),
      status                    TEXT NOT NULL CHECK (status IN ('installed','disabled','removed')),
      event_id                  TEXT NOT NULL UNIQUE REFERENCES control_events(id),
      event_seq                 INTEGER NOT NULL UNIQUE REFERENCES control_events(seq),
      updated_at                TEXT NOT NULL,
+     adoption_provenance       TEXT CHECK (adoption_provenance IS NULL OR (json_valid(adoption_provenance) AND json_type(adoption_provenance) = 'object')),
+     body_read_admission_event_id TEXT REFERENCES control_events(id),
      PRIMARY KEY (account_id, package)
     )"#,
     r#"CREATE INDEX idx_alpha_tab_installs_artifact ON alpha_tab_installs(artifact_id)"#,
+    r#"CREATE TABLE alpha_tab_orders (
+     account_id TEXT NOT NULL PRIMARY KEY CHECK (length(trim(account_id)) > 0),
+     tab_order  TEXT NOT NULL CHECK (json_valid(tab_order) AND json_type(tab_order) = 'array'),
+     event_id   TEXT NOT NULL UNIQUE REFERENCES control_events(id),
+     event_seq  INTEGER NOT NULL UNIQUE REFERENCES control_events(seq),
+     updated_at TEXT NOT NULL
+    )"#,
     r#"CREATE TABLE derivation_events (
      seq             INTEGER PRIMARY KEY AUTOINCREMENT,
      id              TEXT NOT NULL UNIQUE,
@@ -2466,7 +2738,92 @@ pub const DDL_STATEMENTS: [&str; 321] = [
        BEGIN SELECT RAISE(ABORT, 'engine_migration_drills is append-only'); END"#,
     r#"CREATE TRIGGER engine_migration_drills_no_delete BEFORE DELETE ON engine_migration_drills
        BEGIN SELECT RAISE(ABORT, 'engine_migration_drills is append-only'); END"#,
-    r#"PRAGMA user_version = 65"#,
+    // Grant-only realtime revision (engine 66, task 329b059). The broad
+    // `authorization_revision` epoch stays the cache fence; the realtime
+    // stream hashes this counter instead. Predicates match the actual
+    // authorization reads (`owner_bound_to_account` consults only
+    // record_id/system/identifier/is_canonical; `record_policies` only
+    // record_id), so metadata-only updates never move it.
+    r#"CREATE TABLE IF NOT EXISTS authorization_grant_revision (
+     id     INTEGER PRIMARY KEY CHECK (id = 1),
+     epoch  INTEGER NOT NULL
+   )"#,
+    r#"INSERT OR IGNORE INTO authorization_grant_revision (id, epoch) VALUES (1, 0)"#,
+    r#"CREATE TRIGGER IF NOT EXISTS authorization_grant_record_policies_insert AFTER INSERT ON record_policies
+       BEGIN UPDATE authorization_grant_revision SET epoch = epoch + 1 WHERE id = 1; END"#,
+    r#"CREATE TRIGGER IF NOT EXISTS authorization_grant_record_policies_delete AFTER DELETE ON record_policies
+       WHEN EXISTS (SELECT 1 FROM records WHERE id = OLD.record_id)
+       BEGIN UPDATE authorization_grant_revision SET epoch = epoch + 1 WHERE id = 1; END"#,
+    r#"CREATE TRIGGER IF NOT EXISTS authorization_grant_record_policies_update AFTER UPDATE ON record_policies
+       WHEN OLD.record_id IS NOT NEW.record_id
+       BEGIN UPDATE authorization_grant_revision SET epoch = epoch + 1 WHERE id = 1; END"#,
+    r#"CREATE TRIGGER IF NOT EXISTS authorization_grant_policy_entries_insert AFTER INSERT ON policy_entries
+       BEGIN UPDATE authorization_grant_revision SET epoch = epoch + 1 WHERE id = 1; END"#,
+    r#"CREATE TRIGGER IF NOT EXISTS authorization_grant_policy_entries_delete AFTER DELETE ON policy_entries
+       WHEN EXISTS (SELECT 1 FROM records WHERE id = OLD.policy_anchor_id)
+       BEGIN UPDATE authorization_grant_revision SET epoch = epoch + 1 WHERE id = 1; END"#,
+    r#"CREATE TRIGGER IF NOT EXISTS authorization_grant_policy_entries_update AFTER UPDATE ON policy_entries
+       WHEN OLD.policy_anchor_id IS NOT NEW.policy_anchor_id
+         OR OLD.subject_kind IS NOT NEW.subject_kind
+         OR OLD.subject_id IS NOT NEW.subject_id
+         OR OLD.effect IS NOT NEW.effect
+         OR OLD.capability IS NOT NEW.capability
+       BEGIN UPDATE authorization_grant_revision SET epoch = epoch + 1 WHERE id = 1; END"#,
+    r#"CREATE TRIGGER IF NOT EXISTS authorization_grant_bindings_insert AFTER INSERT ON bindings
+       WHEN NEW.system = 'account'
+       BEGIN UPDATE authorization_grant_revision SET epoch = epoch + 1 WHERE id = 1; END"#,
+    r#"CREATE TRIGGER IF NOT EXISTS authorization_grant_bindings_delete AFTER DELETE ON bindings
+       WHEN OLD.system = 'account'
+       BEGIN UPDATE authorization_grant_revision SET epoch = epoch + 1 WHERE id = 1; END"#,
+    r#"CREATE TRIGGER IF NOT EXISTS authorization_grant_bindings_update AFTER UPDATE ON bindings
+       WHEN (OLD.system = 'account' OR NEW.system = 'account')
+        AND (OLD.record_id IS NOT NEW.record_id
+          OR OLD.system IS NOT NEW.system
+          OR OLD.identifier IS NOT NEW.identifier
+          OR OLD.is_canonical IS NOT NEW.is_canonical)
+       BEGIN UPDATE authorization_grant_revision SET epoch = epoch + 1 WHERE id = 1; END"#,
+    r#"CREATE TRIGGER IF NOT EXISTS authorization_grant_records_update
+       AFTER UPDATE OF owner_id, policy_anchor_id, deleted_at, type, kind ON records
+       WHEN OLD.owner_id IS NOT NEW.owner_id
+         OR OLD.policy_anchor_id IS NOT NEW.policy_anchor_id
+         OR OLD.type IS NOT NEW.type
+         OR OLD.kind IS NOT NEW.kind
+         OR (OLD.deleted_at IS NOT NEW.deleted_at
+           AND (EXISTS (SELECT 1 FROM links JOIN records src ON src.id = links.source_id WHERE links.target_id = OLD.id AND links.relationship = 'part_of' AND src.deleted_at IS NULL AND (src.type = 'Annotation' OR (src.type = 'Document' AND src.kind = 'attachment')))
+             OR EXISTS (SELECT 1 FROM semantic_units JOIN records u ON u.id = semantic_units.unit_id WHERE semantic_units.authority_bearer_record_id = OLD.id AND u.deleted_at IS NULL)))
+       BEGIN UPDATE authorization_grant_revision SET epoch = epoch + 1 WHERE id = 1; END"#,
+    r#"CREATE TRIGGER IF NOT EXISTS authorization_grant_records_delete BEFORE DELETE ON records
+       WHEN EXISTS (SELECT 1 FROM links JOIN records src ON src.id = links.source_id WHERE links.target_id = OLD.id AND links.relationship = 'part_of' AND src.deleted_at IS NULL AND (src.type = 'Annotation' OR (src.type = 'Document' AND src.kind = 'attachment')))
+         OR EXISTS (SELECT 1 FROM semantic_units JOIN records u ON u.id = semantic_units.unit_id WHERE semantic_units.authority_bearer_record_id = OLD.id AND u.deleted_at IS NULL)
+       BEGIN UPDATE authorization_grant_revision SET epoch = epoch + 1 WHERE id = 1; END"#,
+    r#"CREATE TRIGGER IF NOT EXISTS authorization_grant_links_insert AFTER INSERT ON links
+       WHEN NEW.relationship = 'part_of'
+        AND EXISTS (SELECT 1 FROM records WHERE id = NEW.source_id AND deleted_at IS NULL AND (type = 'Annotation' OR (type = 'Document' AND kind = 'attachment')))
+        AND (SELECT COUNT(*) FROM links WHERE source_id = NEW.source_id AND relationship = 'part_of') > 1
+       BEGIN UPDATE authorization_grant_revision SET epoch = epoch + 1 WHERE id = 1; END"#,
+    r#"CREATE TRIGGER IF NOT EXISTS authorization_grant_links_delete AFTER DELETE ON links
+       WHEN OLD.relationship = 'part_of'
+        AND EXISTS (SELECT 1 FROM records WHERE id = OLD.source_id AND deleted_at IS NULL AND (type = 'Annotation' OR (type = 'Document' AND kind = 'attachment')))
+        AND (SELECT COUNT(*) FROM links WHERE source_id = OLD.source_id AND relationship = 'part_of') = 0
+       BEGIN UPDATE authorization_grant_revision SET epoch = epoch + 1 WHERE id = 1; END"#,
+    r#"CREATE TRIGGER IF NOT EXISTS authorization_grant_links_update AFTER UPDATE ON links
+       WHEN (OLD.relationship = 'part_of' OR NEW.relationship = 'part_of')
+        AND (OLD.source_id IS NOT NEW.source_id
+          OR OLD.target_id IS NOT NEW.target_id
+          OR OLD.relationship IS NOT NEW.relationship)
+        AND (EXISTS (SELECT 1 FROM records WHERE id = OLD.source_id AND deleted_at IS NULL AND (type = 'Annotation' OR (type = 'Document' AND kind = 'attachment')))
+          OR EXISTS (SELECT 1 FROM records WHERE id = NEW.source_id AND deleted_at IS NULL AND (type = 'Annotation' OR (type = 'Document' AND kind = 'attachment'))))
+       BEGIN UPDATE authorization_grant_revision SET epoch = epoch + 1 WHERE id = 1; END"#,
+    r#"CREATE TRIGGER IF NOT EXISTS authorization_grant_semantic_units_write AFTER INSERT ON semantic_units
+       BEGIN UPDATE authorization_grant_revision SET epoch = epoch + 1 WHERE id = 1; END"#,
+    r#"CREATE TRIGGER IF NOT EXISTS authorization_grant_semantic_units_delete AFTER DELETE ON semantic_units
+       BEGIN UPDATE authorization_grant_revision SET epoch = epoch + 1 WHERE id = 1; END"#,
+    r#"CREATE TRIGGER IF NOT EXISTS authorization_grant_semantic_units_update AFTER UPDATE OF authority_bearer_record_id ON semantic_units
+       WHEN OLD.authority_bearer_record_id IS NOT NEW.authority_bearer_record_id
+       BEGIN UPDATE authorization_grant_revision SET epoch = epoch + 1 WHERE id = 1; END"#,
+    WORKSPACE_RULE_INSTALLATION_DDL[0],
+    WORKSPACE_RULE_INSTALLATION_DDL[1],
+    r#"PRAGMA user_version = 82"#,
 ];
 
 /// The policy-log projections — independently replayed from `policy_events`.
@@ -2485,7 +2842,7 @@ pub const RELATIONSHIP_PROJECTION_TABLES: [&str; 5] = [
 /// The instruction-control projections synchronously folded from
 /// `control_events`. The applications marker is included because it is itself
 /// deterministic replay state, though it is not a product-facing table.
-pub const CONTROL_PROJECTION_TABLES: [&str; 10] = [
+pub const CONTROL_PROJECTION_TABLES: [&str; 11] = [
     "agent_runs",
     "member_contexts",
     "instruction_bindings",
@@ -2495,6 +2852,7 @@ pub const CONTROL_PROJECTION_TABLES: [&str; 10] = [
     "member_obligation_progress",
     "seeded_instruction_sources",
     "alpha_tab_installs",
+    "alpha_tab_orders",
     "control_event_applications",
 ];
 
@@ -2519,11 +2877,13 @@ pub const DERIVATION_PROJECTION_TABLES: [&str; 15] = [
 ];
 
 /// The content-log projections — the surface the content rebuild-and-diff checks.
-pub const PROJECTION_TABLES: [&str; 40] = [
+pub const PROJECTION_TABLES: [&str; 46] = [
     "records",
     "links",
     "facet_values",
     "facet_observations",
+    "facet_times",
+    "facet_value_json_nodes",
     "annotation_targets",
     "attribution_targets",
     "attribution_assertions",
@@ -2536,6 +2896,8 @@ pub const PROJECTION_TABLES: [&str; 40] = [
     "message_conversations",
     "message_mentions",
     "record_mentions",
+    "body_task_items",
+    "body_blocks",
     "module_releases",
     "module_release_imports",
     "recipe_releases",
@@ -2560,14 +2922,22 @@ pub const PROJECTION_TABLES: [&str; 40] = [
     "dependency_audits",
     "canvas_objects",
     "canvas_batches",
+    "content_event_claim_meta",
+    "content_event_reaction_meta",
 ];
 
 /// The meta-log projections — the surface the meta rebuild-and-diff checks
-/// (ba9f97e). Symmetric with [`PROJECTION_TABLES`]: these three tables are folds
+/// (ba9f97e). Symmetric with [`PROJECTION_TABLES`]: these six tables are folds
 /// of `meta_events`, not directly-written system state, and drift between the
 /// log and them is a failing test the same way it is on the content tier.
-pub const META_PROJECTION_TABLES: [&str; 3] =
-    ["vocabularies", "vocabulary_values", "schema_config"];
+pub const META_PROJECTION_TABLES: [&str; 6] = [
+    "vocabularies",
+    "vocabulary_values",
+    "vocabulary_value_json_nodes",
+    "schema_config",
+    "workspace_rule_installations",
+    "schema_config_json_nodes",
+];
 
 /// The four spine facets promoted to columns on `records` (not `facet_values` rows).
 pub const SPINE_FACET_COLUMNS: [(&str, &str); 4] = [
@@ -2583,4 +2953,68 @@ pub fn spine_facet_column(key: &str) -> Option<&'static str> {
         .iter()
         .find(|(k, _)| *k == key)
         .map(|(_, col)| *col)
+}
+
+/// Table declared by a `CREATE TABLE` (regular or virtual) statement, shared
+/// by the standby and member classification tests so a parser fix lands once
+/// (review F-A inc1 F5). Test-only: runtime code paths parse DDL with their
+/// own focused helpers.
+#[cfg(test)]
+pub(crate) fn declared_table(statement: &str) -> Result<Option<String>, String> {
+    let words = statement.split_ascii_whitespace().collect::<Vec<_>>();
+    if !words
+        .first()
+        .is_some_and(|word| word.eq_ignore_ascii_case("CREATE"))
+    {
+        return Ok(None);
+    }
+
+    let mentions_table = words.iter().any(|word| word.eq_ignore_ascii_case("TABLE"));
+    let mut cursor = 1;
+    if words.get(cursor).is_some_and(|word| {
+        word.eq_ignore_ascii_case("TEMP") || word.eq_ignore_ascii_case("TEMPORARY")
+    }) {
+        cursor += 1;
+    }
+    if words
+        .get(cursor)
+        .is_some_and(|word| word.eq_ignore_ascii_case("VIRTUAL"))
+    {
+        cursor += 1;
+    }
+    if !words
+        .get(cursor)
+        .is_some_and(|word| word.eq_ignore_ascii_case("TABLE"))
+    {
+        return if mentions_table {
+            Err(format!("unrecognised CREATE TABLE statement: {statement}"))
+        } else {
+            Ok(None)
+        };
+    }
+    cursor += 1;
+    if words
+        .get(cursor)
+        .is_some_and(|word| word.eq_ignore_ascii_case("IF"))
+    {
+        let guard = words.get(cursor..cursor + 3).unwrap_or_default();
+        if guard.len() != 3
+            || !guard[0].eq_ignore_ascii_case("IF")
+            || !guard[1].eq_ignore_ascii_case("NOT")
+            || !guard[2].eq_ignore_ascii_case("EXISTS")
+        {
+            return Err(format!("unrecognised CREATE TABLE guard: {statement}"));
+        }
+        cursor += 3;
+    }
+    let raw = words
+        .get(cursor)
+        .ok_or_else(|| format!("CREATE TABLE has no table name: {statement}"))?
+        .trim_end_matches('(');
+    let unqualified = raw.rsplit('.').next().unwrap_or(raw);
+    let table = unqualified.trim_matches(|character| matches!(character, '`' | '"' | '[' | ']'));
+    if table.is_empty() {
+        return Err(format!("CREATE TABLE has an empty table name: {statement}"));
+    }
+    Ok(Some(table.to_owned()))
 }

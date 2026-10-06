@@ -113,6 +113,13 @@ async fn pure_reads_leave_no_new_rows_and_retained_rows_store_null_exhaust() {
     let db = db().await;
     let registry = registry();
     let target = create_target(&registry, &db, "Capture target").await;
+    call(
+        &registry,
+        &db,
+        "update_record",
+        json!({"id":target.clone(),"body":"# Capture body\n\nNonempty SQL read content."}),
+    )
+    .await;
     let baseline_calls = call_count(&db).await;
     let baseline_touches = touch_count(&db).await;
     assert!(baseline_calls >= 1, "the create must be retained");
@@ -140,6 +147,25 @@ async fn pure_reads_leave_no_new_rows_and_retained_rows_store_null_exhaust() {
     for (tool, arguments) in reads {
         call(&registry, &db, tool, arguments).await;
     }
+    let body_read = call(
+        &registry,
+        &db,
+        "query_sql",
+        json!({
+            "sql":"SELECT id,body FROM records WHERE id=?1 ORDER BY id",
+            "parameters":[{"type":"text","value":target.clone()}],
+            "run_key":RUN
+        }),
+    )
+    .await;
+    assert_eq!(body_read["columns"], json!(["id", "body"]));
+    assert_eq!(body_read["row_count"], 1);
+    assert_eq!(
+        body_read["rows"],
+        json!([{
+            "id":target,"body":"# Capture body\n\nNonempty SQL read content."
+        }])
+    );
     // A failed pure read is an attempt with no consumer: also dropped.
     let missing = call(
         &registry,

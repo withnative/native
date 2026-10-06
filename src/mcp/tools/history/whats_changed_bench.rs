@@ -395,6 +395,12 @@ async fn malformed_payload_corpus(db: &Db) {
     .execute(db.write_pool())
     .await
     .unwrap();
+    // Model malformed legacy storage without relaxing the live insert trigger.
+    let mut tx = db.write_pool().begin().await.unwrap();
+    sqlx::query("DROP TRIGGER content_event_claim_meta_insert")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
     sqlx::query(
         "INSERT INTO content_events
             (id, record_id, type, payload, actor, run_key, created_at,
@@ -404,9 +410,15 @@ async fn malformed_payload_corpus(db: &Db) {
                  '2026-08-02T00:00:01.000Z', 1, 'legacy_unknown')",
     )
     .bind(BEA)
-    .execute(db.write_pool())
+    .execute(&mut *tx)
     .await
     .unwrap();
+    let trigger = crate::schema::DDL_STATEMENTS
+        .iter()
+        .find(|sql| sql.starts_with("CREATE TRIGGER content_event_claim_meta_insert"))
+        .unwrap();
+    sqlx::query(trigger).execute(&mut *tx).await.unwrap();
+    tx.commit().await.unwrap();
 }
 
 async fn run_case(db: &Db, name: &str, arguments: Value) {

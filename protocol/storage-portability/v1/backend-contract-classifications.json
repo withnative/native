@@ -49,7 +49,7 @@
     },
     {
       "id": "turso-local",
-      "revision": 4,
+      "revision": 5,
       "mode": "embedded",
       "status": "spike",
       "required_evidence": [
@@ -1552,6 +1552,19 @@
         "turso-embedded-sync": "U",
         "libsql-embedded-replica": "U"
       }
+    },
+    {
+      "id": "operator.history.verify",
+      "kind": "operator",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:operator.history.verify",
+        "postgres-server": "N",
+        "turso-local": "N",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      },
+      "notes": "One ready managed SQLite-local database, read-only capture and FULL conformance on a supervised private copy; no catalog migration or serving-state authority."
     },
     {
       "id": "operator.reset-test-tenants",

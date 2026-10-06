@@ -123,7 +123,7 @@ async fn schema_config_accepts_supported_types_and_floors_pack_types_on_open_fac
     .await
     .unwrap();
 
-    for unsupported in ["string", "boolean", "date"] {
+    for unsupported in ["string", "boolean", "datetime"] {
         let err = call_err(
             &registry,
             &db,
@@ -136,7 +136,9 @@ async fn schema_config_accepts_supported_types_and_floors_pack_types_on_open_fac
         )
         .await;
         assert!(
-            err.contains("supported declared types are `number` and `object`"),
+            err.contains(
+                "supported declared types are `number`, `object`, and the typed time types"
+            ),
             "{err}"
         );
     }

@@ -263,6 +263,7 @@ use serde_json::{json, Value};
 
 use crate::authorization::Capability;
 use crate::db::Db;
+use crate::domain_transaction::DECLARED_FACET_TYPES;
 use crate::error::{Error, Result};
 use crate::meta::schema_config::{
     append_prepared_user_schema_config_in, assert_no_authored_kind_arrays,
@@ -1063,9 +1064,11 @@ fn shape_targets(pack: &Value, data: &Value) -> BTreeMap<String, BTreeSet<Option
     targets
 }
 
-/// The declared-facet-type vocabulary covers scalar numbers and atomic JSON
-/// objects. Reject unknown declarations rather than
-/// storing a promise no supported writer understands.
+/// The declared-facet-type vocabulary covers scalar numbers, atomic JSON
+/// objects, and the typed time types `date`, `instant`, `zoned` and `when`.
+/// Reject unknown declarations rather than storing a promise no supported
+/// writer understands. `disambiguation` (`compatible` or `reject`) is
+/// admitted only beside `zoned` or `when`, the types that resolve wall times.
 fn assert_known_facet_types(data: &Value) -> Result<()> {
     assert_no_spine_declared_types(data)?;
     let shapes = data.get("shapes").and_then(Value::as_object);
@@ -1074,12 +1077,30 @@ fn assert_known_facet_types(data: &Value) -> Result<()> {
             continue;
         };
         for (facet_key, facet) in facets {
+            if let Some(disambiguation) = facet.get("disambiguation") {
+                if !matches!(
+                    facet.get("type").and_then(Value::as_str),
+                    Some("zoned" | "when")
+                ) {
+                    return Err(Error::engine(format!(
+                        "cannot configure disambiguation on facet '{facet_key}' (shape '{shape_key}'): it applies only to type `zoned` or `when`"
+                    )));
+                }
+                if !matches!(disambiguation.as_str(), Some("compatible" | "reject")) {
+                    return Err(Error::engine(format!(
+                        "cannot configure disambiguation {disambiguation} on facet '{facet_key}' (shape '{shape_key}'): use `compatible` (the default: the earlier time in a DST overlap, moved forward past a gap) or `reject`"
+                    )));
+                }
+            }
             let Some(declared_type) = facet.get("type") else {
                 continue;
             };
-            if !matches!(declared_type.as_str(), Some("number" | "object")) {
+            if !declared_type
+                .as_str()
+                .is_some_and(|name| DECLARED_FACET_TYPES.contains(&name))
+            {
                 return Err(Error::engine(format!(
-                    "cannot configure type {declared_type} on facet '{facet_key}' (shape '{shape_key}'): supported declared types are `number` and `object`; omit `type` for the string/default lane"
+                    "cannot configure type {declared_type} on facet '{facet_key}' (shape '{shape_key}'): supported declared types are `number`, `object`, and the typed time types `date`, `instant`, `zoned` and `when`; omit `type` for the string/default lane"
                 )));
             }
         }
@@ -1256,7 +1277,28 @@ async fn count_nonconforming_declared_values(
                                 .is_err()
                         })
                 }),
-            _ => false,
+            Some(other) => match crate::typed_time::TimeFacetType::parse(other) {
+                // A historical typed time value conforms when it would be
+                // accepted as written today: the stored text of a date or
+                // instant, or the JSON of a zoned or when value.
+                Some(time_type) => value.as_deref().is_none_or(|raw| {
+                    let candidate = match time_type {
+                        crate::typed_time::TimeFacetType::Date
+                        | crate::typed_time::TimeFacetType::Instant => Value::String(raw.into()),
+                        _ => serde_json::from_str(raw).unwrap_or(Value::Null),
+                    };
+                    crate::typed_time::normalise_facet_value(
+                        time_type,
+                        &candidate,
+                        crate::domain_transaction::declared_disambiguation(
+                            shape.get(&key).unwrap_or(&Value::Null),
+                        ),
+                    )
+                    .is_err()
+                }),
+                None => false,
+            },
+            None => false,
         };
         if nonconforming {
             count += 1;
@@ -1640,7 +1682,7 @@ async fn manage_schema_config(db: Db, caller: Caller, arguments: Value) -> Resul
                 // caller can see the floor without reading the source.
                 "spine_facets": SPINE_FACET_KEYS,
                 "reserved_facets": ENGINE_RESERVED_FACET_KEYS,
-                "declared_facet_types": ["number", "object"],
+                "declared_facet_types": DECLARED_FACET_TYPES,
                 "declared_type_scope": "eligible open facets only; v1 rejects declared type on string-carried spine facets",
             }))
         }

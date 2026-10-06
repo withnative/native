@@ -12,6 +12,8 @@ mod common;
 mod action_evidence;
 #[path = "tools/alpha_tabs.rs"]
 mod alpha_tabs;
+#[path = "tools/alpha_tabs_subscribe.rs"]
+mod alpha_tabs_subscribe;
 #[path = "tools/authoring_context.rs"]
 mod authoring_context;
 
@@ -83,6 +85,10 @@ mod resolve_many;
 mod similar_existing;
 #[path = "tools/source_basis.rs"]
 mod source_basis;
+#[path = "tools/sql_selected_write.rs"]
+mod sql_selected_write;
+#[path = "tools/sql_selected_write_fixtures.rs"]
+mod sql_selected_write_fixtures;
 #[path = "tools/standby_stdio.rs"]
 mod standby_stdio;
 #[path = "tools/suggestions.rs"]

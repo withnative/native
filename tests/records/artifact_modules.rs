@@ -243,6 +243,7 @@ async fn create_artifact(registry: &ToolRegistry, db: &Db, id: &str, source: &st
 /// `held/workbench/src/lib.rs` is registered to answer.
 #[tokio::test]
 async fn safe_tree_plan_carries_author_styles_and_omits_them_when_absent() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
     let (db, registry, _guard) = fixture().await;
     // The sheet carries one thing `css.rs` knows and two it does not: an
     // unknown at-rule, and an id selector it deliberately leaves unrewritten.
@@ -358,6 +359,7 @@ export const nativeStyles = ".card { color: red } @wobble { .card { color: blue 
 
 #[tokio::test]
 async fn current_and_historical_render_use_live_module_visibility() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
     let (db, registry, _guard) = fixture().await;
     create_module(&registry, &db, &module_source("hidden module source")).await;
     let release = publish(&registry, &db).await;
@@ -406,6 +408,7 @@ async fn current_and_historical_render_use_live_module_visibility() {
 
 #[tokio::test]
 async fn portable_release_pins_two_consumers_until_explicit_upgrade() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
     let (db, registry, _guard) = fixture().await;
     create_module(&registry, &db, &module_source("release one")).await;
     let first_release = publish(&registry, &db).await;
@@ -610,6 +613,7 @@ async fn portable_release_pins_two_consumers_until_explicit_upgrade() {
 
 #[tokio::test]
 async fn instantiated_v2_artifact_is_exactly_attested_renderable_and_rebuildable() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
     let (db, registry, _guard) = fixture().await;
     create_module(&registry, &db, &module_source("instantiated")).await;
     let release = publish(&registry, &db).await;
@@ -784,6 +788,7 @@ async fn v2_instantiation_fails_closed_and_rolls_back_attestation_projection_fai
 
 #[tokio::test]
 async fn consumption_authority_denies_a_deleted_module_before_execution() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
     let (db, registry, _guard) = fixture().await;
     create_module(&registry, &db, &module_source("release one")).await;
     let release = publish(&registry, &db).await;
@@ -871,6 +876,7 @@ export const nativeArtifact = { schema: "native.mdx.artifact.v2", inputs: {}, mo
 
 #[tokio::test]
 async fn named_inputs_and_exact_release_grants_fail_closed_before_execution() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
     let (db, registry, _guard) = fixture().await;
     let source = r#"export const nativeModule = {
   schema: "native.mdx.module.v1",
@@ -1099,6 +1105,7 @@ export const nativeArtifact = {{
 
 #[tokio::test]
 async fn messages_home_pane_reexecutes_governed_sql_beside_a_legacy_collection() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
     let (db, registry, _guard) = fixture().await;
 
     for (id, name) in [
@@ -1412,6 +1419,7 @@ async fn messages_home_pane_reexecutes_governed_sql_beside_a_legacy_collection()
 
 #[tokio::test]
 async fn standalone_agents_artifact_joins_separate_governed_ports_and_expires_on_refresh() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
     let _guard = Arc::clone(integration_guard()).lock_owned().await;
     let database_dir = tempfile::tempdir().unwrap();
     let database_path = database_dir.path().join("agents-artifact.sqlite3");
@@ -2014,6 +2022,7 @@ async fn standalone_agents_artifact_joins_separate_governed_ports_and_expires_on
 
 #[tokio::test]
 async fn root_input_and_record_navigation_require_the_exact_artifact_source_grants() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
     let (db, registry, _guard) = fixture().await;
     let artifact = r#"export const nativeArtifact = {
   schema: "native.mdx.artifact.v2",
@@ -2287,6 +2296,7 @@ async fn root_input_and_record_navigation_require_the_exact_artifact_source_gran
 /// hypothesis. The refusal has to name the shape it wanted.
 #[tokio::test]
 async fn refusing_a_manifest_spelled_grant_scope_names_the_resolved_port_key() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
     let (db, registry, _guard) = fixture().await;
     let artifact = r#"export const nativeArtifact = {
   schema: "native.mdx.artifact.v2",
@@ -2412,6 +2422,7 @@ async fn refusing_a_manifest_spelled_grant_scope_names_the_resolved_port_key() {
 }
 #[tokio::test(flavor = "multi_thread")]
 async fn a_total_drop_with_no_declaration_change_is_not_called_a_declaration_change() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
     let (db, registry, _guard) = fixture().await;
     // No ports at all, so nothing can be bound and the only existing state is
     // a port-less navigation grant. Withdrawing its request drops everything
@@ -2506,6 +2517,7 @@ async fn a_total_drop_with_no_declaration_change_is_not_called_a_declaration_cha
 
 #[tokio::test]
 async fn dropping_a_capability_request_drops_its_carried_grant_and_says_so() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
     let (db, registry, _guard) = fixture().await;
     let with_navigation = r#"export const nativeArtifact = {
   schema: "native.mdx.artifact.v2",
@@ -2659,6 +2671,7 @@ async fn dropping_a_capability_request_drops_its_carried_grant_and_says_so() {
 
 #[tokio::test]
 async fn artifact_source_attestations_fail_closed_on_tamper_order_digest_and_bypass() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
     let (db, registry, _guard) = fixture().await;
     let source = r#"export const nativeArtifact = {
   schema: "native.mdx.artifact.v2",
@@ -2838,6 +2851,7 @@ async fn artifact_source_attestations_fail_closed_on_tamper_order_digest_and_byp
 
 #[tokio::test]
 async fn transitive_input_grants_attest_the_full_forwarding_path_to_the_root() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
     const LEAF_ID: &str = "22222222-2222-4222-8222-222222222222";
     let (db, registry, _guard) = fixture().await;
     let leaf_source = r#"export const nativeModule = {
@@ -3131,6 +3145,7 @@ export const nativeArtifact = {{ schema: "native.mdx.artifact.v2", inputs: {{}},
 
 #[tokio::test]
 async fn parent_mapping_cannot_invent_a_hidden_child_input_capability() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
     let (db, registry, _guard) = fixture().await;
     let source = r#"export const nativeModule = {
   schema: "native.mdx.module.v1",
@@ -3239,6 +3254,7 @@ export const nativeArtifact = {{
 
 #[tokio::test]
 async fn navigation_requires_exact_release_request_and_grant() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
     let (db, registry, _guard) = fixture().await;
     let missing_request = r#"export const nativeModule = {
   schema: "native.mdx.module.v1", inputs: {},
@@ -3311,6 +3327,7 @@ export const nativeArtifact = {{ schema: "native.mdx.artifact.v2", inputs: {{}},
 
 #[tokio::test]
 async fn typed_module_boundaries_reject_authority_callbacks_async_and_mutation() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
     let (db, registry, _guard) = fixture().await;
     let source = r#"export const nativeModule = {
   schema: "native.mdx.module.v1", inputs: {},
@@ -3440,6 +3457,7 @@ export const nativeArtifact = {{ schema: "native.mdx.artifact.v2", inputs: {{}},
 
 #[tokio::test]
 async fn transitive_runtime_failures_report_portable_exact_origin_and_import_chain() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
     const LEAF_ID: &str = "22222222-2222-4222-8222-222222222222";
     let (db, registry, _guard) = fixture().await;
     let leaf_source = r#"export const nativeModule = {
@@ -3618,6 +3636,7 @@ export const nativeArtifact = {{ schema: "native.mdx.artifact.v2", inputs: {{}},
 
 #[tokio::test]
 async fn transitive_instruction_limit_keeps_the_deepest_engine_owned_origin() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
     const LEAF_ID: &str = "22222222-2222-4222-8222-222222222222";
     let (db, registry, _guard) = fixture().await;
     let leaf_source = r#"export const nativeModule = {
@@ -3708,6 +3727,7 @@ export const nativeArtifact = {{ schema: "native.mdx.artifact.v2", inputs: {{}},
 
 #[tokio::test]
 async fn top_level_constant_failure_uses_exact_module_export_origin() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
     let (db, registry, _guard) = fixture().await;
     let source = r#"export const nativeModule = {
   schema: "native.mdx.module.v1", inputs: {},
@@ -3817,6 +3837,7 @@ async fn latest_body_event_id(db: &Db, record_id: &str) -> String {
 
 #[tokio::test]
 async fn write_receipts_publish_the_source_event_id_next_to_body_digest() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
     let (db, registry, _guard) = fixture().await;
     let source = orders_nav_artifact_source();
     let created = call(
@@ -3909,6 +3930,7 @@ async fn write_receipts_publish_the_source_event_id_next_to_body_digest() {
 /// edit and the restoring grant.
 #[tokio::test]
 async fn grant_invalidation_warning_names_the_new_source_identity() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
     let (db, registry, _guard) = fixture().await;
     let source = orders_nav_artifact_source();
     let created = call(
@@ -4063,6 +4085,7 @@ async fn grant_invalidation_warning_names_the_new_source_identity() {
 /// cannot silently weaken revision binding into "any recent revision".
 #[tokio::test]
 async fn artifact_source_grant_against_a_superseded_revision_is_refused() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
     let (db, registry, _guard) = fixture().await;
     let source = orders_nav_artifact_source();
     let created = call(

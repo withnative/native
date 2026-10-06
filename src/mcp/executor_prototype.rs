@@ -48,7 +48,7 @@ mod hosted_runtime;
 #[path = "executor_prototype/telemetry.rs"]
 mod telemetry;
 #[doc(hidden)]
-pub use hosted_runtime::HostedExecutorRuntime;
+pub use hosted_runtime::{HostedExecutorAdmission, HostedExecutorRuntime};
 pub use telemetry::{
     ExecutorTelemetryContext, ExecutorTelemetryHealth, ExecutorTelemetrySink,
     StructuredLogTelemetrySink, DEFAULT_RETENTION_DAYS,
@@ -260,6 +260,35 @@ impl PinnedExecutorCatalogue {
     pub(crate) fn descriptor_bytes(&self) -> usize {
         self.descriptor_bytes
     }
+
+    /// Authoritative pre-auth classification for one executor-routed
+    /// `tools/call`: resolve `(executor, operation)` against the pinned
+    /// contracts and return the deployment operation label plus the access
+    /// the dispatch-time admission uses. Unknown executors, unknown
+    /// operations, and missing operation selectors yield `None` so
+    /// transports keep their legacy deferred path; the dispatch-time
+    /// selection error is unchanged. `describe_operation` is not a
+    /// contract and likewise yields `None`: it never dispatches a tool.
+    /// (`bootstrap` *is* a Read contract; dispatch special-cases it to
+    /// the read-only delegate path, which stays safe under the
+    /// frozen-read machinery without an outer lease.)
+    pub(crate) fn classify_call(
+        &self,
+        executor: &str,
+        operation: Option<&str>,
+    ) -> Option<(DeploymentReadOnlyOperation, OperationAccess)> {
+        let operation = operation?;
+        let contract = self
+            .contracts
+            .get(&(executor.to_string(), operation.to_string()))?;
+        Some((
+            DeploymentReadOnlyOperation::registered(format!(
+                "{}.{}",
+                contract.executor, contract.operation
+            )),
+            contract.access,
+        ))
+    }
 }
 
 /// Principal-neutral lens executor catalogue fixed on first authoritative
@@ -273,6 +302,24 @@ pub(crate) struct PinnedLensExecutorCatalogue {
 }
 
 impl PinnedLensExecutorCatalogue {
+    /// Authoritative pre-auth classification for one lens-routed executor
+    /// call: resolve `(executor, operation)` against the pinned lens
+    /// contracts and return the access the dispatch-time admission uses.
+    /// The contracts derive access from the registered source operations,
+    /// so this matches the per-revision pin built from the same registry
+    /// and allowlist. Unknown executors, unknown operations, and missing
+    /// selectors yield `None` so transports fail closed as mutations.
+    pub(crate) fn classify_call(
+        &self,
+        executor: &str,
+        operation: Option<&str>,
+    ) -> Option<OperationAccess> {
+        let contract = self
+            .contracts
+            .get(&(executor.to_owned(), operation?.to_owned()))?;
+        Some(contract.access)
+    }
+
     pub(crate) fn manifest_digest(&self) -> &str {
         &self.manifest_digest
     }
@@ -392,6 +439,100 @@ fn build_ordinary_catalogue(
         contracts,
         operations_by_executor,
     })
+}
+
+/// Database-less discovery uses the exact catalogue and read/plan projection
+/// used by the standby executor constructor. It creates no plans or telemetry.
+pub(crate) fn standby_read_only_descriptors(registry: &ToolRegistry) -> Result<Vec<Value>> {
+    let catalogue = build_ordinary_catalogue(
+        registry,
+        super::registry::EngineKind::Sqlite,
+        false,
+        &ExperimentalExecutors::empty(),
+    )?;
+    Ok(standby_read_only_discovery(
+        &catalogue.descriptors,
+        &catalogue.contracts,
+        &catalogue.operations_by_executor,
+    )?
+    .0)
+}
+
+/// The connected standby's database-less and serving discovery share one
+/// projection, including availability wording and the diagnostic entry point.
+pub(crate) fn standby_discovery_meta(descriptors: &[Value]) -> Result<Value> {
+    Ok(production_executor_meta(
+        "standby-read-only",
+        &jcs_sha256(&Value::Array(descriptors.to_vec()))?,
+        serde_json::to_vec(descriptors)?.len(),
+    ))
+}
+
+/// Split a pinned ordinary catalogue into standby discovery: the full
+/// contract map stays intact so mutation attempts (including cached hosted
+/// write envelopes) refuse with the stable read-only error instead of a
+/// selection error, while the advertised descriptors and operation index
+/// carry directly-executable reads only. Reads that require a plan are
+/// refused at dispatch, so discovery withholds them with the same
+/// `Read && !requires_plan` predicate. `bootstrap` and `describe_operation`
+/// are read contracts and stay advertised as-is.
+fn standby_read_only_discovery(
+    descriptors: &[Value],
+    contracts: &OperationContracts,
+    operations_by_executor: &OperationsByExecutor,
+) -> Result<(Vec<Value>, OperationsByExecutor)> {
+    let mut advertised_operations: OperationsByExecutor = BTreeMap::new();
+    for (executor, operations) in operations_by_executor {
+        let reads = operations
+            .iter()
+            .filter(|operation| {
+                contracts
+                    .get(&(executor.clone(), (*operation).clone()))
+                    .is_some_and(|contract| contract.access == OperationAccess::Read)
+                    && !write_operations::requires_plan(executor, operation)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if !reads.is_empty() {
+            advertised_operations.insert(executor.clone(), reads);
+        }
+    }
+    let mut advertised = Vec::new();
+    for mut descriptor in descriptors.iter().cloned() {
+        let name = descriptor
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        if name == "describe_operation" {
+            advertised.push(descriptor);
+            continue;
+        }
+        let Some(operations) = advertised_operations.get(&name) else {
+            continue;
+        };
+        if name != "bootstrap" {
+            descriptor["inputSchema"]["properties"]["operation"]["enum"] = json!(operations);
+            let retained = operations
+                .iter()
+                .map(String::as_str)
+                .collect::<HashSet<_>>();
+            filter_operation_constraints(&mut descriptor["inputSchema"], &retained);
+        }
+        advertised.push(descriptor);
+    }
+    let executor_names = advertised
+        .iter()
+        .filter_map(|descriptor| descriptor.get("name").and_then(Value::as_str))
+        .filter(|name| *name != "describe_operation")
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    for descriptor in advertised.iter_mut() {
+        if descriptor.get("name").and_then(Value::as_str) == Some("describe_operation") {
+            descriptor["inputSchema"]["properties"]["executor"]["enum"] = json!(executor_names);
+        }
+    }
+    Ok((advertised, advertised_operations))
 }
 
 impl OperationContract {
@@ -568,10 +709,21 @@ pub struct ExecutorPrototypeStdioServer {
     operations_by_executor: OperationsByExecutor,
     trace: Arc<TraceSink>,
     telemetry: Option<telemetry::BoundExecutorTelemetry>,
-    write_runtime: write_operations::WriteRuntime,
+    /// Coherent absence, not a placeholder: `None` means this server holds
+    /// no write runtime at all — no plan store, no expiry/cleanup, no key
+    /// material. Standby dispatch refuses every mutation before any plan
+    /// access, so the plan-backed paths below are unreachable when `None`.
+    write_runtime: Option<write_operations::WriteRuntime>,
     hosted_authority: Option<Arc<dyn HostedExecutorAuthority>>,
     hosted_membership_plans: bool,
     deployment_mutation_barrier: Option<DeploymentMutationBarrier>,
+    /// Transport-held persistence lease for one request. When set, the
+    /// `tools/call` contract branch re-validates it against this server's
+    /// barrier instead of fresh-admitting, so a freeze registered after
+    /// the transport's admission drains instead of refusing an
+    /// already-admitted mutation. `None` preserves the historical
+    /// per-message admission exactly.
+    persistence_lease: Option<DeploymentPersistenceLease>,
 }
 
 pub(super) struct HostedExecutorConstruction {
@@ -589,7 +741,10 @@ enum TelemetryConstruction {
 }
 
 struct ExecutorConstruction {
-    plan_store: plan_store::PlanStore,
+    /// `None` builds a standby read-only server: no sidecar is opened and
+    /// no expiry/cleanup runs. Fail-closed at dispatch, never a writable
+    /// in-memory substitute.
+    plan_store: Option<plan_store::PlanStore>,
     hosted_authority: Option<Arc<dyn HostedExecutorAuthority>>,
     pinned_catalogue: Option<Arc<PinnedExecutorCatalogue>>,
     experimental: ExperimentalExecutors,
@@ -640,7 +795,7 @@ impl ExecutorPrototypeStdioServer {
             caller,
             trace_path,
             ExecutorConstruction {
-                plan_store,
+                plan_store: Some(plan_store),
                 hosted_authority: None,
                 pinned_catalogue: None,
                 experimental: ExperimentalExecutors::empty(),
@@ -698,11 +853,61 @@ impl ExecutorPrototypeStdioServer {
             caller,
             trace_path,
             ExecutorConstruction {
-                plan_store,
+                plan_store: Some(plan_store),
                 hosted_authority: None,
                 pinned_catalogue: None,
                 experimental,
                 telemetry: TelemetryConstruction::Local(telemetry),
+                transport: telemetry::TelemetryTransport::Stdio,
+                deployment_mutation_barrier,
+            },
+        )
+        .await
+    }
+
+    /// Build a standby read-only executor over a physically read-only engine.
+    ///
+    /// Fail-closed: the registry must already be standby read-only and the
+    /// engine must already be a standby read-only SQLite open, otherwise this
+    /// returns an error before any catalogue, runtime, or sidecar is built.
+    /// No plan store is constructed (so no `*.write-plans.sqlite3` sidecar
+    /// can appear), no expiry/cleanup runs, no telemetry binds, and no trace
+    /// file opens. Reads delegate to the ordinary catalogue's exact-name
+    /// production handlers; every mutation refuses with the stable standby
+    /// error before any plan or runtime access.
+    pub async fn new_standby_read_only(
+        registry: Arc<ToolRegistry>,
+        engine: impl Into<EngineHandle>,
+        caller: Caller,
+    ) -> Result<Self> {
+        if !registry.is_standby_read_only() {
+            return Err(Error::engine(
+                "standby read-only executor requires a standby read-only registry",
+            ));
+        }
+        let engine = engine.into();
+        match &engine {
+            EngineHandle::Sqlite(db)
+                if db.open_mode() == crate::db::DatabaseOpenMode::StandbyReadOnly => {}
+            #[allow(unreachable_patterns)]
+            _ => {
+                return Err(Error::engine(
+                    "standby read-only executor requires a physically read-only standby engine",
+                ));
+            }
+        };
+        let deployment_mutation_barrier = registry.deployment_mutation_barrier().cloned();
+        Self::new_with_plan_store(
+            registry,
+            engine,
+            caller,
+            None,
+            ExecutorConstruction {
+                plan_store: None,
+                hosted_authority: None,
+                pinned_catalogue: None,
+                experimental: ExperimentalExecutors::empty(),
+                telemetry: TelemetryConstruction::Disabled,
                 transport: telemetry::TelemetryTransport::Stdio,
                 deployment_mutation_barrier,
             },
@@ -805,7 +1010,7 @@ impl ExecutorPrototypeStdioServer {
             caller,
             None,
             ExecutorConstruction {
-                plan_store,
+                plan_store: Some(plan_store),
                 hosted_authority: Some(authority),
                 pinned_catalogue: Some(catalogue),
                 experimental: ExperimentalExecutors::empty(),
@@ -848,16 +1053,20 @@ impl ExecutorPrototypeStdioServer {
         // Local stdio construction is a process-start boundary. Hosted
         // construction is per request and must remain observational; hosted
         // catalogue maintenance is performed once by HostedExecutorRuntime.
+        // Standby (`plan_store: None`) runs neither: there is no store to
+        // expire and no durable state to clean.
         if hosted_authority.is_none() {
-            plan_store
-                .expire_all(chrono::Utc::now().timestamp_millis())
-                .await?;
-            plan_store
-                .cleanup_expired(
-                    chrono::Utc::now().timestamp_millis(),
-                    plan_store::EXPIRED_PLAN_RETENTION_MS,
-                )
-                .await?;
+            if let Some(plan_store) = &plan_store {
+                plan_store
+                    .expire_all(chrono::Utc::now().timestamp_millis())
+                    .await?;
+                plan_store
+                    .cleanup_expired(
+                        chrono::Utc::now().timestamp_millis(),
+                        plan_store::EXPIRED_PLAN_RETENTION_MS,
+                    )
+                    .await?;
+            }
         }
         let telemetry = match telemetry_construction {
             TelemetryConstruction::Disabled => None,
@@ -899,21 +1108,44 @@ impl ExecutorPrototypeStdioServer {
                 telemetry.manifest_loaded(catalogue.descriptor_bytes, elapsed_ms(started));
             }
         }
+        // Standby servers keep the full contract map (so mutation attempts,
+        // including cached hosted write envelopes, refuse with the stable
+        // read-only error instead of a selection error) but advertise only
+        // read operations. Writable servers keep the pinned catalogue whole.
+        let (descriptors, descriptor_bytes, manifest_digest, operations_by_executor) =
+            if plan_store.is_none() {
+                let (advertised, advertised_operations) = standby_read_only_discovery(
+                    &catalogue.descriptors,
+                    &catalogue.contracts,
+                    &catalogue.operations_by_executor,
+                )?;
+                let bytes = serde_json::to_vec(&advertised)?.len();
+                let digest = jcs_sha256(&Value::Array(advertised.clone()))?;
+                (advertised, bytes, digest, advertised_operations)
+            } else {
+                (
+                    catalogue.descriptors.clone(),
+                    catalogue.descriptor_bytes,
+                    catalogue.manifest_digest.clone(),
+                    catalogue.operations_by_executor.clone(),
+                )
+            };
         Ok(Self {
             registry,
             engine,
             caller,
-            descriptors: catalogue.descriptors.clone(),
-            descriptor_bytes: catalogue.descriptor_bytes,
-            manifest_digest: catalogue.manifest_digest.clone(),
+            descriptors,
+            descriptor_bytes,
+            manifest_digest,
             contracts: catalogue.contracts.clone(),
-            operations_by_executor: catalogue.operations_by_executor.clone(),
+            operations_by_executor,
             trace: Arc::new(TraceSink::new(trace_path)?),
             telemetry,
-            write_runtime: write_operations::WriteRuntime::new(plan_store),
+            write_runtime: plan_store.map(write_operations::WriteRuntime::new),
             hosted_membership_plans: hosted_authority.is_some(),
             hosted_authority,
             deployment_mutation_barrier,
+            persistence_lease: None,
         })
     }
 
@@ -923,6 +1155,33 @@ impl ExecutorPrototypeStdioServer {
 
     pub fn descriptor_bytes(&self) -> usize {
         self.descriptor_bytes
+    }
+
+    /// Bind the session's stable projection after the genuine read-only
+    /// constructor. Contracts and mutation refusal remain constructor-owned.
+    pub(super) fn with_connected_standby_discovery(
+        mut self,
+        descriptors: &[Value],
+    ) -> Result<Self> {
+        if !self.registry.is_standby_read_only() || self.write_runtime.is_some() {
+            return Err(Error::engine(
+                "connected discovery requires a standby executor",
+            ));
+        }
+        self.descriptor_bytes = serde_json::to_vec(descriptors)?.len();
+        self.manifest_digest = jcs_sha256(&Value::Array(descriptors.to_vec()))?;
+        self.descriptors = descriptors.to_vec();
+        Ok(self)
+    }
+
+    /// Pin a transport-held persistence lease for this request's
+    /// `tools/call` contract branch. The per-request hosted server is built
+    /// fresh for every request, so this never leaks across requests.
+    /// Absent (the default) preserves the historical per-message admission
+    /// exactly.
+    pub(super) fn with_persistence_lease(mut self, lease: DeploymentPersistenceLease) -> Self {
+        self.persistence_lease = Some(lease);
+        self
     }
 
     fn admit_deployment_operation(
@@ -939,8 +1198,49 @@ impl ExecutorPrototypeStdioServer {
         barrier.admit(&operation, contract.access).map(Some)
     }
 
+    /// Admit one contract-backed `tools/call`, re-validating the
+    /// transport's pinned lease when one is present. A foreign lease fails
+    /// closed, and a missing barrier falls back to the historical
+    /// per-message admission (which itself yields no admission without a
+    /// barrier, exactly as before).
+    fn admit_or_reuse_deployment_operation(
+        &self,
+        contract: &OperationContract,
+    ) -> Result<Option<DeploymentAdmission>> {
+        if let (Some(lease), Some(barrier)) =
+            (&self.persistence_lease, &self.deployment_mutation_barrier)
+        {
+            return barrier.reuse(lease).map(Some);
+        }
+        self.admit_deployment_operation(contract)
+    }
+
     fn deployment_read_only_response(&self, id: Value, modern: bool, error: Error) -> Value {
         let mut result = protocol::call_error_content(&error, Value::Null, None);
+        if modern {
+            protocol::add_modern_result_fields(&mut result);
+        }
+        result["_meta"]["nativeExecutor"] = self.executor_meta();
+        json!({"jsonrpc":"2.0","id":id,"result":result})
+    }
+
+    /// Stable standby refusal for a mutation routed to a read-only server.
+    /// The run context comes from the standby registry's suppressed
+    /// lifecycle, so a valid supplied key is echoed without persisting
+    /// anything; `protocol::call_error_content` pins the existing
+    /// `STANDBY_READ_ONLY` contract for both protocol eras.
+    async fn standby_read_only_response(
+        &self,
+        id: Value,
+        modern: bool,
+        arguments: &Value,
+    ) -> Value {
+        let run_context = self
+            .registry
+            .run_context_for_engine(&self.engine, self.caller.clone(), arguments)
+            .await;
+        let error = Error::engine(super::registry::STANDBY_READ_ONLY_ERROR);
+        let mut result = protocol::call_error_content(&error, run_context, None);
         if modern {
             protocol::add_modern_result_fields(&mut result);
         }
@@ -1090,7 +1390,7 @@ impl ExecutorPrototypeStdioServer {
             rewrite_executor_bootstrap(
                 &mut body,
                 requested_format,
-                "ordinary",
+                self.executor_surface(),
                 self.descriptors.len(),
                 self.descriptor_bytes,
             );
@@ -1110,6 +1410,47 @@ impl ExecutorPrototypeStdioServer {
                 "elapsed_ms": elapsed_ms(started),
             }));
             return Some(body);
+        }
+        // Each hoist below mutates `arguments` in place. A rejection from a
+        // later hoist must still be reported against the envelope the caller
+        // actually sent, so keep the pre-hoist envelope for those responses.
+        let original_arguments = arguments.clone();
+        // `operation` is an envelope routing field too: hoist a nested copy
+        // before selection reads the envelope, so a nested-only operation
+        // selects the same contract an envelope operation would. A conflict
+        // or non-string rejects here with a targeted message rather than
+        // silently choosing. This is ordinary-only; the lens surface keeps
+        // its own stricter envelope handling.
+        if let Err(diagnostic) = hoist_nested_envelope_fields(&mut arguments, &["operation"]) {
+            // The hoist is transactional, so a conflict still carries the
+            // caller's envelope operation: resolve its contract so the
+            // rejection can travel as a repair, while a nested-only or
+            // non-string operation with no resolvable envelope operation
+            // answers with the diagnostic alone.
+            let conflicted = original_arguments
+                .get("operation")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let contract = conflicted.as_ref().and_then(|operation| {
+                self.contracts
+                    .get(&(executor.clone(), operation.clone()))
+                    .cloned()
+            });
+            return Some(
+                self.fixture_error_response(
+                    id,
+                    modern,
+                    &executor,
+                    conflicted.as_deref().unwrap_or(""),
+                    &diagnostic,
+                    contract.as_ref(),
+                    &original_arguments,
+                    "validation_failure",
+                    Some(false),
+                    true,
+                )
+                .await,
+            );
         }
         let Some(operation) = arguments.get("operation").and_then(Value::as_str) else {
             return Some(
@@ -1176,7 +1517,7 @@ impl ExecutorPrototypeStdioServer {
                     &operation,
                     &diagnostic,
                     Some(&contract),
-                    &arguments,
+                    &original_arguments,
                     "validation_failure",
                     Some(false),
                     true,
@@ -1184,7 +1525,43 @@ impl ExecutorPrototypeStdioServer {
                 .await,
             );
         }
-        let _deployment_admission = match self.admit_deployment_operation(&contract) {
+        // Standby read-only servers hold no write runtime: refuse every
+        // mutation (including cached hosted write envelopes and plan-backed
+        // operations) before deployment admission or any plan/store access.
+        // Reads fall through to the pinned exact-name delegation below.
+        if self.write_runtime.is_none()
+            && (contract.access == OperationAccess::Mutation
+                || write_operations::requires_plan(&executor, &operation))
+        {
+            return Some(
+                self.standby_read_only_response(id, modern, &arguments)
+                    .await,
+            );
+        }
+        // `format` rides the envelope, not the operation arguments, so hoist a
+        // nested copy before validation and before the plan-backed branch, so
+        // plan preparation reads the same envelope `format` a direct caller
+        // would. This runs after the standby refusal above: a standby server
+        // must answer every plan-required write with the same closed refusal
+        // whatever the nested arguments happen to contain.
+        if let Err(diagnostic) = hoist_nested_envelope_fields(&mut arguments, &["format"]) {
+            return Some(
+                self.fixture_error_response(
+                    id,
+                    modern,
+                    &executor,
+                    &operation,
+                    &diagnostic,
+                    Some(&contract),
+                    &original_arguments,
+                    "validation_failure",
+                    Some(false),
+                    true,
+                )
+                .await,
+            );
+        }
+        let _deployment_admission = match self.admit_or_reuse_deployment_operation(&contract) {
             Ok(admission) => admission,
             Err(error) => {
                 return Some(self.deployment_read_only_response(id, modern, error));
@@ -1207,6 +1584,10 @@ impl ExecutorPrototypeStdioServer {
                 .await,
             );
         }
+        // Every envelope-routing hoist must run before this check: it rejects
+        // unknown top-level properties, and a field still nested under
+        // `arguments` would otherwise be misread as an unknown operation
+        // argument by schema validation.
         if let Err(error) = validate_envelope_fields(
             &arguments,
             &["operation", "arguments", "run_key", "parent_key", "format"],
@@ -1287,6 +1668,7 @@ impl ExecutorPrototypeStdioServer {
                 &operation_arguments,
             )
             .map(|error| error.to_string())
+            .or_else(|| query_sql_schema_diagnostic(&operation, &operation_arguments))
             .unwrap_or_else(|| {
                 format!(
                     "arguments do not match the authoritative operation contract: {}",
@@ -1671,9 +2053,20 @@ impl ExecutorPrototypeStdioServer {
             .get("operation")
             .and_then(Value::as_str)
             .unwrap_or("");
+        // Standby servers advertise reads only. Withheld mutation and
+        // plan-backed contracts stay in the full map so dispatch refuses
+        // them with the stable read-only error, but describe follows the
+        // advertised index so discovery never leaks plan_required writable
+        // guidance for an unavailable operation.
+        let standby_advertised = self.write_runtime.is_some()
+            || self
+                .operations_by_executor
+                .get(executor)
+                .is_some_and(|operations| operations.iter().any(|listed| listed == operation));
         let Some(contract) = self
             .contracts
             .get(&(executor.to_string(), operation.to_string()))
+            .filter(|_| standby_advertised)
         else {
             let expected = self
                 .operations_by_executor
@@ -1942,8 +2335,20 @@ impl ExecutorPrototypeStdioServer {
         body
     }
 
+    fn executor_surface(&self) -> &'static str {
+        if self.write_runtime.is_none() {
+            "standby-read-only"
+        } else {
+            "ordinary"
+        }
+    }
+
     fn executor_meta(&self) -> Value {
-        production_executor_meta("ordinary", &self.manifest_digest, self.descriptor_bytes)
+        production_executor_meta(
+            self.executor_surface(),
+            &self.manifest_digest,
+            self.descriptor_bytes,
+        )
     }
 }
 
@@ -2096,7 +2501,9 @@ impl ExecutorPrototypeLensServer {
                         .await,
                 );
             }
-            message["params"]["arguments"]["format"] = json!("json");
+            // Lens dispatch selects its own representation and rejects a
+            // format argument. Its structured payload is sufficient for the
+            // executor's fixed JSON rendering below.
             let mut body = outcome_body(self.delegate(message).await)?;
             rewrite_executor_bootstrap(
                 &mut body,
@@ -3603,8 +4010,10 @@ fn validate_envelope_fields(arguments: &Value, allowed: &[&str]) -> Result<()> {
     Ok(())
 }
 
-/// Hoist a `run_key`/`parent_key` nested under `arguments` to the executor
-/// envelope, preserving run correlation.
+/// Hoist executor-envelope routing fields (`run_key`/`parent_key`, and on the
+/// ordinary surface `operation`/`format`) nested under `arguments` onto the
+/// envelope, so a misplaced field attaches exactly as the envelope field
+/// would.
 ///
 /// Transactional: normalization runs on a clone and the caller's envelope is
 /// assigned only on full success, so a rejection/repair is always built from
@@ -3614,49 +4023,50 @@ fn validate_envelope_fields(arguments: &Value, allowed: &[&str]) -> Result<()> {
 /// Returns `Ok(true)` when the envelope was mutated (hoisted or deduped),
 /// `Ok(false)` when there was nothing nested to do, and `Err(diagnostic)`
 /// when the call must be rejected rather than silently reinterpreted:
-/// a non-string nested key, or any envelope key (including null) beside a
-/// nested key that is not the identical string. Only a missing envelope key
-/// hoists; only an identical string dedupes.
-fn hoist_nested_routing_keys(envelope: &mut Value) -> std::result::Result<bool, String> {
+/// a non-string nested value, or any envelope field (including null) beside
+/// a nested value that is not the identical string. Only a missing envelope
+/// field hoists; only an identical string dedupes.
+fn hoist_nested_envelope_fields(
+    envelope: &mut Value,
+    fields: &[&str],
+) -> std::result::Result<bool, String> {
     // Preflight before the transactional clone: the common case carries no
-    // nested routing keys, and must not pay for an envelope-wide clone.
+    // nested field, and must not pay for an envelope-wide clone.
     let needs_hoist = envelope
         .get("arguments")
         .and_then(Value::as_object)
-        .is_some_and(|arguments| {
-            arguments.contains_key("run_key") || arguments.contains_key("parent_key")
-        });
+        .is_some_and(|arguments| fields.iter().any(|field| arguments.contains_key(*field)));
     if !needs_hoist {
         return Ok(false);
     }
     let mut candidate = envelope.clone();
     let mut hoisted = false;
-    for field in ["run_key", "parent_key"] {
+    for field in fields {
         let nested = candidate
             .get("arguments")
             .and_then(Value::as_object)
-            .and_then(|arguments| arguments.get(field))
+            .and_then(|arguments| arguments.get(*field))
             .cloned();
         let Some(nested_value) = nested else {
             continue;
         };
-        let outer = candidate.get(field).cloned();
+        let outer = candidate.get(*field).cloned();
         match (outer, nested_value) {
             (None, Value::String(nested_key)) => {
                 if let Some(envelope_object) = candidate.as_object_mut() {
-                    envelope_object.insert(field.into(), Value::String(nested_key));
+                    envelope_object.insert((*field).into(), Value::String(nested_key));
                 }
                 if let Some(arguments_object) = candidate
                     .get_mut("arguments")
                     .and_then(Value::as_object_mut)
                 {
-                    arguments_object.remove(field);
+                    arguments_object.remove(*field);
                 }
                 hoisted = true;
             }
             (None, nested_value) => {
                 let _ = nested_value;
-                return Err(misplaced_routing_key_diagnostic(field, false));
+                return Err(misplaced_envelope_field_diagnostic(field, false));
             }
             (Some(outer_value), Value::String(nested_key))
                 if outer_value == Value::String(nested_key.clone()) =>
@@ -3665,12 +4075,12 @@ fn hoist_nested_routing_keys(envelope: &mut Value) -> std::result::Result<bool, 
                     .get_mut("arguments")
                     .and_then(Value::as_object_mut)
                 {
-                    arguments_object.remove(field);
+                    arguments_object.remove(*field);
                 }
                 hoisted = true;
             }
             (Some(_), _) => {
-                return Err(misplaced_routing_key_diagnostic(field, true));
+                return Err(misplaced_envelope_field_diagnostic(field, true));
             }
         }
     }
@@ -3680,14 +4090,20 @@ fn hoist_nested_routing_keys(envelope: &mut Value) -> std::result::Result<bool, 
     Ok(hoisted)
 }
 
-fn misplaced_routing_key_diagnostic(field: &str, conflict: bool) -> String {
+/// The run-correlation pair stays behind its own name because both the
+/// ordinary and lens surfaces call it; `operation`/`format` are ordinary-only.
+fn hoist_nested_routing_keys(envelope: &mut Value) -> std::result::Result<bool, String> {
+    hoist_nested_envelope_fields(envelope, &["run_key", "parent_key"])
+}
+
+fn misplaced_envelope_field_diagnostic(field: &str, conflict: bool) -> String {
     if conflict {
         format!(
             "arguments.{field} conflicts with envelope {field}: remove the nested key and keep the envelope {field}; hoisting must not silently drop a conflicting key."
         )
     } else {
         format!(
-            "arguments.{field} is misplaced: put {field} on the executor envelope alongside operation and arguments; the nested value must be a string {field}."
+            "arguments.{field} is misplaced: put {field} on the executor envelope alongside the other envelope fields; the nested value must be a string {field}."
         )
     }
 }
@@ -4441,15 +4857,21 @@ fn repair_cue(
     diagnostic: Option<&str>,
     hosted_authority: Option<&dyn HostedExecutorAuthority>,
 ) -> RepairCue {
-    // A nested routing-key rejection from the hoist helper names its own
-    // field in the diagnostic (`arguments.run_key ...` / `arguments.parent_key
-    // ...`). Honor it ahead of every other derivation: the schema
-    // `unexpected.first()` below follows caller key order and can name the
-    // other nested key when both are present, and the format pre-check would
-    // otherwise override the actual rejection entirely.
-    let routing_rejected = ["run_key", "parent_key"].iter().copied().find(|field| {
-        diagnostic.is_some_and(|diagnostic| diagnostic.starts_with(&format!("arguments.{field}")))
-    });
+    // A rejection from the envelope-hoist helper names its own nested field in
+    // the diagnostic (`arguments.<field> ...`). Honor it ahead of every other
+    // derivation: the schema `unexpected.first()` below follows caller key
+    // order and can name another nested field when several are present, and
+    // the format pre-check would otherwise override the actual rejection
+    // entirely. A hoist rejection must never be presented as automatically
+    // retryable: the caller sent two contradictory placements, and quietly
+    // choosing one is exactly what the rejection exists to prevent.
+    let routing_rejected = ["run_key", "parent_key", "format", "operation"]
+        .iter()
+        .copied()
+        .find(|field| {
+            diagnostic
+                .is_some_and(|diagnostic| diagnostic.starts_with(&format!("arguments.{field}")))
+        });
     if routing_rejected.is_none()
         && contract.surface == ExecutorSurface::Ordinary
         && !write_operations::requires_plan(&contract.executor, &contract.operation)
@@ -4597,6 +5019,41 @@ fn repair_cue(
                         names_disclosed = true;
                     }
                 }
+            } else if keyword.as_str() == "type"
+                && constraint.is_some_and(|value| {
+                    // The object branch may be spelled as a bare `type: object`
+                    // or as one member of a `type` array (e.g. `["string",
+                    // "object"]` for a source item that accepts a bare id or
+                    // the object form). Both name no field on their own, so
+                    // both disclose the object branch's accepted and required
+                    // property names below.
+                    value.as_str() == Some("object")
+                        || value.as_array().is_some_and(|types| {
+                            types.iter().any(|kind| kind.as_str() == Some("object"))
+                        })
+                })
+            {
+                // A scalar where an object item is expected (e.g. a bare id in
+                // `sources`): the literal `type: object` constraint names no
+                // field, so disclose the expected object's accepted and
+                // required properties — names only, not subschemas — mirroring
+                // the rejected-property repair. Diagnostics-only: `keyword`,
+                // `constraint` and `contract_pointer` are unchanged.
+                let enclosing = schema_pointer
+                    .rfind('/')
+                    .map_or("", |index| &schema_pointer[..index]);
+                if let Some(object) = contract.input_schema.pointer(enclosing) {
+                    let accepted = object
+                        .get("properties")
+                        .and_then(Value::as_object)
+                        .map(|properties| properties.keys().cloned().collect::<Vec<_>>())
+                        .unwrap_or_default();
+                    if !accepted.is_empty() {
+                        shape["accepted_properties"] = json!(accepted);
+                        shape["required_properties"] =
+                            object.get("required").cloned().unwrap_or_else(|| json!([]));
+                    }
+                }
             }
             expected_shape = shape;
             // Localised means the caller has been told what to do, not merely
@@ -4608,11 +5065,19 @@ fn repair_cue(
     }
     if let Some(field) = routing_rejected {
         // The helper rejected this exact field; the schema derivation above
-        // may have named the other nested key instead.
+        // may have named another nested field instead. Carry the helper's
+        // conflict/misplacement text verbatim, and mark the cue localised so
+        // the caller gets the placement instruction rather than the generic
+        // schema shape.
         failing_pointer = format!("/arguments/{field}");
         reason_code = "unexpected_field";
+        expected_shape = json!({
+            "description": diagnostic.unwrap_or("the nested envelope field is misplaced"),
+        });
+        localised = true;
     }
-    if contract.surface == ExecutorSurface::Ordinary
+    if routing_rejected.is_none()
+        && contract.surface == ExecutorSurface::Ordinary
         && !write_operations::requires_plan(&contract.executor, &contract.operation)
         && failing_pointer == "/arguments/format"
     {
@@ -4639,11 +5104,11 @@ fn repair_cue(
     // path that reaches validation with the keys still nested (conflicts,
     // non-strings, or callers that bypassed the hoist); the hoisted path
     // itself proceeds without failing.
-    if failing_pointer == "/arguments/run_key" {
+    if routing_rejected.is_none() && failing_pointer == "/arguments/run_key" {
         expected_shape["description"] = json!(
             "arguments.run_key is misplaced: put run_key on the executor envelope alongside operation and arguments."
         );
-    } else if failing_pointer == "/arguments/parent_key" {
+    } else if routing_rejected.is_none() && failing_pointer == "/arguments/parent_key" {
         expected_shape["description"] = json!(
             "arguments.parent_key is misplaced: put parent_key on the executor envelope alongside operation, arguments and run_key."
         );
@@ -4653,7 +5118,13 @@ fn repair_cue(
         failing_pointer,
         expected_shape,
         localised,
-        corrected_envelope: minimal_corrected_envelope(contract, envelope, hosted_authority),
+        // A hoist rejection is never automatically retryable: offering a
+        // corrected envelope that keeps the envelope copy would silently drop
+        // the conflicting nested value the caller also sent.
+        corrected_envelope: match routing_rejected {
+            Some(_) => None,
+            None => minimal_corrected_envelope(contract, envelope, hosted_authority),
+        },
         suppress_failing_value: descended,
     }
 }
@@ -4673,6 +5144,19 @@ fn schema_error_text(error: &jsonschema::ValidationError<'_>) -> String {
         | ValidationErrorKind::OneOfMultipleValid { .. } => error.masked().to_string(),
         _ => error.to_string(),
     }
+}
+
+/// Query-sql-specific schema-failure repair (Native b0b7419). The widened
+/// `parameters` schema otherwise renders as an opaque anyOf/oneOf union, so
+/// when the entry at some index is neither a valid typed `{type, value}`
+/// entry nor an inferable bare scalar, name the expected shape and the
+/// offending index instead of echoing the union error.
+fn query_sql_schema_diagnostic(operation: &str, operation_arguments: &Value) -> Option<String> {
+    if operation != "query_sql" {
+        return None;
+    }
+    let parameters = operation_arguments.get("parameters")?;
+    crate::query::sql_contract::parameters_shape_diagnostic(parameters)
 }
 
 fn escape_json_pointer(value: &str) -> String {
@@ -5025,10 +5509,21 @@ fn rewrite_executor_bootstrap(
     else {
         return;
     };
-    structured.insert(
-        "tool_exposure".into(),
-        executor_exposure_summary(surface, descriptor_count, descriptor_bytes),
-    );
+    // The registry-generated standby `runtime` block (status-provider
+    // generation/freshness, or the static standby mode block) is authentic
+    // source metadata: carry it into the executor summary instead of
+    // dropping it, so both the modern JSON body and the legacy text
+    // rendering (which reads `/tool_exposure/runtime`) keep it. Nothing is
+    // fabricated here; absent stays absent.
+    let runtime = structured
+        .get("tool_exposure")
+        .and_then(|exposure| exposure.get("runtime"))
+        .cloned();
+    let mut exposure = executor_exposure_summary(surface, descriptor_count, descriptor_bytes);
+    if let (Some(runtime), Some(summary)) = (runtime, exposure.as_object_mut()) {
+        summary.insert("runtime".into(), runtime);
+    }
+    structured.insert("tool_exposure".into(), exposure);
     let structured = Value::Object(structured.clone());
     let text = match format {
         render::Format::Text => {
@@ -5198,6 +5693,48 @@ mod tests {
     /// catalogue before the hosted flag is consulted).
     /// The `sql_write` source is registered explicitly here to mirror a
     /// deployment that allowlisted its executor.
+
+    #[test]
+    fn sql_write_opt_in_hosted_boot_descriptor_budgets() {
+        const EXECUTOR_DESCRIPTOR_MAX_BYTES: usize = 96 * 1024;
+        let registry = hosted_registry();
+        for profile in crate::mcp::ExposureProfile::ALL {
+            let ordinary = registry.descriptor_projection(profile);
+            let lens = crate::mcp::lens_descriptor_projection(&registry, profile).unwrap();
+            println!(
+                "sql_write opt-in hosted {}: ordinary={} lens={} limit={}",
+                profile.as_str(),
+                crate::mcp::descriptor_projection_bytes(&ordinary),
+                crate::mcp::descriptor_projection_bytes(&lens),
+                profile.max_descriptor_bytes()
+            );
+        }
+        for tool in registry.descriptor_projection(crate::mcp::ExposureProfile::Complete) {
+            if tool.name == "sql_write" {
+                println!(
+                    "sql_write source descriptor bytes={}",
+                    tool.descriptor_bytes()
+                );
+            }
+        }
+        registry.validate_profile_budgets().unwrap();
+        crate::mcp::validate_lens_profile_budgets(&registry).unwrap();
+        let experimental = ExperimentalExecutors::from_env_value(Some("sql_write".into())).unwrap();
+        let ordinary = ExecutorPrototypeStdioServer::pin_hosted_catalogue_with_experimental(
+            &registry,
+            &experimental,
+        )
+        .unwrap();
+        let lens =
+            ExecutorPrototypeLensServer::pin_catalogue_with_experimental(&registry, &experimental)
+                .unwrap();
+        println!(
+            "sql_write opted-in executor descriptors: hosted={} lens={} limit={}",
+            ordinary.descriptor_bytes(),
+            lens.descriptor_bytes(),
+            EXECUTOR_DESCRIPTOR_MAX_BYTES
+        );
+    }
     fn hosted_registry() -> Arc<ToolRegistry> {
         let mut registry = ToolRegistry::new();
         register_builtin_tools(&mut registry).unwrap();
@@ -5671,12 +6208,11 @@ mod tests {
                 if params
                     .get("arguments")
                     .and_then(|arguments| arguments.get("format"))
-                    .and_then(Value::as_str)
-                    != Some("json")
+                    .is_some()
                 {
                     return Err((
                         protocol::INVALID_PARAMS,
-                        "lens bootstrap delegate was not forced to JSON".into(),
+                        "lens bootstrap delegate must not receive format".into(),
                     ));
                 }
                 let structured = json!({"schema":"bootstrap.fixture", "tools":[]});
@@ -6032,7 +6568,7 @@ mod tests {
         );
         assert_eq!(
             audit.candidate_surfaces.stable.ordinary.descriptor_bytes,
-            43_163
+            43_360
         );
         assert_eq!(
             serde_json::to_vec(&audit.candidate_surfaces.stable.ordinary.descriptors)
@@ -6049,7 +6585,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             audit.candidate_surfaces.stable.lens.descriptor_bytes,
-            49_410
+            49_607
         );
         assert_eq!(
             serde_json::to_vec(&audit.candidate_surfaces.stable.lens.descriptors)
@@ -6059,6 +6595,16 @@ mod tests {
         );
         assert!(audit.candidate_surfaces.stable.ordinary.descriptor_bytes < 55_902);
         assert!(audit.candidate_surfaces.stable.lens.descriptor_bytes < 61_727);
+        let update = contracts
+            .get(&("artifacts_write".into(), "manage_alpha_tabs.update".into()))
+            .expect("update is an artifacts_write operation");
+        assert_eq!(update.input_schema["additionalProperties"], false);
+        assert!(update.input_schema["required"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("expected_install_event_id")));
+        assert!(update.input_schema["properties"].get("adoption").is_none());
+        assert_eq!(update.payload()["prototype"]["plan_required"], false);
         for operation in [
             "query_record",
             "get_record",
@@ -6931,6 +7477,22 @@ mod tests {
             .unwrap()
     }
 
+    /// Relationship-domain events are a separate log from content events; a
+    /// link preview must append to neither.
+    async fn relationship_event_count(db: &crate::Db) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM relationship_events")
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap()
+    }
+
+    async fn assertion_head_count(db: &crate::Db) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM relationship_assertion_heads")
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap()
+    }
+
     async fn assert_sql_write_plan_prepared(db: &crate::Db, plan_id: &str) {
         let store = plan_store::PlanStore::open_for_database(db.path())
             .await
@@ -6945,6 +7507,738 @@ mod tests {
             "sql_write confirmation must not claim its plan: {:?}",
             stored.state
         );
+    }
+
+    /// Compare signed facet pairs with the public singular tool on separate
+    /// fixtures. Its bounded event tail is singular evidence, not SQL commit parity.
+    #[tokio::test]
+    async fn sql_write_preview_set_and_unset_facet_effects_match_singular_update_on_independent_fixtures(
+    ) {
+        use crate::authorization::{replace_explicit_policy, AllowEntry, Capability};
+
+        const TARGET: &str = "ec00b000-0000-4000-8000-00000000c301";
+        const SENTINEL: &str = "ec00b000-0000-4000-8000-00000000c302";
+        const VOC_NAME: &str = "e4m2-facet-oracle";
+        const VOC_ID: &str = "voc:e4m2-facet-oracle";
+        const R: &str = "rec:voc:e4m2-facet-oracle";
+        const STATEMENT: &str = "SELECT id AS record_id, 'set_facet' AS op, 'e4m2_set' AS key, 'done' AS value FROM records WHERE name = 'Facet oracle target' \
+            UNION ALL SELECT id AS record_id, 'unset_facet' AS op, 'e4m2_clear' AS key, NULL AS value FROM records WHERE name = 'Facet oracle target'";
+        type InitialPair = Option<(&'static str, Option<&'static str>)>;
+
+        async fn initialize(
+            db: &crate::Db,
+            shape: &str,
+            set: InitialPair,
+            clear: InitialPair,
+        ) -> Caller {
+            // Target first, identical deterministic setup on TWO fresh databases.
+            for fields in [
+                json!({"id":TARGET,"type":"Document","kind":"note","name":"Facet oracle target",
+                    "body":"Target body stays intact.","summary":"Target summary","home_id":"native:unfiled",
+                    "lifecycle":"open","maturity":"draft","persistence":"enduring"}),
+                json!({"id":SENTINEL,"type":"Document","kind":"note","name":"Visible sentinel",
+                    "body":"Sentinel body stays intact.","summary":"Sentinel summary","home_id":"native:unfiled",
+                    "lifecycle":"open","maturity":"draft","persistence":"enduring"}),
+            ] {
+                let id = crate::store::create_record(db, fields).await.unwrap();
+                replace_explicit_policy(
+                    db,
+                    "test:sql-write-facet-oracle",
+                    &id,
+                    vec![AllowEntry::account("plan-author", Capability::Manage)],
+                )
+                .await
+                .unwrap();
+            }
+            if shape == "governed" {
+                assert_eq!(
+                    crate::meta::create_vocabulary(db, VOC_NAME, Some(VOC_ID))
+                        .await
+                        .unwrap(),
+                    VOC_ID
+                );
+                for value in ["old", "done"] {
+                    let id = crate::meta::propose_value(db, VOC_NAME, value, None)
+                        .await
+                        .unwrap();
+                    crate::meta::promote_value(db, &id).await.unwrap();
+                }
+            }
+            // Low-level writes are synthetic seed seams only. Install legacy
+            // pairs / an existing required violation BEFORE adding governance.
+            for (key, pair) in [
+                ("fixture_marker", Some(("keep me", None))),
+                ("e4m2_set", set),
+                ("e4m2_clear", clear),
+            ] {
+                if let Some((value, reference)) = pair {
+                    crate::store::set_facet(
+                        db,
+                        TARGET,
+                        crate::events::FacetSetPayload {
+                            key: key.into(),
+                            value: Some(value.into()),
+                            vocab_ref: reference.map(str::to_string),
+                            as_of: None,
+                            observation_only: false,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                }
+            }
+            let caller = Caller::authenticated("plan-author");
+            facade_add_link(db, &caller, TARGET, SENTINEL, "Keep this link").await;
+            let facets = match shape {
+                "governed" => {
+                    Some(json!({"e4m2_set":{"vocab":VOC_NAME},"e4m2_clear":{"vocab":VOC_NAME}}))
+                }
+                "required" => Some(json!({"e4m2_clear":{"required":true}})),
+                "open" => None,
+                _ => panic!("unknown fixture shape"),
+            };
+            if let Some(facets) = facets {
+                crate::meta::seed_pack_schema_config(
+                    db,
+                    "@test/e4m2-facet-oracle",
+                    json!({"shapes":{"Document:note":{"facets":facets}}}),
+                    crate::meta::SchemaConfigOptions::default(),
+                )
+                .await
+                .unwrap();
+            }
+            caller
+        }
+
+        // Independent observations: absence is no row, including when a
+        // present row's value is the empty string. Do not use resolved-op helpers.
+        async fn pair(db: &crate::Db, key: &str) -> Option<(String, Option<String>)> {
+            sqlx::query_as("SELECT value,vocab_ref FROM facet_values WHERE record_id=? AND key=?")
+                .bind(TARGET)
+                .bind(key)
+                .fetch_optional(db.write_pool())
+                .await
+                .unwrap()
+        }
+
+        async fn state(db: &crate::Db, id: &str) -> Value {
+            let text: String = sqlx::query_scalar(
+                "SELECT json_object(
+                    'id',id,'type',type,'kind',kind,'name',name,'body',body,'summary',summary,
+                    'home_id',home_id,'lifecycle',lifecycle,'owner_id',owner_id,
+                    'persistence',persistence,'maturity',maturity,'deleted_at',deleted_at,
+                    'archived',archived,'is_current',is_current,'successor_count',successor_count,
+                    'policy_anchor_id',policy_anchor_id,'claimed_by_account',claimed_by_account,
+                    'claimed_run_key',claimed_run_key,'claimed_at',claimed_at,
+                    'created_at',created_at,'updated_at',updated_at,'last_activity_at',last_activity_at,
+                    'policy_present',(SELECT COUNT(*) FROM record_policies WHERE record_id = records.id),
+                    'policy_entries',json((SELECT json_group_array(json_object('subject_kind',subject_kind,
+                        'subject_id',subject_id,'effect',effect,'capability',capability)) FROM
+                        (SELECT subject_kind,subject_id,effect,capability FROM policy_entries
+                         WHERE policy_anchor_id = records.id ORDER BY subject_kind,subject_id,effect))),
+                    'typed_time_count',(SELECT COUNT(*) FROM facet_times WHERE record_id = records.id),
+                    'previous_seq',(SELECT MAX(seq) FROM content_events WHERE record_id = records.id),
+                    'facets',json((SELECT json_group_array(json_object('key',key,'value',value,
+                        'value_num',value_num,'vocab_ref',vocab_ref)) FROM
+                        (SELECT key,value,value_num,vocab_ref FROM facet_values WHERE record_id = records.id ORDER BY key))),
+                    'links',json((SELECT json_group_array(json_object('source_id',source_id,'target_id',target_id,
+                        'relationship',relationship,'note',note)) FROM
+                        (SELECT source_id,target_id,relationship,note FROM links
+                         WHERE source_id = records.id OR target_id = records.id ORDER BY source_id,target_id,relationship)))
+                ) FROM records WHERE id = ?",
+            )
+            .bind(id)
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap();
+            serde_json::from_str(&text).unwrap()
+        }
+
+        fn semantic(mut state: Value, remove_version: bool) -> Value {
+            for key in ["created_at", "updated_at", "last_activity_at"] {
+                state.as_object_mut().unwrap().remove(key);
+            }
+            if remove_version {
+                state.as_object_mut().unwrap().remove("previous_seq");
+            }
+            state
+        }
+
+        fn unrelated(mut state: Value) -> Value {
+            state["facets"]
+                .as_array_mut()
+                .unwrap()
+                .retain(|facet| facet["key"] != "e4m2_set" && facet["key"] != "e4m2_clear");
+            // Only the singular success may update version / activity.
+            for key in ["previous_seq", "updated_at", "last_activity_at"] {
+                state.as_object_mut().unwrap().remove(key);
+            }
+            state
+        }
+
+        fn value_and_ref(pair: &Option<(String, Option<String>)>) -> (Value, Value) {
+            match pair {
+                Some((value, reference)) => (json!(value), json!(reference)),
+                None => (Value::Null, Value::Null),
+            }
+        }
+
+        // Literal outcomes independently pin semantic changed, including
+        // pair repair and no-ops which still emit public singular events.
+        for (label, shape, initial_set, initial_clear, changed_set, changed_clear, refuses) in [
+            (
+                "set absent / clear present",
+                "open",
+                None,
+                Some(("old", None)),
+                true,
+                true,
+                false,
+            ),
+            (
+                "set old / clear absent",
+                "open",
+                Some(("old", None)),
+                None,
+                true,
+                false,
+                false,
+            ),
+            (
+                "open pair no-op",
+                "open",
+                Some(("done", None)),
+                None,
+                false,
+                false,
+                false,
+            ),
+            (
+                "empty present clear",
+                "open",
+                Some(("done", None)),
+                Some(("", None)),
+                false,
+                true,
+                false,
+            ),
+            (
+                "legacy reference repair",
+                "governed",
+                Some(("done", None)),
+                Some(("old", Some(R))),
+                true,
+                true,
+                false,
+            ),
+            (
+                "governed pair no-op",
+                "governed",
+                Some(("done", Some(R))),
+                None,
+                false,
+                false,
+                false,
+            ),
+            (
+                "existing required violation",
+                "required",
+                Some(("done", None)),
+                None,
+                false,
+                false,
+                false,
+            ),
+            (
+                "required present rollback",
+                "required",
+                Some(("old", None)),
+                Some(("old", None)),
+                false,
+                false,
+                true,
+            ),
+        ] {
+            let preview_db = create_database(":memory:").await.unwrap();
+            let singular_db = create_database(":memory:").await.unwrap();
+            let caller = initialize(&preview_db, shape, initial_set, initial_clear).await;
+            let singular_caller = initialize(&singular_db, shape, initial_set, initial_clear).await;
+            let preview_before = (
+                state(&preview_db, TARGET).await,
+                state(&preview_db, SENTINEL).await,
+            );
+            let singular_before = (
+                state(&singular_db, TARGET).await,
+                state(&singular_db, SENTINEL).await,
+            );
+            for (p, s) in [
+                (&preview_before.0, &singular_before.0),
+                (&preview_before.1, &singular_before.1),
+            ] {
+                assert_eq!(
+                    semantic(p.clone(), true),
+                    semantic(s.clone(), true),
+                    "{label}"
+                );
+                assert_eq!(p["typed_time_count"], 0);
+                assert_eq!(p["policy_present"], 1);
+                assert_eq!(
+                    p["policy_entries"],
+                    json!([{"subject_kind":"account","subject_id":"plan-author",
+                    "effect":"allow","capability":"manage"}])
+                );
+            }
+            assert_eq!(
+                preview_before.0["links"],
+                json!([{"source_id":TARGET,"target_id":SENTINEL,
+                "relationship":"relates_to","note":"Keep this link"}])
+            );
+            assert_eq!(
+                pair(&preview_db, "fixture_marker").await,
+                Some(("keep me".into(), None))
+            );
+            let before_set = pair(&singular_db, "e4m2_set").await;
+            let before_clear = pair(&singular_db, "e4m2_clear").await;
+            for (key, initial, before) in [
+                ("e4m2_set", initial_set, &before_set),
+                ("e4m2_clear", initial_clear, &before_clear),
+            ] {
+                let expected = initial
+                    .map(|(value, reference)| (value.to_string(), reference.map(str::to_string)));
+                assert_eq!(*before, expected, "{label}: singular {key}");
+                assert_eq!(
+                    pair(&preview_db, key).await,
+                    expected,
+                    "{label}: preview {key}"
+                );
+            }
+            let preview_events = (
+                content_event_count(&preview_db).await,
+                relationship_event_count(&preview_db).await,
+            );
+            let server = sql_write_opted_in_server(&preview_db, caller).await;
+            let prepared = sql_write_prepare(&server, STATEMENT).await;
+            // EVERY prepare, including refusal, must preserve whole fixture state and both logs.
+            assert_eq!(
+                (
+                    state(&preview_db, TARGET).await,
+                    state(&preview_db, SENTINEL).await
+                ),
+                preview_before,
+                "{label}"
+            );
+            assert_eq!(
+                (
+                    content_event_count(&preview_db).await,
+                    relationship_event_count(&preview_db).await
+                ),
+                preview_events,
+                "{label}"
+            );
+            let plan = structured_result(&prepared);
+            let singular_events = (
+                content_event_count(&singular_db).await,
+                relationship_event_count(&singular_db).await,
+            );
+            let singular_result = hosted_registry().call(singular_db.clone(), singular_caller, "update_record",
+                json!({"id":TARGET,"facets":{"e4m2_set":"done","e4m2_clear":null},"reason":"facade probe"})).await;
+            if refuses {
+                assert_eq!(prepared["result"]["isError"], true, "{label}: {prepared}");
+                assert_eq!(plan_error_code(&prepared), "preparation_rejected");
+                assert!(plan.get("plan_id").is_none());
+                assert!(plan.get("effect").is_none());
+                let public_error = singular_result.unwrap_err().to_string();
+                let preview_error = plan["error"].as_str().unwrap();
+                let shared = format!("batch would worsen required-facet conformance: record {TARGET} missing required facet 'e4m2_clear' for Document:note");
+                // Compare concrete shared reason, allowing route/transport prefixes.
+                for error in [preview_error, public_error.as_str()] {
+                    let start = error
+                        .find("batch would worsen required-facet conformance:")
+                        .unwrap_or_else(|| panic!("{label}: {error}"));
+                    assert_eq!(&error[start..], shared, "{label}");
+                }
+                assert_eq!(
+                    (
+                        state(&singular_db, TARGET).await,
+                        state(&singular_db, SENTINEL).await
+                    ),
+                    singular_before,
+                    "{label}"
+                );
+                assert_eq!(
+                    (
+                        content_event_count(&singular_db).await,
+                        relationship_event_count(&singular_db).await
+                    ),
+                    singular_events
+                );
+                assert_eq!(
+                    pair(&singular_db, "e4m2_set").await,
+                    Some(("old".into(), None))
+                );
+                assert_eq!(
+                    pair(&singular_db, "e4m2_clear").await,
+                    Some(("old".into(), None))
+                );
+                continue;
+            }
+            singular_result.unwrap_or_else(|error| panic!("{label}: {error}"));
+            assert_eq!(prepared["result"]["isError"], false, "{label}: {prepared}");
+            assert_eq!(plan["preparation_mutated"], false);
+            let after_set = pair(&singular_db, "e4m2_set").await;
+            let after_clear = pair(&singular_db, "e4m2_clear").await;
+            assert_eq!(
+                after_set,
+                Some(("done".into(), (shape == "governed").then(|| R.to_string()))),
+                "{label}"
+            );
+            assert_eq!(after_clear, None, "{label}");
+            assert_eq!(before_set != after_set, changed_set, "{label}");
+            assert_eq!(before_clear.is_some(), changed_clear, "{label}");
+            let (set_before, set_before_ref) = value_and_ref(&before_set);
+            let (set_after, set_after_ref) = value_and_ref(&after_set);
+            let (clear_before, clear_before_ref) = value_and_ref(&before_clear);
+            let (clear_after, clear_after_ref) = value_and_ref(&after_clear);
+            let set_changed = before_set != after_set;
+            let clear_changed = before_clear != after_clear;
+            // Whole effect pins singleton, two distinct keys, canonical order
+            // (clear first despite SET-first SQL), pairs, counts and OR aggregate.
+            assert_eq!(
+                plan["effect"],
+                json!({
+                    "kind":"sql_write_preview","target_count":1,"op_count":2,"changed":set_changed || clear_changed,
+                    "reason":"facade probe","targets":[{"record_id":TARGET,"previous_seq":preview_before.0["previous_seq"],"ops":[
+                        {"op":"unset_facet","key":"e4m2_clear","value":null,"before":clear_before,"after":clear_after,
+                            "before_vocab_ref":clear_before_ref,"after_vocab_ref":clear_after_ref,"changed":clear_changed},
+                        {"op":"set_facet","key":"e4m2_set","value":"done","before":set_before,"after":set_after,
+                            "before_vocab_ref":set_before_ref,"after_vocab_ref":set_after_ref,"changed":set_changed}
+                    ]}]
+                }),
+                "{label}"
+            );
+            let singular_after = state(&singular_db, TARGET).await;
+            assert_eq!(
+                unrelated(singular_after),
+                unrelated(singular_before.0.clone()),
+                "{label}"
+            );
+            assert_eq!(
+                state(&singular_db, SENTINEL).await,
+                singular_before.1,
+                "{label}"
+            );
+            assert_eq!(
+                (
+                    content_event_count(&singular_db).await,
+                    relationship_event_count(&singular_db).await
+                ),
+                (singular_events.0 + 2, singular_events.1),
+                "{label}"
+            );
+            // Ordinary singular no-ops STILL set and unset. Do not compare
+            // observation counts, timestamps, origins or event IDs across P/S.
+            // The public call preserves its set-first input order; SQL's signed
+            // effect independently sorts the keys clear-first.
+            let tail: Vec<(String, String)> = sqlx::query_as(
+                "SELECT type,json_extract(payload,'$.key') FROM content_events WHERE record_id=? AND seq>? ORDER BY seq")
+                .bind(TARGET).bind(singular_before.0["previous_seq"].as_i64().unwrap())
+                .fetch_all(singular_db.write_pool()).await.unwrap();
+            assert_eq!(
+                tail,
+                vec![
+                    ("facet.set".into(), "e4m2_set".into()),
+                    ("facet.unset".into(), "e4m2_clear".into())
+                ],
+                "{label}"
+            );
+            let store = plan_store::PlanStore::open_for_database(preview_db.path())
+                .await
+                .unwrap();
+            let stored = store
+                .load(
+                    plan["plan_id"].as_str().unwrap(),
+                    chrono::Utc::now().timestamp_millis(),
+                )
+                .await
+                .unwrap()
+                .expect("signed facet preview remains stored");
+            assert!(matches!(stored.state, plan_store::StoredState::Prepared));
+            assert_eq!(stored.payload["effect"], plan["effect"], "{label}");
+        }
+    }
+
+    /// Preparatory M2 evidence: signed field effects match the public singular
+    /// tool on a separately initialized database. This does not compare events
+    /// committed by SQL (the SQL route still only prepares a preview).
+    #[tokio::test]
+    async fn sql_write_preview_set_field_effect_matches_singular_update_on_independent_fixtures() {
+        use crate::authorization::{replace_explicit_policy, AllowEntry, Capability};
+
+        const TARGET: &str = "ec00b000-0000-4000-8000-00000000b301";
+        const SENTINEL: &str = "ec00b000-0000-4000-8000-00000000b302";
+        const HIDDEN: &str = "ec00b000-0000-4000-8000-00000000b303";
+        const HIDDEN_NAME: &str = "Parity hidden-only";
+        const NEW_NAME: &str = "Parity renamed";
+        const NEW_SUMMARY: &str = "Parity summary";
+        const STATEMENT: &str = "SELECT id AS record_id, 'set_field' AS op, 'name' AS key, 'Parity renamed' AS value FROM records WHERE name LIKE 'Parity%' \
+            UNION ALL SELECT id AS record_id, 'set_field' AS op, 'summary' AS key, 'Parity summary' AS value FROM records WHERE name LIKE 'Parity%'";
+        const HIDDEN_ONLY: &str = "SELECT id AS record_id, 'set_field' AS op, 'name' AS key, 'Parity renamed' AS value FROM records WHERE name = 'Parity hidden-only' \
+            UNION ALL SELECT id AS record_id, 'set_field' AS op, 'summary' AS key, 'Parity summary' AS value FROM records WHERE name = 'Parity hidden-only'";
+
+        async fn initialize(db: &crate::Db, name: &str, summary: Option<&str>) -> Caller {
+            // Always seed the target first, in the same order on both databases.
+            for fields in [
+                json!({"id":TARGET,"type":"Document","kind":"note","name":name,
+                    "body":"Target body stays intact.","summary":summary,"home_id":"native:unfiled",
+                    "lifecycle":"open","maturity":"draft","persistence":"enduring"}),
+                json!({"id":SENTINEL,"type":"Document","kind":"note","name":"Visible sentinel",
+                    "body":"Sentinel body stays intact.","summary":"Sentinel summary",
+                    "home_id":"native:unfiled","lifecycle":"open","maturity":"draft","persistence":"enduring"}),
+            ] {
+                let id = crate::store::create_record(db, fields).await.unwrap();
+                replace_explicit_policy(
+                    db,
+                    "test:sql-write-field-parity",
+                    &id,
+                    vec![AllowEntry::account("plan-author", Capability::Manage)],
+                )
+                .await
+                .unwrap();
+            }
+            crate::store::set_facet(
+                db,
+                TARGET,
+                crate::events::FacetSetPayload {
+                    key: "fixture_marker".into(),
+                    value: Some("keep me".into()),
+                    vocab_ref: None,
+                    as_of: None,
+                    observation_only: false,
+                },
+            )
+            .await
+            .unwrap();
+            let caller = Caller::authenticated("plan-author");
+            facade_add_link(db, &caller, TARGET, SENTINEL, "Keep this link").await;
+            caller
+        }
+
+        // Independent authoritative observations, without resolved-op or digest
+        // helpers. Include activity/version to detect any preview mutation.
+        async fn state(db: &crate::Db, id: &str) -> Value {
+            let text: String = sqlx::query_scalar(
+                "SELECT json_object(
+                    'id',id,'type',type,'kind',kind,'name',name,'body',body,'summary',summary,
+                    'home_id',home_id,'lifecycle',lifecycle,'owner_id',owner_id,
+                    'persistence',persistence,'maturity',maturity,'deleted_at',deleted_at,
+                    'archived',archived,'is_current',is_current,'successor_count',successor_count,
+                    'policy_anchor_id',policy_anchor_id,'claimed_by_account',claimed_by_account,
+                    'claimed_run_key',claimed_run_key,'claimed_at',claimed_at,
+                    'created_at',created_at,'updated_at',updated_at,'last_activity_at',last_activity_at,
+                    'previous_seq',(SELECT MAX(seq) FROM content_events WHERE record_id = records.id),
+                    'facets',json((SELECT json_group_array(json_object('key',key,'value',value,
+                        'value_num',value_num,'vocab_ref',vocab_ref)) FROM
+                        (SELECT key,value,value_num,vocab_ref FROM facet_values WHERE record_id = records.id ORDER BY key))),
+                    'links',json((SELECT json_group_array(json_object('source_id',source_id,'target_id',target_id,
+                        'relationship',relationship,'note',note)) FROM
+                        (SELECT source_id,target_id,relationship,note FROM links
+                         WHERE source_id = records.id OR target_id = records.id ORDER BY source_id,target_id,relationship)))
+                ) FROM records WHERE id = ?",
+            )
+            .bind(id)
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap();
+            serde_json::from_str(&text).unwrap()
+        }
+
+        async fn prepare_unchanged(
+            db: &crate::Db,
+            server: &ExecutorPrototypeStdioServer,
+            statement: &str,
+        ) -> Value {
+            let before = (state(db, TARGET).await, state(db, SENTINEL).await);
+            let events = (
+                content_event_count(db).await,
+                relationship_event_count(db).await,
+            );
+            let response = sql_write_prepare(server, statement).await;
+            assert_eq!((state(db, TARGET).await, state(db, SENTINEL).await), before);
+            assert_eq!(
+                (
+                    content_event_count(db).await,
+                    relationship_event_count(db).await
+                ),
+                events
+            );
+            response
+        }
+
+        // Null, empty, mixed changed/unchanged, and a full projected no-op.
+        // Singular no-ops may still
+        // emit ordinary events; changed here means a semantic field difference.
+        for (initial_name, initial_summary) in [
+            ("Parity target", None),
+            ("Parity target", Some("")),
+            ("Parity target", Some(NEW_SUMMARY)),
+            (NEW_NAME, Some(NEW_SUMMARY)),
+        ] {
+            let preview_db = create_database(":memory:").await.unwrap();
+            let singular_db = create_database(":memory:").await.unwrap();
+            let caller = initialize(&preview_db, initial_name, initial_summary).await;
+            let singular_caller = initialize(&singular_db, initial_name, initial_summary).await;
+            let preview_before = state(&preview_db, TARGET).await;
+            let singular_before = state(&singular_db, TARGET).await;
+            let sentinel_before = state(&singular_db, SENTINEL).await;
+            assert_eq!(preview_before["name"], json!(initial_name));
+            assert_eq!(singular_before["name"], json!(initial_name));
+            assert_eq!(preview_before["summary"], json!(initial_summary));
+            assert_eq!(singular_before["summary"], json!(initial_summary));
+            let mut comparable_preview = preview_before.clone();
+            let mut comparable_singular = singular_before.clone();
+            // Separately created fixtures have their own timestamps and origins.
+            for key in ["created_at", "updated_at", "last_activity_at"] {
+                comparable_preview.as_object_mut().unwrap().remove(key);
+                comparable_singular.as_object_mut().unwrap().remove(key);
+            }
+            assert_eq!(comparable_preview, comparable_singular);
+            assert!(!preview_before["facets"].as_array().unwrap().is_empty());
+            assert_eq!(preview_before["links"].as_array().unwrap().len(), 1);
+
+            let server = sql_write_opted_in_server(&preview_db, caller).await;
+            let prepared = prepare_unchanged(&preview_db, &server, STATEMENT).await;
+            assert_eq!(prepared["result"]["isError"], false, "{prepared}");
+            let plan = structured_result(&prepared);
+            assert_eq!(plan["preparation_mutated"], false);
+            let missing = prepare_unchanged(&preview_db, &server, HIDDEN_ONLY).await;
+            assert_eq!(missing["result"]["isError"], true, "{missing}");
+            let missing_error = &structured_result(&missing)["plan_error"];
+            assert_eq!(plan_error_code(&missing), "preparation_rejected");
+            let missing_message = &structured_result(&missing)["error"];
+            assert!(missing_message
+                .as_str()
+                .unwrap()
+                .contains("no visible operation row"));
+
+            hosted_registry()
+                .call(
+                    singular_db.clone(),
+                    singular_caller,
+                    "update_record",
+                    json!({"id":TARGET,"name":NEW_NAME,"summary":NEW_SUMMARY,"reason":"facade probe"}),
+                )
+                .await
+                .unwrap();
+            let singular_after = state(&singular_db, TARGET).await;
+            assert_eq!(singular_after["name"], json!(NEW_NAME));
+            assert_eq!(singular_after["summary"], json!(NEW_SUMMARY));
+            assert_eq!(state(&singular_db, SENTINEL).await, sentinel_before);
+            for (key, value) in singular_before.as_object().unwrap() {
+                if ![
+                    "name",
+                    "summary",
+                    "previous_seq",
+                    "updated_at",
+                    "last_activity_at",
+                ]
+                .contains(&key.as_str())
+                {
+                    assert_eq!(&singular_after[key], value, "singular tool changed {key}");
+                }
+            }
+            assert_eq!(state(&preview_db, TARGET).await, preview_before);
+
+            let expected_ops: Vec<Value> = [("name", NEW_NAME), ("summary", NEW_SUMMARY)]
+                .into_iter()
+                .map(|(key, value)| {
+                    json!({
+                        "op":"set_field","key":key,"value":value,
+                        "before":singular_before[key],"after":singular_after[key],
+                        "changed":singular_before[key] != singular_after[key],
+                    })
+                })
+                .collect();
+            let changed = expected_ops.iter().any(|op| op["changed"] == true);
+            // Whole-effect equality fixes the singleton ID, counts, keys and
+            // every op value independently of the SQL selection's returned rows.
+            assert_eq!(
+                plan["effect"],
+                json!({
+                    "kind":"sql_write_preview","target_count":1,"op_count":2,"changed":changed,
+                    "reason":"facade probe","targets":[{
+                        "record_id":TARGET,"previous_seq":preview_before["previous_seq"],"ops":expected_ops,
+                    }],
+                })
+            );
+
+            let hidden = crate::store::create_record(
+                &preview_db,
+                json!({"id":HIDDEN,"type":"Document","kind":"note","name":HIDDEN_NAME,
+                    "body":"Hidden matching body","summary":"Hidden matching summary"}),
+            )
+            .await
+            .unwrap();
+            replace_explicit_policy(
+                &preview_db,
+                "test:sql-write-field-parity-hide",
+                &hidden,
+                vec![],
+            )
+            .await
+            .unwrap();
+            let hidden_before = state(&preview_db, HIDDEN).await;
+            let repeated = prepare_unchanged(&preview_db, &server, STATEMENT).await;
+            assert_eq!(repeated["result"]["isError"], false, "{repeated}");
+            let repeated_plan = structured_result(&repeated);
+            let repeated_text = repeated_plan.to_string();
+            assert!(!repeated_text.contains(HIDDEN) && !repeated_text.contains(HIDDEN_NAME));
+            for key in [
+                "effect",
+                "effect_summary",
+                "target",
+                "target_state_digest",
+                "state_revision",
+            ] {
+                assert!(!plan[key].is_null(), "missing initial {key}");
+                let original_bytes = serde_json::to_vec(&plan[key]).unwrap();
+                let repeated_bytes = serde_json::to_vec(&repeated_plan[key]).unwrap();
+                assert_eq!(repeated_bytes, original_bytes, "hidden row perturbed {key}");
+                let text = String::from_utf8(repeated_bytes).unwrap();
+                assert!(
+                    !text.contains(HIDDEN) && !text.contains(HIDDEN_NAME),
+                    "{key}: {text}"
+                );
+            }
+            let refused = prepare_unchanged(&preview_db, &server, HIDDEN_ONLY).await;
+            assert_eq!(refused["result"]["isError"], true, "{refused}");
+            assert_eq!(
+                serde_json::to_vec(&structured_result(&refused)["plan_error"]).unwrap(),
+                serde_json::to_vec(missing_error).unwrap()
+            );
+            assert_eq!(structured_result(&refused)["error"], *missing_message);
+            let refusal_text = json!({"plan_error":structured_result(&refused)["plan_error"],
+                "message":structured_result(&refused)["error"]})
+            .to_string();
+            assert!(!refusal_text.contains(HIDDEN) && !refusal_text.contains(HIDDEN_NAME));
+            assert_eq!(state(&preview_db, HIDDEN).await, hidden_before);
+            assert_eq!(state(&preview_db, TARGET).await, preview_before);
+
+            let store = plan_store::PlanStore::open_for_database(preview_db.path())
+                .await
+                .unwrap();
+            for response_plan in [plan, repeated_plan] {
+                let stored = store
+                    .load(
+                        response_plan["plan_id"].as_str().unwrap(),
+                        chrono::Utc::now().timestamp_millis(),
+                    )
+                    .await
+                    .unwrap()
+                    .expect("signed field preview remains stored");
+                assert!(matches!(stored.state, plan_store::StoredState::Prepared));
+                assert_eq!(stored.payload["effect"], response_plan["effect"]);
+            }
+        }
     }
 
     /// Prepare then execute-shaped call returns preview-current with no claim,
@@ -7008,6 +8302,1433 @@ mod tests {
         assert_eq!(plan_error_code(&raw), "raw_arguments_forbidden");
         assert_sql_write_plan_prepared(&db, plan_id).await;
         assert_eq!(content_event_count(&db).await, events_before);
+    }
+
+    /// A source and a target `plan-author` may Edit (Edit implies View), for
+    /// the directed link preview facade.
+    async fn sql_write_link_fixture(db: &crate::Db) -> (String, String, Caller) {
+        use crate::authorization::{replace_explicit_policy, AllowEntry, Capability};
+        let source = crate::store::create_record(
+            db,
+            json!({"id":"ec00b000-0000-4000-8000-00000000b211","type":"Document","kind":"note","name":"Link source"}),
+        )
+        .await
+        .unwrap();
+        let target = crate::store::create_record(
+            db,
+            json!({"id":"ec00b000-0000-4000-8000-00000000b212","type":"Document","kind":"note","name":"Link target"}),
+        )
+        .await
+        .unwrap();
+        for id in [source.as_str(), target.as_str()] {
+            replace_explicit_policy(
+                db,
+                "test:sql-write-link-facade",
+                id,
+                vec![AllowEntry::account("plan-author", Capability::Edit)],
+            )
+            .await
+            .unwrap();
+        }
+        (source, target, Caller::authenticated("plan-author"))
+    }
+
+    fn sql_write_link_statement(source: &str, target: &str) -> String {
+        format!(
+            "SELECT id AS record_id, 'add_link' AS op, 'relates_to' AS key, '{target}' AS value FROM records WHERE id = '{source}'"
+        )
+    }
+
+    async fn sql_write_prepare_with_note(
+        server: &ExecutorPrototypeStdioServer,
+        statement: &str,
+        note: Option<&str>,
+    ) -> Value {
+        let mut arguments = json!({"statement":statement,"reason":"facade link probe"});
+        if let Some(note) = note {
+            arguments["link_note"] = json!(note);
+        }
+        server
+            .handle_message(json!({
+                "jsonrpc":"2.0","id":1,"method":"tools/call",
+                "params":{"name":"sql_write","arguments":{
+                    "operation":"sql_write",
+                    "arguments":arguments,
+                    "run_key":"sql-write-b2","parent_key":"sql-write-b2"
+                }}
+            }))
+            .await
+            .unwrap()
+    }
+
+    /// Preparatory M2 oracle: SQL signs an observed before-state and intent;
+    /// only the independent public fixture performs the assertion transition.
+    /// SQL commit/event parity remains M4 work. SQL's live-supersedes readiness,
+    /// content-owned-route refusal and bounded/nonblank note grammar are narrower
+    /// than manage_links; those boundaries are not fabricated refusal parity here.
+    #[tokio::test]
+    async fn sql_write_preview_link_intents_match_public_manage_links_on_independent_fixtures() {
+        use crate::authorization::{replace_explicit_policy, AllowEntry, Capability};
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        use sha2::{Digest, Sha256};
+
+        const SOURCE: &str = "ec00b000-0000-4000-8000-00000000d401";
+        const TARGET: &str = "ec00b000-0000-4000-8000-00000000d402";
+        const SENTINEL: &str = "ec00b000-0000-4000-8000-00000000d403";
+
+        // Generic published RFC8785/SHA256 formula, independent of the legacy
+        // proposition_key and SQL resolved-op helpers. Each real origin is used.
+        fn portable(origin: &str, record: &str) -> String {
+            format!("{origin}/{}", URL_SAFE_NO_PAD.encode(record.as_bytes()))
+        }
+        fn key(origin: &str) -> String {
+            let proposition = json!({
+                "relationship_type_definition":"legacy_link.v1",
+                "endpoints":[{"role":"source","portable_ref":portable(origin,SOURCE)},
+                    {"role":"target","portable_ref":portable(origin,TARGET)}],
+                "qualifiers":{"relationship_token":"relates_to"}
+            });
+            hex::encode(Sha256::digest(serde_jcs::to_vec(&proposition).unwrap()))
+        }
+        fn arguments(add: bool, note: Option<&str>) -> Value {
+            let mut args = json!({"action":if add {"add"} else {"remove"},
+                "source_id":SOURCE,"target_id":TARGET,"relationship":"relates_to"});
+            if let Some(note) = note {
+                assert!(add);
+                args["note"] = json!(note);
+            }
+            args
+        }
+        async fn json_rows(db: &crate::Db, sql: &str) -> Vec<Value> {
+            sqlx::query_scalar::<_, String>(sql)
+                .fetch_all(db.write_pool())
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|text| serde_json::from_str(&text).unwrap())
+                .collect()
+        }
+        // Exact local snapshots stay intact. Only separately constructed
+        // semantic values below cross the independent database boundary.
+        async fn observe(db: &crate::Db) -> Value {
+            let records = sqlx::query_scalar::<_, String>(
+                "SELECT json_object('id',id,'type',type,'kind',kind,'name',name,
+                    'body',body,'summary',summary,'home_id',home_id,'lifecycle',lifecycle,
+                    'owner_id',owner_id,'persistence',persistence,'maturity',maturity,
+                    'deleted_at',deleted_at,'archived',archived,'is_current',is_current,
+                    'successor_count',successor_count,'policy_anchor_id',policy_anchor_id,
+                    'claimed_by_account',claimed_by_account,'claimed_run_key',claimed_run_key,
+                    'claimed_at',claimed_at,'created_at',created_at,'updated_at',updated_at,
+                    'last_activity_at',last_activity_at,
+                    'previous_seq',(SELECT MAX(seq) FROM content_events WHERE record_id=r.id),
+                    'facets',json((SELECT json_group_array(json_object('id',id,'key',key,
+                        'value',value,'vocab_ref',vocab_ref,'created_at',created_at)) FROM
+                        (SELECT * FROM facet_values WHERE record_id=r.id ORDER BY key))),
+                    'observations',json((SELECT json_group_array(json_object('id',id,'key',key,
+                        'value',value,'op',op,'vocab_ref',vocab_ref,'as_of',as_of,
+                        'observed_at',observed_at,'event_seq',event_seq)) FROM
+                        (SELECT * FROM facet_observations WHERE record_id=r.id ORDER BY key,as_of))),
+                    'times',json((SELECT json_group_array(json_object('key',key,'kind',kind,
+                        'all_day',all_day,'start_date',start_date,'end_date',end_date,
+                        'start_ms',start_ms,'end_ms',end_ms,'tz',tz,'tzdb_version',tzdb_version))
+                        FROM (SELECT * FROM facet_times WHERE record_id=r.id ORDER BY key))),
+                    'policy_created_at',(SELECT created_at FROM record_policies WHERE record_id=r.id),
+                    'policy',json((SELECT json_group_array(json_object('subject_kind',subject_kind,
+                        'subject_id',subject_id,'effect',effect,'capability',capability)) FROM
+                        (SELECT * FROM policy_entries WHERE policy_anchor_id=r.id ORDER BY subject_kind,subject_id)))
+                ) FROM records r WHERE id IN (?1,?2,?3) ORDER BY id"
+            ).bind(SOURCE).bind(TARGET).bind(SENTINEL)
+                .fetch_all(db.write_pool()).await.unwrap().into_iter()
+                .map(|text| serde_json::from_str::<Value>(&text).unwrap()).collect::<Vec<_>>();
+            assert_eq!(records.len(), 3);
+            let links = json_rows(
+                db,
+                "SELECT json_object('id',id,'source_id',source_id,'target_id',target_id,
+                    'relationship',relationship,'note',note,'created_at',created_at)
+                 FROM links ORDER BY source_id,target_id,relationship,id",
+            )
+            .await;
+            // Pin both endpoint roles; every relationship join is two-coordinate.
+            let propositions = sqlx::query_scalar::<_, String>(
+                "SELECT json_object(
+                    'identity',json_object('origin',r.relationship_origin_db_id,'rid',r.relationship_id,
+                        'revision',r.relationship_revision,'type',r.relationship_type,
+                        'definition',r.type_definition_id,'key',r.canonical_proposition_key,
+                        'semantics',r.endpoint_semantics,'qualifiers',json(r.identity_qualifiers),
+                        'reducer',r.reducer_id,'reducer_version',r.reducer_version,
+                        'stream_version',r.stream_version,'created_issuer',r.created_event_issuer_origin_db_id,
+                        'created_event',r.created_event_id,'last_issuer',r.last_event_issuer_origin_db_id,
+                        'last_event',r.last_event_id,'occurred_at',r.occurred_at),
+                    'existing',json_object('relationship_id',r.relationship_id,'status',r.status,
+                        'effective_state',e.effective_state,'epistemic_state',e.epistemic_state,
+                        'assertion_set_digest',e.assertion_set_digest,'support_count',e.support_count,
+                        'contest_count',e.contest_count),
+                    'legacy',json_object('token',l.relationship_token,'note',l.note,
+                        'created_at',l.created_at,'source_facts',json(l.source_facts)),
+                    'endpoints',json((SELECT json_group_array(json_object('ordinal',ordinal,'role',role,
+                        'portable_ref',portable_ref,'record_id',record_id,'type',record_type,'kind',record_kind))
+                        FROM (SELECT * FROM relationship_endpoints WHERE relationship_origin_db_id=r.relationship_origin_db_id
+                            AND relationship_id=r.relationship_id ORDER BY ordinal))),
+                    'heads',json((SELECT json_group_array(json_object('issuer',h.issuer_origin_db_id,
+                        'id',h.assertion_id,'origin',h.relationship_origin_db_id,'rid',h.relationship_id,
+                        'revision',h.relationship_revision,'relationship_created_issuer',h.relationship_created_event_issuer_origin_db_id,
+                        'relationship_created_event',h.relationship_created_event_id,'version',h.stream_version,
+                        'stance',h.stance,'state',h.state,'claimant',h.semantic_claimant,'rationale',h.rationale,
+                        'on_behalf_of',h.on_behalf_of,'valid_from',h.valid_from,'valid_until',h.valid_until,
+                        'parents',json(h.causal_parents),'admission',json(h.origin_admission),
+                        'attestation',h.authoring_action_attestation_id,'created_issuer',h.created_event_issuer_origin_db_id,
+                        'created_event',h.created_event_id,'last_issuer',h.last_event_issuer_origin_db_id,
+                        'last_event',h.last_event_id,'occurred_at',h.occurred_at,
+                        'local_state',a.local_admission_state,'local_class',a.local_admission_class,
+                        'local_definition',a.type_definition_id,'local_policy_version',a.local_policy_version,
+                        'local_reason',a.local_reason,'local_evidence',a.local_evidence_digest,'local_at',a.recomputed_at))
+                        FROM (SELECT * FROM relationship_assertion_heads
+                            WHERE relationship_origin_db_id=r.relationship_origin_db_id AND relationship_id=r.relationship_id
+                            ORDER BY issuer_origin_db_id,assertion_id) h
+                        LEFT JOIN relationship_local_admissions a ON a.issuer_origin_db_id=h.issuer_origin_db_id
+                            AND a.assertion_id=h.assertion_id)),
+                    'events',json((SELECT json_group_array(json_object('seq',seq,'id',id,'stream_kind',stream_kind,
+                        'stream_id',stream_id,'version',stream_version,'type',type,'payload',json(payload),
+                        'actor',actor,'issuer',issuer_origin_db_id,'origin',relationship_origin_db_id,
+                        'rid',relationship_id,'act',act,'occurred_at',occurred_at,'ingested_at',ingested_at))
+                        FROM (SELECT * FROM relationship_events WHERE relationship_origin_db_id=r.relationship_origin_db_id
+                            AND relationship_id=r.relationship_id ORDER BY seq))),
+                    'activity',json((SELECT json_group_array(json_object('issuer',event_issuer_origin_db_id,
+                        'event',event_id,'ordinal',endpoint_ordinal,'role',endpoint_role,'portable_ref',portable_ref,
+                        'record_id',record_id,'type',event_type,'occurred_at',occurred_at)) FROM
+                        (SELECT * FROM relationship_endpoint_activity WHERE relationship_origin_db_id=r.relationship_origin_db_id
+                            AND relationship_id=r.relationship_id ORDER BY event_issuer_origin_db_id,event_id,endpoint_ordinal)))
+                ) FROM relationships r
+                JOIN relationship_endpoints s ON s.relationship_origin_db_id=r.relationship_origin_db_id
+                    AND s.relationship_id=r.relationship_id AND s.role='source' AND s.record_id=?1
+                JOIN relationship_endpoints t ON t.relationship_origin_db_id=r.relationship_origin_db_id
+                    AND t.relationship_id=r.relationship_id AND t.role='target' AND t.record_id=?2
+                LEFT JOIN effective_relationships e ON e.relationship_origin_db_id=r.relationship_origin_db_id
+                    AND e.relationship_id=r.relationship_id
+                LEFT JOIN relationship_legacy_links l ON l.relationship_origin_db_id=r.relationship_origin_db_id
+                    AND l.relationship_id=r.relationship_id
+                WHERE r.type_definition_id='legacy_link.v1' AND r.relationship_type='relates_to'"
+            ).bind(SOURCE).bind(TARGET).fetch_all(db.write_pool()).await.unwrap().into_iter()
+                .map(|text| serde_json::from_str::<Value>(&text).unwrap()).collect::<Vec<_>>();
+            assert!(
+                propositions.len() <= 1,
+                "singleton pinned directed proposition"
+            );
+            let relationship_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM relationships")
+                .fetch_one(db.write_pool())
+                .await
+                .unwrap();
+            assert_eq!(relationship_count, propositions.len() as i64);
+            json!({"records":records,"links":links,"relationship":propositions.first(),
+                "counts":[content_event_count(db).await,relationship_event_count(db).await,assertion_head_count(db).await]})
+        }
+        fn semantic_relationship(state: &Value) -> Value {
+            let r = &state["relationship"];
+            if r.is_null() {
+                return Value::Null;
+            }
+            let mut heads = r["heads"].as_array().unwrap().iter().map(|h| json!({
+                "stance":h["stance"],"state":h["state"],"claimant":h["claimant"],
+                "rationale":h["rationale"],"class":h["admission"]["admission_class"],
+                "local_state":h["local_state"],"parents":h["parents"].as_array().unwrap().len()
+            })).collect::<Vec<_>>();
+            heads.sort_by_key(Value::to_string);
+            json!({"status":r["existing"]["status"],"effective":r["existing"]["effective_state"],
+                "epistemic":r["existing"]["epistemic_state"],"support":r["existing"]["support_count"],
+                "contest":r["existing"]["contest_count"],"note":r["legacy"]["note"],"heads":heads})
+        }
+        fn semantic_records(state: &Value) -> Value {
+            json!(state["records"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| {
+                    let mut fields = serde_json::Map::new();
+                    for field in [
+                        "id",
+                        "type",
+                        "kind",
+                        "name",
+                        "body",
+                        "summary",
+                        "home_id",
+                        "lifecycle",
+                        "owner_id",
+                        "persistence",
+                        "maturity",
+                        "deleted_at",
+                        "archived",
+                        "is_current",
+                        "successor_count",
+                        "policy_anchor_id",
+                        "claimed_by_account",
+                        "claimed_run_key",
+                        "claimed_at",
+                        "previous_seq",
+                        "policy",
+                        "times",
+                    ] {
+                        fields.insert(field.into(), r[field].clone());
+                    }
+                    fields.insert(
+                        "facets".into(),
+                        json!(r["facets"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .map(|f| json!([f["key"], f["value"], f["vocab_ref"]]))
+                            .collect::<Vec<_>>()),
+                    );
+                    Value::Object(fields)
+                })
+                .collect::<Vec<_>>())
+        }
+        fn check_uuid(value: &Value) {
+            let id = uuid::Uuid::parse_str(value.as_str().unwrap()).unwrap();
+            assert_eq!(id.get_version_num(), 4);
+            assert_eq!(json!(id.to_string()), *value);
+        }
+        fn check_identity(state: &Value, origin: &str) {
+            let r = &state["relationship"];
+            let i = &r["identity"];
+            assert_eq!(i["origin"], origin);
+            check_uuid(&i["rid"]);
+            assert_eq!(i["key"], key(origin));
+            assert_eq!(i["type"], "relates_to");
+            assert_eq!(i["definition"], "legacy_link.v1");
+            assert_eq!(i["semantics"], "directed");
+            assert_eq!(i["qualifiers"], json!({"relationship_token":"relates_to"}));
+            assert_eq!(i["reducer"], "legacy_link");
+            assert_eq!(i["reducer_version"], 1);
+            assert_eq!(i["revision"], 1);
+            assert_eq!(i["stream_version"], 1);
+            assert_eq!(i["created_issuer"], origin);
+            assert_eq!(i["last_issuer"], origin);
+            assert_eq!(i["created_event"], i["last_event"]);
+            let created = &r["events"][0];
+            assert_eq!(created["id"], i["created_event"]);
+            assert_eq!(created["issuer"], origin);
+            assert_eq!(created["origin"], origin);
+            assert_eq!(created["rid"], i["rid"]);
+            assert_eq!(created["stream_id"], i["rid"]);
+            assert_eq!(created["type"], "relationship.created.v1");
+            assert_eq!(created["payload"]["canonical_proposition_key"], i["key"]);
+            assert_eq!(
+                created["payload"]["legacy_link"]["note"],
+                r["legacy"]["note"]
+            );
+            assert_eq!(r["legacy"]["token"], "relates_to");
+            assert_eq!(r["legacy"]["source_facts"], json!([]));
+            assert_eq!(r["existing"]["relationship_id"], i["rid"]);
+            assert_eq!(r["existing"]["status"], "active");
+            assert_eq!(
+                r["endpoints"],
+                json!([
+                    {"ordinal":0,"role":"source","portable_ref":portable(origin,SOURCE),"record_id":SOURCE,"type":"Document","kind":"note"},
+                    {"ordinal":1,"role":"target","portable_ref":portable(origin,TARGET),"record_id":TARGET,"type":"Document","kind":"note"}
+                ])
+            );
+            // Decode the real portable refs too, rather than normalizing them blindly.
+            for (endpoint, id) in r["endpoints"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .zip([SOURCE, TARGET])
+            {
+                let (local_origin, encoded) = endpoint["portable_ref"]
+                    .as_str()
+                    .unwrap()
+                    .split_once('/')
+                    .unwrap();
+                assert_eq!(local_origin, origin);
+                assert_eq!(URL_SAFE_NO_PAD.decode(encoded).unwrap(), id.as_bytes());
+            }
+        }
+        async fn public_action(
+            db: &crate::Db,
+            caller: &Caller,
+            add: bool,
+            note: Option<&str>,
+        ) -> Value {
+            let before = observe(db).await;
+            let receipt = hosted_registry()
+                .call(
+                    db.clone(),
+                    caller.clone(),
+                    "manage_links",
+                    arguments(add, note),
+                )
+                .await
+                .unwrap();
+            let after = observe(db).await;
+            let origin: String =
+                sqlx::query_scalar("SELECT origin_db_id FROM database_identity WHERE singleton=1")
+                    .fetch_one(db.write_pool())
+                    .await
+                    .unwrap();
+            check_identity(&after, &origin);
+            let old = &before["relationship"];
+            let new = &after["relationship"];
+            let i = &new["identity"];
+            let old_heads = old["heads"].as_array().cloned().unwrap_or_default();
+            let new_heads = new["heads"].as_array().unwrap();
+            let old_events = old["events"].as_array().cloned().unwrap_or_default();
+            let events = new["events"].as_array().unwrap();
+            assert_eq!(&events[..old_events.len()], old_events.as_slice());
+            let tail = &events[old_events.len()..];
+            assert_eq!(tail.len(), if old.is_null() { 2 } else { 1 });
+            assert_eq!(new_heads.len(), old_heads.len() + 1);
+            for head in &old_heads {
+                assert!(new_heads.contains(head), "preserve exact old heads");
+            }
+            if !old.is_null() {
+                assert_eq!(i, &old["identity"]);
+                assert_eq!(new["legacy"], old["legacy"]);
+                assert_eq!(new["endpoints"], old["endpoints"]);
+                assert_ne!(
+                    new["existing"]["assertion_set_digest"],
+                    old["existing"]["assertion_set_digest"]
+                );
+            }
+            assert_eq!(receipt["format"], "native.manage-links-write.v1");
+            assert_eq!(receipt["action"], if add { "add" } else { "remove" });
+            assert_eq!(receipt["status"], if add { "added" } else { "removed" });
+            assert_eq!(receipt["source_id"], SOURCE);
+            assert_eq!(receipt["target_id"], TARGET);
+            assert_eq!(receipt["relationship"], "relates_to");
+            assert_eq!(
+                receipt["previous_seq"],
+                before["records"][0]["previous_seq"]
+            );
+            assert_eq!(receipt["write_receipt"]["kind"], "relationship_assertion");
+            for field in [
+                "relationship_origin_db_id",
+                "relationship_id",
+                "assertion_id",
+                "action_attestation_id",
+                "output_events",
+            ] {
+                assert_eq!(receipt[field], receipt["write_receipt"][field]);
+            }
+            assert_eq!(receipt["relationship_origin_db_id"], origin);
+            assert_eq!(receipt["relationship_id"], i["rid"]);
+            let outputs = tail.iter().map(|e| json!({"domain":"relationship","issuer_origin_db_id":e["issuer"],"event_id":e["id"]})).collect::<Vec<_>>();
+            assert_eq!(receipt["output_events"], json!(outputs));
+            for (index, event) in tail.iter().enumerate() {
+                let created = old.is_null() && index == 0;
+                assert_eq!(event["issuer"], origin);
+                assert_eq!(event["origin"], origin);
+                assert_eq!(event["rid"], i["rid"]);
+                assert_eq!(event["actor"], caller.actor());
+                assert_eq!(event["version"], 1);
+                assert_eq!(event["act"], receipt["act"]);
+                assert!(event["act"].as_i64().unwrap() > 0);
+                check_uuid(&event["id"]);
+                assert_eq!(
+                    event["type"],
+                    if created {
+                        "relationship.created.v1"
+                    } else {
+                        "assertion.created.v1"
+                    }
+                );
+                assert_eq!(
+                    event["stream_kind"],
+                    if created { "relationship" } else { "assertion" }
+                );
+                assert_eq!(
+                    &event["stream_id"],
+                    if created {
+                        &i["rid"]
+                    } else {
+                        &receipt["assertion_id"]
+                    }
+                );
+            }
+            let head = new_heads
+                .iter()
+                .find(|h| h["id"] == receipt["assertion_id"])
+                .unwrap();
+            assert!(!old_heads.iter().any(|h| h["id"] == head["id"]));
+            check_uuid(&head["id"]);
+            check_uuid(&receipt["action_attestation_id"]);
+            let assertion_event = tail.last().unwrap();
+            let payload = &assertion_event["payload"];
+            let stance = if add { "support" } else { "contest" };
+            let class = if add {
+                "source_authorised_support"
+            } else {
+                "source_authorised_contest"
+            };
+            let parents = old_heads.iter().filter(|h|h["state"]=="active").map(|h|json!({
+                "assertion_issuer_origin_db_id":h["issuer"],"assertion_id":h["id"],
+                "head_event_issuer_origin_db_id":h["last_issuer"],"head_event_id":h["last_event"],
+                "head_stream_version":h["version"]
+            })).collect::<Vec<_>>();
+            let previous_highwater = old_events
+                .last()
+                .map(|e| e["seq"].as_i64().unwrap())
+                .unwrap_or(0);
+            assert!(tail
+                .iter()
+                .all(|e| e["seq"].as_i64().unwrap() > previous_highwater));
+            assert_eq!(payload["causal_parents"], json!(parents));
+            assert_eq!(head["parents"], payload["causal_parents"]);
+            assert_eq!(
+                payload["relationship"],
+                json!({"relationship_origin_db_id":origin,"relationship_id":i["rid"],"relationship_revision":1})
+            );
+            assert_eq!(
+                payload["relationship_created_event"],
+                json!({"issuer_origin_db_id":i["created_issuer"],"event_id":i["created_event"]})
+            );
+            assert_eq!(head["relationship_created_issuer"], i["created_issuer"]);
+            assert_eq!(head["relationship_created_event"], i["created_event"]);
+            assert_eq!(head["origin"], origin);
+            assert_eq!(head["rid"], i["rid"]);
+            assert_eq!(head["issuer"], origin);
+            assert_eq!(head["version"], 1);
+            assert_eq!(head["stance"], stance);
+            assert_eq!(head["state"], "active");
+            assert_eq!(head["claimant"], caller.credential());
+            assert_eq!(
+                head["rationale"],
+                format!(
+                    "manage_links compatibility {}",
+                    if add { "add" } else { "remove" }
+                )
+            );
+            for (field, payload_field) in [
+                ("stance", "stance"),
+                ("claimant", "semantic_claimant"),
+                ("rationale", "rationale"),
+                ("admission", "origin_admission"),
+                ("attestation", "authoring_action_attestation_id"),
+            ] {
+                assert_eq!(head[field], payload[payload_field]);
+            }
+            for field in ["created_issuer", "last_issuer"] {
+                assert_eq!(head[field], origin);
+            }
+            for field in ["created_event", "last_event"] {
+                assert_eq!(head[field], assertion_event["id"]);
+            }
+            assert_eq!(head["attestation"], receipt["action_attestation_id"]);
+            assert!(!old_heads
+                .iter()
+                .any(|old_head| old_head["attestation"] == head["attestation"]));
+            assert_eq!(head["admission"]["admission_class"], class);
+            assert_eq!(
+                head["admission"]["relationship_type_definition"],
+                "legacy_link.v1"
+            );
+            assert_eq!(
+                head["admission"]["authority_anchor"],
+                json!({"endpoint_role":"source","endpoint_ref":portable(&origin,SOURCE)})
+            );
+            assert_eq!(
+                head["admission"]["admission_rule"],
+                "edit_source_view_target.v1"
+            );
+            assert_eq!(
+                head["admission"]["authoring_action_attestation_id"],
+                receipt["action_attestation_id"]
+            );
+            assert_eq!(head["admission"]["schema_version"], 1);
+            let authorization = json!({"schema_version":1,"principal":caller.credential(),
+                "operation":"manage_links","relationship_type_definition":"legacy_link.v1",
+                "admission_class":class,"authority_anchor":{"endpoint_role":"source",
+                    "endpoint_ref":portable(&origin,SOURCE)},"admission_rule":"edit_source_view_target.v1"});
+            assert_eq!(
+                head["admission"]["authorization_decision_digest"],
+                hex::encode(Sha256::digest(serde_jcs::to_vec(&authorization).unwrap()))
+            );
+            assert_eq!(head["local_state"], "admitted");
+            assert_eq!(head["local_class"], class);
+            assert_eq!(head["local_definition"], "legacy_link.v1");
+            let attestation: (String,String,String) = sqlx::query_as(
+                "SELECT principal,operation,issuer_origin_database_id FROM provenance_action_attestations WHERE id=?"
+            ).bind(receipt["action_attestation_id"].as_str().unwrap()).fetch_one(db.write_pool()).await.unwrap();
+            assert_eq!(
+                attestation,
+                (
+                    caller.credential().into(),
+                    "manage_links".into(),
+                    origin.clone()
+                )
+            );
+            let actual_outputs: Vec<String> = sqlx::query_scalar(
+                "SELECT output_event_id FROM provenance_action_outputs WHERE action_attestation_id=? AND output_domain='relationship' ORDER BY ordinal"
+            ).bind(receipt["action_attestation_id"].as_str().unwrap()).fetch_all(db.write_pool()).await.unwrap();
+            assert_eq!(
+                actual_outputs,
+                tail.iter()
+                    .map(|e| e["id"].as_str().unwrap().to_owned())
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(after["counts"][0], before["counts"][0]);
+            assert_eq!(
+                after["counts"][1].as_i64().unwrap(),
+                before["counts"][1].as_i64().unwrap() + tail.len() as i64
+            );
+            assert_eq!(
+                after["counts"][2].as_i64().unwrap(),
+                before["counts"][2].as_i64().unwrap() + 1
+            );
+            for (index, (old_record, new_record)) in before["records"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .zip(after["records"].as_array().unwrap())
+                .enumerate()
+            {
+                if index == 2 {
+                    assert_eq!(new_record, old_record);
+                    continue;
+                }
+                let mut comparable = new_record.clone();
+                comparable["last_activity_at"] = old_record["last_activity_at"].clone();
+                assert_eq!(&comparable, old_record);
+                if new_record["last_activity_at"] != old_record["last_activity_at"] {
+                    assert!(tail
+                        .iter()
+                        .any(|e| e["occurred_at"] == new_record["last_activity_at"]));
+                    assert!(
+                        new_record["last_activity_at"].as_str().unwrap()
+                            >= old_record["last_activity_at"].as_str().unwrap()
+                    );
+                }
+            }
+            // Activity is backed by real endpoint/event coordinates, even if
+            // physical record activity is unchanged by this implementation.
+            let activity = new["activity"].as_array().unwrap();
+            assert_eq!(activity.len(), events.len() * 2);
+            for event in events {
+                for (ordinal, id) in [SOURCE, TARGET].into_iter().enumerate() {
+                    assert!(activity.contains(&json!({"issuer":event["issuer"],"event":event["id"],
+                        "ordinal":ordinal,"role":if ordinal==0 {"source"} else {"target"},
+                        "portable_ref":portable(&origin,id),"record_id":id,"type":event["type"],"occurred_at":event["occurred_at"]})));
+                }
+            }
+            let unrelated = |state: &Value| {
+                state["links"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|l| l["relationship"] != "relates_to")
+                    .cloned()
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(unrelated(&after), unrelated(&before));
+            let compatibility = after["links"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|l| l["relationship"] == "relates_to")
+                .collect::<Vec<_>>();
+            assert_eq!(compatibility.len(), usize::from(add));
+            if add {
+                let link = compatibility[0];
+                assert_eq!(
+                    link["id"],
+                    format!("rel:{}:{}", origin, i["rid"].as_str().unwrap())
+                );
+                assert_eq!(link["source_id"], SOURCE);
+                assert_eq!(link["target_id"], TARGET);
+                assert_eq!(link["note"], new["legacy"]["note"]);
+                assert_eq!(link["created_at"], new["legacy"]["created_at"]);
+                if !old.is_null() {
+                    assert_eq!(
+                        Some(link),
+                        before["links"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .find(|l| l["relationship"] == "relates_to")
+                    );
+                }
+            }
+            let support = old_heads
+                .iter()
+                .filter(|h| h["stance"] == "support")
+                .count()
+                + usize::from(add);
+            let contest = old_heads
+                .iter()
+                .filter(|h| h["stance"] == "contest")
+                .count()
+                + usize::from(!add);
+            assert_eq!(new["existing"]["support_count"], json!(support));
+            assert_eq!(new["existing"]["contest_count"], json!(contest));
+            assert_eq!(
+                new["existing"]["effective_state"],
+                if add { "active" } else { "inactive" }
+            );
+            assert_eq!(
+                new["existing"]["epistemic_state"],
+                if add { "supported" } else { "contested" }
+            );
+            receipt
+        }
+        async fn initialize(db: &crate::Db, supports: usize, inactive: bool) -> Caller {
+            for (id, name, capability) in [
+                (SOURCE, "Link oracle source", Capability::Edit),
+                (TARGET, "Link oracle target", Capability::View),
+                (SENTINEL, "Link oracle sentinel", Capability::Manage),
+            ] {
+                assert_eq!(crate::store::create_record(db,json!({"id":id,"type":"Document","kind":"note",
+                    "name":name,"body":"Keep body","summary":"Keep summary","home_id":"native:unfiled",
+                    "lifecycle":"open","maturity":"draft","persistence":"enduring"})).await.unwrap(),id);
+                replace_explicit_policy(
+                    db,
+                    "test:sql-write-link-parity",
+                    id,
+                    vec![AllowEntry::account("plan-author", capability)],
+                )
+                .await
+                .unwrap();
+                crate::store::set_facet(
+                    db,
+                    id,
+                    crate::events::FacetSetPayload {
+                        key: "fixture_marker".into(),
+                        value: Some("keep me".into()),
+                        vocab_ref: None,
+                        as_of: None,
+                        observation_only: false,
+                    },
+                )
+                .await
+                .unwrap();
+            }
+            let caller = Caller::authenticated("plan-author");
+            let unrelated = hosted_registry().call(db.clone(),caller.clone(),"manage_links",json!({
+                "action":"add","source_id":SOURCE,"target_id":SENTINEL,"relationship":"mentions","note":"Keep unrelated"
+            })).await.unwrap();
+            assert_eq!(unrelated["write_receipt"]["kind"], "content_event");
+            for index in 0..supports {
+                public_action(
+                    db,
+                    &caller,
+                    true,
+                    Some(if index == 0 {
+                        "First note"
+                    } else {
+                        "Ignored note"
+                    }),
+                )
+                .await;
+            }
+            if inactive {
+                public_action(db, &caller, false, None).await;
+            }
+            caller
+        }
+
+        // Seed states and operation meanings are pinned independently of SQL.
+        for (label, supports, inactive, add, note, intent, refusal) in [
+            (
+                "create-note",
+                0,
+                false,
+                true,
+                Some("First note"),
+                "would_create_relationship",
+                None,
+            ),
+            (
+                "create-no-note",
+                0,
+                false,
+                true,
+                None,
+                "would_create_relationship",
+                None,
+            ),
+            (
+                "append-support",
+                1,
+                false,
+                true,
+                Some("Ignored note"),
+                "would_append_support",
+                None,
+            ),
+            (
+                "contest-two-supports",
+                2,
+                false,
+                false,
+                None,
+                "would_contest",
+                None,
+            ),
+            (
+                "absent-remove",
+                0,
+                false,
+                false,
+                None,
+                "",
+                Some("cannot remove link: no 'relates_to' link"),
+            ),
+            (
+                "inactive-remove",
+                1,
+                true,
+                false,
+                None,
+                "",
+                Some("inactive or causally unresolved"),
+            ),
+        ] {
+            let p = create_database(":memory:").await.unwrap();
+            let s = create_database(":memory:").await.unwrap();
+            let p_caller = initialize(&p, supports, inactive).await;
+            let s_caller = initialize(&s, supports, inactive).await;
+            let p_origin: String =
+                sqlx::query_scalar("SELECT origin_db_id FROM database_identity WHERE singleton=1")
+                    .fetch_one(p.write_pool())
+                    .await
+                    .unwrap();
+            let s_origin: String =
+                sqlx::query_scalar("SELECT origin_db_id FROM database_identity WHERE singleton=1")
+                    .fetch_one(s.write_pool())
+                    .await
+                    .unwrap();
+            assert_ne!(p_origin, s_origin, "independently initialized origins");
+            for origin in [&p_origin, &s_origin] {
+                assert_eq!(origin.len(), 36);
+                assert!(origin.starts_with("ndb_"));
+                assert!(origin[4..]
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+            }
+            let server = sql_write_opted_in_server(&p, p_caller).await;
+            let p_before = observe(&p).await;
+            let s_before = observe(&s).await;
+            assert_eq!(
+                semantic_relationship(&p_before),
+                semantic_relationship(&s_before),
+                "{label}"
+            );
+            assert_eq!(
+                semantic_records(&p_before),
+                semantic_records(&s_before),
+                "{label}"
+            );
+            for state in [&p_before, &s_before] {
+                assert_eq!(state["counts"][2], json!(supports + usize::from(inactive)));
+                assert_eq!(state["relationship"].is_null(), supports == 0);
+                for (record, capability) in state["records"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .zip(["edit", "view", "manage"])
+                {
+                    assert_eq!(record["type"], "Document");
+                    assert_eq!(record["kind"], "note");
+                    assert_eq!(record["body"], "Keep body");
+                    assert_eq!(record["summary"], "Keep summary");
+                    assert_eq!(record["archived"], 0);
+                    assert_eq!(record["successor_count"], 0);
+                    assert_eq!(record["facets"].as_array().unwrap().len(), 1);
+                    assert_eq!(record["facets"][0]["key"], "fixture_marker");
+                    assert_eq!(record["facets"][0]["value"], "keep me");
+                    assert_eq!(record["observations"].as_array().unwrap().len(), 1);
+                    assert_eq!(
+                        record["policy"],
+                        json!([{"subject_kind":"account","subject_id":"plan-author","effect":"allow","capability":capability}])
+                    );
+                }
+                let noise = state["links"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|l| l["relationship"] == "mentions")
+                    .unwrap();
+                assert_eq!(noise["source_id"], SOURCE);
+                assert_eq!(noise["target_id"], SENTINEL);
+                assert_eq!(noise["note"], "Keep unrelated");
+                if supports > 0 {
+                    let r = &state["relationship"];
+                    assert_eq!(r["legacy"]["note"], "First note");
+                    assert_eq!(r["existing"]["support_count"], json!(supports));
+                    assert_eq!(r["existing"]["contest_count"], json!(usize::from(inactive)));
+                    assert_eq!(
+                        r["existing"]["effective_state"],
+                        if inactive { "inactive" } else { "active" }
+                    );
+                }
+            }
+            let op = if add { "add_link" } else { "remove_link" };
+            let statement = format!("SELECT id AS record_id, '{op}' AS op, 'relates_to' AS key, '{TARGET}' AS value FROM records WHERE name = 'Link oracle source'");
+            let response = sql_write_prepare_with_note(&server, &statement, note).await;
+            assert_eq!(
+                observe(&p).await,
+                p_before,
+                "prepare/refusal leaves exact P state unchanged: {label}"
+            );
+            let plan = structured_result(&response);
+            if let Some(detail) = refusal {
+                assert_eq!(response["result"]["isError"], true, "{response}");
+                assert_eq!(plan_error_code(&response), "preparation_rejected");
+                assert!(response.to_string().contains(detail), "{response}");
+                assert!(plan.get("plan_id").is_none());
+                assert!(plan.get("effect").is_none());
+                let error = hosted_registry()
+                    .call(
+                        s.clone(),
+                        s_caller.clone(),
+                        "manage_links",
+                        arguments(add, note),
+                    )
+                    .await
+                    .unwrap_err();
+                assert!(error.to_string().contains(detail), "{error}");
+                assert_eq!(
+                    observe(&s).await,
+                    s_before,
+                    "public refusal leaves exact S state unchanged: {label}"
+                );
+                continue;
+            }
+            assert_eq!(response["result"]["isError"], false, "{response}");
+            assert_eq!(plan["preparation_mutated"], false);
+            let source_seq = &p_before["records"][0]["previous_seq"];
+            let target_seq = &p_before["records"][1]["previous_seq"];
+            let existing = if supports == 0 {
+                Value::Null
+            } else {
+                p_before["relationship"]["existing"].clone()
+            };
+            if supports > 0 {
+                check_identity(&p_before, &p_origin);
+            }
+            let expected = json!({"kind":"sql_write_preview","target_count":1,"op_count":1,"changed":true,
+                "reason":"facade link probe","targets":[{"record_id":SOURCE,"previous_seq":source_seq,"ops":[{
+                    "op":op,"relationship":"relates_to","route":"directed_legacy_link","source_id":SOURCE,
+                    "source_previous_seq":source_seq,"target_id":TARGET,"target_previous_seq":target_seq,
+                    "proposition_key":key(&p_origin),"existing":existing,"intent":intent,"note":note,
+                    "note_applied":supports==0 && note.is_some(),"changed":true}]}]});
+            assert_eq!(
+                plan["effect"], expected,
+                "whole signed before+intent: {label}"
+            );
+            let stored = plan_store::PlanStore::open_for_database(p.path())
+                .await
+                .unwrap()
+                .load(
+                    plan["plan_id"].as_str().unwrap(),
+                    chrono::Utc::now().timestamp_millis(),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(stored.state, plan_store::StoredState::Prepared));
+            assert_eq!(stored.payload["effect"], expected);
+            public_action(&s, &s_caller, add, note).await;
+            let s_after = observe(&s).await;
+            let r = &s_after["relationship"];
+            assert_eq!(
+                r["legacy"]["note"],
+                json!(if supports == 0 {
+                    note
+                } else {
+                    Some("First note")
+                })
+            );
+            assert_eq!(
+                r["existing"]["support_count"],
+                json!(supports + usize::from(add))
+            );
+            assert_eq!(r["existing"]["contest_count"], json!(usize::from(!add)));
+            assert_eq!(r["heads"].as_array().unwrap().len(), supports + 1);
+            assert_eq!(
+                observe(&p).await,
+                p_before,
+                "P remains a preview after the independent S transition"
+            );
+        }
+    }
+
+    /// Add the directed link through the real singular tool, so the preview and
+    /// the execute-shaped path are exercised against the same route.
+    async fn facade_add_link(
+        db: &crate::Db,
+        caller: &Caller,
+        source: &str,
+        target: &str,
+        note: &str,
+    ) {
+        let receipt = hosted_registry()
+            .call(
+                db.clone(),
+                caller.clone(),
+                "manage_links",
+                json!({
+                    "action":"add","source_id":source,"target_id":target,
+                    "relationship":"relates_to","note":note
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(receipt["action"], json!("add"));
+    }
+
+    /// A directed link preview revalidates to `preview_current` with no claim,
+    /// no dispatch, and no event; a repeated confirmation agrees.
+    #[tokio::test]
+    async fn sql_write_link_execute_confirms_preview_current_without_mutation() {
+        let db = create_database(":memory:").await.unwrap();
+        let (source, target, caller) = sql_write_link_fixture(&db).await;
+        let server = sql_write_opted_in_server(&db, caller).await;
+        let prepared = sql_write_prepare_with_note(
+            &server,
+            &sql_write_link_statement(&source, &target),
+            Some("e0-harness"),
+        )
+        .await;
+        assert_eq!(prepared["result"]["isError"], false, "{prepared}");
+        let plan = structured_result(&prepared);
+        assert_eq!(plan["preparation_mutated"], false);
+        assert_eq!(
+            plan["effect"]["targets"][0]["ops"][0]["op"],
+            json!("add_link")
+        );
+        assert_eq!(
+            plan["effect"]["targets"][0]["ops"][0]["intent"],
+            json!("would_create_relationship")
+        );
+        let plan_id = plan["plan_id"].as_str().unwrap();
+        let target_text = plan["target"].as_str().unwrap();
+        let effect_summary = plan["effect_summary"].as_str().unwrap();
+        let events_before = content_event_count(&db).await;
+        let relationship_events_before = relationship_event_count(&db).await;
+        let assertion_heads_before = assertion_head_count(&db).await;
+        let confirmed = sql_write_execute(&server, plan_id, target_text, effect_summary).await;
+        assert_eq!(confirmed["result"]["isError"], false, "{confirmed}");
+        let current = structured_result(&confirmed);
+        assert_eq!(current["preview_current"], true);
+        assert_eq!(current["committed"], false);
+        assert_eq!(current["source_dispatch_count"], 0);
+        assert_eq!(current["preparation_mutated"], false);
+        assert_sql_write_plan_prepared(&db, plan_id).await;
+        assert_eq!(content_event_count(&db).await, events_before);
+        assert_eq!(
+            relationship_event_count(&db).await,
+            relationship_events_before,
+            "preview-current must append no relationship event"
+        );
+        assert_eq!(
+            assertion_head_count(&db).await,
+            assertion_heads_before,
+            "preview-current must not add a relationship assertion"
+        );
+        // A repeated confirmation agrees: the plan is still Prepared and no
+        // event was appended.
+        let repeated = sql_write_execute(&server, plan_id, target_text, effect_summary).await;
+        assert_eq!(repeated["result"]["isError"], false, "{repeated}");
+        assert_eq!(structured_result(&repeated)["preview_current"], true);
+        assert_sql_write_plan_prepared(&db, plan_id).await;
+        assert_eq!(content_event_count(&db).await, events_before);
+        assert_eq!(
+            relationship_event_count(&db).await,
+            relationship_events_before
+        );
+        assert_eq!(assertion_head_count(&db).await, assertion_heads_before);
+    }
+
+    /// A second support assertion appended to the same proposition between
+    /// prepare and execute is drift. It can leave effective/epistemic state and
+    /// both endpoint content seqs unchanged, so this proves the plan goes
+    /// `plan_stale` from the signed assertion-set state, with no claim and no
+    /// event from the execute-shaped call.
+    #[tokio::test]
+    async fn sql_write_link_support_appended_between_prepare_and_execute_reports_plan_stale() {
+        let db = create_database(":memory:").await.unwrap();
+        let (source, target, caller) = sql_write_link_fixture(&db).await;
+        let statement = sql_write_link_statement(&source, &target);
+        // Establish the proposition (one support) before preparing.
+        facade_add_link(&db, &caller, &source, &target, "first").await;
+        let server = sql_write_opted_in_server(&db, caller.clone()).await;
+        let prepared = sql_write_prepare_with_note(&server, &statement, Some("first")).await;
+        assert_eq!(prepared["result"]["isError"], false, "{prepared}");
+        let plan = structured_result(&prepared);
+        let op = &plan["effect"]["targets"][0]["ops"][0];
+        assert_eq!(op["intent"], json!("would_append_support"));
+        assert_eq!(op["note_applied"], json!(false));
+        let first_digest = op["existing"]["assertion_set_digest"].clone();
+        let first_support = op["existing"]["support_count"].clone();
+        let plan_id = plan["plan_id"].as_str().unwrap().to_string();
+        let target_text = plan["target"].as_str().unwrap().to_string();
+        let effect_summary = plan["effect_summary"].as_str().unwrap().to_string();
+        let content_events_before = content_event_count(&db).await;
+        // Append a SECOND support: relationship-only, so no endpoint content
+        // seq moves.
+        facade_add_link(&db, &caller, &source, &target, "second").await;
+        assert_eq!(
+            content_event_count(&db).await,
+            content_events_before,
+            "a relationship append moves no endpoint content seq"
+        );
+        let assertion_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM relationship_assertion_heads")
+                .fetch_one(db.write_pool())
+                .await
+                .unwrap();
+        assert!(
+            assertion_count >= 2,
+            "expected an appended support assertion, got {assertion_count}"
+        );
+        let relationship_events_before = relationship_event_count(&db).await;
+        let stale = sql_write_execute(&server, &plan_id, &target_text, &effect_summary).await;
+        assert_eq!(plan_error_code(&stale), "plan_stale", "{stale}");
+        assert_sql_write_plan_prepared(&db, &plan_id).await;
+        assert_eq!(
+            content_event_count(&db).await,
+            content_events_before,
+            "a stale execute-shaped call appends no content event"
+        );
+        assert_eq!(
+            relationship_event_count(&db).await,
+            relationship_events_before,
+            "a stale execute-shaped call appends no relationship event"
+        );
+        assert_eq!(
+            assertion_head_count(&db).await,
+            assertion_count,
+            "a stale execute-shaped call adds no relationship assertion"
+        );
+        // Re-preparing against the new state observes both the changed
+        // assertion-set digest and the changed support count.
+        let reprepared = sql_write_prepare_with_note(&server, &statement, Some("first")).await;
+        let reprepared_op = &structured_result(&reprepared)["effect"]["targets"][0]["ops"][0];
+        assert_ne!(
+            reprepared_op["existing"]["assertion_set_digest"],
+            first_digest
+        );
+        assert_ne!(reprepared_op["existing"]["support_count"], first_support);
+    }
+
+    /// Creating the same directed proposition through the singular tool between
+    /// prepare and execute is drift: a would-create plan can never stand in for
+    /// a would-append state. The endpoint content seqs do not move, so this is
+    /// detected from the signed proposition state, and the execute-shaped call
+    /// appends no content or relationship event and never claims the plan.
+    #[tokio::test]
+    async fn sql_write_link_created_between_prepare_and_execute_reports_plan_stale() {
+        let db = create_database(":memory:").await.unwrap();
+        let (source, target, caller) = sql_write_link_fixture(&db).await;
+        let statement = sql_write_link_statement(&source, &target);
+        let server = sql_write_opted_in_server(&db, caller.clone()).await;
+        let prepared = sql_write_prepare_with_note(&server, &statement, Some("first")).await;
+        assert_eq!(prepared["result"]["isError"], false, "{prepared}");
+        let plan = structured_result(&prepared);
+        assert_eq!(
+            plan["effect"]["targets"][0]["ops"][0]["intent"],
+            json!("would_create_relationship")
+        );
+        let plan_id = plan["plan_id"].as_str().unwrap().to_string();
+        let target_text = plan["target"].as_str().unwrap().to_string();
+        let effect_summary = plan["effect_summary"].as_str().unwrap().to_string();
+        let content_events_before = content_event_count(&db).await;
+        assert_eq!(assertion_head_count(&db).await, 0);
+        // The singular route creates the same proposition without touching
+        // either endpoint's content seq.
+        facade_add_link(&db, &caller, &source, &target, "created").await;
+        assert_eq!(
+            content_event_count(&db).await,
+            content_events_before,
+            "creating a relationship moves no endpoint content seq"
+        );
+        let assertion_heads_after_create = assertion_head_count(&db).await;
+        assert_eq!(assertion_heads_after_create, 1);
+        let relationship_events_after_create = relationship_event_count(&db).await;
+        let stale = sql_write_execute(&server, &plan_id, &target_text, &effect_summary).await;
+        assert_eq!(plan_error_code(&stale), "plan_stale", "{stale}");
+        assert_sql_write_plan_prepared(&db, &plan_id).await;
+        assert_eq!(content_event_count(&db).await, content_events_before);
+        assert_eq!(
+            relationship_event_count(&db).await,
+            relationship_events_after_create,
+            "the stale execute-shaped call appends no relationship event"
+        );
+        assert_eq!(
+            assertion_head_count(&db).await,
+            assertion_heads_after_create
+        );
+        // Re-preparing observes the now-existing proposition as an append.
+        let reprepared = sql_write_prepare_with_note(&server, &statement, Some("first")).await;
+        assert_eq!(
+            structured_result(&reprepared)["effect"]["targets"][0]["ops"][0]["intent"],
+            json!("would_append_support")
+        );
+    }
+
+    /// Editing an endpoint between prepare and execute moves its content seq and
+    /// the plan revalidates as `plan_stale` without claim or event.
+    #[tokio::test]
+    async fn sql_write_link_endpoint_version_drift_reports_plan_stale() {
+        let db = create_database(":memory:").await.unwrap();
+        let (source, target, caller) = sql_write_link_fixture(&db).await;
+        let server = sql_write_opted_in_server(&db, caller).await;
+        let prepared = sql_write_prepare_with_note(
+            &server,
+            &sql_write_link_statement(&source, &target),
+            Some("n"),
+        )
+        .await;
+        assert_eq!(prepared["result"]["isError"], false, "{prepared}");
+        let plan = structured_result(&prepared);
+        let plan_id = plan["plan_id"].as_str().unwrap().to_string();
+        let target_text = plan["target"].as_str().unwrap().to_string();
+        let effect_summary = plan["effect_summary"].as_str().unwrap().to_string();
+        let events_before = content_event_count(&db).await;
+        crate::store::update_record(&db, &target, json!({"name":"Link target edited"}))
+            .await
+            .unwrap();
+        let events_after_edit = content_event_count(&db).await;
+        assert!(
+            events_after_edit > events_before,
+            "the edit must append a content event"
+        );
+        let relationship_events_before = relationship_event_count(&db).await;
+        let stale = sql_write_execute(&server, &plan_id, &target_text, &effect_summary).await;
+        assert_eq!(plan_error_code(&stale), "plan_stale", "{stale}");
+        assert_sql_write_plan_prepared(&db, &plan_id).await;
+        assert_eq!(
+            content_event_count(&db).await,
+            events_after_edit,
+            "a stale execute-shaped call appends no content event"
+        );
+        assert_eq!(
+            relationship_event_count(&db).await,
+            relationship_events_before,
+            "a stale execute-shaped call appends no relationship event"
+        );
+        assert_eq!(assertion_head_count(&db).await, 0);
+    }
+
+    fn sql_write_remove_link_statement(source: &str, target: &str) -> String {
+        format!(
+            "SELECT id AS record_id, 'remove_link' AS op, 'relates_to' AS key, '{target}' AS value FROM records WHERE id = '{source}'"
+        )
+    }
+
+    /// Remove the directed link through the real singular tool, so the preview
+    /// and the execute-shaped path are exercised against the same route.
+    async fn facade_remove_link(db: &crate::Db, caller: &Caller, source: &str, target: &str) {
+        let receipt = hosted_registry()
+            .call(
+                db.clone(),
+                caller.clone(),
+                "manage_links",
+                json!({
+                    "action":"remove","source_id":source,"target_id":target,
+                    "relationship":"relates_to"
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(receipt["action"], json!("remove"));
+    }
+
+    /// A directed removal preview revalidates to `preview_current` with no
+    /// claim, no dispatch, and no event; a repeated confirmation agrees.
+    #[tokio::test]
+    async fn sql_write_remove_link_execute_confirms_preview_current_without_mutation() {
+        let db = create_database(":memory:").await.unwrap();
+        let (source, target, caller) = sql_write_link_fixture(&db).await;
+        facade_add_link(&db, &caller, &source, &target, "first").await;
+        let server = sql_write_opted_in_server(&db, caller).await;
+        let prepared = sql_write_prepare_with_note(
+            &server,
+            &sql_write_remove_link_statement(&source, &target),
+            None,
+        )
+        .await;
+        assert_eq!(prepared["result"]["isError"], false, "{prepared}");
+        let plan = structured_result(&prepared);
+        assert_eq!(plan["preparation_mutated"], false);
+        assert_eq!(
+            plan["effect"]["targets"][0]["ops"][0]["op"],
+            json!("remove_link")
+        );
+        assert_eq!(
+            plan["effect"]["targets"][0]["ops"][0]["intent"],
+            json!("would_contest")
+        );
+        let plan_id = plan["plan_id"].as_str().unwrap();
+        let target_text = plan["target"].as_str().unwrap();
+        let effect_summary = plan["effect_summary"].as_str().unwrap();
+        let events_before = content_event_count(&db).await;
+        let relationship_events_before = relationship_event_count(&db).await;
+        let assertion_heads_before = assertion_head_count(&db).await;
+        let confirmed = sql_write_execute(&server, plan_id, target_text, effect_summary).await;
+        assert_eq!(confirmed["result"]["isError"], false, "{confirmed}");
+        let current = structured_result(&confirmed);
+        assert_eq!(current["preview_current"], true);
+        assert_eq!(current["committed"], false);
+        assert_eq!(current["source_dispatch_count"], 0);
+        assert_eq!(current["preparation_mutated"], false);
+        assert_sql_write_plan_prepared(&db, plan_id).await;
+        assert_eq!(content_event_count(&db).await, events_before);
+        assert_eq!(
+            relationship_event_count(&db).await,
+            relationship_events_before,
+            "preview-current must append no relationship event"
+        );
+        assert_eq!(
+            assertion_head_count(&db).await,
+            assertion_heads_before,
+            "preview-current must not add a relationship assertion"
+        );
+        // A repeated confirmation agrees: the plan is still Prepared and no
+        // event was appended.
+        let repeated = sql_write_execute(&server, plan_id, target_text, effect_summary).await;
+        assert_eq!(repeated["result"]["isError"], false, "{repeated}");
+        assert_eq!(structured_result(&repeated)["preview_current"], true);
+        assert_sql_write_plan_prepared(&db, plan_id).await;
+        assert_eq!(content_event_count(&db).await, events_before);
+        assert_eq!(
+            relationship_event_count(&db).await,
+            relationship_events_before
+        );
+        assert_eq!(assertion_head_count(&db).await, assertion_heads_before);
+    }
+
+    /// Contesting the same proposition through the singular tool between
+    /// prepare and execute is drift: the signed assertion-set state moved, so
+    /// the execute-shaped call reports `plan_stale` with no claim and no
+    /// event from that call.
+    #[tokio::test]
+    async fn sql_write_remove_link_contested_between_prepare_and_execute_reports_plan_stale() {
+        let db = create_database(":memory:").await.unwrap();
+        let (source, target, caller) = sql_write_link_fixture(&db).await;
+        facade_add_link(&db, &caller, &source, &target, "first").await;
+        let statement = sql_write_remove_link_statement(&source, &target);
+        let server = sql_write_opted_in_server(&db, caller.clone()).await;
+        let prepared = sql_write_prepare_with_note(&server, &statement, None).await;
+        assert_eq!(prepared["result"]["isError"], false, "{prepared}");
+        let plan = structured_result(&prepared);
+        let op = &plan["effect"]["targets"][0]["ops"][0];
+        assert_eq!(op["intent"], json!("would_contest"));
+        let first_digest = op["existing"]["assertion_set_digest"].clone();
+        let first_contest = op["existing"]["contest_count"].clone();
+        let plan_id = plan["plan_id"].as_str().unwrap().to_string();
+        let target_text = plan["target"].as_str().unwrap().to_string();
+        let effect_summary = plan["effect_summary"].as_str().unwrap().to_string();
+        let content_events_before = content_event_count(&db).await;
+        // Contest through the singular route: relationship-only, so no
+        // endpoint content seq moves.
+        facade_remove_link(&db, &caller, &source, &target).await;
+        assert_eq!(
+            content_event_count(&db).await,
+            content_events_before,
+            "a relationship contest moves no endpoint content seq"
+        );
+        let relationship_events_before = relationship_event_count(&db).await;
+        let assertion_count = assertion_head_count(&db).await;
+        assert!(
+            assertion_count >= 2,
+            "expected an appended contest assertion, got {assertion_count}"
+        );
+        let stale = sql_write_execute(&server, &plan_id, &target_text, &effect_summary).await;
+        assert_eq!(plan_error_code(&stale), "plan_stale", "{stale}");
+        assert_sql_write_plan_prepared(&db, &plan_id).await;
+        assert_eq!(
+            content_event_count(&db).await,
+            content_events_before,
+            "a stale execute-shaped call appends no content event"
+        );
+        assert_eq!(
+            relationship_event_count(&db).await,
+            relationship_events_before,
+            "a stale execute-shaped call appends no relationship event"
+        );
+        assert_eq!(
+            assertion_head_count(&db).await,
+            assertion_count,
+            "a stale execute-shaped call adds no relationship assertion"
+        );
+        // The signed assertion-set state genuinely moved under the plan: read
+        // the contested digest straight from the projection and compare it
+        // with the digest the plan signed.
+        let contested_digest: Option<String> = sqlx::query_scalar(
+            "SELECT e.assertion_set_digest FROM relationships r
+               JOIN effective_relationships e
+                 ON e.relationship_origin_db_id = r.relationship_origin_db_id
+                AND e.relationship_id = r.relationship_id
+              LIMIT 1",
+        )
+        .fetch_optional(db.write_pool())
+        .await
+        .unwrap()
+        .flatten();
+        assert_ne!(
+            contested_digest.as_deref(),
+            first_digest.as_str(),
+            "the contest must move the signed assertion-set digest"
+        );
+        let _ = first_contest;
+        // Re-preparing against the new state refuses: the contest flipped the
+        // proposition out of the active state a removal requires.
+        let reprepared = sql_write_prepare_with_note(&server, &statement, None).await;
+        assert_eq!(reprepared["result"]["isError"], true, "{reprepared}");
+        assert!(
+            reprepared
+                .to_string()
+                .contains("inactive or causally unresolved"),
+            "re-preparing a contested proposition must refuse as inactive: {reprepared}"
+        );
+    }
+
+    /// Editing an endpoint between prepare and execute moves its content seq
+    /// and the removal plan revalidates as `plan_stale` without claim or
+    /// event.
+    #[tokio::test]
+    async fn sql_write_remove_link_endpoint_version_drift_reports_plan_stale() {
+        let db = create_database(":memory:").await.unwrap();
+        let (source, target, caller) = sql_write_link_fixture(&db).await;
+        facade_add_link(&db, &caller, &source, &target, "first").await;
+        let server = sql_write_opted_in_server(&db, caller).await;
+        let prepared = sql_write_prepare_with_note(
+            &server,
+            &sql_write_remove_link_statement(&source, &target),
+            None,
+        )
+        .await;
+        assert_eq!(prepared["result"]["isError"], false, "{prepared}");
+        let plan = structured_result(&prepared);
+        let plan_id = plan["plan_id"].as_str().unwrap().to_string();
+        let target_text = plan["target"].as_str().unwrap().to_string();
+        let effect_summary = plan["effect_summary"].as_str().unwrap().to_string();
+        let events_before = content_event_count(&db).await;
+        crate::store::update_record(&db, &target, json!({"name":"Remove target edited"}))
+            .await
+            .unwrap();
+        let events_after_edit = content_event_count(&db).await;
+        assert!(
+            events_after_edit > events_before,
+            "the edit must append a content event"
+        );
+        let relationship_events_before = relationship_event_count(&db).await;
+        let assertion_heads_before = assertion_head_count(&db).await;
+        let stale = sql_write_execute(&server, &plan_id, &target_text, &effect_summary).await;
+        assert_eq!(plan_error_code(&stale), "plan_stale", "{stale}");
+        assert_sql_write_plan_prepared(&db, &plan_id).await;
+        assert_eq!(
+            content_event_count(&db).await,
+            events_after_edit,
+            "a stale execute-shaped call appends no content event"
+        );
+        assert_eq!(
+            relationship_event_count(&db).await,
+            relationship_events_before,
+            "a stale execute-shaped call appends no relationship event"
+        );
+        assert_eq!(assertion_head_count(&db).await, assertion_heads_before);
     }
 
     /// A grown selection between prepare and execute is drift: the signed
@@ -7197,6 +9918,670 @@ mod tests {
             "test:sql-write-facade-demote",
             &target,
             vec![AllowEntry::account("plan-author", Capability::View)],
+        )
+        .await
+        .unwrap();
+        let events_before = content_event_count(&db).await;
+        let stale = sql_write_execute(&server, &plan_id, &target_text, &effect_summary).await;
+        assert_eq!(plan_error_code(&stale), "plan_stale", "{stale}");
+        assert_sql_write_plan_prepared(&db, &plan_id).await;
+        assert_eq!(content_event_count(&db).await, events_before);
+    }
+
+    fn sql_write_archive_statement(target: &str) -> String {
+        format!(
+            "SELECT id AS record_id, 'archive' AS op, NULL AS key, NULL AS value FROM records WHERE id = '{target}'"
+        )
+    }
+
+    async fn sql_write_archived_facet_rows(db: &crate::Db, target: &str) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM facet_values WHERE record_id = ? AND key = 'archived'",
+        )
+        .bind(target)
+        .fetch_one(db.write_pool())
+        .await
+        .unwrap()
+    }
+
+    /// Preparatory M2 archive effects use an independent public singular
+    /// oracle. SQL's incoming-successor refusal is intentionally stricter;
+    /// this does not establish committed SQL event parity.
+    #[tokio::test]
+    async fn sql_write_preview_archive_effect_matches_singular_archive_on_independent_fixtures() {
+        use crate::authorization::{replace_explicit_policy, AllowEntry, Capability};
+
+        const TARGET: &str = "ec00b000-0000-4000-8000-00000000d301";
+        const SENTINEL: &str = "ec00b000-0000-4000-8000-00000000d302";
+        const SUCCESSOR: &str = "ec00b000-0000-4000-8000-00000000d303";
+        const SUCCESSOR_NAME: &str = "Archive oracle successor";
+        const STATEMENT: &str = "SELECT id AS record_id, 'archive' AS op, NULL AS key, NULL AS value FROM records WHERE name = 'Archive oracle target'";
+
+        async fn archive(db: &crate::Db, caller: &Caller) -> Value {
+            hosted_registry()
+                .call(
+                    db.clone(),
+                    caller.clone(),
+                    "archive_record",
+                    json!({"id":TARGET,"archived":true,"reason":"facade probe"}),
+                )
+                .await
+                .unwrap()
+        }
+
+        async fn initialize(db: &crate::Db, archived: bool, successor: bool) -> Caller {
+            let mut records = vec![
+                (TARGET, "Archive oracle target"),
+                (SENTINEL, "Archive sentinel"),
+            ];
+            if successor {
+                records.push((SUCCESSOR, SUCCESSOR_NAME));
+            }
+            for (id, name) in records {
+                crate::store::create_record(
+                    db,
+                    json!({"id":id,"type":"Document","kind":"note","name":name,
+                        "body":"Fixed archive fixture body.","summary":"Fixed archive fixture summary",
+                        "home_id":"native:unfiled","lifecycle":"open","maturity":"draft",
+                        "persistence":"enduring"}),
+                )
+                .await
+                .unwrap();
+                replace_explicit_policy(
+                    db,
+                    "test:sql-write-archive-parity",
+                    id,
+                    vec![AllowEntry::account("plan-author", Capability::Manage)],
+                )
+                .await
+                .unwrap();
+            }
+            crate::store::set_facet(
+                db,
+                TARGET,
+                crate::events::FacetSetPayload {
+                    key: "fixture_marker".into(),
+                    value: Some("keep me".into()),
+                    vocab_ref: None,
+                    as_of: None,
+                    observation_only: false,
+                },
+            )
+            .await
+            .unwrap();
+            let caller = Caller::authenticated("plan-author");
+            facade_add_link(db, &caller, TARGET, SENTINEL, "Keep this link").await;
+            if archived {
+                let receipt = archive(db, &caller).await;
+                assert_eq!(receipt["id"], TARGET);
+                assert_eq!(receipt["archived"], true);
+                assert_eq!(receipt["changed"], true);
+            }
+            if successor {
+                let receipt = hosted_registry()
+                    .call(
+                        db.clone(),
+                        caller.clone(),
+                        "manage_links",
+                        json!({"action":"add","source_id":SUCCESSOR,"target_id":TARGET,
+                            "relationship":"supersedes","note":"Readiness fixture"}),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(receipt["action"], "add");
+                assert_eq!(receipt["write_receipt"]["kind"], "content_event");
+                assert_eq!(receipt["write_receipt"]["event"]["record_id"], SUCCESSOR);
+                assert_eq!(
+                    receipt["write_receipt"]["event"]["event_type"],
+                    "link.added"
+                );
+            }
+            caller
+        }
+
+        // Retain exact within-fixture state, including time, observations,
+        // policy, currency and link identities. No compiler effect helper.
+        async fn state(db: &crate::Db, id: &str) -> Value {
+            let text: String = sqlx::query_scalar(
+                "SELECT json_object(
+                    'id',id,'type',type,'kind',kind,'name',name,'body',body,'summary',summary,
+                    'home_id',home_id,'lifecycle',lifecycle,'owner_id',owner_id,
+                    'persistence',persistence,'maturity',maturity,'deleted_at',deleted_at,
+                    'archived',archived,'is_current',is_current,'successor_count',successor_count,
+                    'policy_anchor_id',policy_anchor_id,'claimed_by_account',claimed_by_account,
+                    'claimed_run_key',claimed_run_key,'claimed_at',claimed_at,
+                    'created_at',created_at,'updated_at',updated_at,'last_activity_at',last_activity_at,
+                    'previous_seq',(SELECT MAX(seq) FROM content_events WHERE record_id = records.id),
+                    'facets',json((SELECT json_group_array(json_object('id',id,'key',key,'value',value,
+                        'value_num',value_num,'vocab_ref',vocab_ref,'created_at',created_at)) FROM
+                        (SELECT * FROM facet_values WHERE record_id = records.id ORDER BY key))),
+                    'observations',json((SELECT json_group_array(json_object('id',id,'key',key,'value',value,
+                        'op',op,'vocab_ref',vocab_ref,'as_of',as_of,'observed_at',observed_at,'event_seq',event_seq)) FROM
+                        (SELECT * FROM facet_observations WHERE record_id = records.id ORDER BY key,as_of))),
+                    'times',json((SELECT json_group_array(json_object('key',key,'kind',kind,'all_day',all_day,
+                        'start_date',start_date,'end_date',end_date,'start_ms',start_ms,'end_ms',end_ms,
+                        'tz',tz,'tzdb_version',tzdb_version)) FROM
+                        (SELECT * FROM facet_times WHERE record_id = records.id ORDER BY key))),
+                    'links',json((SELECT json_group_array(json_object('id',id,'source_id',source_id,'target_id',target_id,
+                        'relationship',relationship,'note',note,'created_at',created_at)) FROM
+                        (SELECT * FROM links WHERE source_id = records.id OR target_id = records.id
+                         ORDER BY source_id,target_id,relationship))),
+                    'policy_created_at',(SELECT created_at FROM record_policies WHERE record_id = records.id),
+                    'policy',json((SELECT json_group_array(json_object('subject_kind',subject_kind,
+                        'subject_id',subject_id,'effect',effect,'capability',capability)) FROM
+                        (SELECT * FROM policy_entries WHERE policy_anchor_id = records.policy_anchor_id
+                         ORDER BY subject_kind,subject_id,effect)))
+                ) FROM records WHERE id = ?",
+            )
+            .bind(id)
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap();
+            serde_json::from_str(&text).unwrap()
+        }
+
+        fn comparable(mut state: Value) -> Value {
+            // Independent fixtures have independent clocks and random link
+            // identities. Exact snapshots above remain intact for mutation checks.
+            for key in [
+                "created_at",
+                "updated_at",
+                "last_activity_at",
+                "policy_created_at",
+            ] {
+                state.as_object_mut().unwrap().remove(key);
+            }
+            for (collection, keys) in [
+                ("facets", vec!["created_at"]),
+                ("links", vec!["id", "created_at"]),
+                ("observations", vec!["id", "as_of", "observed_at"]),
+            ] {
+                for row in state[collection].as_array_mut().unwrap() {
+                    for key in &keys {
+                        row.as_object_mut().unwrap().remove(*key);
+                    }
+                }
+            }
+            state
+        }
+
+        fn keyed_rows(state: &Value, collection: &str, archived: bool) -> Vec<Value> {
+            state[collection]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|row| (row["key"] == "archived") == archived)
+                .cloned()
+                .collect()
+        }
+
+        for (initial_archived, has_successor) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let preview_db = create_database(":memory:").await.unwrap();
+            let singular_db = create_database(":memory:").await.unwrap();
+            let caller = initialize(&preview_db, initial_archived, has_successor).await;
+            let singular_caller = initialize(&singular_db, initial_archived, has_successor).await;
+            let mut ids = vec![TARGET, SENTINEL];
+            if has_successor {
+                ids.push(SUCCESSOR);
+            }
+            let mut preview_before = Vec::new();
+            let mut singular_before = Vec::new();
+            for id in &ids {
+                let p = state(&preview_db, id).await;
+                let s = state(&singular_db, id).await;
+                assert_eq!(comparable(p.clone()), comparable(s.clone()));
+                preview_before.push(p);
+                singular_before.push(s);
+            }
+            for before in [&preview_before[0], &singular_before[0]] {
+                assert_eq!(before["archived"], json!(i64::from(initial_archived)));
+                assert_eq!(before["successor_count"], json!(i64::from(has_successor)));
+                assert_eq!(
+                    before["is_current"],
+                    if has_successor { Value::Null } else { json!(1) }
+                );
+                let archived = keyed_rows(before, "facets", true);
+                assert_eq!(archived.len(), usize::from(initial_archived));
+                if initial_archived {
+                    assert_eq!(archived[0]["value"], "true");
+                    assert_eq!(archived[0]["vocab_ref"], Value::Null);
+                }
+                assert!(before["facets"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|row| row["key"] == "fixture_marker"
+                        && row["value"] == "keep me"
+                        && row["vocab_ref"].is_null()));
+                let links = before["links"].as_array().unwrap();
+                assert_eq!(links.len(), if has_successor { 2 } else { 1 });
+                assert!(links.iter().any(|link| link["source_id"] == TARGET
+                    && link["target_id"] == SENTINEL
+                    && link["relationship"] == "relates_to"
+                    && link["note"] == "Keep this link"));
+                if has_successor {
+                    assert!(links.iter().any(|link| link["source_id"] == SUCCESSOR
+                        && link["target_id"] == TARGET
+                        && link["relationship"] == "supersedes"
+                        && link["note"] == "Readiness fixture"));
+                }
+            }
+
+            let server = sql_write_opted_in_server(&preview_db, caller).await;
+            let preview_counts = (
+                content_event_count(&preview_db).await,
+                relationship_event_count(&preview_db).await,
+            );
+            let prepared = sql_write_prepare(&server, STATEMENT).await;
+            for (id, before) in ids.iter().zip(&preview_before) {
+                assert_eq!(state(&preview_db, id).await, *before);
+            }
+            assert_eq!(
+                (
+                    content_event_count(&preview_db).await,
+                    relationship_event_count(&preview_db).await
+                ),
+                preview_counts
+            );
+            let plan = structured_result(&prepared);
+            if has_successor {
+                assert_eq!(prepared["result"]["isError"], true, "{prepared}");
+                assert_eq!(plan_error_code(&prepared), "preparation_rejected");
+                assert!(plan.get("plan_id").is_none() && plan.get("effect").is_none());
+                let detail = plan["error"].as_str().unwrap();
+                assert!(detail.contains(&format!("sql_write: selected record {TARGET} has an incoming supersedes link; SQL write preview cannot establish current target")), "{detail}");
+                let text = prepared.to_string();
+                assert!(!text.contains(SUCCESSOR) && !text.contains(SUCCESSOR_NAME));
+            } else {
+                assert_eq!(prepared["result"]["isError"], false, "{prepared}");
+                assert_eq!(plan["preparation_mutated"], false);
+            }
+
+            // Public archive intentionally succeeds/no-ops even with the
+            // successor. Observe its state independently of the receipt flags.
+            let singular_counts = (
+                content_event_count(&singular_db).await,
+                relationship_event_count(&singular_db).await,
+            );
+            let receipt = archive(&singular_db, &singular_caller).await;
+            let after = state(&singular_db, TARGET).await;
+            let before = &singular_before[0];
+            let before_archived = before["archived"].as_i64().unwrap() != 0;
+            let after_archived = after["archived"].as_i64().unwrap() != 0;
+            let changed = before_archived != after_archived;
+            assert!(after_archived);
+            assert_eq!(changed, !initial_archived);
+            assert_eq!(receipt["id"], TARGET);
+            assert_eq!(receipt["archived"], true);
+            assert_eq!(receipt["changed"], changed);
+            assert_eq!(receipt["previous_seq"], before["previous_seq"]);
+            for (id, other_before) in ids.iter().zip(&singular_before).skip(1) {
+                assert_eq!(state(&singular_db, id).await, *other_before);
+            }
+            assert_eq!(
+                relationship_event_count(&singular_db).await,
+                singular_counts.1
+            );
+            if initial_archived {
+                assert_eq!(after, *before);
+                assert!(receipt.get("act").is_none());
+                assert_eq!(content_event_count(&singular_db).await, singular_counts.0);
+            } else {
+                assert!(receipt["act"].as_i64().is_some());
+                assert_eq!(
+                    content_event_count(&singular_db).await,
+                    singular_counts.0 + 1
+                );
+                let tail: Vec<String> = sqlx::query_scalar(
+                    "SELECT json_object('seq',seq,'type',type,'payload',json(payload),'actor',actor)
+                     FROM content_events WHERE record_id = ? AND seq > ? ORDER BY seq",
+                )
+                .bind(TARGET)
+                .bind(before["previous_seq"].as_i64().unwrap())
+                .fetch_all(singular_db.write_pool())
+                .await
+                .unwrap();
+                assert_eq!(tail.len(), 1);
+                let event: Value = serde_json::from_str(&tail[0]).unwrap();
+                assert_eq!(event["type"], "facet.set");
+                assert_eq!(
+                    event["payload"],
+                    json!({"key":"archived","value":"true","reason":"facade probe"})
+                );
+                assert_eq!(event["actor"], singular_caller.actor());
+                assert_eq!(after["previous_seq"], event["seq"]);
+                assert!(event["seq"].as_i64().unwrap() > before["previous_seq"].as_i64().unwrap());
+                for (key, value) in before.as_object().unwrap() {
+                    if ![
+                        "archived",
+                        "facets",
+                        "observations",
+                        "previous_seq",
+                        "updated_at",
+                        "last_activity_at",
+                    ]
+                    .contains(&key.as_str())
+                    {
+                        assert_eq!(&after[key], value, "archive changed unrelated {key}");
+                    }
+                }
+                for collection in ["facets", "observations"] {
+                    assert_eq!(
+                        keyed_rows(&after, collection, false),
+                        keyed_rows(before, collection, false)
+                    );
+                    assert!(keyed_rows(before, collection, true).is_empty());
+                    let archived = keyed_rows(&after, collection, true);
+                    assert_eq!(archived.len(), 1);
+                    assert_eq!(archived[0]["value"], "true");
+                    assert_eq!(archived[0]["vocab_ref"], Value::Null);
+                    if collection == "observations" {
+                        assert_eq!(archived[0]["op"], "set");
+                        assert_eq!(archived[0]["event_seq"], event["seq"]);
+                    }
+                }
+            }
+
+            if !has_successor {
+                assert_eq!(
+                    plan["effect"],
+                    json!({
+                        "kind":"sql_write_preview","target_count":1,"op_count":1,"changed":changed,
+                        "reason":"facade probe","targets":[{"record_id":TARGET,
+                            "previous_seq":preview_before[0]["previous_seq"],"ops":[{
+                                "op":"archive","before":before_archived,"after":after_archived,"changed":changed,
+                            }]}],
+                    })
+                );
+                let store = plan_store::PlanStore::open_for_database(preview_db.path())
+                    .await
+                    .unwrap();
+                let stored = store
+                    .load(
+                        plan["plan_id"].as_str().unwrap(),
+                        chrono::Utc::now().timestamp_millis(),
+                    )
+                    .await
+                    .unwrap()
+                    .expect("signed archive preview remains stored");
+                assert!(matches!(stored.state, plan_store::StoredState::Prepared));
+                assert_eq!(stored.payload["effect"], plan["effect"]);
+            }
+        }
+    }
+
+    /// An archive preview prepares and confirms claim-free: no claim, no
+    /// dispatch, no event, the plan stays Prepared, and the record is not
+    /// archived — preparation is not the transition. Re-preparing after a real
+    /// archive signs `changed:false` and still confirms.
+    #[tokio::test]
+    async fn sql_write_archive_confirms_preview_current_without_mutation() {
+        let db = create_database(":memory:").await.unwrap();
+        let (target, caller) = sql_write_fixture(&db).await;
+        let server = sql_write_opted_in_server(&db, caller).await;
+        let prepared = sql_write_prepare(&server, &sql_write_archive_statement(&target)).await;
+        assert_eq!(prepared["result"]["isError"], false, "{prepared}");
+        let plan = structured_result(&prepared);
+        let op = &plan["effect"]["targets"][0]["ops"][0];
+        assert_eq!(op["op"], json!("archive"));
+        assert_eq!(op["before"], json!(false));
+        assert_eq!(op["after"], json!(true));
+        assert_eq!(op["changed"], json!(true));
+        assert_eq!(plan["effect"]["changed"], json!(true));
+        let plan_id = plan["plan_id"].as_str().unwrap();
+        let target_text = plan["target"].as_str().unwrap();
+        let effect_summary = plan["effect_summary"].as_str().unwrap();
+        let events_before = content_event_count(&db).await;
+        let confirmed = sql_write_execute(&server, plan_id, target_text, effect_summary).await;
+        assert_eq!(confirmed["result"]["isError"], false, "{confirmed}");
+        let current = structured_result(&confirmed);
+        assert_eq!(current["preview_current"], true);
+        assert_eq!(current["committed"], false);
+        assert_eq!(current["source_dispatch_count"], 0);
+        assert_sql_write_plan_prepared(&db, plan_id).await;
+        assert_eq!(content_event_count(&db).await, events_before);
+        assert_eq!(
+            sql_write_archived_facet_rows(&db, &target).await,
+            0,
+            "an archive preview must not archive the record"
+        );
+        // After a real archive, the same selection prepares as a no-op and
+        // still confirms claim-free.
+        crate::store::archive_record(&db, &target).await.unwrap();
+        let noop = sql_write_prepare(&server, &sql_write_archive_statement(&target)).await;
+        assert_eq!(noop["result"]["isError"], false, "{noop}");
+        let noop_plan = structured_result(&noop);
+        let noop_op = &noop_plan["effect"]["targets"][0]["ops"][0];
+        assert_eq!(noop_op["before"], json!(true));
+        assert_eq!(noop_op["after"], json!(true));
+        assert_eq!(noop_op["changed"], json!(false));
+        assert_eq!(noop_plan["effect"]["changed"], json!(false));
+        let noop_events = content_event_count(&db).await;
+        let noop_confirmed = sql_write_execute(
+            &server,
+            noop_plan["plan_id"].as_str().unwrap(),
+            noop_plan["target"].as_str().unwrap(),
+            noop_plan["effect_summary"].as_str().unwrap(),
+        )
+        .await;
+        assert_eq!(structured_result(&noop_confirmed)["preview_current"], true);
+        assert_eq!(content_event_count(&db).await, noop_events);
+    }
+
+    /// Archiving the target between prepare and execute changes the signed
+    /// before-state and the pinned version, so the execute-shaped call reports
+    /// `plan_stale` with no claim, dispatch, or event.
+    #[tokio::test]
+    async fn sql_write_archive_archived_drift_reports_plan_stale() {
+        let db = create_database(":memory:").await.unwrap();
+        let (target, caller) = sql_write_fixture(&db).await;
+        let server = sql_write_opted_in_server(&db, caller).await;
+        let prepared = sql_write_prepare(&server, &sql_write_archive_statement(&target)).await;
+        assert_eq!(prepared["result"]["isError"], false, "{prepared}");
+        let plan = structured_result(&prepared);
+        let (plan_id, target_text, effect_summary) = (
+            plan["plan_id"].as_str().unwrap().to_string(),
+            plan["target"].as_str().unwrap().to_string(),
+            plan["effect_summary"].as_str().unwrap().to_string(),
+        );
+        crate::store::archive_record(&db, &target).await.unwrap();
+        let events_before = content_event_count(&db).await;
+        let stale = sql_write_execute(&server, &plan_id, &target_text, &effect_summary).await;
+        assert_eq!(plan_error_code(&stale), "plan_stale", "{stale}");
+        assert_sql_write_plan_prepared(&db, &plan_id).await;
+        assert_eq!(content_event_count(&db).await, events_before);
+    }
+
+    /// Losing Manage between prepare and execute is drift: the archive
+    /// capability check fails on revalidation, so the execute-shaped call
+    /// reports `plan_stale` with no claim or dispatch.
+    #[tokio::test]
+    async fn sql_write_archive_lost_manage_reports_plan_stale() {
+        use crate::authorization::{replace_explicit_policy, AllowEntry, Capability};
+        let db = create_database(":memory:").await.unwrap();
+        let (target, caller) = sql_write_fixture(&db).await;
+        let server = sql_write_opted_in_server(&db, caller).await;
+        let prepared = sql_write_prepare(&server, &sql_write_archive_statement(&target)).await;
+        assert_eq!(prepared["result"]["isError"], false, "{prepared}");
+        let plan = structured_result(&prepared);
+        let (plan_id, target_text, effect_summary) = (
+            plan["plan_id"].as_str().unwrap().to_string(),
+            plan["target"].as_str().unwrap().to_string(),
+            plan["effect_summary"].as_str().unwrap().to_string(),
+        );
+        replace_explicit_policy(
+            &db,
+            "test:sql-write-archive-demote",
+            &target,
+            vec![AllowEntry::account("plan-author", Capability::Edit)],
+        )
+        .await
+        .unwrap();
+        let events_before = content_event_count(&db).await;
+        let stale = sql_write_execute(&server, &plan_id, &target_text, &effect_summary).await;
+        assert_eq!(plan_error_code(&stale), "plan_stale", "{stale}");
+        assert_sql_write_plan_prepared(&db, &plan_id).await;
+        assert_eq!(content_event_count(&db).await, events_before);
+    }
+
+    /// A facet-valued preview prepares and confirms claim-free: no claim, no
+    /// dispatch, no event, the plan stays Prepared, and the facet itself is
+    /// never written — preparation is not an assertion.
+    #[tokio::test]
+    async fn sql_write_facet_preview_confirms_without_mutation() {
+        let db = create_database(":memory:").await.unwrap();
+        let (target, caller) = sql_write_fixture(&db).await;
+        let server = sql_write_opted_in_server(&db, caller).await;
+        let statement = format!(
+            "SELECT id AS record_id, 'set_facet' AS op, 'e0probe' AS key, 'done' AS value FROM records WHERE id = '{target}'"
+        );
+        let prepared = sql_write_prepare(&server, &statement).await;
+        assert_eq!(prepared["result"]["isError"], false, "{prepared}");
+        let plan = structured_result(&prepared);
+        assert_eq!(
+            plan["effect"]["targets"][0]["ops"][0]["op"],
+            json!("set_facet")
+        );
+        assert_eq!(plan["preparation_mutated"], false);
+        let plan_id = plan["plan_id"].as_str().unwrap();
+        let target_text = plan["target"].as_str().unwrap();
+        let effect_summary = plan["effect_summary"].as_str().unwrap();
+        let events_before = content_event_count(&db).await;
+        let confirmed = sql_write_execute(&server, plan_id, target_text, effect_summary).await;
+        assert_eq!(confirmed["result"]["isError"], false, "{confirmed}");
+        assert_eq!(structured_result(&confirmed)["preview_current"], true);
+        assert_eq!(structured_result(&confirmed)["committed"], false);
+        assert_eq!(structured_result(&confirmed)["source_dispatch_count"], 0);
+        assert_sql_write_plan_prepared(&db, plan_id).await;
+        assert_eq!(content_event_count(&db).await, events_before);
+        let value: Option<String> = sqlx::query_scalar(
+            "SELECT value FROM facet_values WHERE record_id = ? AND key = 'e0probe'",
+        )
+        .bind(&target)
+        .fetch_optional(db.write_pool())
+        .await
+        .unwrap();
+        assert_eq!(value, None, "preview must not write the facet");
+    }
+
+    /// A concurrent facet edit between prepare and execute is drift: the
+    /// signed before-state changed, so the execute-shaped call returns
+    /// `plan_stale` with no claim and no dispatch.
+    #[tokio::test]
+    async fn sql_write_facet_edit_reports_plan_stale() {
+        let db = create_database(":memory:").await.unwrap();
+        let (target, caller) = sql_write_fixture(&db).await;
+        let server = sql_write_opted_in_server(&db, caller).await;
+        let statement = format!(
+            "SELECT id AS record_id, 'set_facet' AS op, 'e0probe' AS key, 'done' AS value FROM records WHERE id = '{target}'"
+        );
+        let prepared = sql_write_prepare(&server, &statement).await;
+        assert_eq!(prepared["result"]["isError"], false, "{prepared}");
+        let plan = structured_result(&prepared);
+        let (plan_id, target_text, effect_summary) = (
+            plan["plan_id"].as_str().unwrap().to_string(),
+            plan["target"].as_str().unwrap().to_string(),
+            plan["effect_summary"].as_str().unwrap().to_string(),
+        );
+        crate::store::set_facet(
+            &db,
+            &target,
+            crate::events::FacetSetPayload {
+                key: "e0probe".into(),
+                value: Some("blocked".into()),
+                vocab_ref: None,
+                as_of: None,
+                observation_only: false,
+            },
+        )
+        .await
+        .unwrap();
+        let events_before = content_event_count(&db).await;
+        let stale = sql_write_execute(&server, &plan_id, &target_text, &effect_summary).await;
+        assert_eq!(plan_error_code(&stale), "plan_stale", "{stale}");
+        assert_sql_write_plan_prepared(&db, &plan_id).await;
+        assert_eq!(content_event_count(&db).await, events_before);
+    }
+
+    /// Changing only the governing vocabulary changes the signed effect even
+    /// though the target record's content revision stays the same.
+    #[tokio::test]
+    async fn sql_write_facet_vocabulary_change_reports_plan_stale() {
+        let db = create_database(":memory:").await.unwrap();
+        let (target, caller) = sql_write_fixture(&db).await;
+        let server = sql_write_opted_in_server(&db, caller).await;
+        let statement = format!(
+            "SELECT id AS record_id, 'set_facet' AS op, 'e4mw1' AS key, 'done' AS value FROM records WHERE id = '{target}'"
+        );
+        let prepared = sql_write_prepare(&server, &statement).await;
+        assert_eq!(prepared["result"]["isError"], false, "{prepared}");
+        let plan = structured_result(&prepared);
+        assert_eq!(
+            plan["effect"]["targets"][0]["ops"][0]["after_vocab_ref"],
+            json!(null)
+        );
+        let (plan_id, target_text, effect_summary, state_revision) = (
+            plan["plan_id"].as_str().unwrap().to_string(),
+            plan["target"].as_str().unwrap().to_string(),
+            plan["effect_summary"].as_str().unwrap().to_string(),
+            plan["state_revision"].clone(),
+        );
+        crate::meta::seed_pack_schema_config(
+            &db,
+            "@test/sql-write-facet-revalidation",
+            json!({ "shapes": { "Document": { "facets": { "e4mw1": { "vocab": "e4mw1" } } } } }),
+            crate::meta::SchemaConfigOptions::default(),
+        )
+        .await
+        .unwrap();
+        crate::meta::create_vocabulary(&db, "e4mw1", None)
+            .await
+            .unwrap();
+        let value = crate::meta::propose_value(&db, "e4mw1", "done", None)
+            .await
+            .unwrap();
+        crate::meta::promote_value(&db, &value).await.unwrap();
+        let current = sql_write_prepare(&server, &statement).await;
+        assert_eq!(current["result"]["isError"], false, "{current}");
+        let current_plan = structured_result(&current);
+        assert_eq!(current_plan["state_revision"], state_revision);
+        assert!(
+            current_plan["effect"]["targets"][0]["ops"][0]["after_vocab_ref"]
+                .as_str()
+                .unwrap()
+                .starts_with("rec:")
+        );
+        let events_before = content_event_count(&db).await;
+        let stale = sql_write_execute(&server, &plan_id, &target_text, &effect_summary).await;
+        assert_eq!(plan_error_code(&stale), "plan_stale", "{stale}");
+        assert_sql_write_plan_prepared(&db, &plan_id).await;
+        assert_eq!(content_event_count(&db).await, events_before);
+    }
+
+    /// A changed facet shape that rejects the proposed value is plan drift.
+    #[tokio::test]
+    async fn sql_write_facet_shape_rejection_reports_plan_stale() {
+        let db = create_database(":memory:").await.unwrap();
+        let (target, caller) = sql_write_fixture(&db).await;
+        let server = sql_write_opted_in_server(&db, caller).await;
+        let statement = format!(
+            "SELECT id AS record_id, 'set_facet' AS op, 'e4mw1' AS key, 'done' AS value FROM records WHERE id = '{target}'"
+        );
+        let prepared = sql_write_prepare(&server, &statement).await;
+        assert_eq!(prepared["result"]["isError"], false, "{prepared}");
+        let plan = structured_result(&prepared);
+        let (plan_id, target_text, effect_summary) = (
+            plan["plan_id"].as_str().unwrap().to_string(),
+            plan["target"].as_str().unwrap().to_string(),
+            plan["effect_summary"].as_str().unwrap().to_string(),
+        );
+        crate::meta::seed_pack_schema_config(
+            &db,
+            "@test/sql-write-facet-shape-revalidation",
+            json!({ "shapes": { "Document": { "facets": { "e4mw1": { "type": "number" } } } } }),
+            crate::meta::SchemaConfigOptions::default(),
         )
         .await
         .unwrap();
@@ -7909,7 +11294,17 @@ mod tests {
                             single => vec![single],
                         };
                         for item in items_vec {
-                            if item.get("properties").is_some() {
+                            // An array item may declare its fields directly or
+                            // hide them behind a combinator (`anyOf`/`oneOf`/
+                            // `allOf`) — e.g. `sources` accepts either the
+                            // `{record_id, reason}` object form or a bare id.
+                            // Descend so the object branch's names stay in the
+                            // enumeration instead of vanishing with the branch.
+                            let has_fields = item.get("properties").is_some()
+                                || ["allOf", "anyOf", "oneOf"]
+                                    .iter()
+                                    .any(|keyword| item.get(*keyword).is_some());
+                            if has_fields {
                                 audit_walk_node(item, false, &format!("{full}[]"), true, out);
                             }
                         }
@@ -8553,6 +11948,72 @@ mod tests {
         }
     }
 
+    /// The hoist can treat a nested copy of `format`/`operation` as the
+    /// envelope field only because no inner operation contract accepts either
+    /// name at its top level. If one did, a nested copy would be ambiguous
+    /// between the envelope field and a legitimate operation argument.
+    ///
+    /// Only the top level matters: the hoist inspects `arguments` directly, so
+    /// a `format`/`operation` nested inside some operation object is not a
+    /// routing field. Same-document `$ref`s are resolved so a top-level
+    /// reference cannot hide a property, and top-level `oneOf`/`anyOf`/`allOf`
+    /// branches are checked recursively. The Postgres engine kind is gated
+    /// behind the `postgres` feature and cannot be built on the default set,
+    /// so only the SQLite kind is covered here; the contract projection is
+    /// engine-kind independent apart from availability filtering.
+    #[test]
+    fn no_inner_operation_contract_declares_format_or_operation() {
+        fn resolve<'a>(schema: &'a Value, root: &'a Value, depth: usize) -> &'a Value {
+            let Some(reference) = schema.get("$ref").and_then(Value::as_str) else {
+                return schema;
+            };
+            if depth == 0 {
+                return schema;
+            }
+            let Some(pointer) = reference.strip_prefix('#') else {
+                return schema;
+            };
+            if pointer.is_empty() {
+                return root;
+            }
+            root.pointer(pointer)
+                .map_or(schema, |resolved| resolve(resolved, root, depth - 1))
+        }
+
+        fn assert_absent(schema: &Value, root: &Value, field: &str) {
+            let schema = resolve(schema, root, 8);
+            if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
+                assert!(
+                    !properties.contains_key(field),
+                    "an inner operation contract declares '{field}': {schema}"
+                );
+            }
+            for keyword in ["oneOf", "anyOf", "allOf"] {
+                if let Some(branches) = schema.get(keyword).and_then(Value::as_array) {
+                    for branch in branches {
+                        assert_absent(branch, root, field);
+                    }
+                }
+            }
+        }
+
+        let registry = registry();
+        let audit: Audit = serde_json::from_str(AUDIT).unwrap();
+        let BuiltContracts { contracts, .. } = build_contracts(
+            &registry,
+            super::super::registry::EngineKind::Sqlite,
+            &audit.audit_rows,
+            ExecutorSurface::Ordinary,
+        )
+        .unwrap();
+        assert!(!contracts.is_empty());
+        for contract in contracts.values() {
+            for field in ["format", "operation"] {
+                assert_absent(&contract.input_schema, &contract.input_schema, field);
+            }
+        }
+    }
+
     #[test]
     fn every_operation_contract_discloses_its_source_tool_description() {
         let registry = registry();
@@ -8595,6 +12056,11 @@ mod tests {
         .unwrap();
         for (executor, operation, expected) in [
             ("guidance_read", "quickstart", OperationAccess::Mutation),
+            (
+                "guidance_read",
+                "manage_instructions.resolve",
+                OperationAccess::Read,
+            ),
             ("records_read", "get_record", OperationAccess::Read),
             ("records_write", "create_record", OperationAccess::Mutation),
             ("records_read", "manage_links.list", OperationAccess::Read),
@@ -8644,6 +12110,215 @@ mod tests {
             materialize.with_registered_access(&registry).access,
             OperationAccess::Mutation
         );
+    }
+
+    #[test]
+    fn pinned_catalogue_classifies_executor_calls_for_pre_auth() {
+        let catalogue =
+            ExecutorPrototypeStdioServer::pin_hosted_catalogue(&hosted_registry()).unwrap();
+        // The access must equal the value dispatch admits with: the table
+        // above pins contract.access, and the classifier returns it verbatim.
+        for (executor, operation, expected) in [
+            ("records_write", "create_record", OperationAccess::Mutation),
+            ("records_read", "get_record", OperationAccess::Read),
+            (
+                "records_write",
+                "manage_links.add",
+                OperationAccess::Mutation,
+            ),
+            (
+                "artifacts_execute",
+                "invoke_artifact_interaction",
+                OperationAccess::Mutation,
+            ),
+            // Routing-only executor name that is still a pinned contract:
+            // dispatch special-cases it to the read-only delegate path.
+            ("bootstrap", "bootstrap", OperationAccess::Read),
+        ] {
+            let (labeled, access) = catalogue
+                .classify_call(executor, Some(operation))
+                .unwrap_or_else(|| panic!("missing classification for {executor}.{operation}"));
+            assert_eq!(access, expected, "{executor}.{operation}");
+            assert_eq!(
+                labeled.as_str(),
+                format!("{executor}.{operation}"),
+                "{executor}.{operation}"
+            );
+        }
+        // Anything outside the pinned contracts stays deferred: unknown
+        // executors and operations, a missing selector, and the
+        // non-contract executor names the dispatcher special-cases.
+        assert!(catalogue
+            .classify_call("no_such_executor", Some("create_record"))
+            .is_none());
+        assert!(catalogue
+            .classify_call("records_write", Some("no_such_operation"))
+            .is_none());
+        assert!(catalogue.classify_call("records_write", None).is_none());
+        assert!(catalogue
+            .classify_call("describe_operation", Some("describe_operation"))
+            .is_none());
+    }
+
+    /// The transport's principal-neutral lens admission catalogue and the
+    /// authoritative per-revision pin build from the same registry and
+    /// allowlist, so their access must agree exactly. Unknown selectors
+    /// stay `None` so transports fail closed as mutations.
+    #[test]
+    fn lens_catalogue_classification_matches_per_revision_contracts() {
+        let registry = hosted_registry();
+        for experimental in [
+            ExperimentalExecutors::empty(),
+            ExperimentalExecutors::from_env_value(Some(
+                EXPERIMENTAL_FRESHNESS_EXECUTOR.to_string(),
+            ))
+            .unwrap(),
+        ] {
+            let admission = ExecutorPrototypeLensServer::pin_catalogue_with_experimental(
+                &registry,
+                &experimental,
+            )
+            .unwrap();
+            let revision = ExecutorPrototypeLensServer::pin_catalogue_with_experimental(
+                &registry,
+                &experimental,
+            )
+            .unwrap();
+            for (executor, operation, expected) in [
+                ("records_read", "search", OperationAccess::Read),
+                ("records_read", "query_record", OperationAccess::Read),
+                ("records_read", "get_record", OperationAccess::Read),
+                ("records_write", "create_record", OperationAccess::Mutation),
+            ] {
+                assert_eq!(
+                    admission.classify_call(executor, Some(operation)),
+                    Some(expected),
+                    "{executor}.{operation}"
+                );
+                assert_eq!(
+                    revision.classify_call(executor, Some(operation)),
+                    Some(expected),
+                    "{executor}.{operation}"
+                );
+            }
+            assert_eq!(
+                admission.classify_call("records_read", Some("no_such_operation")),
+                None
+            );
+            assert_eq!(admission.classify_call("records_read", None), None);
+            assert_eq!(
+                admission.classify_call("no_such_executor", Some("search")),
+                None
+            );
+        }
+    }
+
+    /// A lease admitted from the pinned catalogue before a freeze still
+    /// dispatches through the executor server once freeze intent is
+    /// registered, while a fresh dispatch re-admits and takes the frozen
+    /// refusal. The probe call carries no plan, so it fails deterministically
+    /// in preparation — past the barrier in both legs, which is exactly
+    /// what distinguishes them.
+    #[tokio::test]
+    async fn pinned_lease_reuses_through_executor_contract_dispatch() {
+        use std::time::Duration;
+
+        let barrier = DeploymentMutationBarrier::default();
+        let mut inner = ToolRegistry::new();
+        register_builtin_tools(&mut inner).unwrap();
+        register_surface_tools(&mut inner).unwrap();
+        inner.set_deployment_mutation_barrier(barrier.clone());
+        let registry = Arc::new(inner);
+        let db = create_database(":memory:").await.unwrap();
+        let catalogue_pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        for statement in [
+            "CREATE TABLE databases (id TEXT PRIMARY KEY, status TEXT NOT NULL, activity_epoch INTEGER NOT NULL)",
+            "CREATE TABLE executor_write_plans (key_id TEXT)",
+            "INSERT INTO databases (id, status, activity_epoch) VALUES ('executor-lease-db', 'ready', 0)",
+        ] {
+            sqlx::query(statement)
+                .execute(&catalogue_pool)
+                .await
+                .unwrap();
+        }
+        let server = ExecutorPrototypeStdioServer::new_hosted(
+            registry.clone(),
+            db.clone(),
+            Caller::authenticated("executor-lease-account")
+                .with_hosting_context("executor-lease-user", "executor-lease-db"),
+            Arc::new(SelectorHostedAuthority {
+                pool: catalogue_pool,
+            }),
+            "executor-lease-db",
+            Arc::new(SelectorHostedKeys),
+        )
+        .await
+        .unwrap();
+
+        // Admit from the pinned catalogue exactly as a transport would.
+        let pinned = ExecutorPrototypeStdioServer::pin_hosted_catalogue(&registry).unwrap();
+        let (operation, access) = pinned
+            .classify_call("records_write", Some("create_record"))
+            .expect("records_write.create_record classifies");
+        assert_eq!(access, OperationAccess::Mutation);
+        let lease = match barrier.admit(&operation, access).unwrap() {
+            DeploymentAdmission::Writable(lease) => lease,
+            DeploymentAdmission::FrozenRead => panic!("open barrier refused a mutation"),
+        };
+        let freeze = {
+            let barrier = barrier.clone();
+            tokio::spawn(async move { barrier.freeze().await })
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !barrier.is_read_only() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("freeze intent was not registered");
+
+        let probe = |id: i64| {
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": {
+                    "name": "records_write",
+                    "arguments": {
+                        "operation": "create_record",
+                        "run_key": "executor-lease-probe-0001",
+                    },
+                },
+            })
+        };
+        // Fresh dispatch re-admits and refuses with the frozen shape.
+        let refused = server.handle_message(probe(1)).await.unwrap();
+        assert_eq!(
+            refused["result"]["structuredContent"]["error_code"],
+            super::super::DEPLOYMENT_READ_ONLY_ERROR
+        );
+        // The held lease reuses through the same barrier: past the freeze
+        // into preparation, never the frozen refusal.
+        let through = server
+            .with_persistence_lease(lease.clone())
+            .handle_message(probe(2))
+            .await
+            .unwrap();
+        assert_ne!(
+            through["result"]["structuredContent"].get("error_code"),
+            Some(&json!(super::super::DEPLOYMENT_READ_ONLY_ERROR))
+        );
+
+        drop(lease);
+        tokio::time::timeout(Duration::from_secs(2), freeze)
+            .await
+            .expect("freeze did not acquire after lease drain")
+            .unwrap();
+        db.close().await;
     }
 
     #[test]
@@ -10833,6 +14508,240 @@ mod tests {
         );
     }
 
+    /// Regression for 4c16fd2: a non-string, non-object item in `sources` on the
+    /// single-record `update_record` branch must report `/arguments/sources/0`
+    /// as the wrong type with the expected object shape, not the batch branch's
+    /// `/arguments/body_append` additionalProperties repair. (A bare string is
+    /// now a valid short form, so a number exercises the same descent.)
+    #[tokio::test]
+    async fn oneof_descent_sources_item_reports_object_shape() {
+        let db = create_database(":memory:").await.unwrap();
+        let server =
+            ExecutorPrototypeStdioServer::new(registry(), db.clone(), Caller::local(), None)
+                .await
+                .unwrap();
+        let response = server
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 6398,
+                "method": "tools/call",
+                "params": {
+                    "name": "records_write",
+                    "arguments": {
+                        "operation": "update_record",
+                        "arguments": {
+                            "record_id": "11111111-1111-4111-8111-111111111111",
+                            "reason": "debug probe",
+                            "body_append": "literal",
+                            "sources": [7],
+                        },
+                        "run_key": "bff6395-debug-a748b2",
+                    },
+                },
+            }))
+            .await
+            .unwrap();
+        assert_eq!(response["result"]["isError"], true, "{response}");
+        let repair = &response["result"]["structuredContent"]["repair"];
+        assert_eq!(repair["reason_code"], "wrong_type", "{repair}");
+        assert_eq!(
+            repair["failing_pointer"], "/arguments/sources/0",
+            "{repair}"
+        );
+        assert_eq!(repair["expected_shape"]["keyword"], "type", "{repair}");
+        assert_eq!(
+            repair["expected_shape"]["constraint"],
+            json!(["string", "object"]),
+            "{repair}"
+        );
+        assert_eq!(
+            repair["expected_shape"]["contract_pointer"],
+            "/oneOf/0/allOf/0/properties/sources/items/type",
+            "{repair}"
+        );
+        let accepted = repair["expected_shape"]["accepted_properties"]
+            .as_array()
+            .expect("object item must name accepted properties");
+        assert!(accepted.iter().any(|name| name == "record_id"), "{repair}");
+        assert!(accepted.iter().any(|name| name == "reason"), "{repair}");
+        let required = repair["expected_shape"]["required_properties"]
+            .as_array()
+            .expect("object item must name required properties");
+        assert!(required.iter().any(|name| name == "record_id"), "{repair}");
+        assert!(required.iter().any(|name| name == "reason"), "{repair}");
+        assert!(repair.get("failing_value").is_none(), "{repair}");
+        db.close().await;
+    }
+
+    /// A bare record-id string in `sources` is shorthand for `{record_id}`
+    /// with no reason. It must pass the disclosed schema and store for both
+    /// single-record write operations, with `reason: null` rather than an
+    /// invented placeholder.
+    #[tokio::test]
+    async fn bare_source_ids_execute_create_and_update_and_store_without_reason() {
+        async fn write(
+            server: &ExecutorPrototypeStdioServer,
+            id: i64,
+            operation: &str,
+            arguments: Value,
+        ) -> Value {
+            server
+                .handle_message(json!({
+                    "jsonrpc":"2.0",
+                    "id":id,
+                    "method":"tools/call",
+                    "params":{
+                        "name":"records_write",
+                        "arguments":{
+                            "operation":operation,
+                            "arguments":arguments,
+                            "format":"json",
+                            "run_key":"bare-source-id-9f2c41"
+                        }
+                    }
+                }))
+                .await
+                .unwrap()
+        }
+
+        let db = create_database(":memory:").await.unwrap();
+        let registry = registry();
+        let source_id = registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "create_record",
+                json!({
+                    "type":"Document",
+                    "kind":"note",
+                    "name":"Bare-source fixture source",
+                    "body":"the body a later write rests on",
+                    "reason":"seed the cited source"
+                }),
+            )
+            .await
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let server =
+            ExecutorPrototypeStdioServer::new(registry.clone(), db.clone(), Caller::local(), None)
+                .await
+                .unwrap();
+
+        let created = write(
+            &server,
+            1,
+            "create_record",
+            json!({
+                "type":"Document",
+                "kind":"note",
+                "name":"Bare-source create target",
+                "body":"created while resting on a bare id",
+                "reason":"create resting on a bare id",
+                "sources":[source_id.clone()]
+            }),
+        )
+        .await;
+        assert_eq!(created["result"]["isError"], false, "{created}");
+        let target_id = created["result"]["structuredContent"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let created_payload: Value = serde_json::from_str(
+            &sqlx::query_scalar::<_, String>(
+                "SELECT payload FROM content_events WHERE record_id=? AND type='record.created' \
+                 ORDER BY seq LIMIT 1",
+            )
+            .bind(&target_id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap(),
+        )
+        .unwrap();
+        let created_source = &created_payload["basis"]["sources"][0];
+        assert_eq!(
+            created_source["record_id"],
+            json!(source_id),
+            "{created_payload}"
+        );
+        assert_eq!(
+            created_source["reason"],
+            Value::Null,
+            "a bare id stores no reason: {created_payload}"
+        );
+        assert!(
+            created_source["revision_event_id"].is_string(),
+            "the engine must stamp the source head: {created_payload}"
+        );
+        assert_eq!(
+            created_source["revision_supplied_by"],
+            json!("engine"),
+            "{created_payload}"
+        );
+
+        let updated = write(
+            &server,
+            2,
+            "update_record",
+            json!({
+                "id": target_id.clone(),
+                "summary":"updated while resting on a bare id",
+                "reason":"update resting on a bare id",
+                "sources":[source_id.clone()]
+            }),
+        )
+        .await;
+        assert_eq!(updated["result"]["isError"], false, "{updated}");
+
+        let updated_payload: Value = serde_json::from_str(
+            &sqlx::query_scalar::<_, String>(
+                "SELECT payload FROM content_events WHERE record_id=? AND type='record.updated' \
+                 ORDER BY seq DESC LIMIT 1",
+            )
+            .bind(&target_id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            updated_payload["basis"]["sources"][0]["record_id"],
+            json!(source_id)
+        );
+        assert_eq!(
+            updated_payload["basis"]["sources"][0]["reason"],
+            Value::Null,
+            "a bare id stores no reason: {updated_payload}"
+        );
+
+        // The schema declares no `minLength` on a bare item (descriptor
+        // budget), so an empty or blank id passes validation and must be
+        // refused by the runtime parse instead, through the same call path.
+        for (id, blank) in [(3, ""), (4, "  ")] {
+            let refused = write(
+                &server,
+                id,
+                "update_record",
+                json!({
+                    "id": target_id.clone(),
+                    "summary":"blank bare source",
+                    "reason":"blank bare source probe",
+                    "sources":[blank]
+                }),
+            )
+            .await;
+            assert_eq!(refused["result"]["isError"], true, "{refused}");
+            assert!(
+                refused.to_string().contains("non-empty record id"),
+                "a blank bare id must be refused by the runtime parse: {refused}"
+            );
+        }
+
+        db.close().await;
+    }
+
     /// The boundedness guarantee on the path that actually moves bytes: the
     /// probe envelope carries a ~20KB body at the top level (misplaced routing
     /// the repair corrects by moving it under `arguments`), so the old shape
@@ -12165,6 +16074,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn guidance_read_resolve_returns_the_current_effective_stack() {
+        let db = create_database(":memory:").await.unwrap();
+        let server =
+            ExecutorPrototypeStdioServer::new(registry(), db.clone(), Caller::local(), None)
+                .await
+                .unwrap();
+
+        let described = server
+            .handle_message(json!({
+                "jsonrpc":"2.0",
+                "id":1,
+                "method":"tools/call",
+                "params":{"name":"describe_operation","arguments":{
+                    "executor":"guidance_read",
+                    "operation":"manage_instructions.resolve",
+                    "format":"json"
+                }}
+            }))
+            .await
+            .unwrap();
+        assert_eq!(described["result"]["isError"], false, "{described}");
+        let contract = &described["result"]["structuredContent"];
+        assert_eq!(contract["executor"], "guidance_read");
+        assert_eq!(contract["operation"], "manage_instructions.resolve");
+        assert_eq!(contract["source"]["tool"], "manage_instructions");
+        assert_eq!(contract["source"]["selector"]["value"], "resolve");
+
+        // No bindings yet, so only the build-owned engine entry resolves —
+        // still status ready, never a partial stack.
+        let resolved = server
+            .handle_message(json!({
+                "jsonrpc":"2.0",
+                "id":2,
+                "method":"tools/call",
+                "params":{"name":"guidance_read","arguments":{
+                    "operation":"manage_instructions.resolve",
+                    "arguments":{},
+                    "run_key":"cobra-echo-jnbkt3",
+                    "format":"json"
+                }}
+            }))
+            .await
+            .unwrap();
+        assert_eq!(resolved["result"]["isError"], false, "{resolved}");
+        let body = &resolved["result"]["structuredContent"];
+        assert_eq!(body["instructions"]["status"], "ready");
+        assert_eq!(body["instructions"]["entries"].as_array().unwrap().len(), 1);
+        assert_eq!(body["instructions"]["entries"][0]["scope"], "engine");
+        assert!(body["pending_obligations"].is_array());
+
+        db.close().await;
+    }
+
+    #[tokio::test]
     async fn attribution_responses_render_truthfully_on_the_executor_surface() {
         const BEARER: &str = "700cac00-0000-4000-8000-000000000017";
 
@@ -13489,6 +17452,93 @@ mod tests {
         assert_eq!(envelope, before);
     }
 
+    /// The generalised helper moves `format`/`operation` exactly as it moves
+    /// `run_key`/`parent_key`: nested-only lifts, identical dedupes, conflict
+    /// and non-string reject, and a later failure rolls back every earlier
+    /// field so the repair always sees the envelope as the caller sent it.
+    #[test]
+    fn nested_format_and_operation_hoist_transactionally_and_reject_conflicts() {
+        // Nested-only string `operation` and `format` lift to the envelope.
+        let mut envelope = json!({
+            "arguments": {"operation": "get_record", "ids": ["native:root"], "format": "text"},
+        });
+        assert_eq!(
+            hoist_nested_envelope_fields(&mut envelope, &["operation", "format"]),
+            Ok(true)
+        );
+        assert_eq!(envelope["operation"], "get_record");
+        assert_eq!(envelope["format"], "text");
+        assert!(envelope["arguments"].get("operation").is_none());
+        assert!(envelope["arguments"].get("format").is_none());
+
+        // Identical duplicates dedupe to the single envelope value.
+        let mut envelope = json!({
+            "operation": "get_record",
+            "arguments": {"ids": ["native:root"], "operation": "get_record", "format": "json"},
+            "format": "json",
+        });
+        assert_eq!(
+            hoist_nested_envelope_fields(&mut envelope, &["operation", "format"]),
+            Ok(true)
+        );
+        assert_eq!(envelope["operation"], "get_record");
+        assert_eq!(envelope["format"], "json");
+        assert!(envelope["arguments"].get("operation").is_none());
+        assert!(envelope["arguments"].get("format").is_none());
+
+        // A conflicting `format` names the field and leaves the envelope as
+        // sent rather than silently dropping either value.
+        let mut envelope = json!({
+            "operation": "get_record",
+            "arguments": {"ids": ["native:root"], "format": "text"},
+            "format": "json",
+        });
+        let before = envelope.clone();
+        let diagnostic = hoist_nested_envelope_fields(&mut envelope, &["format"]).unwrap_err();
+        assert!(
+            diagnostic.contains("arguments.format conflicts with envelope format"),
+            "{diagnostic}"
+        );
+        assert_eq!(envelope, before);
+
+        // A conflicting `operation` rejects the same way.
+        let mut envelope = json!({
+            "operation": "get_record",
+            "arguments": {"ids": ["native:root"], "operation": "get_structure"},
+        });
+        let diagnostic = hoist_nested_envelope_fields(&mut envelope, &["operation"]).unwrap_err();
+        assert!(
+            diagnostic.contains("arguments.operation conflicts with envelope operation"),
+            "{diagnostic}"
+        );
+
+        // A non-string nested value with no envelope field is misplaced.
+        for field in ["format", "operation"] {
+            let mut envelope = json!({"arguments": {field: 17}});
+            let diagnostic = hoist_nested_envelope_fields(&mut envelope, &[field]).unwrap_err();
+            assert!(diagnostic.contains("misplaced"), "{diagnostic}");
+            assert!(diagnostic.contains("must be a string"), "{diagnostic}");
+            assert_eq!(envelope["arguments"][field], 17);
+        }
+
+        // Transactional across every field in one call: the earlier `format`
+        // hoist is rolled back when the later `operation` conflict fails.
+        let mut envelope = json!({
+            "arguments": {
+                "ids": ["native:root"],
+                "format": "json",
+                "operation": "get_structure",
+            },
+            "operation": "get_record",
+        });
+        let before = envelope.clone();
+        let diagnostic =
+            hoist_nested_envelope_fields(&mut envelope, &["format", "operation"]).unwrap_err();
+        assert!(diagnostic.contains("operation"), "{diagnostic}");
+        assert_eq!(envelope, before);
+        assert_eq!(envelope["arguments"]["format"], "json");
+    }
+
     /// A nested `run_key`/`parent_key` attaches exactly as an envelope key
     /// would; conflicts and non-strings fail with a targeted repair beside
     /// the existing `format` misplacement message.
@@ -13593,8 +17643,13 @@ mod tests {
             conflict_repair["expected_shape"]["description"]
                 .as_str()
                 .unwrap()
-                .contains("arguments.run_key is misplaced"),
+                .contains("arguments.run_key conflicts with envelope run_key"),
             "{conflict_repair}"
+        );
+        assert_eq!(conflict_repair["retry_ready"], false, "{conflict_repair}");
+        assert!(
+            conflict_repair.get("corrections").is_none(),
+            "a run-key conflict must not advertise an automatic correction: {conflict_repair}"
         );
 
         // A non-string nested key is a targeted misplacement, not a hoist.
@@ -13688,6 +17743,529 @@ mod tests {
             override_repair["failing_pointer"], "/arguments/run_key",
             "{override_repair}"
         );
+        db.close().await;
+    }
+
+    /// A nested `format`/`operation` is normalised onto the ordinary envelope
+    /// before selection and rendering, so it behaves exactly as an envelope
+    /// field would; a conflict fails with a targeted message instead of
+    /// silently choosing one.
+    #[tokio::test]
+    async fn nested_format_and_operation_hoist_on_the_ordinary_surface() {
+        let db = create_database(":memory:").await.unwrap();
+        let server =
+            ExecutorPrototypeStdioServer::new(registry(), db.clone(), Caller::local(), None)
+                .await
+                .unwrap();
+        let call = |id: i64, name: &'static str, envelope: Value| {
+            let server = &server;
+            async move {
+                server
+                    .handle_message(json!({
+                        "jsonrpc":"2.0",
+                        "id":id,
+                        "method":"tools/call",
+                        "params":{"name":name,"arguments":envelope}
+                    }))
+                    .await
+                    .unwrap()
+            }
+        };
+
+        // Both duplicates nested under `arguments` dedupe and succeed.
+        let duplicate = call(
+            1,
+            "records_read",
+            json!({
+                "operation": "get_record",
+                "format": "json",
+                "run_key": "duplicate-a748b2",
+                "arguments": {
+                    "ids": ["native:root"],
+                    "format": "json",
+                    "operation": "get_record",
+                },
+            }),
+        )
+        .await;
+        assert_eq!(duplicate["result"]["isError"], false, "{duplicate}");
+        let duplicate_text = duplicate["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            duplicate_text.trim_start().starts_with('{'),
+            "a hoisted json format must render the payload: {duplicate_text}"
+        );
+
+        // Nested-only operation and format select the contract and honour the
+        // requested representation with no envelope copies at all.
+        let nested_only = call(
+            2,
+            "records_read",
+            json!({
+                "run_key": "nested-only-a748b2",
+                "arguments": {
+                    "operation": "get_record",
+                    "format": "json",
+                    "ids": ["native:root"],
+                },
+            }),
+        )
+        .await;
+        assert_eq!(nested_only["result"]["isError"], false, "{nested_only}");
+        let nested_only_text = nested_only["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap();
+        assert!(
+            nested_only_text.trim_start().starts_with('{'),
+            "a nested-only json format must be honoured: {nested_only_text}"
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(nested_only_text).unwrap(),
+            nested_only["result"]["structuredContent"],
+        );
+
+        // A hoisted `text` on an operation with no text renderer still fails,
+        // exactly as an envelope `text` would.
+        let no_renderer = call(
+            3,
+            "system_read",
+            json!({
+                "operation": "ping",
+                "arguments": {"format": "text"},
+            }),
+        )
+        .await;
+        assert_eq!(no_renderer["result"]["isError"], true, "{no_renderer}");
+        assert!(
+            no_renderer["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("no registered text renderer"),
+            "{no_renderer}"
+        );
+
+        // A conflicting nested format rejects naming both placements rather
+        // than silently choosing one.
+        let conflict = call(
+            4,
+            "records_read",
+            json!({
+                "operation": "get_record",
+                "format": "json",
+                "run_key": "conflict-a748b2",
+                "arguments": {"ids": ["native:root"], "format": "text"},
+            }),
+        )
+        .await;
+        assert_eq!(conflict["result"]["isError"], true, "{conflict}");
+        let conflict_text = conflict["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            conflict_text.contains("arguments.format conflicts with envelope format"),
+            "{conflict_text}"
+        );
+        let conflict_repair = &conflict["result"]["structuredContent"]["repair"];
+        assert_eq!(
+            conflict_repair["failing_pointer"], "/arguments/format",
+            "{conflict_repair}"
+        );
+        assert_eq!(conflict_repair["retry_ready"], false, "{conflict_repair}");
+        assert!(
+            conflict_repair.get("corrections").is_none(),
+            "a conflict must not advertise an automatic correction: {conflict_repair}"
+        );
+        assert!(
+            conflict_repair["expected_shape"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("arguments.format conflicts with envelope format"),
+            "{conflict_repair}"
+        );
+
+        // A non-string nested format rejects with the targeted misplacement
+        // text and is never advertised as automatically retryable.
+        let non_string = call(
+            5,
+            "records_read",
+            json!({
+                "operation": "get_record",
+                "run_key": "format-non-string-a748b2",
+                "arguments": {"ids": ["native:root"], "format": 17},
+            }),
+        )
+        .await;
+        assert_eq!(non_string["result"]["isError"], true, "{non_string}");
+        let non_string_text = non_string["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            non_string_text.contains("arguments.format"),
+            "{non_string_text}"
+        );
+        assert!(
+            non_string_text.contains("must be a string"),
+            "{non_string_text}"
+        );
+        let non_string_repair = &non_string["result"]["structuredContent"]["repair"];
+        assert_eq!(
+            non_string_repair["failing_pointer"], "/arguments/format",
+            "{non_string_repair}"
+        );
+        assert_eq!(
+            non_string_repair["retry_ready"], false,
+            "{non_string_repair}"
+        );
+        assert!(
+            non_string_repair.get("corrections").is_none(),
+            "{non_string_repair}"
+        );
+
+        // A nested-only bogus operation is selected (and rejected) as an
+        // unknown operation rather than as a missing envelope operation.
+        let bogus = call(
+            6,
+            "records_read",
+            json!({"arguments": {"operation": "bogus"}}),
+        )
+        .await;
+        assert_eq!(bogus["result"]["isError"], true, "{bogus}");
+        assert!(
+            bogus["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("unknown operation 'bogus'"),
+            "{bogus}"
+        );
+
+        // A nested operation conflict rejects with the targeted message and no
+        // automatic correction.
+        let operation_conflict = call(
+            7,
+            "records_read",
+            json!({
+                "operation": "get_record",
+                "arguments": {"ids": ["native:root"], "operation": "get_structure"},
+            }),
+        )
+        .await;
+        assert_eq!(
+            operation_conflict["result"]["isError"], true,
+            "{operation_conflict}"
+        );
+        assert!(
+            operation_conflict["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("arguments.operation conflicts with envelope operation"),
+            "{operation_conflict}"
+        );
+        let operation_conflict_repair =
+            &operation_conflict["result"]["structuredContent"]["repair"];
+        assert_eq!(
+            operation_conflict_repair["failing_pointer"], "/arguments/operation",
+            "{operation_conflict_repair}"
+        );
+        assert_eq!(
+            operation_conflict_repair["retry_ready"], false,
+            "{operation_conflict_repair}"
+        );
+        assert!(
+            operation_conflict_repair.get("corrections").is_none(),
+            "{operation_conflict_repair}"
+        );
+
+        // A non-string nested operation beside a resolvable envelope operation
+        // rejects with the targeted misplacement text and no correction.
+        let operation_non_string = call(
+            8,
+            "records_read",
+            json!({
+                "operation": "get_record",
+                "arguments": {"ids": ["native:root"], "operation": 17},
+            }),
+        )
+        .await;
+        assert_eq!(
+            operation_non_string["result"]["isError"], true,
+            "{operation_non_string}"
+        );
+        let operation_non_string_repair =
+            &operation_non_string["result"]["structuredContent"]["repair"];
+        assert_eq!(
+            operation_non_string_repair["failing_pointer"], "/arguments/operation",
+            "{operation_non_string_repair}"
+        );
+        assert_eq!(
+            operation_non_string_repair["retry_ready"], false,
+            "{operation_non_string_repair}"
+        );
+        assert!(
+            operation_non_string_repair.get("corrections").is_none(),
+            "{operation_non_string_repair}"
+        );
+
+        // A later hoist failure is still reported against the original
+        // placement: the nested-only operation hoist succeeded first, yet the
+        // format conflict is named at `/arguments/format` with no correction.
+        let late_conflict = call(
+            9,
+            "records_read",
+            json!({
+                "format": "json",
+                "arguments": {
+                    "operation": "get_record",
+                    "format": "text",
+                    "ids": ["native:root"],
+                },
+            }),
+        )
+        .await;
+        assert_eq!(late_conflict["result"]["isError"], true, "{late_conflict}");
+        assert!(
+            late_conflict["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("arguments.format conflicts with envelope format"),
+            "{late_conflict}"
+        );
+        let late_repair = &late_conflict["result"]["structuredContent"]["repair"];
+        assert_eq!(
+            late_repair["failing_pointer"], "/arguments/format",
+            "{late_repair}"
+        );
+        assert_eq!(late_repair["retry_ready"], false, "{late_repair}");
+
+        db.close().await;
+    }
+
+    /// Plan-backed writes normalise a nested `format` exactly as the direct
+    /// path does: it hoists onto the envelope before the plan branch, so plan
+    /// preparation output is byte-identical to the same call with `format` on
+    /// the envelope. A nested-only `operation` still reaches preparation the
+    /// same way.
+    ///
+    /// A conflict or non-string rejects with the targeted message,
+    /// `retry_ready: false`, no corrections, and a failing pointer that names
+    /// the nested field. A nested unsupported value fails exactly as the
+    /// envelope value would.
+    #[tokio::test]
+    async fn plan_required_operations_hoist_nested_format_like_the_envelope() {
+        let db = create_database(":memory:").await.unwrap();
+        let server =
+            ExecutorPrototypeStdioServer::new(registry(), db.clone(), Caller::local(), None)
+                .await
+                .unwrap();
+        let call = |id: i64, envelope: Value| {
+            let server = &server;
+            async move {
+                server
+                    .handle_message(json!({
+                        "jsonrpc":"2.0",
+                        "id":id,
+                        "method":"tools/call",
+                        "params":{"name":"records_write","arguments":envelope}
+                    }))
+                    .await
+                    .unwrap()
+            }
+        };
+        // The record does not exist, so every well-shaped call reaches
+        // preparation and is rejected there. That keeps the response
+        // deterministic (no plan UUID or nonce), so two calls can be compared
+        // byte for byte.
+        let operation_arguments = json!({
+            "record_id": "11111111-1111-4111-8111-111111111111",
+            "target_type": "Resolution",
+            "target_kind": "decision",
+            "reason": "Plan-path nested format probe.",
+        });
+
+        // Nested-only operation: the operation is a sibling of its own
+        // arguments inside the envelope's `arguments`, hoists first, and
+        // reaches the same preparation as an envelope operation.
+        let envelope_operation = call(
+            1,
+            json!({
+                "operation": "correct_record_type",
+                "arguments": operation_arguments.clone(),
+            }),
+        )
+        .await;
+        assert!(
+            !envelope_operation["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("missing required string field 'operation'"),
+            "the envelope-operation baseline must reach plan preparation: {envelope_operation}"
+        );
+        let mut nested_envelope = operation_arguments.clone();
+        nested_envelope["operation"] = json!("correct_record_type");
+        let nested_operation = call(2, json!({"arguments": nested_envelope})).await;
+        assert_eq!(
+            nested_operation["result"], envelope_operation["result"],
+            "a nested-only operation must prepare the same plan as an envelope operation"
+        );
+
+        // Envelope-only `format`: the plan-preparation baseline.
+        let envelope_format = call(
+            3,
+            json!({
+                "operation": "correct_record_type",
+                "arguments": operation_arguments.clone(),
+                "format": "json",
+            }),
+        )
+        .await;
+        // Nested-only `format` hoists onto the envelope before the plan branch,
+        // so its response is byte-identical to the envelope `format` baseline.
+        let mut nested_format_arguments = operation_arguments.clone();
+        nested_format_arguments["format"] = json!("json");
+        let nested_format = call(
+            4,
+            json!({
+                "operation": "correct_record_type",
+                "arguments": nested_format_arguments,
+            }),
+        )
+        .await;
+        assert_eq!(
+            nested_format["result"], envelope_format["result"],
+            "a nested-only format must prepare exactly as an envelope format"
+        );
+
+        // An identical nested + envelope `format` on the same failing write
+        // dedupes to exactly the envelope-only preparation.
+        let mut duplicate_arguments = operation_arguments.clone();
+        duplicate_arguments["format"] = json!("json");
+        let duplicate = call(
+            5,
+            json!({
+                "operation": "correct_record_type",
+                "arguments": duplicate_arguments,
+                "format": "json",
+            }),
+        )
+        .await;
+        assert_eq!(
+            duplicate["result"], envelope_format["result"],
+            "an identical nested and envelope format must dedupe to the same preparation"
+        );
+
+        // An identical nested + envelope `format` on a preparation that
+        // actually succeeds still prepares the plan.
+        let mut schema_arguments = json!({
+            "data": {"shapes": {"Document": {"facets": {"executor_format_probe": {}}}}},
+        });
+        schema_arguments["format"] = json!("json");
+        let schema_success = server
+            .handle_message(json!({
+                "jsonrpc":"2.0",
+                "id":10,
+                "method":"tools/call",
+                "params":{"name":"schema_admin","arguments":{
+                    "operation":"manage_schema_config.write",
+                    "arguments":schema_arguments,
+                    "format":"json",
+                }},
+            }))
+            .await
+            .unwrap();
+        assert_eq!(
+            schema_success["result"]["isError"], false,
+            "an identical nested and envelope format must still prepare: {schema_success}"
+        );
+        assert!(
+            schema_success["result"]["structuredContent"]["plan_id"].is_string(),
+            "a successful preparation must return a plan id: {schema_success}"
+        );
+
+        // A conflicting nested `format` rejects with the targeted message and
+        // is never advertised as automatically retryable.
+        let mut conflict_arguments = operation_arguments.clone();
+        conflict_arguments["format"] = json!("text");
+        let conflict = call(
+            6,
+            json!({
+                "operation": "correct_record_type",
+                "arguments": conflict_arguments,
+                "format": "json",
+            }),
+        )
+        .await;
+        assert_eq!(conflict["result"]["isError"], true, "{conflict}");
+        let conflict_text = conflict["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            conflict_text.contains("arguments.format conflicts with envelope format"),
+            "{conflict_text}"
+        );
+        let conflict_repair = &conflict["result"]["structuredContent"]["repair"];
+        assert_eq!(
+            conflict_repair["failing_pointer"], "/arguments/format",
+            "{conflict_repair}"
+        );
+        assert_eq!(conflict_repair["retry_ready"], false, "{conflict_repair}");
+        assert!(
+            conflict_repair.get("corrections").is_none(),
+            "a conflict must not advertise an automatic correction: {conflict_repair}"
+        );
+
+        // A non-string nested `format` rejects the same way.
+        let mut non_string_arguments = operation_arguments.clone();
+        non_string_arguments["format"] = json!(17);
+        let non_string = call(
+            7,
+            json!({
+                "operation": "correct_record_type",
+                "arguments": non_string_arguments,
+            }),
+        )
+        .await;
+        assert_eq!(non_string["result"]["isError"], true, "{non_string}");
+        let non_string_text = non_string["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            non_string_text.contains("arguments.format"),
+            "{non_string_text}"
+        );
+        assert!(
+            non_string_text.contains("must be a string"),
+            "{non_string_text}"
+        );
+        let non_string_repair = &non_string["result"]["structuredContent"]["repair"];
+        assert_eq!(
+            non_string_repair["failing_pointer"], "/arguments/format",
+            "{non_string_repair}"
+        );
+        assert_eq!(
+            non_string_repair["retry_ready"], false,
+            "{non_string_repair}"
+        );
+        assert!(
+            non_string_repair.get("corrections").is_none(),
+            "{non_string_repair}"
+        );
+
+        // A nested unsupported value fails exactly as the envelope value would.
+        let envelope_yaml = call(
+            8,
+            json!({
+                "operation": "correct_record_type",
+                "arguments": operation_arguments.clone(),
+                "format": "yaml",
+            }),
+        )
+        .await;
+        let mut nested_yaml_arguments = operation_arguments.clone();
+        nested_yaml_arguments["format"] = json!("yaml");
+        let nested_yaml = call(
+            9,
+            json!({
+                "operation": "correct_record_type",
+                "arguments": nested_yaml_arguments,
+            }),
+        )
+        .await;
+        assert_eq!(envelope_yaml["result"]["isError"], true, "{envelope_yaml}");
+        assert_eq!(
+            nested_yaml["result"], envelope_yaml["result"],
+            "a nested unsupported format must fail exactly as the envelope value does"
+        );
+
         db.close().await;
     }
 

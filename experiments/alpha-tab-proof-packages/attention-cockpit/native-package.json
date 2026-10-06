@@ -1,0 +1,26 @@
+{
+  "format": "native.package-manifest@2",
+  "namespace": "agent",
+  "name": "attention-cockpit",
+  "version": "0.1.0",
+  "files": [
+    {
+      "path": "dist/attention-cockpit.html",
+      "sha256": "3d7bc520560a1f87d36622d9a9706c436351ca561af445d988a16a277c3a6afd",
+      "bytes_len": 6126,
+      "media_type": "text/html",
+      "role": "surface_bundle"
+    }
+  ],
+  "contributions": {
+    "surfaces": [
+      {
+        "name": "attention",
+        "file": "dist/attention-cockpit.html"
+      }
+    ]
+  },
+  "declared_reads": ["attention.query.v1"],
+  "declared_effects": [],
+  "requires": []
+}

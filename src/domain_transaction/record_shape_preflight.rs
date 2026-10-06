@@ -785,6 +785,7 @@ pub(crate) async fn execute_preview_record_shape<E: DomainStatementExecutor>(
     executor: &mut E,
     _caller: &Caller,
     arguments: Value,
+    member: bool,
 ) -> Result<Value> {
     let args = parse_arguments(arguments)?;
     let proposed_facets = args
@@ -808,16 +809,32 @@ pub(crate) async fn execute_preview_record_shape<E: DomainStatementExecutor>(
         .transpose()?;
     let catalogs = static_catalogs();
     let semantic_contract = semantic_contract(&catalogs);
-    let meta_head = event_head(executor, "meta_events").await?;
-    let content_head = event_head(executor, "content_events").await?;
+    // A member copy ships neither `meta_events` nor `content_events`
+    // (member profile excludes both logs, contract c323277 §3.2), and §2.6
+    // omits their log positions from the member profile. Report a
+    // member-safe advisory basis with no event heads rather than reading a
+    // table the copy does not carry.
+    let (meta_head, content_head) = if member {
+        (None, None)
+    } else {
+        (
+            Some(event_head(executor, "meta_events").await?),
+            Some(event_head(executor, "content_events").await?),
+        )
+    };
+    let schema_state_revision = match (meta_head, content_head) {
+        (Some(meta), Some(content)) => {
+            format!("schema-state-v1:meta:{meta}:content:{content}")
+        }
+        _ => "member-read-v1:schema-basis".to_owned(),
+    };
     let mut response = json!({
         "schema": RESPONSE_SCHEMA,
         "catalogs": catalogs,
         "selection": Value::Null,
         "advisory_basis": {
             "engine_schema_version": CURRENT_ENGINE_SCHEMA_VERSION,
-            "schema_state_revision": format!("schema-state-v1:meta:{meta_head}:content:{content_head}"),
-            "event_heads": { "meta": meta_head, "content": content_head },
+            "schema_state_revision": schema_state_revision,
             "semantic_contract": semantic_contract,
             "shape_scope": "global schema declarations only; global governance is caller-visible and collection-scoped declarations do not govern create_record",
         },
@@ -828,6 +845,9 @@ pub(crate) async fn execute_preview_record_shape<E: DomainStatementExecutor>(
         "guarantee": GUARANTEE,
         "not_checked": NOT_CHECKED,
     });
+    if let (Some(meta), Some(content)) = (meta_head, content_head) {
+        response["advisory_basis"]["event_heads"] = json!({ "meta": meta, "content": content });
+    }
 
     if let Some(record_type) = args.record_type.as_deref() {
         // All three reads use the executor borrowed by this call. The backend

@@ -22,7 +22,7 @@ use native_ce::query::sql_contract::{
     MAX_CELL_ENCODED_BYTES, MAX_COLUMNS, MAX_RESULT_ENCODED_BYTES, MAX_ROWS,
 };
 use native_ce::store::{create_record, set_facet};
-use serde_json::json;
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 async fn configured_harness() -> Option<PostgresHarness> {
@@ -129,10 +129,10 @@ async fn postgres_describe_schema_is_normalized_allowlisted_and_owner_gated() {
     assert_eq!(owner["engine"]["storage_profile"], "postgres-server");
     assert_eq!(
         owner["engine"]["ddl_fingerprint"],
-        "52025443a3641300ddc2e984a05c2b3ed4e3c67178da77cceb32048ba199d56d"
+        "73ef84e9fcdf81de2fe48dc5304314590516907fcf3ed907146a87b43c46d6a7"
     );
-    assert_eq!(owner["tables"].as_array().unwrap().len(), 37);
-    assert_eq!(owner["ddl_statements"].as_array().unwrap().len(), 56);
+    assert_eq!(owner["tables"].as_array().unwrap().len(), 38);
+    assert_eq!(owner["ddl_statements"].as_array().unwrap().len(), 58);
     let ddl = owner["ddl_statements"]
         .as_array()
         .unwrap()
@@ -1411,14 +1411,125 @@ async fn postgres_query_sql_full_boundary_contract() {
     .execute(sqlite.qualification_write_pool())
     .await
     .unwrap();
+    // Both engines expose the stored projection, not tasks parsed on read.
+    // Seed the bodies and their source events before the FK-backed task rows.
+    const TASK_BODY: &str = "tasks body\n- [ ] buy milk\n> * [ ] quoted\n- [x] done";
+    sqlx::query(
+        "INSERT INTO records(id,type,kind,name,created_at,updated_at) VALUES \
+         ('9c150000-0000-4000-8000-200000000007','Document','attachment','hidden attachment','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+    )
+    .execute(sqlite.qualification_write_pool())
+    .await
+    .unwrap();
+    let tasks = database.qualified_table("body_task_items").unwrap();
+    for (record_id, source_event_seq, event_id) in [
+        (
+            "9c150000-0000-4000-8000-200000000002",
+            1002_i64,
+            "fixture:event:visible-tasks",
+        ),
+        (
+            "9c150000-0000-4000-8000-200000000007",
+            1003_i64,
+            "fixture:event:hidden-tasks",
+        ),
+    ] {
+        sqlx::query(&format!("UPDATE {records} SET body=$1 WHERE id=$2"))
+            .bind(TASK_BODY)
+            .bind(record_id)
+            .execute(database.pool())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE records SET body=?1 WHERE id=?2")
+            .bind(TASK_BODY)
+            .bind(record_id)
+            .execute(sqlite.qualification_write_pool())
+            .await
+            .unwrap();
+        let payload = json!({"body":TASK_BODY});
+        sqlx::query(&format!(
+            "INSERT INTO {events}(seq,id,record_id,type,payload,actor,created_at,causal_envelope_version,causal_status) \
+             VALUES($1,$2,$3,'record.updated',$4,'acct:alice','2026-01-01T00:00:00Z',1,'legacy_unknown')"
+        ))
+        .bind(source_event_seq)
+        .bind(event_id)
+        .bind(record_id)
+        .bind(&payload)
+        .execute(database.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO content_events(seq,id,record_id,type,payload,actor,created_at,causal_envelope_version,causal_status) \
+             VALUES(?1,?2,?3,'record.updated',?4,'acct:alice','2026-01-01T00:00:00Z',1,'legacy_unknown')",
+        )
+        .bind(source_event_seq)
+        .bind(event_id)
+        .bind(record_id)
+        .bind(payload.to_string())
+        .execute(sqlite.qualification_write_pool())
+        .await
+        .unwrap();
+        for item in native_ce::body_task_items::extract_task_items(TASK_BODY).unwrap() {
+            let marker = native_ce::body_task_items::TaskMarker::as_str(&item.marker).unwrap();
+            sqlx::query(&format!(
+                "INSERT INTO {tasks}(record_id,item_index,source_event_seq,marker,checked,in_quote,start_offset,end_offset) \
+                 VALUES($1,$2,$3,$4,$5,$6,$7,$8)"
+            ))
+            .bind(record_id)
+            .bind(item.index as i64)
+            .bind(source_event_seq)
+            .bind(marker)
+            .bind(item.checked)
+            .bind(item.in_quote)
+            .bind(item.start_offset as i64)
+            .bind(item.end_offset as i64)
+            .execute(database.pool())
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO body_task_items(record_id,item_index,source_event_seq,marker,checked,in_quote,start_offset,end_offset) \
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+            )
+            .bind(record_id)
+            .bind(item.index as i64)
+            .bind(source_event_seq)
+            .bind(marker)
+            .bind(i64::from(item.checked))
+            .bind(i64::from(item.in_quote))
+            .bind(item.start_offset as i64)
+            .bind(item.end_offset as i64)
+            .execute(sqlite.qualification_write_pool())
+            .await
+            .unwrap();
+        }
+    }
+    let hidden_tasks = "SELECT record_id FROM body_task_items WHERE record_id='9c150000-0000-4000-8000-200000000007'";
+    for caller in [Caller::authenticated("acct:alice"), Caller::local()] {
+        assert!(
+            qualification_query_sql(database.clone(), caller.clone(), query(hidden_tasks))
+                .await
+                .unwrap()
+                .rows
+                .is_empty()
+        );
+        assert!(sqlite_query_sql(&sqlite, &caller, hidden_tasks)
+            .await
+            .unwrap()
+            .rows
+            .is_empty());
+    }
     let parity_queries = [
         (
             "records",
             "SELECT * FROM records WHERE id='9c150000-0000-4000-8000-200000000002'",
         ),
         (
+            "record_lifecycle_interpretations",
+            "SELECT record_id,status,raw,axis_key,axis_label,vocabulary_id,vocabulary_name,value_id,canonical,terminality,reason FROM record_lifecycle_interpretations WHERE record_id='9c150000-0000-4000-8000-200000000002'",
+        ),
+        (
             "content_events",
-            "SELECT local_seq,id,record_id,type,created_at,created_at_ms FROM content_events WHERE id IN ('observation:old','observation:correction') ORDER BY local_seq",
+            "SELECT local_seq,id,record_id,type,actor,run_key,parent_key,channel_kind,created_at,created_at_ms FROM content_events WHERE record_id='9c150000-0000-4000-8000-100000000001' AND id IN ('observation:old','observation:correction') ORDER BY local_seq",
         ),
         (
             "links",
@@ -1453,6 +1564,10 @@ async fn postgres_query_sql_full_boundary_contract() {
             "SELECT id,layer,name,data,applies_to_collection_id,version_lineage,created_at,created_at_ms FROM schema_config WHERE id='fixture:config'",
         ),
         (
+            "body_task_items",
+            "SELECT record_id,item_index,marker,checked,in_quote,start_offset,end_offset FROM body_task_items WHERE record_id='9c150000-0000-4000-8000-200000000002' ORDER BY item_index",
+        ),
+        (
             "catalog_relations",
             "SELECT relation_name,identity,semantic_version,caller_relative,completeness,profiles,comment FROM catalog_relations ORDER BY relation_name",
         ),
@@ -1474,11 +1589,22 @@ async fn postgres_query_sql_full_boundary_contract() {
             query(sql),
         )
         .await
-        .unwrap();
+        .unwrap_or_else(|error| panic!("query_sql parity for {relation_name} failed: {error}"));
         let sqlite_result = sqlite_query_sql(&sqlite, &Caller::authenticated("acct:alice"), sql)
             .await
             .unwrap();
         assert!(!postgres_result.rows.is_empty(), "{}", relation.name);
+        if relation_name == "body_task_items" {
+            let record_id = "9c150000-0000-4000-8000-200000000002";
+            assert_eq!(
+                postgres_result.rows,
+                [
+                    json!({"record_id":record_id,"item_index":0,"marker":"-","checked":0,"in_quote":0,"start_offset":11,"end_offset":25}),
+                    json!({"record_id":record_id,"item_index":1,"marker":"*","checked":0,"in_quote":1,"start_offset":28,"end_offset":40}),
+                    json!({"record_id":record_id,"item_index":2,"marker":"-","checked":1,"in_quote":0,"start_offset":41,"end_offset":51}),
+                ]
+            );
+        }
         assert_eq!(
             postgres_result.columns, relation.columns,
             "{}",
@@ -1929,6 +2055,242 @@ async fn postgres_query_sql_widened_functions_run_end_to_end() {
 }
 
 #[tokio::test]
+async fn postgres_query_sql_determinism_normalisations_run_end_to_end() {
+    // I3 (AST design): Postgres orders and divides like the SQLite-family
+    // engines — NULLS FIRST on ASC/default, NULLS LAST on DESC, NULL on
+    // zero divisors — via AST normalisation + deparse. Reviewer hard inputs
+    // from the blocked text-rewrite attempt run live here.
+    let Some(harness) = configured_harness().await else {
+        return;
+    };
+    let database = harness.fresh_logical_database().await.unwrap();
+    let run = |sql: &str, parameters: Vec<QuerySqlParameter>| {
+        let database = database.clone();
+        let sql = sql.to_owned();
+        async move {
+            qualification_query_sql(
+                database,
+                Caller::local(),
+                QuerySqlRequest { sql, parameters },
+            )
+            .await
+            .unwrap()
+            .rows
+        }
+    };
+    let real = |value: f64| QuerySqlParameter::Real { value: Some(value) };
+    for (sql, parameters, expected) in [
+        ("SELECT x FROM (VALUES ('a'), (NULL)) AS v(x) ORDER BY x", vec![], vec![json!({"x": null}), json!({"x": "a"})]),
+        ("SELECT x FROM (VALUES ('a'), (NULL)) AS v(x) ORDER BY x DESC", vec![], vec![json!({"x": "a"}), json!({"x": null})]),
+        ("SELECT x FROM (VALUES ('a'), (NULL)) AS v(x) ORDER BY 1", vec![], vec![json!({"x": null}), json!({"x": "a"})]),
+        ("SELECT n FROM (VALUES (1), (NULL), (2)) AS v(n) ORDER BY n + 1", vec![], vec![json!({"n": null}), json!({"n": 1}), json!({"n": 2})]),
+        ("SELECT s FROM (SELECT sum(n) OVER (ORDER BY n ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS s FROM (VALUES (1), (2)) AS v(n)) t ORDER BY s", vec![], vec![json!({"s": 1}), json!({"s": 3})]),
+        ("SELECT x FROM (VALUES (2), (1)) AS v(x) ORDER BY x USING >", vec![], vec![json!({"x": 2}), json!({"x": 1})]),
+        ("SELECT rank(2) WITHIN GROUP (ORDER BY n) AS r FROM (VALUES (1), (2), (3)) AS v(n)", vec![], vec![json!({"r": 2})]),
+        ("SELECT 1 / 0 AS d, 5 % 0 AS m", vec![], vec![json!({"d": null, "m": null})]),
+        ("SELECT 1 / 2e3 AS q", vec![], vec![json!({"q": 0.0005})]),
+        ("SELECT ?1 / ?2 AS q", vec![real(7.0), real(2.0)], vec![json!({"q": 3.5})]),
+        ("SELECT ?1 / ?2 AS q", vec![real(1.0), real(0.0)], vec![json!({"q": null})]),
+        ("SELECT CASE WHEN n <> 0 THEN 10 / n ELSE -1 END AS q FROM (VALUES (2), (0)) AS v(n) ORDER BY 1", vec![], vec![json!({"q": -1}), json!({"q": 5})]),
+        ("SELECT DISTINCT ON (n / k) n, k FROM (VALUES (1, 1), (2, 0)) AS v(n, k) ORDER BY n / k", vec![], vec![json!({"n": 2, "k": 0}), json!({"n": 1, "k": 1})]),
+    ] {
+        assert_eq!(run(sql, parameters).await, expected, "{sql}");
+    }
+    harness.close(&database).await;
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn postgres_query_sql_like_is_case_insensitive() {
+    // I4: bare LIKE matches case-insensitively on every engine. Postgres
+    // LIKE is case-sensitive natively, so validate() rewrites it to ILIKE
+    // in the pg_query AST. Literals prove the operator semantics live;
+    // view-backed rows prove the COLLATE "C" projections fold ASCII (and
+    // only ASCII), exactly like SQLite/Turso.
+    let Some(harness) = configured_harness().await else {
+        return;
+    };
+    let database = harness.fresh_logical_database().await.unwrap();
+    let run_local = |sql: &str| {
+        let database = database.clone();
+        let sql = sql.to_owned();
+        async move {
+            qualification_query_sql(
+                database,
+                Caller::local(),
+                QuerySqlRequest {
+                    sql,
+                    parameters: vec![],
+                },
+            )
+            .await
+            .unwrap()
+            .rows
+        }
+    };
+    assert_eq!(
+        run_local("SELECT 'ABC' LIKE 'abc' AS m").await,
+        [json!({"m": 1})]
+    );
+    assert_eq!(
+        run_local("SELECT 'ABC' NOT LIKE 'abc' AS m").await,
+        [json!({"m": 0})]
+    );
+    // F1/F2: the direct-operator and ANY/ALL spellings rewrite to the
+    // ILIKE spellings with case-insensitive results, live.
+    assert_eq!(
+        run_local("SELECT 'ABC' ~~ 'abc' AS m").await,
+        [json!({"m": 1})]
+    );
+    assert_eq!(
+        run_local("SELECT 'ABC' !~~ 'abc' AS m").await,
+        [json!({"m": 0})]
+    );
+    assert_eq!(
+        run_local("SELECT 'ABC' LIKE ANY (ARRAY['abc', 'xyz']) AS m").await,
+        [json!({"m": 1})]
+    );
+    assert_eq!(
+        run_local("SELECT 'ABC' NOT LIKE ALL (ARRAY['abc']) AS m").await,
+        [json!({"m": 0})]
+    );
+    assert_eq!(
+        run_local("SELECT 'ABC' LIKE ANY (SELECT 'abc') AS m").await,
+        [json!({"m": 1})]
+    );
+    // Caveat, documented live without pinning a locale: bare non-ASCII
+    // literals fold (or not) per the cluster locale, so read the server's
+    // own ILIKE verdict directly and require the LIKE rewrite to agree
+    // with it. (On this C.UTF-8 cluster that is 1; on SQLite/Turso and on
+    // a C-locale cluster it is 0.) Through the views below every engine
+    // folds ASCII only.
+    let native: bool = sqlx::query_scalar("SELECT 'É' ILIKE 'é'")
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        run_local("SELECT 'É' LIKE 'é' AS m").await,
+        [json!({"m": if native { 1 } else { 0 }})]
+    );
+    harness
+        .call(
+            &database,
+            TestCaller::Local,
+            "create_record",
+            json!({
+                "id": "9c150000-0000-4000-8000-002000000036",
+                "type": "Entity",
+                "kind": "person",
+                "name": "Like",
+                "reason": "Create a LIKE case-folding principal fixture."
+            }),
+        )
+        .await
+        .unwrap();
+    harness
+        .provision_member(
+            &database,
+            "9c150000-0000-4000-8000-002000000036",
+            "acct:like",
+            "principal:like",
+        )
+        .await
+        .unwrap();
+    for (record_id, name) in [
+        ("9c150000-0000-4000-8000-100000000011", "Banana"),
+        ("9c150000-0000-4000-8000-100000000012", "Äpfel"),
+    ] {
+        harness
+            .call(
+                &database,
+                TestCaller::Member {
+                    account_id: "acct:like".into(),
+                },
+                "create_record",
+                json!({
+                    "id": record_id, "type": "Document", "kind": "note", "name": name,
+                    "reason": "Create a LIKE case-folding fixture.",
+                }),
+            )
+            .await
+            .unwrap();
+        let policies = database.qualified_table("record_policies").unwrap();
+        let entries = database.qualified_table("policy_entries").unwrap();
+        let records = database.qualified_table("records").unwrap();
+        let mut tx = database.pool().begin().await.unwrap();
+        sqlx::query(&format!("INSERT INTO {policies}(record_id) VALUES($1)"))
+            .bind(record_id)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::query(&format!(
+            "UPDATE {records} SET policy_anchor_id=$1 WHERE id=$1"
+        ))
+        .bind(record_id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query(&format!("INSERT INTO {entries}(policy_anchor_id,subject_kind,subject_id,effect,capability) VALUES($1,'account',$2,'allow','view')"))
+            .bind(record_id)
+            .bind("acct:like")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+    }
+    let run_alice = |sql: &str| {
+        let database = database.clone();
+        let sql = sql.to_owned();
+        async move {
+            qualification_query_sql(
+                database,
+                Caller::authenticated("acct:like"),
+                QuerySqlRequest {
+                    sql,
+                    parameters: vec![],
+                },
+            )
+            .await
+            .unwrap()
+            .rows
+        }
+    };
+    for (sql, expected) in [
+        (
+            "SELECT id FROM records WHERE name LIKE 'banana' ORDER BY id",
+            vec![json!({"id": "9c150000-0000-4000-8000-100000000011"})],
+        ),
+        (
+            "SELECT id FROM records WHERE name LIKE 'BANANA' ORDER BY id",
+            vec![json!({"id": "9c150000-0000-4000-8000-100000000011"})],
+        ),
+        // Non-ASCII case never folds through the views, on any engine.
+        (
+            "SELECT id FROM records WHERE name LIKE 'äpfel' ORDER BY id",
+            vec![],
+        ),
+        // ASCII positions still fold around the non-ASCII letter.
+        (
+            "SELECT id FROM records WHERE name LIKE 'ÄPFEL' ORDER BY id",
+            vec![json!({"id": "9c150000-0000-4000-8000-100000000012"})],
+        ),
+        // F1/F2 spellings through the views: same ASCII-only fold.
+        (
+            "SELECT id FROM records WHERE name ~~ 'BANANA' ORDER BY id",
+            vec![json!({"id": "9c150000-0000-4000-8000-100000000011"})],
+        ),
+        (
+            "SELECT id FROM records WHERE name LIKE ANY (ARRAY['banana']) ORDER BY id",
+            vec![json!({"id": "9c150000-0000-4000-8000-100000000011"})],
+        ),
+    ] {
+        assert_eq!(run_alice(sql).await, expected, "{sql}");
+    }
+    harness.close(&database).await;
+    harness.shutdown().await;
+}
+
+#[tokio::test]
 async fn postgres_query_sql_computed_booleans_encode_as_zero_one() {
     let Some(harness) = configured_harness().await else {
         return;
@@ -2214,7 +2576,7 @@ async fn postgres_ddl_migration_and_pool_contract() {
     let database = harness.fresh_logical_database().await.unwrap();
     let search_path_before = current_search_path(&database).await.unwrap();
 
-    assert_eq!(migration_version(&database).await.unwrap(), 7);
+    assert_eq!(migration_version(&database).await.unwrap(), 9);
     assert_eq!(
         physical_tables(&database).await.unwrap(),
         [
@@ -2225,6 +2587,7 @@ async fn postgres_ddl_migration_and_pool_contract() {
             "binding_systems",
             "bindings",
             "blobs",
+            "body_task_items",
             "content_event_causal_cutover",
             "content_event_causal_frontier",
             "content_event_sources",
@@ -2294,7 +2657,7 @@ async fn postgres_legacy_v3_shape_never_reports_ready_under_the_v5_runtime() {
     let binding_audit = database.qualified_table("binding_audit").unwrap();
     let mut tx = database.pool().begin().await.unwrap();
     sqlx::query(&format!(
-        "DELETE FROM {migrations} WHERE version IN (5,6,7)"
+        "DELETE FROM {migrations} WHERE version IN (5,6,7,8,9)"
     ))
     .execute(&mut *tx)
     .await
@@ -2313,7 +2676,7 @@ async fn postgres_legacy_v3_shape_never_reports_ready_under_the_v5_runtime() {
 
     let health = database.health().await.unwrap();
     assert_eq!(health.observed_schema_version, Some(3));
-    assert_eq!(health.expected_schema_version, 7);
+    assert_eq!(health.expected_schema_version, 9);
     assert_eq!(health.schema_currency, PostgresSchemaCurrency::Behind);
     assert!(!health.ready);
     assert!(!health.write_ready);
@@ -5411,4 +5774,338 @@ async fn postgres_act_number_is_one_per_transaction_and_gapless() {
     database.assert_replay_equivalent().await.unwrap();
     harness.close(&database).await;
     harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn postgres_content_events_discloses_attribution_by_history_rule() {
+    let Some(harness) = configured_harness().await else {
+        return;
+    };
+    let database = harness.fresh_logical_database().await.unwrap();
+    const ALICE_PERSON: &str = "9c150000-0000-4000-8000-002000000044";
+    const BEA_PERSON: &str = "9c150000-0000-4000-8000-002000000045";
+    const COMMON: &str = "9c150000-0000-4000-8000-100000000044";
+    for (person_id, name) in [(ALICE_PERSON, "Alice"), (BEA_PERSON, "Bea")] {
+        harness
+            .call(
+                &database,
+                TestCaller::Local,
+                "create_record",
+                json!({
+                    "id": person_id,
+                    "type": "Entity",
+                    "kind": "person",
+                    "name": name,
+                    "reason": "Create an attribution principal fixture."
+                }),
+            )
+            .await
+            .unwrap();
+    }
+    harness
+        .provision_member(&database, ALICE_PERSON, "acct:alice", "principal:alice")
+        .await
+        .unwrap();
+    harness
+        .provision_member(&database, BEA_PERSON, "acct:bea", "principal:bea")
+        .await
+        .unwrap();
+    harness
+        .call(
+            &database,
+            TestCaller::Local,
+            "create_record",
+            json!({
+                "id": COMMON,
+                "type": "Document",
+                "kind": "note",
+                "name": COMMON,
+                "reason": "Create an attribution visibility fixture."
+            }),
+        )
+        .await
+        .unwrap();
+    let policies = database.qualified_table("record_policies").unwrap();
+    let entries = database.qualified_table("policy_entries").unwrap();
+    let records = database.qualified_table("records").unwrap();
+    for (record_id, viewers) in [
+        (ALICE_PERSON, vec!["acct:alice", "acct:bea"]),
+        (BEA_PERSON, vec!["acct:bea"]),
+        (COMMON, vec!["acct:alice", "acct:bea"]),
+    ] {
+        let mut tx = database.pool().begin().await.unwrap();
+        sqlx::query(&format!("INSERT INTO {policies}(record_id) VALUES($1)"))
+            .bind(record_id)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::query(&format!(
+            "UPDATE {records} SET policy_anchor_id=$1 WHERE id=$1"
+        ))
+        .bind(record_id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        for viewer in viewers {
+            sqlx::query(&format!("INSERT INTO {entries}(policy_anchor_id,subject_kind,subject_id,effect,capability) VALUES($1,'account',$2,'allow','view')"))
+                .bind(record_id)
+                .bind(viewer)
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+        }
+        tx.commit().await.unwrap();
+    }
+    const RUN_A: &str = "scout-chair-a748b2";
+    const PARENT_A: &str = "heron-river-b748b2";
+    const RUN_B: &str = "scout-chair-b748b2";
+    const HOLDER_RUN: &str = "scout-chair-a749b2";
+    const HOLDER_PARENT: &str = "heron-river-c748b2";
+    let events = database.qualified_table("content_events").unwrap();
+    // (seq, id, payload, actor, run_key, parent_key)
+    type Fixture<'a> = (
+        i64,
+        &'a str,
+        Value,
+        Option<&'a str>,
+        Option<&'a str>,
+        Option<&'a str>,
+    );
+    let fixtures: [Fixture; 5] = [
+        (
+            200,
+            "evt-attrib-disclosed",
+            json!({"summary": "ordinary"}),
+            Some("acct:alice"),
+            Some(RUN_A),
+            Some(PARENT_A),
+        ),
+        (
+            201,
+            "evt-attrib-hidden",
+            json!({"summary": "bea"}),
+            Some("acct:bea"),
+            Some(RUN_B),
+            None,
+        ),
+        (
+            202,
+            "evt-attrib-claim",
+            json!({"summary": "claimed", "claimed_by_account": "acct:alice", "claimed_run_key": HOLDER_RUN}),
+            Some("acct:alice"),
+            Some(HOLDER_RUN),
+            Some(HOLDER_PARENT),
+        ),
+        (
+            203,
+            "evt-attrib-actorless",
+            json!({"summary": "system"}),
+            None,
+            Some("otter-field-c748b2"),
+            None,
+        ),
+        // An explicit-JSON-null claim key is still claim-shaped: the history
+        // rule tests key presence (`.get(..).is_some()`), so `?` must too.
+        // `->>` would read this as SQL NULL and disclose the run to bea.
+        (
+            204,
+            "evt-attrib-claim-null",
+            json!({"summary": "claimed-null", "claimed_by_account": null}),
+            Some("acct:alice"),
+            Some(HOLDER_RUN),
+            Some(HOLDER_PARENT),
+        ),
+    ];
+    for (seq, id, payload, actor, run_key, parent_key) in fixtures {
+        sqlx::query(&format!(
+            "INSERT INTO {events}(seq,id,record_id,type,payload,actor,run_key,parent_key,created_at,causal_envelope_version,causal_status) \
+             VALUES ($1,$2,'{COMMON}','record.updated',$3::jsonb,$4,$5,$6,'2026-01-03T00:00:00Z',1,'legacy_unknown')"
+        ))
+        .bind(seq)
+        .bind(id)
+        .bind(payload.to_string())
+        .bind(actor)
+        .bind(run_key)
+        .bind(parent_key)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    }
+    let query = |sql: &str| QuerySqlRequest {
+        sql: sql.into(),
+        parameters: vec![],
+    };
+    let statement = "SELECT id, actor, run_key, parent_key FROM content_events \
+                     WHERE record_id='9c150000-0000-4000-8000-100000000044' \
+                       AND id IN ('evt-attrib-disclosed','evt-attrib-hidden','evt-attrib-claim',
+                                  'evt-attrib-actorless','evt-attrib-claim-null') \
+                     ORDER BY local_seq";
+    let cell =
+        |row: &Value, column: &str| row.get(column).and_then(Value::as_str).map(str::to_string);
+    let attributed = |rows: &[Value]| {
+        rows.iter()
+            .map(|row| {
+                (
+                    row["id"].as_str().unwrap().to_string(),
+                    cell(row, "actor"),
+                    cell(row, "run_key"),
+                    cell(row, "parent_key"),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let as_alice = attributed(
+        &qualification_query_sql(
+            database.clone(),
+            Caller::authenticated("acct:alice"),
+            query(statement),
+        )
+        .await
+        .unwrap()
+        .rows,
+    );
+    assert_eq!(
+        as_alice,
+        vec![
+            (
+                "evt-attrib-disclosed".to_string(),
+                Some("acct:alice".to_string()),
+                Some(RUN_A.to_string()),
+                Some(PARENT_A.to_string()),
+            ),
+            ("evt-attrib-hidden".to_string(), None, None, None),
+            (
+                "evt-attrib-claim".to_string(),
+                Some("acct:alice".to_string()),
+                Some(HOLDER_RUN.to_string()),
+                Some(HOLDER_PARENT.to_string()),
+            ),
+            ("evt-attrib-actorless".to_string(), None, None, None),
+            (
+                "evt-attrib-claim-null".to_string(),
+                Some("acct:alice".to_string()),
+                Some(HOLDER_RUN.to_string()),
+                Some(HOLDER_PARENT.to_string()),
+            ),
+        ]
+    );
+    let as_bea = attributed(
+        &qualification_query_sql(
+            database.clone(),
+            Caller::authenticated("acct:bea"),
+            query(statement),
+        )
+        .await
+        .unwrap()
+        .rows,
+    );
+    assert_eq!(
+        as_bea,
+        vec![
+            (
+                "evt-attrib-disclosed".to_string(),
+                Some("acct:alice".to_string()),
+                Some(RUN_A.to_string()),
+                Some(PARENT_A.to_string()),
+            ),
+            (
+                "evt-attrib-hidden".to_string(),
+                Some("acct:bea".to_string()),
+                Some(RUN_B.to_string()),
+                None,
+            ),
+            (
+                "evt-attrib-claim".to_string(),
+                Some("acct:alice".to_string()),
+                None,
+                None,
+            ),
+            ("evt-attrib-actorless".to_string(), None, None, None),
+            (
+                "evt-attrib-claim-null".to_string(),
+                Some("acct:alice".to_string()),
+                None,
+                None,
+            ),
+        ]
+    );
+    let as_local = attributed(
+        &qualification_query_sql(database.clone(), Caller::local(), query(statement))
+            .await
+            .unwrap()
+            .rows,
+    );
+    assert!(as_local.iter().all(|(_, actor, run_key, _)| {
+        actor.is_some() || run_key.as_deref() == Some("otter-field-c748b2")
+    }));
+    assert_eq!(as_local[2].2, Some(HOLDER_RUN.to_string()));
+    harness.close(&database).await;
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn postgres_unknown_column_names_that_relations_columns() {
+    // E1 M2 I6: an unknown column on a known logical relation names the
+    // valid columns of that relation, identically on every engine. The
+    // failure is at prepare type-check time, so no row fixture is needed.
+    let Some(harness) = configured_harness().await else {
+        return;
+    };
+    let database = harness.fresh_logical_database().await.unwrap();
+    let query = |sql: &str| QuerySqlRequest {
+        sql: sql.into(),
+        parameters: Vec::new(),
+    };
+    let caller = Caller::authenticated("acct:alice");
+    let error = qualification_query_sql(
+        database.clone(),
+        caller.clone(),
+        query("SELECT titel FROM records"),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert_eq!(
+        error,
+        "query_sql [syntax_or_type]: PostgreSQL could not type-check the query at position 8: \
+         column \"titel\" does not exist. Hint: valid columns of records are id, type, kind, name, \
+         body, home_id, lifecycle, persistence, maturity, summary, is_current, \
+         successor_count … (21 total). Full list: SELECT column_name FROM catalog_columns \
+         WHERE relation_name = 'records' ORDER BY column_position."
+    );
+    let aliased = qualification_query_sql(
+        database.clone(),
+        caller.clone(),
+        query("SELECT r.nme FROM records r"),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(!aliased.contains("no such column"), "{aliased}");
+    assert!(
+        aliased.contains(
+            ". Hint: valid columns of records are id, type, kind, name, body, home_id, lifecycle, \
+             persistence, maturity, summary, is_current, successor_count … (21 total)."
+        ),
+        "{aliased}"
+    );
+    let joined = qualification_query_sql(
+        database.clone(),
+        caller,
+        query("SELECT titel FROM records JOIN links ON links.target_id = records.id"),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(
+        joined.contains("is not a column of any relation in scope"),
+        "{joined}"
+    );
+    assert!(joined.contains("Valid columns of records are "), "{joined}");
+    assert!(joined.contains("valid columns of links are "), "{joined}");
+    assert!(
+        joined.contains("WHERE relation_name IN ('records', 'links')"),
+        "{joined}"
+    );
+    harness.close(&database).await;
 }

@@ -58,8 +58,8 @@ cargo run --locked --bin conformance
 cargo run --locked --bin mcp-stdio -- path/to/native.db
 ```
 
-The root [README](README.md) includes an exact two-request MCP walkthrough and
-its observable success result. The [architecture map](ARCHITECTURE.md) routes
+[SELF_HOSTING.md](SELF_HOSTING.md) includes an exact two-request MCP protocol
+probe and its observable success result. The [architecture map](ARCHITECTURE.md) routes
 changes to implementation and executable evidence.
 
 For the selected optional MCP App bundles, work inside `web/mcp-apps` and use

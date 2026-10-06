@@ -1,0 +1,71 @@
+{
+  "namespace": "sheets",
+  "name": "sheet",
+  "args": ["sheet_id"],
+  "inputs": [
+    {
+      "name": "sheet",
+      "cardinality": "one",
+      "sql": "SELECT r.id AS id, (SELECT value FROM facet_values WHERE record_id = r.id AND key = 'region') AS region FROM records r WHERE r.id = ?1",
+      "params": ["sheet_id"]
+    },
+    {
+      "name": "lines",
+      "cardinality": "many",
+      "sql": "SELECT l.source_id AS id, COALESCE((SELECT value_num FROM facet_values WHERE record_id = l.source_id AND key = 'amount_minor'), 0) AS amount_minor FROM links l JOIN records r ON r.id = l.source_id WHERE l.target_id = ?1 AND l.relationship = 'line_of' ORDER BY l.source_id",
+      "params": ["sheet_id"]
+    },
+    {
+      "name": "totals",
+      "cardinality": "one",
+      "sql": "SELECT COALESCE(SUM(COALESCE((SELECT value_num FROM facet_values WHERE record_id = l.source_id AND key = 'amount_minor'), 0)), 0) AS total FROM links l JOIN records r ON r.id = l.source_id WHERE l.target_id = ?1 AND l.relationship = 'line_of'",
+      "params": ["sheet_id"]
+    },
+    {
+      "name": "rate",
+      "cardinality": "one",
+      "unknown": "tax_rate",
+      "sql": "SELECT r.id AS id, (SELECT value_num FROM facet_values WHERE record_id = r.id AND key = 'rate_bp') AS rate_bp FROM records r WHERE r.type = 'TaxRate' AND (SELECT value FROM facet_values WHERE record_id = r.id AND key = 'region') = ?1 LIMIT 1",
+      "params": [{"input": "sheet", "field": "region"}]
+    }
+  ],
+  "clauses": [
+    {"id": "review", "when": "totals.total > 500000", "result": "{\"decision\": \"needs_review\", \"role\": \"\", \"used\": [sheet.id] + lines.map(l, l.id), \"value\": totals.total}"},
+    {"id": "sheet_ok", "when": "true", "result": "{\"decision\": \"ok\", \"role\": \"\", \"used\": [sheet.id] + lines.map(l, l.id), \"value\": totals.total}"}
+  ],
+  "examples": [
+    {
+      "name": "big total needs review",
+      "inputs": {
+        "sheet": {"id": "sh-big", "region": "EU"},
+        "lines": [{"id": "l1", "amount_minor": 200000}, {"id": "l2", "amount_minor": 350000}],
+        "totals": {"total": 550000},
+        "rate": {"id": "tax-eu", "rate_bp": 2000}
+      },
+      "args": {"sheet_id": "sh-big"},
+      "expect": {"decision": "needs_review", "clause": "review", "used": ["sh-big", "l1", "l2"]}
+    },
+    {
+      "name": "small total ok",
+      "inputs": {
+        "sheet": {"id": "sh-small", "region": "EU"},
+        "lines": [{"id": "m1", "amount_minor": 400000}],
+        "totals": {"total": 400000},
+        "rate": {"id": "tax-eu", "rate_bp": 2000}
+      },
+      "args": {"sheet_id": "sh-small"},
+      "expect": {"decision": "ok", "clause": "sheet_ok", "used": ["sh-small", "m1"]}
+    },
+    {
+      "name": "missing rate is unknown",
+      "inputs": {
+        "sheet": {"id": "sh-norate", "region": "XX"},
+        "lines": [{"id": "n1", "amount_minor": 10}],
+        "totals": {"total": 10},
+        "rate": null
+      },
+      "args": {"sheet_id": "sh-norate"},
+      "expect": {"decision": "unknown", "clause": "unknown(tax_rate)", "used": []}
+    }
+  ]
+}

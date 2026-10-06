@@ -544,10 +544,22 @@ impl ActionAttestationDraft {
     pub(crate) fn id(&self) -> &str {
         &self.id
     }
+
+    /// Admitted executor-identity snapshot for this draft. Pure: no
+    /// accepted-output event is needed and no DB, event, or attestation
+    /// writes occur. Fails on receipt principal or action-scope mismatch,
+    /// so only post-admission facts become snapshots.
+    pub(crate) fn executor_identity_snapshot(&self) -> Result<ExecutorIdentitySnapshot> {
+        ExecutorIdentitySnapshot::admitted(&self.facts)
+    }
 }
 
 tokio::task_local! {
     static TRUSTED_PROVENANCE: ProvenanceDispatch;
+}
+
+pub(crate) fn current_dispatch() -> Option<ProvenanceDispatch> {
+    TRUSTED_PROVENANCE.try_with(Clone::clone).ok()
 }
 
 pub(crate) fn digest_json(value: &Value) -> String {
@@ -682,6 +694,131 @@ fn interaction_scope_digest(arguments: &Value) -> Option<String> {
     })))
 }
 
+/// Immutable executor-identity snapshot: the admitted `{principal,
+/// executor_kind}` pair for one accepted action.
+///
+/// This conveys identity/correlation only. It is NEVER a future-action or
+/// access grant, and it is NEVER proof that an output was accepted: it is
+/// obtainable with no accepted-output event, performs no DB, event, or
+/// attestation writes, and carries no `run_key` (`DispatchFacts` has none;
+/// asserted keys are stripped from the governed action identity and any
+/// validated key is ambient per-event correlation, not executor identity).
+/// Only post-admission facts may feed acknowledged contributors: construction
+/// re-runs the pure receipt principal + action-scope validation shared with
+/// [`issue_action_attestation_outputs_in`], so a raw pre-validation
+/// `human` selection never becomes an admitted snapshot.
+///
+/// Forgery boundary: fields are private to this module and the only
+/// constructors derive from the `Caller`'s verified slots
+/// (`verified_delegated_service`, `verified_agent_executor`,
+/// `verified_provenance_interaction`, `is_trusted_local`, else the canonical
+/// `authenticated_principal` fallback). Channel, public flags, and asserted
+/// run context cannot upgrade the executor kind.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ExecutorIdentitySnapshot {
+    principal: String,
+    executor_kind: String,
+}
+
+impl ExecutorIdentitySnapshot {
+    /// The authenticated identity the attestation would persist.
+    pub(crate) fn principal(&self) -> &str {
+        &self.principal
+    }
+
+    /// The verified executor kind the attestation would persist.
+    pub(crate) fn executor_kind(&self) -> &str {
+        &self.executor_kind
+    }
+
+    /// Admit the identity in already-derived dispatch facts. Re-runs the
+    /// shared receipt validation, so issuance persists exactly the admitted
+    /// pair and raw pre-validation facts cannot flow into an attestation.
+    fn admitted(facts: &DispatchFacts) -> Result<Self> {
+        validate_interaction_admission(
+            &facts.principal,
+            facts.interaction.as_ref(),
+            facts.interaction_scope_valid,
+        )?;
+        Ok(Self {
+            principal: facts.principal.clone(),
+            executor_kind: facts.executor_kind.clone(),
+        })
+    }
+}
+
+/// Derive executor attribution strictly from the `Caller`'s verified slots.
+/// Channel, public tool arguments, and asserted run keys never participate.
+fn verified_executor_attribution(caller: &Caller) -> (String, Option<String>, Option<String>) {
+    if let Some(executor) = caller.verified_delegated_service() {
+        (
+            "delegated_service".to_string(),
+            Some(format!("webhook:{}", executor.endpoint_id)),
+            Some(format!("webhook-credential:{}", executor.credential_id)),
+        )
+    } else if let Some(executor) = caller.verified_agent_executor() {
+        (
+            "agent".to_string(),
+            Some(executor.executor_ref.clone()),
+            Some(executor.delegation_ref.clone()),
+        )
+    } else if let Some(interaction) = caller.verified_provenance_interaction() {
+        (
+            "human".to_string(),
+            Some(interaction.verifier.clone()),
+            None,
+        )
+    } else if caller.is_trusted_local() {
+        ("local".to_string(), Some("native-ce-local".into()), None)
+    } else {
+        (
+            "authenticated_principal".to_string(),
+            Some(caller.credential().to_string()),
+            None,
+        )
+    }
+}
+
+/// Pure receipt-to-action binding: the receipt either binds the canonical
+/// accepted action digest directly or, for the older messaging verifier,
+/// the exact message-scope digest compatibility contract.
+fn compute_interaction_scope_valid(
+    interaction: Option<&VerifiedInteractionEvidence>,
+    operation: &str,
+    arguments: &Value,
+) -> bool {
+    let accepted_digest = action_digest(operation, arguments);
+    interaction.as_ref().is_none_or(|receipt| {
+        receipt.accepted_action_digest.as_deref() == Some(accepted_digest.as_str())
+            || (receipt.accepted_action_digest.is_none()
+                && interaction_scope_digest(arguments).as_deref()
+                    == Some(receipt.scope_digest.as_str()))
+    })
+}
+
+/// Pure receipt admission shared by the snapshot and the v2 issuer.
+/// Principal mismatch reports before scope mismatch; both messages are part
+/// of the issuance contract and must stay exact.
+fn validate_interaction_admission(
+    principal: &str,
+    interaction: Option<&VerifiedInteractionEvidence>,
+    interaction_scope_valid: bool,
+) -> Result<()> {
+    if let Some(receipt) = interaction {
+        if receipt.principal != principal {
+            return Err(Error::engine(
+                "verified interaction principal does not match the authenticated caller",
+            ));
+        }
+        if !interaction_scope_valid {
+            return Err(Error::engine(
+                "verified interaction scope does not allow this accepted action",
+            ));
+        }
+    }
+    Ok(())
+}
+
 impl ProvenanceDispatch {
     pub(crate) fn from_caller(
         caller: &Caller,
@@ -689,46 +826,15 @@ impl ProvenanceDispatch {
         arguments: &Value,
         intent: Option<&str>,
     ) -> Self {
-        let (executor_kind, executor_ref, delegation_ref) =
-            if let Some(executor) = caller.verified_delegated_service() {
-                (
-                    "delegated_service".to_string(),
-                    Some(format!("webhook:{}", executor.endpoint_id)),
-                    Some(format!("webhook-credential:{}", executor.credential_id)),
-                )
-            } else if let Some(executor) = caller.verified_agent_executor() {
-                (
-                    "agent".to_string(),
-                    Some(executor.executor_ref.clone()),
-                    Some(executor.delegation_ref.clone()),
-                )
-            } else if let Some(interaction) = caller.verified_provenance_interaction() {
-                (
-                    "human".to_string(),
-                    Some(interaction.verifier.clone()),
-                    None,
-                )
-            } else if caller.is_trusted_local() {
-                ("local".to_string(), Some("native-ce-local".into()), None)
-            } else {
-                (
-                    "authenticated_principal".to_string(),
-                    Some(caller.credential().to_string()),
-                    None,
-                )
-            };
+        let (executor_kind, executor_ref, delegation_ref) = verified_executor_attribution(caller);
         let interaction = caller.verified_provenance_interaction().cloned();
         let accepted_digest = action_digest(operation, arguments);
         let action_commitment = String::from_utf8(crate::canonical_json::canonical_json(
             &action_commitment(operation, arguments),
         ))
         .expect("canonical JSON is UTF-8");
-        let interaction_scope_valid = interaction.as_ref().is_none_or(|receipt| {
-            receipt.accepted_action_digest.as_deref() == Some(accepted_digest.as_str())
-                || (receipt.accepted_action_digest.is_none()
-                    && interaction_scope_digest(arguments).as_deref()
-                        == Some(receipt.scope_digest.as_str()))
-        });
+        let interaction_scope_valid =
+            compute_interaction_scope_valid(interaction.as_ref(), operation, arguments);
         Self {
             facts: Arc::new(DispatchFacts {
                 principal: caller.credential().to_string(),
@@ -989,18 +1095,11 @@ pub(crate) async fn issue_action_attestation_outputs_in(
             "action attestation requires at least one accepted output event",
         ));
     }
-    if let Some(receipt) = &draft.facts.interaction {
-        if receipt.principal != draft.facts.principal {
-            return Err(Error::engine(
-                "verified interaction principal does not match the authenticated caller",
-            ));
-        }
-        if !draft.facts.interaction_scope_valid {
-            return Err(Error::engine(
-                "verified interaction scope does not allow this accepted action",
-            ));
-        }
-    }
+    // Shared pure receipt admission (same checks as the identity snapshot):
+    // principal mismatch reports before scope mismatch, with exact messages.
+    // The admitted snapshot then supplies the persisted principal + executor
+    // pair, so issuance and snapshot cannot diverge.
+    let admitted = draft.executor_identity_snapshot()?;
     let emitted = TRUSTED_PROVENANCE
         .try_with(|dispatch| {
             dispatch
@@ -1068,8 +1167,8 @@ pub(crate) async fn issue_action_attestation_outputs_in(
     )
     .bind(&draft.id)
     .bind(ACTION_ATTESTATION_SCHEMA_VERSION)
-    .bind(&draft.facts.principal)
-    .bind(&draft.facts.executor_kind)
+    .bind(admitted.principal())
+    .bind(admitted.executor_kind())
     .bind(draft.facts.channel.as_str())
     .bind(&draft.facts.executor_ref)
     .bind(&draft.facts.delegation_ref)
@@ -1098,7 +1197,7 @@ pub(crate) async fn issue_action_attestation_outputs_in(
     )
     .bind(&draft.id)
     .bind(&issuer_origin_database_id)
-    .bind(&draft.facts.principal)
+    .bind(admitted.principal())
     .bind(&draft.facts.operation)
     .bind(&draft.facts.command_identity_digest)
     .bind(&issued_at)
@@ -1484,10 +1583,30 @@ pub(crate) fn state_violations_in<'a>(
     Box::pin(async move { state_violations_on(tx).await })
 }
 
+/// A keyed `batch_write` has a deliberate zero-output v2 anchor. Its local
+/// issuance authority is not portable: canonical interchange carries the
+/// attestation but intentionally omits that receiver-local table. Conformance
+/// therefore checks the portable shape here and validates any local authority
+/// independently below. A foreign row with the same shape is structurally
+/// valid, but this check alone does not claim verified local issuance.
+fn is_empty_batch_anchor_shape(
+    schema_version: i64,
+    operation: &str,
+    issuer: &str,
+    command_digest: Option<&str>,
+    stored_digest: &str,
+) -> bool {
+    schema_version == ACTION_ATTESTATION_SCHEMA_VERSION
+        && operation == "batch_write"
+        && issuer == ISSUER
+        && command_digest.is_some_and(is_sha256_hex)
+        && stored_digest == ordered_output_set_digest(&[])
+}
+
 async fn state_violations_on(connection: &mut sqlx::SqliteConnection) -> Result<Vec<String>> {
     let rows = sqlx::query(
         "SELECT id,schema_version,principal,operation,action_commitment,action_digest,output_event_set_digest,
-                interaction_receipt_id,issuer_origin_database_id
+                interaction_receipt_id,issuer_origin_database_id,command_identity_digest,issuer
            FROM provenance_action_attestations ORDER BY issued_at,id",
     )
     .fetch_all(&mut *connection)
@@ -1527,7 +1646,17 @@ async fn state_violations_on(connection: &mut sqlx::SqliteConnection) -> Result<
         .bind(&id)
         .fetch_all(&mut *connection)
         .await?;
-        if qualified_members.is_empty() {
+        if qualified_members.is_empty()
+            && !is_empty_batch_anchor_shape(
+                row.try_get("schema_version")?,
+                row.try_get::<String, _>("operation")?.as_str(),
+                row.try_get::<String, _>("issuer")?.as_str(),
+                row.try_get::<Option<String>, _>("command_identity_digest")?
+                    .as_deref(),
+                row.try_get::<String, _>("output_event_set_digest")?
+                    .as_str(),
+            )
+        {
             violations.push(format!("attestation {id} has no output events"));
         }
         let mut outputs = Vec::with_capacity(qualified_members.len());
@@ -3271,6 +3400,144 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn conformance_accepts_legitimate_keyed_batch_write_empty_anchor() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let origin = crate::identity::database_id(&db).await.unwrap();
+        let arguments = json!({
+            "reason": "verify keyed batch anchor",
+            "idempotency_key": "anchor-key-1",
+            "items": [{"op": "update", "id": "c0010000-0000-4000-8000-000000000001", "name": "alpha"}]
+        });
+        let commitment = action_commitment("batch_write", &arguments);
+        let commitment_text =
+            String::from_utf8(crate::canonical_json::canonical_json(&commitment)).unwrap();
+        let key_digest = digest_json(&json!("anchor-key-1"));
+        sqlx::query(
+            "INSERT INTO provenance_action_attestations
+                (id,schema_version,principal,executor_kind,operation,action_commitment,
+                 action_digest,output_event_set_digest,issuer,issuer_origin_database_id,issued_at,
+                 command_identity_digest)
+              VALUES ('batch-anchor',2,'acct:anchor','authenticated_principal','batch_write',?,?,?,
+                      'native-ce',?,'2026-08-12T00:00:00.000Z',?)",
+        )
+        .bind(&commitment_text)
+        .bind(digest_json(&commitment))
+        .bind(ordered_output_set_digest(&[]))
+        .bind(&origin)
+        .bind(&key_digest)
+        .execute(db.write_pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO provenance_local_attestation_authority
+                (attestation_id,issuer_origin_database_id,principal,operation,
+                 command_identity_digest,anchored_at)
+              VALUES ('batch-anchor',?,?,?,?,'2026-08-12T00:00:00.000Z')",
+        )
+        .bind(&origin)
+        .bind("acct:anchor")
+        .bind("batch_write")
+        .bind(&key_digest)
+        .execute(db.write_pool())
+        .await
+        .unwrap();
+        assert!(state_violations(&db).await.unwrap().is_empty());
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn conformance_still_rejects_zero_output_rows_without_legitimate_anchor() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let origin = crate::identity::database_id(&db).await.unwrap();
+        let empty_digest = ordered_output_set_digest(&[]);
+        // Wrong operation: v2 zero-output row with consistent authority still fails.
+        let wrong_commitment = action_commitment("forged", &json!({}));
+        let wrong_text =
+            String::from_utf8(crate::canonical_json::canonical_json(&wrong_commitment)).unwrap();
+        let wrong_key = digest_json(&json!("wrong-op-key"));
+        // A portable v2 batch_write anchor can have no local authority row.
+        let missing_commitment =
+            action_commitment("batch_write", &json!({"idempotency_key": "missing-key"}));
+        let missing_text =
+            String::from_utf8(crate::canonical_json::canonical_json(&missing_commitment)).unwrap();
+        let missing_key = digest_json(&json!("missing-key"));
+        // Missing key digest: v2 batch_write zero-output row without a key fails
+        // even when its NULL-key authority row is internally consistent.
+        let nokey_commitment = action_commitment("batch_write", &json!({}));
+        let nokey_text =
+            String::from_utf8(crate::canonical_json::canonical_json(&nokey_commitment)).unwrap();
+        sqlx::query(
+            "INSERT INTO provenance_action_attestations
+                (id,schema_version,principal,executor_kind,operation,action_commitment,
+                 action_digest,output_event_set_digest,issuer,issuer_origin_database_id,issued_at,
+                 command_identity_digest)
+              VALUES ('wrong-op',2,'acct:anchor','authenticated_principal','forged',?,?,?,
+                      'native-ce',?,'2026-08-12T00:00:00.000Z',?),
+                     ('no-authority',2,'acct:anchor','authenticated_principal','batch_write',?,?,?,
+                      'native-ce',?,'2026-08-12T00:00:00.000Z',?),
+                     ('no-key',2,'acct:anchor','authenticated_principal','batch_write',?,?,?,
+                      'native-ce',?,'2026-08-12T00:00:00.000Z',NULL),
+                     ('bad-key',2,'acct:anchor','authenticated_principal','batch_write',?,?,?,
+                      'native-ce',?,'2026-08-12T00:00:00.000Z',?)",
+        )
+        .bind(&wrong_text)
+        .bind(digest_json(&wrong_commitment))
+        .bind(&empty_digest)
+        .bind(&origin)
+        .bind(&wrong_key)
+        .bind(&missing_text)
+        .bind(digest_json(&missing_commitment))
+        .bind(&empty_digest)
+        .bind(&origin)
+        .bind(&missing_key)
+        .bind(&nokey_text)
+        .bind(digest_json(&nokey_commitment))
+        .bind(&empty_digest)
+        .bind(&origin)
+        .bind(&missing_text)
+        .bind(digest_json(&missing_commitment))
+        .bind(&empty_digest)
+        .bind(&origin)
+        .bind("g".repeat(64))
+        .execute(db.write_pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO provenance_local_attestation_authority
+                (attestation_id,issuer_origin_database_id,principal,operation,
+                 command_identity_digest,anchored_at)
+              VALUES ('wrong-op',?,?,?,?,'2026-08-12T00:00:00.000Z'),
+                     ('no-key',?,?,?,NULL,'2026-08-12T00:00:00.000Z')",
+        )
+        .bind(&origin)
+        .bind("acct:anchor")
+        .bind("forged")
+        .bind(&wrong_key)
+        .bind(&origin)
+        .bind("acct:anchor")
+        .bind("batch_write")
+        .execute(db.write_pool())
+        .await
+        .unwrap();
+        let violations = state_violations(&db).await.unwrap();
+        for id in ["wrong-op", "no-key", "bad-key"] {
+            assert!(
+                violations
+                    .iter()
+                    .any(|violation| violation == &format!("attestation {id} has no output events")),
+                "{id} must still be flagged; got: {violations:?}"
+            );
+        }
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation == "attestation no-authority has no output events"),
+            "portable anchor must remain structurally valid: {violations:?}"
+        );
+        db.close().await;
+    }
+
+    #[tokio::test]
     async fn conformance_accepts_exact_v1_and_v2_and_reports_tamper_gaps_and_missing_outputs() {
         let db = crate::create_database(":memory:").await.unwrap();
         let v1_event = crate::store::append(
@@ -3469,6 +3736,395 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(denied.to_string(), "not authorized");
+        db.close().await;
+    }
+
+    /// Build dispatch facts that no public `Caller` seam can produce: a
+    /// receipt bound to one principal carried under another. Token issuance
+    /// always binds the receipt to the attaching credential, so this shapes
+    /// the defense-in-depth path the shared validator must still refuse.
+    fn mismatched_principal_facts() -> (DispatchFacts, VerifiedInteractionEvidence) {
+        let arguments = json!({"name":"mismatch"});
+        let scope = verified_action_scope("create_record", &arguments);
+        let issuer = ProvenanceInteractionTokenIssuer::random("host-ui");
+        let token = issuer.issue("acct:human", &scope, 60).unwrap();
+        let receipt = issuer.verify(&token, "acct:human", &scope).unwrap();
+        let facts = DispatchFacts {
+            principal: "acct:intruder".into(),
+            executor_kind: "human".into(),
+            channel: Channel::Mcp,
+            executor_ref: Some(receipt.verifier.clone()),
+            delegation_ref: None,
+            interaction: Some(receipt.clone()),
+            interaction_scope_valid: true,
+            operation: "create_record".into(),
+            action_commitment: String::from_utf8(crate::canonical_json::canonical_json(
+                &action_commitment("create_record", &arguments),
+            ))
+            .unwrap(),
+            action_digest: action_digest("create_record", &arguments),
+            command_identity_digest: None,
+            intent_digest: None,
+        };
+        (facts, receipt)
+    }
+
+    #[test]
+    fn snapshot_and_issuance_share_exact_receipt_principal_rejection() {
+        let (facts, _) = mismatched_principal_facts();
+        let draft = ActionAttestationDraft {
+            id: Uuid::new_v4().to_string(),
+            facts: Arc::new(facts),
+        };
+        // No accepted-output event is needed to obtain (or refuse) a snapshot.
+        let snapshot = draft.executor_identity_snapshot().unwrap_err();
+        assert_eq!(
+            snapshot.to_string(),
+            "verified interaction principal does not match the authenticated caller"
+        );
+    }
+
+    #[tokio::test]
+    async fn issuance_rejects_receipt_principal_mismatch_with_snapshot_error() {
+        let (facts, _) = mismatched_principal_facts();
+        let db = crate::create_database(":memory:").await.unwrap();
+        let dispatch = ProvenanceDispatch {
+            facts: Arc::new(facts),
+            state: Arc::new(Mutex::new(DispatchState::default())),
+        };
+        dispatch
+            .scope(async {
+                let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+                // The receipt check precedes output auditing, so the outputs
+                // only need to clear the nonempty gate.
+                let draft = ActionAttestationDraft {
+                    id: Uuid::new_v4().to_string(),
+                    facts: Arc::clone(&dispatch.facts),
+                };
+                let rejected = issue_action_attestation_outputs_in(
+                    &mut tx,
+                    draft,
+                    &[ActionOutput::content("missing-event")],
+                )
+                .await
+                .unwrap_err();
+                assert_eq!(
+                    rejected.to_string(),
+                    "verified interaction principal does not match the authenticated caller"
+                );
+                tx.rollback().await.unwrap();
+            })
+            .await;
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn snapshot_and_issuance_reject_scope_mismatch_with_exact_error() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let arguments = json!({"name":"scoped"});
+        let scope = verified_action_scope("create_record", &arguments);
+        let issuer = ProvenanceInteractionTokenIssuer::random("host-ui");
+        let token = issuer.issue("acct:human", &scope, 60).unwrap();
+        let caller = Caller::authenticated("acct:human")
+            .with_provenance_interaction_token(&issuer, &token, &scope)
+            .unwrap();
+        // Same receipt, different accepted arguments: the binding must fail.
+        let dispatch = ProvenanceDispatch::from_caller(
+            &caller,
+            "create_record",
+            &json!({"name":"different action"}),
+            None,
+        );
+        assert_eq!(dispatch.facts.executor_kind, "human");
+        dispatch
+            .scope(async {
+                // No accepted-output event is needed to obtain (or refuse) a
+                // snapshot: reserving the draft is enough.
+                let snapshot = reserve_action_attestation()
+                    .unwrap()
+                    .executor_identity_snapshot()
+                    .unwrap_err();
+                assert_eq!(
+                    snapshot.to_string(),
+                    "verified interaction scope does not allow this accepted action"
+                );
+                let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+                let mut act_alloc = crate::act::ActAllocation::new();
+                let event = crate::store::append_in(
+                    &db,
+                    &mut tx,
+                    create_spec("b40ce000-0000-4000-8000-000000000031", "scoped"),
+                    &mut act_alloc,
+                )
+                .await
+                .unwrap();
+                let draft = reserve_action_attestation().unwrap();
+                let rejected = issue_action_attestation_outputs_in(
+                    &mut tx,
+                    draft,
+                    &[ActionOutput::content(event.id)],
+                )
+                .await
+                .unwrap_err();
+                assert_eq!(
+                    rejected.to_string(),
+                    "verified interaction scope does not allow this accepted action"
+                );
+                tx.rollback().await.unwrap();
+            })
+            .await;
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn snapshot_accepts_matching_scope_and_issuance_persists_the_pair() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let arguments = json!({"name":"admitted"});
+        let scope = verified_action_scope("create_record", &arguments);
+        let issuer = ProvenanceInteractionTokenIssuer::random("host-ui");
+        let token = issuer.issue("acct:human", &scope, 60).unwrap();
+        let caller = Caller::authenticated("acct:human")
+            .with_provenance_interaction_token(&issuer, &token, &scope)
+            .unwrap();
+        let dispatch = ProvenanceDispatch::from_caller(&caller, "create_record", &arguments, None);
+        dispatch
+            .scope(async {
+                // Obtainable before any output exists; performs no writes itself.
+                let snapshot = reserve_action_attestation()
+                    .unwrap()
+                    .executor_identity_snapshot()
+                    .unwrap();
+                assert_eq!(snapshot.principal(), "acct:human");
+                assert_eq!(snapshot.executor_kind(), "human");
+                let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+                let mut act_alloc = crate::act::ActAllocation::new();
+                let event = crate::store::append_in(
+                    &db,
+                    &mut tx,
+                    create_spec("b40ce000-0000-4000-8000-000000000032", "admitted"),
+                    &mut act_alloc,
+                )
+                .await
+                .unwrap();
+                let draft = reserve_action_attestation().unwrap();
+                let id = issue_action_attestation_outputs_in(
+                    &mut tx,
+                    draft,
+                    &[ActionOutput::content(event.id)],
+                )
+                .await
+                .unwrap();
+                tx.commit().await.unwrap();
+                let row: (String, String) = sqlx::query_as(
+                    "SELECT principal,executor_kind FROM provenance_action_attestations WHERE id=?",
+                )
+                .bind(&id)
+                .fetch_one(db.write_pool())
+                .await
+                .unwrap();
+                assert_eq!(row, ("acct:human".into(), "human".into()));
+            })
+            .await;
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn snapshot_only_use_writes_no_events_or_attestation_state() {
+        async fn table_counts(db: &crate::Db) -> Vec<(String, i64)> {
+            let mut counts = Vec::new();
+            for table in [
+                "content_events",
+                "relationship_events",
+                "provenance_action_attestations",
+                "provenance_action_outputs",
+                "provenance_action_events",
+                "provenance_interaction_receipts",
+                "provenance_local_attestation_authority",
+                "provenance_attestation_validity_events",
+            ] {
+                let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+                    .fetch_one(db.write_pool())
+                    .await
+                    .unwrap();
+                counts.push((table.into(), count));
+            }
+            counts
+        }
+
+        let db = crate::create_database(":memory:").await.unwrap();
+        // Seed outside any dispatch scope: one content event exists, and no
+        // attestation-path write has run, so the before counts are nonzero
+        // where it matters.
+        crate::store::append(
+            &db,
+            create_spec("b40ce000-0000-4000-8000-000000000033", "seeded"),
+        )
+        .await
+        .unwrap();
+        let before = table_counts(&db).await;
+        assert!(
+            before[0].1 > 0,
+            "seeded content events must exist before snapshot-only use"
+        );
+
+        let arguments = json!({"name":"snapshot only"});
+        let scope = verified_action_scope("create_record", &arguments);
+        let issuer = ProvenanceInteractionTokenIssuer::random("host-ui");
+        let token = issuer.issue("acct:human", &scope, 60).unwrap();
+        let caller = Caller::authenticated("acct:human")
+            .with_provenance_interaction_token(&issuer, &token, &scope)
+            .unwrap();
+        let dispatch = ProvenanceDispatch::from_caller(&caller, "create_record", &arguments, None);
+        dispatch
+            .scope(async {
+                // Reserve plus snapshot, and nothing else: no output is
+                // appended, no attestation is issued, no receipt is upserted.
+                let snapshot = reserve_action_attestation()
+                    .unwrap()
+                    .executor_identity_snapshot()
+                    .unwrap();
+                assert_eq!(snapshot.principal(), "acct:human");
+                assert_eq!(snapshot.executor_kind(), "human");
+            })
+            .await;
+        assert!(dispatch.receipt_ids().is_empty());
+        assert_eq!(table_counts(&db).await, before);
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn snapshot_accepts_legacy_message_scope_human_binding() {
+        let issuer = crate::awareness::HumanInteractionTokenIssuer::random("host-ui");
+        let message_ids = vec!["message:a".to_string()];
+        let token = issuer
+            .issue("acct:human", "confirm", &message_ids, 60)
+            .unwrap();
+        let caller = Caller::authenticated("acct:human")
+            .with_human_interaction_token(&issuer, &token, "confirm", &message_ids)
+            .unwrap();
+        let arguments = json!({"action":"confirm","message_ids":message_ids});
+        let dispatch =
+            ProvenanceDispatch::from_caller(&caller, "manage_messages", &arguments, None);
+        dispatch
+            .scope(async {
+                let snapshot = reserve_action_attestation()
+                    .unwrap()
+                    .executor_identity_snapshot()
+                    .unwrap();
+                assert_eq!(snapshot.principal(), "acct:human");
+                assert_eq!(snapshot.executor_kind(), "human");
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn observed_channel_asserted_run_and_public_flags_never_upgrade_executor() {
+        async fn snapshot_kind(caller: &Caller, operation: &str, arguments: &Value) -> String {
+            ProvenanceDispatch::from_caller(caller, operation, arguments, None)
+                .scope(async {
+                    reserve_action_attestation()
+                        .unwrap()
+                        .executor_identity_snapshot()
+                        .unwrap()
+                        .executor_kind()
+                        .to_string()
+                })
+                .await
+        }
+
+        async fn snapshot_principal(caller: &Caller, operation: &str, arguments: &Value) -> String {
+            ProvenanceDispatch::from_caller(caller, operation, arguments, None)
+                .scope(async {
+                    reserve_action_attestation()
+                        .unwrap()
+                        .executor_identity_snapshot()
+                        .unwrap()
+                        .principal()
+                        .to_string()
+                })
+                .await
+        }
+
+        let arguments = json!({"verified_human":true,"executor_kind":"human"});
+        // MCP transport plus asserted run correlation still falls back.
+        let observed = Caller::authenticated("acct:agent")
+            .with_channel(Channel::Mcp)
+            .with_run_context(Some("asserted-handle-run-1".into()), None);
+        let dispatch =
+            ProvenanceDispatch::from_caller(&observed, "create_record", &arguments, None);
+        assert_eq!(dispatch.facts.channel, Channel::Mcp);
+        assert_eq!(
+            snapshot_kind(&observed, "create_record", &arguments).await,
+            "authenticated_principal"
+        );
+        assert_eq!(
+            snapshot_principal(&observed, "create_record", &arguments).await,
+            "acct:agent"
+        );
+
+        // Trusted local keeps its own kind, never agent/human.
+        assert_eq!(
+            snapshot_kind(&Caller::local(), "create_record", &arguments).await,
+            "local"
+        );
+
+        // Verified agent and delegated slots still select their kinds.
+        let issuer = crate::awareness::HumanInteractionTokenIssuer::random("host-ui");
+        let ids = vec!["message:b".to_string()];
+        let token = issuer
+            .issue("acct:agent", "agent-executor:exec-1:deleg-1", &ids, 60)
+            .unwrap();
+        let agent = Caller::authenticated("acct:agent")
+            .with_agent_executor_token(&issuer, &token, "exec-1", "deleg-1", &ids)
+            .unwrap()
+            .with_channel(Channel::Mcp);
+        assert_eq!(
+            snapshot_kind(&agent, "create_record", &arguments).await,
+            "agent"
+        );
+        let delegated = unsafe {
+            Caller::authenticated("acct:service")
+                .with_verified_delegated_service("endpoint-1", "credential-1")
+                .unwrap()
+        };
+        assert_eq!(
+            snapshot_kind(&delegated, "create_record", &arguments).await,
+            "delegated_service"
+        );
+    }
+
+    #[tokio::test]
+    async fn issuance_empty_output_error_precedes_receipt_errors() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let arguments = json!({"name":"scoped"});
+        let scope = verified_action_scope("create_record", &arguments);
+        let issuer = ProvenanceInteractionTokenIssuer::random("host-ui");
+        let token = issuer.issue("acct:human", &scope, 60).unwrap();
+        let caller = Caller::authenticated("acct:human")
+            .with_provenance_interaction_token(&issuer, &token, &scope)
+            .unwrap();
+        let dispatch = ProvenanceDispatch::from_caller(
+            &caller,
+            "create_record",
+            &json!({"name":"different action"}),
+            None,
+        );
+        dispatch
+            .scope(async {
+                let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+                let draft = reserve_action_attestation().unwrap();
+                // Even with a scope-mismatched receipt, the empty-set gate
+                // reports first: output-auditing order is unchanged.
+                let rejected = issue_action_attestation_outputs_in(&mut tx, draft, &[])
+                    .await
+                    .unwrap_err();
+                assert_eq!(
+                    rejected.to_string(),
+                    "action attestation requires at least one accepted output event"
+                );
+                tx.rollback().await.unwrap();
+            })
+            .await;
         db.close().await;
     }
 }

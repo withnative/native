@@ -1,0 +1,2561 @@
+{
+  "actual_extrema": {
+    "body.semantic_error_prefix.cost.memory": {
+      "value": 2107,
+      "witness": {
+        "definition": {
+          "declarations": [
+            {
+              "kind": "Many",
+              "name": "xs"
+            },
+            {
+              "kind": "Many",
+              "name": "ys"
+            },
+            {
+              "kind": "One",
+              "name": "one"
+            },
+            {
+              "kind": "One",
+              "name": "pending"
+            },
+            {
+              "kind": "Scalar { kind: Int, nullable: false }",
+              "name": "n"
+            },
+            {
+              "kind": "Scalar { kind: Int, nullable: false }",
+              "name": "m"
+            },
+            {
+              "kind": "Scalar { kind: Bool, nullable: false }",
+              "name": "flag"
+            },
+            {
+              "kind": "Scalar { kind: String, nullable: false }",
+              "name": "text"
+            },
+            {
+              "kind": "Scalar { kind: Int, nullable: false }",
+              "name": "now_ms"
+            }
+          ],
+          "guards": [],
+          "input_metadata": [],
+          "source": {
+            "expression": "{\"prefix\":(((min([6.5,1.5,5.5]) != [7.5,1.5,8.5].min()) ? one.body : string((false ? 5.5 : 4.5))) + ((![n,2,8].contains(4)) ? ([0,1].exists_one(r,true) ? \"\" : (false ? one.body : \"x\")) : text)),\"error\":(duration(\"9223372036854775807ms\") + duration(\"1ms\"))}"
+          }
+        },
+        "error_category": "Overflow",
+        "family": "error-duration-boundary",
+        "fixture": "generated-9605",
+        "generator": {
+          "attempt": 9605,
+          "comprehension_body_depth": 1,
+          "expanded_depth_bound": 9,
+          "family": "error-duration-boundary",
+          "features": {
+            "binary:Add": 2,
+            "binary:NotEqual": 1,
+            "call:contains:receiver": 1,
+            "call:duration:global": 2,
+            "call:min:global": 1,
+            "call:min:receiver": 1,
+            "call:string:global": 1,
+            "conditional": 5,
+            "extremum:min:global:Double": 1,
+            "extremum:min:receiver:Double": 1,
+            "free-variable": 4,
+            "list": 4,
+            "literal:Bool": 3,
+            "literal:Double": 8,
+            "literal:Int": 5,
+            "literal:Text": 6,
+            "macro:ExistsOne": 1,
+            "map": 1,
+            "operator:Add:Duration:Duration": 1,
+            "operator:Add:Text:Text": 1,
+            "operator:NotEqual:Double:Double": 1,
+            "select": 2,
+            "unary:Not": 1
+          },
+          "intentional_semantic_error": true,
+          "nodes": 49,
+          "seed": 7462749370595369445,
+          "version": "native-typed-grammar-v2"
+        },
+        "index": 8533,
+        "outcome": "semantic_error",
+        "replacement_execution": false,
+        "scenario": "rows-0"
+      }
+    },
+    "body.semantic_error_prefix.cost.work": {
+      "value": 1457,
+      "witness": {
+        "definition": {
+          "declarations": [
+            {
+              "kind": "Many",
+              "name": "xs"
+            },
+            {
+              "kind": "Many",
+              "name": "ys"
+            },
+            {
+              "kind": "One",
+              "name": "one"
+            },
+            {
+              "kind": "One",
+              "name": "pending"
+            },
+            {
+              "kind": "Scalar { kind: Int, nullable: false }",
+              "name": "n"
+            },
+            {
+              "kind": "Scalar { kind: Int, nullable: false }",
+              "name": "m"
+            },
+            {
+              "kind": "Scalar { kind: Bool, nullable: false }",
+              "name": "flag"
+            },
+            {
+              "kind": "Scalar { kind: String, nullable: false }",
+              "name": "text"
+            },
+            {
+              "kind": "Scalar { kind: Int, nullable: false }",
+              "name": "now_ms"
+            }
+          ],
+          "guards": [],
+          "input_metadata": [],
+          "source": {
+            "expression": "{\"prefix\":xs.exists_one(r,[0,1].all(r,(!(2 in [one.n,one.n,one.n])))),\"error\":[0,1][true]}"
+          }
+        },
+        "error_category": "UnexpectedType",
+        "family": "error-list-index-kind",
+        "fixture": "generated-4727",
+        "generator": {
+          "attempt": 4727,
+          "comprehension_body_depth": 2,
+          "expanded_depth_bound": 14,
+          "family": "error-list-index-kind",
+          "features": {
+            "binary:In": 1,
+            "free-variable": 4,
+            "index": 1,
+            "list": 3,
+            "literal:Bool": 1,
+            "literal:Int": 5,
+            "literal:Text": 2,
+            "macro:All": 1,
+            "macro:ExistsOne": 1,
+            "map": 1,
+            "operator:In:Int:List(Int)": 1,
+            "select": 3,
+            "unary:Not": 1
+          },
+          "intentional_semantic_error": true,
+          "nodes": 24,
+          "seed": 7462749370595369445,
+          "version": "native-typed-grammar-v2"
+        },
+        "index": 4304,
+        "outcome": "semantic_error",
+        "replacement_execution": false,
+        "scenario": "rows-16"
+      }
+    },
+    "body.semantic_error_prefix.input_cost.memory": {
+      "value": 11175,
+      "witness": {
+        "definition": {
+          "declarations": [
+            {
+              "kind": "Many",
+              "name": "xs"
+            },
+            {
+              "kind": "Many",
+              "name": "ys"
+            },
+            {
+              "kind": "One",
+              "name": "one"
+            },
+            {
+              "kind": "One",
+              "name": "pending"
+            },
+            {
+              "kind": "Scalar { kind: Int, nullable: false }",
+              "name": "n"
+            },
+            {
+              "kind": "Scalar { kind: Int, nullable: false }",
+              "name": "m"
+            },
+            {
+              "kind": "Scalar { kind: Bool, nullable: false }",
+              "name": "flag"
+            },
+            {
+              "kind": "Scalar { kind: String, nullable: false }",
+              "name": "text"
+            },
+            {
+              "kind": "Scalar { kind: Int, nullable: false }",
+              "name": "now_ms"
+            }
+          ],
+          "guards": [],
+          "input_metadata": [],
+          "source": {
+            "expression": "{\"prefix\":(1.5 + ((4.5 / 4.5) - (-6.5))),\"error\":min([])}"
+          }
+        },
+        "error_category": "FunctionError",
+        "family": "error-empty-extremum",
+        "fixture": "generated-5",
+        "generator": {
+          "attempt": 5,
+          "comprehension_body_depth": 0,
+          "expanded_depth_bound": 5,
+          "family": "error-empty-extremum",
+          "features": {
+            "binary:Add": 1,
+            "binary:Divide": 1,
+            "binary:Subtract": 1,
+            "call:min:global": 1,
+            "extremum:min:global:Int": 1,
+            "list": 1,
+            "literal:Double": 4,
+            "literal:Text": 2,
+            "map": 1,
+            "operator:Add:Double:Double": 1,
+            "operator:Divide:Double:Double": 1,
+            "operator:Subtract:Double:Double": 1,
+            "unary:Negate": 1
+          },
+          "intentional_semantic_error": true,
+          "nodes": 13,
+          "seed": 7462749370595369445,
+          "version": "native-typed-grammar-v2"
+        },
+        "index": 5,
+        "outcome": "semantic_error",
+        "replacement_execution": false,
+        "scenario": "rows-16"
+      }
+    },
+    "body.semantic_error_prefix.input_cost.work": {
+      "value": 357,
+      "witness": {
+        "definition": {
+          "declarations": [
+            {
+              "kind": "Many",
+              "name": "xs"
+            },
+            {
+              "kind": "Many",
+              "name": "ys"
+            },
+            {
+              "kind": "One",
+              "name": "one"
+            },
+            {
+              "kind": "One",
+              "name": "pending"
+            },
+            {
+              "kind": "Scalar { kind: Int, nullable: false }",
+              "name": "n"
+            },
+            {
+              "kind": "Scalar { kind: Int, nullable: false }",
+              "name": "m"
+            },
+            {
+              "kind": "Scalar { kind: Bool, nullable: false }",
+              "name": "flag"
+            },
+            {
+              "kind": "Scalar { kind: String, nullable: false }",
+              "name": "text"
+            },
+            {
+              "kind": "Scalar { kind: Int, nullable: false }",
+              "name": "now_ms"
+            }
+          ],
+          "guards": [],
+          "input_metadata": [],
+          "source": {
+            "expression": "{\"prefix\":(1.5 + ((4.5 / 4.5) - (-6.5))),\"error\":min([])}"
+          }
+        },
+        "error_category": "FunctionError",
+        "family": "error-empty-extremum",
+        "fixture": "generated-5",
+        "generator": {
+          "attempt": 5,
+          "comprehension_body_depth": 0,
+          "expanded_depth_bound": 5,
+          "family": "error-empty-extremum",
+          "features": {
+            "binary:Add": 1,
+            "binary:Divide": 1,
+            "binary:Subtract": 1,
+            "call:min:global": 1,
+            "extremum:min:global:Int": 1,
+            "list": 1,
+            "literal:Double": 4,
+            "literal:Text": 2,
+            "map": 1,
+            "operator:Add:Double:Double": 1,
+            "operator:Divide:Double:Double": 1,
+            "operator:Subtract:Double:Double": 1,
+            "unary:Negate": 1
+          },
+          "intentional_semantic_error": true,
+          "nodes": 13,
+          "seed": 7462749370595369445,
+          "version": "native-typed-grammar-v2"
+        },
+        "index": 5,
+        "outcome": "semantic_error",
+        "replacement_execution": false,
+        "scenario": "rows-16"
+      }
+    },
+    "body.success.cost.memory": {
+      "value": 28908,
+      "witness": {
+        "definition": {
+          "declarations": [
+            {
+              "kind": "Many",
+              "name": "xs"
+            },
+            {
+              "kind": "Many",
+              "name": "ys"
+            },
+            {
+              "kind": "One",
+              "name": "one"
+            },
+            {
+              "kind": "One",
+              "name": "pending"
+            },
+            {
+              "kind": "Scalar { kind: Int, nullable: false }",
+              "name": "n"
+            },
+            {
+              "kind": "Scalar { kind: Int, nullable: false }",
+              "name": "m"
+            },
+            {
+              "kind": "Scalar { kind: Bool, nullable: false }",
+              "name": "flag"
+            },
+            {
+              "kind": "Scalar { kind: String, nullable: false }",
+              "name": "text"
+            },
+            {
+              "kind": "Scalar { kind: Int, nullable: false }",
+              "name": "now_ms"
+            }
+          ],
+          "guards": [],
+          "input_metadata": [],
+          "source": {
+            "expression": "xs.map(r,{\"twice\":[r,r],\"id\":r.id,\"computed\":((text + \"escaped\\ntext\") + r.body)})"
+          }
+        },
+        "error_category": null,
+        "family": "row-copy-projection",
+        "fixture": "generated-5967",
+        "generator": {
+          "attempt": 5967,
+          "comprehension_body_depth": 1,
+          "expanded_depth_bound": 8,
+          "family": "row-copy-projection",
+          "features": {
+            "binary:Add": 2,
+            "bound-variable": 4,
+            "free-variable": 2,
+            "list": 1,
+            "literal:Text": 4,
+            "macro:Map": 1,
+            "map": 1,
+            "operator:Add:Text:Text": 2,
+            "select": 2
+          },
+          "intentional_semantic_error": false,
+          "nodes": 17,
+          "seed": 7462749370595369445,
+          "version": "native-typed-grammar-v2"
+        },
+        "index": 5399,
+        "outcome": "value",
+        "replacement_execution": false,
+        "scenario": "rows-16"
+      }
+    },
+    "body.success.cost.work": {
+      "value": 7851,
+      "witness": {
+        "definition": {
+          "declarations": [
+            {
+              "kind": "Many",
+              "name": "xs"
+            },
+            {
+              "kind": "Many",
+              "name": "ys"
+            },
+            {
+              "kind": "One",
+              "name": "one"
+            },
+            {
+              "kind": "One",
+              "name": "pending"
+            },
+            {
+              "kind": "Scalar { kind: Int, nullable: false }",
+              "name": "n"
+            },
+            {
+              "kind": "Scalar { kind: Int, nullable: false }",
+              "name": "m"
+            },
+            {
+              "kind": "Scalar { kind: Bool, nullable: false }",
+              "name": "flag"
+            },
+            {
+              "kind": "Scalar { kind: String, nullable: false }",
+              "name": "text"
+            },
+            {
+              "kind": "Scalar { kind: Int, nullable: false }",
+              "name": "now_ms"
+            }
+          ],
+          "guards": [],
+          "input_metadata": [],
+          "source": {
+            "expression": "xs.map(r,[4,8,2].map(r,(max([((true || flag) ? [r,m].min() : (one.n / 7)),min([(one.n * 3),(m / 5),[one.n,4,r].min()]),[(7 / 5),[n,r].max(),(one.n - m)].max()]) - (size((one.ok ? \"escaped\\ntext\" : one.body)) / 5))))"
+          }
+        },
+        "error_category": null,
+        "family": "shadowing-inner",
+        "fixture": "generated-1064",
+        "generator": {
+          "attempt": 1064,
+          "comprehension_body_depth": 2,
+          "expanded_depth_bound": 17,
+          "family": "shadowing-inner",
+          "features": {
+            "binary:Divide": 4,
+            "binary:Multiply": 1,
+            "binary:Or": 1,
+            "binary:Subtract": 2,
+            "bound-variable": 3,
+            "call:max:global": 1,
+            "call:max:receiver": 2,
+            "call:min:global": 1,
+            "call:min:receiver": 2,
+            "call:size:global": 1,
+            "conditional": 2,
+            "extremum:max:global:Int": 1,
+            "extremum:max:receiver:Int": 2,
+            "extremum:min:global:Int": 1,
+            "extremum:min:receiver:Int": 2,
+            "free-variable": 12,
+            "list": 7,
+            "literal:Bool": 1,
+            "literal:Int": 10,
+            "literal:Text": 1,
+            "macro:Map": 2,
+            "operator:Divide:Int:Int": 4,
+            "operator:Multiply:Int:Int": 1,
+            "operator:Or:Bool:Bool": 1,
+            "operator:Subtract:Int:Int": 2,
+            "select": 6
+          },
+          "intentional_semantic_error": false,
+          "nodes": 59,
+          "seed": 7462749370595369445,
+          "version": "native-typed-grammar-v2"
+        },
+        "index": 1021,
+        "outcome": "value",
+        "replacement_execution": false,
+        "scenario": "rows-16"
+      }
+    },
+    "body.success.input_cost.memory": {
+      "value": 11252,
+      "witness": {
+        "definition": {
+          "declarations": [
+            {
+              "kind": "Many",
+              "name": "xs"
+            },
+            {
+              "kind": "Many",
+              "name": "ys"
+            },
+            {
+              "kind": "One",
+              "name": "one"
+            },
+            {
+              "kind": "One",
+              "name": "pending"
+            },
+            {
+              "kind": "Scalar { kind: Int, nullable: false }",
+              "name": "n"
+            },
+            {
+              "kind": "Scalar { kind: Int, nullable: false }",
+              "name": "m"
+            },
+            {
+              "kind": "Scalar { kind: Bool, nullable: false }",
+              "name": "flag"
+            },
+            {
+              "kind": "Scalar { kind: String, nullable: false }",
+              "name": "text"
+            },
+            {
+              "kind": "Scalar { kind: Int, nullable: false }",
+              "name": "now_ms"
+            }
+          ],
+          "guards": [
+            {
+              "input": "one",
+              "source": "[0,1].all(r,(!(true && true)))"
+            },
+            {
+              "input": "pending",
+              "source": "((xs.exists(r,false) && matches(\"\",\"a.*\")) || (1 >= (m - n)))"
+            }
+          ],
+          "input_metadata": [],
+          "source": {
+            "expression": "(matches(string(1),\"x?\") ? ((3.5 + 2.5) * 5.5) : ((3.5 + 2.5) / 3.5))"
+          }
+        },
+        "error_category": null,
+        "family": "ordered-guards",
+        "fixture": "generated-81",
+        "generator": {
+          "attempt": 81,
+          "comprehension_body_depth": 1,
+          "expanded_depth_bound": 7,
+          "family": "ordered-guards",
+          "features": {
+            "binary:Add": 2,
+            "binary:And": 2,
+            "binary:Divide": 1,
+            "binary:GreaterEqual": 1,
+            "binary:Multiply": 1,
+            "binary:Or": 1,
+            "binary:Subtract": 1,
+            "call:matches:global": 2,
+            "call:string:global": 1,
+            "conditional": 1,
+            "free-variable": 3,
+            "list": 1,
+            "literal:Bool": 3,
+            "literal:Double": 6,
+            "literal:Int": 4,
+            "literal:Text": 3,
+            "macro:All": 1,
+            "macro:Exists": 1,
+            "operator:Add:Double:Double": 2,
+            "operator:And:Bool:Bool": 2,
+            "operator:Divide:Double:Double": 1,
+            "operator:GreaterEqual:Int:Int": 1,
+            "operator:Multiply:Double:Double": 1,
+            "operator:Or:Bool:Bool": 1,
+            "operator:Subtract:Int:Int": 1,
+            "unary:Not": 1
+          },
+          "intentional_semantic_error": false,
+          "nodes": 36,
+          "seed": 7462749370595369445,
+          "version": "native-typed-grammar-v2"
+        },
+        "index": 81,
+        "outcome": "value",
+        "replacement_execution": true,
+        "scenario": "rows-16"
+      }
+    },
+    "body.success.input_cost.work": {
+      "value": 359,
+      "witness": {
+        "definition": {
+          "declarations": [
+            {
+              "kind": "Many",
+              "name": "xs"
+            },
+            {
+              "kind": "Many",
+              "name": "ys"
+            },
+            {
+              "kind": "One",
+              "name": "one"
+            },
+            {
+              "kind": "One",
+              "name": "pending"
+            },
+            {
+              "kind": "Scalar { kind: Int, nullable: false }",
+              "name": "n"
+            },
+            {
+              "kind": "Scalar { kind: Int, nullable: false }",
+              "name": "m"
+            },
+            {
+              "kind": "Scalar { kind: Bool, nullable: false }",
+              "name": "flag"
+            },
+            {
+              "kind": "Scalar { kind: String, nullable: false }",
+              "name": "text"
+            },
+            {
+              "kind": "Scalar { kind: Int, nullable: false }",
+              "name": "now_ms"
+            }
+          ],
+          "guards": [
+            {
+              "input": "one",
+              "source": "[0,1].all(r,(!(true && true)))"
+            },
+            {
+              "input": "pending",
+              "source": "((xs.exists(r,false) && matches(\"\",\"a.*\")) || (1 >= (m - n)))"
+            }
+          ],
+          "input_metadata": [],
+          "source": {
+            "expression": "(matches(string(1),\"x?\") ? ((3.5 + 2.5) * 5.5) : ((3.5 + 2.5) / 3.5))"
+          }
+        },
+        "error_category": null,
+        "family": "ordered-guards",
+        "fixture": "generated-81",
+        "generator": {
+          "attempt": 81,
+          "comprehension_body_depth": 1,
+          "expanded_depth_bound": 7,
+          "family": "ordered-guards",
+          "features": {
+            "binary:Add": 2,
+            "binary:And": 2,
+            "binary:Divide": 1,
+            "binary:GreaterEqual": 1,
+            "binary:Multiply": 1,
+            "binary:Or": 1,
+            "binary:Subtract": 1,
+            "call:matches:global": 2,
+            "call:string:global": 1,
+            "conditional": 1,
+            "free-variable": 3,
+            "list": 1,
+            "literal:Bool": 3,
+            "literal:Double": 6,
+            "literal:Int": 4,
+            "literal:Text": 3,
+            "macro:All": 1,
+            "macro:Exists": 1,
+            "operator:Add:Double:Double": 2,
+            "operator:And:Bool:Bool": 2,
+            "operator:Divide:Double:Double": 1,
+            "operator:GreaterEqual:Int:Int": 1,
+            "operator:Multiply:Double:Double": 1,
+            "operator:Or:Bool:Bool": 1,
+            "operator:Subtract:Int:Int": 1,
+            "unary:Not": 1
+          },
+          "intentional_semantic_error": false,
+          "nodes": 36,
+          "seed": 7462749370595369445,
+          "version": "native-typed-grammar-v2"
+        },
+        "index": 81,
+        "outcome": "value",
+        "replacement_execution": true,
+        "scenario": "rows-16"
+      }
+    },
+    "body.success.output.cached_bytes": {
+      "value": 14442,
+      "witness": {
+        "definition": {
+          "declarations": [
+            {
+              "kind": "Many",
+              "name": "xs"
+            },
+            {
+              "kind": "Many",
+              "name": "ys"
+            },
+            {
+              "kind": "One",
+              "name": "one"
+            },
+            {
+              "kind": "One",
+              "name": "pending"
+            },
+            {
+              "kind": "Scalar { kind: Int, nullable: false }",
+              "name": "n"
+            },
+            {
+              "kind": "Scalar { kind: Int, nullable: false }",
+              "name": "m"
+            },
+            {
+              "kind": "Scalar { kind: Bool, nullable: false }",
+              "name": "flag"
+            },
+            {
+              "kind": "Scalar { kind: String, nullable: false }",
+              "name": "text"
+            },
+            {
+              "kind": "Scalar { kind: Int, nullable: false }",
+              "name": "now_ms"
+            }
+          ],
+          "guards": [],
+          "input_metadata": [],
+          "source": {
+            "expression": "xs.map(r,{\"twice\":[r,r],\"id\":r.id,\"computed\":((text + \"escaped\\ntext\") + r.body)})"
+          }
+        },
+        "error_category": null,
+        "family": "row-copy-projection",
+        "fixture": "generated-5967",
+        "generator": {
+          "attempt": 5967,
+          "comprehension_body_depth": 1,
+          "expanded_depth_bound": 8,
+          "family": "row-copy-projection",
+          "features": {
+            "binary:Add": 2,
+            "bound-variable": 4,
+            "free-variable": 2,
+            "list": 1,
+            "literal:Text": 4,
+            "macro:Map": 1,
+            "map": 1,
+            "operator:Add:Text:Text": 2,
+            "select": 2
+          },
+          "intentional_semantic_error": false,
+          "nodes": 17,
+          "seed": 7462749370595369445,
+          "version": "native-typed-grammar-v2"
+        },
+        "index": 5399,
+        "outcome": "value",
+        "replacement_execution": false,
+        "scenario": "rows-16"
+      }
+    },
+    "body.success.output.cached_nodes": {
+      "value": 225,
+      "witness": {
+        "definition": {
+          "declarations": [
+            {
+              "kind": "Many",
+              "name": "xs"
+            },
+            {
+              "kind": "Many",
+              "name": "ys"
+            },
+            {
+              "kind": "One",
+              "name": "one"
+            },
+            {
+              "kind": "One",
+              "name": "pending"
+            },
+            {
+              "kind": "Scalar { kind: Int, nullable: false }",
+              "name": "n"
+            },
+            {
+              "kind": "Scalar { kind: Int, nullable: false }",
+              "name": "m"
+            },
+            {
+              "kind": "Scalar { kind: Bool, nullable: false }",
+              "name": "flag"
+            },
+            {
+              "kind": "Scalar { kind: String, nullable: false }",
+              "name": "text"
+            },
+            {
+              "kind": "Scalar { kind: Int, nullable: false }",
+              "name": "now_ms"
+            }
+          ],
+          "guards": [],
+          "input_metadata": [],
+          "source": {
+            "expression": "xs.map(r,{\"twice\":[r,r],\"id\":r.id,\"computed\":((r.ok || flag) ? 7.5 : 8.5)})"
+          }
+        },
+        "error_category": null,
+        "family": "row-copy-projection",
+        "fixture": "generated-6",
+        "generator": {
+          "attempt": 6,
+          "comprehension_body_depth": 1,
+          "expanded_depth_bound": 9,
+          "family": "row-copy-projection",
+          "features": {
+            "binary:Or": 1,
+            "bound-variable": 4,
+            "conditional": 1,
+            "free-variable": 2,
+            "list": 1,
+            "literal:Double": 2,
+            "literal:Text": 3,
+            "macro:Map": 1,
+            "map": 1,
+            "operator:Or:Bool:Bool": 1,
+            "select": 2
+          },
+          "intentional_semantic_error": false,
+          "nodes": 18,
+          "seed": 7462749370595369445,
+          "version": "native-typed-grammar-v2"
+        },
+        "index": 6,
+        "outcome": "value",
+        "replacement_execution": false,
+        "scenario": "rows-16"
+      }
+    },
+    "body.success.output.depth": {
+      "value": 5,
+      "witness": {
+        "definition": {
+          "declarations": [
+            {
+              "kind": "Many",
+              "name": "xs"
+            },
+            {
+              "kind": "Many",
+              "name": "ys"
+            },
+            {
+              "kind": "One",
+              "name": "one"
+            },
+            {
+              "kind": "One",
+              "name": "pending"
+            },
+            {
+              "kind": "Scalar { kind: Int, nullable: false }",
+              "name": "n"
+            },
+            {
+              "kind": "Scalar { kind: Int, nullable: false }",
+              "name": "m"
+            },
+            {
+              "kind": "Scalar { kind: Bool, nullable: false }",
+              "name": "flag"
+            },
+            {
+              "kind": "Scalar { kind: String, nullable: false }",
+              "name": "text"
+            },
+            {
+              "kind": "Scalar { kind: Int, nullable: false }",
+              "name": "now_ms"
+            }
+          ],
+          "guards": [],
+          "input_metadata": [],
+          "source": {
+            "expression": "xs.map(r,{\"twice\":[r,r],\"id\":r.id,\"computed\":((r.ok || flag) ? 7.5 : 8.5)})"
+          }
+        },
+        "error_category": null,
+        "family": "row-copy-projection",
+        "fixture": "generated-6",
+        "generator": {
+          "attempt": 6,
+          "comprehension_body_depth": 1,
+          "expanded_depth_bound": 9,
+          "family": "row-copy-projection",
+          "features": {
+            "binary:Or": 1,
+            "bound-variable": 4,
+            "conditional": 1,
+            "free-variable": 2,
+            "list": 1,
+            "literal:Double": 2,
+            "literal:Text": 3,
+            "macro:Map": 1,
+            "map": 1,
+            "operator:Or:Bool:Bool": 1,
+            "select": 2
+          },
+          "intentional_semantic_error": false,
+          "nodes": 18,
+          "seed": 7462749370595369445,
+          "version": "native-typed-grammar-v2"
+        },
+        "index": 6,
+        "outcome": "value",
+        "replacement_execution": false,
+        "scenario": "rows-1"
+      }
+    },
+    "guard.success.bound.memory": {
+      "value": 241540,
+      "witness": {
+        "definition": {
+          "declarations": [
+            {
+              "kind": "Many",
+              "name": "xs"
+            },
+            {
+              "kind": "Many",
+              "name": "ys"
+            },
+            {
+              "kind": "One",
+              "name": "one"
+            },
+            {
+              "kind": "One",
+              "name": "pending"
+            },
+            {
+              "kind": "Scalar { kind: Int, nullable: false }",
+              "name": "n"
+            },
+            {
+              "kind": "Scalar { kind: Int, nullable: false }",
+              "name": "m"
+            },
+            {
+              "kind": "Scalar { kind: Bool, nullable: false }",
+              "name": "flag"
+            },
+            {
+              "kind": "Scalar { kind: String, nullable: false }",
+              "name": "text"
+            },
+            {
+              "kind": "Scalar { kind: Int, nullable: false }",
+              "name": "now_ms"
+            }
+          ],
+          "guards": [
+            {
+              "input": "one",
+              "source": "string(bytes(string(bytes(string(bytes(text)))))).endsWith(string(bytes(((!true) ? (true ? text : \"escaped\\ntext\") : string(6u)))))"
+            },
+            {
+              "input": "pending",
+              "source": "[0,1].exists_one(r,(string(bytes(\"\")).matches(\"a.*\") || ((one.n == r) || one.body.matches(\"[ab]+\"))))"
+            }
+          ],
+          "input_metadata": [],
+          "source": {
+            "expression": "string(string([4,n,8].max()).size())"
+          }
+        },
+        "error_category": null,
+        "family": "ordered-guards",
+        "fixture": "generated-6208",
+        "generator": {
+          "attempt": 6208,
+          "comprehension_body_depth": 1,
+          "expanded_depth_bound": 9,
+          "family": "ordered-guards",
+          "features": {
+            "binary:Equal": 1,
+            "binary:Or": 2,
+            "bound-variable": 1,
+            "call:bytes:global": 5,
+            "call:endsWith:receiver": 1,
+            "call:matches:receiver": 2,
+            "call:max:receiver": 1,
+            "call:size:receiver": 1,
+            "call:string:global": 8,
+            "conditional": 2,
+            "extremum:max:receiver:Int": 1,
+            "free-variable": 5,
+            "list": 2,
+            "literal:Bool": 2,
+            "literal:Int": 4,
+            "literal:Text": 4,
+            "literal:UInt": 1,
+            "macro:ExistsOne": 1,
+            "operator:Equal:Int:Int": 1,
+            "operator:Or:Bool:Bool": 2,
+            "select": 2,
+            "unary:Not": 1
+          },
+          "intentional_semantic_error": false,
+          "nodes": 46,
+          "seed": 7462749370595369445,
+          "version": "native-typed-grammar-v2"
+        },
+        "guard_error_category": null,
+        "guard_input": "one",
+        "guard_phase": "standalone",
+        "index": 5614,
+        "outcome": "value",
+        "replacement_execution": false,
+        "scenario": "rows-0"
+      }
+    },
+    "guard.success.bound.work": {
+      "value": 13594992,
+      "witness": {
+        "definition": {
+          "declarations": [
+            {
+              "kind": "Many",
+              "name": "xs"
+            },
+            {
+              "kind": "Many",
+              "name": "ys"
+            },
+            {
+              "kind": "One",
+              "name": "one"
+            },
+            {
+              "kind": "One",
+              "name": "pending"
+            },
+            {
+              "kind": "Scalar { kind: Int, nullable: false }",
+              "name": "n"
+            },
+            {
+              "kind": "Scalar { kind: Int, nullable: false }",
+              "name": "m"
+            },
+            {
+              "kind": "Scalar { kind: Bool, nullable: false }",
+              "name": "flag"
+            },
+            {
+              "kind": "Scalar { kind: String, nullable: false }",
+              "name": "text"
+            },
+            {
+              "kind": "Scalar { kind: Int, nullable: false }",
+              "name": "now_ms"
+            }
+          ],
+          "guards": [
+            {
+              "input": "one",
+              "source": "((!(text.endsWith(text) || false)) || matches(((true ? \"rowless\" : \"\") + (text + \"beta\")),\"x?\"))"
+            },
+            {
+              "input": "pending",
+              "source": "(!xs.exists(r,matches(string(bytes(r.body)),\"x?\")))"
+            }
+          ],
+          "input_metadata": [],
+          "source": {
+            "expression": "(double(1) / 4.5)"
+          }
+        },
+        "error_category": null,
+        "family": "ordered-guards",
+        "fixture": "generated-2317",
+        "generator": {
+          "attempt": 2317,
+          "comprehension_body_depth": 1,
+          "expanded_depth_bound": 10,
+          "family": "ordered-guards",
+          "features": {
+            "binary:Add": 2,
+            "binary:Divide": 1,
+            "binary:Or": 2,
+            "bound-variable": 1,
+            "call:bytes:global": 1,
+            "call:double:global": 1,
+            "call:endsWith:receiver": 1,
+            "call:matches:global": 2,
+            "call:string:global": 1,
+            "conditional": 1,
+            "free-variable": 4,
+            "literal:Bool": 2,
+            "literal:Double": 1,
+            "literal:Int": 1,
+            "literal:Text": 5,
+            "macro:Exists": 1,
+            "operator:Add:Text:Text": 2,
+            "operator:Divide:Double:Double": 1,
+            "operator:Or:Bool:Bool": 2,
+            "select": 1,
+            "unary:Not": 2
+          },
+          "intentional_semantic_error": false,
+          "nodes": 30,
+          "seed": 7462749370595369445,
+          "version": "native-typed-grammar-v2"
+        },
+        "guard_error_category": null,
+        "guard_input": "pending",
+        "guard_phase": "standalone",
+        "index": 2175,
+        "outcome": "value",
+        "replacement_execution": true,
+        "scenario": "rows-0"
+      }
+    },
+    "guard.success.cost.memory": {
+      "value": 1682,
+      "witness": {
+        "definition": {
+          "declarations": [
+            {
+              "kind": "Many",
+              "name": "xs"
+            },
+            {
+              "kind": "Many",
+              "name": "ys"
+            },
+            {
+              "kind": "One",
+              "name": "one"
+            },
+            {
+              "kind": "One",
+              "name": "pending"
+            },
+            {
+              "kind": "Scalar { kind: Int, nullable: false }",
+              "name": "n"
+            },
+            {
+              "kind": "Scalar { kind: Int, nullable: false }",
+              "name": "m"
+            },
+            {
+              "kind": "Scalar { kind: Bool, nullable: false }",
+              "name": "flag"
+            },
+            {
+              "kind": "Scalar { kind: String, nullable: false }",
+              "name": "text"
+            },
+            {
+              "kind": "Scalar { kind: Int, nullable: false }",
+              "name": "now_ms"
+            }
+          ],
+          "guards": [
+            {
+              "input": "one",
+              "source": "(((\"rowless\" + \"\").matches(\"[ab]+\") || [0,1].exists(r,(flag || true))) && (((6.5 == 8.5) || (true || false)) || (flag ? \"x\" : text).startsWith(string(1u))))"
+            },
+            {
+              "input": "pending",
+              "source": "((([n,5].min() + (one.n * 3)) * 5) in [(string(bytes(\"escaped\\ntext\")).endsWith(string(1u)) ? ((!false) ? (4 / 3) : (false ? 7 : m)) : ([1,3,m].contains(m) ? (false ? 8 : one.n) : 4)),((!(!one.ok)) ? ((n + one.n) * 3) : ((one.n + one.n) * 5)),max([(xs.exists_one(r,flag) ? [m,one.n,1].min() : max([one.n,one.n,n])),([4,one.n,8].max() * 5),([one.n,7,n].contains(2) ? (n * 5) : [one.n,4,m].min())])])"
+            }
+          ],
+          "input_metadata": [],
+          "source": {
+            "expression": "((!true) ? (4u * 7u) : uint(5))"
+          }
+        },
+        "error_category": null,
+        "family": "ordered-guards",
+        "fixture": "generated-3283",
+        "generator": {
+          "attempt": 3283,
+          "comprehension_body_depth": 1,
+          "expanded_depth_bound": 10,
+          "family": "ordered-guards",
+          "features": {
+            "binary:Add": 4,
+            "binary:And": 1,
+            "binary:Divide": 1,
+            "binary:Equal": 1,
+            "binary:In": 1,
+            "binary:Multiply": 7,
+            "binary:Or": 5,
+            "call:bytes:global": 1,
+            "call:contains:receiver": 2,
+            "call:endsWith:receiver": 1,
+            "call:matches:receiver": 1,
+            "call:max:global": 2,
+            "call:max:receiver": 1,
+            "call:min:receiver": 3,
+            "call:startsWith:receiver": 1,
+            "call:string:global": 3,
+            "call:uint:global": 1,
+            "conditional": 10,
+            "extremum:max:global:Int": 2,
+            "extremum:max:receiver:Int": 1,
+            "extremum:min:receiver:Int": 3,
+            "free-variable": 27,
+            "list": 10,
+            "literal:Bool": 7,
+            "literal:Double": 2,
+            "literal:Int": 23,
+            "literal:Text": 5,
+            "literal:UInt": 4,
+            "macro:Exists": 1,
+            "macro:ExistsOne": 1,
+            "operator:Add:Int:Int": 3,
+            "operator:Add:Text:Text": 1,
+            "operator:And:Bool:Bool": 1,
+            "operator:Divide:Int:Int": 1,
+            "operator:Equal:Double:Double": 1,
+            "operator:In:Int:List(Int)": 1,
+            "operator:Multiply:Int:Int": 6,
+            "operator:Multiply:UInt:UInt": 1,
+            "operator:Or:Bool:Bool": 5,
+            "select": 12,
+            "unary:Not": 4
+          },
+          "intentional_semantic_error": false,
+          "nodes": 142,
+          "seed": 7462749370595369445,
+          "version": "native-typed-grammar-v2"
+        },
+        "guard_error_category": null,
+        "guard_input": "pending",
+        "guard_phase": "standalone",
+        "index": 3038,
+        "outcome": "value",
+        "replacement_execution": false,
+        "scenario": "rows-0"
+      }
+    },
+    "guard.success.cost.work": {
+      "value": 1466,
+      "witness": {
+        "definition": {
+          "declarations": [
+            {
+              "kind": "Many",
+              "name": "xs"
+            },
+            {
+              "kind": "Many",
+              "name": "ys"
+            },
+            {
+              "kind": "One",
+              "name": "one"
+            },
+            {
+              "kind": "One",
+              "name": "pending"
+            },
+            {
+              "kind": "Scalar { kind: Int, nullable: false }",
+              "name": "n"
+            },
+            {
+              "kind": "Scalar { kind: Int, nullable: false }",
+              "name": "m"
+            },
+            {
+              "kind": "Scalar { kind: Bool, nullable: false }",
+              "name": "flag"
+            },
+            {
+              "kind": "Scalar { kind: String, nullable: false }",
+              "name": "text"
+            },
+            {
+              "kind": "Scalar { kind: Int, nullable: false }",
+              "name": "now_ms"
+            }
+          ],
+          "guards": [
+            {
+              "input": "one",
+              "source": "(((6.5 == 3.5) && [0,1].exists_one(r,true)) && [n,(2 * 5),size(text)].contains(8))"
+            },
+            {
+              "input": "pending",
+              "source": "xs.exists_one(r,[0,1].exists_one(r,matches(\"alpha\",\"x?\")))"
+            }
+          ],
+          "input_metadata": [],
+          "source": {
+            "expression": "(-1.5)"
+          }
+        },
+        "error_category": null,
+        "family": "ordered-guards",
+        "fixture": "generated-5187",
+        "generator": {
+          "attempt": 5187,
+          "comprehension_body_depth": 2,
+          "expanded_depth_bound": 10,
+          "family": "ordered-guards",
+          "features": {
+            "binary:And": 2,
+            "binary:Equal": 1,
+            "binary:Multiply": 1,
+            "call:contains:receiver": 1,
+            "call:matches:global": 1,
+            "call:size:global": 1,
+            "free-variable": 3,
+            "list": 3,
+            "literal:Bool": 1,
+            "literal:Double": 3,
+            "literal:Int": 7,
+            "literal:Text": 2,
+            "macro:ExistsOne": 3,
+            "operator:And:Bool:Bool": 2,
+            "operator:Equal:Double:Double": 1,
+            "operator:Multiply:Int:Int": 1,
+            "unary:Negate": 1
+          },
+          "intentional_semantic_error": false,
+          "nodes": 30,
+          "seed": 7462749370595369445,
+          "version": "native-typed-grammar-v2"
+        },
+        "guard_error_category": null,
+        "guard_input": "pending",
+        "guard_phase": "standalone",
+        "index": 4713,
+        "outcome": "value",
+        "replacement_execution": false,
+        "scenario": "rows-16"
+      }
+    },
+    "guard.success.input_cost.memory": {
+      "value": 11096,
+      "witness": {
+        "definition": {
+          "declarations": [
+            {
+              "kind": "Many",
+              "name": "xs"
+            },
+            {
+              "kind": "Many",
+              "name": "ys"
+            },
+            {
+              "kind": "One",
+              "name": "one"
+            },
+            {
+              "kind": "One",
+              "name": "pending"
+            },
+            {
+              "kind": "Scalar { kind: Int, nullable: false }",
+              "name": "n"
+            },
+            {
+              "kind": "Scalar { kind: Int, nullable: false }",
+              "name": "m"
+            },
+            {
+              "kind": "Scalar { kind: Bool, nullable: false }",
+              "name": "flag"
+            },
+            {
+              "kind": "Scalar { kind: String, nullable: false }",
+              "name": "text"
+            },
+            {
+              "kind": "Scalar { kind: Int, nullable: false }",
+              "name": "now_ms"
+            }
+          ],
+          "guards": [
+            {
+              "input": "one",
+              "source": "true"
+            },
+            {
+              "input": "pending",
+              "source": "((size(text) / 1) > string(bytes(text)).size())"
+            }
+          ],
+          "input_metadata": [],
+          "source": {
+            "expression": "(-one.n)"
+          }
+        },
+        "error_category": null,
+        "family": "ordered-guards",
+        "fixture": "generated-26",
+        "generator": {
+          "attempt": 26,
+          "comprehension_body_depth": 0,
+          "expanded_depth_bound": 5,
+          "family": "ordered-guards",
+          "features": {
+            "binary:Divide": 1,
+            "binary:Greater": 1,
+            "call:bytes:global": 1,
+            "call:size:global": 1,
+            "call:size:receiver": 1,
+            "call:string:global": 1,
+            "free-variable": 3,
+            "literal:Bool": 1,
+            "literal:Int": 1,
+            "operator:Divide:Int:Int": 1,
+            "operator:Greater:Int:Int": 1,
+            "select": 1,
+            "unary:Negate": 1
+          },
+          "intentional_semantic_error": false,
+          "nodes": 13,
+          "seed": 7462749370595369445,
+          "version": "native-typed-grammar-v2"
+        },
+        "guard_error_category": null,
+        "guard_input": "pending",
+        "guard_phase": "standalone",
+        "index": 26,
+        "outcome": "value",
+        "replacement_execution": false,
+        "scenario": "rows-16"
+      }
+    },
+    "guard.success.input_cost.work": {
+      "value": 354,
+      "witness": {
+        "definition": {
+          "declarations": [
+            {
+              "kind": "Many",
+              "name": "xs"
+            },
+            {
+              "kind": "Many",
+              "name": "ys"
+            },
+            {
+              "kind": "One",
+              "name": "one"
+            },
+            {
+              "kind": "One",
+              "name": "pending"
+            },
+            {
+              "kind": "Scalar { kind: Int, nullable: false }",
+              "name": "n"
+            },
+            {
+              "kind": "Scalar { kind: Int, nullable: false }",
+              "name": "m"
+            },
+            {
+              "kind": "Scalar { kind: Bool, nullable: false }",
+              "name": "flag"
+            },
+            {
+              "kind": "Scalar { kind: String, nullable: false }",
+              "name": "text"
+            },
+            {
+              "kind": "Scalar { kind: Int, nullable: false }",
+              "name": "now_ms"
+            }
+          ],
+          "guards": [
+            {
+              "input": "one",
+              "source": "true"
+            },
+            {
+              "input": "pending",
+              "source": "((size(text) / 1) > string(bytes(text)).size())"
+            }
+          ],
+          "input_metadata": [],
+          "source": {
+            "expression": "(-one.n)"
+          }
+        },
+        "error_category": null,
+        "family": "ordered-guards",
+        "fixture": "generated-26",
+        "generator": {
+          "attempt": 26,
+          "comprehension_body_depth": 0,
+          "expanded_depth_bound": 5,
+          "family": "ordered-guards",
+          "features": {
+            "binary:Divide": 1,
+            "binary:Greater": 1,
+            "call:bytes:global": 1,
+            "call:size:global": 1,
+            "call:size:receiver": 1,
+            "call:string:global": 1,
+            "free-variable": 3,
+            "literal:Bool": 1,
+            "literal:Int": 1,
+            "operator:Divide:Int:Int": 1,
+            "operator:Greater:Int:Int": 1,
+            "select": 1,
+            "unary:Negate": 1
+          },
+          "intentional_semantic_error": false,
+          "nodes": 13,
+          "seed": 7462749370595369445,
+          "version": "native-typed-grammar-v2"
+        },
+        "guard_error_category": null,
+        "guard_input": "pending",
+        "guard_phase": "standalone",
+        "index": 26,
+        "outcome": "value",
+        "replacement_execution": false,
+        "scenario": "rows-16"
+      }
+    },
+    "native_aux.cells": {
+      "value": 15851,
+      "witness": {
+        "definition": {
+          "declarations": [
+            {
+              "kind": "Many",
+              "name": "xs"
+            },
+            {
+              "kind": "Many",
+              "name": "ys"
+            },
+            {
+              "kind": "One",
+              "name": "one"
+            },
+            {
+              "kind": "One",
+              "name": "pending"
+            },
+            {
+              "kind": "Scalar { kind: Int, nullable: false }",
+              "name": "n"
+            },
+            {
+              "kind": "Scalar { kind: Int, nullable: false }",
+              "name": "m"
+            },
+            {
+              "kind": "Scalar { kind: Bool, nullable: false }",
+              "name": "flag"
+            },
+            {
+              "kind": "Scalar { kind: String, nullable: false }",
+              "name": "text"
+            },
+            {
+              "kind": "Scalar { kind: Int, nullable: false }",
+              "name": "now_ms"
+            }
+          ],
+          "guards": [],
+          "input_metadata": [],
+          "source": {
+            "expression": "xs.map(r,{\"twice\":[r,r],\"id\":r.id,\"computed\":([max([r.n,n]),[n,n,n].max(),(r.ok ? r.n : 7)].contains((m + r.n)) ? (string(bytes(r.body)) + (text + text)) : ((\"alpha\" + \"\") + (false ? \"\" : r.body)))})"
+          }
+        },
+        "fixture": "generated-10687",
+        "generator": {
+          "attempt": 10687,
+          "comprehension_body_depth": 1,
+          "expanded_depth_bound": 12,
+          "family": "row-copy-projection",
+          "features": {
+            "binary:Add": 5,
+            "bound-variable": 9,
+            "call:bytes:global": 1,
+            "call:contains:receiver": 1,
+            "call:max:global": 1,
+            "call:max:receiver": 1,
+            "call:string:global": 1,
+            "conditional": 3,
+            "extremum:max:global:Int": 1,
+            "extremum:max:receiver:Int": 1,
+            "free-variable": 8,
+            "list": 4,
+            "literal:Bool": 1,
+            "literal:Int": 1,
+            "literal:Text": 6,
+            "macro:Map": 1,
+            "map": 1,
+            "operator:Add:Int:Int": 1,
+            "operator:Add:Text:Text": 4,
+            "select": 7
+          },
+          "intentional_semantic_error": false,
+          "nodes": 51,
+          "seed": 7462749370595369445,
+          "version": "native-typed-grammar-v2"
+        },
+        "phase": "expression"
+      }
+    },
+    "native_aux.nodes": {
+      "value": 2788,
+      "witness": {
+        "definition": {
+          "declarations": [
+            {
+              "kind": "Many",
+              "name": "xs"
+            },
+            {
+              "kind": "Many",
+              "name": "ys"
+            },
+            {
+              "kind": "One",
+              "name": "one"
+            },
+            {
+              "kind": "One",
+              "name": "pending"
+            },
+            {
+              "kind": "Scalar { kind: Int, nullable: false }",
+              "name": "n"
+            },
+            {
+              "kind": "Scalar { kind: Int, nullable: false }",
+              "name": "m"
+            },
+            {
+              "kind": "Scalar { kind: Bool, nullable: false }",
+              "name": "flag"
+            },
+            {
+              "kind": "Scalar { kind: String, nullable: false }",
+              "name": "text"
+            },
+            {
+              "kind": "Scalar { kind: Int, nullable: false }",
+              "name": "now_ms"
+            }
+          ],
+          "guards": [],
+          "input_metadata": [],
+          "source": {
+            "expression": "{false:(((flag ? one.body : \"beta\").matches(\"[ab]+\") || (\"alpha\".endsWith(text) && text.endsWith(text))) && [m,((!flag) ? (true ? one.n : n) : max([2,one.n,1])),(\"\".matches(\"a.*\") ? (-one.n) : (one.n * 1))].contains(7)),true:\"escaped\\ntext\"}.map(key,(key ? (([5,one.n,m].max() < (3 / 1)) ? (string(bytes(one.body)) + (true ? \"escaped\\ntext\" : text)) : string((m * 7))) : ([(one.n * 7),(8 + one.n),[m,3,4].min()].contains((7 + n)) ? (flag ? \"\" : (true ? one.body : text)) : (xs.exists_one(r,r.ok) ? string(bytes(\"alpha\")) : string(bytes(one.body))))))"
+          }
+        },
+        "fixture": "generated-740",
+        "generator": {
+          "attempt": 740,
+          "comprehension_body_depth": 2,
+          "expanded_depth_bound": 13,
+          "family": "bool-map-keys",
+          "features": {
+            "binary:Add": 3,
+            "binary:And": 2,
+            "binary:Divide": 1,
+            "binary:Less": 1,
+            "binary:Multiply": 3,
+            "binary:Or": 1,
+            "bound-variable": 2,
+            "call:bytes:global": 3,
+            "call:contains:receiver": 2,
+            "call:endsWith:receiver": 2,
+            "call:matches:receiver": 2,
+            "call:max:global": 1,
+            "call:max:receiver": 1,
+            "call:min:receiver": 1,
+            "call:string:global": 4,
+            "conditional": 11,
+            "extremum:max:global:Int": 1,
+            "extremum:max:receiver:Int": 1,
+            "extremum:min:receiver:Int": 1,
+            "free-variable": 26,
+            "key-iteration:Bool": 1,
+            "list": 5,
+            "literal:Bool": 5,
+            "literal:Int": 13,
+            "literal:Text": 9,
+            "macro:ExistsOne": 1,
+            "macro:Map": 1,
+            "map": 1,
+            "operator:Add:Int:Int": 2,
+            "operator:Add:Text:Text": 1,
+            "operator:And:Bool:Bool": 2,
+            "operator:Divide:Int:Int": 1,
+            "operator:Less:Int:Int": 1,
+            "operator:Multiply:Int:Int": 3,
+            "operator:Or:Bool:Bool": 1,
+            "select": 12,
+            "unary:Negate": 1,
+            "unary:Not": 1
+          },
+          "intentional_semantic_error": false,
+          "nodes": 115,
+          "seed": 7462749370595369445,
+          "version": "native-typed-grammar-v2"
+        },
+        "phase": "expression"
+      }
+    },
+    "native_aux.shapes": {
+      "value": 643,
+      "witness": {
+        "definition": {
+          "declarations": [
+            {
+              "kind": "Many",
+              "name": "xs"
+            },
+            {
+              "kind": "Many",
+              "name": "ys"
+            },
+            {
+              "kind": "One",
+              "name": "one"
+            },
+            {
+              "kind": "One",
+              "name": "pending"
+            },
+            {
+              "kind": "Scalar { kind: Int, nullable: false }",
+              "name": "n"
+            },
+            {
+              "kind": "Scalar { kind: Int, nullable: false }",
+              "name": "m"
+            },
+            {
+              "kind": "Scalar { kind: Bool, nullable: false }",
+              "name": "flag"
+            },
+            {
+              "kind": "Scalar { kind: String, nullable: false }",
+              "name": "text"
+            },
+            {
+              "kind": "Scalar { kind: Int, nullable: false }",
+              "name": "now_ms"
+            }
+          ],
+          "guards": [],
+          "input_metadata": [],
+          "source": {
+            "expression": "{false:[(([n,one.n,5].contains(3) && (n < one.n)) ? [one.n,(-7)].max() : (-m)),(((m + 4) * 3) / 4),(((true ? one.n : m) in [(2 * 5),(one.ok ? 1 : 2),size(one.body)]) ? 3 : ((one.ok ? one.n : 3) / 5))].contains(((min([n,8,6]) + (6 * 4)) * 8)),true:text}.map(key,(key ? ((!(2u < 6u)) ? (true ? string(m) : (one.body + text)) : (\"\" + string(bytes(one.body)))) : ((one.ok ? (one.ok ? one.body : text) : string(bytes(\"beta\"))) + (string(n) + (true ? text : one.body)))))"
+          }
+        },
+        "fixture": "generated-2286",
+        "generator": {
+          "attempt": 2286,
+          "comprehension_body_depth": 1,
+          "expanded_depth_bound": 11,
+          "family": "bool-map-keys",
+          "features": {
+            "binary:Add": 6,
+            "binary:And": 1,
+            "binary:Divide": 2,
+            "binary:In": 1,
+            "binary:Less": 2,
+            "binary:Multiply": 4,
+            "bound-variable": 1,
+            "call:bytes:global": 2,
+            "call:contains:receiver": 2,
+            "call:max:receiver": 1,
+            "call:min:global": 1,
+            "call:size:global": 1,
+            "call:string:global": 4,
+            "conditional": 11,
+            "extremum:max:receiver:Int": 1,
+            "extremum:min:global:Int": 1,
+            "free-variable": 26,
+            "key-iteration:Bool": 1,
+            "list": 5,
+            "literal:Bool": 5,
+            "literal:Int": 18,
+            "literal:Text": 2,
+            "literal:UInt": 2,
+            "macro:Map": 1,
+            "map": 1,
+            "operator:Add:Int:Int": 2,
+            "operator:Add:Text:Text": 4,
+            "operator:And:Bool:Bool": 1,
+            "operator:Divide:Int:Int": 2,
+            "operator:In:Int:List(Int)": 1,
+            "operator:Less:Int:Int": 1,
+            "operator:Less:UInt:UInt": 1,
+            "operator:Multiply:Int:Int": 4,
+            "select": 14,
+            "unary:Negate": 2,
+            "unary:Not": 1
+          },
+          "intentional_semantic_error": false,
+          "nodes": 116,
+          "seed": 7462749370595369445,
+          "version": "native-typed-grammar-v2"
+        },
+        "phase": "expression"
+      }
+    },
+    "native_aux.visits": {
+      "value": 4295,
+      "witness": {
+        "definition": {
+          "declarations": [
+            {
+              "kind": "Many",
+              "name": "xs"
+            },
+            {
+              "kind": "Many",
+              "name": "ys"
+            },
+            {
+              "kind": "One",
+              "name": "one"
+            },
+            {
+              "kind": "One",
+              "name": "pending"
+            },
+            {
+              "kind": "Scalar { kind: Int, nullable: false }",
+              "name": "n"
+            },
+            {
+              "kind": "Scalar { kind: Int, nullable: false }",
+              "name": "m"
+            },
+            {
+              "kind": "Scalar { kind: Bool, nullable: false }",
+              "name": "flag"
+            },
+            {
+              "kind": "Scalar { kind: String, nullable: false }",
+              "name": "text"
+            },
+            {
+              "kind": "Scalar { kind: Int, nullable: false }",
+              "name": "now_ms"
+            }
+          ],
+          "guards": [],
+          "input_metadata": [],
+          "source": {
+            "expression": "{false:(size(string((7.5 / 1.5))) != ([(5 - 2),one.n].max() / 6)),true:n}.map(key,(key ? (((one.n + one.n) in [(-m),(n - one.n),(one.n + one.n)]) ? ((one.ok ? text : one.body) + (true ? text : one.body)) : ((!false) ? one.body : string(6.5))) : (((!true) && [0,1].exists_one(r,false)) ? (string(bytes(one.body)) + string(bytes(text))) : (string(1.5) + string(bytes(text))))))"
+          }
+        },
+        "fixture": "generated-1375",
+        "generator": {
+          "attempt": 1375,
+          "comprehension_body_depth": 2,
+          "expanded_depth_bound": 12,
+          "family": "bool-map-keys",
+          "features": {
+            "binary:Add": 5,
+            "binary:And": 1,
+            "binary:Divide": 2,
+            "binary:In": 1,
+            "binary:NotEqual": 1,
+            "binary:Subtract": 2,
+            "bound-variable": 1,
+            "call:bytes:global": 3,
+            "call:max:receiver": 1,
+            "call:size:global": 1,
+            "call:string:global": 6,
+            "conditional": 6,
+            "extremum:max:receiver:Int": 1,
+            "free-variable": 18,
+            "key-iteration:Bool": 1,
+            "list": 3,
+            "literal:Bool": 6,
+            "literal:Double": 4,
+            "literal:Int": 5,
+            "macro:ExistsOne": 1,
+            "macro:Map": 1,
+            "map": 1,
+            "operator:Add:Int:Int": 2,
+            "operator:Add:Text:Text": 3,
+            "operator:And:Bool:Bool": 1,
+            "operator:Divide:Double:Double": 1,
+            "operator:Divide:Int:Int": 1,
+            "operator:In:Int:List(Int)": 1,
+            "operator:NotEqual:Int:Int": 1,
+            "operator:Subtract:Int:Int": 2,
+            "select": 11,
+            "unary:Negate": 1,
+            "unary:Not": 2
+          },
+          "intentional_semantic_error": false,
+          "nodes": 83,
+          "seed": 7462749370595369445,
+          "version": "native-typed-grammar-v2"
+        },
+        "phase": "expression"
+      }
+    }
+  },
+  "admitted_bound_maxima": {
+    "memory": 371137176,
+    "result_bytes": 185568576,
+    "work": 15962772
+  },
+  "auxiliary_limits": {
+    "cells": 1000000,
+    "nodes": 250000,
+    "shapes": 16384,
+    "visits": 1000000
+  },
+  "auxiliary_storage": {
+    "arc_edge_bytes": 8,
+    "ast_depth": 32,
+    "body_depth": 2,
+    "ceilings": {
+      "cells": 1000000,
+      "nodes": 250000,
+      "shapes": 16384,
+      "visits": 1000000
+    },
+    "kind_inline_bytes": 56,
+    "last_owner_drop_edge_payload_max": 4000000,
+    "node_inline_bytes": 48,
+    "node_inline_payload_max": 12000000,
+    "real_tokens": 1024,
+    "scope": "Inline payload models exclude allocator headers/capacity/alignment. Cells cumulatively bound traversal/memo/coefficient records with bounded Rust record sizes; Shapes also count clone/rebind/join operations and bound nested union slots. These are finite native auxiliary-control storage implications, not an allocator census or runtime H charge. Visits bound traversal work. Last-owner queues have at most2edges per constructed node; source/declaration/value validation imposes separate finite bounds.",
+    "shape_inline_bytes": 120,
+    "shape_inline_payload_model": 1966080,
+    "source_bytes": 8192,
+    "value_depth": 35
+  },
+  "by_family": {
+    "aggregate-output": {
+      "admitted_candidates": 496,
+      "candidates": 496,
+      "expected:AdmitValue": 1984,
+      "outcome:value": 1984
+    },
+    "bool-map-keys": {
+      "admitted_candidates": 493,
+      "candidates": 495,
+      "expected:AdmitValue": 1980,
+      "outcome:value": 1972,
+      "rejected_candidates": 2,
+      "rejection_reason:work_cost": 2,
+      "rejection_stage:body_admission": 2
+    },
+    "boolean": {
+      "admitted_candidates": 411,
+      "candidates": 414,
+      "expected:AdmitValue": 1656,
+      "outcome:value": 1644,
+      "rejected_candidates": 3,
+      "rejection_reason:work_cost": 3,
+      "rejection_stage:body_admission": 3
+    },
+    "byte-output": {
+      "admitted_candidates": 365,
+      "candidates": 366,
+      "expected:AdmitValue": 1464,
+      "outcome:value": 1460,
+      "rejected_candidates": 1,
+      "rejection_reason:work_cost": 1,
+      "rejection_stage:body_admission": 1
+    },
+    "error-aggregate-map-key": {
+      "admitted_candidates": 165,
+      "body_error:UnsupportedKeyType": 660,
+      "candidates": 166,
+      "expected:AdmitSemanticError(\"UnsupportedKeyType\")": 664,
+      "outcome:semantic_error": 660,
+      "rejected_candidates": 1,
+      "rejection_reason:work_cost": 1,
+      "rejection_stage:body_admission": 1
+    },
+    "error-duration-boundary": {
+      "admitted_candidates": 154,
+      "body_error:Overflow": 616,
+      "candidates": 154,
+      "expected:AdmitSemanticError(\"Overflow\")": 616,
+      "outcome:semantic_error": 616
+    },
+    "error-empty-extremum": {
+      "admitted_candidates": 180,
+      "body_error:FunctionError": 720,
+      "candidates": 180,
+      "expected:AdmitSemanticError(\"FunctionError\")": 720,
+      "outcome:semantic_error": 720
+    },
+    "error-invalid-operator-kind": {
+      "admitted_candidates": 168,
+      "body_error:UnsupportedBinaryOperator": 672,
+      "candidates": 168,
+      "expected:AdmitSemanticError(\"UnsupportedBinaryOperator\")": 672,
+      "outcome:semantic_error": 672
+    },
+    "error-list-index-kind": {
+      "admitted_candidates": 161,
+      "body_error:UnexpectedType": 644,
+      "candidates": 161,
+      "expected:AdmitSemanticError(\"UnexpectedType\")": 644,
+      "outcome:semantic_error": 644
+    },
+    "error-list-map-add": {
+      "admitted_candidates": 176,
+      "body_error:NoSuchOverload": 704,
+      "candidates": 176,
+      "expected:AdmitSemanticError(\"NoSuchOverload\")": 704,
+      "outcome:semantic_error": 704
+    },
+    "error-missing-field": {
+      "admitted_candidates": 147,
+      "body_error:NoSuchKey": 588,
+      "candidates": 149,
+      "expected:AdmitSemanticError(\"NoSuchKey\")": 596,
+      "outcome:semantic_error": 588,
+      "rejected_candidates": 2,
+      "rejection_reason:work_cost": 2,
+      "rejection_stage:body_admission": 2
+    },
+    "error-mixed-extremum": {
+      "admitted_candidates": 161,
+      "body_error:NoSuchOverload": 644,
+      "candidates": 161,
+      "expected:AdmitSemanticError(\"NoSuchOverload\")": 644,
+      "outcome:semantic_error": 644
+    },
+    "error-nan-extremum": {
+      "admitted_candidates": 158,
+      "body_error:FunctionError": 632,
+      "candidates": 158,
+      "expected:AdmitSemanticError(\"FunctionError\")": 632,
+      "outcome:semantic_error": 632
+    },
+    "error-numeric-cast": {
+      "admitted_candidates": 162,
+      "body_error:FunctionError": 648,
+      "candidates": 163,
+      "expected:AdmitSemanticError(\"FunctionError\")": 652,
+      "outcome:semantic_error": 648,
+      "rejected_candidates": 1,
+      "rejection_reason:work_cost": 1,
+      "rejection_stage:body_admission": 1
+    },
+    "error-temporal-parse": {
+      "admitted_candidates": 165,
+      "body_error:FunctionError": 660,
+      "candidates": 165,
+      "expected:AdmitSemanticError(\"FunctionError\")": 660,
+      "outcome:semantic_error": 660
+    },
+    "error-timestamp-boundary": {
+      "admitted_candidates": 164,
+      "body_error:Overflow": 656,
+      "candidates": 164,
+      "expected:AdmitSemanticError(\"Overflow\")": 656,
+      "outcome:semantic_error": 656
+    },
+    "linear-many-size": {
+      "admitted_candidates": 417,
+      "candidates": 430,
+      "expected:AdmitValue": 1720,
+      "outcome:value": 1668,
+      "rejected_candidates": 13,
+      "rejection_reason:work_cost": 13,
+      "rejection_stage:body_admission": 13
+    },
+    "macro-all": {
+      "admitted_candidates": 371,
+      "candidates": 436,
+      "expected:AdmitValue": 1744,
+      "outcome:value": 1484,
+      "rejected_candidates": 65,
+      "rejection_reason:work_cost": 65,
+      "rejection_stage:body_admission": 65
+    },
+    "macro-exists": {
+      "admitted_candidates": 389,
+      "candidates": 429,
+      "expected:AdmitValue": 1716,
+      "outcome:value": 1556,
+      "rejected_candidates": 40,
+      "rejection_reason:work_cost": 40,
+      "rejection_stage:body_admission": 40
+    },
+    "macro-exists-one": {
+      "admitted_candidates": 372,
+      "candidates": 420,
+      "expected:AdmitValue": 1680,
+      "outcome:value": 1488,
+      "rejected_candidates": 48,
+      "rejection_reason:work_cost": 48,
+      "rejection_stage:body_admission": 48
+    },
+    "macro-filter": {
+      "admitted_candidates": 384,
+      "candidates": 430,
+      "expected:AdmitValue": 1720,
+      "outcome:value": 1536,
+      "rejected_candidates": 46,
+      "rejection_reason:work_cost": 46,
+      "rejection_stage:body_admission": 46
+    },
+    "macro-map": {
+      "admitted_candidates": 356,
+      "candidates": 375,
+      "expected:AdmitValue": 1500,
+      "outcome:value": 1424,
+      "rejected_candidates": 19,
+      "rejection_reason:work_cost": 19,
+      "rejection_stage:body_admission": 19
+    },
+    "macro-three-map": {
+      "admitted_candidates": 444,
+      "candidates": 494,
+      "expected:AdmitValue": 1976,
+      "outcome:value": 1776,
+      "rejected_candidates": 50,
+      "rejection_reason:work_cost": 50,
+      "rejection_stage:body_admission": 50
+    },
+    "mixed-map-keys": {
+      "admitted_candidates": 495,
+      "candidates": 495,
+      "expected:AdmitValue": 1980,
+      "outcome:value": 1980
+    },
+    "numeric": {
+      "admitted_candidates": 356,
+      "candidates": 356,
+      "expected:AdmitValue": 1424,
+      "outcome:value": 1424
+    },
+    "numeric-extrema": {
+      "admitted_candidates": 491,
+      "candidates": 492,
+      "expected:AdmitValue": 1968,
+      "outcome:value": 1964,
+      "rejected_candidates": 1,
+      "rejection_reason:work_cost": 1,
+      "rejection_stage:body_admission": 1
+    },
+    "numeric-map-keys": {
+      "admitted_candidates": 494,
+      "candidates": 494,
+      "expected:AdmitValue": 1976,
+      "outcome:value": 1976
+    },
+    "ordered-guards": {
+      "admitted_candidates": 492,
+      "candidates": 495,
+      "expected:AdmitValue": 1980,
+      "guard_value_executions": 5904,
+      "outcome:value": 1968,
+      "rejected_candidates": 3,
+      "rejection_reason:work_cost": 3,
+      "rejection_stage:guard_admission": 3
+    },
+    "row-copy-projection": {
+      "admitted_candidates": 361,
+      "candidates": 373,
+      "expected:AdmitValue": 1492,
+      "outcome:value": 1444,
+      "rejected_candidates": 12,
+      "rejection_reason:work_cost": 12,
+      "rejection_stage:body_admission": 12
+    },
+    "row-local-inner": {
+      "admitted_candidates": 422,
+      "candidates": 438,
+      "expected:AdmitValue": 1752,
+      "outcome:value": 1688,
+      "rejected_candidates": 16,
+      "rejection_reason:work_cost": 16,
+      "rejection_stage:body_admission": 16
+    },
+    "sequential-loops": {
+      "admitted_candidates": 434,
+      "candidates": 495,
+      "expected:AdmitValue": 1980,
+      "outcome:value": 1736,
+      "rejected_candidates": 61,
+      "rejection_reason:work_cost": 61,
+      "rejection_stage:body_admission": 61
+    },
+    "shadowing-inner": {
+      "admitted_candidates": 408,
+      "candidates": 433,
+      "expected:AdmitValue": 1732,
+      "outcome:value": 1632,
+      "rejected_candidates": 25,
+      "rejection_reason:work_cost": 25,
+      "rejection_stage:body_admission": 25
+    },
+    "temporal-success": {
+      "admitted_candidates": 299,
+      "candidates": 299,
+      "expected:AdmitValue": 1196,
+      "outcome:value": 1196
+    },
+    "text": {
+      "admitted_candidates": 350,
+      "candidates": 350,
+      "expected:AdmitValue": 1400,
+      "outcome:value": 1400
+    },
+    "whole-rule": {
+      "admitted_candidates": 482,
+      "candidates": 495,
+      "expected:AdmitValue": 1980,
+      "outcome:value": 1928,
+      "rejected_candidates": 13,
+      "rejection_reason:work_cost": 13,
+      "rejection_stage:body_admission": 13
+    }
+  },
+  "counts": {
+    "admitted_candidates": 11543,
+    "admitted_distinct": 11539,
+    "candidates": 11965,
+    "canonical_missing": 0,
+    "canonicalized": 11965,
+    "distinct_candidates": 11961,
+    "duplicate_candidates": 4,
+    "exercised_distinct": 11539,
+    "failures": 0,
+    "false_refusals": 0,
+    "guard_failure_executions": 0,
+    "guard_semantic_error_executions": 0,
+    "guard_value_executions": 5904,
+    "input_refusals": 0,
+    "no_token_guard_error": 0,
+    "no_token_required": 0,
+    "rejected_candidates": 422,
+    "rejected_distinct": 422,
+    "required_missing_events": 889,
+    "required_replacements": 889,
+    "semantic_error_distinct": 1957,
+    "semantic_error_executions": 7844,
+    "successful_distinct": 9582,
+    "value_executions": 38328
+  },
+  "execution": {
+    "arch": "x86_64",
+    "available_parallelism": 12,
+    "binary_sha256": "5ffa225d4907100a4967f2f60136806352a76c62e4d35cbd2745c77abd95e71e",
+    "command": {
+      "candidate": 18446744073709551615,
+      "mode": "generated",
+      "requested_successes": 10000
+    },
+    "cpu": "model name\t: AMD EPYC 7232P 8-Core Processor",
+    "debug_assertions": true,
+    "elapsed_seconds": 315.351684266,
+    "execution_head_end": "b307a2c5954630eb58b69159495f8422ee6c800f",
+    "execution_head_start": "b307a2c5954630eb58b69159495f8422ee6c800f",
+    "memory": "MemTotal:       131768020 kB",
+    "os": "linux",
+    "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18)\nbinary: rustc\ncommit-hash: 88d9e12ae178fab0fb5cc050a94da85685d449ea\ncommit-date: 2026-08-18\nhost: x86_64-unknown-linux-gnu\nrelease: 1.98.0\nLLVM version: 22.1.8",
+    "scope": "Native wall time includes source check, input validation, proof diagnostics and runtime; not guest fuel or allocator high-water.",
+    "working_tree_end": "",
+    "working_tree_start": ""
+  },
+  "failures": [],
+  "generator": {
+    "attempted_by_family": {
+      "aggregate-output": 496,
+      "bool-map-keys": 495,
+      "boolean": 496,
+      "byte-output": 496,
+      "error-aggregate-map-key": 190,
+      "error-duration-boundary": 190,
+      "error-empty-extremum": 190,
+      "error-invalid-operator-kind": 189,
+      "error-list-index-kind": 190,
+      "error-list-map-add": 189,
+      "error-missing-field": 190,
+      "error-mixed-extremum": 190,
+      "error-nan-extremum": 190,
+      "error-numeric-cast": 190,
+      "error-temporal-parse": 190,
+      "error-timestamp-boundary": 190,
+      "linear-many-size": 495,
+      "macro-all": 496,
+      "macro-exists": 496,
+      "macro-exists-one": 495,
+      "macro-filter": 496,
+      "macro-map": 496,
+      "macro-three-map": 495,
+      "mixed-map-keys": 495,
+      "numeric": 496,
+      "numeric-extrema": 495,
+      "numeric-map-keys": 495,
+      "ordered-guards": 495,
+      "row-copy-projection": 496,
+      "row-local-inner": 495,
+      "sequential-loops": 495,
+      "shadowing-inner": 495,
+      "temporal-success": 495,
+      "text": 496,
+      "whole-rule": 495
+    },
+    "attempts": 13673,
+    "canonical_duplicates": 624,
+    "exhausted_attempt_budget": false,
+    "features": {
+      "binary:Add": 16503,
+      "binary:And": 2944,
+      "binary:Divide": 8613,
+      "binary:Equal": 483,
+      "binary:Greater": 480,
+      "binary:GreaterEqual": 483,
+      "binary:In": 1536,
+      "binary:Less": 515,
+      "binary:LessEqual": 475,
+      "binary:Multiply": 8657,
+      "binary:NotEqual": 511,
+      "binary:Or": 2967,
+      "binary:Subtract": 7123,
+      "bound-variable": 8171,
+      "call:bytes:global": 6398,
+      "call:contains:receiver": 2441,
+      "call:double:global": 2172,
+      "call:duration:global": 1527,
+      "call:dyn:global": 258,
+      "call:endsWith:receiver": 949,
+      "call:int:global": 87,
+      "call:matches:global": 1455,
+      "call:matches:receiver": 1426,
+      "call:max:global": 2257,
+      "call:max:receiver": 2590,
+      "call:min:global": 2514,
+      "call:min:receiver": 2336,
+      "call:size:global": 2715,
+      "call:size:receiver": 2775,
+      "call:startsWith:receiver": 945,
+      "call:string:global": 12384,
+      "call:timestamp:global": 699,
+      "call:uint:global": 3062,
+      "conditional": 15481,
+      "extremum:max:global:Double": 532,
+      "extremum:max:global:Int": 1267,
+      "extremum:max:global:UInt": 458,
+      "extremum:max:receiver:Double": 752,
+      "extremum:max:receiver:Int": 1348,
+      "extremum:max:receiver:UInt": 490,
+      "extremum:min:global:Double": 591,
+      "extremum:min:global:Int": 1472,
+      "extremum:min:global:UInt": 451,
+      "extremum:min:receiver:Double": 563,
+      "extremum:min:receiver:Int": 1328,
+      "extremum:min:receiver:UInt": 445,
+      "free-variable": 46724,
+      "index": 161,
+      "key-iteration:Any": 258,
+      "key-iteration:Bool": 256,
+      "key-iteration:Int": 112,
+      "key-iteration:UInt": 123,
+      "list": 17795,
+      "literal:Bool": 10523,
+      "literal:Bytes": 188,
+      "literal:Double": 17782,
+      "literal:Int": 36803,
+      "literal:Text": 30440,
+      "literal:UInt": 12384,
+      "macro:All": 1322,
+      "macro:Exists": 1365,
+      "macro:ExistsOne": 1300,
+      "macro:Filter": 925,
+      "macro:Map": 4659,
+      "macro:MapThree": 494,
+      "map": 6272,
+      "operator:Add:Bytes:Bytes": 188,
+      "operator:Add:Double:Double": 2099,
+      "operator:Add:Duration:Duration": 321,
+      "operator:Add:Int:Int": 5511,
+      "operator:Add:List(Any):Map": 57,
+      "operator:Add:List(Row):Row": 119,
+      "operator:Add:Row:Int": 43,
+      "operator:Add:Text:Text": 6224,
+      "operator:Add:Timestamp:Duration": 335,
+      "operator:Add:UInt:UInt": 1606,
+      "operator:And:Bool:Bool": 2944,
+      "operator:Divide:Double:Double": 1992,
+      "operator:Divide:Int:Int": 5075,
+      "operator:Divide:UInt:UInt": 1546,
+      "operator:Equal:Double:Double": 160,
+      "operator:Equal:Int:Int": 161,
+      "operator:Equal:UInt:UInt": 162,
+      "operator:Greater:Double:Double": 151,
+      "operator:Greater:Int:Int": 148,
+      "operator:Greater:UInt:UInt": 181,
+      "operator:GreaterEqual:Double:Double": 152,
+      "operator:GreaterEqual:Int:Int": 171,
+      "operator:GreaterEqual:UInt:UInt": 160,
+      "operator:In:Int:List(Int)": 1536,
+      "operator:Less:Double:Double": 181,
+      "operator:Less:Int:Int": 160,
+      "operator:Less:UInt:UInt": 174,
+      "operator:LessEqual:Double:Double": 157,
+      "operator:LessEqual:Int:Int": 156,
+      "operator:LessEqual:UInt:UInt": 162,
+      "operator:Multiply:Double:Double": 1974,
+      "operator:Multiply:Int:Int": 5144,
+      "operator:Multiply:Text:Bool": 39,
+      "operator:Multiply:UInt:UInt": 1500,
+      "operator:NotEqual:Double:Double": 166,
+      "operator:NotEqual:Int:Int": 170,
+      "operator:NotEqual:UInt:UInt": 175,
+      "operator:Or:Bool:Bool": 2967,
+      "operator:Subtract:Bool:Int": 38,
+      "operator:Subtract:Double:Double": 1975,
+      "operator:Subtract:Int:Int": 5062,
+      "operator:Subtract:List(Int):Int": 48,
+      "select": 17876,
+      "unary:Negate": 3333,
+      "unary:Not": 2947
+    },
+    "generated_by_family": {
+      "aggregate-output": 496,
+      "bool-map-keys": 495,
+      "boolean": 414,
+      "byte-output": 366,
+      "error-aggregate-map-key": 166,
+      "error-duration-boundary": 154,
+      "error-empty-extremum": 180,
+      "error-invalid-operator-kind": 168,
+      "error-list-index-kind": 161,
+      "error-list-map-add": 176,
+      "error-missing-field": 149,
+      "error-mixed-extremum": 161,
+      "error-nan-extremum": 158,
+      "error-numeric-cast": 163,
+      "error-temporal-parse": 165,
+      "error-timestamp-boundary": 164,
+      "linear-many-size": 430,
+      "macro-all": 436,
+      "macro-exists": 429,
+      "macro-exists-one": 420,
+      "macro-filter": 430,
+      "macro-map": 375,
+      "macro-three-map": 494,
+      "mixed-map-keys": 495,
+      "numeric": 356,
+      "numeric-extrema": 492,
+      "numeric-map-keys": 494,
+      "ordered-guards": 495,
+      "row-copy-projection": 373,
+      "row-local-inner": 438,
+      "sequential-loops": 495,
+      "shadowing-inner": 433,
+      "temporal-success": 299,
+      "text": 350,
+      "whole-rule": 495
+    },
+    "generated_by_output_type": {
+      "Bool": 1796,
+      "Bytes": 366,
+      "Double": 370,
+      "Duration": 73,
+      "Int": 395,
+      "KeyMap(Any)": 237,
+      "KeyMap(Bool)": 239,
+      "KeyMap(Int)": 128,
+      "KeyMap(UInt)": 131,
+      "List(Bool)": 186,
+      "List(Double)": 168,
+      "List(Int)": 1106,
+      "List(List(Int))": 871,
+      "List(Map)": 631,
+      "List(Row)": 430,
+      "List(Text)": 674,
+      "List(UInt)": 151,
+      "Map": 3934,
+      "Text": 599,
+      "Timestamp": 80,
+      "UInt": 378
+    },
+    "generated_candidates": 11965,
+    "grammar_limit_rejections": 0,
+    "note": "Generator counters are provenance; actual public admissions are counts.admitted_distinct. No hidden resampling.",
+    "requested_successes": 10000,
+    "retries": 1708,
+    "seed": 7462749370595369445,
+    "semantic_error_candidates": 1965,
+    "structural_duplicates": 1708,
+    "successful_candidates": 10000,
+    "version": "native-typed-grammar-v2"
+  },
+  "interim": true,
+  "limits": {
+    "guard_memory": 1048576,
+    "guard_work": 16000000,
+    "input_count": 16,
+    "memory": 402653184,
+    "string_bytes": 4096,
+    "work": 16000000
+  },
+  "m1_original_examples": [],
+  "mode": "generated-candidates",
+  "note": "Counts use exact expanded-AST identity; this digest is reproducibility evidence, not the distinctness test. Full failure witnesses retained.",
+  "ordered_canonical_fnv1a64": "6f6d7b286263cdc5",
+  "policy_id": "cel-subset@1/p1"
+}

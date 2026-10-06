@@ -1,0 +1,47 @@
+{
+  "namespace": "deal-desk",
+  "name": "bands",
+  "args": ["deal_id"],
+  "inputs": [
+    {
+      "name": "deal",
+      "cardinality": "one",
+      "sql": "SELECT r.id AS id, (SELECT value_num FROM facet_values WHERE record_id = r.id AND key = 'discount_bp') AS discount_bp, COALESCE((SELECT value_num FROM facet_values WHERE record_id = r.id AND key = 'term_months'), 0) AS term_months FROM records r WHERE r.id = ?1",
+      "params": ["deal_id"],
+      "required": {"discount_bp": "discount"}
+    }
+  ],
+  "clauses": [
+    {"id": "term_bands_allow", "when": "deal.term_months >= 36 && deal.discount_bp <= 2000", "result": "{\"decision\": \"allow\", \"role\": \"\", \"used\": [deal.id]}"},
+    {"id": "bands_allow", "when": "deal.discount_bp <= 1500", "result": "{\"decision\": \"allow\", \"role\": \"\", \"used\": [deal.id]}"},
+    {"id": "term_bands_approval", "when": "deal.term_months >= 36 && deal.discount_bp <= 2500", "result": "{\"decision\": \"needs_approval\", \"role\": \"deal_desk\", \"used\": [deal.id]}"},
+    {"id": "bands_approval", "when": "deal.discount_bp <= 2000", "result": "{\"decision\": \"needs_approval\", \"role\": \"deal_desk\", \"used\": [deal.id]}"},
+    {"id": "bands_deny", "when": "true", "result": "{\"decision\": \"deny\", \"role\": \"\", \"used\": [deal.id]}"}
+  ],
+  "examples": [
+    {
+      "name": "allow under band",
+      "inputs": {"deal": {"id": "d1", "discount_bp": 1000, "term_months": 12}},
+      "args": {"deal_id": "d1"},
+      "expect": {"decision": "allow", "clause": "bands_allow", "used": ["d1"]}
+    },
+    {
+      "name": "approval in band",
+      "inputs": {"deal": {"id": "d2", "discount_bp": 1800, "term_months": 12}},
+      "args": {"deal_id": "d2"},
+      "expect": {"decision": "needs_approval", "clause": "bands_approval", "used": ["d2"]}
+    },
+    {
+      "name": "term shifts band",
+      "inputs": {"deal": {"id": "d3", "discount_bp": 2000, "term_months": 36}},
+      "args": {"deal_id": "d3"},
+      "expect": {"decision": "allow", "clause": "term_bands_allow", "used": ["d3"]}
+    },
+    {
+      "name": "missing discount is unknown",
+      "inputs": {"deal": {"id": "d0", "discount_bp": null, "term_months": 12}},
+      "args": {"deal_id": "d0"},
+      "expect": {"decision": "unknown", "clause": "unknown(discount)", "used": []}
+    }
+  ]
+}

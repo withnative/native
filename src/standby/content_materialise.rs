@@ -612,13 +612,15 @@ mod tests {
         .unwrap()
     }
 
-    /// Build a destination at the source's current act by canonical
-    /// interchange export/import, exactly as the acceptance contract requires.
+    /// Bootstrap a replica of the same workspace from an exact primary snapshot,
+    /// as production standby does; this is not a foreign workspace import.
     async fn destination_at_current_head(source: &crate::Db, dir: &Path, name: &str) -> crate::Db {
-        let bytes = crate::interchange::export_canonical_interchange(source)
+        let export = crate::export::export_connected_db(source, Some(dir))
             .await
             .unwrap();
-        crate::interchange::import_canonical_interchange(&bytes, &dir.join(name))
+        let path = dir.join(name);
+        std::fs::copy(export.path(), &path).unwrap();
+        crate::db::open_existing_database(path.to_str().unwrap())
             .await
             .unwrap()
     }

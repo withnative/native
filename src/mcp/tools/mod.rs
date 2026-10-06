@@ -17,6 +17,7 @@ pub mod apps;
 pub mod artifact_input_cache;
 pub mod artifact_interactions;
 pub mod artifact_revalidate;
+pub mod artifact_reversal;
 pub mod artifacts;
 pub mod attachments;
 pub mod attribution;
@@ -24,10 +25,13 @@ pub mod authoring;
 pub mod authoring_context;
 pub mod authority_act;
 pub mod batch_write;
+pub mod briefing;
 pub mod canvas;
 pub mod change_summaries;
 pub mod citations;
 pub mod create_many;
+pub mod effect_admission;
+pub mod effect_bounds;
 pub mod event_context;
 #[cfg(feature = "experimental-agent-intents")]
 pub mod experimental_agent_intents;
@@ -41,6 +45,7 @@ pub mod intent;
 pub mod interventions;
 pub mod lifecycle;
 pub mod links;
+pub mod live_scheduler;
 pub mod messaging;
 pub mod meta;
 pub mod mint;
@@ -56,6 +61,7 @@ pub mod similar;
 pub mod sql_write;
 pub mod suggestions;
 pub mod surface_bindings;
+pub mod tab_effect_catalogue;
 pub mod work;
 pub mod workspace_snapshot;
 
@@ -175,8 +181,7 @@ pub fn register_snapshot_tool(
 /// they are the two where the reasoning is least recoverable afterwards and the
 /// act is most consequential.
 pub(crate) const REASON_DESCRIPTION: &str =
-    "Why this change: reasoning and alternatives, including what you were arguing \
-     against. Restating the record is not an answer. See the effective-writing guide.";
+    "Reasoning, alternatives, what you're arguing against. Restating: not an answer. See effective-writing guide.";
 
 /// Shared response contract for direct record-write tools. Keeping the wording
 /// identical makes the compensating-forward recovery path discoverable at the
@@ -557,6 +562,14 @@ pub(crate) async fn visible_ids_preloaded_in(
         .collect::<std::collections::HashSet<_>>();
     if ids.is_empty() {
         return Ok(std::collections::HashSet::new());
+    }
+    if caller.is_member_copy() {
+        // A member copy holds only E(m), so per-id visibility is slice
+        // presence. The engine policy/Unit fold below reads
+        // `record_policies`/`policy_entries`/`semantic_units`, which the
+        // member profile excludes (contract §1.3/§3.2; C2a review check 5).
+        let candidates = ids.iter().cloned().collect::<Vec<_>>();
+        return crate::mcp::member_serving::slice_visible_ids_in_tx(tx, &candidates).await;
     }
     let ids_json = serde_json::to_string(&ids)?;
     let attribution_predicate = crate::query::attribution_predicate("r");

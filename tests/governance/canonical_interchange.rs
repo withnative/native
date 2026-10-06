@@ -80,9 +80,13 @@ async fn deterministic_round_trip_preserves_authority_and_projections() {
     validate_protocol_schemas(&first);
 
     let imported_path = temp.path().join("imported.db");
-    let imported = import_canonical_interchange(&first, &imported_path)
-        .await
-        .unwrap();
+    let imported = import_canonical_interchange(
+        &first,
+        &imported_path,
+        native_ce::interchange::ImportContinuity::ForeignBoundary,
+    )
+    .await
+    .unwrap();
     let reexported = export_canonical_interchange(&imported).await.unwrap();
     assert_eq!(first, reexported);
 
@@ -228,10 +232,13 @@ async fn canonical_round_trip_preserves_units_occurrences_and_aggregate_receipts
     .unwrap();
 
     let canonical = export_canonical_interchange(&source).await.unwrap();
-    let imported =
-        import_canonical_interchange(&canonical, &temp.path().join("freshness-imported.db"))
-            .await
-            .unwrap();
+    let imported = import_canonical_interchange(
+        &canonical,
+        &temp.path().join("freshness-imported.db"),
+        native_ce::interchange::ImportContinuity::ForeignBoundary,
+    )
+    .await
+    .unwrap();
     for table in [
         "semantic_units",
         "unit_revisions",
@@ -283,9 +290,13 @@ async fn strict_policy_survives_canonical_import_and_subsequent_reopen() {
     let bytes = export_canonical_interchange(&source).await.unwrap();
 
     let imported_path = temp.path().join("strict-imported.db");
-    let imported = import_canonical_interchange(&bytes, &imported_path)
-        .await
-        .unwrap();
+    let imported = import_canonical_interchange(
+        &bytes,
+        &imported_path,
+        native_ce::interchange::ImportContinuity::ForeignBoundary,
+    )
+    .await
+    .unwrap();
     assert_eq!(
         native_ce::storage_profile::portability_policy_report(&imported)
             .await
@@ -362,20 +373,26 @@ async fn corruption_and_partial_input_are_rejected_before_destination_mutation()
     let mut corrupt: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     corrupt["sections"][0]["rows"][0][0] = json!({"type": "text", "value": "corrupt"});
     let corrupt_destination = temp.path().join("corrupt.db");
-    let error =
-        import_canonical_interchange(&serde_json::to_vec(&corrupt).unwrap(), &corrupt_destination)
-            .await
-            .expect_err("corrupt interchange must fail");
+    let error = import_canonical_interchange(
+        &serde_json::to_vec(&corrupt).unwrap(),
+        &corrupt_destination,
+        native_ce::interchange::ImportContinuity::ForeignBoundary,
+    )
+    .await
+    .expect_err("corrupt interchange must fail");
     assert!(error.to_string().contains("integrity"));
     assert!(!corrupt_destination.exists());
 
     let mut partial: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     partial["sections"].as_array_mut().unwrap().pop();
     let partial_destination = temp.path().join("partial.db");
-    let error =
-        import_canonical_interchange(&serde_json::to_vec(&partial).unwrap(), &partial_destination)
-            .await
-            .expect_err("partial interchange must fail");
+    let error = import_canonical_interchange(
+        &serde_json::to_vec(&partial).unwrap(),
+        &partial_destination,
+        native_ce::interchange::ImportContinuity::ForeignBoundary,
+    )
+    .await
+    .expect_err("partial interchange must fail");
     assert!(error.to_string().contains("inventory"));
     assert!(!partial_destination.exists());
 
@@ -385,6 +402,7 @@ async fn corruption_and_partial_input_are_rejected_before_destination_mutation()
     let error = import_canonical_interchange(
         &serde_json::to_vec(&unsupported).unwrap(),
         &unsupported_destination,
+        native_ce::interchange::ImportContinuity::ForeignBoundary,
     )
     .await
     .expect_err("unsupported revision must fail");
@@ -395,9 +413,13 @@ async fn corruption_and_partial_input_are_rejected_before_destination_mutation()
 
     let occupied_destination = temp.path().join("occupied.db");
     std::fs::write(&occupied_destination, b"sentinel").unwrap();
-    let error = import_canonical_interchange(&bytes, &occupied_destination)
-        .await
-        .expect_err("an existing destination must not be replaced");
+    let error = import_canonical_interchange(
+        &bytes,
+        &occupied_destination,
+        native_ce::interchange::ImportContinuity::ForeignBoundary,
+    )
+    .await
+    .expect_err("an existing destination must not be replaced");
     assert!(error.to_string().contains("already exists"));
     assert_eq!(std::fs::read(&occupied_destination).unwrap(), b"sentinel");
 

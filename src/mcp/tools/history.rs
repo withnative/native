@@ -706,6 +706,70 @@ pub(super) async fn resolve_actor_names_in(
 #[cfg(test)]
 mod whats_changed_bench;
 
+#[cfg(test)]
+mod tab_change_deadline_tests {
+    //! How `records.changes.v1` settles a step once its deadline passes.
+
+    use super::{deadline_step, is_sqlite_interrupt, DeadlineStep};
+    use crate::error::{Error, Result};
+
+    /// A real `SQLITE_INTERRUPT`, raised by a progress handler that refuses
+    /// to continue, as the walk's own handler does past its deadline.
+    async fn interrupted() -> Error {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let mut connection = db.write_pool().acquire().await.unwrap();
+        connection
+            .lock_handle()
+            .await
+            .unwrap()
+            .set_progress_handler(1, || false);
+        let error = sqlx::query_scalar::<_, i64>(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 100000)
+             SELECT count(*) FROM n",
+        )
+        .fetch_one(&mut *connection)
+        .await
+        .unwrap_err();
+        connection
+            .lock_handle()
+            .await
+            .unwrap()
+            .remove_progress_handler();
+        Error::from(error)
+    }
+
+    fn cut<T>(step: Result<DeadlineStep<T>>) -> bool {
+        matches!(step, Ok(DeadlineStep::Cut))
+    }
+
+    #[tokio::test]
+    async fn only_the_armed_handlers_interrupt_past_the_deadline_cuts_a_page() {
+        let interrupt = interrupted().await;
+        assert!(is_sqlite_interrupt(&interrupt), "{interrupt:?}");
+        let other = || Error::engine("no such index: idx_content_events_record_changes");
+        assert!(!is_sqlite_interrupt(&other()));
+
+        // Past the deadline with the handler armed: the handler's interrupt,
+        // and a step that finished late, are cut; anything else propagates.
+        assert!(cut(deadline_step::<()>(
+            Err(interrupted().await),
+            true,
+            true
+        )));
+        assert!(cut(deadline_step(Ok(1), true, true)));
+        assert!(deadline_step::<()>(Err(other()), true, true).is_err());
+        // Without the armed handler, or before the deadline, nothing is cut:
+        // failures propagate, including an interrupt nobody asked for.
+        assert!(deadline_step::<()>(Err(interrupted().await), false, true).is_err());
+        assert!(deadline_step::<()>(Err(interrupted().await), true, false).is_err());
+        assert!(deadline_step::<()>(Err(other()), false, false).is_err());
+        assert!(matches!(
+            deadline_step(Ok(1), false, true),
+            Ok(DeadlineStep::Done(1))
+        ));
+    }
+}
+
 pub(super) async fn redact_event(
     db: &Db,
     caller: &Caller,
@@ -755,25 +819,16 @@ pub(super) async fn redact_event(
         match value {
             Value::Object(object) => {
                 for (key, child) in object.iter_mut() {
-                    let identity_key =
-                        matches!(key.as_str(), "actor" | "account_id" | "email" | "owner_id");
-                    let record_key = key == "id"
-                        || key.ends_with("_id")
-                        || matches!(key.as_str(), "owner" | "home");
-                    let claim_identity_key = matches!(
-                        key.as_str(),
-                        "claimed_by_account" | "claimed_run_key" | "released_from_run_key"
-                    );
-                    if identity_key || (claim_identity_key && !claim_holder_visible) {
-                        *child = Value::Null;
-                    } else if record_key {
-                        if let Some(id) = child.as_str() {
-                            if !can_record(db, caller, id, Capability::View).await? {
-                                *child = Value::Null;
+                    match redaction_key_rule(key, claim_holder_visible) {
+                        RedactionKeyRule::Erase => *child = Value::Null,
+                        RedactionKeyRule::CheckReference => {
+                            if let Some(id) = child.as_str() {
+                                if !can_record(db, caller, id, Capability::View).await? {
+                                    *child = Value::Null;
+                                }
                             }
                         }
-                    } else {
-                        stack.push(child);
+                        RedactionKeyRule::Descend => stack.push(child),
                     }
                 }
             }
@@ -789,10 +844,7 @@ pub(super) async fn redact_event(
 /// protected artefact. Unit visibility alone therefore cannot make the event
 /// visible. This check must run before page occupancy or aggregation.
 pub(super) async fn event_is_visible(db: &Db, caller: &Caller, event: &EventRow) -> Result<bool> {
-    if matches!(
-        event.event_type.as_str(),
-        "reconciliation.recorded.v1" | "unit.superseded.v1" | "receipt.dependency_audited.v1"
-    ) {
+    if events::HISTORY_HIDDEN_EVENT_TYPES.contains(&event.event_type.as_str()) {
         return Ok(false);
     }
     let acknowledgement = crate::query::acknowledgement_predicate("r");
@@ -828,10 +880,7 @@ async fn event_is_visible_in(
     caller: &Caller,
     event: &EventRow,
 ) -> Result<bool> {
-    if matches!(
-        event.event_type.as_str(),
-        "reconciliation.recorded.v1" | "unit.superseded.v1" | "receipt.dependency_audited.v1"
-    ) {
+    if events::HISTORY_HIDDEN_EVENT_TYPES.contains(&event.event_type.as_str()) {
         return Ok(false);
     }
     let acknowledgement = crate::query::acknowledgement_predicate("r");
@@ -868,9 +917,32 @@ pub(super) async fn redact_event_in(
     disclosure: &mut ActorDisclosure,
     event: &mut EventRow,
 ) -> Result<()> {
+    if let Some(walk) = redact_event_actor_in(tx, caller, disclosure, event).await? {
+        redact_event_payload_in(tx, caller, event, walk).await?;
+    }
+    Ok(())
+}
+
+/// A parsed payload awaiting [`redact_event_payload_in`], and how that walk
+/// treats claim keys for this viewer.
+pub(super) struct PayloadRedaction {
+    pub(super) payload: Value,
+    pub(super) claim_holder_visible: bool,
+}
+
+/// The first half of [`redact_event_in`]: the canvas summary and the actor
+/// rule. Returns the payload walk still to do, or `None` when there is none
+/// (a trusted local caller's events are not redacted; an event without a
+/// parseable payload has nothing to walk, and an unparseable one is dropped).
+pub(super) async fn redact_event_actor_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    caller: &Caller,
+    disclosure: &mut ActorDisclosure,
+    event: &mut EventRow,
+) -> Result<Option<PayloadRedaction>> {
     crate::canvas::summarise_event_row(event);
     if super::is_legacy_local(caller) {
-        return Ok(());
+        return Ok(None);
     }
     // See `redact_event`; this is the snapshot-scoped form of the same gate.
     let disclose_actor = match event.actor.as_deref() {
@@ -884,11 +956,11 @@ pub(super) async fn redact_event_in(
         event.intent = None;
     }
     let Some(raw) = event.payload.as_deref() else {
-        return Ok(());
+        return Ok(None);
     };
-    let Ok(mut payload) = serde_json::from_str::<Value>(raw) else {
+    let Ok(payload) = serde_json::from_str::<Value>(raw) else {
         event.payload = None;
-        return Ok(());
+        return Ok(None);
     };
     let claim_payload = payload.get("claimed_by_account").is_some()
         || payload.get("claimed_run_key").is_some()
@@ -899,30 +971,39 @@ pub(super) async fn redact_event_in(
         event.parent_key = None;
         event.intent = None;
     }
+    Ok(Some(PayloadRedaction {
+        payload,
+        claim_holder_visible,
+    }))
+}
+
+/// The second half of [`redact_event_in`]: walk the payload by
+/// [`redaction_key_rule`], checking the viewer's access to each reference.
+pub(super) async fn redact_event_payload_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    caller: &Caller,
+    event: &mut EventRow,
+    walk: PayloadRedaction,
+) -> Result<()> {
+    let PayloadRedaction {
+        mut payload,
+        claim_holder_visible,
+    } = walk;
     let mut stack = vec![&mut payload];
     while let Some(value) = stack.pop() {
         match value {
             Value::Object(object) => {
                 for (key, child) in object.iter_mut() {
-                    let identity_key =
-                        matches!(key.as_str(), "actor" | "account_id" | "email" | "owner_id");
-                    let record_key = key == "id"
-                        || key.ends_with("_id")
-                        || matches!(key.as_str(), "owner" | "home");
-                    let claim_identity_key = matches!(
-                        key.as_str(),
-                        "claimed_by_account" | "claimed_run_key" | "released_from_run_key"
-                    );
-                    if identity_key || (claim_identity_key && !claim_holder_visible) {
-                        *child = Value::Null;
-                    } else if record_key {
-                        if let Some(id) = child.as_str() {
-                            if !super::can_record_in(tx, caller, id, Capability::View).await? {
-                                *child = Value::Null;
+                    match redaction_key_rule(key, claim_holder_visible) {
+                        RedactionKeyRule::Erase => *child = Value::Null,
+                        RedactionKeyRule::CheckReference => {
+                            if let Some(id) = child.as_str() {
+                                if !super::can_record_in(tx, caller, id, Capability::View).await? {
+                                    *child = Value::Null;
+                                }
                             }
                         }
-                    } else {
-                        stack.push(child);
+                        RedactionKeyRule::Descend => stack.push(child),
                     }
                 }
             }
@@ -932,6 +1013,37 @@ pub(super) async fn redact_event_in(
     }
     event.payload = Some(serde_json::to_string(&payload)?);
     Ok(())
+}
+
+/// What payload redaction does beneath one object key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RedactionKeyRule {
+    /// The value is replaced by null, unread: identity keys always, and
+    /// claim keys unless the viewer is the claim's holder.
+    Erase,
+    /// A text value is a record reference, kept only if the viewer may see
+    /// that record. Nothing beneath it is walked.
+    CheckReference,
+    /// The value is walked like the rest of the payload.
+    Descend,
+}
+
+/// The one rule payload redaction applies per key, shared by every walk
+/// that must agree with it.
+pub(super) fn redaction_key_rule(key: &str, claim_holder_visible: bool) -> RedactionKeyRule {
+    let identity_key = matches!(key, "actor" | "account_id" | "email" | "owner_id");
+    let record_key = key == "id" || key.ends_with("_id") || matches!(key, "owner" | "home");
+    let claim_identity_key = matches!(
+        key,
+        "claimed_by_account" | "claimed_run_key" | "released_from_run_key"
+    );
+    if identity_key || (claim_identity_key && !claim_holder_visible) {
+        RedactionKeyRule::Erase
+    } else if record_key {
+        RedactionKeyRule::CheckReference
+    } else {
+        RedactionKeyRule::Descend
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1966,6 +2078,868 @@ async fn get_record_history_in(
     result
 }
 
+/// Longest scalar value, in characters, a `records.changes.v1` page carries
+/// for one side of one change. Longer values are cut and flagged.
+pub(crate) const TAB_CHANGE_VALUE_MAX_CHARS: usize = 256;
+
+/// Longest field name, in characters, a `records.changes.v1` page carries in
+/// `changed_fields` or `changes[].field`. Facet keys are otherwise unbounded;
+/// a longer name is cut and the event flagged `fields_truncated`.
+pub(crate) const TAB_CHANGE_FIELD_MAX_CHARS: usize = 256;
+
+/// Longest `reason`, in characters, a `records.changes.v1` page carries.
+pub(crate) const TAB_CHANGE_REASON_MAX_CHARS: usize = 1024;
+
+/// Rows fetched per step, so a record whose events carry very large bodies
+/// never holds more than a few of them at once.
+const TAB_CHANGE_SCAN_WINDOW: usize = 16;
+
+/// The stored event types that can carry a scalar or body change, as
+/// [`changed_fields_for_payload`] names them. A look-back reads payloads of
+/// these only.
+const TAB_CHANGE_FIELD_EVENT_TYPES: &[&str] = &[
+    "record.created",
+    "record.updated",
+    "receipt.committed.v1",
+    "record.type_corrected.v1",
+    "facet.set",
+    "facet.unset",
+];
+
+/// Largest stored payload, in bytes, one `records.changes.v1` event may
+/// carry and still be processed. It measures raw stored bytes, before
+/// redaction, so a larger one is not read at all and its event arrives as an
+/// `unprocessed` placeholder with `created_at: null` for every viewer. That
+/// discloses one accepted fact, that the raw payload exceeds this; a
+/// processed event's `payload_bytes` is the viewer's redacted size.
+pub const TAB_CHANGE_MAX_PAYLOAD_BYTES: i64 = 8 * 1024 * 1024;
+
+/// Most record references (`id`, `*_id`, `owner`, `home` keys holding text)
+/// one event's payload may carry and still be processed. Redaction checks
+/// the viewer's access to each, one authorization query apiece, so an event
+/// with more arrives as an `unprocessed` placeholder instead.
+pub const TAB_CHANGE_MAX_REFERENCES: usize = 256;
+
+/// SQLite VM instructions between deadline checks in the progress handler.
+const TAB_CHANGE_PROGRESS_OPS: i32 = 1000;
+
+/// The work one `records.changes.v1` read may do.
+///
+/// Every row it examines is a row the viewer can see (see
+/// [`events::field_change_rows_in`]), so none of these can be spent, or
+/// seen to be spent, on hidden history. `scan_rows` and `lookback_rows`
+/// bound the rows examined. `deadline` bounds time: it is checked before
+/// every event, and a SQLite progress handler interrupts any statement still
+/// running when it passes.
+///
+/// Running out is reported, never hidden: a page walk that stops early is
+/// `complete: false` with a cursor after the last event it carries, and a
+/// look-back that stops early leaves the values it did not find
+/// `before_known: false`. A page always processes its first row whatever
+/// the budget, so paging always progresses; that row's work is bounded by
+/// [`TAB_CHANGE_MAX_PAYLOAD_BYTES`] and [`TAB_CHANGE_MAX_REFERENCES`].
+#[derive(Clone, Copy, Debug)]
+pub struct TabChangeBudget {
+    /// Rows the page walk may examine.
+    pub scan_rows: usize,
+    /// Rows the look-back may examine past the page.
+    pub lookback_rows: usize,
+    /// Time after which no further statement or event is started.
+    pub deadline: std::time::Duration,
+}
+
+impl TabChangeBudget {
+    pub const DEFAULT: Self = Self {
+        scan_rows: 1024,
+        lookback_rows: 256,
+        deadline: std::time::Duration::from_millis(1500),
+    };
+}
+
+/// One page of a record's changes, newest first, shaped for a tab: see
+/// [`tab_record_changes_in`].
+pub(crate) struct TabRecordChangesPage {
+    /// `(event id, shaped event)`, newest first.
+    pub(crate) events: Vec<(String, Value)>,
+    /// The id of the page's last event, when older events may remain.
+    /// `None` means the record's history is exhausted.
+    pub(crate) resume_after: Option<String>,
+}
+
+/// One scalar a field-changing event assigns.
+struct ScalarAssignment {
+    /// The name `changed_fields` gives it: `name`, `facet:lifecycle`, ...
+    field: String,
+    /// The record state it writes. A spine facet and its record column are
+    /// one state, so `facet:lifecycle` and `lifecycle` share `lifecycle`.
+    state: String,
+    value: Value,
+    /// The value it replaces, when the event itself states it
+    /// (`record.type_corrected.v1`).
+    from: Option<Value>,
+    /// A valid-time observation that leaves the current value alone.
+    observation_only: bool,
+}
+
+/// Which states an event writes that could not be processed.
+enum UnprocessedWrites {
+    /// These states, with values that are not known.
+    States(Vec<String>),
+    /// Not known: its payload was not read.
+    Unknown,
+}
+
+/// One event of a page, before the page's before-values are known.
+enum TabChangeEvent {
+    Processed {
+        event_id: String,
+        shaped: Value,
+        /// For `record.created`, every scalar state as the projector stores it.
+        creation: Option<Vec<(String, Value)>>,
+        assignments: Vec<ScalarAssignment>,
+        body_bytes: Option<u64>,
+    },
+    /// An event over the per-event work bounds: shown as a placeholder, and
+    /// what it writes becomes unknown.
+    Unprocessed {
+        event_id: String,
+        event_type: String,
+        /// `None` for a payload over the byte cap: its time is stored after
+        /// it, and is not read.
+        created_at: Option<String>,
+        writes: UnprocessedWrites,
+    },
+}
+
+/// Record state as a page replays it: a known value, `None` for a value
+/// that cannot be known, and absent for one not yet seen.
+#[derive(Default)]
+struct TabChangeState {
+    values: HashMap<String, Option<Value>>,
+    /// The record's creation is behind this point: an unseen state is its
+    /// creation default, null.
+    origin_known: bool,
+    /// An event whose writes are unknown is behind this point: an unseen
+    /// state may have been written by it.
+    clouded: bool,
+}
+
+impl TabChangeState {
+    /// The value `state` holds here, or `None` when it cannot be known.
+    fn value(&self, state: &str) -> Option<Value> {
+        match self.values.get(state) {
+            Some(value) => value.clone(),
+            None if self.clouded => None,
+            None if self.origin_known => Some(Value::Null),
+            None => None,
+        }
+    }
+}
+
+/// How many reference checks redaction may make in `payload` for this
+/// viewer, stopping once past `cap`: every key [`redaction_key_rule`] marks
+/// as a reference, beneath every key it walks for this viewer (so beneath a
+/// claim key only when the viewer holds the claim). A reference key whose
+/// value is not text costs redaction nothing, but is counted anyway, so the
+/// count depends only on keys, which redaction always leaves in place:
+/// everything it reads is visible in the same viewer's `get_history`.
+fn payload_reference_count(payload: &Value, claim_holder_visible: bool, cap: usize) -> usize {
+    let mut count = 0usize;
+    let mut stack = vec![payload];
+    while let Some(value) = stack.pop() {
+        match value {
+            Value::Object(object) => {
+                for (key, child) in object {
+                    match redaction_key_rule(key, claim_holder_visible) {
+                        RedactionKeyRule::Erase => {}
+                        RedactionKeyRule::CheckReference => {
+                            count += 1;
+                            if count > cap {
+                                return count;
+                            }
+                        }
+                        RedactionKeyRule::Descend => stack.push(child),
+                    }
+                }
+            }
+            Value::Array(values) => stack.extend(values.iter()),
+            _ => {}
+        }
+    }
+    count
+}
+
+/// The scalar record state a `record.created` event leaves, as
+/// `apply_record_created` stores it whichever fields the payload names: an
+/// absent or null name is empty text, and an absent type, lifecycle or
+/// maturity is null. Facets start unset.
+fn creation_state(payload: &Value) -> Vec<(String, Value)> {
+    let field = |name: &str| payload.get(name).cloned().unwrap_or(Value::Null);
+    let name = match field("name") {
+        Value::Null => Value::String(String::new()),
+        name => name,
+    };
+    vec![
+        ("name".into(), name),
+        ("type".into(), field("type")),
+        ("kind".into(), field("kind")),
+        ("lifecycle".into(), field("lifecycle")),
+        ("maturity".into(), field("maturity")),
+    ]
+}
+
+/// The scalars `records.changes.v1` reports values for, by the names
+/// `changed_fields` uses. Owner and persistence are named in
+/// `changed_fields` but carry no values here: an owner is a person record
+/// the viewer may not see.
+fn scalar_assignments(event_type: &str, payload: &Value) -> Vec<ScalarAssignment> {
+    let assign = |field: &str, value: Value| ScalarAssignment {
+        field: field.to_string(),
+        state: field.to_string(),
+        value,
+        from: None,
+        observation_only: false,
+    };
+    match event_type {
+        "record.created" => {
+            let Some(object) = payload.as_object() else {
+                return Vec::new();
+            };
+            creation_state(payload)
+                .into_iter()
+                .filter(|(field, _)| object.contains_key(field))
+                .map(|(field, value)| assign(&field, value))
+                .collect()
+        }
+        "record.updated" | "receipt.committed.v1" => {
+            let Some(object) = payload.as_object() else {
+                return Vec::new();
+            };
+            ["name", "lifecycle", "maturity", "kind"]
+                .into_iter()
+                .filter_map(|field| Some(assign(field, object.get(field)?.clone())))
+                .collect()
+        }
+        "record.type_corrected.v1" => ["kind", "type"]
+            .into_iter()
+            .map(|field| ScalarAssignment {
+                from: Some(payload["from"][field].clone()),
+                ..assign(field, payload["to"][field].clone())
+            })
+            .collect(),
+        "facet.set" | "facet.unset" => {
+            let Some(key) = payload.get("key").and_then(Value::as_str) else {
+                return Vec::new();
+            };
+            let state = match key {
+                "owner" | "persistence" => return Vec::new(),
+                "lifecycle" | "maturity" => key.to_string(),
+                _ => format!("facet:{key}"),
+            };
+            let value = if event_type == "facet.set" {
+                payload.get("value").cloned().unwrap_or(Value::Null)
+            } else {
+                Value::Null
+            };
+            vec![ScalarAssignment {
+                field: format!("facet:{key}"),
+                state,
+                value,
+                from: None,
+                observation_only: payload
+                    .get("observation_only")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            }]
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// UTF-8 bytes of the body an event writes, if it writes one. Text counts
+/// as itself; anything else as the text the projector stores for it.
+fn body_bytes(event_type: &str, payload: &Value) -> Option<u64> {
+    if !matches!(
+        event_type,
+        "record.created" | "record.updated" | "receipt.committed.v1"
+    ) {
+        return None;
+    }
+    Some(match payload.get("body")? {
+        Value::Null => 0,
+        Value::String(text) => text.len() as u64,
+        other => other.to_string().len() as u64,
+    })
+}
+
+/// `value` as a tab receives it: null, or text of at most
+/// [`TAB_CHANGE_VALUE_MAX_CHARS`] characters, and whether it was cut.
+/// Anything that is not text arrives as its JSON text.
+fn bounded_scalar(value: &Value) -> (Value, bool) {
+    let text = match value {
+        Value::Null => return (Value::Null, false),
+        Value::String(text) => text.clone(),
+        other => other.to_string(),
+    };
+    bounded_text(&text, TAB_CHANGE_VALUE_MAX_CHARS)
+}
+
+fn bounded_text(text: &str, max_chars: usize) -> (Value, bool) {
+    match text.char_indices().nth(max_chars) {
+        Some((end, _)) => (Value::String(text[..end].to_string()), true),
+        None => (Value::String(text.to_string()), false),
+    }
+}
+
+/// The viewer may read `record_id`'s history: exactly `get_history`'s own
+/// View and acknowledgement refusal, message included.
+pub(crate) async fn require_tab_history_record_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    caller: &Caller,
+    record_id: &str,
+) -> Result<()> {
+    super::require_record_in(tx, caller, "get_history", record_id, Capability::View).await?;
+    let acknowledgement = crate::query::acknowledgement_predicate("r");
+    let hidden_acknowledgement: bool = sqlx::query_scalar(&format!(
+        "SELECT EXISTS(SELECT 1 FROM records r WHERE r.id=? AND {acknowledgement})"
+    ))
+    .bind(record_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    if hidden_acknowledgement {
+        return Err(Error::engine(format!(
+            "get_history: record {record_id} does not exist"
+        )));
+    }
+    Ok(())
+}
+
+/// The internal position of one of the record's own events, for resuming a
+/// `records.changes.v1` page after it. `None` when no such event belongs to
+/// the record. The position never leaves the engine, and the caller must
+/// only ask about an event id it sealed itself.
+pub(crate) async fn record_event_position_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    record_id: &str,
+    event_id: &str,
+) -> Result<Option<i64>> {
+    Ok(
+        sqlx::query_scalar("SELECT seq FROM content_events WHERE id = ? AND record_id = ?")
+            .bind(event_id)
+            .bind(record_id)
+            .fetch_optional(&mut **tx)
+            .await?,
+    )
+}
+
+/// One page of a record's history as the `records.changes.v1` tab read
+/// shows it, newest first, on the caller's transaction.
+///
+/// The page is `get_history {record_id, detail: metadata}` under the
+/// viewer, less `occurrence.bound.v1` events, which carry no field change:
+/// the same View and acknowledgement refusal (with `get_history`'s own
+/// message), the same visible events, the same `redact_event_in` actor and
+/// payload rule (an actor the viewer may not see is null, with its run), and
+/// `changed_fields`, `reason` and payload size taken from
+/// [`shape_history_event`] itself. Visibility is applied in SQL before a
+/// row is examined (see [`events::field_change_rows_in`]), so nothing about
+/// hidden events, their number included, shapes a page. Payloads never
+/// reach the tab. What it adds:
+///
+/// * **Scalar before/after** for `name`, `lifecycle`, `maturity`, `kind`,
+///   `type` and non-spine `facet:<key>` values, each cut at
+///   [`TAB_CHANGE_VALUE_MAX_CHARS`] and flagged. Before-values come from the
+///   record's own events only, through the same redaction as the page: the
+///   older events in this page, then a look-back of at most
+///   [`TabChangeBudget::lookback_rows`] earlier rows. There is no log
+///   replay. A before-value not found that way is reported unknown.
+/// * **Body changes** as their size in bytes, never their text.
+/// * **Bounded work** per [`TabChangeBudget`]; an event over the per-event
+///   bounds arrives as `{event_id, type, created_at, unprocessed: true}`.
+///
+/// Nothing positional is returned. The caller resumes from an event id, via
+/// [`record_event_position_in`].
+pub(crate) async fn tab_record_changes_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    caller: &Caller,
+    record_id: &str,
+    after: Option<i64>,
+    limit: usize,
+    budget: TabChangeBudget,
+) -> Result<TabRecordChangesPage> {
+    require_tab_history_record_in(tx, caller, record_id).await?;
+    let deadline = std::time::Instant::now() + budget.deadline;
+    let result =
+        tab_record_changes_walk(tx, caller, record_id, after, limit, budget, deadline).await;
+    // The handler must not outlive this read: the caller goes on to roll the
+    // transaction back on this connection.
+    tx.lock_handle().await?.remove_progress_handler();
+    result
+}
+
+async fn tab_record_changes_walk(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    caller: &Caller,
+    record_id: &str,
+    after: Option<i64>,
+    limit: usize,
+    budget: TabChangeBudget,
+    deadline: std::time::Instant,
+) -> Result<TabRecordChangesPage> {
+    let out_of_time = || std::time::Instant::now() >= deadline;
+
+    let mut disclosure = ActorDisclosure::default();
+    let no_names = HashMap::new();
+    let mut page: Vec<TabChangeEvent> = Vec::new();
+    let mut cursor = after;
+    let mut examined = 0usize;
+    let mut exhausted = false;
+    let mut deadline_armed = false;
+    'scan: while page.len() < limit {
+        if examined > 0 && (examined >= budget.scan_rows || out_of_time()) {
+            break;
+        }
+        // The page's first row is read on its own and without the deadline,
+        // so every page carries at least one event. Every later statement
+        // runs under the progress handler.
+        let window = if examined == 0 {
+            1
+        } else {
+            if !deadline_armed {
+                tx.lock_handle()
+                    .await?
+                    .set_progress_handler(TAB_CHANGE_PROGRESS_OPS, move || {
+                        std::time::Instant::now() < deadline
+                    });
+                deadline_armed = true;
+            }
+            TAB_CHANGE_SCAN_WINDOW.min(budget.scan_rows - examined)
+        };
+        let rows = events::field_change_rows_in(
+            tx,
+            record_id,
+            cursor,
+            window as i64,
+            None,
+            TAB_CHANGE_MAX_PAYLOAD_BYTES,
+        )
+        .await;
+        let rows = match deadline_step(rows, deadline_armed, out_of_time())? {
+            DeadlineStep::Done(rows) => rows,
+            DeadlineStep::Cut => break,
+        };
+        let fetched = rows.len();
+        if fetched < window {
+            exhausted = true;
+        }
+        for (index, row) in rows.into_iter().enumerate() {
+            if examined > 0 && out_of_time() {
+                exhausted = false;
+                break 'scan;
+            }
+            let seq = row.event.local_seq;
+            let processed = tab_change_event(tx, caller, &mut disclosure, &no_names, row).await;
+            match deadline_step(processed, deadline_armed, out_of_time())? {
+                DeadlineStep::Done(processed) => page.push(processed),
+                DeadlineStep::Cut => {
+                    exhausted = false;
+                    break 'scan;
+                }
+            }
+            examined += 1;
+            cursor = Some(seq);
+            if page.len() == limit {
+                // Complete only if this was the record's oldest row.
+                exhausted = exhausted && index + 1 == fetched;
+                break 'scan;
+            }
+        }
+        if exhausted {
+            break;
+        }
+    }
+
+    // Walk the page oldest first, noting each state it reads before any
+    // event in the page has written it: those need a look-back.
+    let mut written: HashSet<String> = HashSet::new();
+    let mut needed: HashSet<String> = HashSet::new();
+    let mut settled = false;
+    for change in page.iter().rev() {
+        match change {
+            TabChangeEvent::Processed {
+                creation,
+                assignments,
+                ..
+            } => {
+                settled |= creation.is_some();
+                for assignment in assignments {
+                    if !settled && assignment.from.is_none() && !written.contains(&assignment.state)
+                    {
+                        needed.insert(assignment.state.clone());
+                    }
+                    if !assignment.observation_only {
+                        written.insert(assignment.state.clone());
+                    }
+                }
+            }
+            TabChangeEvent::Unprocessed {
+                event_type, writes, ..
+            } => {
+                settled |= event_type == "record.created";
+                match writes {
+                    UnprocessedWrites::States(states) => written.extend(states.iter().cloned()),
+                    // Everything after it is unknown or written after it.
+                    UnprocessedWrites::Unknown => settled = true,
+                }
+            }
+        }
+    }
+
+    // The look-back reads the record's own earlier rows through the same
+    // redaction as the page, so a before-value is whatever the viewer would
+    // have seen had the page been long enough to hold the event that wrote
+    // it.
+    let mut state = TabChangeState::default();
+    if !needed.is_empty() && !exhausted {
+        let mut before = cursor;
+        let mut looked = 0usize;
+        'lookback: while looked < budget.lookback_rows && !out_of_time() {
+            if !deadline_armed {
+                tx.lock_handle()
+                    .await?
+                    .set_progress_handler(TAB_CHANGE_PROGRESS_OPS, move || {
+                        std::time::Instant::now() < deadline
+                    });
+                deadline_armed = true;
+            }
+            let window = TAB_CHANGE_SCAN_WINDOW.min(budget.lookback_rows - looked);
+            let rows = events::field_change_rows_in(
+                tx,
+                record_id,
+                before,
+                window as i64,
+                Some(TAB_CHANGE_FIELD_EVENT_TYPES),
+                TAB_CHANGE_MAX_PAYLOAD_BYTES,
+            )
+            .await;
+            let rows = match deadline_step(rows, deadline_armed, out_of_time())? {
+                DeadlineStep::Done(rows) => rows,
+                DeadlineStep::Cut => break,
+            };
+            let fetched = rows.len();
+            for row in rows {
+                if out_of_time() {
+                    break 'lookback;
+                }
+                looked += 1;
+                before = Some(row.event.local_seq);
+                if !TAB_CHANGE_FIELD_EVENT_TYPES.contains(&row.event.event_type.as_str()) {
+                    continue;
+                }
+                let created = row.event.event_type == "record.created";
+                let processed = tab_change_event(tx, caller, &mut disclosure, &no_names, row).await;
+                let processed = match deadline_step(processed, deadline_armed, out_of_time())? {
+                    DeadlineStep::Done(processed) => processed,
+                    DeadlineStep::Cut => break 'lookback,
+                };
+                match processed {
+                    TabChangeEvent::Processed {
+                        creation,
+                        assignments,
+                        ..
+                    } => {
+                        if let Some(creation) = creation {
+                            for (key, value) in creation {
+                                if needed.remove(&key) {
+                                    state.values.insert(key, Some(value));
+                                }
+                            }
+                            state.origin_known = true;
+                            break 'lookback;
+                        }
+                        for assignment in assignments {
+                            if !assignment.observation_only && needed.remove(&assignment.state) {
+                                state
+                                    .values
+                                    .insert(assignment.state, Some(assignment.value));
+                            }
+                        }
+                    }
+                    TabChangeEvent::Unprocessed { writes, .. } => match writes {
+                        UnprocessedWrites::States(states) => {
+                            for key in states {
+                                if needed.remove(&key) {
+                                    state.values.insert(key, None);
+                                }
+                            }
+                            if created {
+                                state.origin_known = true;
+                                break 'lookback;
+                            }
+                        }
+                        // Whatever is still needed may have been written by
+                        // it: none of it can be known.
+                        UnprocessedWrites::Unknown => break 'lookback,
+                    },
+                }
+                if needed.is_empty() {
+                    break 'lookback;
+                }
+            }
+            if fetched < window {
+                break;
+            }
+        }
+    }
+
+    // Replay the page oldest first over what the look-back found.
+    let mut shaped_by_event: Vec<(String, Value)> = Vec::with_capacity(page.len());
+    for change in page.iter().rev() {
+        let (event_id, shaped, creation, assignments, body_bytes) = match change {
+            TabChangeEvent::Unprocessed {
+                event_id,
+                event_type,
+                created_at,
+                writes,
+            } => {
+                match writes {
+                    UnprocessedWrites::States(states) => {
+                        for key in states {
+                            state.values.insert(key.clone(), None);
+                        }
+                    }
+                    UnprocessedWrites::Unknown => {
+                        state.values.clear();
+                        state.clouded = true;
+                    }
+                }
+                state.origin_known |= event_type == "record.created";
+                shaped_by_event.push((
+                    event_id.clone(),
+                    json!({
+                        "event_id": event_id,
+                        "type": event_type,
+                        "created_at": created_at,
+                        "unprocessed": true,
+                    }),
+                ));
+                continue;
+            }
+            TabChangeEvent::Processed {
+                event_id,
+                shaped,
+                creation,
+                assignments,
+                body_bytes,
+            } => (event_id, shaped, creation, assignments, body_bytes),
+        };
+        let mut changes = Vec::new();
+        let mut fields_truncated = false;
+        for assignment in assignments {
+            let before = if creation.is_some() {
+                Some(Value::Null)
+            } else if let Some(from) = &assignment.from {
+                Some(from.clone())
+            } else {
+                state.value(&assignment.state)
+            };
+            let (before_value, before_truncated) =
+                before.as_ref().map_or((Value::Null, false), bounded_scalar);
+            let (after_value, after_truncated) = bounded_scalar(&assignment.value);
+            let (field, cut) = bounded_text(&assignment.field, TAB_CHANGE_FIELD_MAX_CHARS);
+            fields_truncated |= cut;
+            changes.push(json!({
+                "field": field,
+                "before": before_value,
+                "before_known": before.is_some(),
+                "before_truncated": before_truncated,
+                "after": after_value,
+                "after_truncated": after_truncated,
+                "observation_only": assignment.observation_only,
+            }));
+        }
+        if let Some(creation) = creation {
+            state.values = creation
+                .iter()
+                .map(|(key, value)| (key.clone(), Some(value.clone())))
+                .collect();
+            state.origin_known = true;
+            state.clouded = false;
+        }
+        for assignment in assignments {
+            if !assignment.observation_only {
+                state
+                    .values
+                    .insert(assignment.state.clone(), Some(assignment.value.clone()));
+            }
+        }
+        if let Some(bytes) = body_bytes {
+            changes.push(json!({"field": "body", "changed": true, "bytes": bytes}));
+        }
+        let (reason, reason_truncated) = match shaped.get("reason").and_then(Value::as_str) {
+            Some(reason) => bounded_text(reason, TAB_CHANGE_REASON_MAX_CHARS),
+            None => (Value::Null, false),
+        };
+        let changed_fields: Vec<Value> = shaped["changed_fields"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+            .iter()
+            .map(|field| {
+                let (field, cut) = bounded_text(
+                    field.as_str().unwrap_or_default(),
+                    TAB_CHANGE_FIELD_MAX_CHARS,
+                );
+                fields_truncated |= cut;
+                field
+            })
+            .collect();
+        shaped_by_event.push((
+            event_id.clone(),
+            json!({
+                "event_id": event_id,
+                "type": shaped["type"],
+                "created_at": shaped["created_at"],
+                "actor": shaped["actor"],
+                "run_key": shaped["run_key"],
+                "changed_fields": changed_fields,
+                "fields_truncated": fields_truncated,
+                "reason": reason,
+                "reason_truncated": reason_truncated,
+                "payload_bytes": shaped["payload_json_utf8_bytes"],
+                "changes": changes,
+            }),
+        ));
+    }
+    shaped_by_event.reverse();
+    if page.is_empty() && !exhausted {
+        // Unreachable by construction (a page's first row is always
+        // processed or its failure propagated), and never to be reported as
+        // the end of history.
+        return Err(Error::engine(
+            "records.changes.v1: the page made no progress",
+        ));
+    }
+    let resume_after = if exhausted {
+        None
+    } else {
+        page.last().map(|change| change.event_id().to_string())
+    };
+    Ok(TabRecordChangesPage {
+        events: shaped_by_event,
+        resume_after,
+    })
+}
+
+/// What became of one step of the walk once the deadline is taken into
+/// account.
+enum DeadlineStep<T> {
+    Done(T),
+    /// The deadline passed while the progress handler was armed: the step
+    /// may have been interrupted part-way, so it is discarded and the page
+    /// ends incomplete.
+    Cut,
+}
+
+/// Settle one step of the walk. Only a step that ends after the deadline
+/// with the progress handler armed can be cut, and only if it either
+/// succeeded or failed with the handler's own `SQLITE_INTERRUPT`. A step
+/// that finished late is discarded rather than trusted, because an
+/// interrupted authorization check inside redaction reads as "no access".
+/// Every other failure propagates, so no failure ever reads as the end of
+/// history.
+fn deadline_step<T>(
+    result: Result<T>,
+    armed: bool,
+    past_deadline: bool,
+) -> Result<DeadlineStep<T>> {
+    if armed && past_deadline {
+        return match result {
+            Err(error) if !is_sqlite_interrupt(&error) => Err(error),
+            _ => Ok(DeadlineStep::Cut),
+        };
+    }
+    result.map(DeadlineStep::Done)
+}
+
+/// Whether `error` is SQLite's `SQLITE_INTERRUPT` (result code 9), which is
+/// what a progress handler returning false raises.
+fn is_sqlite_interrupt(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::Sqlx(sqlx::Error::Database(database))
+            if database.code().as_deref() == Some("9")
+    )
+}
+
+impl TabChangeEvent {
+    fn event_id(&self) -> &str {
+        match self {
+            Self::Processed { event_id, .. } | Self::Unprocessed { event_id, .. } => event_id,
+        }
+    }
+}
+
+/// Process one visible row within the per-event bounds: redact it as
+/// `get_history` does and derive what it changed, or, over the bounds,
+/// describe it as unprocessed.
+async fn tab_change_event(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    caller: &Caller,
+    disclosure: &mut ActorDisclosure,
+    no_names: &HashMap<String, String>,
+    row: events::FieldChangeRow,
+) -> Result<TabChangeEvent> {
+    let mut event = row.event;
+    let unprocessed = |event: &EventRow, writes| TabChangeEvent::Unprocessed {
+        event_id: event.id.clone(),
+        event_type: event.event_type.clone(),
+        created_at: (!row.withheld).then(|| event.created_at.clone()),
+        writes,
+    };
+    if row.withheld {
+        return Ok(unprocessed(&event, UnprocessedWrites::Unknown));
+    }
+    // Redact as `redact_event_in` does, in its two halves, so the reference
+    // cap is judged on exactly the walk this viewer's redaction would make.
+    if let Some(walk) = redact_event_actor_in(tx, caller, disclosure, &mut event).await? {
+        if payload_reference_count(
+            &walk.payload,
+            walk.claim_holder_visible,
+            TAB_CHANGE_MAX_REFERENCES,
+        ) > TAB_CHANGE_MAX_REFERENCES
+        {
+            // Which states it writes comes from its top-level keys, which
+            // redaction never removes.
+            let mut states: Vec<String> = scalar_assignments(&event.event_type, &walk.payload)
+                .into_iter()
+                .map(|assignment| assignment.state)
+                .collect();
+            if event.event_type == "record.created" {
+                states.extend(
+                    creation_state(&walk.payload)
+                        .into_iter()
+                        .map(|(key, _)| key),
+                );
+            }
+            return Ok(unprocessed(&event, UnprocessedWrites::States(states)));
+        }
+        redact_event_payload_in(tx, caller, &mut event, walk).await?;
+    }
+    let payload: Value = event
+        .payload
+        .as_deref()
+        .and_then(|raw| serde_json::from_str(raw).ok())
+        .unwrap_or(Value::Null);
+    Ok(TabChangeEvent::Processed {
+        event_id: event.id.clone(),
+        creation: (event.event_type == "record.created").then(|| creation_state(&payload)),
+        assignments: scalar_assignments(&event.event_type, &payload),
+        body_bytes: body_bytes(&event.event_type, &payload),
+        shaped: shape_history_event(event_to_value(&event, no_names), HistoryDetail::Metadata),
+    })
+}
+
 /// Opt-in oldest/newest visible-event attribution for `get_record` bylines.
 ///
 /// Both ends run the same per-event pipeline as `get_history` on this
@@ -2851,7 +3825,7 @@ async fn discover_own_runs(
     let cursor_id = cursor.as_ref().map(|cursor| cursor.activity_id.as_str());
     let rows = sqlx::query(
         "WITH candidates AS (
-             SELECT activity_id,run_key,started_at,
+             SELECT activity_id,run_key,started_at,start_event_id,
                     CASE WHEN ended_at IS NOT NULL AND ended_at<=? THEN ended_at END AS observed_ended_at,
                     CASE WHEN ended_at IS NULL OR ended_at>? THEN 0 ELSE 1 END AS open_rank,
                     CASE WHEN ended_at IS NULL OR ended_at>? THEN started_at ELSE ended_at END AS sort_at
@@ -2859,8 +3833,11 @@ async fn discover_own_runs(
               WHERE account_id=? AND started_at<=?
                 AND (ended_at IS NULL OR ended_at>?)
          )
-         SELECT activity_id,run_key,started_at,observed_ended_at,open_rank,sort_at
+         SELECT candidates.activity_id,candidates.run_key,candidates.started_at,
+                candidates.observed_ended_at,candidates.open_rank,candidates.sort_at,
+                start_event.payload AS start_payload
            FROM candidates
+           JOIN control_events start_event ON start_event.id=candidates.start_event_id
           WHERE ? IS NULL
              OR open_rank>?
              OR (open_rank=? AND (sort_at<? OR (sort_at=? AND activity_id>?)))
@@ -2888,6 +3865,12 @@ async fn discover_own_runs(
     for row in page {
         let run_key: String = row.try_get("run_key")?;
         let started_at: String = row.try_get("started_at")?;
+        let start_payload: String = row.try_get("start_payload")?;
+        let admission_channel =
+            serde_json::from_str::<crate::control::AgentRunStartedPayload>(&start_payload)
+                .ok()
+                .and_then(|start| start.channel)
+                .unwrap_or(Channel::Unknown);
         let ended_at: Option<String> = row.try_get("observed_ended_at")?;
         let intent = latest_discovery_intent(db, caller, &run_key, &observed_at).await;
         let activity = discovery_activity_freshness(
@@ -2906,6 +3889,10 @@ async fn discover_own_runs(
             "started_at": started_at,
             "ended_at": ended_at,
             "run_state": if ended_at.is_some() { "closed" } else { "open" },
+            "channel": {
+                "kind": admission_channel.as_str(),
+                "assurance": if admission_channel == Channel::Unknown { "unknown_or_withheld" } else { "server_observed" },
+            },
             "activity_freshness": activity,
         }));
     }

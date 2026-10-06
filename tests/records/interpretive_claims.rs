@@ -912,9 +912,13 @@ async fn targets_hidden_evidence_import_and_current_invalidation_fail_closed() {
         .is_empty());
     let bytes = export_canonical_interchange(&db).await.unwrap();
     let temp = tempfile::tempdir().unwrap();
-    let imported = import_canonical_interchange(&bytes, &temp.path().join("stress-import.db"))
-        .await
-        .unwrap();
+    let imported = import_canonical_interchange(
+        &bytes,
+        &temp.path().join("stress-import.db"),
+        native_ce::interchange::ImportContinuity::ForeignBoundary,
+    )
+    .await
+    .unwrap();
     let foreign = call(
         &registry,
         &imported,

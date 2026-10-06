@@ -8,6 +8,10 @@ repository = "https://github.com/withnative/native"
 license = "AGPL-3.0-only"
 publish = false
 
+[features]
+default = []
+test-support = []
+
 [dependencies]
 native-artifact-runtime = { path = "../artifact-runtime" }
 # The HTML parser/DOM pair is deliberately pinned: sanitizer semantics are a

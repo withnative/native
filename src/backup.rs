@@ -110,6 +110,7 @@ impl FsSink {
     /// why this is a separate, non-`async` method.
     fn put_blocking(&self, key: &str, source: &Path) -> Result<()> {
         let target = self.path_for(key)?;
+        crate::managed_custody::refuse_maintenance(&target)?;
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -124,6 +125,7 @@ impl FsSink {
 
     /// The synchronous body of [`BackupSink::get`].
     fn get_blocking(&self, key: &str, dest: &Path) -> Result<()> {
+        crate::managed_custody::refuse_maintenance(dest)?;
         let source = self.path_for(key)?;
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)?;
@@ -145,6 +147,7 @@ impl FsSink {
     /// The synchronous body of [`BackupSink::delete`].
     fn delete_blocking(&self, key: &str) -> Result<()> {
         let target = self.path_for(key)?;
+        crate::managed_custody::refuse_maintenance(&target)?;
         match std::fs::remove_file(&target) {
             Ok(()) => Ok(()),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),

@@ -147,7 +147,7 @@ fn severity_for(_code: &str) -> &'static str {
 }
 
 impl WriteDiagnostic {
-    fn new(
+    pub(crate) fn new(
         code: &'static str,
         message: String,
         name: Option<String>,

@@ -809,10 +809,40 @@ async fn project_compatibility_link_in(
     recomputed_at: &str,
 ) -> Result<()> {
     let link_id = format!("rel:{relationship_origin_db_id}:{relationship_id}");
+    // Historical content links could use this id before `rel:` was reserved.
+    // The relationship fold must never delete or replace such a row, even
+    // when the relationship ledger happens to name the same generated id.
+    let content_owned: bool = sqlx::query_scalar(&format!(
+        "SELECT EXISTS(SELECT 1 FROM links WHERE id=?1 AND {})",
+        super::legacy::content_link_provenance()
+    ))
+    .bind(&link_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    if content_owned {
+        return Ok(());
+    }
+    // E3 M1 (v73): the compatibility row being replaced may carry a
+    // `supersedes` token. Capture its target before deleting so the
+    // currency recompute below can recount it in this same transaction.
+    let prior: Option<(String, String)> =
+        sqlx::query_as("SELECT target_id, relationship FROM links WHERE id=?1")
+            .bind(&link_id)
+            .fetch_optional(&mut **tx)
+            .await?;
     sqlx::query("DELETE FROM links WHERE id=?1")
         .bind(&link_id)
         .execute(&mut **tx)
         .await?;
+    // Recount the old target before any branch can return. An active
+    // compatibility row may be replaced, suppressed by a content-owned row,
+    // or lose its resolved endpoints. The recount and any replacement insert
+    // stay in this transaction, so no intermediate value is exposed.
+    if let Some((target_id, relationship)) = &prior {
+        if relationship == "supersedes" {
+            recompute_currency_tx(tx, target_id).await?;
+        }
+    }
     if effective_state != "active" {
         return Ok(());
     }
@@ -898,12 +928,214 @@ async fn project_compatibility_link_in(
         "INSERT INTO links(id,source_id,target_id,relationship,note,created_at)
          VALUES(?1,?2,?3,?4,?5,?6)",
     )
-    .bind(link_id)
+    .bind(&link_id)
     .bind(source_id)
     .bind(target_id)
     .bind(relationship_type)
     .bind(relationship.3.as_deref())
     .bind(relationship.4.as_deref().unwrap_or(recomputed_at))
+    .execute(&mut **tx)
+    .await?;
+    // E3 M1 (v73): a compatibility row carrying a `supersedes` token is a
+    // live incoming successor like any content-owned one. Content-owned
+    // `supersedes` links never reach this projector (they are skipped by the
+    // `occupied` check above), so this only fires for relationship-owned
+    // rows that happen to share the token. (`relationship_type` moved into
+    // the INSERT above, so re-derive the token test from the stored row
+    // rather than reusing the moved value.)
+    let stored_is_supersedes: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM links WHERE id=?1 AND relationship='supersedes')",
+    )
+    .bind(&link_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    if stored_is_supersedes {
+        recompute_currency_tx(tx, target_id).await?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod compatibility_id_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn historical_content_link_with_matching_compatibility_id_survives_recompute() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let source = crate::store::create_record(
+            &db,
+            json!({"type":"Document","kind":"note","name":"source"}),
+        )
+        .await
+        .unwrap();
+        let target = crate::store::create_record(
+            &db,
+            json!({"type":"Document","kind":"note","name":"target"}),
+        )
+        .await
+        .unwrap();
+        let id = "rel:historical:collision";
+        let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+        sqlx::query(
+            "INSERT INTO content_events(id,record_id,type,payload,causal_envelope_version,causal_status)
+             VALUES('historical-link-event',?1,'link.added',?2,1,'legacy_unknown')",
+        )
+        .bind(&source)
+        .bind(json!({"id":id,"source_id":source,"target_id":target,"relationship":"supersedes"}).to_string())
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO links(id,source_id,target_id,relationship) VALUES(?1,?2,?3,'supersedes')",
+        )
+        .bind(id)
+        .bind(&source)
+        .bind(&target)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+
+        project_compatibility_link_in(&mut tx, "historical", "collision", "inactive", "now")
+            .await
+            .unwrap();
+        let retained: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM links WHERE id=?1")
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        assert_eq!(retained, 1);
+
+        // A later content removal ends that ownership witness. A leftover
+        // compatibility row with the same id is then safe to clear.
+        sqlx::query(
+            "INSERT INTO content_events(id,record_id,type,payload,causal_envelope_version,causal_status)
+             VALUES('historical-link-removal',?1,'link.removed',?2,1,'legacy_unknown')",
+        )
+        .bind(&source)
+        .bind(json!({"source_id":source,"target_id":target,"relationship":"supersedes"}).to_string())
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        project_compatibility_link_in(&mut tx, "historical", "collision", "inactive", "now")
+            .await
+            .unwrap();
+        let cleared: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM links WHERE id=?1")
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        assert_eq!(cleared, 0);
+
+        // A historical relationship-owned add cannot claim a compatibility
+        // row merely because it shares the generated id and coordinates.
+        sqlx::query(
+            "INSERT INTO content_events(id,record_id,type,payload,causal_envelope_version,causal_status)
+             VALUES('historical-relationship-add',?1,'link.added',?2,1,'legacy_unknown')",
+        )
+        .bind(&source)
+        .bind(json!({"id":id,"source_id":source,"target_id":target,"relationship":"relates_to"}).to_string())
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO links(id,source_id,target_id,relationship) VALUES(?1,?2,?3,'relates_to')",
+        )
+        .bind(id)
+        .bind(&source)
+        .bind(&target)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        project_compatibility_link_in(&mut tx, "historical", "collision", "inactive", "now")
+            .await
+            .unwrap();
+        let relationship_cleared: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM links WHERE id=?1")
+                .bind(id)
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap();
+        assert_eq!(relationship_cleared, 0);
+
+        // Message classification is fixed at the add event, even if a later
+        // governed correction changes the record's current type.
+        let former_message = "historical-former-message";
+        let message_link = "rel:historical:former-message";
+        sqlx::query("INSERT INTO records(id,type,kind) VALUES(?1,'Document','note')")
+            .bind(former_message)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        for (event_id, event_type, payload) in [
+            (
+                "former-message-created",
+                "record.created",
+                json!({"type":"Message","kind":"note"}),
+            ),
+            (
+                "former-message-link",
+                "link.added",
+                json!({"id":message_link,"source_id":former_message,"target_id":target,"relationship":"relates_to"}),
+            ),
+            (
+                "former-message-corrected",
+                "record.type_corrected.v1",
+                json!({"to":{"record_type":"Document","kind":"note"}}),
+            ),
+        ] {
+            sqlx::query(
+                "INSERT INTO content_events(id,record_id,type,payload,causal_envelope_version,causal_status)
+                 VALUES(?1,?2,?3,?4,1,'legacy_unknown')",
+            )
+            .bind(event_id)
+            .bind(former_message)
+            .bind(event_type)
+            .bind(payload.to_string())
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO links(id,source_id,target_id,relationship) VALUES(?1,?2,?3,'relates_to')",
+        )
+        .bind(message_link)
+        .bind(former_message)
+        .bind(&target)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        project_compatibility_link_in(&mut tx, "historical", "former-message", "inactive", "now")
+            .await
+            .unwrap();
+        let former_message_retained: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM links WHERE id=?1")
+                .bind(message_link)
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap();
+        assert_eq!(former_message_retained, 1);
+        tx.rollback().await.unwrap();
+    }
+}
+
+/// E3 M1 (v73): transaction-scoped twin of the content projector's
+/// `recompute_currency` (`crate::projector`). Same counting rule — live
+/// incoming `supersedes` only — and same tri-state outcome, so both folds
+/// converge row-for-row.
+async fn recompute_currency_tx(tx: &mut Transaction<'_, Sqlite>, target_id: &str) -> Result<()> {
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM links l JOIN records s ON s.id=l.source_id
+          WHERE l.target_id=?1 AND l.relationship='supersedes' AND s.deleted_at IS NULL",
+    )
+    .bind(target_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    sqlx::query(
+        "UPDATE records SET successor_count=?1,
+           is_current=CASE WHEN ?1 > 0 THEN NULL ELSE 1 END WHERE id=?2",
+    )
+    .bind(count)
+    .bind(target_id)
     .execute(&mut **tx)
     .await?;
     Ok(())

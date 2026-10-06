@@ -126,10 +126,22 @@ fn installed_platform() -> Result<StandbyConsumerPlatform> {
     {
         Ok(StandbyConsumerPlatform::LinuxX8664)
     }
-    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        Ok(StandbyConsumerPlatform::MacosArm64)
+    }
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    {
+        Ok(StandbyConsumerPlatform::MacosX64)
+    }
+    #[cfg(not(any(
+        all(target_os = "linux", target_arch = "x86_64"),
+        all(target_os = "macos", target_arch = "aarch64"),
+        all(target_os = "macos", target_arch = "x86_64")
+    )))]
     {
         Err(Error::engine(
-            "installed standby platform is not supported; expected linux-x86_64",
+            "installed standby platform is not supported; expected linux-x86_64, macos-arm64, or macos-x64",
         ))
     }
 }
@@ -226,28 +238,56 @@ mod tests {
         let source_sha = "a".repeat(40);
 
         let observed = observe_consumer_identity_at(&executable, &source_sha);
-        #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+        #[cfg(not(any(
+            all(target_os = "linux", target_arch = "x86_64"),
+            all(target_os = "macos", target_arch = "aarch64"),
+            all(target_os = "macos", target_arch = "x86_64")
+        )))]
         {
             assert!(observed.is_err());
             return;
         }
-        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        #[cfg(any(
+            all(target_os = "linux", target_arch = "x86_64"),
+            all(target_os = "macos", target_arch = "aarch64"),
+            all(target_os = "macos", target_arch = "x86_64")
+        ))]
         let observed = observed.unwrap();
-        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-        assert_eq!(observed.platform, StandbyConsumerPlatform::LinuxX8664);
-        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        #[cfg(any(
+            all(target_os = "linux", target_arch = "x86_64"),
+            all(target_os = "macos", target_arch = "aarch64"),
+            all(target_os = "macos", target_arch = "x86_64")
+        ))]
+        assert_eq!(observed.platform, installed_platform().unwrap());
+        #[cfg(any(
+            all(target_os = "linux", target_arch = "x86_64"),
+            all(target_os = "macos", target_arch = "aarch64"),
+            all(target_os = "macos", target_arch = "x86_64")
+        ))]
         assert_eq!(observed.source_sha, source_sha);
-        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        #[cfg(any(
+            all(target_os = "linux", target_arch = "x86_64"),
+            all(target_os = "macos", target_arch = "aarch64"),
+            all(target_os = "macos", target_arch = "x86_64")
+        ))]
         assert_eq!(
             observed.artifact_sha256,
             hex::encode(Sha256::digest(b"installed executable bytes"))
         );
-        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        #[cfg(any(
+            all(target_os = "linux", target_arch = "x86_64"),
+            all(target_os = "macos", target_arch = "aarch64"),
+            all(target_os = "macos", target_arch = "x86_64")
+        ))]
         assert_eq!(
             observed.engine_schema_version,
             crate::CURRENT_ENGINE_SCHEMA_VERSION
         );
-        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        #[cfg(any(
+            all(target_os = "linux", target_arch = "x86_64"),
+            all(target_os = "macos", target_arch = "aarch64"),
+            all(target_os = "macos", target_arch = "x86_64")
+        ))]
         assert_eq!(observed.ddl_sha256, crate::schema::FROZEN_DDL_SHA256);
 
         // A local build stamps "dev" and cannot serve. The rejection must name

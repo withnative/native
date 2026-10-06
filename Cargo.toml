@@ -13,6 +13,9 @@ default-run = "conformance"
 members = [
     "crates/artifact-html",
     "crates/artifact-runtime",
+    "crates/cel-subset",
+    # Test-only core/SDK bridge; deliberately absent from default-members.
+    "crates/coedit-core-fixture",
     "crates/native-federation",
     "crates/query-contract",
     "crates/policy-kernel",
@@ -97,8 +100,33 @@ path = "src/bin/board_render_cost.rs"
 required-features = ["dev-tools"]
 test = false
 
+# Fresh-agent harness for the v2 kernel slice (trial binary, not a product
+# surface). Cargo auto-discovers `examples/`; `required-features` keeps it
+# out of default builds exactly like the dev-tools binaries above.
+[[example]]
+name = "v2_contract"
+path = "examples/v2_contract.rs"
+required-features = ["v2-kernel-probe"]
+test = false
+
+[[example]]
+name = "standby_admit"
+path = "examples/standby_admit.rs"
+required-features = ["dev-tools"]
+test = true
+
 [features]
 default = ["experimental-agent-intents", "mcp-executor-prototype"]
+# Test-only v2 kernel probe surface (slice 2, piece 6): enables the
+# `kernel` module, its content-log intent/projector arms, the `kernel.`
+# store-skip exemption, and the `/2` definition-language validators — all
+# spelled `cfg(any(test, feature = "v2-kernel-probe"))`, so the default
+# build is byte-identical (production `EVENT_TYPES`, frozen DDL, and the
+# `cfg!(test)` store skip are untouched).
+v2-kernel-probe = []
+# Read-only observation of existing body jobs for inter-crate fixture lifecycle
+# proofs. Enabled by Held's dev-dependency only, never a production default.
+body-read-test-support = []
 # The selected JOSE–HPKE profile is still an Internet-Draft. This feature is a
 # compile-time acknowledgement that callers are running an interoperability
 # experiment; the default build exposes the profile boundary but returns
@@ -131,7 +159,7 @@ postgres-tests = ["postgres"]
 # Stable embedded Turso runtime and executor. The exact local topology remains
 # a spike profile rather than a support claim; cloud direct-remote and sync are
 # separate drivers and qualification tracks.
-turso-local = ["dep:turso", "dep:turso_parser"]
+turso-local = ["dep:turso"]
 # Deterministic contract harness and physical probes for the same exact local
 # driver/runtime identity.
 turso-tests = ["turso-local"]
@@ -159,11 +187,26 @@ axum = { version = "0.8.4", default-features = false, features = [
 # `serde` is for the backup sweep's off-box heartbeat (RFC 3339 timestamps an
 # external monitor can age out). It adds no crates — serde is already here.
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
+# Typed `zoned` time values (task fef3469, D2 slice T1) need an IANA tz
+# database compiled into the engine. SQL cannot do zone arithmetic portably,
+# so zones are resolved in Rust. `chrono-tz` builds on the `chrono` already
+# here. With default features off it uses prebuilt zone tables: its build
+# script does nothing, and it adds only phf and phf_shared. The IANA tz
+# database version (2025b) is fixed by the chrono-tz version in Cargo.lock;
+# updating it can change resolved offsets for stored zoned values.
+chrono-tz = { version = "0.10", default-features = false }
+# Seals the records.changes.v1 tab cursor (AEAD). The same crate and version
+# native-federation already uses for custody wrapping, so no new crate enters
+# the graph.
+chacha20poly1305 = "0.10"
 futures = "0.3"
 async-stream = "0.3"
 hex = "0.4"
 hmac = "0.12"
 image = { version = "=0.25.6", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
+# E3 M3 increment 1: GFM task-list extraction for record bodies. Same pin as
+# crates/artifact-runtime, so no new crate enters the graph.
+markdown = "=1.0.0"
 native-artifact-html = { path = "crates/artifact-html" }
 native-artifact-runtime = { path = "crates/artifact-runtime" }
 native-federation = { path = "crates/native-federation", default-features = false }
@@ -181,6 +224,10 @@ sqlx = { version = "0.8", default-features = false, features = [
     "runtime-tokio",
     "sqlite",
     "macros",
+    # E1 M3: sqlx's bundled `regexp(pattern, haystack)` scalar (same `regex`
+    # crate version as Turso core and the validator) on every SQLite
+    # connection; enabled per connection with `.with_regexp()` in db.rs.
+    "regexp",
 ] }
 # Keep Postgres-native JSONB/TIMESTAMPTZ codecs scoped to the opt-in adapter;
 # enabling sqlx's umbrella type features would also activate its MySQL driver.
@@ -188,6 +235,8 @@ sqlx-postgres = { version = "0.8", default-features = false, features = ["chrono
 syn = { version = "2", features = ["full", "parsing"] }
 tempfile = "3"
 thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
 tokio = { version = "1", features = [
     "rt",
     "rt-multi-thread",
@@ -202,6 +251,8 @@ tokio = { version = "1", features = [
     # SIGTERM, so `serve` releases the volume before a redeploy remounts it
     # rather than being SIGKILLed mid-write (task 46c7705).
     "signal",
+    # Bounded test-owned subprocess proof of process-lifetime custody.
+    "process",
 ] }
 uuid = { version = "1", features = ["v4"] }
 # Pinned alongside sqlx's SQLite build; the bundled amalgamation compiles with
@@ -210,12 +261,13 @@ uuid = { version = "1", features = ["v4"] }
 libsqlite3-sys = { version = "0.30", features = ["bundled"] }
 base64 = "0.23.0"
 fs2 = "0.4"
+libc = "0.2"
 serde_jcs = "0.1"
 zeroize = { version = "1", features = ["derive"] }
-rusqlite = { version = "0.32", features = ["hooks"] }
+rusqlite = { version = "0.32", features = ["hooks", "functions"] }
 jsonschema = { version = "0.49.3", default-features = false }
-turso = { version = "=0.7.2", default-features = false, features = ["fts"], optional = true }
-turso_parser = { version = "=0.7.2", optional = true }
+turso = { version = "=0.8.0", default-features = false, features = ["fts"], optional = true }
+turso_parser = { version = "=0.8.0" }
 # HTTP client for tool 23 (`attach_from_url`), chosen for SSRF-guard control
 # (docs/tool-surface.md): redirects are DISABLED (`redirect::Policy::none()`)
 # and re-driven per hop by `mcp::fetch`, and DNS is pinned per host via
@@ -223,18 +275,27 @@ turso_parser = { version = "=0.7.2", optional = true }
 reqwest = { version = "0.12", default-features = false, features = [
     "json",
     "rustls-tls",
+    # Advisors (S4) stream reply bodies to enforce the response-size cap.
+    "stream",
 ] }
 rust-embed = "8.7"
 percent-encoding = "2"
 regex = "1"
 # URL parsing for the fetch guard (already in the tree via reqwest/sqlx).
 url = "2"
+# S2 live co-editing of record bodies ("session.body.v1"): Yjs-CRDT core.
+yrs = "0.28"
 
 [dev-dependencies]
+# Pure bridge controls exercise the actual native scalar-kind admission.
+cel = { package = "cel-subset", path = "crates/cel-subset" }
+indexmap = "2"
 flate2 = "1"
+native-artifact-html = { path = "crates/artifact-html", features = ["test-support"] }
 native-artifact-runtime = { path = "crates/artifact-runtime", features = ["test-support"] }
 rmcp = { version = "0.8.5", features = ["client", "transport-streamable-http-client-reqwest"] }
 sse-stream = "0.2.5"
+tokio = { version = "1", features = ["test-util"] }
 tower = { version = "0.5", features = ["util"] }
 
 [profile.dev]

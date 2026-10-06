@@ -42,6 +42,7 @@ use crate::schema::{
 use crate::store::AppendSpec;
 use crate::{Error, Result};
 
+pub(crate) mod determinism;
 /// The Postgres `query_sql` executor: adapter-owned, implementing the
 /// backend-neutral `crate::query::sql_contract`. Contracts never depend on
 /// adapters; the executor lives with the backend it drives.
@@ -53,18 +54,18 @@ pub use substrate::{
     PostgresMetaEvent, PostgresPolicyEvent,
 };
 
-const SCHEMA_VERSION: i32 = 7;
+const SCHEMA_VERSION: i32 = 9;
 const DATABASE_PROVISION_LOCK: &str = "native-ce:postgres-database-provision:v1";
 const SEEDED_RECORD_TIMESTAMP: &str = "1970-01-01T00:00:00Z";
-const POSTGRES_DESCRIBE_SCHEMA_DDL_COUNT: usize = 56;
+const POSTGRES_DESCRIBE_SCHEMA_DDL_COUNT: usize = 58;
 const POSTGRES_DESCRIBE_SCHEMA_DDL_FINGERPRINT: &str =
-    "52025443a3641300ddc2e984a05c2b3ed4e3c67178da77cceb32048ba199d56d";
+    "73ef84e9fcdf81de2fe48dc5304314590516907fcf3ed907146a87b43c46d6a7";
 const POSTGRES_V4_DDL_COUNT: usize = 49;
 const POSTGRES_V4_DDL_FINGERPRINT: &str =
     "9a65675dd0d396a6437fe25d98051303b9a6128fc6686fbb28bdfaff0a5eb553";
 const MAX_MULTI_UPDATE: usize = 100;
 const MAX_MULTI_UPDATE_FAILURE_DETAILS: usize = 20;
-const REQUIRED_RELATIONS: [&str; 37] = [
+const REQUIRED_RELATIONS: [&str; 38] = [
     "schema_migrations",
     "event_cursor",
     "content_events",
@@ -72,6 +73,7 @@ const REQUIRED_RELATIONS: [&str; 37] = [
     "content_event_causal_cutover",
     "content_event_sources",
     "records",
+    "body_task_items",
     "facet_values",
     "bindings",
     "message_audience",
@@ -855,6 +857,20 @@ impl PostgresRuntimeConfig {
             if observed == Some(6) {
                 db.migrate_v6_to_v7().await?;
             }
+            let observed: Option<i32> =
+                sqlx::query_scalar(&format!("SELECT MAX(version) FROM {migrations}"))
+                    .fetch_one(&db.pool)
+                    .await?;
+            if observed == Some(7) {
+                db.migrate_v7_to_v8().await?;
+            }
+            let observed: Option<i32> =
+                sqlx::query_scalar(&format!("SELECT MAX(version) FROM {migrations}"))
+                    .fetch_one(&db.pool)
+                    .await?;
+            if observed == Some(8) {
+                db.migrate_v8_to_v9().await?;
+            }
             let health = db.health().await?;
             if !health.ready || !health.write_ready {
                 db.close().await;
@@ -1144,6 +1160,7 @@ impl PostgresCluster {
     ) -> Result<(PostgresDb, PostgresImportReport)> {
         let interchange = validate_canonical_interchange(bytes)?;
         validate_postgres_admission(&interchange)?;
+        validate_postgres_alpha_tab_import(&interchange).await?;
         let db = self.fresh_database(false, tag).await?;
         match db.import_validated(&interchange).await {
             Ok(report) => Ok((db, report)),
@@ -1474,6 +1491,52 @@ fn postgres_v7_schema(schema: &str) -> Vec<String> {
     statements
 }
 
+/// Caller-independent currency for existing v7 logical databases. A live
+/// incoming `supersedes` link makes whole-record currency unknown; no
+/// successor name or caller-specific governance is stored here.
+fn postgres_v8_schema(schema: &str) -> Vec<String> {
+    vec![
+        format!(
+            "ALTER TABLE {schema}.records ADD COLUMN is_current BOOLEAN DEFAULT TRUE"
+        ),
+        format!(
+            "ALTER TABLE {schema}.records ADD COLUMN successor_count BIGINT NOT NULL DEFAULT 0 CHECK (successor_count >= 0)"
+        ),
+        format!(
+            "UPDATE {schema}.records r SET successor_count=(\
+             SELECT COUNT(*) FROM {schema}.links l JOIN {schema}.records s ON s.id=l.source_id \
+             WHERE l.target_id=r.id AND l.relationship='supersedes' AND s.deleted_at IS NULL)"
+        ),
+        format!(
+            "UPDATE {schema}.records SET is_current=NULL WHERE successor_count>0"
+        ),
+    ]
+}
+
+/// PG v9 mirrors the engine-74 task projection. The provenance FK is
+/// deliberately retained: migration, live folding and replay must identify
+/// the body-bearing content event that supplied the current body.
+fn postgres_body_task_items_table(schema: &str) -> String {
+    format!(
+        "CREATE TABLE {schema}.body_task_items (\
+         record_id TEXT NOT NULL REFERENCES {schema}.records(id) ON DELETE CASCADE,\
+         item_index BIGINT NOT NULL,\
+         source_event_seq BIGINT NOT NULL REFERENCES {schema}.content_events(seq),\
+         marker TEXT NOT NULL CHECK(marker IN ('-','*','+','ordered')),\
+         checked BOOLEAN NOT NULL, in_quote BOOLEAN NOT NULL,\
+         start_offset BIGINT NOT NULL CHECK(start_offset>=0),\
+         end_offset BIGINT NOT NULL CHECK(end_offset>=0),\
+         PRIMARY KEY(record_id,item_index))"
+    )
+}
+
+fn postgres_v9_schema(schema: &str) -> Vec<String> {
+    vec![
+        postgres_body_task_items_table(schema),
+        format!("CREATE INDEX body_task_items_record ON {schema}.body_task_items(record_id)"),
+    ]
+}
+
 impl PostgresDb {
     #[cfg(feature = "postgres-tests")]
     #[doc(hidden)]
@@ -1562,8 +1625,26 @@ impl PostgresDb {
         )
         .await?;
         tx.execute(format!("DROP INDEX {index}").as_str()).await?;
+        tx.execute(
+            format!(
+                "DROP TABLE {}.{}",
+                quote_identifier(&self.schema)?,
+                quote_identifier("body_task_items")?
+            )
+            .as_str(),
+        )
+        .await?;
+        tx.execute(
+            format!(
+                "ALTER TABLE {}.{} DROP COLUMN is_current,DROP COLUMN successor_count",
+                quote_identifier(&self.schema)?,
+                quote_identifier("records")?
+            )
+            .as_str(),
+        )
+        .await?;
         sqlx::query(&format!(
-            "DELETE FROM {migrations} WHERE version IN (5,6,7)"
+            "DELETE FROM {migrations} WHERE version IN (5,6,7,8,9)"
         ))
         .execute(&mut *tx)
         .await?;
@@ -1599,7 +1680,7 @@ impl PostgresDb {
             "persistence":"enduring"
         });
         let act = allocate_act_in(self, &mut tx).await?;
-        let (_, created_at) = append_event(
+        let (event_seq, created_at) = append_event(
             self,
             &mut tx,
             record_id,
@@ -1609,13 +1690,14 @@ impl PostgresDb {
             act,
         )
         .await?;
-        apply_projection(
+        apply_projection_with_seq(
             self,
             &mut tx,
             record_id,
             "record.created",
             &created,
             &created_at,
+            Some(event_seq),
         )
         .await?;
         tx.commit().await?;
@@ -1634,7 +1716,7 @@ impl PostgresDb {
             "reason":"Exercise portable attribution deletion refusal."
         });
         let act = allocate_act_in(self, &mut tx).await?;
-        let (_, created_at) = append_event(
+        let (event_seq, created_at) = append_event(
             self,
             &mut tx,
             record_id,
@@ -1644,13 +1726,14 @@ impl PostgresDb {
             act,
         )
         .await?;
-        apply_projection(
+        apply_projection_with_seq(
             self,
             &mut tx,
             record_id,
             "record.created",
             &created,
             &created_at,
+            Some(event_seq),
         )
         .await?;
         let linked = json!({
@@ -1976,6 +2059,7 @@ impl PostgresDb {
                 | "content_event_causal_cutover"
                 | "content_event_sources"
                 | "records"
+                | "body_task_items"
                 | "facet_values"
                 | "bindings"
                 | "message_audience"
@@ -2076,8 +2160,11 @@ impl PostgresDb {
                  persistence TEXT NOT NULL DEFAULT 'enduring' CHECK(persistence IN ('enduring','occurrent')), maturity TEXT,\
                  archived BOOLEAN NOT NULL DEFAULT FALSE, deleted_at TIMESTAMPTZ,\
                  created_at TIMESTAMPTZ NOT NULL DEFAULT transaction_timestamp(),\
-                 updated_at TIMESTAMPTZ NOT NULL DEFAULT transaction_timestamp())"
+                 updated_at TIMESTAMPTZ NOT NULL DEFAULT transaction_timestamp(),\
+                 is_current BOOLEAN DEFAULT TRUE, successor_count BIGINT NOT NULL DEFAULT 0 CHECK (successor_count >= 0))"
             ),
+            postgres_body_task_items_table(&schema),
+            format!("CREATE INDEX body_task_items_record ON {schema}.body_task_items(record_id)"),
             format!(
                 "CREATE TABLE {schema}.facet_values (\
                  record_id TEXT NOT NULL REFERENCES {schema}.records(id) ON DELETE CASCADE,\
@@ -2329,6 +2416,98 @@ impl PostgresDb {
             tx.execute(statement.as_str()).await?;
         }
         sqlx::query(&format!("INSERT INTO {migrations}(version) VALUES(7)"))
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        self.complete_realtime_commit();
+        Ok(())
+    }
+
+    async fn migrate_v7_to_v8(&self) -> Result<()> {
+        let schema = quote_identifier(&self.schema)?;
+        let migrations = self.qualified_table("schema_migrations")?;
+        let mut tx = self.pool.begin().await?;
+        let observed: Option<i32> = sqlx::query_scalar(&format!(
+            "SELECT version FROM {migrations} ORDER BY version DESC LIMIT 1 FOR UPDATE"
+        ))
+        .fetch_optional(&mut *tx)
+        .await?;
+        if observed != Some(7) {
+            return Err(Error::engine(
+                "Postgres schema v7-to-v8 migration requires exact source version 7",
+            ));
+        }
+        for statement in postgres_v8_schema(&schema) {
+            tx.execute(statement.as_str()).await?;
+        }
+        sqlx::query(&format!("INSERT INTO {migrations}(version) VALUES(8)"))
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        self.complete_realtime_commit();
+        Ok(())
+    }
+
+    async fn migrate_v8_to_v9(&self) -> Result<()> {
+        let schema = quote_identifier(&self.schema)?;
+        let migrations = self.qualified_table("schema_migrations")?;
+        let records = self.qualified_table("records")?;
+        let events = self.qualified_table("content_events")?;
+        let items = self.qualified_table("body_task_items")?;
+        let mut tx = self.pool.begin().await?;
+        let observed: Option<i32> = sqlx::query_scalar(&format!(
+            "SELECT version FROM {migrations} ORDER BY version DESC LIMIT 1 FOR UPDATE"
+        ))
+        .fetch_optional(&mut *tx)
+        .await?;
+        if observed != Some(8) {
+            return Err(Error::engine(
+                "Postgres schema v8-to-v9 migration requires exact source version 8",
+            ));
+        }
+        for statement in postgres_v9_schema(&schema) {
+            tx.execute(statement.as_str()).await?;
+        }
+        // Keyset pages bound memory to a small batch of bodies. The lateral
+        // lookup uses content_events_record_seq, avoiding a provenance query
+        // round trip for every record on a remote Postgres server.
+        let mut after_id: Option<String> = None;
+        loop {
+            let sources: Vec<(String, String, Option<i64>, Option<Value>)> =
+                sqlx::query_as(&format!(
+                    "SELECT r.id,r.body,e.seq,e.payload FROM {records} r \
+                     LEFT JOIN LATERAL (SELECT seq,payload FROM {events} \
+                       WHERE record_id=r.id AND type IN ('record.created','record.updated') \
+                         AND payload ? 'body' ORDER BY seq DESC LIMIT 1) e ON TRUE \
+                     WHERE r.body IS NOT NULL AND r.body<>'' \
+                       AND ($1::text IS NULL OR r.id>$1) ORDER BY r.id LIMIT 128"
+                ))
+                .bind(after_id.as_deref())
+                .fetch_all(&mut *tx)
+                .await?;
+            if sources.is_empty() {
+                break;
+            }
+            for (record_id, body, source_event_seq, source_payload) in sources {
+                after_id = Some(record_id.clone());
+                let (Some(source_event_seq), Some(source_payload)) =
+                    (source_event_seq, source_payload)
+                else {
+                    return Err(Error::engine(format!(
+                        "Postgres v9 task backfill lacks body provenance for record {record_id}"
+                    )));
+                };
+                let source_body = crate::record_body::coerce_body(&source_payload["body"]);
+                if source_body.as_deref() != Some(body.as_str()) {
+                    return Err(Error::engine(format!(
+                        "Postgres v9 task backfill body differs from latest body event for record {record_id}"
+                    )));
+                }
+                insert_body_task_items_pg(&mut tx, &items, &record_id, source_event_seq, &body)
+                    .await?;
+            }
+        }
+        sqlx::query(&format!("INSERT INTO {migrations}(version) VALUES(9)"))
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
@@ -2599,7 +2778,16 @@ impl PostgresDb {
             .bind(act)
             .execute(&mut *tx)
             .await?;
-            apply_projection(self, &mut tx, record_id, event_type, &payload, created_at).await?;
+            apply_projection_with_seq(
+                self,
+                &mut tx,
+                record_id,
+                event_type,
+                &payload,
+                created_at,
+                Some(seq),
+            )
+            .await?;
             last_seq = last_seq.max(seq);
         }
         for row in &frontier_section.rows {
@@ -3178,13 +3366,14 @@ impl PostgresDb {
                 .bind(event.act)
                 .execute(&mut *tx)
                 .await?;
-                apply_projection(
+                apply_projection_with_seq(
                     &rebuilt,
                     &mut tx,
                     &event.subject_id,
                     &event.event_type,
                     &payload,
                     &event.created_at,
+                    Some(event.seq),
                 )
                 .await?;
                 content_high_water = event.seq;
@@ -3249,7 +3438,7 @@ impl PostgresDb {
             }
             for event in control_events {
                 rebuilt
-                    .append_control_event(PostgresControlEvent {
+                    .replay_stored_control_event(PostgresControlEvent {
                         id: event.id,
                         idempotency_key: event.idempotency_key.unwrap_or_default(),
                         event_type: event.event_type,
@@ -3423,9 +3612,9 @@ impl PostgresDb {
     ///   `act_state`, `act_cutover`, `database_identity*`, `binding_systems`,
     ///   `binding_audit`, `schema_migrations`, and every meta/policy/control
     ///   table: not outputs of the content fold.
-    /// - `records.archived` IS compared here even though SQLite keeps it in a
-    ///   facet: on Postgres it is a physical column the projector writes, so
-    ///   omitting it would create a real blind spot. The same reasoning makes
+    /// - `records.archived`, `is_current`, and `successor_count` ARE compared
+    ///   here because the Postgres content projector writes them. Omitting
+    ///   them would create a real blind spot. The same reasoning makes
     ///   `records.record_type` (not `type`) the compared column.
     /// - Genesis is a named difference from SQLite. SQLite's content tier
     ///   appends `record.created` events for `native:root`/`native:unfiled`;
@@ -3492,18 +3681,34 @@ impl PostgresDb {
         let result = async {
             let has_imported_roots = events
                 .iter()
-                .any(|event| event.1 == ROOT_RECORD_ID && event.2 == "record.created");
+                .any(|event| event.2 == ROOT_RECORD_ID && event.3 == "record.created");
             rebuilt.migrate(!has_imported_roots).await?;
             {
                 let mut tx = rebuilt.pool.begin().await?;
-                for (_, record_id, event_type, payload, created_at) in &events {
-                    apply_projection(
+                let rebuilt_events = rebuilt.qualified_table("content_events")?;
+                for (seq, id, record_id, event_type, payload, created_at) in &events {
+                    // Keep the original log position in scratch: task-item
+                    // provenance has a real FK to this body-bearing event.
+                    sqlx::query(&format!(
+                        "INSERT INTO {rebuilt_events}(seq,id,record_id,type,payload,created_at,causal_envelope_version,causal_status) \
+                         VALUES($1,$2,$3,$4,$5,$6::timestamptz,1,'legacy_unknown')"
+                    ))
+                    .bind(seq)
+                    .bind(id)
+                    .bind(record_id)
+                    .bind(event_type)
+                    .bind(payload)
+                    .bind(created_at)
+                    .execute(&mut *tx)
+                    .await?;
+                    apply_projection_with_seq(
                         &rebuilt,
                         &mut tx,
                         record_id,
                         event_type,
                         payload.as_ref().unwrap_or(&Value::Null),
                         created_at,
+                        Some(*seq),
                     )
                     .await?;
                 }
@@ -3562,10 +3767,10 @@ impl PostgresDb {
     async fn content_rebuild_events_on(
         &self,
         tx: &mut Transaction<'_, Postgres>,
-    ) -> Result<Vec<(i64, String, String, Option<Value>, String)>> {
+    ) -> Result<Vec<(i64, String, String, String, Option<Value>, String)>> {
         let events = self.qualified_table("content_events")?;
         let rows = sqlx::query(&format!(
-            "SELECT seq,record_id,type,payload,created_at FROM {events} ORDER BY seq"
+            "SELECT seq,id,record_id,type,payload,created_at FROM {events} ORDER BY seq"
         ))
         .fetch_all(&mut **tx)
         .await?;
@@ -3573,6 +3778,7 @@ impl PostgresDb {
             .map(|row| {
                 Ok((
                     row.try_get("seq")?,
+                    row.try_get("id")?,
                     row.try_get("record_id")?,
                     row.try_get("type")?,
                     row.try_get("payload")?,
@@ -3736,8 +3942,13 @@ impl PostgresDb {
 /// [`PostgresDb::rebuild_and_diff_content`] therefore compares. This is the
 /// Postgres subset of `PROJECTION_TABLES` in `src/conformance/rebuild.rs`; see
 /// that method for the named exclusions.
-const POSTGRES_CONTENT_REBUILD_TABLES: [&str; 4] =
-    ["records", "facet_values", "links", "message_audience"];
+const POSTGRES_CONTENT_REBUILD_TABLES: [&str; 5] = [
+    "records",
+    "body_task_items",
+    "facet_values",
+    "links",
+    "message_audience",
+];
 
 /// Explicit comparison columns per table, ported from `columns_for` in
 /// `src/conformance/rebuild.rs` and adapted to the Postgres physical names
@@ -3761,9 +3972,21 @@ fn postgres_content_rebuild_columns(table: &str) -> &'static [&'static str] {
             "persistence",
             "maturity",
             "archived",
+            "is_current",
+            "successor_count",
             "deleted_at",
             "created_at",
             "updated_at",
+        ],
+        "body_task_items" => &[
+            "record_id",
+            "item_index",
+            "source_event_seq",
+            "marker",
+            "checked",
+            "in_quote",
+            "start_offset",
+            "end_offset",
         ],
         "facet_values" => &["record_id", "key", "value"],
         "links" => &[
@@ -3784,6 +4007,7 @@ fn postgres_content_rebuild_columns(table: &str) -> &'static [&'static str] {
 fn postgres_content_rebuild_order(table: &str) -> &'static str {
     match table {
         "records" => "id",
+        "body_task_items" => "record_id, item_index",
         "facet_values" => "record_id, key",
         "links" => "id",
         "message_audience" => "message_id, account_id",
@@ -3856,6 +4080,61 @@ fn validate_postgres_admission(interchange: &ValidatedInterchange) -> Result<()>
                 text(records, row, "id")?
             )));
         }
+    }
+    Ok(())
+}
+
+/// Until Postgres can mint a sealed foreign-import consent boundary, refuse
+/// adopted state before provisioning a staging schema. Use the shared fold so
+/// later pending generations and stored import resets have their true meaning.
+async fn validate_postgres_alpha_tab_import(interchange: &ValidatedInterchange) -> Result<()> {
+    let section = required_section(interchange, "control_events")?;
+    let events = section
+        .rows
+        .iter()
+        .map(|row| {
+            Ok(crate::control::ControlEventRow {
+                seq: integer(section, row, "seq")?,
+                id: text(section, row, "id")?.into(),
+                idempotency_key: text(section, row, "idempotency_key")?.into(),
+                event_type: text(section, row, "type")?.into(),
+                schema_version: integer(section, row, "schema_version")?,
+                aggregate_kind: text(section, row, "aggregate_kind")?.into(),
+                aggregate_id: text(section, row, "aggregate_id")?.into(),
+                actor: text(section, row, "actor")?.into(),
+                run_key: optional_text_cell(section, row, "run_key")?.map(str::to_owned),
+                reason: text(section, row, "reason")?.into(),
+                payload: text(section, row, "payload")?.into(),
+                created_at: text(section, row, "created_at")?.into(),
+                act: optional_integer_cell(section, row, "act")?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let records = required_section(interchange, "records")?;
+    let record_ids = records
+        .rows
+        .iter()
+        .map(|row| Ok(text(records, row, "id")?.to_owned()))
+        .collect::<Result<Vec<_>>>()?;
+    let snapshot = crate::control::canonical_projection_snapshot(&events, &record_ids).await?;
+    let installs = snapshot["alpha_tab_installs"]
+        .as_array()
+        .ok_or_else(|| Error::engine("control snapshot is missing alpha-tab installs"))?;
+    let mut packages = BTreeSet::new();
+    for install in installs {
+        if install["adoption"].as_str() != Some(crate::control::ALPHA_TAB_ADOPTION_CALLER_ASSERTED)
+        {
+            let package = install["package"]
+                .as_str()
+                .ok_or_else(|| Error::engine("control snapshot is missing an alpha-tab package"))?;
+            packages.insert(package.to_owned());
+        }
+    }
+    if !packages.is_empty() {
+        return Err(Error::engine(format!(
+            "Postgres import does not yet support alpha-tab consent reset; adopted packages: {}",
+            packages.into_iter().collect::<Vec<_>>().join(", ")
+        )));
     }
     Ok(())
 }
@@ -4438,6 +4717,7 @@ async fn assert_postgres_v4_search_migration_source(db: &PostgresDb) -> Result<(
                     | "content_event_sources"
                     | "act_state"
                     | "act_cutover"
+                    | "body_task_items"
             )
         })
         .collect::<Vec<_>>();
@@ -4890,6 +5170,8 @@ async fn postgres_query_sql(db: &PostgresDb, caller: &Caller, arguments: Value) 
         "truncated": result.truncated,
         "truncation_hint": result.truncation_hint,
         "as_of_seq": result.as_of_seq,
+        "now_ms_ms": result.now_ms_ms,
+        "time_dependent": result.time_dependent,
     }))
 }
 
@@ -5220,6 +5502,7 @@ async fn create_record(db: &PostgresDb, caller: &Caller, arguments: Value) -> Re
             key: "lifecycle".into(),
             value: Value::String(lifecycle.clone()),
             vocab_ref: None,
+            time_type: None,
         });
     }
     crate::domain_transaction::govern_facet_writes(
@@ -5232,10 +5515,7 @@ async fn create_record(db: &PostgresDb, caller: &Caller, arguments: Value) -> Re
     )
     .await?;
     for facet in &mut facets {
-        facet.vocab_ref = governed
-            .iter()
-            .find(|checked| checked.key == facet.key)
-            .and_then(|checked| checked.vocab_ref.clone());
+        facet.adopt_governed(governed.iter().find(|checked| checked.key == facet.key));
     }
     let payload = json!({
         "type": args.record_type,
@@ -5255,9 +5535,18 @@ async fn create_record(db: &PostgresDb, caller: &Caller, arguments: Value) -> Re
     {
         let act = transaction.allocate_act().await?;
         let tx = transaction.admitted("append create_record")?;
-        let (_, created_at) =
+        let (event_seq, created_at) =
             append_event(db, tx, &id, "record.created", &payload, caller.actor(), act).await?;
-        apply_projection(db, tx, &id, "record.created", &payload, &created_at).await?;
+        apply_projection_with_seq(
+            db,
+            tx,
+            &id,
+            "record.created",
+            &payload,
+            &created_at,
+            Some(event_seq),
+        )
+        .await?;
     }
 
     // Alias shadows warn on success with the admitted kind; exact governed
@@ -6108,6 +6397,7 @@ async fn postgres_correction_snapshot(
                 key: facet.try_get("key")?,
                 value: facet.try_get("value")?,
                 vocab_ref: None,
+                time_type: None,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -6959,7 +7249,7 @@ async fn update_record_multi(db: &PostgresDb, caller: &Caller, arguments: Value)
             let payload = Value::Object(target.fields);
             let act = transaction.allocate_act().await?;
             let tx = transaction.admitted("append multi-update fields")?;
-            let (_, created_at) = append_event(
+            let (event_seq, created_at) = append_event(
                 db,
                 tx,
                 &target.id,
@@ -6969,7 +7259,16 @@ async fn update_record_multi(db: &PostgresDb, caller: &Caller, arguments: Value)
                 act,
             )
             .await?;
-            apply_projection(db, tx, &target.id, "record.updated", &payload, &created_at).await?;
+            apply_projection_with_seq(
+                db,
+                tx,
+                &target.id,
+                "record.updated",
+                &payload,
+                &created_at,
+                Some(event_seq),
+            )
+            .await?;
         }
         let mut first_facet = true;
         for facet in target.facet_sets {
@@ -7243,6 +7542,7 @@ async fn update_record_singular(
             key: "lifecycle".into(),
             value: Value::String(lifecycle.clone()),
             vocab_ref: None,
+            time_type: None,
         });
     }
     crate::domain_transaction::govern_facet_writes(
@@ -7256,10 +7556,7 @@ async fn update_record_singular(
     .await?;
     for (_, facet) in &mut facets {
         if let Some(facet) = facet {
-            facet.vocab_ref = governed
-                .iter()
-                .find(|checked| checked.key == facet.key)
-                .and_then(|checked| checked.vocab_ref.clone());
+            facet.adopt_governed(governed.iter().find(|checked| checked.key == facet.key));
         }
     }
     let mut payload = Map::new();
@@ -7276,7 +7573,7 @@ async fn update_record_singular(
     }
     let act = transaction.allocate_act().await?;
     let tx = transaction.admitted("append update_record")?;
-    let (_, created_at) = append_event(
+    let (event_seq, created_at) = append_event(
         db,
         tx,
         &args.id,
@@ -7286,13 +7583,14 @@ async fn update_record_singular(
         act,
     )
     .await?;
-    apply_projection(
+    apply_projection_with_seq(
         db,
         tx,
         &args.id,
         "record.updated",
         &Value::Object(payload),
         &created_at,
+        Some(event_seq),
     )
     .await?;
     // Alias shadows warn on success with the effective kind; unsets never
@@ -8414,6 +8712,7 @@ async fn run_portable_view(
                 &mut snapshot,
                 caller,
                 arguments,
+                false,
             )
             .await
         }
@@ -8776,7 +9075,7 @@ impl AttachmentPhysicalPort for PostgresDomainTransaction<'_> {
             let tx = self.executor.admitted_mut().map_err(|error| {
                 crate::domain_transaction::stable_storage_error("append content event", &error)
             })?;
-            let (_, created_at) = append_event(
+            let (seq, created_at) = append_event(
                 db,
                 tx,
                 &spec.record_id,
@@ -8786,13 +9085,14 @@ impl AttachmentPhysicalPort for PostgresDomainTransaction<'_> {
                 act,
             )
             .await?;
-            apply_projection(
+            apply_projection_with_seq(
                 db,
                 tx,
                 &spec.record_id,
                 &spec.event_type,
                 &payload,
                 &created_at,
+                Some(seq),
             )
             .await?;
             Ok(())
@@ -8845,7 +9145,7 @@ impl crate::domain_transaction::RecordLifecyclePhysicalPort for PostgresDomainTr
             let tx = self.executor.admitted_mut().map_err(|error| {
                 crate::domain_transaction::stable_storage_error("append content event", &error)
             })?;
-            let (_, event_id, created_at) = append_event_with_id(
+            let (seq, event_id, created_at) = append_event_with_id(
                 db,
                 tx,
                 &spec.record_id,
@@ -8855,13 +9155,14 @@ impl crate::domain_transaction::RecordLifecyclePhysicalPort for PostgresDomainTr
                 act,
             )
             .await?;
-            apply_projection(
+            apply_projection_with_seq(
                 db,
                 tx,
                 &spec.record_id,
                 &spec.event_type,
                 &payload,
                 &created_at,
+                Some(seq),
             )
             .await?;
             Ok(event_id)
@@ -9196,6 +9497,7 @@ fn attachment_facet_write(key: String, value: Value) -> Result<FacetWrite> {
             key,
             value,
             vocab_ref: None,
+            time_type: None,
         }),
         _ => Err(Error::engine(
             "Postgres facets require string, number, or object values",
@@ -9783,6 +10085,103 @@ impl ContentSemanticStatePort for PostgresContentSemanticState<'_, '_, '_> {
     }
 }
 
+/// Store parsed body tasks with the exact event that supplied the body.
+async fn insert_body_task_items_pg(
+    tx: &mut Transaction<'_, Postgres>,
+    table: &str,
+    record_id: &str,
+    source_event_seq: i64,
+    body: &str,
+) -> Result<()> {
+    let extracted = crate::body_task_items::extract_task_items(body).map_err(|error| {
+        Error::engine(format!(
+            "Postgres body_task_items extraction failed for record {record_id}: {error}"
+        ))
+    })?;
+    let items = extracted
+        .into_iter()
+        .map(|item| {
+            let marker = item.marker.as_str().ok_or_else(|| {
+                Error::engine(format!(
+                    "Postgres body_task_items refuses unrepresentable marker for record {record_id} item {}",
+                    item.index
+                ))
+            })?;
+            Ok((item, marker))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    // Keep one statement per bounded item batch; this avoids a network round
+    // trip for every task while staying well under PostgreSQL's bind limit.
+    for batch in items.chunks(256) {
+        let mut builder = sqlx::QueryBuilder::<Postgres>::new(format!(
+            "INSERT INTO {table}(record_id,item_index,source_event_seq,marker,checked,in_quote,start_offset,end_offset) "
+        ));
+        builder.push_values(batch, |mut values, (item, marker)| {
+            values
+                .push_bind(record_id)
+                .push_bind(item.index as i64)
+                .push_bind(source_event_seq)
+                .push_bind(*marker)
+                .push_bind(item.checked)
+                .push_bind(item.in_quote)
+                .push_bind(item.start_offset as i64)
+                .push_bind(item.end_offset as i64);
+        });
+        builder.build().execute(&mut **tx).await?;
+    }
+    Ok(())
+}
+
+async fn replace_body_task_items_pg(
+    db: &PostgresDb,
+    tx: &mut Transaction<'_, Postgres>,
+    record_id: &str,
+    source_event_seq: Option<i64>,
+    body: Option<&str>,
+) -> Result<()> {
+    let table = db.qualified_table("body_task_items")?;
+    sqlx::query(&format!("DELETE FROM {table} WHERE record_id=$1"))
+        .bind(record_id)
+        .execute(&mut **tx)
+        .await?;
+    let Some(body) = body.filter(|body| !body.is_empty()) else {
+        return Ok(());
+    };
+    let source_event_seq = source_event_seq.ok_or_else(|| {
+        Error::engine(format!(
+            "Postgres body_task_items lacks exact body event provenance for record {record_id}"
+        ))
+    })?;
+    insert_body_task_items_pg(tx, &table, record_id, source_event_seq, body).await
+}
+
+/// Recount inside the content transaction. Names stay in the caller-filtered
+/// read path; only the live incoming count is a global projection fact.
+async fn recompute_currency_pg(
+    db: &PostgresDb,
+    tx: &mut Transaction<'_, Postgres>,
+    target_id: &str,
+) -> Result<()> {
+    let records = db.qualified_table("records")?;
+    let links = db.qualified_table("links")?;
+    let count: i64 = sqlx::query_scalar(&format!(
+        "SELECT COUNT(*) FROM {links} l JOIN {records} s ON s.id=l.source_id \
+         WHERE l.target_id=$1 AND l.relationship='supersedes' AND s.deleted_at IS NULL"
+    ))
+    .bind(target_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    sqlx::query(&format!(
+        "UPDATE {records} SET successor_count=$1, \
+         is_current=CASE WHEN $1 > 0 THEN NULL ELSE TRUE END WHERE id=$2"
+    ))
+    .bind(count)
+    .bind(target_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 async fn apply_projection(
     db: &PostgresDb,
     tx: &mut Transaction<'_, Postgres>,
@@ -9790,6 +10189,30 @@ async fn apply_projection(
     event_type: &str,
     payload: &Value,
     event_created_at: &str,
+) -> Result<()> {
+    apply_projection_with_seq(
+        db,
+        tx,
+        record_id,
+        event_type,
+        payload,
+        event_created_at,
+        None,
+    )
+    .await
+}
+
+/// Body-bearing callers pass the exact appended event sequence. Other
+/// projectors use the wrapper above; an accidental body write through that
+/// wrapper refuses instead of inventing provenance.
+async fn apply_projection_with_seq(
+    db: &PostgresDb,
+    tx: &mut Transaction<'_, Postgres>,
+    record_id: &str,
+    event_type: &str,
+    payload: &Value,
+    event_created_at: &str,
+    source_event_seq: Option<i64>,
 ) -> Result<()> {
     let records = db.qualified_table("records")?;
     let facets = db.qualified_table("facet_values")?;
@@ -9825,7 +10248,7 @@ async fn apply_projection(
             // SQLite's records.name is NOT NULL DEFAULT ''. Its projector
             // therefore canonicalizes omitted/null names to the empty string.
             .bind(payload["name"].as_str().unwrap_or(""))
-            .bind(payload["body"].as_str())
+            .bind(crate::record_body::coerce_body(&payload["body"]))
             .bind(home_id)
             .bind(payload["summary"].as_str())
             .bind(payload["lifecycle"].as_str())
@@ -9836,6 +10259,9 @@ async fn apply_projection(
             .bind(event_created_at)
             .execute(&mut **tx)
             .await?;
+            let body = crate::record_body::coerce_body(&payload["body"]);
+            replace_body_task_items_pg(db, tx, record_id, source_event_seq, body.as_deref())
+                .await?;
             if record_id == ROOT_RECORD_ID {
                 let policies = db.qualified_table("record_policies")?;
                 let entries = db.qualified_table("policy_entries")?;
@@ -9854,6 +10280,7 @@ async fn apply_projection(
             }
         }
         "record.updated" => {
+            let body_changed = payload.get("body").is_some();
             let fields = [
                 "name",
                 "body",
@@ -9865,12 +10292,22 @@ async fn apply_projection(
             for field in fields {
                 if payload.get(field).is_some() {
                     let column = quote_identifier(field)?;
+                    let value = if field == "body" {
+                        crate::record_body::coerce_body(&payload[field])
+                    } else {
+                        payload[field].as_str().map(str::to_owned)
+                    };
                     sqlx::query(&format!("UPDATE {records} SET {column}=$2 WHERE id=$1"))
                         .bind(record_id)
-                        .bind(payload[field].as_str())
+                        .bind(value)
                         .execute(&mut **tx)
                         .await?;
                 }
+            }
+            if body_changed {
+                let body = crate::record_body::coerce_body(&payload["body"]);
+                replace_body_task_items_pg(db, tx, record_id, source_event_seq, body.as_deref())
+                    .await?;
             }
             advance_record_updated_at(db, tx, record_id, event_created_at).await?;
         }
@@ -9910,17 +10347,24 @@ async fn apply_projection(
             advance_record_updated_at(db, tx, record_id, event_created_at).await?;
         }
         "facet.set" if payload["key"] == "archived" => {
-            sqlx::query(&format!("UPDATE {records} SET archived=TRUE WHERE id=$1"))
-                .bind(record_id)
-                .execute(&mut **tx)
-                .await?;
+            // E3 M1 slice 1: the physical column follows current facet state,
+            // not observations — mirroring the SQLite and Turso projectors.
+            // Observation_only history still advances timestamps below.
+            if !payload["observation_only"].as_bool().unwrap_or(false) {
+                sqlx::query(&format!("UPDATE {records} SET archived=TRUE WHERE id=$1"))
+                    .bind(record_id)
+                    .execute(&mut **tx)
+                    .await?;
+            }
             advance_record_updated_at(db, tx, record_id, event_created_at).await?;
         }
         "facet.unset" if payload["key"] == "archived" => {
-            sqlx::query(&format!("UPDATE {records} SET archived=FALSE WHERE id=$1"))
-                .bind(record_id)
-                .execute(&mut **tx)
-                .await?;
+            if !payload["observation_only"].as_bool().unwrap_or(false) {
+                sqlx::query(&format!("UPDATE {records} SET archived=FALSE WHERE id=$1"))
+                    .bind(record_id)
+                    .execute(&mut **tx)
+                    .await?;
+            }
             advance_record_updated_at(db, tx, record_id, event_created_at).await?;
         }
         "facet.set" => {
@@ -9987,6 +10431,46 @@ async fn apply_projection(
             .bind(event_created_at)
             .execute(&mut **tx)
             .await?;
+            if relationship == "supersedes" {
+                recompute_currency_pg(db, tx, target_id).await?;
+            }
+            advance_record_updated_at(db, tx, record_id, event_created_at).await?;
+        }
+        "link.removed" => {
+            let links = db.qualified_table("links")?;
+            let source_id = payload["source_id"]
+                .as_str()
+                .ok_or_else(|| Error::engine("link.removed payload requires source_id"))?;
+            if source_id != record_id {
+                return Err(Error::engine(
+                    "link.removed envelope mismatch: event record does not match payload source_id",
+                ));
+            }
+            let target_id = payload["target_id"]
+                .as_str()
+                .ok_or_else(|| Error::engine("link.removed payload requires target_id"))?;
+            let relationship = payload["relationship"]
+                .as_str()
+                .filter(|relationship| !relationship.is_empty())
+                .ok_or_else(|| {
+                    Error::engine("link.removed payload requires a non-empty relationship")
+                })?;
+            let removed = sqlx::query(&format!(
+                "DELETE FROM {links} WHERE source_id=$1 AND target_id=$2 AND relationship=$3"
+            ))
+            .bind(source_id)
+            .bind(target_id)
+            .bind(relationship)
+            .execute(&mut **tx)
+            .await?;
+            if removed.rows_affected() == 0 {
+                return Err(Error::engine(format!(
+                    "cannot remove link: no '{relationship}' link from {source_id} to {target_id}"
+                )));
+            }
+            if relationship == "supersedes" {
+                recompute_currency_pg(db, tx, target_id).await?;
+            }
             advance_record_updated_at(db, tx, record_id, event_created_at).await?;
         }
         "record.deleted" => {
@@ -9997,6 +10481,16 @@ async fn apply_projection(
             .bind(event_created_at)
             .execute(&mut **tx)
             .await?;
+            let links = db.qualified_table("links")?;
+            let targets: Vec<String> = sqlx::query_scalar(&format!(
+                "SELECT DISTINCT target_id FROM {links} WHERE source_id=$1 AND relationship='supersedes'"
+            ))
+            .bind(record_id)
+            .fetch_all(&mut **tx)
+            .await?;
+            for target in targets {
+                recompute_currency_pg(db, tx, &target).await?;
+            }
             advance_record_updated_at(db, tx, record_id, event_created_at).await?;
         }
         "message.audience.declared" => {

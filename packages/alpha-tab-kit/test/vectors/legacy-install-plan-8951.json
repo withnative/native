@@ -1,0 +1,12 @@
+{
+  "baseline": "8951ce2979b56f0d855238ca3bc6c945fce39526",
+  "note": "Generated only with the entire immutable baseline kit source; JSON plan byte SHA256 includes source text/steps/placeholders and digests.",
+  "digests": {
+    "digest_version": "alpha-tab-digest.v1",
+    "bundle_sha256": "1c7811887596c0cd39dc9746bee08eb9424161b715585bfeec54a784f64ff976",
+    "declaration_digest": "7046960d2f71a024b142dda14cf51ce5616c8964b0782ab7f275a97078724c16",
+    "digest": "sha256:c593f94136e397ad144116428cdcdc9eb643ed186015c22a712d0b26913cd2c8"
+  },
+  "normal_sha256": "d0e7d0e5dbb448f065977fb2fb3b5a42536bd970229d2d6143cdc9e007c49c91",
+  "replace_sha256": "0f714fee2ee41c0637a8fc4e4737d0a78818621e498f826c8878c4d3e3d08fdd"
+}

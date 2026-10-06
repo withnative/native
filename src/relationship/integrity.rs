@@ -298,15 +298,17 @@ pub(crate) async fn relationship_state_violations(db: &crate::Db) -> Result<Vec<
             "{activity_mismatch} relationship event(s) have incomplete endpoint activity"
         ));
     }
-    let orphan_compatibility_links: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM links l WHERE l.id LIKE 'rel:%'
+    let orphan_compatibility_links: i64 = sqlx::query_scalar(&format!(
+        "SELECT COUNT(*) FROM links WHERE links.id LIKE 'rel:%'
+          AND NOT {}
           AND NOT EXISTS (
             SELECT 1 FROM relationships r JOIN effective_relationships e
               ON e.relationship_origin_db_id=r.relationship_origin_db_id
              AND e.relationship_id=r.relationship_id
-             WHERE l.id='rel:' || r.relationship_origin_db_id || ':' || r.relationship_id
+             WHERE links.id='rel:' || r.relationship_origin_db_id || ':' || r.relationship_id
                AND e.effective_state='active')",
-    )
+        super::legacy::content_link_provenance()
+    ))
     .fetch_one(db.pool())
     .await?;
     if orphan_compatibility_links != 0 {
@@ -487,6 +489,15 @@ pub(crate) async fn relationship_state_violations(db: &crate::Db) -> Result<Vec<
     }
     effective_snapshot.rollback().await?;
 
+    violations.extend(relationship_append_only_trigger_violations(db).await?);
+    Ok(violations)
+}
+
+/// Cheap schema-only append-only protection check, independent of history size.
+pub(crate) async fn relationship_append_only_trigger_violations(
+    db: &crate::Db,
+) -> Result<Vec<String>> {
+    let mut violations = Vec::new();
     for (name, expected) in [
         (
             "relationship_events_no_update",

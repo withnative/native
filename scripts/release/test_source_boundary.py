@@ -145,6 +145,12 @@ class SourceBoundaryTests(unittest.TestCase):
         self.assertEqual(readme["source_path"], "publication/root/README.md")
         self.assertFalse(any(row["path"].startswith("docs/evals/") for row in first))
         self.assertFalse(any(row["path"] in {"Dockerfile", "docker-entrypoint.sh"} for row in first))
+        selected_paths = {row["source_path"] for row in first}
+        self.assertTrue({
+            "packages/alpha-tab-kit/src/shell-routing.rs",
+            "packages/alpha-tab-kit/shared-source-license.json",
+            "packages/alpha-tab-kit/LICENSE.md",
+        }.issubset(selected_paths))
 
     @unittest.skipUnless(IS_UPSTREAM, "compares private and publication wrapper inputs")
     def test_cold_roots_describe_distinct_repository_perspectives(self) -> None:

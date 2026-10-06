@@ -38,9 +38,17 @@ PRIVATE_PREVIEW = "private-preview"
 PUBLIC_RELEASE = "public-release"
 SCANNER = "native-ce-private-preview-credential-scan/v1"
 EXPECTED_LICENSE_SHA256 = "40e38d978117d3ea0b1925acb7fa8b1dbd0955671050ee1051fdaec277486f8a"
+# Approved exact bytes per public file. RELEASE_NOTES.md has two approved
+# versions: publication/root/ (engine-only snapshots) and publication/combined/
+# (Native + Desktop source-pair snapshots).
 EXPECTED_PUBLIC_FILE_SHA256 = {
-    "CONTRIBUTING.md": "0266b07cd70ed1db6f8b3c6fc75f4313195382bbc75198769e958f12ea033efa",
-    "RELEASE_NOTES.md": "b070bc18a5529291c803e717c72a3d808aaceeccb10b00bff81d94f22c2a5138",
+    "CONTRIBUTING.md": frozenset({
+        "0266b07cd70ed1db6f8b3c6fc75f4313195382bbc75198769e958f12ea033efa",
+    }),
+    "RELEASE_NOTES.md": frozenset({
+        "9622a8e4ec65c397917e75bf2b616a6868d08f0f20b66c375293fc7ce2186ae2",
+        "0e5a055de5e905bbe87d035715395d08627b6dadec3c1e77e5d9eb9343592d27",
+    }),
 }
 OBJECT_ID = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 RFC3339_TIMESTAMP = re.compile(
@@ -419,7 +427,7 @@ def validate_public_release_files(candidate: Path) -> dict[str, Any]:
         )
     for relative, markers in PUBLIC_CONTENT_MARKERS.items():
         content = (candidate / relative).read_bytes()
-        if sha256(content) != EXPECTED_PUBLIC_FILE_SHA256[relative]:
+        if sha256(content) not in EXPECTED_PUBLIC_FILE_SHA256[relative]:
             raise PreviewRefusal(
                 f"public-release content differs from the exact approved bytes: {relative}"
             )

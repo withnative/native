@@ -8,6 +8,7 @@
 mod error;
 pub mod events;
 pub mod principal;
+pub mod rule_contract;
 pub mod sql_contract;
 
 pub use error::QueryError;

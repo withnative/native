@@ -1464,3 +1464,84 @@ async fn generic_part_of_links_remain_open_on_a_targeted_citation() {
     )
     .await;
 }
+
+/// A selector-backed citation remains evidence when its source is archived.
+/// Neither archive nor citation certifies whole-record replacement/currentness.
+#[tokio::test]
+async fn archived_but_cited_source_keeps_independent_currency_certification() {
+    let db = db().await;
+    let registry = registry();
+    let bearer = create(
+        &registry,
+        &db,
+        json!({
+            "type":"Document", "kind":"note", "name":"Citing note"
+        }),
+    )
+    .await;
+    let source = create(&registry, &db, json!({
+        "type":"Document", "kind":"note", "name":"Archived source", "body":"Evidence remains cited."
+    })).await;
+    let citation = body_citation(&registry, &db, &bearer, &source, "Evidence remains cited.").await;
+    call(&registry, &db, "archive_record", json!({"id":source})).await;
+    let sql =
+        format!("SELECT archived,is_current,successor_count FROM records WHERE id='{source}'");
+    let current = call(&registry, &db, "query_sql", json!({"sql":sql})).await;
+    assert_eq!(
+        current["rows"],
+        json!([{"archived":1,"is_current":1,"successor_count":0}])
+    );
+    let successor = create(&registry, &db, json!({
+        "type":"Document", "kind":"note", "name":"Partial correction", "body":"Only one claim is corrected."
+    })).await;
+    call(
+        &registry,
+        &db,
+        "manage_links",
+        json!({
+            "action":"add", "source_id":successor, "target_id":source, "relationship":"supersedes"
+        }),
+    )
+    .await;
+    let unknown = call(&registry, &db, "query_sql", json!({"sql":sql})).await;
+    assert_eq!(
+        unknown["rows"],
+        json!([{"archived":1,"is_current":null,"successor_count":1}])
+    );
+    let record = call(&registry, &db, "get_record", json!({"ids":[source]})).await;
+    assert_eq!(record["records"][0]["archived"], true);
+    assert_eq!(record["records"][0]["superseded_by"]["total_count"], 1);
+    // The exact target is still a real citation, not an arbitrary link token.
+    let target: String =
+        sqlx::query_scalar("SELECT target_record_id FROM annotation_targets WHERE annotation_id=?")
+            .bind(&citation)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(target, source);
+    let resolved = call(
+        &registry,
+        &db,
+        "resolve_citation",
+        json!({"citation_id":citation}),
+    )
+    .await;
+    // Citation validation refers to the anchored body, not record currency.
+    assert_eq!(resolved["validation"]["status"], "current");
+    assert_eq!(
+        resolved["anchored"]["excerpt"]["text"],
+        "Evidence remains cited."
+    );
+    call(
+        &registry,
+        &db,
+        "archive_record",
+        json!({"id":source,"archived":false}),
+    )
+    .await;
+    let restored = call(&registry, &db, "query_sql", json!({"sql":sql})).await;
+    assert_eq!(
+        restored["rows"],
+        json!([{"archived":0,"is_current":null,"successor_count":1}])
+    );
+}

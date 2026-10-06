@@ -161,6 +161,11 @@ pub struct ReadLens<'a> {
     blobs: LiveBlobRead<'a>,
     content_log: ContentLogRead<'a>,
     temporal: Option<&'a ResolvedAsOf>,
+    /// Member-copy serving (contract c323277 §1.3, §2.3): the projection holds
+    /// only E(m), so per-id authorization is slice presence and the excluded
+    /// companion reads are replaced by their member answer. False for every
+    /// online caller.
+    member: bool,
 }
 
 impl<'a> ReadLens<'a> {
@@ -172,7 +177,14 @@ impl<'a> ReadLens<'a> {
             blobs: LiveBlobRead::new(db),
             content_log: ContentLogRead::new(db),
             temporal: None,
+            member: db.open_mode() == crate::db::DatabaseOpenMode::MemberReadOnly,
         }
+    }
+
+    /// True for an admitted member copy. Every `if member` branch below gives
+    /// the contract's member answer; online callers are unaffected.
+    pub fn is_member(&self) -> bool {
+        self.member
     }
 
     /// A replayed content projection combined with explicit live tiers.
@@ -183,6 +195,7 @@ impl<'a> ReadLens<'a> {
             blobs: LiveBlobRead::new(live),
             content_log: ContentLogRead::new(live),
             temporal: Some(temporal),
+            member: false,
         }
     }
 
@@ -199,6 +212,7 @@ impl<'a> ReadLens<'a> {
             blobs: LiveBlobRead::new(self.blobs.db),
             content_log: ContentLogRead::new(self.content_log.db),
             temporal: Some(temporal),
+            member: self.member,
         }
     }
 

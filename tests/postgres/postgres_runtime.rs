@@ -82,12 +82,12 @@ async fn legacy_v2_binding_audit_shape_is_refused_on_runtime_reopen() {
     let logical_database_id = format!("contract-legacy-v2-{}", uuid::Uuid::new_v4().simple());
     let config = runtime_config(&url, &logical_database_id);
     let (database, report) = config.provision_and_connect().await.unwrap();
-    assert_eq!(report.schema_version, 7);
+    assert_eq!(report.schema_version, 9);
     let migrations = database.qualified_table("schema_migrations").unwrap();
     let binding_audit = database.qualified_table("binding_audit").unwrap();
     let mut transaction = database.pool().begin().await.unwrap();
     sqlx::query(&format!(
-        "DELETE FROM {migrations} WHERE version IN (5,6,7)"
+        "DELETE FROM {migrations} WHERE version IN (5,6,7,8,9)"
     ))
     .execute(&mut *transaction)
     .await
@@ -108,7 +108,266 @@ async fn legacy_v2_binding_audit_shape_is_refused_on_runtime_reopen() {
     let error = config.connect().await.unwrap_err().to_string();
     assert_eq!(
         error,
-        "Postgres logical database uses legacy schema v2; authoritative substrate v7 requires operator-controlled reprovisioning"
+        "Postgres logical database uses legacy schema v2; authoritative substrate v9 requires operator-controlled reprovisioning"
+    );
+    config.drop_owned().await.unwrap();
+}
+
+#[tokio::test]
+async fn v7_to_v8_backfills_live_successors_without_changing_archive() {
+    let Some(url) = postgres_url() else {
+        return;
+    };
+    let logical_database_id = format!("contract-currency-v7-{}", uuid::Uuid::new_v4().simple());
+    let config = runtime_config(&url, &logical_database_id);
+    let (database, report) = config.provision_and_connect().await.unwrap();
+    assert_eq!(report.schema_version, 9);
+    let records = database.qualified_table("records").unwrap();
+    let links = database.qualified_table("links").unwrap();
+    let migrations = database.qualified_table("schema_migrations").unwrap();
+    let task_items = database.qualified_table("body_task_items").unwrap();
+    let mut registry = ToolRegistry::new();
+    register_builtin_tools(&mut registry).unwrap();
+    register_surface_tools(&mut registry).unwrap();
+    register_postgres_tools(&mut registry).unwrap();
+    let fresh_ddl = registry
+        .call_engine(
+            EngineHandle::Postgres(database.clone()),
+            Caller::local(),
+            "describe_schema",
+            json!({"include_ddl": true}),
+        )
+        .await
+        .unwrap()["ddl_statements"]
+        .clone();
+    let target = "156c37d6-0000-4000-8000-000000000001";
+    let live = "156c37d6-0000-4000-8000-000000000002";
+    let deleted = "156c37d6-0000-4000-8000-000000000003";
+    let mut tx = database.pool().begin().await.unwrap();
+    for (id, archived, tombstoned) in [
+        (target, true, false),
+        (live, false, false),
+        (deleted, false, true),
+    ] {
+        sqlx::query(&format!(
+            "INSERT INTO {records}(id,record_type,kind,archived,deleted_at) \
+             VALUES($1,'Document','note',$2,CASE WHEN $3 THEN transaction_timestamp() ELSE NULL END)"
+        ))
+        .bind(id)
+        .bind(archived)
+        .bind(tombstoned)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    }
+    for (id, source) in [("live-edge", live), ("deleted-edge", deleted)] {
+        sqlx::query(&format!(
+            "INSERT INTO {links}(id,source_id,target_id,relationship) VALUES($1,$2,$3,'supersedes')"
+        ))
+        .bind(id)
+        .bind(source)
+        .bind(target)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    }
+    sqlx::query(&format!(
+        "ALTER TABLE {records} DROP COLUMN is_current,DROP COLUMN successor_count"
+    ))
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    sqlx::query(&format!("DROP TABLE {task_items}"))
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query(&format!(
+        "UPDATE {migrations} SET version=7 WHERE version=9"
+    ))
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    database.close().await;
+
+    let (migrated, report) = config.provision_and_connect().await.unwrap();
+    assert_eq!(report.schema_version, 9);
+    let target_row: (Option<bool>, i64, bool) = sqlx::query_as(&format!(
+        "SELECT is_current,successor_count,archived FROM {records} WHERE id=$1"
+    ))
+    .bind(target)
+    .fetch_one(migrated.pool())
+    .await
+    .unwrap();
+    assert_eq!(target_row, (None, 1, true));
+    let source_row: (Option<bool>, i64) = sqlx::query_as(&format!(
+        "SELECT is_current,successor_count FROM {records} WHERE id=$1"
+    ))
+    .bind(live)
+    .fetch_one(migrated.pool())
+    .await
+    .unwrap();
+    assert_eq!(source_row, (Some(true), 0));
+    let upgraded_ddl = registry
+        .call_engine(
+            EngineHandle::Postgres(migrated.clone()),
+            Caller::local(),
+            "describe_schema",
+            json!({"include_ddl": true}),
+        )
+        .await
+        .unwrap()["ddl_statements"]
+        .clone();
+    assert_eq!(
+        upgraded_ddl, fresh_ddl,
+        "fresh and upgraded v9 DDL diverged"
+    );
+    migrated.close().await;
+    config.drop_owned().await.unwrap();
+}
+
+#[tokio::test]
+async fn v8_to_v9_backfills_task_items_with_exact_body_event_provenance() {
+    let Some(url) = postgres_url() else {
+        return;
+    };
+    let logical_database_id = format!("contract-tasks-v8-{}", uuid::Uuid::new_v4().simple());
+    let config = runtime_config(&url, &logical_database_id);
+    let (database, report) = config.provision_and_connect().await.unwrap();
+    assert_eq!(report.schema_version, 9);
+    let records = database.qualified_table("records").unwrap();
+    let events = database.qualified_table("content_events").unwrap();
+    let items = database.qualified_table("body_task_items").unwrap();
+    let migrations = database.qualified_table("schema_migrations").unwrap();
+    let event_cursor = database.qualified_table("event_cursor").unwrap();
+    let log_cursors = database.qualified_table("log_cursors").unwrap();
+    let record_id = "contract:task-backfill";
+    let body = "- [ ] first\n> - [ ] quoted\n* [x] done\n";
+    let mut tx = database.pool().begin().await.unwrap();
+    sqlx::query(&format!(
+        "INSERT INTO {records}(id,record_type,kind,body,archived,deleted_at) \
+         VALUES($1,'Document','note',$2,TRUE,transaction_timestamp())"
+    ))
+    .bind(record_id)
+    .bind(body)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    let seq: i64 = sqlx::query_scalar(&format!("SELECT COALESCE(MAX(seq),0)+1 FROM {events}"))
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query(&format!(
+        "INSERT INTO {events}(seq,id,record_id,type,payload,causal_envelope_version,causal_status) \
+         VALUES($1,'contract:task-backfill-event',$2,'record.created',$3::jsonb,1,'legacy_unknown')"
+    ))
+    .bind(seq)
+    .bind(record_id)
+    .bind(serde_json::json!({"body":body}).to_string())
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    // Cross the backfill page boundary with one task and event per record.
+    sqlx::query(&format!(
+        "INSERT INTO {records}(id,record_type,kind,body) \
+         SELECT 'contract:task-batch-' || lpad(i::text,3,'0'),'Document','note','- [ ] batch' \
+         FROM generate_series(0,129) AS series(i)"
+    ))
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    sqlx::query(&format!(
+        "INSERT INTO {events}(seq,id,record_id,type,payload,causal_envelope_version,causal_status) \
+         SELECT $1 + 1 + i,'contract:task-batch-event-' || lpad(i::text,3,'0'), \
+                'contract:task-batch-' || lpad(i::text,3,'0'),'record.created', \
+                jsonb_build_object('body','- [ ] batch'),1,'legacy_unknown' \
+         FROM generate_series(0,129) AS series(i)"
+    ))
+    .bind(seq)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    sqlx::query(&format!("UPDATE {event_cursor} SET last_seq=$1"))
+        .bind(seq + 130)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query(&format!(
+        "UPDATE {log_cursors} SET last_seq=$1 WHERE log_name='content'"
+    ))
+    .bind(seq + 130)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    sqlx::query(&format!("DROP TABLE {items}"))
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query(&format!(
+        "UPDATE {migrations} SET version=8 WHERE version=9"
+    ))
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    database.close().await;
+
+    let (migrated, report) = config.provision_and_connect().await.unwrap();
+    assert_eq!(report.schema_version, 9);
+    let rows: Vec<(i64, i64, String, bool, bool)> = sqlx::query_as(&format!(
+        "SELECT item_index,source_event_seq,marker,checked,in_quote \
+         FROM {items} WHERE record_id=$1 ORDER BY item_index"
+    ))
+    .bind(record_id)
+    .fetch_all(migrated.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            (0, seq, "-".into(), false, false),
+            (1, seq, "-".into(), false, true),
+            (2, seq, "*".into(), true, false),
+        ]
+    );
+    let batch: (i64, Option<i64>, Option<i64>) = sqlx::query_as(&format!(
+        "SELECT COUNT(*),MIN(source_event_seq),MAX(source_event_seq) FROM {items} \
+         WHERE record_id LIKE 'contract:task-batch-%'"
+    ))
+    .fetch_one(migrated.pool())
+    .await
+    .unwrap();
+    assert_eq!(batch, (130, Some(seq + 1), Some(seq + 130)));
+    // A physical body without a body-bearing log event cannot acquire an
+    // invented source_event_seq during a later upgrade.
+    let orphan = "contract:task-backfill-orphan";
+    let mut tx = migrated.pool().begin().await.unwrap();
+    sqlx::query(&format!(
+        "INSERT INTO {records}(id,record_type,kind,body) VALUES($1,'Document','note','- [ ] orphan')"
+    ))
+    .bind(orphan)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    sqlx::query(&format!("DROP TABLE {items}"))
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    // The first upgrade appended 9 beside the retained 8 row.
+    sqlx::query(&format!("DELETE FROM {migrations} WHERE version=9"))
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    migrated.close().await;
+    let error = config
+        .provision_and_connect()
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("Postgres v9 task backfill lacks body provenance for record contract:task-backfill-orphan"),
+        "{error}"
     );
     config.drop_owned().await.unwrap();
 }
@@ -121,11 +380,41 @@ async fn main_era_v4_reopens_through_the_exact_v5_search_index_migration() {
     let logical_database_id = format!("contract-search-v4-{}", uuid::Uuid::new_v4().simple());
     let config = runtime_config(&url, &logical_database_id);
     let (database, report) = config.provision_and_connect().await.unwrap();
-    assert_eq!(report.schema_version, 7);
+    assert_eq!(report.schema_version, 9);
     let records = database.qualified_table("records").unwrap();
+    let events = database.qualified_table("content_events").unwrap();
+    let event_cursor = database.qualified_table("event_cursor").unwrap();
+    let log_cursors = database.qualified_table("log_cursors").unwrap();
     sqlx::query(&format!(
         "INSERT INTO {records}(id,record_type,kind,name,body,policy_anchor_id,created_at,updated_at) VALUES('contract:v4-search-survivor','Document','note','Migration survivor','migrationneedle','native:root',transaction_timestamp(),transaction_timestamp())"
     ))
+    .execute(database.pool())
+    .await
+    .unwrap();
+    // v9 backfill requires real provenance for every nonempty legacy body.
+    // Plant the matching body-bearing event in this deliberately raw fixture.
+    let seq: i64 = sqlx::query_scalar(&format!("SELECT COALESCE(MAX(seq),0)+1 FROM {events}"))
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+    sqlx::query(&format!(
+        "INSERT INTO {events}(seq,id,record_id,type,payload,causal_envelope_version,causal_status) \
+         VALUES($1,'contract:v4-search-body','contract:v4-search-survivor','record.created', \
+                '{{\"body\":\"migrationneedle\"}}'::jsonb,1,'legacy_unknown')"
+    ))
+    .bind(seq)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    sqlx::query(&format!("UPDATE {event_cursor} SET last_seq=$1"))
+        .bind(seq)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    sqlx::query(&format!(
+        "UPDATE {log_cursors} SET last_seq=$1 WHERE log_name='content'"
+    ))
+    .bind(seq)
     .execute(database.pool())
     .await
     .unwrap();
@@ -138,11 +427,11 @@ async fn main_era_v4_reopens_through_the_exact_v5_search_index_migration() {
     let refusal = config.connect().await.unwrap_err().to_string();
     assert_eq!(
         refusal,
-        "Postgres logical database uses legacy schema v4; authoritative substrate v7 requires provision_and_connect exact v4-to-v5 migration or operator-controlled reprovisioning"
+        "Postgres logical database uses legacy schema v4; authoritative substrate v9 requires provision_and_connect exact v4-to-v5 migration or operator-controlled reprovisioning"
     );
 
     let (migrated, migrated_report) = config.provision_and_connect().await.unwrap();
-    assert_eq!(migrated_report.schema_version, 7);
+    assert_eq!(migrated_report.schema_version, 9);
     let survivor: bool = sqlx::query_scalar(&format!(
         "SELECT EXISTS(SELECT 1 FROM {records} WHERE id='contract:v4-search-survivor' AND body='migrationneedle')"
     ))
@@ -282,7 +571,7 @@ async fn provisioning_is_owned_idempotent_and_least_privilege() {
         Some("42501")
     );
 
-    assert_eq!(migration_version(&second).await.unwrap(), 7);
+    assert_eq!(migration_version(&second).await.unwrap(), 9);
     assert_eq!(
         current_search_path(&second).await.unwrap(),
         "\"$user\", public"

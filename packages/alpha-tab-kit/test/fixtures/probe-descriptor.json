@@ -1,0 +1,14 @@
+{
+  "package": "agent.kit-probe",
+  "version": "0.1.0",
+  "bundle": "probe-concurrent.html",
+  "runtime": "native.html.v1",
+  "declaration": {
+    "needs": [
+      { "need": "sql.snapshot.v1", "key": "probe.list", "label": "Open tasks, newest first", "sql": "SELECT id, name FROM records WHERE type = 'WorkItem' ORDER BY last_activity_at_ms DESC, id LIMIT 200" },
+      { "need": "sql.snapshot.v1", "key": "probe.body", "label": "One record's body, read when opened", "sql": "SELECT id, body FROM records WHERE id = ?1", "params": [{ "name": "id", "type": "text", "max_len": 64 }] },
+      { "need": "sql.snapshot.v1", "key": "probe.links", "label": "One record's outgoing links, read when opened", "sql": "SELECT target_id, relationship FROM links WHERE source_id = ?1 ORDER BY target_id LIMIT 50", "params": [{ "name": "id", "type": "text", "max_len": 64 }] }
+    ],
+    "effects": []
+  }
+}

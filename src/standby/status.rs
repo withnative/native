@@ -162,9 +162,9 @@ struct ServingGeneration {
 
 /// Read-only source for the shared bootstrap and system/status projection.
 ///
-/// The serving generation is frozen at process activation. Accepted-generation
-/// and refresh diagnostics are re-read for every call, so a background refresh
-/// can be disclosed without pretending the open SQLite pool hot-swapped.
+/// Each provider freezes one serving generation. The connected session captures
+/// this provider with the same database and lease. Accepted-generation and
+/// refresh diagnostics are re-read for full status without changing that capture.
 #[derive(Clone, Debug)]
 pub struct StandbyStatusProvider {
     runtime: StandbyRuntimeConfig,
@@ -174,6 +174,7 @@ pub struct StandbyStatusProvider {
     status_only: Option<StandbyStatusOnly>,
     refresh_configured: bool,
     refresh_available: bool,
+    connected_handoff: bool,
 }
 
 impl StandbyStatusProvider {
@@ -202,6 +203,7 @@ impl StandbyStatusProvider {
             status_only: None,
             refresh_configured,
             refresh_available,
+            connected_handoff: false,
         }
     }
 
@@ -243,7 +245,15 @@ impl StandbyStatusProvider {
             status_only: Some(status_only),
             refresh_configured,
             refresh_available,
+            connected_handoff: false,
         }
+    }
+
+    /// Enable truthful pending-handoff diagnostics on a connected session.
+    /// This does not certify readiness or change the frozen serving generation.
+    pub fn with_connected_handoff(mut self) -> Self {
+        self.connected_handoff = true;
+        self
     }
 
     pub async fn status(&self) -> StandbyStatus {
@@ -269,7 +279,11 @@ impl StandbyStatusProvider {
             }
         }
         let next_safe_action = if self.serving.is_none() {
-            Some("refresh the standby, then restart it after a verified generation is accepted")
+            Some(if self.connected_handoff {
+                "run a verified external refresh; the connected session will attempt full handoff"
+            } else {
+                "refresh the standby, then restart it after a verified generation is accepted"
+            })
         } else if matches!(freshness.state, StandbyFreshnessState::BeyondRpo) {
             Some("restore hosted connectivity or authentication and run the supported refresh command")
         } else if matches!(freshness.state, StandbyFreshnessState::Unavailable) {
@@ -473,14 +487,30 @@ fn build_status(
         && serving_generation.is_some()
         && accepted_generation.is_some()
     {
-        degraded_reasons.push("accepted_generation_pending_restart");
+        degraded_reasons.push(if provider.connected_handoff {
+            "accepted_generation_pending_handoff"
+        } else {
+            "accepted_generation_pending_restart"
+        });
     }
     degraded_reasons.sort_unstable();
     degraded_reasons.dedup();
 
     let accepted_generation_available = accepted_generation.is_some();
-    let next_safe_action = if provider.serving.is_none() && accepted_generation_available {
+    let pending_handoff = provider.connected_handoff
+        && accepted_generation_available
+        && serving_generation
+            .as_ref()
+            .map(|generation| &generation.generation_id)
+            != accepted_generation
+                .as_ref()
+                .map(|generation| &generation.generation_id);
+    let next_safe_action = if pending_handoff {
+        Some("the connected session will attempt full verification and readiness; inspect aggregate handoff diagnostics if serving does not advance")
+    } else if provider.serving.is_none() && accepted_generation_available {
         Some("restart the standby to activate the verified accepted generation")
+    } else if provider.serving.is_none() && provider.connected_handoff {
+        Some("run a verified external refresh; the connected session will attempt full handoff")
     } else if provider.serving.is_none() {
         Some("refresh the standby, then restart it after a verified generation is accepted")
     } else if degraded_reasons.contains(&"refresh_authentication_failing") {
@@ -565,7 +595,12 @@ fn build_status(
         pending_writes_supported: false,
         degraded,
         degraded_reasons,
-        summary: if provider.serving.is_none() && accepted_generation_available {
+        summary: if provider.serving.is_none()
+            && accepted_generation_available
+            && provider.connected_handoff
+        {
+            "This status-only Native standby has an accepted generation; workspace reads remain unavailable until full handoff readiness succeeds."
+        } else if provider.serving.is_none() && accepted_generation_available {
             "This status-only Native standby has accepted a verified generation; restart is required before workspace reads can serve it."
         } else if provider.serving.is_none() {
             "This local Native standby has no usable verified generation and cannot serve workspace data."
@@ -826,6 +861,7 @@ mod tests {
             status_only: None,
             refresh_configured: true,
             refresh_available: true,
+            connected_handoff: false,
         }
     }
 

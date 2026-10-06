@@ -1,0 +1,129 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.87s
+     Running unittests src/lib.rs (target/debug/deps/cel-d9f182ebdd29b587)
+
+running 7 tests
+test parser::l0::tests::native_stack_probe_child ... ok
+test parser::l0::tests::malformed_sources_cannot_bypass_guard ... ok
+test parser::l0::tests::generated_alternatives_and_recovery ... ok
+test parser::l0::tests::lexer_measures_and_located_limits ... ok
+boundary select: n=95 bytes=191 tokens=191 chain=96
+boundary select: n=95 bytes=191 tokens=191 chain=96
+boundary add: n=95 bytes=191 tokens=191 chain=96
+test parser::l0::tests::wide_rules_and_source_info ... ok
+boundary relation: n=95 bytes=286 tokens=191 chain=96
+boundary add: n=95 bytes=191 tokens=191 chain=96
+boundary unary: n=95 bytes=99 tokens=96 chain=96
+boundary negate: n=95 bytes=96 tokens=96 chain=96
+boundary group: n=47 bytes=95 tokens=95 chain=95
+boundary relation: n=95 bytes=286 tokens=191 chain=96
+boundary list: n=47 bytes=95 tokens=95 chain=95
+boundary unary: n=95 bytes=99 tokens=96 chain=96
+boundary map: n=47 bytes=283 tokens=189 chain=95
+boundary call: n=47 bytes=142 tokens=142 chain=95
+boundary negate: n=95 bytes=96 tokens=96 chain=96
+boundary index_child: n=47 bytes=142 tokens=142 chain=95
+boundary group: n=47 bytes=95 tokens=95 chain=95
+boundary list: n=47 bytes=95 tokens=95 chain=95
+boundary index_chain: n=47 bytes=142 tokens=142 chain=95
+boundary receiver_chain: n=31 bytes=125 tokens=125 chain=94
+boundary map: n=47 bytes=283 tokens=189 chain=95
+boundary call: n=47 bytes=142 tokens=142 chain=95
+boundary index_child: n=47 bytes=142 tokens=142 chain=95
+boundary index_chain: n=47 bytes=142 tokens=142 chain=95
+boundary receiver_chain: n=31 bytes=125 tokens=125 chain=94
+boundary ternary_else: n=95 bytes=666 tokens=381 chain=96
+boundary all: n=13 bytes=147 tokens=118 chain=92
+boundary exists: n=13 bytes=186 tokens=118 chain=92
+boundary exists_one: n=13 bytes=238 tokens=118 chain=92
+boundary map_macro: n=11 bytes=122 tokens=100 chain=89
+boundary filter: n=10 bytes=144 tokens=91 chain=91
+boundary filtered_map: n=11 bytes=177 tokens=122 chain=89
+boundary mixed: n=15 bytes=226 tokens=181 chain=91
+boundary alternating: n=9 bytes=199 tokens=154 chain=91
+boundary mixed_arithmetic: n=9 bytes=172 tokens=145 chain=91
+boundary mixed_macro: n=5 bytes=156 tokens=131 chain=91
+boundary logic_child: n=23 bytes=349 tokens=162 chain=93
+boundary ternary_else: n=95 bytes=666 tokens=381 chain=96
+boundary all: n=13 bytes=147 tokens=118 chain=92
+boundary exists: n=13 bytes=186 tokens=118 chain=92
+boundary exists_one: n=13 bytes=238 tokens=118 chain=92
+boundary map_macro: n=11 bytes=122 tokens=100 chain=89
+boundary filter: n=10 bytes=144 tokens=91 chain=91
+boundary filtered_map: n=11 bytes=177 tokens=122 chain=89
+boundary mixed: n=15 bytes=226 tokens=181 chain=91
+boundary alternating: n=9 bytes=199 tokens=154 chain=91
+boundary mixed_arithmetic: n=9 bytes=172 tokens=145 chain=91
+boundary mixed_macro: n=5 bytes=156 tokens=131 chain=91
+boundary logic_child: n=23 bytes=349 tokens=162 chain=93
+boundary logic_and_chain: n=87 bytes=703 tokens=351 chain=96
+boundary closed_group_chain: n=46 bytes=189 tokens=189 chain=96
+probe select n=95 stack=4194304
+probe add n=95 stack=4194304
+boundary logic_and_chain: n=87 bytes=703 tokens=351 chain=96
+probe relation n=95 stack=4194304
+boundary closed_group_chain: n=46 bytes=189 tokens=189 chain=96
+probe unary n=95 stack=4194304
+test parser::l0::tests::frames_persist_across_segments_and_closes ... ok
+probe negate n=95 stack=4194304
+probe group n=47 stack=4194304
+probe list n=47 stack=4194304
+probe map n=47 stack=4194304
+probe call n=47 stack=4194304
+probe index_child n=47 stack=4194304
+probe index_chain n=47 stack=4194304
+probe receiver_chain n=31 stack=4194304
+probe ternary_else n=95 stack=4194304
+probe all n=13 stack=4194304
+probe exists n=13 stack=4194304
+probe exists_one n=13 stack=4194304
+probe map_macro n=11 stack=4194304
+probe filter n=10 stack=4194304
+probe filtered_map n=11 stack=4194304
+probe mixed n=15 stack=4194304
+probe alternating n=9 stack=4194304
+probe mixed_arithmetic n=9 stack=4194304
+probe mixed_macro n=5 stack=4194304
+probe logic_child n=23 stack=4194304
+probe logic_and_chain n=87 stack=4194304
+probe closed_group_chain n=46 stack=4194304
+probe token_ceiling n=0 stack=4194304
+probe source_ceiling n=0 stack=4194304
+probe wide_logic n=0 stack=4194304
+probe malformed_add stack=4194304 (guard-admitted recovery)
+probe malformed_ternary stack=4194304 (guard-admitted recovery)
+probe malformed_group stack=4194304 (guard-admitted recovery)
+probe select n=95 stack=8388608
+probe add n=95 stack=8388608
+probe relation n=95 stack=8388608
+probe unary n=95 stack=8388608
+probe negate n=95 stack=8388608
+probe group n=47 stack=8388608
+probe list n=47 stack=8388608
+probe map n=47 stack=8388608
+probe call n=47 stack=8388608
+probe index_child n=47 stack=8388608
+probe index_chain n=47 stack=8388608
+probe receiver_chain n=31 stack=8388608
+probe ternary_else n=95 stack=8388608
+probe all n=13 stack=8388608
+probe exists n=13 stack=8388608
+probe exists_one n=13 stack=8388608
+probe map_macro n=11 stack=8388608
+probe filter n=10 stack=8388608
+probe filtered_map n=11 stack=8388608
+probe mixed n=15 stack=8388608
+probe alternating n=9 stack=8388608
+probe mixed_arithmetic n=9 stack=8388608
+probe mixed_macro n=5 stack=8388608
+probe logic_child n=23 stack=8388608
+probe logic_and_chain n=87 stack=8388608
+probe closed_group_chain n=46 stack=8388608
+probe token_ceiling n=0 stack=8388608
+probe source_ceiling n=0 stack=8388608
+probe wide_logic n=0 stack=8388608
+probe malformed_add stack=8388608 (guard-admitted recovery)
+probe malformed_ternary stack=8388608 (guard-admitted recovery)
+probe malformed_group stack=8388608 (guard-admitted recovery)
+test parser::l0::tests::native_stack_headroom ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 271 filtered out; finished in 1.57s

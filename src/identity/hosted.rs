@@ -158,6 +158,27 @@ pub async fn reconcile_hosted_identity(
     .await
 }
 
+/// Resolve an already-reconciled hosted identity without opening a writer.
+/// `None` means the usual reconciliation would need to provision or repair
+/// durable state, so callers serving a frozen read must refuse that request.
+#[doc(hidden)]
+pub async fn reconciled_hosted_identity_read_only(
+    db: &Db,
+    email: &str,
+    catalog_user_id: &str,
+    arrival: &HostedMembershipArrival,
+    public_principal: Option<&str>,
+) -> Result<Option<String>> {
+    reconciled_identity_in_read_snapshot(
+        db,
+        email,
+        catalog_user_id,
+        Some(arrival),
+        public_principal,
+    )
+    .await
+}
+
 /// Read an already-established portable identity without provisioning or
 /// repairing anything. Membership roster reads and offboarding use this seam
 /// so observing catalog membership can never create content records.
@@ -1797,43 +1818,46 @@ mod guest_provisioning_tests {
         // re-seed below must be a fresh append, not an idempotency replay).
         // control_events is append-only by trigger, so the triggers are
         // saved, dropped, and restored verbatim around the simulation.
+        // All of it runs in one write transaction on a single pooled
+        // connection: the DROP and the verbatim CREATE previously ran on
+        // separate pooled checkouts, and the restore intermittently
+        // observed the trigger as still present ("already exists").
+        let mut tx = db.write_pool().begin().await.unwrap();
         let triggers: Vec<String> = sqlx::query_scalar(
             "SELECT sql FROM sqlite_master WHERE type = 'trigger'
               AND name IN ('control_events_no_update', 'control_events_no_delete')
               ORDER BY name",
         )
-        .fetch_all(db.write_pool())
+        .fetch_all(&mut *tx)
         .await
         .unwrap();
         assert_eq!(triggers.len(), 2);
         sqlx::query("DROP TRIGGER control_events_no_update")
-            .execute(db.write_pool())
+            .execute(&mut *tx)
             .await
             .unwrap();
         sqlx::query("DROP TRIGGER control_events_no_delete")
-            .execute(db.write_pool())
+            .execute(&mut *tx)
             .await
             .unwrap();
         sqlx::query("DELETE FROM onboarding_programme_sources WHERE programme_id = ?")
             .bind(crate::instruction_templates::GUEST_PROGRAMME_ID)
-            .execute(db.write_pool())
+            .execute(&mut *tx)
             .await
             .unwrap();
         sqlx::query("DELETE FROM onboarding_programmes WHERE id = ?")
             .bind(crate::instruction_templates::GUEST_PROGRAMME_ID)
-            .execute(db.write_pool())
+            .execute(&mut *tx)
             .await
             .unwrap();
         sqlx::query("DELETE FROM control_events WHERE idempotency_key LIKE 'seed:v1:programme%guest-welcome%'")
-            .execute(db.write_pool())
+            .execute(&mut *tx)
             .await
             .unwrap();
         for trigger in triggers {
-            sqlx::query(&trigger)
-                .execute(db.write_pool())
-                .await
-                .unwrap();
+            sqlx::query(&trigger).execute(&mut *tx).await.unwrap();
         }
+        tx.commit().await.unwrap();
 
         // The next provisioning reseeds exactly the missing guest pieces
         // instead of failing the connect as a partial seed.
@@ -1894,9 +1918,10 @@ mod guest_onboarding_resolution_tests {
             reconcile_hosted_identity(&db, "guest@example.com", "catalog-guest", &arrival, None)
                 .await
                 .unwrap();
-        let resolution = crate::instructions::resolve_for_account(db.pool(), &account, false, None)
-            .await
-            .unwrap();
+        let resolution =
+            crate::instructions::resolve_for_account(db.pool(), &account, false, false, None)
+                .await
+                .unwrap();
         assert_eq!(resolution.instructions.status, "ready");
         assert!(
             resolution.instructions.entries.iter().any(|entry| {

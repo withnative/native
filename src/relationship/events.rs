@@ -216,7 +216,7 @@ pub(crate) struct OriginAdmissionV1 {
     authoring_action_attestation_id: String,
 }
 
-fn validate_causal_assertion_parent(parent: &CausalAssertionParent) -> Result<()> {
+pub(crate) fn validate_causal_assertion_parent(parent: &CausalAssertionParent) -> Result<()> {
     if !crate::identity::is_database_id(&parent.assertion_issuer_origin_db_id)
         || !crate::identity::is_database_id(&parent.head_event_issuer_origin_db_id)
         || parent.assertion_issuer_origin_db_id != parent.head_event_issuer_origin_db_id

@@ -9,11 +9,17 @@ use crate::schema::SPINE_TYPES;
 use super::super::{Caller, ToolKind, ToolRegistry};
 
 async fn preview_record_shape(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
+    let member = db.open_mode() == crate::db::DatabaseOpenMode::MemberReadOnly;
     let mut snapshot = db.write_pool().begin().await?;
     let result = {
         let mut executor = crate::portable_sql::BorrowedSqliteStatementExecutor::new(&mut snapshot);
-        crate::domain_transaction::execute_preview_record_shape(&mut executor, &caller, arguments)
-            .await
+        crate::domain_transaction::execute_preview_record_shape(
+            &mut executor,
+            &caller,
+            arguments,
+            member,
+        )
+        .await
     };
 
     match result {

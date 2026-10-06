@@ -1,0 +1,227 @@
+{
+  "definitions": [
+    {
+      "family": "native.standard.document",
+      "package": {
+        "namespace": "native.standard",
+        "name": "document",
+        "version": 1,
+        "digest": "c3805cc3b4bfe3bd2abab594ffcdd83e664966dee9efcbc94d5548fc340372e3"
+      },
+      "version": 1,
+      "digest": "6f0dab56958edc57378098a3f5bcde76d32f2d34f0e58d590cb534fecb91da61",
+      "primary_type": "Document",
+      "kind": "note",
+      "fields": [
+        {
+          "name": "title",
+          "type": "text",
+          "required": true,
+          "description": "Short human title."
+        },
+        {
+          "name": "body",
+          "type": "text",
+          "required": false,
+          "description": "The prose, as Markdown."
+        }
+      ],
+      "identity": {
+        "mode": "record"
+      },
+      "links": [
+        {
+          "predicate": "relates_to",
+          "target": {
+            "primary_type": "Document",
+            "kind": "note"
+          },
+          "direction": "either",
+          "cardinality": "many"
+        }
+      ],
+      "refines": null,
+      "maturity": "current",
+      "description": "An ordinary authored prose or capture document. Each note is distinct; matching titles or content do not make two notes the same.",
+      "adoption": {
+        "state": "adopted",
+        "resolved_in": [
+          "kernel:root"
+        ],
+        "pin": {
+          "family": "native.standard.document",
+          "version": 1,
+          "digest": "6f0dab56958edc57378098a3f5bcde76d32f2d34f0e58d590cb534fecb91da61"
+        },
+        "creatable_homes": [
+          "kernel:root"
+        ]
+      },
+      "operations": [
+        {
+          "name": "create",
+          "requires": "Edit",
+          "applies_to": {
+            "primary_type": "Document",
+            "kind": "note"
+          }
+        },
+        {
+          "name": "link",
+          "requires": "Edit",
+          "applies_to": {
+            "primary_type": "Document",
+            "kind": "note"
+          }
+        },
+        {
+          "name": "query",
+          "requires": "View",
+          "applies_to": {
+            "primary_type": "Document",
+            "kind": "note"
+          }
+        },
+        {
+          "name": "revise",
+          "requires": "Edit",
+          "applies_to": {
+            "primary_type": "Document",
+            "kind": "note"
+          }
+        },
+        {
+          "name": "history",
+          "requires": "View",
+          "applies_to": {
+            "primary_type": "Document",
+            "kind": "note"
+          }
+        }
+      ]
+    },
+    {
+      "family": "native.standard.outcome",
+      "package": {
+        "namespace": "native.standard",
+        "name": "outcome",
+        "version": 1,
+        "digest": "3056847de3a1526a05acc4318b7c288f3fc22a9e9a4c96436073f50f88b85660"
+      },
+      "version": 1,
+      "digest": "c55d62e78993a75504e91fe227be1156eca7b3ef51f5dddab9440d1a0a6baaa4",
+      "primary_type": "Outcome",
+      "kind": "impact",
+      "fields": [
+        {
+          "name": "claim",
+          "type": "text",
+          "required": true,
+          "description": "The effect claimed, in one sentence."
+        },
+        {
+          "name": "method",
+          "type": "choice",
+          "values": [
+            "declared",
+            "derived"
+          ],
+          "required": true
+        },
+        {
+          "name": "effective_at",
+          "type": "date",
+          "required": true
+        },
+        {
+          "name": "magnitude_value",
+          "type": "number",
+          "required": false
+        },
+        {
+          "name": "magnitude_unit",
+          "type": "text",
+          "required": false
+        },
+        {
+          "name": "magnitude_per",
+          "type": "text",
+          "required": false
+        },
+        {
+          "name": "window_start",
+          "type": "date",
+          "required": false
+        },
+        {
+          "name": "window_end",
+          "type": "date",
+          "required": false
+        }
+      ],
+      "identity": {
+        "mode": "record"
+      },
+      "links": [],
+      "refines": null,
+      "maturity": "current",
+      "description": "One claimed realised effect for a particular subject and effective period. Corrections to the same claim keep the record. If you give a magnitude, give value and unit together; if you give a measurement window, give start and end together, with start no later than end.",
+      "adoption": {
+        "state": "adopted",
+        "resolved_in": [
+          "kernel:root"
+        ],
+        "pin": {
+          "family": "native.standard.outcome",
+          "version": 1,
+          "digest": "c55d62e78993a75504e91fe227be1156eca7b3ef51f5dddab9440d1a0a6baaa4"
+        },
+        "creatable_homes": [
+          "kernel:root"
+        ]
+      },
+      "operations": [
+        {
+          "name": "create",
+          "requires": "Edit",
+          "applies_to": {
+            "primary_type": "Outcome",
+            "kind": "impact"
+          }
+        },
+        {
+          "name": "link",
+          "requires": "Edit",
+          "applies_to": {
+            "primary_type": "Outcome",
+            "kind": "impact"
+          }
+        },
+        {
+          "name": "query",
+          "requires": "View",
+          "applies_to": {
+            "primary_type": "Outcome",
+            "kind": "impact"
+          }
+        },
+        {
+          "name": "revise",
+          "requires": "Edit",
+          "applies_to": {
+            "primary_type": "Outcome",
+            "kind": "impact"
+          }
+        },
+        {
+          "name": "history",
+          "requires": "View",
+          "applies_to": {
+            "primary_type": "Outcome",
+            "kind": "impact"
+          }
+        }
+      ]
+    }
+  ]
+}

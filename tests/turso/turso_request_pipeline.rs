@@ -212,7 +212,7 @@ async fn install_strict_policy(db: &TursoLocalDb, targets: Vec<StorageTarget>) -
     // profile, not the compiled active profile that belongs to SQLite.
     assert_eq!(
         report["source"],
-        json!({"id": "turso-local", "revision": 4, "mode": "embedded"}),
+        json!({"id": "turso-local", "revision": 5, "mode": "embedded"}),
         "Turso-authored policy must own its source profile"
     );
     report
@@ -1161,7 +1161,7 @@ async fn production_persisted_strict_policy_denies_unqualified_pairs() {
         .to_string();
     assert_eq!(
         denied,
-        "strict_portability_blocked: operation=get_record; capability=native.operation.record-read.v1; target=turso-local@4(embedded); reason=source_capability_not_available"
+        "strict_portability_blocked: operation=get_record; capability=native.operation.record-read.v1; target=turso-local@5(embedded); reason=source_capability_not_available"
     );
 
     // A write is denied by the same intersection rather than silently applied.
@@ -1177,7 +1177,7 @@ async fn production_persisted_strict_policy_denies_unqualified_pairs() {
     .to_string();
     assert_eq!(
         write,
-        "strict_portability_blocked: operation=create_record; capability=native.domain-mcp.v1; target=turso-local@4(embedded); reason=source_capability_not_available"
+        "strict_portability_blocked: operation=create_record; capability=native.domain-mcp.v1; target=turso-local@5(embedded); reason=source_capability_not_available"
     );
 
     // Capability-less diagnostics remain callable even though no ordinary
@@ -1487,7 +1487,7 @@ async fn production_cancelled_admission_releases_a_waiting_policy_writer() {
         .to_string();
     assert_eq!(
         denied,
-        "strict_portability_blocked: operation=get_record; capability=native.operation.record-read.v1; target=turso-local@4(embedded); reason=source_capability_not_available"
+        "strict_portability_blocked: operation=get_record; capability=native.operation.record-read.v1; target=turso-local@5(embedded); reason=source_capability_not_available"
     );
 }
 
@@ -1540,7 +1540,7 @@ async fn production_persisted_strict_policy_survives_reopen() {
         .to_string();
     assert_eq!(
         denied,
-        "strict_portability_blocked: operation=get_record; capability=native.operation.record-read.v1; target=turso-local@4(embedded); reason=source_capability_not_available"
+        "strict_portability_blocked: operation=get_record; capability=native.operation.record-read.v1; target=turso-local@5(embedded); reason=source_capability_not_available"
     );
 
     // The same intersection still admits what it admitted before the reopen.

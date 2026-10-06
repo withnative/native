@@ -99,7 +99,7 @@ impl StatusOnlyStdioServer {
         }
     }
 
-    async fn handle_message(&self, message: Value) -> Option<Value> {
+    pub(crate) async fn handle_message(&self, message: Value) -> Option<Value> {
         if message.as_object().is_some_and(|object| {
             object.get("method").is_none()
                 && (object.get("result").is_some() || object.get("error").is_some())
@@ -272,7 +272,16 @@ impl StatusOnlyStdioServer {
                 }
             }
         } else {
-            unavailable_tool_result()
+            let mut result = unavailable_tool_result();
+            if let StatusSource::Dynamic(provider) = &self.status {
+                // Bounded, database-less context lets the owner-only relay
+                // disclose status-only availability without invoking a full
+                // audit or manufacturing a successful workspace read.
+                result["structuredContent"]["standby_context"] =
+                    serde_json::to_value(provider.response_context())
+                        .expect("standby context is serializable");
+            }
+            result
         };
         if modern {
             protocol::add_modern_result_fields(&mut result);

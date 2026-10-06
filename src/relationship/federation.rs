@@ -1971,9 +1971,14 @@ mod tests {
             .await
             .unwrap();
         let destination = temp.path().join("federation-restored.db");
-        let restored = crate::interchange::import_canonical_interchange(&interchange, &destination)
-            .await
-            .unwrap();
+        // ForeignBoundary is appropriate here: this federation fixture has no alpha tabs.
+        let restored = crate::interchange::import_canonical_interchange(
+            &interchange,
+            &destination,
+            crate::interchange::ImportContinuity::ForeignBoundary,
+        )
+        .await
+        .unwrap();
         for table in [
             "relationship_federation_quarantine",
             "relationship_foreign_action_attestations",

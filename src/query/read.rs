@@ -972,16 +972,19 @@ async fn get_record_with_lens_inner(
     principal: Option<crate::authorization::Principal<'_>>,
 ) -> Result<Option<EnrichedRecord>> {
     opts.validate()?;
-    if let Some(principal) = principal {
-        let visible = crate::authorization::effective_capability_in_pool(
-            lens.meta().snapshot_pool(),
-            principal,
-            id,
-        )
-        .await
-        .is_ok_and(|capability| capability.allows(crate::authorization::Capability::View));
-        if !visible {
-            return Ok(None);
+    let member = lens.is_member();
+    if !member {
+        if let Some(principal) = principal {
+            let visible = crate::authorization::effective_capability_in_pool(
+                lens.meta().snapshot_pool(),
+                principal,
+                id,
+            )
+            .await
+            .is_ok_and(|capability| capability.allows(crate::authorization::Capability::View));
+            if !visible {
+                return Ok(None);
+            }
         }
     }
     let db = lens.projection().snapshot_pool();
@@ -990,8 +993,10 @@ async fn get_record_with_lens_inner(
         return Ok(None);
     };
     let mut record = record_from_row(&row)?;
-    super::hydrate_communication_origin_in_pool(db, &mut record).await?;
-    super::hydrate_federation_provenance_in_pool(db, &mut record).await?;
+    if !member {
+        super::hydrate_communication_origin_in_pool(db, &mut record).await?;
+        super::hydrate_federation_provenance_in_pool(db, &mut record).await?;
+    }
     let bears_shape = super::cascade::bears_shape_in_pool(lens.meta().snapshot_pool(), id).await?;
     let kind_governance = match record.kind.as_deref() {
         Some(kind) => Some(
@@ -1011,20 +1016,32 @@ async fn get_record_with_lens_inner(
         return Ok(None);
     }
 
-    let facet_rows = sqlx::query(
+    // A member copy ships no `facet_observations`, so the facet version is
+    // omitted: the member answer is NULL, never `obs:0` (§2.6).
+    let facet_rows = sqlx::query(if member {
+        "SELECT fv.key, fv.value, fv.vocab_ref, NULL AS version \
+         FROM facet_values fv WHERE fv.record_id = ? ORDER BY fv.key"
+    } else {
         "SELECT fv.key, fv.value, fv.vocab_ref,
                 (SELECT MAX(fo.event_seq) FROM facet_observations fo
                   WHERE fo.record_id = fv.record_id AND fo.key = fv.key) AS version
-           FROM facet_values fv WHERE fv.record_id = ? ORDER BY fv.key",
-    )
+           FROM facet_values fv WHERE fv.record_id = ? ORDER BY fv.key"
+    })
     .bind(id)
     .fetch_all(db)
     .await?;
-    let schema_rows = super::cascade::schema_config_rows_for_principal_in_pool(
-        lens.meta().snapshot_pool(),
-        principal,
-    )
-    .await?;
+    // A member copy ships only E(m), and the producer already applied the
+    // exact-id gate, so every shipped schema row is visible; the gate
+    // (`schema_incomplete_for`) decides the schema-surface refusals.
+    let schema_rows = if member {
+        super::cascade::schema_config_rows_in_pool(lens.meta().snapshot_pool(), None).await?
+    } else {
+        super::cascade::schema_config_rows_for_principal_in_pool(
+            lens.meta().snapshot_pool(),
+            principal,
+        )
+        .await?
+    };
     let lifecycle_interpreter = super::lifecycle::LifecycleInterpreter::load_from_pool(
         lens.meta().snapshot_pool(),
         schema_rows.clone(),
@@ -1046,11 +1063,12 @@ async fn get_record_with_lens_inner(
             continue;
         }
         let stored: Option<String> = f.try_get("value")?;
-        let object_typed = facet_shapes
-            .get(&key)
-            .and_then(|shape| shape.get("type"))
-            .and_then(Value::as_str)
-            == Some("object");
+        let object_typed = crate::domain_transaction::declared_type_is_json_object(
+            facet_shapes
+                .get(&key)
+                .and_then(|shape| shape.get("type"))
+                .and_then(Value::as_str),
+        );
         let value = stored.map(|stored| {
             if object_typed {
                 serde_json::from_str::<Value>(&stored)
@@ -1124,7 +1142,11 @@ async fn get_record_with_lens_inner(
     // window itself returns. `tree::descendants`' `child_count` excludes
     // archived unless asked, because the walk it annotates skips archived
     // subtrees whole; enrichment has no such walk to agree with.
-    let not_hidden = super::not_hidden_predicate("r");
+    let not_hidden = if member {
+        super::member_not_hidden_predicate("r")
+    } else {
+        super::not_hidden_predicate("r")
+    };
     let suggestion_candidates = artifact_summaries(
         lens,
         id,
@@ -1214,7 +1236,11 @@ async fn get_record_with_lens_inner(
     if let Some(comments) = comments.as_mut() {
         hydrate_comment_targets_with_lens(lens, comments).await?;
     }
-    let target = if record.record_type == "Annotation" {
+    // Citation resolution compares the anchor with the current source, which
+    // can reflect history the member copy does not hold: the member answer is
+    // an `unavailable_offline` marker at the MCP layer, never a silent None
+    // standing in for an answer. Leave `target` absent here.
+    let target = if record.record_type == "Annotation" && !member {
         let target_owner = if is_comment {
             comment_context_owner_with_lens(lens, id).await?
         } else {
@@ -1313,7 +1339,7 @@ async fn artifact_summaries(
     let mut summaries = Vec::with_capacity(rows.len());
     for row in rows {
         let id: String = row.try_get("id")?;
-        if let Some(principal) = principal {
+        if let Some(principal) = principal.filter(|_| !lens.is_member()) {
             let visible = crate::authorization::effective_capability_in_pool(
                 lens.meta().snapshot_pool(),
                 principal,
@@ -1538,11 +1564,15 @@ async fn hydrate_comment_lifecycles_with_lens(
     comments: &mut [CommentSummary],
     principal: Option<crate::authorization::Principal<'_>>,
 ) -> Result<()> {
-    let schema_rows = super::cascade::schema_config_rows_for_principal_in_pool(
-        lens.meta().snapshot_pool(),
-        principal,
-    )
-    .await?;
+    let schema_rows = if lens.is_member() {
+        super::cascade::schema_config_rows_in_pool(lens.meta().snapshot_pool(), None).await?
+    } else {
+        super::cascade::schema_config_rows_for_principal_in_pool(
+            lens.meta().snapshot_pool(),
+            principal,
+        )
+        .await?
+    };
     let interpreter = super::lifecycle::LifecycleInterpreter::load_from_pool(
         lens.meta().snapshot_pool(),
         schema_rows,
@@ -2025,7 +2055,7 @@ pub(crate) async fn comment_summaries(
             continue;
         }
         let mut summary = comment_summary_from_row(&row)?;
-        if let Some(principal) = principal {
+        if let Some(principal) = principal.filter(|_| !lens.is_member()) {
             let visible = crate::authorization::effective_capability_in_pool(
                 lens.meta().snapshot_pool(),
                 principal,
@@ -2330,11 +2360,12 @@ async fn get_record_live_in(
             continue;
         }
         let stored: Option<String> = facet.try_get("value")?;
-        let object_typed = facet_shapes
-            .get(&key)
-            .and_then(|shape| shape.get("type"))
-            .and_then(Value::as_str)
-            == Some("object");
+        let object_typed = crate::domain_transaction::declared_type_is_json_object(
+            facet_shapes
+                .get(&key)
+                .and_then(|shape| shape.get("type"))
+                .and_then(Value::as_str),
+        );
         let value = stored.map(|stored| {
             if object_typed {
                 serde_json::from_str::<Value>(&stored)

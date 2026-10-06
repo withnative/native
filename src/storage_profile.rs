@@ -45,6 +45,8 @@ const TURSO_LOCAL_PROFILE_V3: &str =
     include_str!("../protocol/storage-portability/v1/profiles/turso-local-v3.json");
 const TURSO_LOCAL_PROFILE_V4: &str =
     include_str!("../protocol/storage-portability/v1/profiles/turso-local-v4.json");
+const TURSO_LOCAL_PROFILE_V5: &str =
+    include_str!("../protocol/storage-portability/v1/profiles/turso-local-v5.json");
 const TURSO_REMOTE_PROFILE_V2: &str =
     include_str!("../protocol/storage-portability/v1/profiles/turso-remote-v2.json");
 const TURSO_EMBEDDED_SYNC_PROFILE_V2: &str =
@@ -197,6 +199,7 @@ fn build_catalog() -> std::result::Result<ProfileCatalog, String> {
         TURSO_LOCAL_PROFILE_V2,
         TURSO_LOCAL_PROFILE_V3,
         TURSO_LOCAL_PROFILE_V4,
+        TURSO_LOCAL_PROFILE_V5,
         TURSO_REMOTE_PROFILE_V2,
         TURSO_EMBEDDED_SYNC_PROFILE_V2,
         LIBSQL_EMBEDDED_REPLICA_PROFILE,
@@ -794,6 +797,128 @@ struct OperationContext {
 tokio::task_local! {
     static PORTABILITY_OPERATION: OperationContext;
 }
+
+/// Owned admission survives cancellation of the response waiter. This is an
+/// internal policy lease, never Caller or session authority.
+#[derive(Clone, Debug)]
+pub(crate) struct OperationAdmission {
+    _lease: std::sync::Arc<tokio::sync::OwnedRwLockReadGuard<()>>,
+    context: OperationContext,
+}
+tokio::task_local! { static OWNED_OPERATION_ADMISSION: OperationAdmission; }
+impl OperationAdmission {
+    pub(crate) async fn scope<F: Future>(&self, future: F) -> F::Output {
+        OWNED_OPERATION_ADMISSION
+            .scope(
+                self.clone(),
+                PORTABILITY_OPERATION.scope(self.context.clone(), future),
+            )
+            .await
+    }
+}
+pub(crate) fn current_admission() -> Result<OperationAdmission> {
+    OWNED_OPERATION_ADMISSION
+        .try_with(Clone::clone)
+        .map_err(|_| Error::engine("enrolled execution requires storage admission"))
+}
+
+/// Pending custody only: neither Caller authority nor an admitted operation.
+/// The retained outer body job must keep this (and any admitted clone) through
+/// registered CPU completion and physical shutdown ACK, or permanent quarantine.
+#[derive(Clone)]
+pub(crate) struct PendingBodyPolicy {
+    db: crate::Db,
+    lease: std::sync::Arc<tokio::sync::OwnedRwLockReadGuard<()>>,
+    deadline: std::time::Instant,
+}
+
+/// Internal causes for the existing body boundary to map statically. These are
+/// not wire codes; policy diagnostics must not be exposed by that boundary.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum BodyPolicyFailure {
+    #[error("body policy deadline exceeded")]
+    Deadline,
+    #[error("body policy handle mismatch")]
+    HandleMismatch,
+    #[error("body policy state failure")]
+    State(#[source] Error),
+    #[error("body policy admission failure")]
+    Admission(#[source] Error),
+}
+
+impl PendingBodyPolicy {
+    /// Acquire ONLY the selected handle's read gate, before physical submission.
+    /// `started` is the true pre-body ingress instant, never a renewed clock.
+    pub(crate) async fn acquire(
+        db: &crate::Db,
+        started: std::time::Instant,
+    ) -> std::result::Result<Self, BodyPolicyFailure> {
+        let deadline = started
+            .checked_add(std::time::Duration::from_secs(5))
+            .ok_or(BodyPolicyFailure::Deadline)?;
+        if std::time::Instant::now() >= deadline {
+            return Err(BodyPolicyFailure::Deadline);
+        }
+        let db = db.clone();
+        let lease = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline),
+            db.owned_portability_policy_gate().read_owned(),
+        )
+        .await
+        .map_err(|_| BodyPolicyFailure::Deadline)?;
+        // A ready gate cannot make a late scheduler poll publication-eligible.
+        if std::time::Instant::now() >= deadline {
+            return Err(BodyPolicyFailure::Deadline);
+        }
+        Ok(Self {
+            db,
+            lease: std::sync::Arc::new(lease),
+            deadline,
+        })
+    }
+
+    /// Pure literal admission from the SAME owned SQLite snapshot as the body.
+    /// H5 must validate storage types/octet totals BEFORE hydration, charge all
+    /// nine columns/copies to its cumulative ledger, and run this decode in a
+    /// registered CPU job. This helper performs no SQL or snapshot acquisition.
+    /// `None` means an actually observed absent policy, never a caught DB fault.
+    pub(crate) fn admit_snapshot(
+        &self,
+        db: &crate::Db,
+        columns: Option<PortabilityPolicyColumns>,
+    ) -> std::result::Result<OperationAdmission, BodyPolicyFailure> {
+        if std::time::Instant::now() >= self.deadline {
+            return Err(BodyPolicyFailure::Deadline);
+        }
+        if db.handle_id() != self.db.handle_id() {
+            return Err(BodyPolicyFailure::HandleMismatch);
+        }
+        let policy = columns
+            .map(decode_policy_columns)
+            .transpose()
+            .map_err(BodyPolicyFailure::State)?;
+        admit_request_operation(
+            policy.as_ref(),
+            &active_target(),
+            "records.body.read.v1",
+            Some("native.operation.record-read.v1"),
+        )
+        .map_err(BodyPolicyFailure::Admission)?;
+        if std::time::Instant::now() >= self.deadline {
+            return Err(BodyPolicyFailure::Deadline);
+        }
+        Ok(OperationAdmission {
+            _lease: self.lease.clone(),
+            context: OperationContext {
+                operation: "records.body.read.v1".into(),
+                capability: Some("native.operation.record-read.v1".into()),
+            },
+        })
+    }
+}
+
+#[cfg(test)]
+mod body_admission_tests;
 
 fn active_target() -> StorageTarget {
     StorageTarget {
@@ -1493,18 +1618,17 @@ pub(crate) async fn with_operation<F, T>(
 where
     F: Future<Output = Result<T>>,
 {
-    let _lease = db.portability_policy_gate().read().await;
+    let lease = db.owned_portability_policy_gate().read_owned().await;
     let policy = load_policy_from_pool(db.pool()).await?;
     admit_request_operation(policy.as_ref(), &active_target(), operation, capability)?;
-    PORTABILITY_OPERATION
-        .scope(
-            OperationContext {
-                operation: operation.into(),
-                capability: capability.map(str::to_string),
-            },
-            future,
-        )
-        .await
+    let admission = OperationAdmission {
+        _lease: std::sync::Arc::new(lease),
+        context: OperationContext {
+            operation: operation.into(),
+            capability: capability.map(str::to_string),
+        },
+    };
+    admission.scope(future).await
 }
 
 /// Admit one response-independent capture without the duplicate

@@ -38,7 +38,9 @@ pub(crate) use federation::{
     VerifiedRelationshipEnvelopeContext,
 };
 #[allow(unused_imports)]
-pub(crate) use integrity::relationship_state_violations;
+pub(crate) use integrity::{
+    relationship_append_only_trigger_violations, relationship_state_violations,
+};
 pub(crate) use native_relationship_kernel::CausalAssertionParent;
 #[allow(unused_imports)] // Phase 3/5 consume the caller-owned transaction seam.
 pub(crate) use persistence::{

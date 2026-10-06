@@ -25,9 +25,18 @@ use crate::error::{Error, Result};
 use crate::schema::DDL_STATEMENTS;
 use crate::store::now_iso;
 
+pub(crate) mod alpha_tab_provenance;
+#[cfg(test)]
+pub(crate) mod alpha_tab_provenance_tests;
+pub use alpha_tab_provenance::{
+    alpha_tab_pin_digest, AlphaTabAdoptionProvenance, AlphaTabUpdatePayload,
+};
+
+pub(crate) use alpha_tab_provenance::complete_update_in as complete_alpha_tab_update_in;
+
 pub const CONTROL_EVENT_SCHEMA_VERSION: i64 = 1;
 
-pub const CONTROL_EVENT_TYPES: [&str; 28] = [
+pub const CONTROL_EVENT_TYPES: [&str; 32] = [
     "agent_run.started.v1",
     "agent_run.started.v2",
     "agent_run.closed.v1",
@@ -53,9 +62,13 @@ pub const CONTROL_EVENT_TYPES: [&str; 28] = [
     "seeded_instruction_source.applied",
     "instruction_binding.reordered",
     "alpha_tab.installed",
+    "alpha_tab.updated",
+    "alpha_tab.import_reset",
     "alpha_tab.disabled",
     "alpha_tab.restored",
     "alpha_tab.removed",
+    "alpha_tab.order_set",
+    "alpha_tab.adopted.v2",
 ];
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -64,6 +77,10 @@ pub struct AgentRunStartedPayload {
     pub activity_id: String,
     pub account_id: String,
     pub started_at: String,
+    /// Transport observed by the server on the admitting `set_intent` call.
+    /// Older start events have no such observation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel: Option<crate::provenance::Channel>,
     /// Self-asserted MCP client name from the admitting call's
     /// `params._meta["io.modelcontextprotocol/clientInfo"]`. Absent means the
     /// admitting call carried no `clientInfo` — never a default string, never
@@ -400,7 +417,22 @@ pub struct AlphaTabStatePayload {
     pub declaration_digest: String,
     pub consented_declaration: Value,
     pub adoption: String,
+    /// Display-only request text recorded at install (E3, task `f1d80b0`):
+    /// what the installer asked for, echoed on adoption. Never authority.
+    /// `None` for installs predating the field and for callers that omit it.
+    #[serde(default)]
+    pub request: Option<String>,
     pub previous_event_id: Option<String>,
+}
+
+/// Canonical import's durable consent boundary. It preserves the complete pin
+/// and status but never receiver eligibility. Ordinary append paths refuse it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AlphaTabImportResetPayload {
+    pub pin: AlphaTabStatePayload,
+    pub status: String,
+    pub adoption_provenance: Option<Value>,
 }
 
 /// The only adoption provenance the backend can honestly stamp in this
@@ -417,13 +449,36 @@ pub const ALPHA_TAB_ADOPTION_CALLER_ASSERTED: &str = "caller_asserted";
 /// proof (`docs/alpha-tab-install-slice3-adopt-gesture.md` §3.1).
 pub const ALPHA_TAB_ADOPTION_VERIFIED: &str = "shell_adopt.v1";
 
+/// Honest shell auto-adoption (plan `100d273` E1, task `f1d80b0`): the
+/// desktop shell adopts a revision its own pane agent authored, over a
+/// cookie session plus trusted-Origin same-origin POST, with no preview
+/// receipt. Pane binding — that the install really came from the shell's
+/// own pane agent — is enforced by the desktop app, not the engine: the
+/// engine records the claimed launch as provenance, labelled asserted.
+/// Never stamped by chaining preview+adopt, which would forge a receipt
+/// claiming a sample preview nobody saw.
+pub const ALPHA_TAB_ADOPTION_SHELL_AUTO: &str = "shell_auto.v1";
+
+/// Bound on display-only alpha-tab request text, in characters.
+pub const ALPHA_TAB_REQUEST_MAX_CHARS: usize = 500;
+
+/// Bound on client-asserted shell-auto provenance fields, in characters.
+pub const ALPHA_TAB_AUTHORED_FIELD_MAX_CHARS: usize = 256;
+
 /// Adopt-confirm payload for `alpha_tab.adopted`: the full consented pin
 /// echoed field-for-field, the verified adoption value, the CAS token it
-/// chains from, and the server-held preview receipt that authorized it.
+/// chains from, and — for `shell_adopt.v1` only — the server-held preview
+/// receipt that authorized it.
 /// Carrying the receipt id plus the pin is what lets idempotency-key
 /// convergence distinguish a retried adopt (same receipt, same intent)
 /// from a conflicting reuse (different receipt, visible error), and what
 /// keeps the audit trail naming which preview authorized the adoption.
+///
+/// `shell_auto.v1` carries no receipt fields (`None`): instead it carries
+/// client-asserted `launch_id` / `authored_run_key` provenance plus the
+/// install's `request` echo. The two kinds are mutually exclusive by
+/// construction — a payload carrying both a receipt and authored fields is
+/// refused — so one event can never claim two consent bases.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AlphaTabAdoptPayload {
@@ -437,9 +492,103 @@ pub struct AlphaTabAdoptPayload {
     pub consented_declaration: Value,
     pub adoption: String,
     pub previous_event_id: String,
-    pub receipt_id: String,
-    pub preview_session: String,
+    /// Server-held preview receipt authorizing a `shell_adopt.v1` adopt.
+    /// `None` for `shell_auto.v1`, which has no preview and no receipt.
+    #[serde(default)]
+    pub receipt_id: Option<String>,
+    /// Preview session the receipt was minted in. `None` for `shell_auto.v1`.
+    #[serde(default)]
+    pub preview_session: Option<String>,
+    /// Client-asserted shell-auto provenance (E1): opaque launch handle
+    /// from the desktop shell. `None` for `shell_adopt.v1` and for older
+    /// rows. Documented as asserted, never verified.
+    #[serde(default)]
+    pub launch_id: Option<String>,
+    /// Client-asserted shell-auto provenance (E1): run key of the pane
+    /// agent that authored the adopted revision. `None` for
+    /// `shell_adopt.v1` and for older rows.
+    #[serde(default)]
+    pub authored_run_key: Option<String>,
+    /// Install's `request` text echoed at adoption (E3). `None` for
+    /// `shell_adopt.v1` rows and when the install carries no request.
+    #[serde(default)]
+    pub request: Option<String>,
 }
+
+/// Private historical structural evidence; not authenticated producer proof.
+/// Only the request-bound trusted producer emits new feature evidence.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AlphaTabBodyReadAdmission {
+    pub need: String,
+    pub scope: String,
+}
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AlphaTabAdoptV2Payload {
+    pub account_id: String,
+    pub package: String,
+    pub version: String,
+    pub digest: String,
+    pub artifact_id: String,
+    pub consented_source_revision: String,
+    pub declaration_digest: String,
+    pub consented_declaration: Value,
+    pub adoption: String,
+    pub previous_event_id: String,
+    /// Server-held preview receipt authorizing a `shell_adopt.v1` adopt.
+    /// `None` for `shell_auto.v1`, which has no preview and no receipt.
+    #[serde(default)]
+    pub receipt_id: Option<String>,
+    /// Preview session the receipt was minted in. `None` for `shell_auto.v1`.
+    #[serde(default)]
+    pub preview_session: Option<String>,
+    /// Client-asserted shell-auto provenance (E1): opaque launch handle
+    /// from the desktop shell. `None` for `shell_adopt.v1` and for older
+    /// rows. Documented as asserted, never verified.
+    #[serde(default)]
+    pub launch_id: Option<String>,
+    /// Client-asserted shell-auto provenance (E1): run key of the pane
+    /// agent that authored the adopted revision. `None` for
+    /// `shell_adopt.v1` and for older rows.
+    #[serde(default)]
+    pub authored_run_key: Option<String>,
+    /// Install's `request` text echoed at adoption (E3). `None` for
+    /// `shell_adopt.v1` rows and when the install carries no request.
+    #[serde(default)]
+    pub request: Option<String>,
+    pub runtime: String,
+    pub bundle_sha256: String,
+    pub body_read_admission: AlphaTabBodyReadAdmission,
+}
+
+/// Personal alpha-tab order (task `c5d3820`).
+///
+/// One row per account in `alpha_tab_orders`: the viewer's full tab-strip
+/// order as an array of tab ids (shell built-ins such as `agents` plus
+/// `pending:<package>` for installs). The event carries complete state —
+/// last writer wins, with no CAS token — because a tab order is a
+/// preference, not a lifecycle transition: two concurrent reorders serialize
+/// in the write transaction and the later one stands. Callers that care
+/// should `list` first and reorder from what they saw.
+///
+/// The tier validates shape only (non-blank account, bounded entries); the
+/// `manage_alpha_tabs` tool validates vocabulary (known built-ins,
+/// installed-or-disabled packages, no duplicates) before appending.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AlphaTabOrderPayload {
+    pub account_id: String,
+    pub tab_order: Vec<String>,
+}
+
+/// Bound on stored tab-order entries: four shell built-ins plus headroom
+/// for installs. The tool refuses longer orders before appending.
+pub const ALPHA_TAB_ORDER_MAX_ENTRIES: usize = 64;
+
+/// Bound on one stored tab id: `pending:` plus a 128-char package id, with
+/// headroom for future built-in ids.
+pub const ALPHA_TAB_ORDER_MAX_ENTRY_CHARS: usize = 160;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ControlEventPayload {
@@ -467,10 +616,14 @@ pub enum ControlEventPayload {
     MemberObligationRolloutBaselined(MemberObligationStatePayload),
     SeededInstructionSourceApplied(SeededInstructionSourceAppliedPayload),
     AlphaTabInstalled(AlphaTabStatePayload),
+    AlphaTabUpdated(Box<AlphaTabUpdatePayload>),
+    AlphaTabImportReset(AlphaTabImportResetPayload),
     AlphaTabDisabled(AlphaTabStatePayload),
     AlphaTabRestored(AlphaTabStatePayload),
     AlphaTabRemoved(AlphaTabStatePayload),
     AlphaTabAdopted(AlphaTabAdoptPayload),
+    AlphaTabAdoptedV2(AlphaTabAdoptV2Payload),
+    AlphaTabOrderSet(AlphaTabOrderPayload),
 }
 
 impl ControlEventPayload {
@@ -500,10 +653,14 @@ impl ControlEventPayload {
             Self::MemberObligationRolloutBaselined(_) => "member_obligation.rollout_baselined",
             Self::SeededInstructionSourceApplied(_) => "seeded_instruction_source.applied",
             Self::AlphaTabInstalled(_) => "alpha_tab.installed",
+            Self::AlphaTabUpdated(_) => "alpha_tab.updated",
+            Self::AlphaTabImportReset(_) => "alpha_tab.import_reset",
             Self::AlphaTabDisabled(_) => "alpha_tab.disabled",
             Self::AlphaTabRestored(_) => "alpha_tab.restored",
             Self::AlphaTabRemoved(_) => "alpha_tab.removed",
             Self::AlphaTabAdopted(_) => "alpha_tab.adopted",
+            Self::AlphaTabAdoptedV2(_) => "alpha_tab.adopted.v2",
+            Self::AlphaTabOrderSet(_) => "alpha_tab.order_set",
         }
     }
 
@@ -531,11 +688,15 @@ impl ControlEventPayload {
             | Self::MemberObligationRebased(_)
             | Self::MemberObligationRolloutBaselined(_) => "member_obligation",
             Self::SeededInstructionSourceApplied(_) => "seeded_instruction_source",
-            Self::AlphaTabInstalled(_)
+            Self::AlphaTabImportReset(_)
+            | Self::AlphaTabUpdated(_)
+            | Self::AlphaTabInstalled(_)
             | Self::AlphaTabDisabled(_)
             | Self::AlphaTabRestored(_)
             | Self::AlphaTabRemoved(_)
-            | Self::AlphaTabAdopted(_) => "alpha_tab",
+            | Self::AlphaTabAdopted(_)
+            | Self::AlphaTabAdoptedV2(_)
+            | Self::AlphaTabOrderSet(_) => "alpha_tab",
         }
     }
 
@@ -578,7 +739,11 @@ impl ControlEventPayload {
             | Self::AlphaTabDisabled(value)
             | Self::AlphaTabRestored(value)
             | Self::AlphaTabRemoved(value) => serde_json::to_string(value)?,
+            Self::AlphaTabUpdated(value) => serde_json::to_string(value)?,
+            Self::AlphaTabImportReset(value) => serde_json::to_string(value)?,
             Self::AlphaTabAdopted(value) => serde_json::to_string(value)?,
+            Self::AlphaTabAdoptedV2(value) => serde_json::to_string(value)?,
+            Self::AlphaTabOrderSet(value) => serde_json::to_string(value)?,
         })
     }
 }
@@ -615,6 +780,14 @@ pub fn member_obligation_aggregate_id(
 /// punctuation from aliasing another pair.
 pub fn alpha_tab_aggregate_id(account_id: &str, package: &str) -> String {
     encode_aggregate_parts(&[account_id, package])
+}
+
+/// Canonical identity for one account's alpha-tab order: the viewer's
+/// database-local account alone. Length-prefix encoding keeps the aggregate
+/// namespace disjoint from install chains even if an account id ever
+/// contained punctuation.
+pub fn alpha_tab_order_aggregate_id(account_id: &str) -> String {
+    encode_aggregate_parts(&[account_id])
 }
 
 #[derive(Debug, Clone)]
@@ -943,6 +1116,39 @@ fn valid_sha256_hex(label: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+/// Display-only alpha-tab request text (E3): optional, 1..=500 characters
+/// when present. The tool rejects over-long input before appending; the
+/// tier enforces the same bound so a forged long request can never be
+/// written directly.
+fn validate_alpha_tab_request(request: Option<&str>) -> Result<()> {
+    if let Some(text) = request {
+        let chars = text.chars().count();
+        if text.trim().is_empty() || chars > ALPHA_TAB_REQUEST_MAX_CHARS {
+            return Err(Error::engine(format!(
+                "control event alpha tab request must be 1..={} characters",
+                ALPHA_TAB_REQUEST_MAX_CHARS
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// One client-asserted shell-auto provenance field (E1): optional,
+/// 1..=256 characters when present. Asserted, never verified — the bound
+/// keeps the provenance column honest, not authoritative.
+fn validate_alpha_tab_authored_field(label: &str, value: Option<&str>) -> Result<()> {
+    if let Some(text) = value {
+        let chars = text.chars().count();
+        if text.trim().is_empty() || chars > ALPHA_TAB_AUTHORED_FIELD_MAX_CHARS {
+            return Err(Error::engine(format!(
+                "control event alpha tab {label} must be 1..={} characters",
+                ALPHA_TAB_AUTHORED_FIELD_MAX_CHARS
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn validate_alpha_tab(event: &ControlEventRow, value: &AlphaTabStatePayload) -> Result<()> {
     for (label, text) in [
         ("alpha tab account_id", value.account_id.as_str()),
@@ -980,6 +1186,13 @@ fn validate_alpha_tab(event: &ControlEventRow, value: &AlphaTabStatePayload) -> 
             "control event alpha tab consented_declaration must be an object",
         ));
     }
+    crate::alpha_tab_sessions::validate_declaration_sessions(&value.consented_declaration)
+        .map_err(|reason| {
+            Error::engine(format!(
+                "control event alpha tab consented_declaration sessions invalid: {reason}"
+            ))
+        })?;
+    validate_alpha_tab_request(value.request.as_deref())?;
     if let Some(previous) = value.previous_event_id.as_deref() {
         nonblank("alpha tab previous_event_id", previous)?;
     }
@@ -991,10 +1204,42 @@ fn validate_alpha_tab(event: &ControlEventRow, value: &AlphaTabStatePayload) -> 
     Ok(())
 }
 
+/// Validate an `alpha_tab.order_set` event: shape only. The entry vocabulary
+/// (known built-ins, installed packages, no duplicates) is the tool's check
+/// (`manage_alpha_tabs reorder`); the tier refuses only what no honest tool
+/// would append — a blank account, an over-long order, or a blank or
+/// over-long entry — plus a wrong aggregate id, so a forged order can never
+/// be written directly under another account's aggregate.
+fn validate_alpha_tab_order(event: &ControlEventRow, value: &AlphaTabOrderPayload) -> Result<()> {
+    nonblank("alpha tab account_id", &value.account_id)?;
+    if value.tab_order.len() > ALPHA_TAB_ORDER_MAX_ENTRIES {
+        return Err(Error::engine(format!(
+            "control event alpha tab order holds {} entries (max {})",
+            value.tab_order.len(),
+            ALPHA_TAB_ORDER_MAX_ENTRIES
+        )));
+    }
+    for entry in &value.tab_order {
+        if entry.trim().is_empty() || entry.len() > ALPHA_TAB_ORDER_MAX_ENTRY_CHARS {
+            return Err(Error::engine(
+                "control event alpha tab order entry must be 1..160 characters",
+            ));
+        }
+    }
+    if event.aggregate_id != alpha_tab_order_aggregate_id(&value.account_id) {
+        return Err(Error::engine(
+            "alpha tab order aggregate id does not match its canonical payload identity",
+        ));
+    }
+    Ok(())
+}
+
 /// Validate an `alpha_tab.adopted` event: the full consented pin echoed
 /// field-for-field, the closed-vocabulary verified adoption (and nothing
 /// else — a caller-asserted adopt is a contradiction in terms), the CAS
-/// token it chains from, and the receipt that authorized it. The receipt's
+/// token it chains from, and the proof for its kind: the receipt that
+/// authorized a `shell_adopt.v1` adopt, or the asserted provenance (and no
+/// receipt) for a `shell_auto.v1` one. The receipt's
 /// own liveness, account/pin binding, and single-use are the tool's check
 /// (`verify_alpha_tab_adopt_confirm`); the tier checks what the event
 /// claims, so a forged verified adoption can never be written directly.
@@ -1017,8 +1262,6 @@ fn validate_alpha_tab_adopt(event: &ControlEventRow, value: &AlphaTabAdoptPayloa
             "alpha tab previous_event_id",
             value.previous_event_id.as_str(),
         ),
-        ("alpha tab receipt_id", value.receipt_id.as_str()),
-        ("alpha tab preview_session", value.preview_session.as_str()),
     ] {
         nonblank(label, text)?;
     }
@@ -1029,9 +1272,43 @@ fn validate_alpha_tab_adopt(event: &ControlEventRow, value: &AlphaTabAdoptPayloa
     };
     valid_sha256_hex("alpha tab digest", digest_hex)?;
     valid_sha256_hex("alpha tab declaration_digest", &value.declaration_digest)?;
-    if value.adoption != ALPHA_TAB_ADOPTION_VERIFIED {
+    // The consent basis is exactly one of the two verified kinds, and each
+    // kind carries only its own proof: a receipt adopt never carries
+    // authored fields or a request echo, and an authored adopt never
+    // carries receipt fields.
+    if value.adoption == ALPHA_TAB_ADOPTION_VERIFIED {
+        for (label, field) in [
+            ("alpha tab receipt_id", value.receipt_id.as_deref()),
+            (
+                "alpha tab preview_session",
+                value.preview_session.as_deref(),
+            ),
+        ] {
+            let Some(text) = field else {
+                return Err(Error::engine(format!(
+                    "control event {label} is required for shell_adopt.v1"
+                )));
+            };
+            nonblank(label, text)?;
+        }
+        if value.launch_id.is_some() || value.authored_run_key.is_some() || value.request.is_some()
+        {
+            return Err(Error::engine(
+                "control event alpha tab shell_adopt.v1 carries no authored fields or request echo",
+            ));
+        }
+    } else if value.adoption == ALPHA_TAB_ADOPTION_SHELL_AUTO {
+        if value.receipt_id.is_some() || value.preview_session.is_some() {
+            return Err(Error::engine(
+                "control event alpha tab shell_auto.v1 carries no receipt fields",
+            ));
+        }
+        validate_alpha_tab_authored_field("launch_id", value.launch_id.as_deref())?;
+        validate_alpha_tab_authored_field("authored_run_key", value.authored_run_key.as_deref())?;
+        validate_alpha_tab_request(value.request.as_deref())?;
+    } else {
         return Err(Error::engine(
-            "control event alpha tab adoption is unknown: alpha_tab.adopted carries only shell_adopt.v1",
+            "control event alpha tab adoption is unknown: alpha_tab.adopted carries only shell_adopt.v1 and shell_auto.v1",
         ));
     }
     if !value.consented_declaration.is_object() {
@@ -1039,6 +1316,12 @@ fn validate_alpha_tab_adopt(event: &ControlEventRow, value: &AlphaTabAdoptPayloa
             "control event alpha tab consented_declaration must be an object",
         ));
     }
+    crate::alpha_tab_sessions::validate_declaration_sessions(&value.consented_declaration)
+        .map_err(|reason| {
+            Error::engine(format!(
+                "control event alpha tab consented_declaration sessions invalid: {reason}"
+            ))
+        })?;
     if event.aggregate_id != alpha_tab_aggregate_id(&value.account_id, &value.package) {
         return Err(Error::engine(
             "alpha tab aggregate id does not match its canonical payload identity",
@@ -1047,7 +1330,160 @@ fn validate_alpha_tab_adopt(event: &ControlEventRow, value: &AlphaTabAdoptPayloa
     Ok(())
 }
 
+/// Immutable adopted.v2 audit and frozen structural commitment validation.
+// Intrinsically versioned frozen proof; also used by private outcome recovery.
+pub(crate) fn validate_alpha_tab_adopt_v2(
+    event: &ControlEventRow,
+    value: &AlphaTabAdoptV2Payload,
+) -> Result<()> {
+    for (label, text) in [
+        ("alpha tab account_id", value.account_id.as_str()),
+        ("alpha tab package", value.package.as_str()),
+        ("alpha tab version", value.version.as_str()),
+        ("alpha tab digest", value.digest.as_str()),
+        ("alpha tab artifact_id", value.artifact_id.as_str()),
+        (
+            "alpha tab consented_source_revision",
+            value.consented_source_revision.as_str(),
+        ),
+        (
+            "alpha tab declaration_digest",
+            value.declaration_digest.as_str(),
+        ),
+        (
+            "alpha tab previous_event_id",
+            value.previous_event_id.as_str(),
+        ),
+    ] {
+        nonblank(label, text)?;
+    }
+    let Some(digest_hex) = value.digest.strip_prefix("sha256:") else {
+        return Err(Error::engine(
+            "control event alpha tab digest must start with 'sha256:'",
+        ));
+    };
+    valid_sha256_hex("alpha tab digest", digest_hex)?;
+    valid_sha256_hex("alpha tab declaration_digest", &value.declaration_digest)?;
+    // The consent basis is exactly one of the two verified kinds, and each
+    // kind carries only its own proof: a receipt adopt never carries
+    // authored fields or a request echo, and an authored adopt never
+    // carries receipt fields.
+    if value.adoption == "shell_adopt.v1" {
+        for (label, field) in [
+            ("alpha tab receipt_id", value.receipt_id.as_deref()),
+            (
+                "alpha tab preview_session",
+                value.preview_session.as_deref(),
+            ),
+        ] {
+            let Some(text) = field else {
+                return Err(Error::engine(format!(
+                    "control event {label} is required for shell_adopt.v1"
+                )));
+            };
+            nonblank(label, text)?;
+        }
+        if value.launch_id.is_some() || value.authored_run_key.is_some() || value.request.is_some()
+        {
+            return Err(Error::engine(
+                "control event alpha tab shell_adopt.v1 carries no authored fields or request echo",
+            ));
+        }
+    } else if value.adoption == "shell_auto.v1" {
+        if value.receipt_id.is_some() || value.preview_session.is_some() {
+            return Err(Error::engine(
+                "control event alpha tab shell_auto.v1 carries no receipt fields",
+            ));
+        }
+        validate_v2_optional_text("launch_id", value.launch_id.as_deref(), 256)?;
+        validate_v2_optional_text("authored_run_key", value.authored_run_key.as_deref(), 256)?;
+        validate_v2_optional_text("request", value.request.as_deref(), 500)?;
+    } else {
+        return Err(Error::engine(
+            "control event alpha tab adoption is unknown: alpha_tab.adopted.v2 carries only shell_adopt.v1 and shell_auto.v1",
+        ));
+    }
+    if !value.consented_declaration.is_object() {
+        return Err(Error::engine(
+            "control event alpha tab consented_declaration must be an object",
+        ));
+    }
+    use crate::alpha_tab_body_admission_v1 as frozen;
+    if value.body_read_admission.need != "records.body.read.v1"
+        || value.body_read_admission.scope != "viewer-visible-current-bodies"
+        || !frozen::has_body_descriptor(&value.consented_declaration)?
+    {
+        return Err(Error::engine(
+            "invalid frozen body read admission descriptor",
+        ));
+    }
+    if value.runtime != "native.html.v1" {
+        return Err(Error::engine(
+            "body admission runtime must be native.html.v1",
+        ));
+    }
+    valid_sha256_hex("alpha tab bundle_sha256", &value.bundle_sha256)?;
+    if frozen::declaration_digest(&value.consented_declaration)? != value.declaration_digest
+        || frozen::install_digest(
+            &value.bundle_sha256,
+            &value.declaration_digest,
+            &value.runtime,
+        ) != value.digest
+    {
+        return Err(Error::engine(
+            "frozen body admission pin commitment mismatch",
+        ));
+    }
+    // New feature evidence is intrinsically an engine-created event generation.
+    // No marker identity is accepted in the payload or synthesized on replay.
+    for id in [&event.id, &value.previous_event_id] {
+        if uuid::Uuid::parse_str(id)
+            .map(|uuid| uuid.to_string())
+            .ok()
+            .as_ref()
+            != Some(id)
+        {
+            return Err(Error::engine(
+                "body admission event/CAS identity must be a canonical UUID",
+            ));
+        }
+    }
+    if event.aggregate_id != alpha_tab_aggregate_id(&value.account_id, &value.package) {
+        return Err(Error::engine(
+            "alpha tab aggregate id does not match its canonical payload identity",
+        ));
+    }
+    Ok(())
+}
+// Frozen v2 audit string bounds from26f5a47; independent of current adoption helpers.
+fn validate_v2_optional_text(label: &str, value: Option<&str>, max_chars: usize) -> Result<()> {
+    if value.is_some_and(|s| s.trim().is_empty() || s.chars().count() > max_chars) {
+        return Err(Error::engine(format!(
+            "frozen body adoption {label} exceeds its text bound"
+        )));
+    }
+    Ok(())
+}
+
+/// Validate new appends. Historical replay uses the tolerant stored validator,
+/// so tightening restore admission does not rewrite legacy event semantics.
 pub fn validate_control_event(event: &ControlEventRow) -> Result<()> {
+    if event.event_type == "alpha_tab.import_reset" {
+        return Err(Error::engine(
+            "alpha tab import reset is reserved for canonical import",
+        ));
+    }
+    if event.event_type == "alpha_tab.restored"
+        && decode::<AlphaTabStatePayload>(event)?.adoption != ALPHA_TAB_ADOPTION_CALLER_ASSERTED
+    {
+        return Err(Error::engine(
+            "new alpha tab restore must require fresh adoption",
+        ));
+    }
+    validate_stored_control_event(event)
+}
+
+pub(crate) fn validate_stored_control_event(event: &ControlEventRow) -> Result<()> {
     positive("sequence", event.seq)?;
     for (label, value) in [
         ("id", event.id.as_str()),
@@ -1324,9 +1760,33 @@ pub fn validate_control_event(event: &ControlEventRow) -> Result<()> {
             let value: AlphaTabStatePayload = decode(event)?;
             validate_alpha_tab(event, &value)?;
         }
+        "alpha_tab.import_reset" => {
+            let value: AlphaTabImportResetPayload = decode(event)?;
+            validate_alpha_tab(event, &value.pin)?;
+            if value.pin.adoption != ALPHA_TAB_ADOPTION_CALLER_ASSERTED
+                || value.adoption_provenance.is_some()
+                || value.pin.previous_event_id.is_none()
+                || !matches!(value.status.as_str(), "installed" | "disabled" | "removed")
+            {
+                return Err(Error::engine("alpha tab import reset must preserve status and require fresh adoption with NULL provenance"));
+            }
+            alpha_tab_provenance::alpha_tab_pin_digest(&value.pin)?;
+        }
+        "alpha_tab.updated" => {
+            let value: AlphaTabUpdatePayload = decode(event)?;
+            alpha_tab_provenance::validate_update(event, &value)?;
+        }
         "alpha_tab.adopted" => {
             let value: AlphaTabAdoptPayload = decode(event)?;
             validate_alpha_tab_adopt(event, &value)?;
+        }
+        "alpha_tab.adopted.v2" => {
+            let value: AlphaTabAdoptV2Payload = decode(event)?;
+            validate_alpha_tab_adopt_v2(event, &value)?;
+        }
+        "alpha_tab.order_set" => {
+            let value: AlphaTabOrderPayload = decode(event)?;
+            validate_alpha_tab_order(event, &value)?;
         }
         "seeded_instruction_source.applied" => {
             let value: SeededInstructionSourceAppliedPayload = decode(event)?;
@@ -1403,7 +1863,7 @@ pub(crate) async fn project_control(
     conn: &mut SqliteConnection,
     event: &ControlEventRow,
 ) -> Result<()> {
-    validate_control_event(event)?;
+    validate_stored_control_event(event)?;
     let applied: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM control_event_applications WHERE event_id = ?)",
     )
@@ -1896,6 +2356,12 @@ pub(crate) async fn project_control(
             .execute(&mut *conn)
                 .await?;
         }
+        "alpha_tab.import_reset" => {
+            alpha_tab_provenance::fold_import_reset(conn, event).await?;
+        }
+        "alpha_tab.updated" => {
+            alpha_tab_provenance::fold_update(conn, event).await?;
+        }
         "alpha_tab.installed" => {
             let value: AlphaTabStatePayload = decode(event)?;
             let existing: Option<(String, String)> = sqlx::query_as(
@@ -1926,8 +2392,8 @@ pub(crate) async fn project_control(
             sqlx::query(
                 "INSERT INTO alpha_tab_installs
                  (account_id,package,version,digest,artifact_id,consented_source_revision,
-                  declaration_digest,consented_declaration,adoption,status,event_id,event_seq,updated_at)
-                 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+                  declaration_digest,consented_declaration,adoption,request,status,event_id,event_seq,updated_at)
+                 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                  ON CONFLICT(account_id,package) DO UPDATE SET
                    version=excluded.version,digest=excluded.digest,
                    artifact_id=excluded.artifact_id,
@@ -1935,6 +2401,8 @@ pub(crate) async fn project_control(
                    declaration_digest=excluded.declaration_digest,
                    consented_declaration=excluded.consented_declaration,
                    adoption=excluded.adoption,
+                   adoption_provenance=NULL,body_read_admission_event_id=NULL,
+                   request=excluded.request,
                    status='installed',event_id=excluded.event_id,
                    event_seq=excluded.event_seq,updated_at=excluded.updated_at",
             )
@@ -1947,6 +2415,7 @@ pub(crate) async fn project_control(
             .bind(value.declaration_digest)
             .bind(serde_json::to_string(&value.consented_declaration)?)
             .bind(value.adoption)
+            .bind(value.request)
             .bind("installed")
             .bind(&event.id)
             .bind(event.seq)
@@ -1989,7 +2458,7 @@ pub(crate) async fn project_control(
                 "UPDATE alpha_tab_installs
                     SET version=?,digest=?,artifact_id=?,consented_source_revision=?,
                         declaration_digest=?,consented_declaration=?,adoption=?,
-                        status='installed',event_id=?,event_seq=?,updated_at=?
+                        request=?,adoption_provenance=NULL,body_read_admission_event_id=NULL,status='installed',event_id=?,event_seq=?,updated_at=?
                   WHERE account_id=? AND package=? AND status='disabled' AND event_id=?",
             )
             .bind(value.version)
@@ -1999,6 +2468,7 @@ pub(crate) async fn project_control(
             .bind(value.declaration_digest)
             .bind(serde_json::to_string(&value.consented_declaration)?)
             .bind(value.adoption)
+            .bind(value.request)
             .bind(&event.id)
             .bind(event.seq)
             .bind(&event.created_at)
@@ -2023,7 +2493,8 @@ pub(crate) async fn project_control(
                 "UPDATE alpha_tab_installs
                     SET version=?,digest=?,artifact_id=?,consented_source_revision=?,
                         declaration_digest=?,consented_declaration=?,adoption=?,
-                        status='installed',event_id=?,event_seq=?,updated_at=?
+                        request=COALESCE(?,request),adoption_provenance=?,
+                        status='installed',body_read_admission_event_id=NULL,event_id=?,event_seq=?,updated_at=?
                    WHERE account_id=? AND package=? AND status='installed' AND event_id=?
                      AND version=? AND digest=? AND artifact_id=?
                      AND consented_source_revision=? AND declaration_digest=?",
@@ -2035,6 +2506,100 @@ pub(crate) async fn project_control(
             .bind(value.declaration_digest.clone())
             .bind(serde_json::to_string(&value.consented_declaration)?)
             .bind(value.adoption.clone())
+            .bind(value.request.clone())
+            .bind(alpha_tab_provenance::direct_provenance_json(conn, event, &value).await?)
+            .bind(&event.id)
+            .bind(event.seq)
+            .bind(&event.created_at)
+            .bind(value.account_id.clone())
+            .bind(value.package.clone())
+            .bind(value.previous_event_id.clone())
+            .bind(value.version)
+            .bind(value.digest)
+            .bind(value.artifact_id)
+            .bind(value.consented_source_revision)
+            .bind(value.declaration_digest)
+            .execute(&mut *conn)
+            .await?;
+            require_one(result, event).await?;
+        }
+        "alpha_tab.order_set" => {
+            let value: AlphaTabOrderPayload = decode(event)?;
+            // Complete-state preference write: last event wins, no CAS.
+            // An empty order is a reset — the row stays (so the event keeps
+            // its projection) and readers fall back to the default order.
+            sqlx::query(
+                "INSERT INTO alpha_tab_orders
+                  (account_id,tab_order,event_id,event_seq,updated_at)
+                  VALUES(?,?,?,?,?)
+                  ON CONFLICT(account_id) DO UPDATE SET
+                    tab_order=excluded.tab_order,event_id=excluded.event_id,
+                    event_seq=excluded.event_seq,updated_at=excluded.updated_at",
+            )
+            .bind(value.account_id)
+            .bind(serde_json::to_string(&value.tab_order)?)
+            .bind(&event.id)
+            .bind(event.seq)
+            .bind(&event.created_at)
+            .execute(&mut *conn)
+            .await?;
+        }
+        "alpha_tab.adopted.v2" => {
+            let value: AlphaTabAdoptV2Payload = decode(event)?;
+            // Adopt flips a live install to verified adoption without
+            // changing its pin: the event's pin must equal the stored row's
+            // pin field-for-field (a receipt for another pin can never adopt
+            // this install), the CAS token must name the current event, and
+            // only `installed` rows adopt — a disabled tab restores first.
+            // The receipt's own liveness and single-use are the tool's
+            // check; the projection refuses anything the tool should never
+            // have appended.
+            // Control replay has inert record identities, not retained app bytes.
+            // Bind to the exact prior installed declaration and full pin here;
+            // the later genuine issuer and per-page resolver must verify source bytes.
+            let prior: Option<String> = sqlx::query_scalar(
+                "SELECT consented_declaration FROM alpha_tab_installs
+                 WHERE account_id=? AND package=? AND status='installed' AND event_id=?",
+            )
+            .bind(&value.account_id)
+            .bind(&value.package)
+            .bind(&value.previous_event_id)
+            .fetch_optional(&mut *conn)
+            .await?;
+            let Some(prior) = prior else {
+                return Err(Error::engine(
+                    "body admission has no matching current install/CAS",
+                ));
+            };
+            let prior: Value = serde_json::from_str(&prior)?;
+            if prior != value.consented_declaration
+                || crate::alpha_tab_body_admission_v1::declaration_digest(&prior)?
+                    != value.declaration_digest
+            {
+                return Err(Error::engine(
+                    "body admission prior declaration linkage mismatch",
+                ));
+            }
+            let result = sqlx::query(
+                "UPDATE alpha_tab_installs
+                    SET version=?,digest=?,artifact_id=?,consented_source_revision=?,
+                        declaration_digest=?,consented_declaration=?,adoption=?,
+                        request=COALESCE(?,request),adoption_provenance=?,
+                        status='installed',body_read_admission_event_id=?,event_id=?,event_seq=?,updated_at=?
+                   WHERE account_id=? AND package=? AND status='installed' AND event_id=?
+                     AND version=? AND digest=? AND artifact_id=?
+                     AND consented_source_revision=? AND declaration_digest=?",
+            )
+            .bind(value.version.clone())
+            .bind(value.digest.clone())
+            .bind(value.artifact_id.clone())
+            .bind(value.consented_source_revision.clone())
+            .bind(value.declaration_digest.clone())
+            .bind(serde_json::to_string(&value.consented_declaration)?)
+            .bind(value.adoption.clone())
+            .bind(value.request.clone())
+            .bind(alpha_tab_provenance::direct_v2_provenance_json(conn, event, &value).await?)
+            .bind(&event.id)
             .bind(&event.id)
             .bind(event.seq)
             .bind(&event.created_at)
@@ -2060,7 +2625,7 @@ pub(crate) async fn project_control(
             };
             let result = sqlx::query(
                 "UPDATE alpha_tab_installs
-                    SET status='removed',event_id=?,event_seq=?,updated_at=?
+                    SET status='removed',adoption_provenance=NULL,body_read_admission_event_id=NULL,event_id=?,event_seq=?,updated_at=?
                    WHERE account_id=? AND package=?
                      AND status IN ('installed','disabled') AND event_id=?",
             )
@@ -2154,6 +2719,19 @@ async fn append_control_event_on(
     input: NewControlEvent,
     act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<ControlEventRow> {
+    if matches!(input.payload, ControlEventPayload::AlphaTabImportReset(_)) {
+        return Err(Error::engine(
+            "alpha tab import reset is reserved for canonical import",
+        ));
+    }
+    append_control_event_on_internal(conn, input, act_alloc).await
+}
+
+async fn append_control_event_on_internal(
+    conn: &mut SqliteConnection,
+    input: NewControlEvent,
+    act_alloc: &mut crate::act::ActAllocation,
+) -> Result<ControlEventRow> {
     nonblank("idempotency key", &input.idempotency_key)?;
     nonblank("aggregate id", &input.aggregate_id)?;
     nonblank("actor", &input.actor)?;
@@ -2193,7 +2771,11 @@ async fn append_control_event_on(
         created_at: now_iso(),
         act: None,
     };
-    validate_control_event(&event)?;
+    if event.event_type == "alpha_tab.import_reset" {
+        validate_stored_control_event(&event)?;
+    } else {
+        validate_control_event(&event)?;
+    }
     let act = act_alloc.get_or_allocate(conn).await?;
     event.seq = sqlx::query_scalar(
         "INSERT INTO control_events
@@ -2252,11 +2834,30 @@ pub(crate) struct AgentRunLifecycle {
 /// recorded model value is benign. Clamping applies before anything is
 /// compared or stamped, so an overlong repeat of the recorded value still
 /// matches what admission stored.
+#[cfg(test)]
 pub(crate) async fn ensure_agent_run(
     db: &Db,
     run_key: &str,
     account_id: &str,
     reported: ReportedRunIdentity,
+) -> Result<AgentRunLifecycle> {
+    ensure_agent_run_with_channel(
+        db,
+        run_key,
+        account_id,
+        reported,
+        crate::provenance::Channel::Unknown,
+    )
+    .await
+}
+
+/// Admit a run with the server-observed transport of its first declaration.
+pub(crate) async fn ensure_agent_run_with_channel(
+    db: &Db,
+    run_key: &str,
+    account_id: &str,
+    reported: ReportedRunIdentity,
+    channel: crate::provenance::Channel,
 ) -> Result<AgentRunLifecycle> {
     if !matches!(
         crate::runkey::validate_full(Some(run_key)),
@@ -2312,6 +2913,7 @@ pub(crate) async fn ensure_agent_run(
                 activity_id: activity_id.clone(),
                 account_id: account_id.to_string(),
                 started_at: started_at.clone(),
+                channel: (channel != crate::provenance::Channel::Unknown).then_some(channel),
                 reported_mcp_client_name: reported.client_name,
                 reported_mcp_client_version: reported.client_version,
                 reported_model: reported.model,
@@ -2552,7 +3154,67 @@ pub(crate) async fn replay_control(
     Ok(())
 }
 
-const CONTROL_OBJECTS: [&str; 18] = [
+/// The sealed witness can only be constructed by canonical import, after
+/// rebuilding its unpublished staging projections. No MCP/member-copy path
+/// can author this boundary; authenticated primary standby replay may fold it.
+pub(crate) async fn reset_imported_alpha_tabs_in(
+    conn: &mut SqliteConnection,
+    _import: crate::interchange::CanonicalImportConsentBoundary,
+) -> Result<()> {
+    let rows = sqlx::query("SELECT * FROM alpha_tab_installs ORDER BY account_id,package")
+        .fetch_all(&mut *conn)
+        .await?;
+    let mut allocation = crate::act::ActAllocation::new();
+    for row in rows {
+        let mut pin = alpha_tab_provenance::projection_pin(&row)?;
+        pin.adoption = ALPHA_TAB_ADOPTION_CALLER_ASSERTED.into();
+        pin.previous_event_id = Some(row.try_get("event_id")?);
+        let payload = AlphaTabImportResetPayload {
+            pin: pin.clone(),
+            status: row.try_get("status")?,
+            adoption_provenance: None,
+        };
+        let input = NewControlEvent::authored(
+            uuid::Uuid::new_v4().to_string(),
+            alpha_tab_aggregate_id(&pin.account_id, &pin.package),
+            "canonical_import",
+            None,
+            "Imported workspace requires fresh browser Preview → Adopt",
+            ControlEventPayload::AlphaTabImportReset(payload),
+        )?;
+        append_control_event_on_internal(conn, input, &mut allocation).await?;
+    }
+    Ok(())
+}
+
+/// Alpha-tab projections are omitted from canonical interchange. Rebuild only
+/// this family in unpublished import staging so conformance can validate history.
+/// Imported event claims alone are not receiver consent: canonical import must
+/// append its durable reset boundaries immediately after this rebuild.
+/// Carried markers for other control projections stay intact.
+pub(crate) async fn rebuild_alpha_tab_projections_in(conn: &mut SqliteConnection) -> Result<()> {
+    sqlx::query("DELETE FROM alpha_tab_installs")
+        .execute(&mut *conn)
+        .await?;
+    sqlx::query("DELETE FROM alpha_tab_orders")
+        .execute(&mut *conn)
+        .await?;
+    sqlx::query("DELETE FROM control_event_applications WHERE event_id IN (SELECT id FROM control_events WHERE aggregate_kind='alpha_tab')")
+        .execute(&mut *conn).await?;
+    let mut after: Option<i64> = None;
+    loop {
+        let event = sqlx::query("SELECT seq,id,idempotency_key,type,schema_version,aggregate_kind,aggregate_id,actor,run_key,reason,payload,created_at,act FROM control_events WHERE aggregate_kind='alpha_tab' AND (? IS NULL OR seq>?) ORDER BY seq LIMIT 1")
+            .bind(after).bind(after).fetch_optional(&mut *conn).await?.map(row_from_sql).transpose()?;
+        let Some(event) = event else {
+            break;
+        };
+        project_control(conn, &event).await?;
+        after = Some(event.seq);
+    }
+    Ok(())
+}
+
+const CONTROL_OBJECTS: [&str; 19] = [
     "control_events",
     "idx_control_events_aggregate",
     "control_events_no_update",
@@ -2570,6 +3232,7 @@ const CONTROL_OBJECTS: [&str; 18] = [
     "seeded_instruction_sources",
     "alpha_tab_installs",
     "idx_alpha_tab_installs_artifact",
+    "alpha_tab_orders",
     "control_event_applications",
 ];
 
@@ -2759,7 +3422,7 @@ pub(crate) async fn canonical_projection_snapshot(
     })
     .collect::<Result<Vec<_>>>()?;
     let alpha_tab_installs = sqlx::query(
-        "SELECT account_id,package,version,digest,artifact_id,consented_source_revision,declaration_digest,consented_declaration,adoption,status,event_id,event_seq,updated_at FROM alpha_tab_installs ORDER BY account_id,package",
+        "SELECT account_id,package,version,digest,artifact_id,consented_source_revision,declaration_digest,consented_declaration,adoption,adoption_provenance,body_read_admission_event_id,request,status,event_id,event_seq,updated_at FROM alpha_tab_installs ORDER BY account_id,package",
     )
     .fetch_all(&mut conn)
     .await?
@@ -2776,7 +3439,27 @@ pub(crate) async fn canonical_projection_snapshot(
             "declaration_digest": row.try_get::<String, _>("declaration_digest")?,
             "consented_declaration": declaration,
             "adoption": row.try_get::<String, _>("adoption")?,
+            "adoption_provenance": row.try_get::<Option<String>, _>("adoption_provenance")?.map(|text| serde_json::from_str::<Value>(&text)).transpose()?,
+            "body_read_admission_event_id": row.try_get::<Option<String>, _>("body_read_admission_event_id")?,
+            "request": row.try_get::<Option<String>, _>("request")?,
             "status": row.try_get::<String, _>("status")?,
+            "event_id": row.try_get::<String, _>("event_id")?,
+            "event_seq": row.try_get::<i64, _>("event_seq")?,
+            "updated_at": row.try_get::<String, _>("updated_at")?,
+        }))
+    })
+    .collect::<Result<Vec<_>>>()?;
+    let alpha_tab_orders = sqlx::query(
+        "SELECT account_id,tab_order,event_id,event_seq,updated_at FROM alpha_tab_orders ORDER BY account_id",
+    )
+    .fetch_all(&mut conn)
+    .await?
+    .into_iter()
+    .map(|row| {
+        let tab_order = serde_json::from_str::<Value>(&row.try_get::<String, _>("tab_order")?)?;
+        Ok(json!({
+            "account_id": row.try_get::<String, _>("account_id")?,
+            "tab_order": tab_order,
             "event_id": row.try_get::<String, _>("event_id")?,
             "event_seq": row.try_get::<i64, _>("event_seq")?,
             "updated_at": row.try_get::<String, _>("updated_at")?,
@@ -2794,6 +3477,7 @@ pub(crate) async fn canonical_projection_snapshot(
         "member_obligation_progress": member_obligation_progress,
         "seeded_instruction_sources": seeded_instruction_sources,
         "alpha_tab_installs": alpha_tab_installs,
+        "alpha_tab_orders": alpha_tab_orders,
     }))
 }
 
@@ -2865,7 +3549,7 @@ pub async fn state_violations_on(conn: &mut SqliteConnection) -> Result<Vec<Stri
                'agent_runs','idx_agent_runs_account_started','member_contexts','instruction_bindings','onboarding_programmes',
                'onboarding_programme_sources','member_obligations',
                 'member_obligation_progress','seeded_instruction_sources','idx_instruction_bindings_source',
-                'alpha_tab_installs','idx_alpha_tab_installs_artifact',
+                'alpha_tab_installs','idx_alpha_tab_installs_artifact','alpha_tab_orders',
                 'idx_member_obligations_one_pending','idx_control_events_aggregate')
           ORDER BY name,type",
     )
@@ -2918,7 +3602,7 @@ pub async fn state_violations_on(conn: &mut SqliteConnection) -> Result<Vec<Stri
                 event.seq
             ));
         }
-        if let Err(error) = validate_control_event(event) {
+        if let Err(error) = validate_stored_control_event(event) {
             violations.push(format!("control event {} is malformed: {error}", event.id));
         }
     }

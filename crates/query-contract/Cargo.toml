@@ -14,6 +14,7 @@ default = []
 [dependencies]
 base64 = "0.23.0"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
+regex-syntax = "0.8"
 serde = { version = "=1.0.228", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 thiserror = "2"

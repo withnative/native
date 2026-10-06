@@ -1,0 +1,122 @@
+{
+  "recipe": "workspace_rule_canonical_v1",
+  "cases": [
+    {
+      "id": "reviewer-unicode",
+      "input": "{\"\":1,\"😀\":2}",
+      "ijson_subset": true,
+      "bytes": "{\"😀\":2,\"\":1}",
+      "sha256": "28c95d1bbb2209223307e62f489020e8f9e0cfa16adf2daf6d88127a1e8dd22a",
+      "legacy_bytes": "{\"\":1,\"😀\":2}",
+      "legacy_sha256": "871954531859c7572c6279f90eb83a594ddc3a289e8bdc28d2a84ffb8c1a1703"
+    },
+    {
+      "id": "raw-escaped-control-prefix",
+      "input": "{\"a\":1,\"aa\":2,\"a\\n\":3,\"\\n\":4,\"\\u0000\":5,\"\\\"\":6,\"\\\\\":7,\"\":8}",
+      "ijson_subset": true,
+      "bytes": "{\"\":8,\"\\u0000\":5,\"\\n\":4,\"\\\"\":6,\"\\\\\":7,\"a\":1,\"a\\n\":3,\"aa\":2}",
+      "sha256": "bd9f61d31530d06235f7e16c3fa4de79792296f007501cb03a74e20b7216adbe",
+      "legacy_bytes": "{\"\":8,\"\\\"\":6,\"\\\\\":7,\"\\n\":4,\"\\u0000\":5,\"a\":1,\"a\\n\":3,\"aa\":2}",
+      "legacy_sha256": "0d66045bc4f35f9ee49a8cb11001c0b996c6d5e1f9c2e097ac8715d50ad49b32"
+    },
+    {
+      "id": "nested-arrays",
+      "input": "{\"z\":[{\"\":{\"a\":1,\"\\t\":2},\"😀\":[true,null,-0.0]},{\"b\":2,\"a\":1}],\"a\":{\"ab\":1,\"a\":2}}",
+      "ijson_subset": true,
+      "bytes": "{\"a\":{\"a\":2,\"ab\":1},\"z\":[{\"😀\":[true,null,0],\"\":{\"\\t\":2,\"a\":1}},{\"a\":1,\"b\":2}]}",
+      "sha256": "ad816bedb49ce5039b0fa084c8006626d6dac5970268bc80745c9907610ebf8d",
+      "legacy_bytes": "{\"a\":{\"a\":2,\"ab\":1},\"z\":[{\"\":{\"\\t\":2,\"a\":1},\"😀\":[true,null,0]},{\"a\":1,\"b\":2}]}",
+      "legacy_sha256": "ddf01c19b3a698630f6639868db1e64f465e4911544ec3fcde93b664f88b88a3"
+    },
+    {
+      "id": "nested-array-order",
+      "input": "[{\"a\":1,\"b\":2},{\"b\":1,\"a\":2}]",
+      "ijson_subset": true,
+      "bytes": "[{\"a\":1,\"b\":2},{\"a\":2,\"b\":1}]",
+      "sha256": "e8165542042e4d5602787f561e1b520fda4e441596b19116d018a6c7d61a8335",
+      "legacy_bytes": "[{\"a\":1,\"b\":2},{\"a\":2,\"b\":1}]",
+      "legacy_sha256": "e8165542042e4d5602787f561e1b520fda4e441596b19116d018a6c7d61a8335"
+    },
+    {
+      "id": "unicode-prefix",
+      "input": "{\"😀x\":1,\"😀\":2,\"\":3,\"퟿\":4,\"é\":5,\"é\":6}",
+      "ijson_subset": true,
+      "bytes": "{\"é\":6,\"é\":5,\"퟿\":4,\"😀\":2,\"😀x\":1,\"\":3}",
+      "sha256": "7531889808c6caba353391eae2f401e74b7369da2642a097ffed17e982fb8492",
+      "legacy_bytes": "{\"é\":6,\"é\":5,\"퟿\":4,\"\":3,\"😀\":2,\"😀x\":1}",
+      "legacy_sha256": "9091f1fd349e1e8c218bda12e759f6dd01f50ae87d5d18e5c7d6d04df671b71d"
+    },
+    {
+      "id": "strings-escapes",
+      "input": "[\"\\b\\t\\n\\f\\r\\u0000\\u001f\", \"\\\"\\\\/\", \"é😀\"]",
+      "ijson_subset": true,
+      "bytes": "[\"\\b\\t\\n\\f\\r\\u0000\\u001f\",\"\\\"\\\\/\",\"é😀\"]",
+      "sha256": "2e04ae45fbface536f6c9a0ab007c8ac317e061870538ab623b0beabab1d5049",
+      "legacy_bytes": "[\"\\b\\t\\n\\f\\r\\u0000\\u001f\",\"\\\"\\\\/\",\"é😀\"]",
+      "legacy_sha256": "2e04ae45fbface536f6c9a0ab007c8ac317e061870538ab623b0beabab1d5049"
+    },
+    {
+      "id": "finite-binary64-zero",
+      "input": "[-0.0,0.0,1.0,1.5,1e-7,1e-6,1e20,1e21,9007199254740991.0]",
+      "ijson_subset": true,
+      "bytes": "[0,0,1,1.5,1e-7,0.000001,100000000000000000000,1e+21,9007199254740991]",
+      "sha256": "ec9aea60fa864c2d6e84a9538a7205e90a3eb46d32c9fa42ab2392a36e68f048",
+      "legacy_bytes": "[0,0,1,1.5,1e-7,0.000001,100000000000000000000,1e+21,9007199254740991]",
+      "legacy_sha256": "ec9aea60fa864c2d6e84a9538a7205e90a3eb46d32c9fa42ab2392a36e68f048"
+    },
+    {
+      "id": "native-integer-extrema",
+      "input": "[-9223372036854775808,9223372036854775807,18446744073709551615]",
+      "ijson_subset": false,
+      "bytes": "[-9223372036854775808,9223372036854775807,18446744073709551615]",
+      "sha256": "f7a5aa78925e65cb1ae66f5685b5c375450013254e1e8eaac9fd493775fab725",
+      "legacy_bytes": "[-9223372036854775808,9223372036854775807,18446744073709551615]",
+      "legacy_sha256": "f7a5aa78925e65cb1ae66f5685b5c375450013254e1e8eaac9fd493775fab725"
+    },
+    {
+      "id": "native-near-2pow53",
+      "input": "[9007199254740990,9007199254740991,9007199254740992,9007199254740993,-9007199254740993]",
+      "ijson_subset": false,
+      "bytes": "[9007199254740990,9007199254740991,9007199254740992,9007199254740993,-9007199254740993]",
+      "sha256": "3bea9611157994c3c6c9b58fac947bc8bba7266d2c929b514d77f5e3ec0bf285",
+      "legacy_bytes": "[9007199254740990,9007199254740991,9007199254740992,9007199254740993,-9007199254740993]",
+      "legacy_sha256": "3bea9611157994c3c6c9b58fac947bc8bba7266d2c929b514d77f5e3ec0bf285"
+    },
+    {
+      "id": "integer-vs-float",
+      "input": "[9007199254740993,9007199254740993.0,9223372036854775807,9223372036854775807.0]",
+      "ijson_subset": false,
+      "bytes": "[9007199254740993,9007199254740992,9223372036854775807,9223372036854776000]",
+      "sha256": "7eafcdede6ebac8becc0396df8623245d933e227acd3d995fd40cb112fdb2b91",
+      "legacy_bytes": "[9007199254740993,9007199254740992,9223372036854775807,9223372036854776000]",
+      "legacy_sha256": "7eafcdede6ebac8becc0396df8623245d933e227acd3d995fd40cb112fdb2b91"
+    },
+    {
+      "id": "wide-host-fields",
+      "input": "{\"previous_seq\":9223372036854775807,\"evidence\":{\"counter\":18446744073709551615},\"zero\":-0.0}",
+      "ijson_subset": false,
+      "bytes": "{\"evidence\":{\"counter\":18446744073709551615},\"previous_seq\":9223372036854775807,\"zero\":0}",
+      "sha256": "cd3cbfdbbe9cfca462854b16d039fbd956fc73a82e140984f0f21c74678e0e86",
+      "legacy_bytes": "{\"evidence\":{\"counter\":18446744073709551615},\"previous_seq\":9223372036854775807,\"zero\":0}",
+      "legacy_sha256": "cd3cbfdbbe9cfca462854b16d039fbd956fc73a82e140984f0f21c74678e0e86"
+    },
+    {
+      "id": "declaration-order-a",
+      "input": "{\"b\":2,\"a\":{\"z\":1,\"\\t\":2}}",
+      "ijson_subset": true,
+      "bytes": "{\"a\":{\"\\t\":2,\"z\":1},\"b\":2}",
+      "sha256": "860308adb2f9384d4e1475f75e859ed8a8523f48fceaa3be73075f6e768f0170",
+      "legacy_bytes": "{\"a\":{\"\\t\":2,\"z\":1},\"b\":2}",
+      "legacy_sha256": "860308adb2f9384d4e1475f75e859ed8a8523f48fceaa3be73075f6e768f0170"
+    },
+    {
+      "id": "declaration-order-b",
+      "input": "{\"a\":{\"\\t\":2,\"z\":1},\"b\":2}",
+      "ijson_subset": true,
+      "bytes": "{\"a\":{\"\\t\":2,\"z\":1},\"b\":2}",
+      "sha256": "860308adb2f9384d4e1475f75e859ed8a8523f48fceaa3be73075f6e768f0170",
+      "legacy_bytes": "{\"a\":{\"\\t\":2,\"z\":1},\"b\":2}",
+      "legacy_sha256": "860308adb2f9384d4e1475f75e859ed8a8523f48fceaa3be73075f6e768f0170"
+    }
+  ]
+}

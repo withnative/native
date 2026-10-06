@@ -1205,10 +1205,12 @@ mod tests {
     /// A native authority source for the executor seam: it answers with the
     /// same response builder the hosted runtime wires, so the executor frames
     /// genuine authority bytes rather than a fixture.
+    #[cfg(feature = "mcp-executor-prototype")]
     struct NativeAuthorityActSource {
         db: crate::Db,
     }
 
+    #[cfg(feature = "mcp-executor-prototype")]
     impl crate::mcp::AuthorityActSource for NativeAuthorityActSource {
         fn head(
             &self,
@@ -1232,6 +1234,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "mcp-executor-prototype")]
     async fn append_large_record(db: &crate::Db, record_id: &str, body_len: usize) {
         crate::store::append(
             db,
@@ -1255,6 +1258,7 @@ mod tests {
     /// The client's own request body reaches the executor, and the client parses
     /// the executor's rendered response bytes. The raw response body is sent
     /// back on the receiver so a test can assert the actual framing.
+    #[cfg(feature = "mcp-executor-prototype")]
     async fn serve_executor_once(
         server: crate::mcp::ExecutorPrototypeStdioServer,
     ) -> (u16, tokio::sync::oneshot::Receiver<Vec<u8>>) {
@@ -1276,6 +1280,7 @@ mod tests {
         (port, receiver)
     }
 
+    #[cfg(feature = "mcp-executor-prototype")]
     async fn read_http_body(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
         use tokio::io::AsyncReadExt as _;
         let mut buffer = Vec::new();
@@ -1304,6 +1309,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "mcp-executor-prototype")]
     async fn write_http_bytes(stream: &mut tokio::net::TcpStream, bytes: &[u8]) {
         use tokio::io::AsyncWriteExt as _;
         let head = format!(
@@ -1321,6 +1327,7 @@ mod tests {
     /// no-renderer `content`/`structuredContent` duplication), and the client
     /// parses those exact bytes and mints a trusted delta whose immutable
     /// canonical bytes equal the received decoded bytes.
+    #[cfg(feature = "mcp-executor-prototype")]
     #[tokio::test]
     async fn client_parses_a_real_executor_surface_authority_delta() {
         let db = real_authority().await;
@@ -1411,6 +1418,7 @@ mod tests {
     /// Boundary: a real executor-rendered delta just under the ceiling parses
     /// and its raw body stays under the client ceiling; a cut over the ceiling
     /// is refused with the whole-snapshot fallback, not a body-too-large error.
+    #[cfg(feature = "mcp-executor-prototype")]
     #[tokio::test]
     async fn rendered_response_stays_under_the_client_ceiling_and_oversize_refuses() {
         let db = fresh_authority().await;

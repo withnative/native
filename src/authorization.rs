@@ -128,6 +128,79 @@ fn auth_statement(
         .map_err(|error| crate::domain_transaction::stable_storage_error("authorize", &error))
 }
 
+/// Test-only collector for the mechanical trigger-coverage test (slice
+/// F-B). Drives every `auth_statement(...)` site with a recording
+/// executor and returns the constructed templates, so the coverage test
+/// prepares the real template SQL rather than a hand-maintained copy.
+/// When a new authorization read is added, drive it here as well or the
+/// coverage test will not see its columns. This hand-maintained site
+/// list is guarded by `collector_covers_every_auth_statement_site`,
+/// which fails when a new call site appears.
+#[cfg(test)]
+pub(crate) async fn collect_authorization_templates_for_coverage() -> Vec<StatementTemplate> {
+    use crate::portable_sql::{
+        DomainStatementExecutor, LogicalType, NormalizedRow, NormalizedValue, SqlResult,
+    };
+
+    struct TemplateRecorder {
+        templates: Vec<StatementTemplate>,
+    }
+
+    fn zero_row(columns: &[ColumnSpec]) -> NormalizedRow {
+        columns
+            .iter()
+            .map(|column| {
+                let value = match column.logical_type {
+                    LogicalType::Bool => NormalizedValue::Bool(false),
+                    LogicalType::Text if column.nullable => NormalizedValue::Null,
+                    LogicalType::Text => NormalizedValue::Text(String::new()),
+                    _ => NormalizedValue::Null,
+                };
+                (column.name.clone(), value)
+            })
+            .collect()
+    }
+
+    impl DomainStatementExecutor for TemplateRecorder {
+        fn fetch_all<'a>(
+            &'a mut self,
+            statement: &'a StatementTemplate,
+            _bindings: &'a [BindValue],
+            columns: &'a [ColumnSpec],
+        ) -> futures::future::BoxFuture<'a, SqlResult<Vec<NormalizedRow>>> {
+            Box::pin(async move {
+                self.templates.push(*statement);
+                // Only the EXISTS probes (`explicit`, `owns`) index
+                // `rows[0]`; everything else tolerates an empty set, and
+                // no caller here follows bearer chains, so probing just
+                // those two keeps the drive recursion-free.
+                let probe = columns
+                    .iter()
+                    .any(|column| column.name == "explicit" || column.name == "owns");
+                Ok(if probe {
+                    vec![zero_row(columns)]
+                } else {
+                    vec![]
+                })
+            })
+        }
+    }
+
+    let mut recorder = TemplateRecorder {
+        templates: Vec::new(),
+    };
+    let principal = Principal::bound("coverage-account", false);
+    let _ = authorization_record(&mut recorder, "coverage-record").await;
+    let _ = derived_bearers(&mut recorder, "coverage-record").await;
+    let _ = unit_bearer(&mut recorder, "coverage-record").await;
+    let _ = has_explicit_policy(&mut recorder, "coverage-record").await;
+    let _ = authorization_policy_entries(&mut recorder, "coverage-anchor", true).await;
+    let _ = authorization_policy_entries(&mut recorder, "coverage-anchor", false).await;
+    let _ = owner_bound_to_account(&mut recorder, "coverage-owner", "coverage-account").await;
+    let _ = actor_disclosable_with(&mut recorder, principal, "coverage-other").await;
+    recorder.templates
+}
+
 async fn auth_fetch<E: DomainStatementExecutor>(
     executor: &mut E,
     statement: &StatementTemplate,
@@ -528,7 +601,7 @@ async fn effective_capability_on_inner(
     effective_capability_with(&mut state, principal, record_id, include_tombstone).await
 }
 
-async fn effective_capability_with<E: DomainStatementExecutor>(
+pub(crate) async fn effective_capability_with<E: DomainStatementExecutor>(
     state: &mut E,
     principal: Principal<'_>,
     record_id: &str,
@@ -739,6 +812,77 @@ impl DomainStatementExecutor for PreloadedAuthorizationState {
     }
 }
 
+/// Bulk preload SQL, shared as `const`s so the mechanical
+/// trigger-coverage test (slice F-B) prepares exactly the strings the
+/// production path executes. Do not inline new reads here: add a const
+/// and list it in `preloaded_bulk_coverage_statements`.
+const PRELOADED_CLOSURE_SQL: &str = "WITH RECURSIVE walk(id,derived_depth,unit_depth,path) AS (\
+     SELECT value,0,0,'|'||hex(value)||'|' FROM json_each(?) \
+     UNION ALL \
+     SELECT CASE WHEN r.type='Annotation' OR (r.type='Document' AND r.kind='attachment') \
+                 THEN (SELECT target_id FROM links \
+                        WHERE source_id=r.id AND relationship='part_of' \
+                        ORDER BY target_id LIMIT 1) \
+                 ELSE unit.authority_bearer_record_id END, \
+            CASE WHEN r.type='Annotation' OR (r.type='Document' AND r.kind='attachment') \
+                 THEN walk.derived_depth+1 ELSE 0 END, \
+            CASE WHEN r.type='Annotation' OR (r.type='Document' AND r.kind='attachment') \
+                 THEN walk.unit_depth ELSE walk.unit_depth+1 END, \
+            walk.path||hex(CASE \
+                WHEN r.type='Annotation' OR (r.type='Document' AND r.kind='attachment') \
+                THEN (SELECT target_id FROM links \
+                       WHERE source_id=r.id AND relationship='part_of' \
+                       ORDER BY target_id LIMIT 1) \
+                ELSE unit.authority_bearer_record_id END)||'|' \
+       FROM walk JOIN records r ON r.id=walk.id \
+       LEFT JOIN semantic_units unit ON unit.unit_id=r.id \
+      WHERE ((r.type='Annotation' OR (r.type='Document' AND r.kind='attachment')) \
+              AND walk.derived_depth < ? \
+              AND (SELECT COUNT(*) FROM links \
+                    WHERE source_id=r.id AND relationship='part_of') >= 1 \
+              AND instr(walk.path,'|'||hex((SELECT target_id FROM links \
+                          WHERE source_id=r.id AND relationship='part_of' \
+                          ORDER BY target_id LIMIT 1))||'|')=0) \
+         OR (NOT (r.type='Annotation' OR (r.type='Document' AND r.kind='attachment')) \
+              AND unit.authority_bearer_record_id IS NOT NULL \
+              AND walk.unit_depth < ? \
+              AND instr(walk.path,'|'||hex(unit.authority_bearer_record_id)||'|')=0) \
+     ) \
+     SELECT DISTINCT r.id,r.type,r.kind,r.deleted_at,r.owner_id,r.policy_anchor_id,\
+            unit.authority_bearer_record_id \
+       FROM walk JOIN records r ON r.id=walk.id \
+       LEFT JOIN semantic_units unit ON unit.unit_id=r.id";
+const PRELOADED_LINKS_SQL: &str = "SELECT source_id,target_id FROM links \
+     WHERE relationship='part_of' AND source_id IN (SELECT value FROM json_each(?)) \
+     ORDER BY source_id,target_id";
+const PRELOADED_RECORD_POLICIES_SQL: &str = "SELECT record_id FROM record_policies \
+     WHERE record_id IN (SELECT value FROM json_each(?))";
+const PRELOADED_POLICY_ENTRIES_SQL: &str =
+    "SELECT policy_anchor_id,subject_kind,subject_id,effect,capability \
+       FROM policy_entries \
+      WHERE policy_anchor_id IN (SELECT value FROM json_each(?)) \
+      ORDER BY policy_anchor_id,subject_kind,subject_id,capability";
+const PRELOADED_OWNER_BINDINGS_SQL: &str = "SELECT record_id FROM bindings \
+         WHERE system='account' AND identifier=? AND is_canonical=1 \
+           AND record_id IN (SELECT value FROM json_each(?))";
+
+/// Test-only accessor for the mechanical trigger-coverage test (slice
+/// F-B): the bulk preload statements above, which are the same `const`s
+/// the production path executes.
+#[cfg(test)]
+pub(crate) fn preloaded_bulk_coverage_statements() -> Vec<String> {
+    [
+        PRELOADED_CLOSURE_SQL,
+        PRELOADED_LINKS_SQL,
+        PRELOADED_RECORD_POLICIES_SQL,
+        PRELOADED_POLICY_ENTRIES_SQL,
+        PRELOADED_OWNER_BINDINGS_SQL,
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
+}
+
 /// Evaluate a bounded record set through the canonical authorization fold
 /// without issuing request-scaled SQL. One recursive closure query and four
 /// set loads populate the same [`DomainStatementExecutor`] contract used by
@@ -756,49 +900,12 @@ pub(crate) async fn effective_capabilities_preloaded_on(
     let seeds = serde_json::to_string(&record_ids)?;
     let max_derived = i64::try_from(MAX_DERIVED_BEARER_DEPTH).unwrap_or(i64::MAX);
     let max_units = i64::try_from(MAX_UNIT_BEARER_DEPTH).unwrap_or(i64::MAX);
-    let closure_rows = sqlx::query(
-        "WITH RECURSIVE walk(id,derived_depth,unit_depth,path) AS (\
-         SELECT value,0,0,'|'||hex(value)||'|' FROM json_each(?) \
-         UNION ALL \
-         SELECT CASE WHEN r.type='Annotation' OR (r.type='Document' AND r.kind='attachment') \
-                     THEN (SELECT target_id FROM links \
-                            WHERE source_id=r.id AND relationship='part_of' \
-                            ORDER BY target_id LIMIT 1) \
-                     ELSE unit.authority_bearer_record_id END, \
-                CASE WHEN r.type='Annotation' OR (r.type='Document' AND r.kind='attachment') \
-                     THEN walk.derived_depth+1 ELSE 0 END, \
-                CASE WHEN r.type='Annotation' OR (r.type='Document' AND r.kind='attachment') \
-                     THEN walk.unit_depth ELSE walk.unit_depth+1 END, \
-                walk.path||hex(CASE \
-                    WHEN r.type='Annotation' OR (r.type='Document' AND r.kind='attachment') \
-                    THEN (SELECT target_id FROM links \
-                           WHERE source_id=r.id AND relationship='part_of' \
-                           ORDER BY target_id LIMIT 1) \
-                    ELSE unit.authority_bearer_record_id END)||'|' \
-           FROM walk JOIN records r ON r.id=walk.id \
-           LEFT JOIN semantic_units unit ON unit.unit_id=r.id \
-          WHERE ((r.type='Annotation' OR (r.type='Document' AND r.kind='attachment')) \
-                  AND walk.derived_depth < ? \
-                  AND (SELECT COUNT(*) FROM links \
-                        WHERE source_id=r.id AND relationship='part_of') >= 1 \
-                  AND instr(walk.path,'|'||hex((SELECT target_id FROM links \
-                              WHERE source_id=r.id AND relationship='part_of' \
-                              ORDER BY target_id LIMIT 1))||'|')=0) \
-             OR (NOT (r.type='Annotation' OR (r.type='Document' AND r.kind='attachment')) \
-                  AND unit.authority_bearer_record_id IS NOT NULL \
-                  AND walk.unit_depth < ? \
-                  AND instr(walk.path,'|'||hex(unit.authority_bearer_record_id)||'|')=0) \
-         ) \
-         SELECT DISTINCT r.id,r.type,r.kind,r.deleted_at,r.owner_id,r.policy_anchor_id,\
-                unit.authority_bearer_record_id \
-           FROM walk JOIN records r ON r.id=walk.id \
-           LEFT JOIN semantic_units unit ON unit.unit_id=r.id",
-    )
-    .bind(seeds)
-    .bind(max_derived)
-    .bind(max_units)
-    .fetch_all(&mut **transaction)
-    .await?;
+    let closure_rows = sqlx::query(PRELOADED_CLOSURE_SQL)
+        .bind(seeds)
+        .bind(max_derived)
+        .bind(max_units)
+        .fetch_all(&mut **transaction)
+        .await?;
 
     let mut state = PreloadedAuthorizationState::default();
     for row in closure_rows {
@@ -818,14 +925,10 @@ pub(crate) async fn effective_capabilities_preloaded_on(
         );
     }
     let loaded_ids = serde_json::to_string(&state.records.keys().collect::<Vec<_>>())?;
-    for row in sqlx::query(
-        "SELECT source_id,target_id FROM links \
-          WHERE relationship='part_of' AND source_id IN (SELECT value FROM json_each(?)) \
-          ORDER BY source_id,target_id",
-    )
-    .bind(&loaded_ids)
-    .fetch_all(&mut **transaction)
-    .await?
+    for row in sqlx::query(PRELOADED_LINKS_SQL)
+        .bind(&loaded_ids)
+        .fetch_all(&mut **transaction)
+        .await?
     {
         state
             .derived_bearers
@@ -839,24 +942,16 @@ pub(crate) async fn effective_capabilities_preloaded_on(
         .filter_map(|record| record.policy_anchor_id.clone())
         .collect::<HashSet<_>>();
     let anchors_json = serde_json::to_string(&anchors)?;
-    state.explicit_policies = sqlx::query_scalar(
-        "SELECT record_id FROM record_policies \
-          WHERE record_id IN (SELECT value FROM json_each(?))",
-    )
-    .bind(&anchors_json)
-    .fetch_all(&mut **transaction)
-    .await?
-    .into_iter()
-    .collect();
-    for row in sqlx::query(
-        "SELECT policy_anchor_id,subject_kind,subject_id,effect,capability \
-           FROM policy_entries \
-          WHERE policy_anchor_id IN (SELECT value FROM json_each(?)) \
-          ORDER BY policy_anchor_id,subject_kind,subject_id,capability",
-    )
-    .bind(&anchors_json)
-    .fetch_all(&mut **transaction)
-    .await?
+    state.explicit_policies = sqlx::query_scalar(PRELOADED_RECORD_POLICIES_SQL)
+        .bind(&anchors_json)
+        .fetch_all(&mut **transaction)
+        .await?
+        .into_iter()
+        .collect();
+    for row in sqlx::query(PRELOADED_POLICY_ENTRIES_SQL)
+        .bind(&anchors_json)
+        .fetch_all(&mut **transaction)
+        .await?
     {
         state
             .policy_entries
@@ -876,18 +971,14 @@ pub(crate) async fn effective_capabilities_preloaded_on(
             .filter_map(|record| record.owner_id.clone())
             .collect::<HashSet<_>>();
         let owners_json = serde_json::to_string(&owners)?;
-        state.owner_bindings = sqlx::query_scalar::<_, String>(
-            "SELECT record_id FROM bindings \
-              WHERE system='account' AND identifier=? AND is_canonical=1 \
-                AND record_id IN (SELECT value FROM json_each(?))",
-        )
-        .bind(account_id)
-        .bind(owners_json)
-        .fetch_all(&mut **transaction)
-        .await?
-        .into_iter()
-        .map(|owner| (owner, account_id.into()))
-        .collect();
+        state.owner_bindings = sqlx::query_scalar::<_, String>(PRELOADED_OWNER_BINDINGS_SQL)
+            .bind(account_id)
+            .bind(owners_json)
+            .fetch_all(&mut **transaction)
+            .await?
+            .into_iter()
+            .map(|owner| (owner, account_id.into()))
+            .collect();
     }
 
     let mut capabilities = HashMap::with_capacity(record_ids.len());

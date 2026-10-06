@@ -447,6 +447,55 @@ impl DomainStatementExecutor for BorrowedSqliteStatementExecutor<'_> {
     }
 }
 
+/// Reviewed reads on an already pinned PostgreSQL transaction. This is used
+/// when a caller-facing projection must share its snapshot with the query.
+#[cfg(feature = "postgres")]
+pub(crate) struct BorrowedPostgresStatementExecutor<'a, 'connection> {
+    transaction: &'a mut Transaction<'connection, Postgres>,
+    schema: &'a str,
+}
+
+#[cfg(feature = "postgres")]
+impl<'a, 'connection> BorrowedPostgresStatementExecutor<'a, 'connection> {
+    pub(crate) fn new(
+        transaction: &'a mut Transaction<'connection, Postgres>,
+        schema: &'a str,
+    ) -> Self {
+        Self {
+            transaction,
+            schema,
+        }
+    }
+}
+
+#[cfg(feature = "postgres")]
+impl DomainStatementExecutor for BorrowedPostgresStatementExecutor<'_, '_> {
+    fn fetch_all<'a>(
+        &'a mut self,
+        statement: &'a StatementTemplate,
+        bindings: &'a [BindValue],
+        columns: &'a [ColumnSpec],
+    ) -> BoxFuture<'a, SqlResult<Vec<NormalizedRow>>> {
+        Box::pin(async move {
+            if statement.kind() != StatementKind::Select {
+                return Err(SqlError::contract("fetch_all requires a SELECT template"));
+            }
+            let rendered = statement.render_in(Dialect::Postgres, Some(self.schema))?;
+            validate_bindings(&rendered, bindings)?;
+            let query = bind_postgres(sqlx::query(&rendered.sql), bindings)?;
+            let rows = query
+                .fetch_all(&mut **self.transaction)
+                .await
+                .map_err(|error| {
+                    normalize_sqlx_error(Backend::Postgres, ExecutionPhase::Statement, &error)
+                })?;
+            rows.iter()
+                .map(|row| normalize_postgres_row(row, columns))
+                .collect()
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorCategory {
@@ -984,7 +1033,10 @@ impl<'connection> TursoTransaction<'connection> {
     }
 }
 
-fn validate_bindings(statement: &RenderedStatement, bindings: &[BindValue]) -> SqlResult<()> {
+pub(crate) fn validate_bindings(
+    statement: &RenderedStatement,
+    bindings: &[BindValue],
+) -> SqlResult<()> {
     if statement.parameter_count != bindings.len() {
         return Err(SqlError::contract(format!(
             "portable SQL expected {} bindings, received {}",
@@ -1003,7 +1055,7 @@ fn validate_bindings(statement: &RenderedStatement, bindings: &[BindValue]) -> S
     Ok(())
 }
 
-fn bind_sqlite<'q>(
+pub(crate) fn bind_sqlite<'q>(
     mut query: Query<'q, Sqlite, SqliteArguments<'q>>,
     bindings: &[BindValue],
 ) -> SqlResult<Query<'q, Sqlite, SqliteArguments<'q>>> {
@@ -1093,7 +1145,10 @@ fn bind_turso(bindings: &[BindValue]) -> SqlResult<Vec<turso::Value>> {
         .collect()
 }
 
-fn normalize_sqlite_row(row: &SqliteRow, columns: &[ColumnSpec]) -> SqlResult<NormalizedRow> {
+pub(crate) fn normalize_sqlite_row(
+    row: &SqliteRow,
+    columns: &[ColumnSpec],
+) -> SqlResult<NormalizedRow> {
     let mut normalized = BTreeMap::new();
     for column in columns {
         let value = match column.logical_type {

@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Kit probe</title>
+</head>
+<body>
+<main>
+<h1>Kit probe</h1>
+<ul id="list"></ul>
+<section id="detail"><h2>Detail</h2><p id="body">Nothing open</p><p id="links"></p></section>
+</main>
+<script>
+// Deliberately naive: opens a record with two reads at once, like the
+// 0.1.0 Slack, Miro and Notion tabs did.
+const read = (need, params) => window.nativeArtifact.read(need, params).then((reply) => reply && reply.status === "ok" ? reply.result.rows : null);
+function open(id) {
+  document.getElementById("body").textContent = "Loading";
+  read("probe.body", { id }).then((rows) => { document.getElementById("body").textContent = rows && rows[0] ? rows[0].body : "The record body could not be read"; });
+  read("probe.links", { id }).then((rows) => { document.getElementById("links").textContent = rows ? rows.length + " links" : "Links could not be read"; });
+}
+function render(input) {
+  const list = document.getElementById("list");
+  list.textContent = "";
+  const section = input.sql && input.sql["probe.list"];
+  for (const row of section ? section.rows : []) {
+    const item = document.createElement("li");
+    const button = document.createElement("button");
+    button.type = "button"; button.textContent = row.name; button.dataset.id = row.id;
+    button.addEventListener("click", () => { open(row.id); window.nativeArtifact.setViewState({ open: row.id }); });
+    item.append(button);
+    list.append(item);
+  }
+  list.dataset.count = section ? section.row_count + (section.truncated ? " truncated" : "") : "sample";
+}
+window.nativeArtifact.ready.then((delivery) => render(delivery.input));
+window.nativeArtifact.onInput((delivery) => render(delivery.input));
+</script>
+</body>
+</html>

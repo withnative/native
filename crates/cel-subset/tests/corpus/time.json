@@ -1,0 +1,14 @@
+[
+{"name":"time_lt","expr":"t0 < t1","bindings":{"t0":{"int":"1700000000000"},"t1":{"int":"1700000000500"}},"expect":{"value":{"bool":true}},"spec":"Subset choice: time is integer UTC milliseconds (int)"},
+{"name":"time_gt","expr":"t1 > t0","bindings":{"t0":{"int":"1700000000000"},"t1":{"int":"1700000000500"}},"expect":{"value":{"bool":true}}},
+{"name":"time_diff_positive","expr":"t1 - t0 == 500","bindings":{"t0":{"int":"1700000000000"},"t1":{"int":"1700000000500"}},"expect":{"value":{"bool":true}}},
+{"name":"time_diff_negative","expr":"t0 - t1","bindings":{"t0":{"int":"1700000000000"},"t1":{"int":"1700000000500"}},"expect":{"value":{"int":"-500"}}},
+{"name":"time_add_ms","expr":"t0 + 1000 == 1700000001000","bindings":{"t0":{"int":"1700000000000"}},"expect":{"value":{"bool":true}}},
+{"name":"time_window","expr":"t0 >= 1699999999000 && t0 <= 1700000001000","bindings":{"t0":{"int":"1700000000000"}},"expect":{"value":{"bool":true}}},
+{"name":"time_overflow_mul","expr":"t0 * 100000000","bindings":{"t0":{"int":"1700000000000"}},"expect":{"error":"overflow","note":"overflow"},"spec":"Overflow: arithmetic raises error when result exceeds int64"},
+{"name":"time_extreme_lt","expr":"t0 < t1","bindings":{"t0":{"int":"-9223372036854775808"},"t1":{"int":"9223372036854775807"}},"expect":{"value":{"bool":true}},"spec":"Subset choice: time is integer UTC milliseconds (int)"},
+{"name":"time_neg_ms","expr":"t0 < 0","bindings":{"t0":{"int":"-1"}},"expect":{"value":{"bool":true}}},
+{"name":"time_ms_vs_double","expr":"dyn(t0) < 1720000000000.0","bindings":{"t0":{"int":"1700000000000"}},"expect":{"value":{"bool":true}},"spec":"Ordering: runtime int/double ordering"},
+{"name":"time_2p53_eq_double","expr":"dyn(t0) < 9007199254740992.0","bindings":{"t0":{"int":"9007199254740992"}},"expect":{"value":{"bool":false}},"spec":"2^53 is exactly representable"},
+{"name":"time_max_add_overflow","expr":"t0 + t0","bindings":{"t0":{"int":"9223372036854775807"}},"expect":{"error":"overflow"},"spec":"Overflow: arithmetic raises error when result exceeds int64"}
+]

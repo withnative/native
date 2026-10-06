@@ -721,6 +721,29 @@ const TOP_LEVEL_ID_ADDRESSES_A_RECORD: &[&str] = &[
     "verify_artifact",
 ];
 
+/// Actions whose target ids are exact-only (task `fb8564c`): the reveal
+/// admission target must meet the install gates before any target analysis,
+/// so no target-dependent pre-handler resolution runs for it at all. Narrow
+/// to one tool plus one exact action value; every other action of the same
+/// tool — including install/adopt `artifact_id` prefixes — resolves
+/// unchanged, as does the `claim_unowned_record` whole-tool exemption.
+///
+/// The `artifact.render.v1` declared read (task `51e8571`) is exact-only for
+/// the same reason: its `params.artifact_id` must reach the read as written,
+/// so the tab's gates and consent precede any lookup of it and a prefix is
+/// refused `invalid_params` rather than resolved. Other `live_read` needs
+/// resolve unchanged.
+fn admits_exact_target_ids_only(tool: &str, arguments: &Value) -> bool {
+    tool == "manage_alpha_tabs"
+        && match arguments.get("action").and_then(Value::as_str) {
+            Some("admit_reveal_target") => true,
+            Some("live_read") => {
+                arguments.get("need").and_then(Value::as_str) == Some("artifact.render.v1")
+            }
+            _ => false,
+        }
+}
+
 /// Resolve every abbreviated record id in one tool's arguments.
 ///
 /// Returns the arguments unchanged when nothing looks like an abbreviation,
@@ -737,6 +760,14 @@ pub(crate) async fn resolve_record_ids(
     // check host-owner authority before any target-dependent lookup, while
     // prefix resolution necessarily reads candidate records first.
     if tool == "claim_unowned_record" {
+        return Ok(arguments);
+    }
+    // Exact-target reveal admission (task `fb8564c`): install gates must
+    // precede any invalid/missing/ambiguous target analysis, so the target
+    // reaches the action exactly as written. Checked after legacy selector
+    // normalization (a no-op for this tool) and before the abbreviation
+    // scan, so no target-dependent lookup runs at all for this action.
+    if admits_exact_target_ids_only(tool, &arguments) {
         return Ok(arguments);
     }
     // Keep the overwhelmingly common path pure. Full ids, human ids, and
@@ -781,6 +812,40 @@ pub(crate) async fn resolve_record_ids(
             crate::turso_local::resolve_record_ids(db, caller, tool, arguments, abbreviations).await
         }
     }
+}
+
+/// Snapshot-scoped form of [`resolve_record_ids`]: resolve one tool's
+/// record-selector arguments inside one already-admitted caller snapshot
+/// instead of opening its own. Declared tab reads use this so the install
+/// gates and the reference share one transaction; existing callers keep
+/// [`resolve_record_ids`], whose behaviour is unchanged.
+pub(crate) async fn resolve_record_ids_in<E: DomainStatementExecutor>(
+    executor: &mut E,
+    caller: &Caller,
+    tool: &str,
+    arguments: Value,
+) -> Result<Value> {
+    let mut arguments = normalize_legacy_record_selector(tool, arguments)?;
+    if tool == "claim_unowned_record" {
+        return Ok(arguments);
+    }
+    // Same exact-target exemption as the pre-handler entry above (task
+    // `fb8564c`): declared tab reads that resolve through an admitted
+    // snapshot share the gate-before-target contract for this action.
+    if admits_exact_target_ids_only(tool, &arguments) {
+        return Ok(arguments);
+    }
+    let mut abbreviations = HashSet::new();
+    walk(&mut arguments, true, tool, &mut |text| {
+        if let Some(prefix) = canonical_prefix(text) {
+            abbreviations.insert((text.clone(), prefix));
+        }
+    });
+    if abbreviations.is_empty() {
+        return Ok(arguments);
+    }
+    let abbreviations = abbreviations.into_iter().collect::<Vec<_>>();
+    resolve_record_ids_with(executor, caller, tool, arguments, abbreviations).await
 }
 
 /// Resolve record references inside one already-admitted backend snapshot.
@@ -1109,6 +1174,35 @@ pub(crate) async fn display_references(
     ids: &[&str],
 ) -> Result<HashMap<String, Option<String>>> {
     display_references_in_pool(db.write_pool(), ids).await
+}
+
+/// Snapshot-scoped form of [`display_references`]: group the ids and read
+/// display references through the caller's executor instead of opening a
+/// pool snapshot. Declared tab reads use this; existing callers keep the
+/// pool forms.
+pub(crate) async fn display_references_in<E: DomainStatementExecutor>(
+    executor: &mut E,
+    ids: &[&str],
+) -> Result<HashMap<String, Option<String>>> {
+    let mut result = HashMap::with_capacity(ids.len());
+    let mut by_prefix: HashMap<String, Vec<&str>> = HashMap::new();
+    for id in ids {
+        if !is_canonical_uuid(id) {
+            result.insert((*id).to_owned(), None);
+            continue;
+        }
+        let hex = uuid_hex(id);
+        by_prefix
+            .entry(hex[..MIN_DISPLAY_HEX].to_string())
+            .or_default()
+            .push(id);
+    }
+    if by_prefix.is_empty() {
+        return Ok(result);
+    }
+    let mut references = display_references_with(executor, &by_prefix).await?;
+    result.extend(references.drain());
+    Ok(result)
 }
 
 pub(crate) async fn display_references_in_pool(

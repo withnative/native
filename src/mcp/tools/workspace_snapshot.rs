@@ -30,6 +30,12 @@ struct WorkspaceSnapshotArgs {
     limit: Option<usize>,
     #[serde(default)]
     after_id: Option<String>,
+    /// Opt into a fence-moved delta on `catch_up`: when the
+    /// authorization/relationship/unit fences moved but M2 holds a fresh
+    /// filtered view, return the exact diff with `fence_moved: true`
+    /// instead of `restart_required`. Defaults to false (today's restarts).
+    #[serde(default)]
+    accept_fence_moved: bool,
 }
 
 fn unavailable() -> Value {
@@ -103,22 +109,33 @@ async fn get_workspace_snapshot(db: Db, caller: Caller, arguments: Value) -> Res
             let token = args.snapshot_token.as_deref().ok_or_else(|| {
                 Error::engine("get_workspace_snapshot catch_up requires snapshot_token")
             })?;
-            match db.catch_up_workspace_snapshot(principal, token).await? {
-                CatchUpOutcome::Delta(delta) => Ok(json!({
-                    "snapshot_token": delta.token,
-                    "content_seq": delta.content_seq,
-                    "authorization_epoch": delta.authorization_epoch,
-                    "relationship_seq": delta.relationship_seq,
-                    "upsert_records": delta.upsert_records,
-                    "delete_record_ids": delta.delete_record_ids,
-                    "upsert_facets": delta.upsert_facets,
-                    "delete_facet_ids": delta.delete_facet_ids,
-                    "delete_facet_keys": delta.delete_facet_keys,
-                    "upsert_links": delta.upsert_links,
-                    "delete_link_ids": delta.delete_link_ids,
-                    "delete_link_keys": delta.delete_link_keys,
-                    "content_events": delta.content_events,
-                })),
+            match db
+                .catch_up_workspace_snapshot(principal, token, args.accept_fence_moved)
+                .await?
+            {
+                CatchUpOutcome::Delta(delta) => {
+                    // `fence_moved` is emitted only when the caller opted in:
+                    // an opt-out delta carries exactly the keys main has.
+                    let mut out = json!({
+                        "snapshot_token": delta.token,
+                        "content_seq": delta.content_seq,
+                        "authorization_epoch": delta.authorization_epoch,
+                        "relationship_seq": delta.relationship_seq,
+                        "upsert_records": delta.upsert_records,
+                        "delete_record_ids": delta.delete_record_ids,
+                        "upsert_facets": delta.upsert_facets,
+                        "delete_facet_ids": delta.delete_facet_ids,
+                        "delete_facet_keys": delta.delete_facet_keys,
+                        "upsert_links": delta.upsert_links,
+                        "delete_link_ids": delta.delete_link_ids,
+                        "delete_link_keys": delta.delete_link_keys,
+                        "content_events": delta.content_events,
+                    });
+                    if args.accept_fence_moved {
+                        out["fence_moved"] = json!(delta.fence_moved);
+                    }
+                    Ok(out)
+                }
                 CatchUpOutcome::Restart { reason } => Ok(restart(reason)),
                 CatchUpOutcome::Unavailable => Ok(unavailable()),
             }
@@ -138,8 +155,10 @@ pub fn register_workspace_snapshot_tool(registry: &mut ToolRegistry) -> Result<(
          open pins the caller's filtered records/facets/links plus stamps, \
          page reads one section of that pin across calls, catch_up diffs the \
          pin against a fresh view with exact row upserts/deletes and a new \
-         token. Fence moves, expired tokens, or wide gaps return \
-         restart_required (discard and re-open); an unavailable index returns \
+          token. Fence moves, expired tokens, or wide gaps return \
+          restart_required (discard and re-open); catch_up with \
+          accept_fence_moved:true returns the exact diff with fence_moved:true \
+          on a fence move instead; an unavailable index returns \
          unavailable with retry_hint (use the governed read path, never an \
          empty model).",
         json!({
@@ -149,7 +168,8 @@ pub fn register_workspace_snapshot_tool(registry: &mut ToolRegistry) -> Result<(
                 "snapshot_token": { "type": "string", "description": "Opaque pin from open (required for page and catch_up)." },
                 "section": { "type": "string", "description": "Page section for action=page: records|facets|links|content_events." },
                 "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "description": "Max rows in this page (default 500)." },
-                "after_id": { "type": "string", "description": "Resume cursor from the previous page's after_id." }
+                "after_id": { "type": "string", "description": "Resume cursor from the previous page's after_id." },
+                "accept_fence_moved": { "type": "boolean", "description": "For action=catch_up: return the exact diff with fence_moved:true when authorization/relationship/unit fences moved instead of restart_required. Defaults to false." }
             },
             "required": ["action"],
             "additionalProperties": false
@@ -164,7 +184,7 @@ mod tests {
     use super::*;
     use crate::authorization::{replace_explicit_policy, AllowEntry, Capability};
     use crate::mcp::{register_surface_tools, ToolRegistry};
-    use crate::store::create_record;
+    use crate::store::{create_record, update_record};
 
     const COMMON_ID: &str = "9e795003-0000-4000-8000-000000000001";
     const ALICE_ID: &str = "9e795003-0000-4000-8000-000000000002";
@@ -304,6 +324,122 @@ mod tests {
         .await;
         assert_eq!(paged["restart_required"], true);
         assert!(paged.get("rows").is_none());
+    }
+
+    #[tokio::test]
+    async fn tool_catch_up_opt_in_returns_fence_moved_delta() {
+        let db = fixture().await;
+        let alice = Caller::authenticated("alice");
+        let opened = call(&db, alice.clone(), json!({ "action": "open" })).await;
+        let token = opened["snapshot_token"].as_str().unwrap().to_string();
+        // A record INSERT moves the authorization epoch by schema trigger.
+        let newcomer = "9e795003-0000-4000-8000-000000000041";
+        create_record(
+            &db,
+            json!({
+                "id": newcomer, "type": "Document", "kind": "note", "name": "Newcomer",
+                "home_id": crate::schema::ROOT_RECORD_ID
+            }),
+        )
+        .await
+        .unwrap();
+        replace_explicit_policy(
+            &db,
+            "test:policy",
+            newcomer,
+            vec![AllowEntry::account("alice", Capability::View)],
+        )
+        .await
+        .unwrap();
+        // Default (flag absent) still restarts on the moved fence.
+        let restarted = call(
+            &db,
+            alice.clone(),
+            json!({ "action": "catch_up", "snapshot_token": &token }),
+        )
+        .await;
+        assert_eq!(restarted["restart_required"], true);
+        assert!(restarted.get("upsert_records").is_none());
+        // Opt-in returns the exact diff flagged fence_moved:true.
+        let delta = call(
+            &db,
+            alice.clone(),
+            json!({ "action": "catch_up", "snapshot_token": &token, "accept_fence_moved": true }),
+        )
+        .await;
+        assert_eq!(delta["fence_moved"], true);
+        let upserted: Vec<&str> = delta["upsert_records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["id"].as_str().unwrap())
+            .collect();
+        assert!(upserted.contains(&newcomer));
+        assert!(delta["delete_record_ids"].as_array().unwrap().is_empty());
+        // With the flag passed and fences steady, the key is present as false.
+        let steady = call(
+            &db,
+            alice.clone(),
+            json!({ "action": "catch_up", "snapshot_token": delta["snapshot_token"], "accept_fence_moved": true }),
+        )
+        .await;
+        assert_eq!(steady["fence_moved"], false);
+    }
+
+    #[tokio::test]
+    async fn tool_catch_up_opt_out_omits_fence_moved() {
+        // Byte-identical contract: without the flag the delta carries
+        // exactly the keys main has — no `fence_moved` member at all.
+        let db = fixture().await;
+        let alice = Caller::authenticated("alice");
+        let opened = call(&db, alice.clone(), json!({ "action": "open" })).await;
+        let token = opened["snapshot_token"].as_str().unwrap().to_string();
+        // A rename moves no fence, so the default path diffs.
+        update_record(&db, ALICE_ID, json!({ "name": "Alice renamed" }))
+            .await
+            .unwrap();
+        let delta = call(
+            &db,
+            alice.clone(),
+            json!({ "action": "catch_up", "snapshot_token": &token }),
+        )
+        .await;
+        assert!(delta.get("restart_required").is_none());
+        assert!(delta.get("fence_moved").is_none());
+        let mut keys: Vec<&str> = delta
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "authorization_epoch",
+                "content_events",
+                "content_seq",
+                "delete_facet_ids",
+                "delete_facet_keys",
+                "delete_link_ids",
+                "delete_link_keys",
+                "delete_record_ids",
+                "relationship_seq",
+                "run_context",
+                "snapshot_token",
+                "upsert_facets",
+                "upsert_links",
+                "upsert_records",
+            ],
+            "opt-out delta carries exactly the keys main has"
+        );
+        let upserted: Vec<&str> = delta["upsert_records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["id"].as_str().unwrap())
+            .collect();
+        assert!(upserted.contains(&ALICE_ID));
     }
 
     #[tokio::test]

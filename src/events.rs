@@ -59,6 +59,19 @@ pub const EVENT_TYPES: [&str; 46] = [
     "canvas.batch.committed.v1",
 ];
 
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+/// Experimental bare-kernel identity. The root id deliberately avoids the
+/// `native:` prefix (reserved for engine-owned records) and the UUID shape
+/// (caller-supplied record rule): it is a fixed kernel constant, not a
+/// minted record, and it never lands in `records`.
+pub const KERNEL_ROOT_ID: &str = "kernel:root";
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+/// Content event type that carries kernel genesis.
+pub const KERNEL_GENESIS_EVENT: &str = "kernel.root_created.v1";
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+/// The only actor the kernel-root fold accepts.
+pub const KERNEL_GENESIS_ACTOR: &str = "test:bare-kernel";
+
 pub const MESSAGE_REACTION_FORMAT: &str = "native.message-reaction.v1";
 pub const MESSAGE_REACTION_EMOJIS: [&str; 5] = ["👍", "❤️", "😂", "🎉", "👀"];
 
@@ -75,6 +88,15 @@ pub struct MessageReactionPayload {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub executor_ref: Option<String>,
     pub reason: String,
+    /// Artifact origin for tab-governed reactions (task `07ae879` I2):
+    /// `{kind, effect, artifact_id, entry_id, source_digest,
+    /// source_event_id, idempotency_key, message_id, emoji, reacted,
+    /// gesture, guard}`, mirroring the comment/record.create origin shape.
+    /// Additive and skipped when absent, so existing events, projectors
+    /// and interchange stay byte-identical; D7 Undo locates reactions
+    /// through `origin.*`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<serde_json::Value>,
 }
 
 impl MessageReactionPayload {
@@ -732,6 +754,15 @@ mod causal_envelope_tests {
 // `records` column names and need absent-vs-null fidelity, so they stay
 // `serde_json::Value` objects end to end. The facet/link payloads below are
 // closed shapes and get typed structs.
+
+/// The optional `facet.set` payload member naming a typed time facet type
+/// (`date`, `instant`, `zoned` or `when`). Writers add it when the facet's
+/// resolved shape declares that type, after normalising the value, so the
+/// content projector can fold `facet_times` without reading schema state.
+/// Events without it, including every event written before engine 70, fold
+/// no `facet_times` row. It is read beside [`FacetSetPayload`] rather than as
+/// a field of it, so the many payload constructors stay untouched.
+pub const FACET_TIME_KIND_MEMBER: &str = "time_kind";
 
 /// Payload of `facet.set`.
 #[derive(Debug, Clone, Serialize, Deserialize)]

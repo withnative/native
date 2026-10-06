@@ -229,7 +229,24 @@ pub(super) async fn project_unit_revision_recorded(
     // replace the record's body-mention rows exactly as `record.updated`
     // does. The event's own sequence is the provenance: the backfill selects
     // the latest `$.content.content`-bearing `unit.revision.recorded.v1`.
+    crate::body_blocks_projection::replace_sqlite(
+        conn,
+        &event.record_id,
+        event.local_seq,
+        Some(&payload.content.content),
+        crate::body_blocks::BodyFormat::Markdown,
+    )
+    .await?;
     replace_record_mentions(
+        conn,
+        &event.record_id,
+        event.local_seq,
+        Some(payload.content.content.clone()),
+    )
+    .await?;
+    // E3 M3 increment 2A: a Unit revision is a body writer, so it replaces
+    // the record's body-task rows exactly as `record.updated` does.
+    replace_body_task_items(
         conn,
         &event.record_id,
         event.local_seq,

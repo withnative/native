@@ -8,6 +8,9 @@
 
 mod common;
 
+#[path = "records/runtime_config_fixture.rs"]
+mod runtime_config_fixture;
+
 #[path = "records/anchored_body_fold.rs"]
 mod anchored_body_fold;
 #[path = "records/anchored_body_scale.rs"]
@@ -18,6 +21,12 @@ mod annotations;
 mod artifact_interactions;
 #[path = "records/artifact_modules.rs"]
 mod artifact_modules;
+#[path = "records/artifact_react.rs"]
+mod artifact_react;
+#[path = "records/artifact_reversal.rs"]
+mod artifact_reversal;
+#[path = "records/artifact_title.rs"]
+mod artifact_title;
 #[path = "records/artifacts.rs"]
 mod artifacts;
 #[path = "records/attachments.rs"]
@@ -26,12 +35,16 @@ mod attachments;
 mod attribution;
 #[path = "records/bears_shape.rs"]
 mod bears_shape;
+#[path = "records/body_blocks.rs"]
+mod body_blocks;
 #[path = "records/citations.rs"]
 mod citations;
 #[path = "records/comments.rs"]
 mod comments;
 #[path = "records/contribution_provenance.rs"]
 mod contribution_provenance;
+#[path = "records/currency_counts.rs"]
+mod currency_counts;
 #[path = "records/embed_seam.rs"]
 mod embed_seam;
 #[path = "records/identity.rs"]
@@ -64,5 +77,7 @@ mod render;
 mod search_semantics;
 #[path = "records/superseded_by.rs"]
 mod superseded_by;
+#[path = "records/task_items.rs"]
+mod task_items;
 #[path = "records/wordlist.rs"]
 mod wordlist;

@@ -16,6 +16,18 @@
 //! - A fence change (authorization epoch or relationship seq), a missing or
 //!   expired token, or a content gap beyond the window returns
 //!   `restart_required` with no rows; the client discards its model and re-opens.
+//!   `catch_up` alone distinguishes one safe case — an expired-but-known token
+//!   for the same principal with all fences unchanged
+//!   (`token_expired_fences_unchanged`) — from the generic
+//!   `token_expired_or_unknown` that still covers unknown tokens and principal
+//!   mismatches.
+//!   Callers that pass `accept_fence_moved: true` to `catch_up` instead receive
+//!   the exact old-vs-fresh diff with `fence_moved: true` when the fresh M2 view
+//!   is available; the diff's deletes are the revocations, and the fresh view
+//!   is filtered for the principal at the new fences, so no hidden row appears
+//!   in upserts or content events. `page` still restarts on any fence move.
+//!   The `fence_moved` wire key is emitted only when the caller opted in, so
+//!   an opt-out delta carries exactly the keys it always has.
 //! - M2 `None` (over-cap refusal, absent index, racing fences) surfaces as a
 //!   generic `index_unavailable`, never an empty workspace. The fallback reader
 //!   is the client's existing governed path.
@@ -320,10 +332,56 @@ impl SnapshotEntry {
 /// Bounded token store. Count, byte, and TTL caps are enforced on insert;
 /// expiry is also checked on read, so a token that ages out between calls
 /// restarts rather than serving a stale pin.
+///
+/// Retired pins leave a bounded, short-lived tombstone (`expired`) carrying
+/// only the authority proof — principal fingerprint plus fence stamps, never
+/// rows. `catch_up` alone consults it to answer a distinct safe-expiry
+/// reason; every other path keeps the generic `token_expired_or_unknown`,
+/// so unknown tokens and principal mismatches stay indistinguishable.
 #[derive(Debug, Default)]
 pub(crate) struct SnapshotStore {
     entries: HashMap<String, SnapshotEntry>,
     bytes: usize,
+    expired: HashMap<String, ExpiredPin>,
+}
+
+/// Authority proof for one retired pin: who it was pinned for, and the
+/// fence stamps it was pinned at. No rows, no bodies, no content — it can
+/// vouch that a same-principal re-open loses no authority, never what the
+/// rows were.
+#[derive(Debug, Clone)]
+struct ExpiredPin {
+    principal_credential: String,
+    principal_is_member: bool,
+    principal_trusted_bypass: bool,
+    authorization_epoch: i64,
+    relationship_seq: i64,
+    unit_seq_max: i64,
+    retired_at: Instant,
+}
+
+impl ExpiredPin {
+    fn of(entry: &SnapshotEntry, retired_at: Instant) -> Self {
+        Self {
+            principal_credential: entry.principal_credential.clone(),
+            principal_is_member: entry.principal_is_member,
+            principal_trusted_bypass: entry.principal_trusted_bypass,
+            authorization_epoch: entry.authorization_epoch,
+            relationship_seq: entry.relationship_seq,
+            unit_seq_max: entry.unit_seq_max,
+            retired_at,
+        }
+    }
+
+    fn principal_matches(&self, principal: &QueryPrincipal) -> bool {
+        self.principal_credential == principal.credential()
+            && self.principal_is_member == principal.is_member()
+            && self.principal_trusted_bypass == principal.trusted_local_bypass()
+    }
+
+    fn fresh(&self, now: Instant) -> bool {
+        now.duration_since(self.retired_at) < SNAPSHOT_TTL
+    }
 }
 
 impl SnapshotStore {
@@ -355,6 +413,9 @@ impl SnapshotStore {
                 Some(victim) => {
                     if let Some(removed) = self.entries.remove(&victim) {
                         self.bytes = self.bytes.saturating_sub(removed.estimated_bytes);
+                        // Capacity eviction is still a known pin: tombstone it
+                        // so a same-principal catch_up can prove safe expiry.
+                        self.tombstone(victim, &removed, now);
                     }
                 }
                 None => break,
@@ -366,6 +427,41 @@ impl SnapshotStore {
     pub(crate) fn remove(&mut self, token: &str) {
         if let Some(removed) = self.entries.remove(token) {
             self.bytes = self.bytes.saturating_sub(removed.estimated_bytes);
+            // Rotation after a successful catch_up retires a known-good pin;
+            // tombstone it under the same proof rules as expiry.
+            self.tombstone(token.to_string(), &removed, Instant::now());
+        }
+    }
+
+    /// Keep a bounded, short-lived tombstone for a retired pin. Tombstones
+    /// never serve rows; they only let `catch_up` prove safe expiry for the
+    /// same principal. Count-capped like live pins; the oldest retires first.
+    fn tombstone(&mut self, token: String, entry: &SnapshotEntry, now: Instant) {
+        self.expired.retain(|_, pin| pin.fresh(now));
+        if self.expired.len() >= SNAPSHOT_MAX_TOKENS {
+            if let Some(oldest) = self
+                .expired
+                .iter()
+                .min_by_key(|(_, pin)| pin.retired_at)
+                .map(|(token, _)| token.clone())
+            {
+                self.expired.remove(&oldest);
+            }
+        }
+        self.expired.insert(token, ExpiredPin::of(entry, now));
+    }
+
+    /// The safe-expiry proof for `catch_up` only: `Some` when the token is a
+    /// known retired pin, the caller is the same principal it was pinned for,
+    /// and the tombstone itself is fresh. `None` covers unknown tokens,
+    /// principal mismatches, and stale tombstones alike — all answer the
+    /// generic reason, preserving the oracle boundary.
+    fn expired_pin_for(&mut self, principal: &QueryPrincipal, token: &str) -> Option<ExpiredPin> {
+        let now = Instant::now();
+        self.expired.retain(|_, pin| pin.fresh(now));
+        match self.expired.get(token) {
+            Some(pin) if pin.principal_matches(principal) => Some(pin.clone()),
+            _ => None,
         }
     }
 
@@ -379,6 +475,7 @@ impl SnapshotStore {
         for token in expired {
             if let Some(removed) = self.entries.remove(&token) {
                 self.bytes = self.bytes.saturating_sub(removed.estimated_bytes);
+                self.tombstone(token, &removed, now);
             }
         }
     }
@@ -472,13 +569,16 @@ pub struct SnapshotPage {
 
 /// Exact delta from an old pin to a fresh view. Apply deletes first, then
 /// upserts keyed by id, then swap the event window: the result equals a fresh
-/// open at the returned stamp.
+/// open at the returned stamp. `fence_moved` is true only when the caller
+/// opted into `accept_fence_moved` and the authorization/relationship/unit
+/// fences moved under the pin; it is false on the ordinary same-fence path.
 #[derive(Debug, Clone, Serialize)]
 pub struct SnapshotDelta {
     pub token: String,
     pub content_seq: i64,
     pub authorization_epoch: i64,
     pub relationship_seq: i64,
+    pub fence_moved: bool,
     pub upsert_records: Vec<SnapshotRecord>,
     pub delete_record_ids: Vec<String>,
     pub upsert_facets: Vec<SnapshotFacet>,
@@ -651,21 +751,67 @@ impl crate::db::Db {
     /// retired only once its replacement is stored. Anything else — missing
     /// token, fence move, content gap beyond the window, M2 `None`, or a
     /// budget-refused replacement (generic unavailable) — carries no old rows.
+    /// When `accept_fence_moved` is true and M2 returns a fresh view, a moved
+    /// authorization/relationship/unit fence returns the same exact diff with
+    /// `fence_moved: true` instead of a restart; the content-gap check still
+    /// restarts, and the M2-`None` branch is unchanged.
     pub async fn catch_up_workspace_snapshot(
         &self,
         principal: QueryPrincipal,
         token: &str,
+        accept_fence_moved: bool,
     ) -> Result<CatchUpOutcome> {
+        // No live pin: either an unknown token, a principal mismatch, or an
+        // expired/evicted/rotated one. Only a known tombstone for THIS
+        // principal proceeds to the fence proof; everything else stays
+        // generic, so unknown tokens and mismatches remain
+        // indistinguishable. The lock is released before any await below.
         let old = {
             let store = self.workspace_snapshots.clone();
             let mut guard = store
                 .lock()
                 .map_err(|_| Error::engine("workspace snapshot store is unavailable"))?;
             match guard.get_for(&principal, token) {
-                Ok(entry) => entry.clone(),
-                Err(SnapshotLookup::Restart { reason }) => {
-                    return Ok(CatchUpOutcome::Restart { reason });
+                Ok(entry) => Ok(entry.clone()),
+                Err(_) => match guard.expired_pin_for(&principal, token) {
+                    None => {
+                        return Ok(CatchUpOutcome::Restart {
+                            reason: "token_expired_or_unknown",
+                        });
+                    }
+                    Some(pin) => Err(pin),
+                },
+            }
+        };
+        let old = match old {
+            Ok(entry) => entry,
+            Err(pin) => {
+                // Positive authority proof: the pin was issued to this
+                // principal (checked above) and no authorization,
+                // relationship, or unit fence has moved since it was pinned.
+                // Content may be stale — the caller re-opens — but nothing
+                // displayed under the old pin was revoked. Any fence move
+                // fails closed with its specific reason, never the safe one.
+                let (live_epoch, live_relationship, live_unit_seq_max) =
+                    self.live_snapshot_fences().await?;
+                if live_epoch != pin.authorization_epoch {
+                    return Ok(CatchUpOutcome::Restart {
+                        reason: "authorization_epoch_moved",
+                    });
                 }
+                if live_relationship != pin.relationship_seq {
+                    return Ok(CatchUpOutcome::Restart {
+                        reason: "relationship_seq_moved",
+                    });
+                }
+                if live_unit_seq_max != pin.unit_seq_max {
+                    return Ok(CatchUpOutcome::Restart {
+                        reason: "unit_seq_moved",
+                    });
+                }
+                return Ok(CatchUpOutcome::Restart {
+                    reason: "token_expired_fences_unchanged",
+                });
             }
         };
         let Some(filtered) = self.filtered_workspace_index(principal.clone()).await? else {
@@ -693,21 +839,24 @@ impl crate::db::Db {
             }
             return Ok(CatchUpOutcome::Unavailable);
         };
-        if filtered.authorization_epoch != old.authorization_epoch {
+        if !accept_fence_moved && filtered.authorization_epoch != old.authorization_epoch {
             return Ok(CatchUpOutcome::Restart {
                 reason: "authorization_epoch_moved",
             });
         }
-        if filtered.relationship_seq != old.relationship_seq {
+        if !accept_fence_moved && filtered.relationship_seq != old.relationship_seq {
             return Ok(CatchUpOutcome::Restart {
                 reason: "relationship_seq_moved",
             });
         }
-        if filtered.unit_seq_max != old.unit_seq_max {
+        if !accept_fence_moved && filtered.unit_seq_max != old.unit_seq_max {
             return Ok(CatchUpOutcome::Restart {
                 reason: "unit_seq_moved",
             });
         }
+        let fence_moved = filtered.authorization_epoch != old.authorization_epoch
+            || filtered.relationship_seq != old.relationship_seq
+            || filtered.unit_seq_max != old.unit_seq_max;
         if filtered.content_seq < old.content_seq
             || filtered.content_seq - old.content_seq > SNAPSHOT_MAX_CATCH_UP_GAP
         {
@@ -721,6 +870,7 @@ impl crate::db::Db {
             content_seq: fresh.content_seq,
             authorization_epoch: fresh.authorization_epoch,
             relationship_seq: fresh.relationship_seq,
+            fence_moved,
             upsert_records: Vec::new(),
             delete_record_ids: Vec::new(),
             upsert_facets: Vec::new(),
@@ -1004,7 +1154,7 @@ mod tests {
         .await
         .unwrap();
         match db
-            .catch_up_workspace_snapshot(bea(), &bea_open.token)
+            .catch_up_workspace_snapshot(bea(), &bea_open.token, false)
             .await
             .unwrap()
         {
@@ -1128,7 +1278,7 @@ mod tests {
             Ok(_) => panic!("unitized pin must not page a formerly visible artifact"),
         }
         match db
-            .catch_up_workspace_snapshot(alice(), &opened.token)
+            .catch_up_workspace_snapshot(alice(), &opened.token, false)
             .await
             .unwrap()
         {
@@ -1167,7 +1317,7 @@ mod tests {
             .await
             .unwrap();
         match db
-            .catch_up_workspace_snapshot(alice(), &opened.token)
+            .catch_up_workspace_snapshot(alice(), &opened.token, false)
             .await
             .unwrap()
         {
@@ -1266,13 +1416,17 @@ mod tests {
             .await
             .unwrap();
         let delta = match db
-            .catch_up_workspace_snapshot(alice(), &opened.token)
+            .catch_up_workspace_snapshot(alice(), &opened.token, false)
             .await
             .unwrap()
         {
             CatchUpOutcome::Delta(delta) => delta,
             other => panic!("same-fence changes must delta, got {other:?}"),
         };
+        assert!(
+            !delta.fence_moved,
+            "same-fence delta carries fence_moved:false"
+        );
         // Exact application rule: deletes first, then whole-row upserts.
         for id in &delta.delete_record_ids {
             model.remove(id);
@@ -1412,7 +1566,7 @@ mod tests {
             .unwrap();
         }
         match db
-            .catch_up_workspace_snapshot(alice(), &opened.token)
+            .catch_up_workspace_snapshot(alice(), &opened.token, false)
             .await
             .unwrap()
         {
@@ -1449,6 +1603,125 @@ mod tests {
                 }
                 Ok(_) => panic!("foreign token must not page"),
             }
+        }
+    }
+
+    /// Age one live pin past its TTL, the way the store's own bound test
+    /// does. The pin is expired but still known: the tombstone proof below
+    /// can vouch for it.
+    fn expire_token(db: &crate::db::Db, token: &str) {
+        let store = db.workspace_snapshots.clone();
+        let mut guard = store.lock().unwrap();
+        guard.entries.get_mut(token).unwrap().created_at =
+            Instant::now() - SNAPSHOT_TTL - Duration::from_secs(1);
+    }
+
+    #[tokio::test]
+    async fn expired_known_token_proves_safe_catch_up_for_same_principal() {
+        let db = three_record_fixture().await;
+        let opened = open_token(&db, alice()).await;
+        expire_token(&db, &opened.token);
+        // Paging stays generic even for the same principal: only catch_up
+        // carries the safe-expiry proof, never rows.
+        match db
+            .page_workspace_snapshot(alice(), &opened.token, SnapshotSection::Records, 50, None)
+            .await
+            .unwrap()
+        {
+            Err(SnapshotLookup::Restart { reason }) => {
+                assert_eq!(reason, "token_expired_or_unknown");
+            }
+            Ok(_) => panic!("expired token must not serve"),
+        }
+        match db
+            .catch_up_workspace_snapshot(alice(), &opened.token, false)
+            .await
+            .unwrap()
+        {
+            CatchUpOutcome::Restart { reason } => {
+                assert_eq!(reason, "token_expired_fences_unchanged");
+            }
+            other => panic!("safe expiry must prove, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn expired_token_mismatch_and_unknown_stay_generic_on_catch_up() {
+        let db = three_record_fixture().await;
+        let opened = open_token(&db, alice()).await;
+        expire_token(&db, &opened.token);
+        // Another principal's catch_up and a forged token answer identically:
+        // the tombstone never vouches across principals, preserving the
+        // oracle boundary the page path already holds.
+        for (principal, token) in [
+            (bea(), opened.token.clone()),
+            (alice(), "not-a-real-token".to_string()),
+        ] {
+            match db
+                .catch_up_workspace_snapshot(principal, &token, false)
+                .await
+                .unwrap()
+            {
+                CatchUpOutcome::Restart { reason } => {
+                    assert_eq!(reason, "token_expired_or_unknown");
+                }
+                other => panic!("mismatch/unknown must stay generic, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn expired_token_fence_move_fails_closed_without_safe_reason() {
+        let db = three_record_fixture().await;
+        let opened = open_token(&db, alice()).await;
+        expire_token(&db, &opened.token);
+        // A fence move after expiry must surface its specific reason — never
+        // the safe one — so a revoked model cannot retain live content.
+        replace_explicit_policy(
+            &db,
+            "test:narrow",
+            ALICE_COMMON_ID,
+            vec![AllowEntry::account("alice", Capability::View)],
+        )
+        .await
+        .unwrap();
+        match db
+            .catch_up_workspace_snapshot(alice(), &opened.token, false)
+            .await
+            .unwrap()
+        {
+            CatchUpOutcome::Restart { reason } => {
+                assert_eq!(reason, "authorization_epoch_moved");
+            }
+            other => panic!("fence move must fail closed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn expired_pin_with_moved_fence_restarts_even_opt_in() {
+        // The tombstone path runs before the opt-in fence-moved path and
+        // ignores the flag: an expired pin can never yield a delta, so a
+        // revoked model cannot retain live content past expiry.
+        let db = three_record_fixture().await;
+        let opened = open_token(&db, alice()).await;
+        expire_token(&db, &opened.token);
+        replace_explicit_policy(
+            &db,
+            "test:narrow",
+            ALICE_COMMON_ID,
+            vec![AllowEntry::account("alice", Capability::View)],
+        )
+        .await
+        .unwrap();
+        match db
+            .catch_up_workspace_snapshot(alice(), &opened.token, true)
+            .await
+            .unwrap()
+        {
+            CatchUpOutcome::Restart { reason } => {
+                assert_eq!(reason, "authorization_epoch_moved");
+            }
+            other => panic!("expired pin must restart even opt-in, got {other:?}"),
         }
     }
 
@@ -1771,5 +2044,586 @@ mod tests {
         // And the wire form is a JSON number, not a string.
         let wire = serde_json::to_value(numeric).unwrap();
         assert!(wire["value_num"].is_number());
+    }
+
+    #[tokio::test]
+    async fn opt_in_insert_epoch_move_returns_delta_equal_to_fresh() {
+        let db = three_record_fixture().await;
+        let opened = open_token(&db, alice()).await;
+        let mut model = page_all_records(&db, alice(), &opened.token).await;
+        // A record INSERT moves the authorization epoch by schema trigger.
+        let newcomer = "9e795001-0000-4000-8000-000000000041";
+        create_record(
+            &db,
+            json!({
+                "id": newcomer,
+                "type": "Document", "kind": "note", "name": "Newcomer",
+                "home_id": crate::schema::ROOT_RECORD_ID
+            }),
+        )
+        .await
+        .unwrap();
+        replace_explicit_policy(
+            &db,
+            "test:policy",
+            newcomer,
+            vec![AllowEntry::account("alice", Capability::View)],
+        )
+        .await
+        .unwrap();
+        // Opt-out still restarts on the moved epoch, without retiring the pin.
+        match db
+            .catch_up_workspace_snapshot(alice(), &opened.token, false)
+            .await
+            .unwrap()
+        {
+            CatchUpOutcome::Restart { reason } => {
+                assert_eq!(reason, "authorization_epoch_moved");
+            }
+            other => panic!("opt-out insert must restart, got {other:?}"),
+        }
+        let delta = match db
+            .catch_up_workspace_snapshot(alice(), &opened.token, true)
+            .await
+            .unwrap()
+        {
+            CatchUpOutcome::Delta(delta) => delta,
+            other => panic!("opt-in insert must delta, got {other:?}"),
+        };
+        assert!(delta.fence_moved, "epoch moved under the pin");
+        assert!(
+            delta.upsert_records.iter().any(|row| row.id == newcomer),
+            "new record arrives as an upsert"
+        );
+        assert!(delta.delete_record_ids.is_empty());
+        for id in &delta.delete_record_ids {
+            model.remove(id);
+        }
+        for row in delta.upsert_records {
+            model.insert(row.id.clone(), row);
+        }
+        let fresh = open_token(&db, alice()).await;
+        assert_eq!(delta.content_seq, fresh.content_seq);
+        assert_eq!(delta.authorization_epoch, fresh.authorization_epoch);
+        assert_eq!(model, page_all_records(&db, alice(), &fresh.token).await);
+    }
+
+    #[tokio::test]
+    async fn opt_in_narrowing_returns_revocation_deletes_equal_to_fresh() {
+        let db = three_record_fixture().await;
+        // Fence-stable setup bea can see: a facet and a both-endpoints-visible
+        // link on the record she is about to lose.
+        set_facet(
+            &db,
+            ALICE_COMMON_ID,
+            FacetSetPayload {
+                key: "priority".to_string(),
+                value: Some("high".to_string()),
+                vocab_ref: None,
+                as_of: None,
+                observation_only: false,
+            },
+        )
+        .await
+        .unwrap();
+        add_link(
+            &db,
+            LinkAddedPayload {
+                id: Some("9e795001-0000-4000-8000-000000000042".to_string()),
+                source_id: ALICE_COMMON_ID.to_string(),
+                target_id: BEA_ONLY_ID.to_string(),
+                relationship: "mentions".to_string(),
+                note: None,
+            },
+        )
+        .await
+        .unwrap();
+        let bea_open = open_token(&db, bea()).await;
+        // A second pin proves `page` still restarts after the same fence move.
+        let bea_page_pin = open_token(&db, bea()).await;
+        let mut model = page_all_records(&db, bea(), &bea_open.token).await;
+        assert!(model.contains_key(ALICE_COMMON_ID));
+        let mut facet_model =
+            facet_map(page_all_section(&db, bea(), &bea_open.token, SnapshotSection::Facets).await);
+        let mut link_model =
+            link_map(page_all_section(&db, bea(), &bea_open.token, SnapshotSection::Links).await);
+        let lost_facet = facet_model
+            .values()
+            .find(|facet| facet.record_id == ALICE_COMMON_ID)
+            .expect("common facet is held")
+            .id
+            .clone();
+        assert!(link_model.contains_key("9e795001-0000-4000-8000-000000000042"));
+        replace_explicit_policy(
+            &db,
+            "test:narrow",
+            ALICE_COMMON_ID,
+            vec![AllowEntry::account("alice", Capability::View)],
+        )
+        .await
+        .unwrap();
+        let delta = match db
+            .catch_up_workspace_snapshot(bea(), &bea_open.token, true)
+            .await
+            .unwrap()
+        {
+            CatchUpOutcome::Delta(delta) => delta,
+            other => panic!("opt-in narrowing must delta, got {other:?}"),
+        };
+        assert!(delta.fence_moved, "epoch moved under the pin");
+        // The revocation is a delete across records, facets, and links.
+        assert!(delta
+            .delete_record_ids
+            .contains(&ALICE_COMMON_ID.to_string()));
+        assert!(delta.delete_facet_ids.contains(&lost_facet));
+        assert!(
+            delta.delete_facet_keys.contains(&FacetKey {
+                record_id: ALICE_COMMON_ID.to_string(),
+                key: "priority".to_string(),
+            }),
+            "facet deletes carry their page key"
+        );
+        assert!(delta
+            .delete_link_ids
+            .contains(&"9e795001-0000-4000-8000-000000000042".to_string()));
+        assert!(
+            delta.delete_link_keys.contains(&LinkKey {
+                source_id: ALICE_COMMON_ID.to_string(),
+                target_id: BEA_ONLY_ID.to_string(),
+                relationship: "mentions".to_string(),
+            }),
+            "link deletes carry their page key"
+        );
+        // No hidden row may appear anywhere else in the response.
+        assert!(
+            !delta
+                .upsert_records
+                .iter()
+                .any(|row| row.id == ALICE_COMMON_ID),
+            "revoked record must not upsert"
+        );
+        assert!(
+            !delta
+                .upsert_facets
+                .iter()
+                .any(|facet| facet.record_id == ALICE_COMMON_ID),
+            "revoked facets must not upsert"
+        );
+        assert!(
+            !delta
+                .upsert_links
+                .iter()
+                .any(|link| link.source_id == ALICE_COMMON_ID || link.target_id == ALICE_COMMON_ID),
+            "revoked links must not upsert"
+        );
+        assert!(
+            !delta
+                .content_events
+                .iter()
+                .any(|event| event.record_id == ALICE_COMMON_ID),
+            "revoked record must not appear in content events"
+        );
+        // `page` on the sibling pin still restarts with no rows.
+        match db
+            .page_workspace_snapshot(
+                bea(),
+                &bea_page_pin.token,
+                SnapshotSection::Records,
+                50,
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            Err(SnapshotLookup::Restart { reason }) => {
+                assert_eq!(reason, "authorization_epoch_moved");
+            }
+            Ok(_) => panic!("revoked pin must not page stale rows"),
+        }
+        // The caught-up model equals a fresh open for bea across every section.
+        for id in &delta.delete_record_ids {
+            model.remove(id);
+        }
+        for row in delta.upsert_records {
+            model.insert(row.id.clone(), row);
+        }
+        for id in &delta.delete_facet_ids {
+            facet_model.remove(id);
+        }
+        for facet in delta.upsert_facets {
+            facet_model.insert(facet.id.clone(), facet);
+        }
+        for id in &delta.delete_link_ids {
+            link_model.remove(id);
+        }
+        for link in delta.upsert_links {
+            link_model.insert(link.id.clone(), link);
+        }
+        let fresh = open_token(&db, bea()).await;
+        assert_eq!(delta.content_seq, fresh.content_seq);
+        assert_eq!(model, page_all_records(&db, bea(), &fresh.token).await);
+        assert_eq!(
+            facet_model,
+            facet_map(page_all_section(&db, bea(), &fresh.token, SnapshotSection::Facets).await)
+        );
+        assert_eq!(
+            link_model,
+            link_map(page_all_section(&db, bea(), &fresh.token, SnapshotSection::Links).await)
+        );
+        let fresh_events: Vec<SnapshotEvent> =
+            page_all_section(&db, bea(), &fresh.token, SnapshotSection::ContentEvents)
+                .await
+                .into_iter()
+                .map(|row| serde_json::from_value(row).unwrap())
+                .collect();
+        assert_eq!(delta.content_events, fresh_events);
+    }
+
+    #[tokio::test]
+    async fn opt_in_hidden_parent_masks_child_home_id() {
+        // A parent folder becomes hidden while the child stays visible: the
+        // child upserts with its home masked to None, and the caught-up
+        // model equals a fresh open.
+        let db = three_record_fixture().await;
+        let parent = "9e795001-0000-4000-8000-000000000061";
+        let child = "9e795001-0000-4000-8000-000000000062";
+        create_record(
+            &db,
+            json!({
+                "id": parent,
+                "type": "Collection", "kind": "folder", "name": "Parent",
+                "home_id": crate::schema::ROOT_RECORD_ID
+            }),
+        )
+        .await
+        .unwrap();
+        create_record(
+            &db,
+            json!({
+                "id": child,
+                "type": "Document", "kind": "note", "name": "Child",
+                "home_id": parent
+            }),
+        )
+        .await
+        .unwrap();
+        for id in [parent, child] {
+            replace_explicit_policy(
+                &db,
+                "test:policy",
+                id,
+                vec![
+                    AllowEntry::account("alice", Capability::View),
+                    AllowEntry::account("bea", Capability::View),
+                ],
+            )
+            .await
+            .unwrap();
+        }
+        let bea_open = open_token(&db, bea()).await;
+        let mut model = page_all_records(&db, bea(), &bea_open.token).await;
+        assert_eq!(model[child].home_id.as_deref(), Some(parent));
+        replace_explicit_policy(
+            &db,
+            "test:narrow",
+            parent,
+            vec![AllowEntry::account("alice", Capability::View)],
+        )
+        .await
+        .unwrap();
+        let delta = match db
+            .catch_up_workspace_snapshot(bea(), &bea_open.token, true)
+            .await
+            .unwrap()
+        {
+            CatchUpOutcome::Delta(delta) => delta,
+            other => panic!("opt-in parent narrowing must delta, got {other:?}"),
+        };
+        assert!(delta.fence_moved, "epoch moved under the pin");
+        assert!(delta.delete_record_ids.contains(&parent.to_string()));
+        let masked = delta
+            .upsert_records
+            .iter()
+            .find(|row| row.id == child)
+            .expect("visible child arrives as an upsert");
+        assert_eq!(masked.home_id, None, "hidden parent is masked, not leaked");
+        for id in &delta.delete_record_ids {
+            model.remove(id);
+        }
+        for row in delta.upsert_records {
+            model.insert(row.id.clone(), row);
+        }
+        let fresh = open_token(&db, bea()).await;
+        assert_eq!(model, page_all_records(&db, bea(), &fresh.token).await);
+    }
+
+    #[tokio::test]
+    async fn opt_in_m2_none_with_moved_fence_still_restarts() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let id = "9e795001-0000-4000-8000-000000000051";
+        create_record(
+            &db,
+            json!({
+                "id": id, "type": "Document", "kind": "note", "name": "large",
+                "home_id": crate::schema::ROOT_RECORD_ID
+            }),
+        )
+        .await
+        .unwrap();
+        replace_explicit_policy(
+            &db,
+            "test:policy",
+            id,
+            vec![AllowEntry::account("alice", Capability::View)],
+        )
+        .await
+        .unwrap();
+        let opened = open_token(&db, alice()).await;
+        // Bloat past the index cap so M2 holds nothing, then move the fence
+        // with a record INSERT. The opt-in cannot diff without a fresh view.
+        let large_summary = "x".repeat(25 * 1024 * 1024);
+        sqlx::query("UPDATE records SET summary = ? WHERE id = ?")
+            .bind(large_summary)
+            .bind(id)
+            .execute(db.write_pool())
+            .await
+            .unwrap();
+        create_record(
+            &db,
+            json!({
+                "id": "9e795001-0000-4000-8000-000000000052",
+                "type": "Document", "kind": "note", "name": "Newcomer",
+                "home_id": crate::schema::ROOT_RECORD_ID
+            }),
+        )
+        .await
+        .unwrap();
+        match db
+            .catch_up_workspace_snapshot(alice(), &opened.token, true)
+            .await
+            .unwrap()
+        {
+            CatchUpOutcome::Restart { reason } => {
+                assert_eq!(reason, "authorization_epoch_moved");
+            }
+            other => panic!("M2-None with a moved fence must restart, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn opt_in_content_gap_with_moved_fence_still_restarts() {
+        let db = three_record_fixture().await;
+        let opened = open_token(&db, alice()).await;
+        // Facet writes advance the content cursor without moving either
+        // fence; the trailing INSERT moves the epoch on top of the gap.
+        for index in 0..SNAPSHOT_MAX_CATCH_UP_GAP + 8 {
+            set_facet(
+                &db,
+                ALICE_ONLY_ID,
+                FacetSetPayload {
+                    key: "churn".to_string(),
+                    value: Some(index.to_string()),
+                    vocab_ref: None,
+                    as_of: None,
+                    observation_only: false,
+                },
+            )
+            .await
+            .unwrap();
+        }
+        create_record(
+            &db,
+            json!({
+                "id": "9e795001-0000-4000-8000-000000000053",
+                "type": "Document", "kind": "note", "name": "Newcomer",
+                "home_id": crate::schema::ROOT_RECORD_ID
+            }),
+        )
+        .await
+        .unwrap();
+        match db
+            .catch_up_workspace_snapshot(alice(), &opened.token, true)
+            .await
+            .unwrap()
+        {
+            CatchUpOutcome::Restart { reason } => {
+                assert_eq!(reason, "content_gap_outside_window");
+            }
+            other => panic!("over-window gap must restart even opt-in, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn opt_in_relationship_move_returns_delta_equal_to_fresh() {
+        // A governed relationship write moves only the relationship fence:
+        // the opt-in path diffs with `fence_moved: true` and reaches the
+        // same model as a fresh open.
+        let db = three_record_fixture().await;
+        let opened = open_token(&db, alice()).await;
+        let mut model = page_all_records(&db, alice(), &opened.token).await;
+        let mut registry = crate::mcp::ToolRegistry::new();
+        crate::mcp::register_surface_tools(&mut registry).unwrap();
+        registry
+            .call(
+                db.clone(),
+                crate::mcp::Caller::local(),
+                "manage_relationships",
+                json!({
+                    "action": "assert",
+                    "relationship_type": "relates_to",
+                    "endpoints": [
+                        {"role": "participant", "record_id": ALICE_COMMON_ID},
+                        {"role": "participant", "record_id": ALICE_ONLY_ID}
+                    ],
+                    "idempotency_key": "workspace-snapshot-fence-opt-in"
+                }),
+            )
+            .await
+            .unwrap();
+        let delta = match db
+            .catch_up_workspace_snapshot(alice(), &opened.token, true)
+            .await
+            .unwrap()
+        {
+            CatchUpOutcome::Delta(delta) => delta,
+            other => panic!("opt-in relationship move must delta, got {other:?}"),
+        };
+        assert!(delta.fence_moved, "relationship fence moved under the pin");
+        for id in &delta.delete_record_ids {
+            model.remove(id);
+        }
+        for row in delta.upsert_records {
+            model.insert(row.id.clone(), row);
+        }
+        let fresh = open_token(&db, alice()).await;
+        assert_eq!(delta.content_seq, fresh.content_seq);
+        assert_eq!(delta.relationship_seq, fresh.relationship_seq);
+        assert_eq!(model, page_all_records(&db, alice(), &fresh.token).await);
+    }
+
+    #[tokio::test]
+    async fn opt_in_unit_hiding_returns_revocation_deletes() {
+        // Unit creation hides the derived artifact behind the unit fence:
+        // the opt-in delta lists it in deletes, names it nowhere else, and
+        // the caught-up model equals a fresh open.
+        let db = three_record_fixture().await;
+        let envelope = "9e795001-0000-4000-8000-000000000064";
+        let derived = "9e795001-0000-4000-8000-000000000065";
+        append(
+            &db,
+            AppendSpec {
+                record_id: envelope.to_string(),
+                event_type: "record.created".into(),
+                payload: json!({
+                    "type": "Entity",
+                    "kind": "semantic-unit",
+                    "name": "unit envelope",
+                    "home_id": crate::schema::ROOT_RECORD_ID,
+                }),
+                actor: None,
+            },
+        )
+        .await
+        .unwrap();
+        create_record(
+            &db,
+            json!({
+                "id": derived,
+                "type": "Document",
+                "kind": "attachment",
+                "name": "derived artifact",
+                "home_id": crate::schema::ROOT_RECORD_ID,
+            }),
+        )
+        .await
+        .unwrap();
+        let derived_anchor: String =
+            sqlx::query_scalar("SELECT policy_anchor_id FROM records WHERE id = ?")
+                .bind(derived)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        replace_explicit_policy(
+            &db,
+            "test:policy",
+            &derived_anchor,
+            vec![AllowEntry::account("alice", Capability::View)],
+        )
+        .await
+        .unwrap();
+        add_link(
+            &db,
+            LinkAddedPayload {
+                id: Some("unit-derived-artifact-opt-in".into()),
+                source_id: derived.into(),
+                target_id: envelope.into(),
+                relationship: "part_of".into(),
+                note: None,
+            },
+        )
+        .await
+        .unwrap();
+        let opened = open_token(&db, alice()).await;
+        let mut model = page_all_records(&db, alice(), &opened.token).await;
+        assert!(model.contains_key(derived));
+        append(
+            &db,
+            AppendSpec {
+                record_id: envelope.to_string(),
+                event_type: "unit.created.v1".into(),
+                payload: json!({
+                    "semantic_contract_version": "native.freshness-kernel.v1",
+                    "authority_bearer_record_id": ALICE_COMMON_ID,
+                    "label": "unit envelope",
+                }),
+                actor: Some("test:unit".into()),
+            },
+        )
+        .await
+        .unwrap();
+        let delta = match db
+            .catch_up_workspace_snapshot(alice(), &opened.token, true)
+            .await
+            .unwrap()
+        {
+            CatchUpOutcome::Delta(delta) => delta,
+            other => panic!("opt-in unit hiding must delta, got {other:?}"),
+        };
+        assert!(delta.fence_moved, "unit fence moved under the pin");
+        assert!(delta.delete_record_ids.contains(&derived.to_string()));
+        assert!(
+            !delta.upsert_records.iter().any(|row| row.id == derived),
+            "hidden artifact must not upsert"
+        );
+        assert!(
+            !delta
+                .upsert_facets
+                .iter()
+                .any(|facet| facet.record_id == derived),
+            "hidden artifact facets must not upsert"
+        );
+        assert!(
+            !delta
+                .upsert_links
+                .iter()
+                .any(|link| link.source_id == derived || link.target_id == derived),
+            "hidden artifact links must not upsert"
+        );
+        assert!(
+            !delta
+                .content_events
+                .iter()
+                .any(|event| event.record_id == derived),
+            "hidden artifact must not appear in content events"
+        );
+        for id in &delta.delete_record_ids {
+            model.remove(id);
+        }
+        for row in delta.upsert_records {
+            model.insert(row.id.clone(), row);
+        }
+        let fresh = open_token(&db, alice()).await;
+        assert_eq!(delta.content_seq, fresh.content_seq);
+        assert_eq!(model, page_all_records(&db, alice(), &fresh.token).await);
     }
 }

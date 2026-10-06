@@ -10,6 +10,8 @@ Choose exactly one body operation on `update_record`:
 
 The old `body` argument is a deprecated alias for full replacement, with a warning directing callers to `body_set`. It does not append. Do not combine it with another body operation. `create_record.body` still supplies the initial content of a new record.
 
+**Large finished content.** Write finished content once. `body_append` is for small additions only: every append re-stores the whole body in the record's history, so streaming a finished document through it grows the log quadratically. Write a finished document with one `body_set`; a single request carries up to about 3 MB of text. Put an app artifact in one `body_set` of at most 512 KiB. Reserve `body_append` for genuinely incremental progress where a small delta is the point.
+
 Replacing a non-empty body requires `if_body_digest` from a fresh `get_record.body_digest` and/or `if_unmodified_since`. Surgical edits and append do not require a digest, but a supplied digest must match current content. An append without a digest preserves edits committed before it acquires the write transaction. A stale guard rejects the write without changing the record; reread and reconcile before retrying.
 
 Body-write receipts identify the operation and report lengths before and after the write, plus the signed net change, counted in Unicode scalar values. Full replacement remains explicit even when the lengths are equal. Check the receipt when you intended to preserve existing content. Append is not retry-idempotent: if a response is lost, inspect the record before repeating the call.

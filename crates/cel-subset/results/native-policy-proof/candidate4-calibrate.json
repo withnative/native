@@ -1,0 +1,7182 @@
+{
+  "all_legitimate_measured": true,
+  "auxiliary_storage": {
+    "arc_edge_bytes": 8,
+    "ast_depth": 32,
+    "body_depth": 2,
+    "ceilings": {
+      "cells": 1000000,
+      "nodes": 250000,
+      "shapes": 16384,
+      "visits": 1000000
+    },
+    "kind_inline_bytes": 56,
+    "last_owner_drop_edge_payload_max": 4000000,
+    "node_inline_bytes": 48,
+    "node_inline_payload_max": 12000000,
+    "real_tokens": 1024,
+    "scope": "Inline payload models exclude allocator headers/capacity/alignment. Cells cumulatively bound traversal/memo/coefficient records with bounded Rust record sizes; Shapes also count clone/rebind/join operations and bound nested union slots. These are finite native auxiliary-control storage implications, not an allocator census or runtime H charge. Visits bound traversal work. Last-owner queues have at most2edges per constructed node; source/declaration/value validation imposes separate finite bounds.",
+    "shape_inline_bytes": 120,
+    "shape_inline_payload_model": 1966080,
+    "source_bytes": 8192,
+    "value_depth": 35
+  },
+  "cases": [
+    {
+      "bound": {
+        "memory": 86536,
+        "resource_product": false,
+        "result_bytes": 4359,
+        "result_depth": 3,
+        "result_nodes": 5,
+        "retained": 86536,
+        "work": 1649
+      },
+      "family": "m1-original",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 28608,
+        "work": 447
+      },
+      "measurement_only": true,
+      "name": "bands",
+      "native_aux": [
+        [
+          "term_bands_allow:When",
+          {
+            "cells": 642,
+            "nodes": 179,
+            "shapes": 29,
+            "visits": 174
+          }
+        ],
+        [
+          "term_bands_allow:Result",
+          {
+            "cells": 1418,
+            "nodes": 233,
+            "shapes": 43,
+            "visits": 412
+          }
+        ],
+        [
+          "bands_allow:When",
+          {
+            "cells": 386,
+            "nodes": 91,
+            "shapes": 15,
+            "visits": 102
+          }
+        ],
+        [
+          "bands_allow:Result",
+          {
+            "cells": 1418,
+            "nodes": 233,
+            "shapes": 43,
+            "visits": 412
+          }
+        ],
+        [
+          "term_bands_approval:When",
+          {
+            "cells": 642,
+            "nodes": 179,
+            "shapes": 29,
+            "visits": 174
+          }
+        ],
+        [
+          "term_bands_approval:Result",
+          {
+            "cells": 1418,
+            "nodes": 236,
+            "shapes": 43,
+            "visits": 412
+          }
+        ],
+        [
+          "bands_approval:When",
+          {
+            "cells": 386,
+            "nodes": 91,
+            "shapes": 15,
+            "visits": 102
+          }
+        ],
+        [
+          "bands_approval:Result",
+          {
+            "cells": 1418,
+            "nodes": 236,
+            "shapes": 43,
+            "visits": 412
+          }
+        ],
+        [
+          "bands_deny:When",
+          {
+            "cells": 103,
+            "nodes": 30,
+            "shapes": 7,
+            "visits": 24
+          }
+        ],
+        [
+          "bands_deny:Result",
+          {
+            "cells": 1418,
+            "nodes": 233,
+            "shapes": 43,
+            "visits": 412
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 10040367,
+        "resource_product": false,
+        "result_bytes": 1252994,
+        "result_depth": 3,
+        "result_nodes": 5007,
+        "retained": 10040367,
+        "work": 472198
+      },
+      "family": "m1-original",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 17472,
+        "work": 273
+      },
+      "measurement_only": true,
+      "name": "capacity",
+      "native_aux": [
+        [
+          "seats_ok:When",
+          {
+            "cells": 386,
+            "nodes": 134,
+            "shapes": 24,
+            "visits": 102
+          }
+        ],
+        [
+          "seats_ok:Result",
+          {
+            "cells": 5572,
+            "nodes": 643,
+            "shapes": 117,
+            "visits": 1549
+          }
+        ],
+        [
+          "sold_out:When",
+          {
+            "cells": 103,
+            "nodes": 57,
+            "shapes": 12,
+            "visits": 24
+          }
+        ],
+        [
+          "sold_out:Result",
+          {
+            "cells": 5572,
+            "nodes": 643,
+            "shapes": 117,
+            "visits": 1549
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 77216,
+        "resource_product": false,
+        "result_bytes": 8483,
+        "result_depth": 3,
+        "result_nodes": 6,
+        "retained": 77216,
+        "work": 1402
+      },
+      "family": "m1-original",
+      "guards": [
+        {
+          "bound": {
+            "memory": 1847,
+            "resource_product": false,
+            "result_bytes": 8,
+            "result_depth": 1,
+            "result_nodes": 1,
+            "retained": 1847,
+            "work": 44
+          },
+          "input": "cap",
+          "load": {
+            "memory": 1984,
+            "work": 31
+          },
+          "native_aux": {
+            "cells": 386,
+            "nodes": 91,
+            "shapes": 15,
+            "visits": 102
+          },
+          "public_gate_would_refuse": null,
+          "source": "request.needs_exception == true"
+        }
+      ],
+      "legitimate": true,
+      "load": {
+        "memory": 19328,
+        "work": 302
+      },
+      "measurement_only": true,
+      "name": "eu",
+      "native_aux": [
+        [
+          "not_applicable:When",
+          {
+            "cells": 386,
+            "nodes": 104,
+            "shapes": 19,
+            "visits": 102
+          }
+        ],
+        [
+          "not_applicable:Result",
+          {
+            "cells": 1418,
+            "nodes": 246,
+            "shapes": 47,
+            "visits": 412
+          }
+        ],
+        [
+          "eu_ok:When",
+          {
+            "cells": 642,
+            "nodes": 198,
+            "shapes": 33,
+            "visits": 174
+          }
+        ],
+        [
+          "eu_ok:Result",
+          {
+            "cells": 1897,
+            "nodes": 291,
+            "shapes": 53,
+            "visits": 546
+          }
+        ],
+        [
+          "eu_legal:When",
+          {
+            "cells": 103,
+            "nodes": 43,
+            "shapes": 11,
+            "visits": 24
+          }
+        ],
+        [
+          "eu_legal:Result",
+          {
+            "cells": 1897,
+            "nodes": 294,
+            "shapes": 53,
+            "visits": 546
+          }
+        ],
+        [
+          "guard:cap",
+          {
+            "cells": 386,
+            "nodes": 91,
+            "shapes": 15,
+            "visits": 102
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 31179808,
+        "resource_product": false,
+        "result_bytes": 1252917,
+        "result_depth": 3,
+        "result_nodes": 5006,
+        "retained": 21412803,
+        "work": 1910384
+      },
+      "family": "m1-original",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 32128,
+        "work": 502
+      },
+      "measurement_only": true,
+      "name": "full-deal",
+      "native_aux": [
+        [
+          "approval:When",
+          {
+            "cells": 1560,
+            "nodes": 349,
+            "shapes": 57,
+            "visits": 414
+          }
+        ],
+        [
+          "approval:Result",
+          {
+            "cells": 7231,
+            "nodes": 871,
+            "shapes": 135,
+            "visits": 1960
+          }
+        ],
+        [
+          "policy_allow:When",
+          {
+            "cells": 476,
+            "nodes": 160,
+            "shapes": 27,
+            "visits": 126
+          }
+        ],
+        [
+          "policy_allow:Result",
+          {
+            "cells": 1897,
+            "nodes": 322,
+            "shapes": 59,
+            "visits": 546
+          }
+        ],
+        [
+          "policy_approval:When",
+          {
+            "cells": 476,
+            "nodes": 160,
+            "shapes": 27,
+            "visits": 126
+          }
+        ],
+        [
+          "policy_approval:Result",
+          {
+            "cells": 1897,
+            "nodes": 325,
+            "shapes": 59,
+            "visits": 546
+          }
+        ],
+        [
+          "policy_deny:When",
+          {
+            "cells": 103,
+            "nodes": 74,
+            "shapes": 17,
+            "visits": 24
+          }
+        ],
+        [
+          "policy_deny:Result",
+          {
+            "cells": 1897,
+            "nodes": 322,
+            "shapes": 59,
+            "visits": 546
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 10048541,
+        "resource_product": false,
+        "result_bytes": 1257089,
+        "result_depth": 3,
+        "result_nodes": 5007,
+        "retained": 10048541,
+        "work": 472165
+      },
+      "family": "m1-original",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 14272,
+        "work": 223
+      },
+      "measurement_only": true,
+      "name": "sheet",
+      "native_aux": [
+        [
+          "review:When",
+          {
+            "cells": 386,
+            "nodes": 144,
+            "shapes": 28,
+            "visits": 102
+          }
+        ],
+        [
+          "review:Result",
+          {
+            "cells": 5658,
+            "nodes": 576,
+            "shapes": 107,
+            "visits": 1569
+          }
+        ],
+        [
+          "sheet_ok:When",
+          {
+            "cells": 103,
+            "nodes": 83,
+            "shapes": 20,
+            "visits": 24
+          }
+        ],
+        [
+          "sheet_ok:Result",
+          {
+            "cells": 5658,
+            "nodes": 576,
+            "shapes": 107,
+            "visits": 1569
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 86536,
+        "resource_product": false,
+        "result_bytes": 4359,
+        "result_depth": 3,
+        "result_nodes": 5,
+        "retained": 86536,
+        "work": 1649
+      },
+      "family": "m1-max-many",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 28608,
+        "work": 447
+      },
+      "measurement_only": true,
+      "name": "bands-max-many",
+      "native_aux": [
+        [
+          "term_bands_allow:When",
+          {
+            "cells": 642,
+            "nodes": 179,
+            "shapes": 29,
+            "visits": 174
+          }
+        ],
+        [
+          "term_bands_allow:Result",
+          {
+            "cells": 1418,
+            "nodes": 233,
+            "shapes": 43,
+            "visits": 412
+          }
+        ],
+        [
+          "bands_allow:When",
+          {
+            "cells": 386,
+            "nodes": 91,
+            "shapes": 15,
+            "visits": 102
+          }
+        ],
+        [
+          "bands_allow:Result",
+          {
+            "cells": 1418,
+            "nodes": 233,
+            "shapes": 43,
+            "visits": 412
+          }
+        ],
+        [
+          "term_bands_approval:When",
+          {
+            "cells": 642,
+            "nodes": 179,
+            "shapes": 29,
+            "visits": 174
+          }
+        ],
+        [
+          "term_bands_approval:Result",
+          {
+            "cells": 1418,
+            "nodes": 236,
+            "shapes": 43,
+            "visits": 412
+          }
+        ],
+        [
+          "bands_approval:When",
+          {
+            "cells": 386,
+            "nodes": 91,
+            "shapes": 15,
+            "visits": 102
+          }
+        ],
+        [
+          "bands_approval:Result",
+          {
+            "cells": 1418,
+            "nodes": 236,
+            "shapes": 43,
+            "visits": 412
+          }
+        ],
+        [
+          "bands_deny:When",
+          {
+            "cells": 103,
+            "nodes": 30,
+            "shapes": 7,
+            "visits": 24
+          }
+        ],
+        [
+          "bands_deny:Result",
+          {
+            "cells": 1418,
+            "nodes": 233,
+            "shapes": 43,
+            "visits": 412
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 10040367,
+        "resource_product": false,
+        "result_bytes": 1252994,
+        "result_depth": 3,
+        "result_nodes": 5007,
+        "retained": 10040367,
+        "work": 472198
+      },
+      "family": "m1-max-many",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 17472,
+        "work": 273
+      },
+      "measurement_only": true,
+      "name": "capacity-max-many",
+      "native_aux": [
+        [
+          "seats_ok:When",
+          {
+            "cells": 386,
+            "nodes": 134,
+            "shapes": 24,
+            "visits": 102
+          }
+        ],
+        [
+          "seats_ok:Result",
+          {
+            "cells": 5572,
+            "nodes": 643,
+            "shapes": 117,
+            "visits": 1549
+          }
+        ],
+        [
+          "sold_out:When",
+          {
+            "cells": 103,
+            "nodes": 57,
+            "shapes": 12,
+            "visits": 24
+          }
+        ],
+        [
+          "sold_out:Result",
+          {
+            "cells": 5572,
+            "nodes": 643,
+            "shapes": 117,
+            "visits": 1549
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 77216,
+        "resource_product": false,
+        "result_bytes": 8483,
+        "result_depth": 3,
+        "result_nodes": 6,
+        "retained": 77216,
+        "work": 1402
+      },
+      "family": "m1-max-many",
+      "guards": [
+        {
+          "bound": {
+            "memory": 1847,
+            "resource_product": false,
+            "result_bytes": 8,
+            "result_depth": 1,
+            "result_nodes": 1,
+            "retained": 1847,
+            "work": 44
+          },
+          "input": "cap",
+          "load": {
+            "memory": 1984,
+            "work": 31
+          },
+          "native_aux": {
+            "cells": 386,
+            "nodes": 91,
+            "shapes": 15,
+            "visits": 102
+          },
+          "public_gate_would_refuse": null,
+          "source": "request.needs_exception == true"
+        }
+      ],
+      "legitimate": true,
+      "load": {
+        "memory": 19328,
+        "work": 302
+      },
+      "measurement_only": true,
+      "name": "eu-max-many",
+      "native_aux": [
+        [
+          "not_applicable:When",
+          {
+            "cells": 386,
+            "nodes": 104,
+            "shapes": 19,
+            "visits": 102
+          }
+        ],
+        [
+          "not_applicable:Result",
+          {
+            "cells": 1418,
+            "nodes": 246,
+            "shapes": 47,
+            "visits": 412
+          }
+        ],
+        [
+          "eu_ok:When",
+          {
+            "cells": 642,
+            "nodes": 198,
+            "shapes": 33,
+            "visits": 174
+          }
+        ],
+        [
+          "eu_ok:Result",
+          {
+            "cells": 1897,
+            "nodes": 291,
+            "shapes": 53,
+            "visits": 546
+          }
+        ],
+        [
+          "eu_legal:When",
+          {
+            "cells": 103,
+            "nodes": 43,
+            "shapes": 11,
+            "visits": 24
+          }
+        ],
+        [
+          "eu_legal:Result",
+          {
+            "cells": 1897,
+            "nodes": 294,
+            "shapes": 53,
+            "visits": 546
+          }
+        ],
+        [
+          "guard:cap",
+          {
+            "cells": 386,
+            "nodes": 91,
+            "shapes": 15,
+            "visits": 102
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 31179808,
+        "resource_product": false,
+        "result_bytes": 1252917,
+        "result_depth": 3,
+        "result_nodes": 5006,
+        "retained": 21412803,
+        "work": 1910384
+      },
+      "family": "m1-max-many",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 32128,
+        "work": 502
+      },
+      "measurement_only": true,
+      "name": "full-deal-max-many",
+      "native_aux": [
+        [
+          "approval:When",
+          {
+            "cells": 1560,
+            "nodes": 349,
+            "shapes": 57,
+            "visits": 414
+          }
+        ],
+        [
+          "approval:Result",
+          {
+            "cells": 7231,
+            "nodes": 871,
+            "shapes": 135,
+            "visits": 1960
+          }
+        ],
+        [
+          "policy_allow:When",
+          {
+            "cells": 476,
+            "nodes": 160,
+            "shapes": 27,
+            "visits": 126
+          }
+        ],
+        [
+          "policy_allow:Result",
+          {
+            "cells": 1897,
+            "nodes": 322,
+            "shapes": 59,
+            "visits": 546
+          }
+        ],
+        [
+          "policy_approval:When",
+          {
+            "cells": 476,
+            "nodes": 160,
+            "shapes": 27,
+            "visits": 126
+          }
+        ],
+        [
+          "policy_approval:Result",
+          {
+            "cells": 1897,
+            "nodes": 325,
+            "shapes": 59,
+            "visits": 546
+          }
+        ],
+        [
+          "policy_deny:When",
+          {
+            "cells": 103,
+            "nodes": 74,
+            "shapes": 17,
+            "visits": 24
+          }
+        ],
+        [
+          "policy_deny:Result",
+          {
+            "cells": 1897,
+            "nodes": 322,
+            "shapes": 59,
+            "visits": 546
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 10048541,
+        "resource_product": false,
+        "result_bytes": 1257089,
+        "result_depth": 3,
+        "result_nodes": 5007,
+        "retained": 10048541,
+        "work": 472165
+      },
+      "family": "m1-max-many",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 14272,
+        "work": 223
+      },
+      "measurement_only": true,
+      "name": "sheet-max-many",
+      "native_aux": [
+        [
+          "review:When",
+          {
+            "cells": 386,
+            "nodes": 144,
+            "shapes": 28,
+            "visits": 102
+          }
+        ],
+        [
+          "review:Result",
+          {
+            "cells": 5658,
+            "nodes": 576,
+            "shapes": 107,
+            "visits": 1569
+          }
+        ],
+        [
+          "sheet_ok:When",
+          {
+            "cells": 103,
+            "nodes": 83,
+            "shapes": 20,
+            "visits": 24
+          }
+        ],
+        [
+          "sheet_ok:Result",
+          {
+            "cells": 5658,
+            "nodes": 576,
+            "shapes": 107,
+            "visits": 1569
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 920,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 920,
+        "work": 20
+      },
+      "family": "canonical-many",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 640,
+        "work": 10
+      },
+      "measurement_only": true,
+      "name": "size-global",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 68,
+            "shapes": 15,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 920,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 920,
+        "work": 20
+      },
+      "family": "canonical-many",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 704,
+        "work": 11
+      },
+      "measurement_only": true,
+      "name": "size-receiver",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 68,
+            "shapes": 15,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 2874,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 1048,
+        "work": 225005
+      },
+      "family": "canonical-many",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 1280,
+        "work": 20
+      },
+      "measurement_only": true,
+      "name": "all",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 977,
+            "nodes": 193,
+            "shapes": 35,
+            "visits": 268
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 2874,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 1048,
+        "work": 225005
+      },
+      "family": "canonical-many",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 1664,
+        "work": 26
+      },
+      "measurement_only": true,
+      "name": "exists",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 977,
+            "nodes": 193,
+            "shapes": 35,
+            "visits": 268
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 3714,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 976,
+        "work": 425030
+      },
+      "family": "canonical-many",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 1920,
+        "work": 30
+      },
+      "measurement_only": true,
+      "name": "exists-one",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 1399,
+            "nodes": 346,
+            "shapes": 62,
+            "visits": 378
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 45618479,
+        "resource_product": false,
+        "result_bytes": 16308056,
+        "result_depth": 3,
+        "result_nodes": 214716,
+        "retained": 32616136,
+        "work": 1148798
+      },
+      "family": "canonical-many",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 1472,
+        "work": 23
+      },
+      "measurement_only": true,
+      "name": "filter",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 2983,
+            "nodes": 287,
+            "shapes": 42,
+            "visits": 787
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 2497176,
+        "resource_product": false,
+        "result_bytes": 1248576,
+        "result_depth": 2,
+        "result_nodes": 5001,
+        "retained": 2497176,
+        "work": 186525
+      },
+      "family": "canonical-many",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 1024,
+        "work": 16
+      },
+      "measurement_only": true,
+      "name": "map",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 2164,
+            "nodes": 211,
+            "shapes": 34,
+            "visits": 585
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 2497176,
+        "resource_product": false,
+        "result_bytes": 1248576,
+        "result_depth": 2,
+        "result_nodes": 5001,
+        "retained": 2497176,
+        "work": 396526
+      },
+      "family": "canonical-many",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 1600,
+        "work": 25
+      },
+      "measurement_only": true,
+      "name": "three-arg-map",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 2568,
+            "nodes": 300,
+            "shapes": 44,
+            "visits": 689
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 30759015,
+        "resource_product": false,
+        "result_bytes": 1248576,
+        "result_depth": 2,
+        "result_nodes": 5001,
+        "retained": 18805248,
+        "work": 849407
+      },
+      "family": "canonical-many",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 2240,
+        "work": 35
+      },
+      "measurement_only": true,
+      "name": "filter-map",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 4309,
+            "nodes": 448,
+            "shapes": 65,
+            "visits": 1156
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 3759962,
+        "resource_product": false,
+        "result_bytes": 1252704,
+        "result_depth": 2,
+        "result_nodes": 5003,
+        "retained": 3759962,
+        "work": 211277
+      },
+      "family": "canonical-many",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 1600,
+        "work": 25
+      },
+      "measurement_only": true,
+      "name": "used-list",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 3873,
+            "nodes": 334,
+            "shapes": 53,
+            "visits": 1073
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 2105,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 2105,
+        "work": 453208
+      },
+      "family": "canonical-many",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 3072,
+        "work": 48
+      },
+      "measurement_only": true,
+      "name": "contains",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 568,
+            "nodes": 227,
+            "shapes": 52,
+            "visits": 144
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 2105,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 2105,
+        "work": 453208
+      },
+      "family": "canonical-many",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 2624,
+        "work": 41
+      },
+      "measurement_only": true,
+      "name": "membership",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 568,
+            "nodes": 227,
+            "shapes": 52,
+            "visits": 144
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 1253666,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 1249520,
+        "work": 172036
+      },
+      "family": "canonical-many",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 1280,
+        "work": 20
+      },
+      "measurement_only": true,
+      "name": "min-global",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 2138,
+            "nodes": 241,
+            "shapes": 38,
+            "visits": 593
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 1253666,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 1249520,
+        "work": 172036
+      },
+      "family": "canonical-many",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 1280,
+        "work": 20
+      },
+      "measurement_only": true,
+      "name": "max-global",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 2138,
+            "nodes": 241,
+            "shapes": 38,
+            "visits": 593
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 1253666,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 1249520,
+        "work": 172036
+      },
+      "family": "canonical-many",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 1344,
+        "work": 21
+      },
+      "measurement_only": true,
+      "name": "min-receiver",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 2138,
+            "nodes": 241,
+            "shapes": 38,
+            "visits": 593
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 1253666,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 1249520,
+        "work": 172036
+      },
+      "family": "canonical-many",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 1344,
+        "work": 21
+      },
+      "measurement_only": true,
+      "name": "max-receiver",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 2138,
+            "nodes": 241,
+            "shapes": 38,
+            "visits": 593
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 64514,
+        "resource_product": false,
+        "result_bytes": 554,
+        "result_depth": 4,
+        "result_nodes": 11,
+        "retained": 64514,
+        "work": 2564
+      },
+      "family": "wide",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 33152,
+        "work": 518
+      },
+      "measurement_only": true,
+      "name": "wide-17",
+      "native_aux": [
+        [
+          "allow:When",
+          {
+            "cells": 4236,
+            "nodes": 1932,
+            "shapes": 276,
+            "visits": 1182
+          }
+        ],
+        [
+          "allow:Result",
+          {
+            "cells": 103,
+            "nodes": 424,
+            "shapes": 88,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 75428,
+        "resource_product": false,
+        "result_bytes": 554,
+        "result_depth": 4,
+        "result_nodes": 11,
+        "retained": 75428,
+        "work": 2996
+      },
+      "family": "wide",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 37952,
+        "work": 593
+      },
+      "measurement_only": true,
+      "name": "wide-20",
+      "native_aux": [
+        [
+          "allow:When",
+          {
+            "cells": 4941,
+            "nodes": 2271,
+            "shapes": 324,
+            "visits": 1380
+          }
+        ],
+        [
+          "allow:Result",
+          {
+            "cells": 103,
+            "nodes": 424,
+            "shapes": 88,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 111808,
+        "resource_product": false,
+        "result_bytes": 554,
+        "result_depth": 4,
+        "result_nodes": 11,
+        "retained": 111808,
+        "work": 4436
+      },
+      "family": "wide",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 53952,
+        "work": 843
+      },
+      "measurement_only": true,
+      "name": "wide-30",
+      "native_aux": [
+        [
+          "allow:When",
+          {
+            "cells": 7291,
+            "nodes": 3401,
+            "shapes": 484,
+            "visits": 2040
+          }
+        ],
+        [
+          "allow:Result",
+          {
+            "cells": 103,
+            "nodes": 424,
+            "shapes": 88,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 148188,
+        "resource_product": false,
+        "result_bytes": 554,
+        "result_depth": 4,
+        "result_nodes": 11,
+        "retained": 148188,
+        "work": 5876
+      },
+      "family": "wide",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 69952,
+        "work": 1093
+      },
+      "measurement_only": true,
+      "name": "wide-40",
+      "native_aux": [
+        [
+          "allow:When",
+          {
+            "cells": 9641,
+            "nodes": 4531,
+            "shapes": 644,
+            "visits": 2700
+          }
+        ],
+        [
+          "allow:Result",
+          {
+            "cells": 103,
+            "nodes": 424,
+            "shapes": 88,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 920,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 920,
+        "work": 20
+      },
+      "family": "loop-control",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 640,
+        "work": 10
+      },
+      "measurement_only": true,
+      "name": "depth-zero",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 68,
+            "shapes": 15,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 2497176,
+        "resource_product": false,
+        "result_bytes": 1248576,
+        "result_depth": 2,
+        "result_nodes": 5001,
+        "retained": 2497176,
+        "work": 186525
+      },
+      "family": "loop-control",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 960,
+        "work": 15
+      },
+      "measurement_only": true,
+      "name": "depth-one",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 2164,
+            "nodes": 211,
+            "shapes": 34,
+            "visits": 585
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 400024,
+        "resource_product": false,
+        "result_bytes": 200000,
+        "result_depth": 2,
+        "result_nodes": 5001,
+        "retained": 400024,
+        "work": 318131
+      },
+      "family": "loop-control",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 2176,
+        "work": 34
+      },
+      "measurement_only": true,
+      "name": "depth-two-literal",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 1240,
+            "nodes": 293,
+            "shapes": 57,
+            "visits": 354
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 400024,
+        "resource_product": false,
+        "result_bytes": 200000,
+        "result_depth": 2,
+        "result_nodes": 5001,
+        "retained": 400024,
+        "work": 273131
+      },
+      "family": "loop-control",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 2112,
+        "work": 33
+      },
+      "measurement_only": true,
+      "name": "depth-two-one-row",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 1906,
+            "nodes": 284,
+            "shapes": 49,
+            "visits": 530
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 2897208,
+        "resource_product": false,
+        "result_bytes": 200000,
+        "result_depth": 2,
+        "result_nodes": 5001,
+        "retained": 2897208,
+        "work": 462158
+      },
+      "family": "loop-control",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 2752,
+        "work": 43
+      },
+      "measurement_only": true,
+      "name": "sequential",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 4196,
+            "nodes": 517,
+            "shapes": 78,
+            "visits": 1136
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 720024,
+        "resource_product": false,
+        "result_bytes": 360000,
+        "result_depth": 3,
+        "result_nodes": 10001,
+        "retained": 720024,
+        "work": 205631
+      },
+      "family": "loop-control",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 1664,
+        "work": 26
+      },
+      "measurement_only": true,
+      "name": "shadowing",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 1329,
+            "nodes": 277,
+            "shapes": 52,
+            "visits": 374
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 2497176,
+        "resource_product": false,
+        "result_bytes": 1248576,
+        "result_depth": 2,
+        "result_nodes": 5001,
+        "retained": 2497176,
+        "work": 186525
+      },
+      "family": "loop-control",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 1216,
+        "work": 19
+      },
+      "measurement_only": true,
+      "name": "caller-name-shadowing",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 2164,
+            "nodes": 211,
+            "shapes": 34,
+            "visits": 585
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 400024,
+        "resource_product": false,
+        "result_bytes": 200000,
+        "result_depth": 2,
+        "result_nodes": 5001,
+        "retained": 400024,
+        "work": 133131
+      },
+      "family": "heterogeneous",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 1216,
+        "work": 19
+      },
+      "measurement_only": true,
+      "name": "heterogeneous-exact",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 1186,
+            "nodes": 161,
+            "shapes": 32,
+            "visits": 338
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 400024,
+        "resource_product": false,
+        "result_bytes": 200000,
+        "result_depth": 2,
+        "result_nodes": 5001,
+        "retained": 400024,
+        "work": 133131
+      },
+      "family": "heterogeneous",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 1216,
+        "work": 19
+      },
+      "measurement_only": true,
+      "name": "cached-over-one-mib",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 1186,
+            "nodes": 161,
+            "shapes": 32,
+            "visits": 338
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 121755922,
+        "resource_product": false,
+        "result_bytes": 32776112,
+        "result_depth": 4,
+        "result_nodes": 434431,
+        "retained": 65552248,
+        "work": 2786376
+      },
+      "family": "copy-error-prefix",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 1088,
+        "work": 17
+      },
+      "measurement_only": true,
+      "name": "row-twice",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 3761,
+            "nodes": 287,
+            "shapes": 47,
+            "visits": 1007
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 41280024,
+        "resource_product": false,
+        "result_bytes": 20640000,
+        "result_depth": 2,
+        "result_nodes": 5001,
+        "retained": 41280024,
+        "work": 787506
+      },
+      "family": "copy-error-prefix",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 1280,
+        "work": 20
+      },
+      "measurement_only": true,
+      "name": "same-field-many-times",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 1826,
+            "nodes": 202,
+            "shapes": 34,
+            "visits": 516
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 46897176,
+        "resource_product": false,
+        "result_bytes": 23448576,
+        "result_depth": 2,
+        "result_nodes": 5001,
+        "retained": 46897176,
+        "work": 1610055
+      },
+      "family": "copy-error-prefix",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 2048,
+        "work": 32
+      },
+      "measurement_only": true,
+      "name": "iteration-text-concat",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 4440,
+            "nodes": 374,
+            "shapes": 46,
+            "visits": 1199
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 5012,
+        "resource_product": false,
+        "result_bytes": 4096,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 5012,
+        "work": 88
+      },
+      "family": "copy-error-prefix",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 512,
+        "work": 8
+      },
+      "measurement_only": true,
+      "name": "output-text",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 582,
+            "nodes": 78,
+            "shapes": 13,
+            "visits": 158
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 10012,
+        "resource_product": false,
+        "result_bytes": 4096,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 10012,
+        "work": 236
+      },
+      "family": "copy-error-prefix",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 960,
+        "work": 15
+      },
+      "measurement_only": true,
+      "name": "output-bytes",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 747,
+            "nodes": 103,
+            "shapes": 17,
+            "visits": 208
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 30529313,
+        "resource_product": false,
+        "result_bytes": 15263727,
+        "result_depth": 4,
+        "result_nodes": 214718,
+        "retained": 30529313,
+        "work": 906478
+      },
+      "family": "copy-error-prefix",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 1856,
+        "work": 29
+      },
+      "measurement_only": true,
+      "name": "output-aggregate",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 2338,
+            "nodes": 174,
+            "shapes": 34,
+            "visits": 622
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 2881,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 1048,
+        "work": 205004
+      },
+      "family": "copy-error-prefix",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 1472,
+        "work": 23
+      },
+      "measurement_only": true,
+      "name": "negative-uint-prefix",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 445,
+            "nodes": 171,
+            "shapes": 37,
+            "visits": 132
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 2893,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 1048,
+        "work": 215004
+      },
+      "family": "copy-error-prefix",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 2304,
+        "work": 36
+      },
+      "measurement_only": true,
+      "name": "bad-numeric-parse",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 445,
+            "nodes": 175,
+            "shapes": 37,
+            "visits": 132
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 15100415,
+        "resource_product": false,
+        "result_bytes": 15099495,
+        "result_depth": 2,
+        "result_nodes": 209716,
+        "retained": 15100415,
+        "work": 445666
+      },
+      "family": "copy-error-prefix",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 576,
+        "work": 9
+      },
+      "measurement_only": true,
+      "name": "fractional-index",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 831,
+            "nodes": 75,
+            "shapes": 17,
+            "visits": 216
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 15100415,
+        "resource_product": false,
+        "result_bytes": 15099495,
+        "result_depth": 2,
+        "result_nodes": 209716,
+        "retained": 15100415,
+        "work": 445666
+      },
+      "family": "copy-error-prefix",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 640,
+        "work": 10
+      },
+      "measurement_only": true,
+      "name": "wrong-kind-index",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 831,
+            "nodes": 75,
+            "shapes": 17,
+            "visits": 216
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 200952,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 200952,
+        "work": 40026
+      },
+      "family": "copy-error-prefix",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 1024,
+        "work": 16
+      },
+      "measurement_only": true,
+      "name": "first-item-owned-steal",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 1281,
+            "nodes": 188,
+            "shapes": 38,
+            "visits": 380
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 200952,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 200952,
+        "work": 40026
+      },
+      "family": "copy-error-prefix",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 1088,
+        "work": 17
+      },
+      "measurement_only": true,
+      "name": "first-item-owned-uint",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 1281,
+            "nodes": 188,
+            "shapes": 38,
+            "visits": 380
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 200952,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 200952,
+        "work": 40026
+      },
+      "family": "copy-error-prefix",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 1152,
+        "work": 18
+      },
+      "measurement_only": true,
+      "name": "first-item-owned-double",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 1281,
+            "nodes": 188,
+            "shapes": 38,
+            "visits": 380
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 1963,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 1963,
+        "work": 50
+      },
+      "family": "copy-error-prefix",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 896,
+        "work": 14
+      },
+      "measurement_only": true,
+      "name": "invalid-key-membership",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 175,
+            "shapes": 31,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 1971,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 1971,
+        "work": 52
+      },
+      "family": "copy-error-prefix",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 768,
+        "work": 12
+      },
+      "measurement_only": true,
+      "name": "invalid-key-index",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 178,
+            "shapes": 31,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 1232,
+        "resource_product": false,
+        "result_bytes": 112,
+        "result_depth": 2,
+        "result_nodes": 2,
+        "retained": 1232,
+        "work": 33
+      },
+      "family": "copy-error-prefix",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 448,
+        "work": 7
+      },
+      "measurement_only": true,
+      "name": "invalid-key-mapliteral",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 138,
+            "shapes": 25,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 4828,
+        "resource_product": true,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 1048,
+        "work": 1735070005
+      },
+      "family": "cross-product-refusal",
+      "guards": [],
+      "legitimate": false,
+      "load": {
+        "memory": 2112,
+        "work": 33
+      },
+      "measurement_only": true,
+      "name": "different-many",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 2085,
+            "nodes": 340,
+            "shapes": 54,
+            "visits": 552
+          }
+        ]
+      ],
+      "public_gate_would_refuse": "cross_product: resource multiplication 1 exceeds permitted 0 (work bound 1735070005, memory bound 4828); move repeated input traversal/copy to a SQL join or projection"
+    },
+    {
+      "bound": {
+        "memory": 4828,
+        "resource_product": true,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 1048,
+        "work": 1735070005
+      },
+      "family": "cross-product-refusal",
+      "guards": [],
+      "legitimate": false,
+      "load": {
+        "memory": 2112,
+        "work": 33
+      },
+      "measurement_only": true,
+      "name": "same-many",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 1911,
+            "nodes": 334,
+            "shapes": 54,
+            "visits": 510
+          }
+        ]
+      ],
+      "public_gate_would_refuse": "cross_product: resource multiplication 1 exceeds permitted 0 (work bound 1735070005, memory bound 4828); move repeated input traversal/copy to a SQL join or projection"
+    },
+    {
+      "bound": {
+        "memory": 30759015,
+        "resource_product": true,
+        "result_bytes": 200000,
+        "result_depth": 2,
+        "result_nodes": 5001,
+        "retained": 16708096,
+        "work": 1735484066
+      },
+      "family": "cross-product-refusal",
+      "guards": [],
+      "legitimate": false,
+      "load": {
+        "memory": 3072,
+        "work": 48
+      },
+      "measurement_only": true,
+      "name": "outer-filter",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 4544,
+            "nodes": 570,
+            "shapes": 84,
+            "visits": 1218
+          }
+        ]
+      ],
+      "public_gate_would_refuse": "cross_product: resource multiplication 1 exceeds permitted 0 (work bound 1735484066, memory bound 30759015); move repeated input traversal/copy to a SQL join or projection"
+    },
+    {
+      "bound": {
+        "memory": 1453707,
+        "resource_product": true,
+        "result_bytes": 200000,
+        "result_depth": 2,
+        "result_nodes": 5001,
+        "retained": 400024,
+        "work": 932853131
+      },
+      "family": "cross-product-refusal",
+      "guards": [],
+      "legitimate": false,
+      "load": {
+        "memory": 2368,
+        "work": 37
+      },
+      "measurement_only": true,
+      "name": "materialized-inner-map",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 3863,
+            "nodes": 461,
+            "shapes": 64,
+            "visits": 1086
+          }
+        ]
+      ],
+      "public_gate_would_refuse": "cross_product: resource multiplication 1 exceeds permitted 0 (work bound 932853131, memory bound 1453707); move repeated input traversal/copy to a SQL join or projection"
+    },
+    {
+      "bound": {
+        "memory": 30560019,
+        "resource_product": true,
+        "result_bytes": 200000,
+        "result_depth": 2,
+        "result_nodes": 5001,
+        "retained": 400024,
+        "work": 5244118725
+      },
+      "family": "cross-product-refusal",
+      "guards": [],
+      "legitimate": false,
+      "load": {
+        "memory": 2496,
+        "work": 39
+      },
+      "measurement_only": true,
+      "name": "materialized-inner-filter",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 4125,
+            "nodes": 455,
+            "shapes": 64,
+            "visits": 1137
+          }
+        ]
+      ],
+      "public_gate_would_refuse": "cross_product: resource multiplication 1 exceeds permitted 0 (work bound 5244118725, memory bound 30560019); move repeated input traversal/copy to a SQL join or projection"
+    },
+    {
+      "bound": {
+        "memory": 400024,
+        "resource_product": true,
+        "result_bytes": 200000,
+        "result_depth": 2,
+        "result_nodes": 5001,
+        "retained": 400024,
+        "work": 2265877053
+      },
+      "family": "cross-product-refusal",
+      "guards": [],
+      "legitimate": false,
+      "load": {
+        "memory": 1536,
+        "work": 24
+      },
+      "measurement_only": true,
+      "name": "inner-contains",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 1823,
+            "nodes": 222,
+            "shapes": 39,
+            "visits": 500
+          }
+        ]
+      ],
+      "public_gate_would_refuse": "cross_product: resource multiplication 1 exceeds permitted 0 (work bound 2265877053, memory bound 400024); move repeated input traversal/copy to a SQL join or projection"
+    },
+    {
+      "bound": {
+        "memory": 400024,
+        "resource_product": true,
+        "result_bytes": 200000,
+        "result_depth": 2,
+        "result_nodes": 5001,
+        "retained": 400024,
+        "work": 2265877053
+      },
+      "family": "cross-product-refusal",
+      "guards": [],
+      "legitimate": false,
+      "load": {
+        "memory": 1088,
+        "work": 17
+      },
+      "measurement_only": true,
+      "name": "inner-membership",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 1823,
+            "nodes": 222,
+            "shapes": 39,
+            "visits": 500
+          }
+        ]
+      ],
+      "public_gate_would_refuse": "cross_product: resource multiplication 1 exceeds permitted 0 (work bound 2265877053, memory bound 400024); move repeated input traversal/copy to a SQL join or projection"
+    },
+    {
+      "bound": {
+        "memory": 400024,
+        "resource_product": true,
+        "result_bytes": 200000,
+        "result_depth": 2,
+        "result_nodes": 5001,
+        "retained": 400024,
+        "work": 2278377053
+      },
+      "family": "cross-product-refusal",
+      "guards": [],
+      "legitimate": false,
+      "load": {
+        "memory": 1152,
+        "work": 18
+      },
+      "measurement_only": true,
+      "name": "inner-equality",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 2287,
+            "nodes": 238,
+            "shapes": 39,
+            "visits": 611
+          }
+        ]
+      ],
+      "public_gate_would_refuse": "cross_product: resource multiplication 1 exceeds permitted 0 (work bound 2278377053, memory bound 400024); move repeated input traversal/copy to a SQL join or projection"
+    },
+    {
+      "bound": {
+        "memory": 152595264024,
+        "resource_product": true,
+        "result_bytes": 76297632000,
+        "result_depth": 4,
+        "result_nodes": 1073580001,
+        "retained": 152595264024,
+        "work": 4531495428
+      },
+      "family": "cross-product-refusal",
+      "guards": [],
+      "legitimate": false,
+      "load": {
+        "memory": 768,
+        "work": 12
+      },
+      "measurement_only": true,
+      "name": "whole-list-copy",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 2652,
+            "nodes": 208,
+            "shapes": 33,
+            "visits": 704
+          }
+        ]
+      ],
+      "public_gate_would_refuse": "cross_product: resource multiplication 1 exceeds permitted 0 (work bound 4531495428, memory bound 152595264024); move repeated input traversal/copy to a SQL join or projection"
+    },
+    {
+      "bound": {
+        "memory": 12486080024,
+        "resource_product": true,
+        "result_bytes": 6243040000,
+        "result_depth": 3,
+        "result_nodes": 25005001,
+        "retained": 12486080024,
+        "work": 4979635304
+      },
+      "family": "cross-product-refusal",
+      "guards": [],
+      "legitimate": false,
+      "load": {
+        "memory": 2880,
+        "work": 45
+      },
+      "measurement_only": true,
+      "name": "hidden-filter-map",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 7103,
+            "nodes": 748,
+            "shapes": 89,
+            "visits": 1897
+          }
+        ]
+      ],
+      "public_gate_would_refuse": "cross_product: resource multiplication 1 exceeds permitted 0 (work bound 4979635304, memory bound 12486080024); move repeated input traversal/copy to a SQL join or projection"
+    },
+    {
+      "bound": {
+        "memory": 400024,
+        "resource_product": false,
+        "result_bytes": 200000,
+        "result_depth": 2,
+        "result_nodes": 5001,
+        "retained": 400024,
+        "work": 133131
+      },
+      "family": "cross-product-control",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 1152,
+        "work": 18
+      },
+      "measurement_only": true,
+      "name": "linear-size-control",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 1186,
+            "nodes": 188,
+            "shapes": 37,
+            "visits": 338
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 5012,
+        "resource_product": false,
+        "result_bytes": 4096,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 5012,
+        "work": 88
+      },
+      "family": "text-boundary",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 512,
+        "work": 8
+      },
+      "measurement_only": true,
+      "name": "text-output-4096",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 582,
+            "nodes": 51,
+            "shapes": 8,
+            "visits": 158
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 10012,
+        "resource_product": false,
+        "result_bytes": 4096,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 10012,
+        "work": 236
+      },
+      "family": "text-boundary",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 960,
+        "work": 15
+      },
+      "measurement_only": true,
+      "name": "text-bytes-output-4096",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 747,
+            "nodes": 76,
+            "shapes": 12,
+            "visits": 208
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 1828,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 1828,
+        "work": 107
+      },
+      "family": "text-boundary",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 896,
+        "work": 14
+      },
+      "measurement_only": true,
+      "name": "text-size-4096",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 340,
+            "nodes": 75,
+            "shapes": 12,
+            "visits": 90
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 18352,
+        "resource_product": false,
+        "result_bytes": 8256,
+        "result_depth": 2,
+        "result_nodes": 3,
+        "retained": 18352,
+        "work": 311
+      },
+      "family": "text-boundary",
+      "guards": [],
+      "legitimate": false,
+      "load": {
+        "memory": 1216,
+        "work": 19
+      },
+      "measurement_only": true,
+      "name": "text-copy-twice-4096",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 979,
+            "nodes": 127,
+            "shapes": 19,
+            "visits": 288
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 19120,
+        "resource_product": false,
+        "result_bytes": 8192,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 19120,
+        "work": 321
+      },
+      "family": "text-boundary",
+      "guards": [],
+      "legitimate": false,
+      "load": {
+        "memory": 1088,
+        "work": 17
+      },
+      "measurement_only": true,
+      "name": "text-concat-4096",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 820,
+            "nodes": 112,
+            "shapes": 16,
+            "visits": 238
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 16,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 16,
+        "work": 3
+      },
+      "family": "input-refusal",
+      "guards": [],
+      "legitimate": false,
+      "load": {
+        "memory": 256,
+        "work": 4
+      },
+      "measurement_only": true,
+      "name": "combined-input-total-over-b",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 38,
+            "shapes": 10,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 2006,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 2006,
+        "work": 235989
+      },
+      "family": "map-key-equality",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 1280,
+        "work": 20
+      },
+      "measurement_only": true,
+      "name": "long-left-key-4096",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 512,
+            "nodes": 157,
+            "shapes": 29,
+            "visits": 132
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 15101727,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 15101727,
+        "work": 681648
+      },
+      "family": "map-key-equality",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 1536,
+        "work": 24
+      },
+      "measurement_only": true,
+      "name": "nested-long-left-key-4096",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 1526,
+            "nodes": 223,
+            "shapes": 39,
+            "visits": 402
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 928,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 928,
+        "work": 86
+      },
+      "family": "temporal-boundary",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 896,
+        "work": 14
+      },
+      "measurement_only": true,
+      "name": "bound-duration-4096",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 298,
+            "nodes": 40,
+            "shapes": 7,
+            "visits": 78
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 928,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 928,
+        "work": 86
+      },
+      "family": "temporal-boundary",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 896,
+        "work": 14
+      },
+      "measurement_only": true,
+      "name": "bound-duration-invalid-4096",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 298,
+            "nodes": 40,
+            "shapes": 7,
+            "visits": 78
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 32,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 32,
+        "work": 6
+      },
+      "family": "ordered-guard",
+      "guards": [
+        {
+          "bound": {
+            "memory": 1840,
+            "resource_product": false,
+            "result_bytes": 8,
+            "result_depth": 1,
+            "result_nodes": 1,
+            "retained": 1840,
+            "work": 40
+          },
+          "input": "pending",
+          "load": {
+            "memory": 1344,
+            "work": 21
+          },
+          "native_aux": {
+            "cells": 103,
+            "nodes": 78,
+            "shapes": 16,
+            "visits": 24
+          },
+          "public_gate_would_refuse": null,
+          "source": "enabled && now_ms > 0"
+        }
+      ],
+      "legitimate": true,
+      "load": {
+        "memory": 1856,
+        "work": 29
+      },
+      "measurement_only": true,
+      "name": "first-one",
+      "native_aux": [
+        [
+          "measurement-envelope:When",
+          {
+            "cells": 103,
+            "nodes": 46,
+            "shapes": 12,
+            "visits": 24
+          }
+        ],
+        [
+          "measurement-envelope:Result",
+          {
+            "cells": 103,
+            "nodes": 46,
+            "shapes": 12,
+            "visits": 24
+          }
+        ],
+        [
+          "guard:pending",
+          {
+            "cells": 103,
+            "nodes": 78,
+            "shapes": 16,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 32,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 32,
+        "work": 6
+      },
+      "family": "ordered-guard",
+      "guards": [
+        {
+          "bound": {
+            "memory": 1834,
+            "resource_product": false,
+            "result_bytes": 8,
+            "result_depth": 1,
+            "result_nodes": 1,
+            "retained": 1834,
+            "work": 42
+          },
+          "input": "pending",
+          "load": {
+            "memory": 1216,
+            "work": 19
+          },
+          "native_aux": {
+            "cells": 103,
+            "nodes": 84,
+            "shapes": 16,
+            "visits": 24
+          },
+          "public_gate_would_refuse": null,
+          "source": "first.ok && enabled"
+        }
+      ],
+      "legitimate": true,
+      "load": {
+        "memory": 1728,
+        "work": 27
+      },
+      "measurement_only": true,
+      "name": "after-first-one",
+      "native_aux": [
+        [
+          "measurement-envelope:When",
+          {
+            "cells": 103,
+            "nodes": 59,
+            "shapes": 16,
+            "visits": 24
+          }
+        ],
+        [
+          "measurement-envelope:Result",
+          {
+            "cells": 103,
+            "nodes": 59,
+            "shapes": 16,
+            "visits": 24
+          }
+        ],
+        [
+          "guard:pending",
+          {
+            "cells": 103,
+            "nodes": 84,
+            "shapes": 16,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 32,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 32,
+        "work": 6
+      },
+      "family": "ordered-guard",
+      "guards": [
+        {
+          "bound": {
+            "memory": 920,
+            "resource_product": false,
+            "result_bytes": 8,
+            "result_depth": 1,
+            "result_nodes": 1,
+            "retained": 920,
+            "work": 20
+          },
+          "input": "pending",
+          "load": {
+            "memory": 512,
+            "work": 8
+          },
+          "native_aux": {
+            "cells": 103,
+            "nodes": 49,
+            "shapes": 12,
+            "visits": 24
+          },
+          "public_gate_would_refuse": null,
+          "source": "!enabled"
+        }
+      ],
+      "legitimate": true,
+      "load": {
+        "memory": 1024,
+        "work": 16
+      },
+      "measurement_only": true,
+      "name": "guard-false",
+      "native_aux": [
+        [
+          "measurement-envelope:When",
+          {
+            "cells": 103,
+            "nodes": 59,
+            "shapes": 16,
+            "visits": 24
+          }
+        ],
+        [
+          "measurement-envelope:Result",
+          {
+            "cells": 103,
+            "nodes": 59,
+            "shapes": 16,
+            "visits": 24
+          }
+        ],
+        [
+          "guard:pending",
+          {
+            "cells": 103,
+            "nodes": 49,
+            "shapes": 12,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 32,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 32,
+        "work": 6
+      },
+      "family": "ordered-guard",
+      "guards": [
+        {
+          "bound": {
+            "memory": 16,
+            "resource_product": false,
+            "result_bytes": 8,
+            "result_depth": 1,
+            "result_nodes": 1,
+            "retained": 16,
+            "work": 3
+          },
+          "input": "pending",
+          "load": {
+            "memory": 64,
+            "work": 1
+          },
+          "native_aux": {
+            "cells": 103,
+            "nodes": 33,
+            "shapes": 8,
+            "visits": 24
+          },
+          "public_gate_would_refuse": null,
+          "source": "1"
+        }
+      ],
+      "legitimate": true,
+      "load": {
+        "memory": 576,
+        "work": 9
+      },
+      "measurement_only": true,
+      "name": "guard-nonbool",
+      "native_aux": [
+        [
+          "measurement-envelope:When",
+          {
+            "cells": 103,
+            "nodes": 59,
+            "shapes": 16,
+            "visits": 24
+          }
+        ],
+        [
+          "measurement-envelope:Result",
+          {
+            "cells": 103,
+            "nodes": 59,
+            "shapes": 16,
+            "visits": 24
+          }
+        ],
+        [
+          "guard:pending",
+          {
+            "cells": 103,
+            "nodes": 33,
+            "shapes": 8,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "family": "ordered-guard",
+      "guards": [
+        {
+          "input": "pending",
+          "refusal": "ERROR: <input>:0:0: undeclared binding 'pending'; declare its shape before checking",
+          "source": "pending.ok"
+        }
+      ],
+      "legitimate": false,
+      "load": {
+        "memory": 1152,
+        "work": 18
+      },
+      "measurement_only": true,
+      "name": "guard-self",
+      "refusal": "ERROR: <input>:0:0: undeclared binding 'pending'; declare its shape before checking"
+    },
+    {
+      "family": "ordered-guard",
+      "guards": [
+        {
+          "input": "pending",
+          "refusal": "ERROR: <input>:0:0: undeclared binding 'future'; declare its shape before checking",
+          "source": "future.ok"
+        }
+      ],
+      "legitimate": false,
+      "load": {
+        "memory": 1088,
+        "work": 17
+      },
+      "measurement_only": true,
+      "name": "guard-future",
+      "refusal": "ERROR: <input>:0:0: undeclared binding 'future'; declare its shape before checking"
+    },
+    {
+      "bound": {
+        "memory": 32,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 32,
+        "work": 6
+      },
+      "family": "ordered-guard",
+      "guards": [
+        {
+          "bound": {
+            "memory": 29176,
+            "resource_product": false,
+            "result_bytes": 8,
+            "result_depth": 1,
+            "result_nodes": 1,
+            "retained": 29176,
+            "work": 3000288
+          },
+          "input": "pending",
+          "load": {
+            "memory": 30528,
+            "work": 477
+          },
+          "native_aux": {
+            "cells": 6641,
+            "nodes": 2474,
+            "shapes": 558,
+            "visits": 2004
+          },
+          "public_gate_would_refuse": null,
+          "source": "enabled && prefix0.all(r,size(r) == 0) && prefix1.all(r,size(r) == 0) && prefix2.all(r,size(r) == 0) && prefix3.all(r,size(r) == 0) && prefix4.all(r,size(r) == 0) && prefix5.all(r,size(r) == 0) && prefix6.all(r,size(r) == 0) && prefix7.all(r,size(r) == 0) && prefix8.all(r,size(r) == 0) && prefix9.all(r,size(r) == 0) && prefix10.all(r,size(r) == 0) && prefix11.all(r,size(r) == 0) && prefix12.all(r,size(r) == 0) && prefix13.all(r,size(r) == 0) && prefix14.all(r,size(r) == 0)"
+        }
+      ],
+      "legitimate": true,
+      "load": {
+        "memory": 31040,
+        "work": 485
+      },
+      "measurement_only": true,
+      "name": "many-prefix-15-5000",
+      "native_aux": [
+        [
+          "measurement-envelope:When",
+          {
+            "cells": 103,
+            "nodes": 434,
+            "shapes": 82,
+            "visits": 24
+          }
+        ],
+        [
+          "measurement-envelope:Result",
+          {
+            "cells": 103,
+            "nodes": 434,
+            "shapes": 82,
+            "visits": 24
+          }
+        ],
+        [
+          "guard:pending",
+          {
+            "cells": 6641,
+            "nodes": 2474,
+            "shapes": 558,
+            "visits": 2004
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 1072,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 1072,
+        "work": 39
+      },
+      "family": "callable-semantic",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 768,
+        "work": 12
+      },
+      "measurement_only": true,
+      "name": "min-int",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 111,
+            "shapes": 19,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 1072,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 1072,
+        "work": 39
+      },
+      "family": "callable-semantic",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 832,
+        "work": 13
+      },
+      "measurement_only": true,
+      "name": "max-int",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 111,
+            "shapes": 19,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 1024,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 1024,
+        "work": 34
+      },
+      "family": "callable-semantic",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 832,
+        "work": 13
+      },
+      "measurement_only": true,
+      "name": "min-uint",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 94,
+            "shapes": 15,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 1024,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 1024,
+        "work": 34
+      },
+      "family": "callable-semantic",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 768,
+        "work": 12
+      },
+      "measurement_only": true,
+      "name": "max-uint",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 94,
+            "shapes": 15,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 1024,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 1024,
+        "work": 34
+      },
+      "family": "callable-semantic",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 896,
+        "work": 14
+      },
+      "measurement_only": true,
+      "name": "min-double",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 94,
+            "shapes": 15,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 1024,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 1024,
+        "work": 34
+      },
+      "family": "callable-semantic",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 960,
+        "work": 15
+      },
+      "measurement_only": true,
+      "name": "max-double",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 94,
+            "shapes": 15,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 928,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 928,
+        "work": 23
+      },
+      "family": "callable-semantic",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 448,
+        "work": 7
+      },
+      "measurement_only": true,
+      "name": "min-empty",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 151,
+            "nodes": 58,
+            "shapes": 8,
+            "visits": 36
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 928,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 928,
+        "work": 23
+      },
+      "family": "callable-semantic",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 512,
+        "work": 8
+      },
+      "measurement_only": true,
+      "name": "max-empty",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 151,
+            "nodes": 58,
+            "shapes": 8,
+            "visits": 36
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 1024,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 1024,
+        "work": 34
+      },
+      "family": "callable-semantic",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 768,
+        "work": 12
+      },
+      "measurement_only": true,
+      "name": "min-mixed",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 94,
+            "shapes": 15,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 1939,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 1939,
+        "work": 54
+      },
+      "family": "callable-semantic",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 1408,
+        "work": 22
+      },
+      "measurement_only": true,
+      "name": "mixed-before-nan",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 123,
+            "shapes": 19,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 1939,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 1939,
+        "work": 54
+      },
+      "family": "callable-semantic",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 1408,
+        "work": 22
+      },
+      "measurement_only": true,
+      "name": "mixed-after-nan",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 123,
+            "shapes": 19,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 1939,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 1939,
+        "work": 54
+      },
+      "family": "callable-semantic",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 1536,
+        "work": 24
+      },
+      "measurement_only": true,
+      "name": "homogeneous-nan",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 123,
+            "shapes": 19,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 1024,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 1024,
+        "work": 34
+      },
+      "family": "callable-semantic",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 960,
+        "work": 15
+      },
+      "measurement_only": true,
+      "name": "first-tie-negative-zero",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 94,
+            "shapes": 15,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 1024,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 1024,
+        "work": 34
+      },
+      "family": "callable-semantic",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 1024,
+        "work": 16
+      },
+      "measurement_only": true,
+      "name": "first-tie-positive-zero",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 94,
+            "shapes": 15,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 2903,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 2903,
+        "work": 79
+      },
+      "family": "callable-semantic",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 2560,
+        "work": 40
+      },
+      "measurement_only": true,
+      "name": "internal-infinities",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 169,
+            "shapes": 27,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 912,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 912,
+        "work": 19
+      },
+      "family": "callable-semantic",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 320,
+        "work": 5
+      },
+      "measurement_only": true,
+      "name": "min-global-arity-zero",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 21,
+            "shapes": 4,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 1024,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 1024,
+        "work": 29
+      },
+      "family": "callable-semantic",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 768,
+        "work": 12
+      },
+      "measurement_only": true,
+      "name": "max-global-arity-two",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 105,
+            "shapes": 18,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 976,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 976,
+        "work": 25
+      },
+      "family": "callable-semantic",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 640,
+        "work": 10
+      },
+      "measurement_only": true,
+      "name": "min-receiver-arity-one",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 72,
+            "shapes": 13,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 920,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 920,
+        "work": 20
+      },
+      "family": "callable-semantic",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 448,
+        "work": 7
+      },
+      "measurement_only": true,
+      "name": "max-wrong-receiver",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 30,
+            "shapes": 6,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 970,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 970,
+        "work": 30
+      },
+      "family": "callable-semantic",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 640,
+        "work": 10
+      },
+      "measurement_only": true,
+      "name": "min-wrong-kind",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 78,
+            "shapes": 11,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 1963,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 1963,
+        "work": 50
+      },
+      "family": "callable-semantic",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 1344,
+        "work": 21
+      },
+      "measurement_only": true,
+      "name": "invalid-map-contains",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 135,
+            "shapes": 22,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 928,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 928,
+        "work": 21
+      },
+      "family": "callable-semantic",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 512,
+        "work": 8
+      },
+      "measurement_only": true,
+      "name": "uint-overflow-int",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 37,
+            "shapes": 6,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 928,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 928,
+        "work": 21
+      },
+      "family": "callable-semantic",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 640,
+        "work": 10
+      },
+      "measurement_only": true,
+      "name": "uint-overflow-double",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 37,
+            "shapes": 6,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 928,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 928,
+        "work": 21
+      },
+      "family": "callable-semantic",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 1664,
+        "work": 26
+      },
+      "measurement_only": true,
+      "name": "int-overflow-uint",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 37,
+            "shapes": 6,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 1843,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 1843,
+        "work": 41
+      },
+      "family": "callable-semantic",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 1152,
+        "work": 18
+      },
+      "measurement_only": true,
+      "name": "int-overflow-infinity",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 66,
+            "shapes": 10,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 2776,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 2776,
+        "work": 61
+      },
+      "family": "callable-semantic",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 3136,
+        "work": 49
+      },
+      "measurement_only": true,
+      "name": "duration-overflow-add",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 97,
+            "shapes": 16,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 2777,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 2777,
+        "work": 61
+      },
+      "family": "callable-semantic",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 3200,
+        "work": 50
+      },
+      "measurement_only": true,
+      "name": "duration-overflow-subtract",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 97,
+            "shapes": 16,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 931,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 931,
+        "work": 23
+      },
+      "family": "callable-semantic",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 960,
+        "work": 15
+      },
+      "measurement_only": true,
+      "name": "duration-trailing-junk",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 41,
+            "shapes": 6,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 933,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 933,
+        "work": 23
+      },
+      "family": "callable-semantic",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 1088,
+        "work": 17
+      },
+      "measurement_only": true,
+      "name": "duration-exact-exponent",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 41,
+            "shapes": 6,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 2774,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 2774,
+        "work": 61
+      },
+      "family": "callable-semantic",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 3072,
+        "work": 48
+      },
+      "measurement_only": true,
+      "name": "timestamp-upper-add",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 97,
+            "shapes": 16,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 2774,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 2774,
+        "work": 61
+      },
+      "family": "callable-semantic",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 3072,
+        "work": 48
+      },
+      "measurement_only": true,
+      "name": "timestamp-lower-sub",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 97,
+            "shapes": 16,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 2774,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 2774,
+        "work": 61
+      },
+      "family": "callable-semantic",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 3072,
+        "work": 48
+      },
+      "measurement_only": true,
+      "name": "timestamp-upper-valid",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 97,
+            "shapes": 16,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 938,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 938,
+        "work": 23
+      },
+      "family": "callable-semantic",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 1472,
+        "work": 23
+      },
+      "measurement_only": true,
+      "name": "timestamp-bad-parse",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 41,
+            "shapes": 6,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 1024,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 1024,
+        "work": 34
+      },
+      "family": "callable-semantic",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 704,
+        "work": 11
+      },
+      "measurement_only": true,
+      "name": "min-int-receiver",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 94,
+            "shapes": 15,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 1024,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 1024,
+        "work": 34
+      },
+      "family": "callable-semantic",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 640,
+        "work": 10
+      },
+      "measurement_only": true,
+      "name": "max-int-global",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 94,
+            "shapes": 15,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 1024,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 1024,
+        "work": 34
+      },
+      "family": "callable-semantic",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 768,
+        "work": 12
+      },
+      "measurement_only": true,
+      "name": "min-uint-global",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 94,
+            "shapes": 15,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 1024,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 1024,
+        "work": 34
+      },
+      "family": "callable-semantic",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 832,
+        "work": 13
+      },
+      "measurement_only": true,
+      "name": "max-uint-receiver",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 94,
+            "shapes": 15,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 1024,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 1024,
+        "work": 34
+      },
+      "family": "callable-semantic",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 960,
+        "work": 15
+      },
+      "measurement_only": true,
+      "name": "min-double-receiver",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 94,
+            "shapes": 15,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 1024,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 1024,
+        "work": 34
+      },
+      "family": "callable-semantic",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 896,
+        "work": 14
+      },
+      "measurement_only": true,
+      "name": "max-double-global",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 94,
+            "shapes": 15,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 949,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 949,
+        "work": 23
+      },
+      "family": "callable-semantic",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 2112,
+        "work": 33
+      },
+      "measurement_only": true,
+      "name": "duration-max-valid",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 41,
+            "shapes": 6,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 950,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 950,
+        "work": 23
+      },
+      "family": "callable-semantic",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 2176,
+        "work": 34
+      },
+      "measurement_only": true,
+      "name": "duration-min-valid",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 41,
+            "shapes": 6,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 968,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 968,
+        "work": 24
+      },
+      "family": "callable-shape",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 576,
+        "work": 9
+      },
+      "measurement_only": true,
+      "name": "size-list-global",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 63,
+            "shapes": 11,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 968,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 968,
+        "work": 24
+      },
+      "family": "callable-shape",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 640,
+        "work": 10
+      },
+      "measurement_only": true,
+      "name": "size-list-receiver",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 63,
+            "shapes": 11,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 1907,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 1907,
+        "work": 44
+      },
+      "family": "callable-shape",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 832,
+        "work": 13
+      },
+      "measurement_only": true,
+      "name": "size-map-global",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 87,
+            "shapes": 15,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 923,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 923,
+        "work": 23
+      },
+      "family": "callable-shape",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 768,
+        "work": 12
+      },
+      "measurement_only": true,
+      "name": "size-text-receiver",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 40,
+            "shapes": 6,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 923,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 923,
+        "work": 21
+      },
+      "family": "callable-shape",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 768,
+        "work": 12
+      },
+      "measurement_only": true,
+      "name": "size-bytes-global",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 34,
+            "shapes": 6,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 1907,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 1907,
+        "work": 44
+      },
+      "family": "callable-shape",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 896,
+        "work": 14
+      },
+      "measurement_only": true,
+      "name": "size-map-receiver",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 87,
+            "shapes": 15,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 923,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 923,
+        "work": 23
+      },
+      "family": "callable-shape",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 704,
+        "work": 11
+      },
+      "measurement_only": true,
+      "name": "size-text-global",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 40,
+            "shapes": 6,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 923,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 923,
+        "work": 21
+      },
+      "family": "callable-shape",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 832,
+        "work": 13
+      },
+      "measurement_only": true,
+      "name": "size-bytes-receiver",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 34,
+            "shapes": 6,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 932,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 932,
+        "work": 25
+      },
+      "family": "callable-shape",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 1216,
+        "work": 19
+      },
+      "measurement_only": true,
+      "name": "contains-text",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 54,
+            "shapes": 8,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 932,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 932,
+        "work": 25
+      },
+      "family": "callable-shape",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 1344,
+        "work": 21
+      },
+      "measurement_only": true,
+      "name": "prefix",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 54,
+            "shapes": 8,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 932,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 932,
+        "work": 25
+      },
+      "family": "callable-shape",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 1216,
+        "work": 19
+      },
+      "measurement_only": true,
+      "name": "suffix",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 54,
+            "shapes": 8,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 934,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 934,
+        "work": 36
+      },
+      "family": "callable-shape",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 1792,
+        "work": 532
+      },
+      "measurement_only": true,
+      "name": "regex-global",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 55,
+            "shapes": 8,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 934,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 934,
+        "work": 36
+      },
+      "family": "callable-shape",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 1792,
+        "work": 532
+      },
+      "measurement_only": true,
+      "name": "regex-receiver",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 55,
+            "shapes": 8,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 930,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 930,
+        "work": 23
+      },
+      "family": "callable-shape",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 576,
+        "work": 9
+      },
+      "measurement_only": true,
+      "name": "cast-int-string",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 41,
+            "shapes": 6,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 928,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 928,
+        "work": 21
+      },
+      "family": "callable-shape",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 448,
+        "work": 7
+      },
+      "measurement_only": true,
+      "name": "cast-int-identity",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 37,
+            "shapes": 6,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 928,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 928,
+        "work": 21
+      },
+      "family": "callable-shape",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 576,
+        "work": 9
+      },
+      "measurement_only": true,
+      "name": "cast-uint-identity",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 37,
+            "shapes": 6,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 928,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 928,
+        "work": 21
+      },
+      "family": "callable-shape",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 768,
+        "work": 12
+      },
+      "measurement_only": true,
+      "name": "cast-double-identity",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 37,
+            "shapes": 6,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 921,
+        "resource_product": false,
+        "result_bytes": 3,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 921,
+        "work": 24
+      },
+      "family": "callable-shape",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 832,
+        "work": 13
+      },
+      "measurement_only": true,
+      "name": "string-identity",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 41,
+            "shapes": 6,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 928,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 928,
+        "work": 21
+      },
+      "family": "callable-shape",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 512,
+        "work": 8
+      },
+      "measurement_only": true,
+      "name": "cast-int-uint",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 37,
+            "shapes": 6,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 928,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 928,
+        "work": 21
+      },
+      "family": "callable-shape",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 576,
+        "work": 9
+      },
+      "measurement_only": true,
+      "name": "cast-int-double",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 37,
+            "shapes": 6,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 930,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 930,
+        "work": 23
+      },
+      "family": "callable-shape",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 640,
+        "work": 10
+      },
+      "measurement_only": true,
+      "name": "cast-uint-string",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 41,
+            "shapes": 6,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 928,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 928,
+        "work": 21
+      },
+      "family": "callable-shape",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 512,
+        "work": 8
+      },
+      "measurement_only": true,
+      "name": "cast-uint-int",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 37,
+            "shapes": 6,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 928,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 928,
+        "work": 21
+      },
+      "family": "callable-shape",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 640,
+        "work": 10
+      },
+      "measurement_only": true,
+      "name": "cast-uint-double",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 37,
+            "shapes": 6,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 930,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 930,
+        "work": 23
+      },
+      "family": "callable-shape",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 768,
+        "work": 12
+      },
+      "measurement_only": true,
+      "name": "cast-double-string",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 41,
+            "shapes": 6,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 928,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 928,
+        "work": 21
+      },
+      "family": "callable-shape",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 640,
+        "work": 10
+      },
+      "measurement_only": true,
+      "name": "cast-double-int",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 37,
+            "shapes": 6,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 928,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 928,
+        "work": 21
+      },
+      "family": "callable-shape",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 704,
+        "work": 11
+      },
+      "measurement_only": true,
+      "name": "cast-double-uint",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 37,
+            "shapes": 6,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 1600,
+        "resource_product": false,
+        "result_bytes": 344,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 1600,
+        "work": 32
+      },
+      "family": "callable-shape",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 640,
+        "work": 10
+      },
+      "measurement_only": true,
+      "name": "string-int",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 38,
+            "shapes": 6,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 1600,
+        "resource_product": false,
+        "result_bytes": 344,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 1600,
+        "work": 32
+      },
+      "family": "callable-shape",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 704,
+        "work": 11
+      },
+      "measurement_only": true,
+      "name": "string-uint",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 38,
+            "shapes": 6,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 1600,
+        "resource_product": false,
+        "result_bytes": 344,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 1600,
+        "work": 32
+      },
+      "family": "callable-shape",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 768,
+        "work": 12
+      },
+      "measurement_only": true,
+      "name": "string-double",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 38,
+            "shapes": 6,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 933,
+        "resource_product": false,
+        "result_bytes": 9,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 933,
+        "work": 24
+      },
+      "family": "callable-shape",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 896,
+        "work": 14
+      },
+      "measurement_only": true,
+      "name": "string-bytes",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 43,
+            "shapes": 6,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 1926,
+        "resource_product": false,
+        "result_bytes": 40,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 1926,
+        "work": 42
+      },
+      "family": "callable-shape",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 2688,
+        "work": 42
+      },
+      "measurement_only": true,
+      "name": "string-duration",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 67,
+            "shapes": 10,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 1924,
+        "resource_product": false,
+        "result_bytes": 40,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 1924,
+        "work": 42
+      },
+      "family": "callable-shape",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 2624,
+        "work": 41
+      },
+      "measurement_only": true,
+      "name": "string-timestamp",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 67,
+            "shapes": 10,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 921,
+        "resource_product": false,
+        "result_bytes": 3,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 921,
+        "work": 24
+      },
+      "family": "callable-shape",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 768,
+        "work": 12
+      },
+      "measurement_only": true,
+      "name": "bytes-text",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 41,
+            "shapes": 6,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 921,
+        "resource_product": false,
+        "result_bytes": 3,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 921,
+        "work": 24
+      },
+      "family": "callable-shape",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 832,
+        "work": 13
+      },
+      "measurement_only": true,
+      "name": "bytes-identity",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 41,
+            "shapes": 6,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 1842,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 1842,
+        "work": 41
+      },
+      "family": "callable-shape",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 1536,
+        "work": 24
+      },
+      "measurement_only": true,
+      "name": "duration-identity",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 66,
+            "shapes": 10,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 1860,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 1860,
+        "work": 41
+      },
+      "family": "callable-shape",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 2816,
+        "work": 44
+      },
+      "measurement_only": true,
+      "name": "timestamp-identity",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 66,
+            "shapes": 10,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 2205,
+        "resource_product": false,
+        "result_bytes": 145,
+        "result_depth": 3,
+        "result_nodes": 4,
+        "retained": 2205,
+        "work": 58
+      },
+      "family": "callable-shape",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 1024,
+        "work": 16
+      },
+      "measurement_only": true,
+      "name": "dyn-aggregate",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 137,
+            "shapes": 27,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 1600,
+        "resource_product": false,
+        "result_bytes": 344,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 1600,
+        "work": 32
+      },
+      "family": "callable-shape",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 768,
+        "work": 12
+      },
+      "measurement_only": true,
+      "name": "string-bool",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 38,
+            "shapes": 6,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 912,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 912,
+        "work": 19
+      },
+      "family": "callable-shape",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 384,
+        "work": 6
+      },
+      "measurement_only": true,
+      "name": "size-arity",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 21,
+            "shapes": 4,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 920,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 920,
+        "work": 20
+      },
+      "family": "callable-shape",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 448,
+        "work": 7
+      },
+      "measurement_only": true,
+      "name": "size-kind",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 30,
+            "shapes": 6,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 912,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 912,
+        "work": 19
+      },
+      "family": "callable-shape",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 320,
+        "work": 5
+      },
+      "measurement_only": true,
+      "name": "cast-arity",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 21,
+            "shapes": 4,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 929,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 929,
+        "work": 23
+      },
+      "family": "callable-shape",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 576,
+        "work": 9
+      },
+      "measurement_only": true,
+      "name": "cast-receiver",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 41,
+            "shapes": 6,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 928,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 928,
+        "work": 21
+      },
+      "family": "callable-shape",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 448,
+        "work": 7
+      },
+      "measurement_only": true,
+      "name": "cast-kind",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 135,
+            "nodes": 54,
+            "shapes": 8,
+            "visits": 32
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 932,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 932,
+        "work": 23
+      },
+      "family": "callable-shape",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 1216,
+        "work": 19
+      },
+      "measurement_only": true,
+      "name": "temporal-arity",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 47,
+            "shapes": 8,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 928,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 928,
+        "work": 21
+      },
+      "family": "callable-shape",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 768,
+        "work": 12
+      },
+      "measurement_only": true,
+      "name": "temporal-kind",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 37,
+            "shapes": 6,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 931,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 931,
+        "work": 24
+      },
+      "family": "callable-shape",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 1088,
+        "work": 17
+      },
+      "measurement_only": true,
+      "name": "text-kind",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 50,
+            "shapes": 8,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 930,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 930,
+        "work": 23
+      },
+      "family": "callable-shape",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 960,
+        "work": 15
+      },
+      "measurement_only": true,
+      "name": "temporal-receiver",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 41,
+            "shapes": 6,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 912,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 912,
+        "work": 19
+      },
+      "family": "callable-shape",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 704,
+        "work": 11
+      },
+      "measurement_only": true,
+      "name": "timestamp-arity",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 21,
+            "shapes": 4,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 932,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 932,
+        "work": 25
+      },
+      "family": "callable-shape",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 1216,
+        "work": 19
+      },
+      "measurement_only": true,
+      "name": "global-contains",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 54,
+            "shapes": 8,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 923,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 923,
+        "work": 23
+      },
+      "family": "callable-shape",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 1152,
+        "work": 18
+      },
+      "measurement_only": true,
+      "name": "text-arity",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 41,
+            "shapes": 6,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 977,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 977,
+        "work": 28
+      },
+      "family": "callable-shape",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 1088,
+        "work": 17
+      },
+      "measurement_only": true,
+      "name": "text-wrong-receiver",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 103,
+            "nodes": 83,
+            "shapes": 13,
+            "visits": 24
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 5009,
+        "resource_product": false,
+        "result_bytes": 4096,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 5009,
+        "work": 88
+      },
+      "family": "input-refusal",
+      "guards": [],
+      "legitimate": false,
+      "load": {
+        "memory": 320,
+        "work": 5
+      },
+      "measurement_only": true,
+      "name": "external-uint",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 582,
+            "nodes": 51,
+            "shapes": 8,
+            "visits": 158
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 5009,
+        "resource_product": false,
+        "result_bytes": 4096,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 5009,
+        "work": 88
+      },
+      "family": "input-refusal",
+      "guards": [],
+      "legitimate": false,
+      "load": {
+        "memory": 320,
+        "work": 5
+      },
+      "measurement_only": true,
+      "name": "external-nan",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 582,
+            "nodes": 51,
+            "shapes": 8,
+            "visits": 158
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 5009,
+        "resource_product": false,
+        "result_bytes": 4096,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 5009,
+        "work": 88
+      },
+      "family": "input-refusal",
+      "guards": [],
+      "legitimate": false,
+      "load": {
+        "memory": 320,
+        "work": 5
+      },
+      "measurement_only": true,
+      "name": "external-infinity",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 582,
+            "nodes": 51,
+            "shapes": 8,
+            "visits": 158
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 2497176,
+        "resource_product": false,
+        "result_bytes": 1248576,
+        "result_depth": 2,
+        "result_nodes": 5001,
+        "retained": 2497176,
+        "work": 186525
+      },
+      "family": "total-B-text",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 1152,
+        "work": 18
+      },
+      "measurement_only": true,
+      "name": "total-B-text-rows.map(r,r.body)",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 2164,
+            "nodes": 198,
+            "shapes": 30,
+            "visits": 585
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 61038898,
+        "resource_product": false,
+        "result_bytes": 30518989,
+        "result_depth": 3,
+        "result_nodes": 429432,
+        "retained": 61038898,
+        "work": 1812606
+      },
+      "family": "total-B-text",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 576,
+        "work": 9
+      },
+      "measurement_only": true,
+      "name": "total-B-text-rows+rows",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 2171,
+            "nodes": 142,
+            "shapes": 37,
+            "visits": 615
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 928,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 928,
+        "work": 691599
+      },
+      "family": "total-B-text",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 768,
+        "work": 12
+      },
+      "measurement_only": true,
+      "name": "total-B-text-rows == rows",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 597,
+            "nodes": 70,
+            "shapes": 13,
+            "visits": 153
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 5937176,
+        "resource_product": false,
+        "result_bytes": 2968576,
+        "result_depth": 2,
+        "result_nodes": 5001,
+        "retained": 5937176,
+        "work": 401170
+      },
+      "family": "total-B-text",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 1664,
+        "work": 26
+      },
+      "measurement_only": true,
+      "name": "total-B-text-rows.map(r,string(r.body))",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 2985,
+            "nodes": 254,
+            "shapes": 34,
+            "visits": 803
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 2497176,
+        "resource_product": false,
+        "result_bytes": 1248576,
+        "result_depth": 2,
+        "result_nodes": 5001,
+        "retained": 2497176,
+        "work": 320545
+      },
+      "family": "total-B-text",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 1600,
+        "work": 25
+      },
+      "measurement_only": true,
+      "name": "total-B-text-rows.map(r,bytes(r.body))",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 2648,
+            "nodes": 245,
+            "shapes": 34,
+            "visits": 715
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 6851480,
+        "resource_product": false,
+        "result_bytes": 3425728,
+        "result_depth": 2,
+        "result_nodes": 5001,
+        "retained": 6851480,
+        "work": 556619
+      },
+      "family": "total-B-text",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 2112,
+        "work": 33
+      },
+      "measurement_only": true,
+      "name": "total-B-text-rows.map(r,string(bytes(r.body)))",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 3976,
+            "nodes": 309,
+            "shapes": 38,
+            "visits": 1065
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 400024,
+        "resource_product": false,
+        "result_bytes": 200000,
+        "result_depth": 2,
+        "result_nodes": 5001,
+        "retained": 400024,
+        "work": 4612436
+      },
+      "family": "total-B-text",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 2496,
+        "work": 543
+      },
+      "measurement_only": true,
+      "name": "total-B-text-rows.map(r,r.body.matches('x'))",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 1907,
+            "nodes": 236,
+            "shapes": 36,
+            "visits": 520
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 2878,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 1048,
+        "work": 4584309
+      },
+      "family": "total-B-text",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 2496,
+        "work": 543
+      },
+      "measurement_only": true,
+      "name": "total-B-text-rows.all(r,r.body.matches('x'))",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 1080,
+            "nodes": 186,
+            "shapes": 31,
+            "visits": 292
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 45618479,
+        "resource_product": false,
+        "result_bytes": 16308056,
+        "result_depth": 3,
+        "result_nodes": 214716,
+        "retained": 32616136,
+        "work": 938797
+      },
+      "family": "heterogeneous",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 832,
+        "work": 13
+      },
+      "measurement_only": true,
+      "name": "heterogeneous-rows.map(r,r)",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 2442,
+            "nodes": 180,
+            "shapes": 28,
+            "visits": 646
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 121755922,
+        "resource_product": false,
+        "result_bytes": 32776112,
+        "result_depth": 4,
+        "result_nodes": 434431,
+        "retained": 65552248,
+        "work": 2786376
+      },
+      "family": "heterogeneous",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 1088,
+        "work": 17
+      },
+      "measurement_only": true,
+      "name": "heterogeneous-rows.map(r,[r,r])",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 3761,
+            "nodes": 274,
+            "shapes": 43,
+            "visits": 1007
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 182473871,
+        "resource_product": false,
+        "result_bytes": 49084168,
+        "result_depth": 4,
+        "result_nodes": 649146,
+        "retained": 98168360,
+        "work": 4153310
+      },
+      "family": "heterogeneous",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 1216,
+        "work": 19
+      },
+      "measurement_only": true,
+      "name": "heterogeneous-rows.map(r,[r,r,r])",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 4089,
+            "nodes": 301,
+            "shapes": 53,
+            "visits": 1113
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 45618479,
+        "resource_product": false,
+        "result_bytes": 16308056,
+        "result_depth": 3,
+        "result_nodes": 214716,
+        "retained": 32616136,
+        "work": 943797
+      },
+      "family": "heterogeneous",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 1216,
+        "work": 19
+      },
+      "measurement_only": true,
+      "name": "heterogeneous-rows.filter(r,true)",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 2442,
+            "nodes": 191,
+            "shapes": 30,
+            "visits": 646
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 45618479,
+        "resource_product": false,
+        "result_bytes": 16308056,
+        "result_depth": 3,
+        "result_nodes": 214716,
+        "retained": 32616136,
+        "work": 938797
+      },
+      "family": "heterogeneous",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 832,
+        "work": 13
+      },
+      "measurement_only": true,
+      "name": "cached-rows.map(r,r)",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 2442,
+            "nodes": 180,
+            "shapes": 28,
+            "visits": 646
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 121755922,
+        "resource_product": false,
+        "result_bytes": 32776112,
+        "result_depth": 4,
+        "result_nodes": 434431,
+        "retained": 65552248,
+        "work": 2786376
+      },
+      "family": "heterogeneous",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 1088,
+        "work": 17
+      },
+      "measurement_only": true,
+      "name": "cached-rows.map(r,[r,r])",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 3761,
+            "nodes": 274,
+            "shapes": 43,
+            "visits": 1007
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 182473871,
+        "resource_product": false,
+        "result_bytes": 49084168,
+        "result_depth": 4,
+        "result_nodes": 649146,
+        "retained": 98168360,
+        "work": 4153310
+      },
+      "family": "heterogeneous",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 1216,
+        "work": 19
+      },
+      "measurement_only": true,
+      "name": "cached-rows.map(r,[r,r,r])",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 4089,
+            "nodes": 301,
+            "shapes": 53,
+            "visits": 1113
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 45618479,
+        "resource_product": false,
+        "result_bytes": 16308056,
+        "result_depth": 3,
+        "result_nodes": 214716,
+        "retained": 32616136,
+        "work": 943797
+      },
+      "family": "heterogeneous",
+      "guards": [],
+      "legitimate": true,
+      "load": {
+        "memory": 1216,
+        "work": 19
+      },
+      "measurement_only": true,
+      "name": "cached-rows.filter(r,true)",
+      "native_aux": [
+        [
+          "expression",
+          {
+            "cells": 2442,
+            "nodes": 191,
+            "shapes": 30,
+            "visits": 646
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    },
+    {
+      "bound": {
+        "memory": 32,
+        "resource_product": false,
+        "result_bytes": 8,
+        "result_depth": 1,
+        "result_nodes": 1,
+        "retained": 32,
+        "work": 6
+      },
+      "family": "ordered-guard",
+      "guards": [
+        {
+          "bound": {
+            "memory": 2878,
+            "resource_product": false,
+            "result_bytes": 8,
+            "result_depth": 1,
+            "result_nodes": 1,
+            "retained": 1048,
+            "work": 4584309
+          },
+          "input": "pending",
+          "load": {
+            "memory": 2496,
+            "work": 543
+          },
+          "native_aux": {
+            "cells": 1080,
+            "nodes": 186,
+            "shapes": 31,
+            "visits": 292
+          },
+          "public_gate_would_refuse": null,
+          "source": "rows.all(r,r.body.matches('x'))"
+        }
+      ],
+      "legitimate": true,
+      "load": {
+        "memory": 3008,
+        "work": 551
+      },
+      "measurement_only": true,
+      "name": "total-B-regex-guard",
+      "native_aux": [
+        [
+          "measurement-envelope:When",
+          {
+            "cells": 103,
+            "nodes": 52,
+            "shapes": 11,
+            "visits": 24
+          }
+        ],
+        [
+          "measurement-envelope:Result",
+          {
+            "cells": 103,
+            "nodes": 52,
+            "shapes": 11,
+            "visits": 24
+          }
+        ],
+        [
+          "guard:pending",
+          {
+            "cells": 1080,
+            "nodes": 186,
+            "shapes": 31,
+            "visits": 292
+          }
+        ]
+      ],
+      "public_gate_would_refuse": null
+    }
+  ],
+  "execution": {
+    "arch": "x86_64",
+    "available_parallelism": 12,
+    "binary_sha256": "a521ea33b3f228971c1934860e56a65daa7cdb01f059ee6481e226ce1d6bbbb2",
+    "command": {
+      "candidate": 4,
+      "mode": "calibrate",
+      "requested_successes": 0
+    },
+    "cpu": "model name\t: AMD EPYC 7232P 8-Core Processor",
+    "debug_assertions": true,
+    "elapsed_seconds": 0.9664433,
+    "execution_head_end": "6a371f168a8ca3945670fe717ff64933c6145444",
+    "execution_head_start": "6a371f168a8ca3945670fe717ff64933c6145444",
+    "memory": "MemTotal:       131768020 kB",
+    "os": "linux",
+    "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18)\nbinary: rustc\ncommit-hash: 88d9e12ae178fab0fb5cc050a94da85685d449ea\ncommit-date: 2026-08-18\nhost: x86_64-unknown-linux-gnu\nrelease: 1.98.0\nLLVM version: 22.1.8",
+    "scope": "Native wall time includes source check, input validation, proof diagnostics and runtime; not guest fuel or allocator high-water.",
+    "working_tree_end": "",
+    "working_tree_start": ""
+  },
+  "largest_legitimate_estimated": {
+    "guard_memory": [
+      29176,
+      "many-prefix-15-5000"
+    ],
+    "guard_work": [
+      4584309,
+      "total-B-regex-guard"
+    ],
+    "rule_memory": [
+      182473871,
+      "heterogeneous-rows.map(r,[r,r,r])"
+    ],
+    "rule_work": [
+      4612436,
+      "total-B-text-rows.map(r,r.body.matches('x'))"
+    ]
+  },
+  "limits": {
+    "B": 1048576,
+    "Imax": 16,
+    "S": 4096,
+    "guard_memory": 1048576,
+    "guard_work": 32000000,
+    "regex_K": 128,
+    "regex_nest": 24,
+    "regex_pattern": 256,
+    "regex_tiers": [
+      512,
+      2048,
+      8192
+    ],
+    "rows": 5000,
+    "rule_memory": 402653184,
+    "rule_work": 32000000
+  },
+  "measured_auxiliary_maxima": {
+    "cells": {
+      "value": 9641,
+      "witness": {
+        "fixture": "wide-40",
+        "phase": "allow:When"
+      }
+    },
+    "nodes": {
+      "value": 4531,
+      "witness": {
+        "fixture": "wide-40",
+        "phase": "allow:When"
+      }
+    },
+    "shapes": {
+      "value": 644,
+      "witness": {
+        "fixture": "wide-40",
+        "phase": "allow:When"
+      }
+    },
+    "visits": {
+      "value": 2700,
+      "witness": {
+        "fixture": "wide-40",
+        "phase": "allow:When"
+      }
+    }
+  },
+  "measurement_only": true,
+  "measurement_refusals": [],
+  "policy": "cel-subset@1/measure-s4096-i16-re512-n24-k128",
+  "required_twofold": {
+    "guard_memory": 58352,
+    "guard_work": 9168618,
+    "rule_memory": 364947742,
+    "rule_work": 9224872
+  }
+}

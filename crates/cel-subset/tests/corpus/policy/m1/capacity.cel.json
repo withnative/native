@@ -1,0 +1,44 @@
+{
+  "namespace": "events",
+  "name": "capacity",
+  "args": ["tt_id"],
+  "inputs": [
+    {
+      "name": "tt",
+      "cardinality": "one",
+      "sql": "SELECT r.id AS id, (SELECT value_num FROM facet_values WHERE record_id = r.id AND key = 'capacity') AS capacity FROM records r WHERE r.id = ?1",
+      "params": ["tt_id"],
+      "required": {"capacity": "capacity"}
+    },
+    {
+      "name": "tickets",
+      "cardinality": "many",
+      "sql": "SELECT l.source_id AS id FROM links l JOIN facet_values f ON f.record_id = l.source_id AND f.key = 'status' WHERE l.target_id = ?1 AND l.relationship = 'ticket_of' AND f.value IN ('held', 'paid') ORDER BY l.source_id",
+      "params": ["tt_id"]
+    }
+  ],
+  "clauses": [
+    {"id": "seats_ok", "when": "size(tickets) <= tt.capacity", "result": "{\"decision\": \"allow\", \"role\": \"\", \"used\": [tt.id] + tickets.map(t, t.id), \"value\": int(tt.capacity) - int(size(tickets))}"},
+    {"id": "sold_out", "when": "true", "result": "{\"decision\": \"deny\", \"role\": \"\", \"used\": [tt.id] + tickets.map(t, t.id), \"value\": int(tt.capacity) - int(size(tickets))}"}
+  ],
+  "examples": [
+    {
+      "name": "seats available",
+      "inputs": {"tt": {"id": "tt", "capacity": 2}, "tickets": [{"id": "t1"}]},
+      "args": {"tt_id": "tt"},
+      "expect": {"decision": "allow", "clause": "seats_ok", "used": ["tt", "t1"]}
+    },
+    {
+      "name": "sold out",
+      "inputs": {"tt": {"id": "tt", "capacity": 1}, "tickets": [{"id": "t1"}, {"id": "t2"}]},
+      "args": {"tt_id": "tt"},
+      "expect": {"decision": "deny", "clause": "sold_out", "used": ["tt", "t1", "t2"]}
+    },
+    {
+      "name": "missing capacity is unknown",
+      "inputs": {"tt": {"id": "tt0", "capacity": null}, "tickets": []},
+      "args": {"tt_id": "tt0"},
+      "expect": {"decision": "unknown", "clause": "unknown(capacity)", "used": []}
+    }
+  ]
+}

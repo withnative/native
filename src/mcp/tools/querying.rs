@@ -1154,6 +1154,57 @@ pub(crate) async fn execute_portable_live_rollup<
     Ok(payload)
 }
 
+/// Member selector check: the id must simply be present in the slice.
+/// Hidden, deleted and never-existed ids are indistinguishable not_found.
+async fn member_require_record(pool: &sqlx::SqlitePool, tool: &str, record_id: &str) -> Result<()> {
+    let exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM records WHERE id = ? AND deleted_at IS NULL)",
+    )
+    .bind(record_id)
+    .fetch_one(pool)
+    .await?;
+    if exists {
+        Ok(())
+    } else {
+        Err(Error::engine(format!(
+            "{tool}: record {record_id} does not exist"
+        )))
+    }
+}
+
+/// Member containment: the home_id chain over the slice must reach ROOT.
+/// A hidden parent is nulled at produce time, so the walk stops short and
+/// the path reads not-visible — matching online.
+async fn member_containment_path_visible(pool: &sqlx::SqlitePool, record_id: &str) -> Result<bool> {
+    if record_id == crate::schema::ROOT_RECORD_ID {
+        return Ok(true);
+    }
+    let mut current: Option<String> =
+        sqlx::query_scalar("SELECT home_id FROM records WHERE id = ?")
+            .bind(record_id)
+            .fetch_optional(pool)
+            .await?
+            .flatten();
+    for _ in 0..64 {
+        match current {
+            None => return Ok(false),
+            Some(id) if id == crate::schema::ROOT_RECORD_ID => return Ok(true),
+            Some(id) => {
+                let row: Option<Option<String>> =
+                    sqlx::query_scalar("SELECT home_id FROM records WHERE id = ?")
+                        .bind(&id)
+                        .fetch_optional(pool)
+                        .await?;
+                match row {
+                    None => return Ok(false),
+                    Some(next) => current = next,
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
 enum QueryExecutionSource<'a, 'db> {
     Lens(&'a ReadLens<'db>),
     Live(&'a mut sqlx::Transaction<'db, sqlx::Sqlite>),
@@ -1161,6 +1212,11 @@ enum QueryExecutionSource<'a, 'db> {
 
 impl QueryExecutionSource<'_, '_> {
     async fn annotate_record_versions(&mut self, payload: &mut Value) -> Result<()> {
+        // Member copies omit `version` (§2.6) and exclude `content_events`,
+        // so there is nothing to annotate; the scrub removes any key anyway.
+        if matches!(self, Self::Lens(lens) if lens.is_member()) {
+            return Ok(());
+        }
         let Some(records) = payload.get_mut("records").and_then(Value::as_array_mut) else {
             return Ok(());
         };
@@ -1266,6 +1322,16 @@ impl QueryExecutionSource<'_, '_> {
     async fn require_record(&mut self, caller: &Caller, tool: &str, record_id: &str) -> Result<()> {
         match self {
             Self::Lens(lens) => {
+                // Slice presence replaces the policy fold; hidden and absent
+                // are indistinguishable not_found, matching online.
+                if lens.is_member() {
+                    return member_require_record(
+                        lens.projection().snapshot_pool(),
+                        tool,
+                        record_id,
+                    )
+                    .await;
+                }
                 super::require_record_in_pool(
                     lens.meta().snapshot_pool(),
                     caller,
@@ -1360,6 +1426,11 @@ impl QueryExecutionSource<'_, '_> {
     ) -> Result<bool> {
         match self {
             Self::Lens(lens) => {
+                // Member copies ship no anchors; the MCP layer turns the
+                // field into a marker, mirroring get_record.
+                if lens.is_member() {
+                    return Ok(false);
+                }
                 crate::query::tree::custody_boundary_in_pool(
                     lens.meta().snapshot_pool(),
                     record_id,
@@ -1379,6 +1450,13 @@ impl QueryExecutionSource<'_, '_> {
         }
         match self {
             Self::Lens(lens) => {
+                if lens.is_member() {
+                    return member_containment_path_visible(
+                        lens.projection().snapshot_pool(),
+                        record_id,
+                    )
+                    .await;
+                }
                 crate::query::tree::containment_path_visible(
                     lens.projection(),
                     lens.meta().snapshot_pool(),
@@ -2116,10 +2194,124 @@ pub(crate) fn validate_query_record_operation(mut arguments: Value) -> Result<()
     parse_query_plan("query_record", arguments).map(|_| ())
 }
 
+/// Member `query_record` over the admitted slice (contract §2.3(a)): the
+/// shared grammar and pipeline run over `ReadLens::member`; `as_of`,
+/// `activity` and `include_coordination` refuse with `unavailable_offline`
+/// before any storage read beyond the slice itself. `include_interpretation`
+/// serves the supported rows with the contract's `unavailable_offline`
+/// marker on the `interpretation` section (its inputs are excluded
+/// companions); the shipped-schema `lifecycle_interpretation` on each row
+/// is retained. There is no `as_of` snapshot, no version annotation and no
+/// coordination projection. The raw pipeline id digest stays in
+/// `page_basis_digest`; the member gate rebinds it to the admitted
+/// generation and verifies the caller's continuation token there.
+async fn member_query_record(
+    db: &Db,
+    caller: &Caller,
+    as_of_present: bool,
+    include_interpretation: bool,
+    include_coordination: bool,
+    has_page_basis: bool,
+    arguments: Value,
+) -> Result<Value> {
+    const TOOL: &str = "query_record";
+    if as_of_present {
+        return Err(Error::unavailable_offline(TOOL, "as_of"));
+    }
+    if arguments.get("activity").is_some() {
+        return Err(Error::unavailable_offline(TOOL, "activity"));
+    }
+    if include_coordination {
+        return Err(Error::unavailable_offline(TOOL, "include_coordination"));
+    }
+    if has_page_basis && !record_producing_query(TOOL, arguments.clone())? {
+        return Err(Error::engine(
+            "query_record: if_page_basis_digest is supported only for record-producing continuations",
+        ));
+    }
+    let lens = ReadLens::live(db);
+    debug_assert!(lens.is_member(), "member path needs a member lens");
+    // The continuation retains the supported query arguments so it can be
+    // dispatched unchanged; only snapshot/content coordinates stay out (the
+    // refused terminals above never reach this point, and the gate rebinds
+    // the opaque digest to the admitted generation).
+    let mut continuation = arguments.clone();
+    if let Some(request) = continuation.as_object_mut() {
+        request.remove("as_of");
+        request.remove("activity");
+        request.remove("include_coordination");
+        request.remove("include_interpretation");
+        // The envelope parser strips `include_interpretation` from the owned
+        // arguments; the terminal supports it via the explicit marker, so a
+        // dispatched continuation must retain the request.
+        if include_interpretation {
+            request.insert("include_interpretation".into(), Value::Bool(true));
+        }
+    }
+    let mut output =
+        execute_query_record_args_with_lens_as_with_page_basis(&lens, caller, TOOL, arguments)
+            .await?;
+    member_annotate_query_record_paths(db, caller, &mut output).await?;
+    inject_member_query_record_markers(&mut output);
+    // The generic interpretation projection reads excluded companions, so
+    // member rows carry the marker where online attaches a projection. The
+    // rows and counts still serve; the key is never silently absent.
+    if include_interpretation {
+        if let Some(records) = output.get_mut("records").and_then(Value::as_array_mut) {
+            for record in records {
+                if let Some(object) = record.as_object_mut() {
+                    object.insert(
+                        "interpretation".into(),
+                        serde_json::json!({ "unavailable_offline": { "surface": "interpretation", "retry": "when_online" } }),
+                    );
+                }
+            }
+        }
+    }
+    if let Some(object) = output.as_object_mut() {
+        let has_more = object
+            .get("has_more")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let next_request = if has_more {
+            let offset = object.get("offset").and_then(Value::as_i64).unwrap_or(0);
+            let returned = object.get("returned").and_then(Value::as_i64).unwrap_or(0);
+            let mut next = continuation;
+            if let Some(request) = next.as_object_mut() {
+                request.insert("offset".into(), serde_json::json!(offset + returned));
+                request.remove("if_page_basis_digest");
+                if let Some(basis) = object.get("page_basis_digest").and_then(Value::as_str) {
+                    request.insert(
+                        "if_page_basis_digest".into(),
+                        Value::String(basis.to_owned()),
+                    );
+                }
+            }
+            next
+        } else {
+            Value::Null
+        };
+        object.insert("next_request".into(), next_request);
+    }
+    Ok(output)
+}
+
 async fn query_record(db: Db, caller: Caller, mut arguments: Value) -> Result<Value> {
     const TOOL: &str = "query_record";
     let (as_of, include_interpretation, include_coordination, page_basis_digest) =
         validate_query_record_envelope(TOOL, &mut arguments)?;
+    if caller.is_member_copy() {
+        return member_query_record(
+            &db,
+            &caller,
+            as_of.is_some(),
+            include_interpretation,
+            include_coordination,
+            page_basis_digest.is_some(),
+            arguments,
+        )
+        .await;
+    }
     let record_producing = record_producing_query(TOOL, arguments.clone())?;
     if page_basis_digest.is_some() && !record_producing {
         return Err(Error::engine(
@@ -2271,6 +2463,78 @@ async fn annotate_query_record_paths(
         records,
     )
     .await
+}
+
+/// Member `query_record` path annotator: display references come from the
+/// shipped `member_display_references` side table (Q6c — never a slice-local
+/// recomputation, which a hidden record could make too short) and succession
+/// reads the slice for content with slice presence for visibility (R1
+/// carve-out: links only ship with both endpoints in E(m), so hidden
+/// successors are never counted or named).
+async fn member_annotate_query_record_paths(
+    db: &Db,
+    caller: &Caller,
+    payload: &mut Value,
+) -> Result<()> {
+    let Some(records) = payload.get_mut("records").and_then(Value::as_array_mut) else {
+        return Ok(());
+    };
+    let ids: Vec<String> = records
+        .iter()
+        .filter_map(|record| record.get("id").and_then(Value::as_str).map(str::to_owned))
+        .collect();
+    let references =
+        super::lifecycle::member_display_references_in_pool(db.write_pool(), &ids).await?;
+    for record in records.iter_mut() {
+        let Some(id) = record.get("id").and_then(Value::as_str).map(str::to_owned) else {
+            continue;
+        };
+        super::lifecycle::apply_record_path_with_reference(
+            record,
+            &id,
+            references.get(&id).cloned().flatten(),
+        )?;
+    }
+    let records = payload
+        .get_mut("records")
+        .and_then(Value::as_array_mut)
+        .expect("records stay an array");
+    super::lifecycle::annotate_superseded_by_in_pools(
+        db.write_pool(),
+        db.write_pool(),
+        caller,
+        records,
+    )
+    .await
+}
+
+/// Member marker injection for `query_record` rows. Message audience and
+/// provenance read excluded tables, so member rows carry the contract's
+/// `unavailable_offline` marker instead of a silent absence; custody has no
+/// member answer either (the copy ships no anchors).
+fn inject_member_query_record_markers(payload: &mut Value) {
+    let Some(records) = payload.get_mut("records").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for record in records {
+        let Some(object) = record.as_object_mut() else {
+            continue;
+        };
+        object.insert(
+            "custody_boundary".into(),
+            serde_json::json!({ "unavailable_offline": { "surface": "custody_boundary", "retry": "when_online" } }),
+        );
+        if object.get("type").and_then(Value::as_str) == Some("Message") {
+            object.insert(
+                "communication_origin".into(),
+                serde_json::json!({ "unavailable_offline": { "surface": "message_audience", "retry": "when_online" } }),
+            );
+            object.insert(
+                "federation_provenance".into(),
+                serde_json::json!({ "unavailable_offline": { "surface": "message_provenance", "retry": "when_online" } }),
+            );
+        }
+    }
 }
 
 pub(crate) const SAVED_QUERY_VERSION: &str = "0.2";
@@ -2501,7 +2765,12 @@ fn valid_saved_sql_identifier(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
 }
 
-fn logical_cte_shadow(sql: &str) -> Option<String> {
+/// The first leading CTE whose name `guarded` holds. Saved validation guards
+/// only the relations a definition declares: a CTE named after a relation the
+/// definition never reads shadows nothing it depends on, and guarding every
+/// catalog name would invalidate stored definitions each time a relation is
+/// added (b1c8a94 added `actors`).
+fn logical_cte_shadow(sql: &str, guarded: impl Fn(&str) -> bool) -> Option<String> {
     #[derive(Clone, Copy)]
     enum State {
         Normal,
@@ -2597,7 +2866,7 @@ fn logical_cte_shadow(sql: &str) -> Option<String> {
     }
     loop {
         let name = tokens.get(cursor)?;
-        if crate::query::sql_contract::is_logical_relation(name) {
+        if guarded(name) {
             return Some(name.clone());
         }
         cursor += 1;
@@ -2675,12 +2944,46 @@ pub(crate) fn saved_governed_sql_write_issue(tool: &str, value: &Value) -> Optio
     ) {
         return Some(format!("{tool}: refusing to save governed SQL: {error}"));
     }
+    // E1 M3: bound `?N` regexp patterns meet the same subset and cap as
+    // literals before the definition is stored.
+    if let Err(error) = contract::validate_regexp_bound_patterns(
+        contract::QuerySqlProfile::SqliteLocal,
+        &definition.sql,
+        &definition.parameters,
+    ) {
+        return Some(format!("{tool}: refusing to save governed SQL: {error}"));
+    }
+    // Native e25665c: bound `?N` label arguments meet the integer contract
+    // before the definition is stored, so a Text-bound saved definition
+    // receives the same precise repair it would get at execution.
+    if let Err(error) = contract::validate_utc_date_label_bound_args(
+        contract::QuerySqlProfile::SqliteLocal,
+        &definition.sql,
+        &definition.parameters,
+    ) {
+        return Some(format!("{tool}: refusing to save governed SQL: {error}"));
+    }
     if let Err(error) = contract::check_positional_arguments(
         contract::QuerySqlProfile::SqliteLocal,
         &definition.sql,
         definition.parameters.len(),
     ) {
         return Some(format!("{tool}: refusing to save governed SQL: {error}"));
+    }
+    // I3 (AST design, new-SQL-only rejections): LIMIT/OFFSET/FETCH without
+    // ORDER BY and bare GROUP BY columns are refused at save time too, via
+    // the same shared AST entry as ad-hoc query_sql (fail-open admit for
+    // unparseable text; stored definitions execute under LegacySavedSql).
+    // E2: an unordered top-level LIMIT still refuses, but names the exact
+    // default the ad-hoc path would apply.
+    if let Err(error) = crate::query::turso_ast_rules::check_statement(&definition.sql) {
+        let mut refusal = format!("{tool}: refusing to save governed SQL: {error}");
+        if error.to_string().contains("LIMIT without ORDER BY") {
+            if let Some(repair) = crate::query::sql::default_order_repair(&definition.sql) {
+                refusal.push_str(&format!("; {repair}"));
+            }
+        }
+        return Some(refusal);
     }
     None
 }
@@ -2697,13 +3000,27 @@ fn validate_saved_sql_in(
         ));
     }
     let active = contract::QuerySqlProfile::SqliteLocal.contract();
-    if definition.profile.id != active.id || definition.profile.revision != active.revision {
+    // Shared policy: the exact-profile predicate lives in the pure contract;
+    // the message stays the saved-SQL one (behavior-preserving).
+    let actual = crate::query::sql::current_catalog_snapshot();
+    if native_query_contract::rule_contract::check_profile_pin(
+        &actual,
+        &definition.profile.id,
+        definition.profile.revision,
+    )
+    .is_err()
+    {
         return Err(Error::engine(format!(
             "saved governed SQL requires profile {}@{}",
             active.id, active.revision
         )));
     }
-    if definition.catalog_revision != contract::LOGICAL_CATALOG_REVISION {
+    if native_query_contract::rule_contract::check_catalog_revision(
+        &actual,
+        definition.catalog_revision,
+    )
+    .is_err()
+    {
         return Err(Error::engine(format!(
             "saved governed SQL pins catalog revision {}, but the active catalog is revision {} (value-model change): re-save the definition against the current catalog — set catalog_revision to {}, re-validate the output columns, and re-run",
             definition.catalog_revision,
@@ -2716,11 +3033,39 @@ fn validate_saved_sql_in(
         parameters: definition.parameters.clone(),
     };
     request.validate().map_err(Error::from)?;
+    // E1 M3: bound `?N` regexp patterns are validated against the same
+    // subset and cap as literals, under both allowances.
+    contract::validate_regexp_bound_patterns(
+        contract::QuerySqlProfile::SqliteLocal,
+        &definition.sql,
+        &definition.parameters,
+    )
+    .map_err(Error::from)?;
+    // Native e25665c: bound `?N` label arguments meet the integer contract
+    // under both allowances, so inspection reports the same repair as the
+    // write gate and the execution paths.
+    contract::validate_utc_date_label_bound_args(
+        contract::QuerySqlProfile::SqliteLocal,
+        &definition.sql,
+        &definition.parameters,
+    )
+    .map_err(Error::from)?;
     match allowance {
-        Allow::Portable => sql::validate(&definition.sql)?,
+        // E2: an unordered top-level LIMIT still refuses, but names the
+        // exact default the ad-hoc path would apply.
+        Allow::Portable => sql::validate(&definition.sql).map_err(|error| {
+            if error.to_string().contains("LIMIT without ORDER BY") {
+                if let Some(repair) = sql::default_order_repair(&definition.sql) {
+                    return Error::engine(format!("{error}; {repair}"));
+                }
+            }
+            error
+        })?,
         Allow::LegacySavedSql => sql::validate_legacy_saved_sql(&definition.sql)?,
     }
-    if let Some(name) = logical_cte_shadow(&definition.sql) {
+    if let Some(name) = logical_cte_shadow(&definition.sql, |name| {
+        definition.relations.contains_key(name)
+    }) {
         return Err(Error::engine(format!(
             "saved governed SQL cannot shadow logical relation '{name}' with a CTE"
         )));
@@ -2738,21 +3083,47 @@ fn validate_saved_sql_in(
     }
     for relation in contract::LOGICAL_RELATIONS {
         let mentioned = used_relations.contains(relation.name);
+        // Snapshot mirrors the live catalog; absence fails closed.
+        let live = match native_query_contract::rule_contract::find_relation(&actual, relation.name)
+        {
+            Some(live) => live,
+            None => {
+                return Err(Error::engine(format!(
+                    "saved governed SQL relation '{}' is no longer served",
+                    relation.name
+                )));
+            }
+        };
         match definition.relations.get(relation.name) {
             Some(dependency)
-                if dependency.identity == relation.identity
-                    && dependency.semantic_version == relation.semantic_version
+                if native_query_contract::rule_contract::check_relation_identity(
+                    live,
+                    &dependency.identity,
+                    dependency.semantic_version,
+                )
+                .is_ok()
                     && mentioned
-                    && relation.profiles.contains(&active.id) => {}
-            Some(_) if mentioned && !relation.profiles.contains(&active.id) => {
+                    && native_query_contract::rule_contract::relation_serves_profile(
+                        live, active.id,
+                    ) => {}
+            Some(_)
+                if mentioned
+                    && !native_query_contract::rule_contract::relation_serves_profile(
+                        live, active.id,
+                    ) =>
+            {
                 return Err(Error::engine(format!(
                     "saved governed SQL relation '{}' is unavailable in profile {}",
                     relation.name, active.id
                 )))
             }
             Some(dependency)
-                if dependency.identity != relation.identity
-                    || dependency.semantic_version != relation.semantic_version =>
+                if native_query_contract::rule_contract::check_relation_identity(
+                    live,
+                    &dependency.identity,
+                    dependency.semantic_version,
+                )
+                .is_err() =>
             {
                 return Err(Error::engine(format!(
                     "saved governed SQL relation '{}' identity/version is incompatible with {}@{}",
@@ -3358,11 +3729,15 @@ fn hit_json(hit: &SearchHit) -> Value {
 /// contract binds near-misses as much as strict hits — so sibling rows are
 /// membership-filtered, not assumed in-scope by construction.
 #[allow(clippy::too_many_arguments)]
+/// Sibling scan and parent visibility filter over the caller's connection,
+/// so one search reads one snapshot. Declared tab reads pass their gate
+/// transaction's connection.
 async fn tree_siblings(
-    db: &Db,
+    conn: &mut sqlx::SqliteConnection,
     credential: &str,
     trusted_local_bypass: bool,
     is_member: bool,
+    member: bool,
     hits: &[SearchHit],
     exclude: &HashSet<String>,
     scope: Option<&HashSet<String>>,
@@ -3385,8 +3760,16 @@ async fn tree_siblings(
                           WHERE av.record_id = r.id AND av.key = 'archived')"
     };
     let placeholders = vec!["?"; home_ids.len()].join(", ");
-    let not_hidden = crate::query::not_hidden_predicate("r");
-    let view_filter = crate::query::fts::view_predicate("r");
+    let not_hidden = if member {
+        crate::query::member_not_hidden_predicate("r")
+    } else {
+        crate::query::not_hidden_predicate("r")
+    };
+    let view_filter = if member {
+        "1".to_string()
+    } else {
+        crate::query::fts::view_predicate("r")
+    };
     let name_chars = crate::query::fts::TRUSTED_NAME_CHARS;
     let scope_filter = if scope.is_some() {
         "AND r.id IN (SELECT value FROM json_each(?))"
@@ -3411,25 +3794,39 @@ async fn tree_siblings(
     for id in &home_ids {
         query = query.bind(id);
     }
-    query = query
-        .bind(trusted_local_bypass)
-        .bind(credential)
-        .bind(is_member)
-        .bind(credential);
+    if !member {
+        query = query
+            .bind(trusted_local_bypass)
+            .bind(credential)
+            .bind(is_member)
+            .bind(credential);
+    }
     query = query.bind(json!(exclude.iter().collect::<Vec<_>>()).to_string());
     if let Some(scope) = scope {
         query = query.bind(json!(scope.iter().collect::<Vec<_>>()).to_string());
     }
     query = query.bind(NEAR_MISS_CAP);
-    let rows = query.fetch_all(db.write_pool()).await?;
-    let visible_parents = crate::query::fts::independently_visible_ids(
-        db,
-        credential,
-        trusted_local_bypass,
-        is_member,
-        &home_ids,
-    )
-    .await?;
+    let rows = query.fetch_all(&mut *conn).await?;
+    let visible_parents: HashSet<String> = if member {
+        let encoded = serde_json::to_string(&home_ids)?;
+        sqlx::query_scalar::<_, String>(
+            "SELECT id FROM records WHERE id IN (SELECT value FROM json_each(?))",
+        )
+        .bind(encoded)
+        .fetch_all(&mut *conn)
+        .await?
+        .into_iter()
+        .collect()
+    } else {
+        crate::query::fts::independently_visible_ids(
+            conn,
+            credential,
+            trusted_local_bypass,
+            is_member,
+            &home_ids,
+        )
+        .await?
+    };
     let mut out = Vec::new();
     for row in &rows {
         let id: String = row.try_get("id")?;
@@ -3448,29 +3845,87 @@ async fn tree_siblings(
 pub(crate) async fn search(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
     const TOOL: &str = "search";
     let args: SearchArgs = parse_args(TOOL, arguments)?;
-    if args.query.trim().is_empty() {
+    let mut tx = db.write_pool().begin().await?;
+    let result = search_in(
+        &mut tx,
+        &caller,
+        &args.query,
+        args.scope.as_deref(),
+        args.limit,
+        args.include_archived.unwrap_or(false),
+    )
+    .await;
+    let cleanup = tx.rollback().await;
+    match result {
+        Ok(value) => {
+            cleanup?;
+            Ok(value)
+        }
+        Err(error) => {
+            let _ = cleanup;
+            Err(error)
+        }
+    }
+}
+
+/// Snapshot-scoped form of [`search`]: every result-controlling read —
+/// match, near misses, siblings, parent redaction, paths and succession —
+/// shares the caller's transaction instead of opening its own snapshots.
+/// Declared tab reads pass their gate transaction; the pool form above reads
+/// through one snapshot the same way. No algorithm change: same SQL, same
+/// envelope, same guidance.
+pub(crate) async fn search_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    caller: &Caller,
+    query: &str,
+    scope: Option<&str>,
+    limit: Option<i64>,
+    include_archived: bool,
+) -> Result<Value> {
+    const TOOL: &str = "search";
+    if query.trim().is_empty() {
         return Err(Error::engine(format!("{TOOL}: 'query' must be non-empty")));
     }
-    let limit = fts::effective_limit(args.limit)?;
+    let limit = fts::effective_limit(limit)?;
+    let member = caller.is_member_copy();
     let opts = FtsOptions {
-        scope: args.scope.clone(),
-        include_archived: args.include_archived.unwrap_or(false),
+        scope: scope.map(str::to_owned),
+        include_archived,
         limit: Some(limit),
         types: Vec::new(),
+        member,
     };
-    let trusted_local_bypass = super::is_legacy_local(&caller);
-    let scope_set: Option<HashSet<String>> = match &args.scope {
+    let trusted_local_bypass = super::is_legacy_local(caller);
+    let scope_set: Option<HashSet<String>> = match &opts.scope {
         Some(root) => {
-            super::require_record(
-                &db,
-                &caller,
-                TOOL,
-                root,
-                crate::authorization::Capability::View,
-            )
-            .await?;
+            if member {
+                // A member copy has no policy plane: the scope root must
+                // simply be present in the slice.
+                let exists: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM records WHERE id = ? AND deleted_at IS NULL)",
+                )
+                .bind(root)
+                .fetch_one(&mut **tx)
+                .await?;
+                if !exists {
+                    return Err(Error::engine(format!(
+                        "{TOOL}: scope record {root} does not exist"
+                    )));
+                }
+            } else {
+                super::require_record_in(
+                    tx,
+                    caller,
+                    TOOL,
+                    root,
+                    crate::authorization::Capability::View,
+                )
+                .await?;
+            }
+            // `subtree_ids` contract: the scope hedge always excludes
+            // archived records, even for archived-including searches.
             Some(
-                crate::query::tree::subtree_ids(&db, root)
+                crate::query::tree::subtree_ids_with_hidden_in(tx, root, false, false, false)
                     .await?
                     .into_iter()
                     .collect(),
@@ -3478,12 +3933,12 @@ pub(crate) async fn search(db: Db, caller: Caller, arguments: Value) -> Result<V
         }
         None => None,
     };
-    let hits = fts::search_with_policy_bypass(
-        &db,
+    let hits = fts::search_with_policy_bypass_in(
+        tx,
         caller.credential(),
         trusted_local_bypass,
         caller.is_host_member(),
-        &args.query,
+        query,
         &opts,
     )
     .await?;
@@ -3498,8 +3953,8 @@ pub(crate) async fn search(db: Db, caller: Caller, arguments: Value) -> Result<V
     let thin = hits.len() < THIN_RESULTS_THRESHOLD && !limit_reached;
 
     let mut payload = json!({
-        "query": args.query,
-        "scope": args.scope,
+        "query": query,
+        "scope": opts.scope,
         "hits": hits.iter().map(hit_json).collect::<Vec<_>>(),
         "total": hits.len(),
         "returned": hits.len(),
@@ -3514,10 +3969,11 @@ pub(crate) async fn search(db: Db, caller: Caller, arguments: Value) -> Result<V
     // scan each — see query::fts).
     if thin {
         let near_opts = FtsOptions {
-            scope: args.scope.clone(),
+            scope: opts.scope.clone(),
             include_archived: opts.include_archived,
             limit: Some(NEAR_MISS_CAP),
             types: Vec::new(),
+            member,
         };
         let mut seen: HashSet<String> = hits.iter().map(|h| h.id.clone()).collect();
         let mut dedup = |mechanism_hits: Vec<SearchHit>| -> Vec<Value> {
@@ -3528,32 +3984,33 @@ pub(crate) async fn search(db: Db, caller: Caller, arguments: Value) -> Result<V
                 .collect()
         };
         let prefix = dedup(
-            fts::name_prefix_with_policy_bypass(
-                &db,
+            fts::name_prefix_with_policy_bypass_in(
+                tx,
                 caller.credential(),
                 trusted_local_bypass,
                 caller.is_host_member(),
-                &args.query,
+                query,
                 &near_opts,
             )
             .await?,
         );
         let infix = dedup(
-            fts::name_infix_with_policy_bypass(
-                &db,
+            fts::name_infix_with_policy_bypass_in(
+                tx,
                 caller.credential(),
                 trusted_local_bypass,
                 caller.is_host_member(),
-                &args.query,
+                query,
                 &near_opts,
             )
             .await?,
         );
         let siblings = tree_siblings(
-            &db,
+            tx,
             caller.credential(),
             trusted_local_bypass,
             caller.is_host_member(),
+            member,
             &hits,
             &seen,
             scope_set.as_ref(),
@@ -3572,12 +4029,12 @@ pub(crate) async fn search(db: Db, caller: Caller, arguments: Value) -> Result<V
         // The payload does the prompting — agents do not reformulate reliably
         // unprompted (3bc7fd0). Say the results are thin, say what to try.
         let mut guidance = if hits.is_empty() {
-            format!("No full-text matches for {:?}.", args.query)
+            format!("No full-text matches for {:?}.", query)
         } else {
             format!(
                 "Only {} full-text match(es) for {:?} — likely not exhaustive.",
                 hits.len(),
-                args.query
+                query
             )
         };
         guidance.push_str(
@@ -3602,11 +4059,19 @@ pub(crate) async fn search(db: Db, caller: Caller, arguments: Value) -> Result<V
         // cannot both describe one response.
         object.insert("guidance".into(), json!(CAPPED_RESULTS_GUIDANCE));
     }
-    annotate_search_record_paths(&db, &caller, &mut payload).await?;
+    annotate_search_record_paths_in(tx, caller, &mut payload).await?;
     Ok(payload)
 }
 
-async fn annotate_search_record_paths(db: &Db, caller: &Caller, payload: &mut Value) -> Result<()> {
+/// Snapshot-scoped form of the search path annotation: display references
+/// and succession share the caller's transaction, so paths, succession and
+/// the hits they annotate cannot drift across snapshots. The pool form is
+/// gone: both readers (`search`, `search_in`) go through here.
+async fn annotate_search_record_paths_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    caller: &Caller,
+    payload: &mut Value,
+) -> Result<()> {
     let mut ids = Vec::new();
     for pointer in [
         "/hits",
@@ -3623,9 +4088,29 @@ async fn annotate_search_record_paths(db: &Db, caller: &Caller, payload: &mut Va
             }
         }
     }
-    let references = {
+    let references = if caller.is_member_copy() {
+        // Q6c: use the shipped online display references, never a slice-local
+        // prefix recompute (which could shorten a hidden-unique prefix).
+        let encoded = serde_json::to_string(&ids)?;
+        let rows = sqlx::query(
+            "SELECT record_id, display_reference FROM member_display_references
+              WHERE record_id IN (SELECT value FROM json_each(?))",
+        )
+        .bind(encoded)
+        .fetch_all(&mut **tx)
+        .await?;
+        let mut references = std::collections::HashMap::new();
+        for row in rows {
+            references.insert(
+                row.try_get::<String, _>("record_id")?,
+                Some(row.try_get::<String, _>("display_reference")?),
+            );
+        }
+        references
+    } else {
         let borrowed: Vec<&str> = ids.iter().map(String::as_str).collect();
-        crate::mcp::record_ref::display_references(db, &borrowed).await?
+        let mut executor = crate::portable_sql::BorrowedSqliteStatementExecutor::new(tx);
+        crate::mcp::record_ref::display_references_in(&mut executor, &borrowed).await?
     };
     for pointer in [
         "/hits",
@@ -3651,13 +4136,7 @@ async fn annotate_search_record_paths(db: &Db, caller: &Caller, payload: &mut Va
     // renderer names id/type/title, so naming successors there would be
     // payload without a reader.
     if let Some(hits) = payload.get_mut("hits").and_then(Value::as_array_mut) {
-        super::lifecycle::annotate_superseded_by_in_pools(
-            db.write_pool(),
-            db.write_pool(),
-            caller,
-            hits,
-        )
-        .await?;
+        super::lifecycle::annotate_superseded_by_in_tx(tx, caller, hits).await?;
     }
     Ok(())
 }
@@ -3666,7 +4145,10 @@ async fn annotate_search_record_paths(db: &Db, caller: &Caller, payload: &mut Va
 // Tool 18 — query_sql
 // ---------------------------------------------------------------------------
 
-async fn query_sql(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
+/// Ordinary `query_sql` handler, reused by the alpha-tab snapshot path so a
+/// declared SQL need returns exactly what the viewer's own `query_sql` call
+/// with the same text returns (parity and access semantics by construction).
+pub(crate) async fn query_sql(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
     let request = parse_args::<crate::query::sql_contract::QuerySqlRequest>("query_sql", arguments)
         .map_err(|error| {
             crate::query::sql_contract::categorized_error(
@@ -3684,6 +4166,9 @@ async fn query_sql(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
         "truncated": result.truncated,
         "truncation_hint": result.truncation_hint,
         "as_of_seq": result.as_of_seq,
+        "now_ms_ms": result.now_ms_ms,
+        "time_dependent": result.time_dependent,
+        "assumed_order": result.assumed_order,
     }))
 }
 
@@ -3831,6 +4316,31 @@ fn finish_saved_sql(
         .relations
         .keys()
         .any(|name| matches!(name.as_str(), "agent_activity" | "agent_activity_claims"));
+    // Run lifecycle and the read log sit outside the content boundary below,
+    // so a result over `runs` or `run_intents` can be neither replayed from it
+    // nor called complete. Any read counts, including a column-less one the
+    // declared relations cannot carry (`(SELECT count(*) FROM runs)`): this
+    // over-approximates, which only ever makes a receipt more conservative.
+    let run_dependent = definition
+        .relations
+        .keys()
+        .any(|name| matches!(name.as_str(), "runs" | "run_intents"))
+        || crate::query::sql::saved_sql_reads_any_relation(
+            &definition.sql,
+            &["runs", "run_intents"],
+        );
+    // D6 (b2583dc): `my_message_state` and `my_mentions` carry the caller's
+    // own read state and preferences, which change through awareness events
+    // with no content event, so the same conservative rule as `runs` applies
+    // to any read of them, column-less ones included.
+    let message_state_dependent = definition
+        .relations
+        .keys()
+        .any(|name| matches!(name.as_str(), "my_message_state" | "my_mentions"))
+        || crate::query::sql::saved_sql_reads_any_relation(
+            &definition.sql,
+            &["my_message_state", "my_mentions"],
+        );
     let definition_bytes = serde_json::to_vec(definition)?;
     let parameters_bytes = serde_json::to_vec(&parameters)?;
     let rows_bytes = serde_json::to_vec(&rows)?;
@@ -3869,12 +4379,14 @@ fn finish_saved_sql(
     }
     let snapshot = format!("native.snapshot.v1.{:x}", token_digest.finalize());
     let row_count = rows.len();
-    let completeness = if definition.relations.keys().any(|name| {
-        crate::query::sql_contract::LOGICAL_RELATIONS
-            .iter()
-            .find(|relation| relation.name == name)
-            .is_some_and(|relation| relation.completeness == "best_effort")
-    }) {
+    let completeness = if run_dependent
+        || message_state_dependent
+        || definition.relations.keys().any(|name| {
+            crate::query::sql_contract::LOGICAL_RELATIONS
+                .iter()
+                .find(|relation| relation.name == name)
+                .is_some_and(|relation| relation.completeness == "best_effort")
+        }) {
         "best_effort"
     } else if truncated {
         "truncated"
@@ -3913,6 +4425,11 @@ fn finish_saved_sql(
         "row_count": row_count,
         "truncated": truncated,
         "as_of_seq": result.as_of_seq,
+        "now_ms_ms": result.now_ms_ms,
+        "time_dependent": result.time_dependent,
+        // Stored governed SQL keeps the unordered-LIMIT refusal, so the
+        // server never assumes an order here; the key stays null.
+        "assumed_order": result.assumed_order,
         "receipt": {
             "version": "native.governed-sql-receipt.v1",
             "snapshot": snapshot,
@@ -3920,7 +4437,7 @@ fn finish_saved_sql(
             "row_count": row_count,
             "truncated": truncated,
             "completeness": completeness,
-            "replayable": !activity_dependent,
+            "replayable": !activity_dependent && !run_dependent && !message_state_dependent,
             "observation_window_hours": activity_dependent.then_some(24),
             "catalog_revision": definition.catalog_revision,
             "relations": relation_receipts,
@@ -4184,6 +4701,7 @@ async fn derived_relationship_axis(
     binds: &[String],
     metric: DerivedAxisMetric,
     minimum: i64,
+    member: bool,
 ) -> Result<AxisFacet> {
     let sql =
         format!("SELECT r.id, r.type, r.name FROM records r WHERE {corpus_where} ORDER BY r.id");
@@ -4251,11 +4769,15 @@ async fn derived_relationship_axis(
             }
         }
         DerivedAxisMetric::ChildCount => {
+            let child_not_hidden = if member {
+                crate::query::member_not_hidden_predicate("c")
+            } else {
+                crate::query::not_hidden_predicate("c")
+            };
             let sql = format!(
                 "SELECT c.id, c.home_id FROM records c
                   WHERE c.home_id IN (SELECT value FROM json_each(?))
-                    AND c.deleted_at IS NULL AND {}",
-                crate::query::not_hidden_predicate("c")
+                    AND c.deleted_at IS NULL AND {child_not_hidden}"
             );
             let child_rows: Vec<(String, String)> = sqlx::query_as(&sql)
                 .bind(&corpus_json)
@@ -4317,6 +4839,7 @@ async fn derived_relationship_axis(
 
 async fn annotate_scan_axes_record_paths(
     db: &Db,
+    caller: &Caller,
     axes: &mut serde_json::Map<String, Value>,
 ) -> Result<()> {
     let mut ids = Vec::new();
@@ -4330,8 +4853,14 @@ async fn annotate_scan_axes_record_paths(
             }
         }
     }
-    let borrowed: Vec<&str> = ids.iter().map(String::as_str).collect();
-    let references = crate::mcp::record_ref::display_references(db, &borrowed).await?;
+    // Q6c: a member copy ships its display references; never recompute a
+    // slice-local prefix, which a hidden record could make too short.
+    let references = if caller.is_member_copy() {
+        member_scan_display_references(db.write_pool(), &ids).await?
+    } else {
+        let borrowed: Vec<&str> = ids.iter().map(String::as_str).collect();
+        crate::mcp::record_ref::display_references(db, &borrowed).await?
+    };
     for facet in axes.values_mut() {
         let Some(samples) = facet.get_mut("samples").and_then(Value::as_array_mut) else {
             continue;
@@ -4378,8 +4907,15 @@ async fn annotate_scan_axes_lifecycle(
     caller: &Caller,
     axes: &mut serde_json::Map<String, Value>,
 ) -> Result<()> {
-    let principal = (!super::is_legacy_local(caller)).then(|| super::principal(caller));
-    let interpreter = crate::query::lifecycle::LifecycleInterpreter::load(db, principal).await?;
+    let interpreter = if caller.is_member_copy() {
+        // A member copy ships its schema rows (no policy scoping); interpret
+        // from the shipped set, exactly as the record readers do.
+        let rows = crate::query::cascade::schema_config_rows_in_pool(db.write_pool(), None).await?;
+        crate::query::lifecycle::LifecycleInterpreter::load_from_pool(db.write_pool(), rows).await?
+    } else {
+        let principal = (!super::is_legacy_local(caller)).then(|| super::principal(caller));
+        crate::query::lifecycle::LifecycleInterpreter::load(db, principal).await?
+    };
     let mut interpretations = std::collections::HashMap::new();
     for facet in axes.values_mut() {
         let Some(samples) = facet.get_mut("samples").and_then(Value::as_array_mut) else {
@@ -4507,8 +5043,134 @@ fn build_scan_convergence(axes: &serde_json::Map<String, Value>) -> Vec<Value> {
         .collect()
 }
 
+/// The one member marker shape (contract §2.3(a)): a section the member copy
+/// cannot compute. It carries no counter and never stands in for a value.
+fn member_unavailable_marker(surface: &str) -> Value {
+    json!({ "unavailable_offline": { "surface": surface, "retry": "when_online" } })
+}
+
+/// A member copy's axis sample references: read the shipped
+/// `member_display_references` table rather than recompute a slice-local
+/// prefix over the slice (Q6c).
+async fn member_scan_display_references(
+    pool: &sqlx::SqlitePool,
+    ids: &[String],
+) -> Result<HashMap<String, Option<String>>> {
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let encoded = serde_json::to_string(ids)?;
+    let rows = sqlx::query(
+        "SELECT record_id, display_reference FROM member_display_references
+          WHERE record_id IN (SELECT value FROM json_each(?))",
+    )
+    .bind(encoded)
+    .fetch_all(pool)
+    .await?;
+    let mut references = HashMap::new();
+    for row in rows {
+        references.insert(
+            row.try_get::<String, _>("record_id")?,
+            Some(row.try_get::<String, _>("display_reference")?),
+        );
+    }
+    Ok(references)
+}
+
+/// The scan axes actually served: facets carrying a `samples` array. Marker
+/// axes (a bare `unavailable_offline` object) are excluded, so convergence
+/// over the served set can never include an excluded axis.
+fn served_scan_axes(axes: &serde_json::Map<String, Value>) -> Vec<String> {
+    axes.iter()
+        .filter(|(_, value)| value.get("samples").and_then(Value::as_array).is_some())
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
+/// Member census over the slice. It applies the same filter the online
+/// pipeline's count terminal applies (types, ancestor subtree, archived), with
+/// slice presence standing in for the caller-relative authorization fold, and
+/// emits the same bucket shape (`count` DESC, `key` ASC; a null key is the
+/// no-value bucket).
+async fn member_scan_census(
+    db: &Db,
+    args: &ScanArgs,
+    include_archived: bool,
+) -> Result<serde_json::Map<String, Value>> {
+    let mut clauses = vec![
+        "r.deleted_at IS NULL".to_string(),
+        crate::query::member_not_hidden_predicate("r"),
+    ];
+    let mut binds: Vec<String> = Vec::new();
+    if let Some(types) = &args.types {
+        if !types.is_empty() {
+            clauses.push("r.type IN (SELECT value FROM json_each(?))".into());
+            binds.push(serde_json::to_string(types)?);
+        }
+    }
+    if !include_archived {
+        clauses.push(
+            "NOT EXISTS (SELECT 1 FROM facet_values av
+               WHERE av.record_id = r.id AND av.key = 'archived')"
+                .into(),
+        );
+    }
+    if let Some(root) = &args.scope {
+        let ids = crate::query::tree::member_subtree_ids(db, root, include_archived).await?;
+        clauses.push("r.id IN (SELECT value FROM json_each(?))".into());
+        binds.push(serde_json::to_string(&ids)?);
+    }
+    let where_sql = clauses.join(" AND ");
+    let mut census = serde_json::Map::new();
+    for (label, column) in [
+        ("by_type", "type"),
+        ("by_kind", "kind"),
+        ("by_lifecycle", "lifecycle"),
+    ] {
+        let sql = format!(
+            "SELECT r.{column} AS key, COUNT(*) AS n FROM records r
+              WHERE {where_sql} GROUP BY r.{column}"
+        );
+        let mut query = sqlx::query(&sql);
+        for bind in &binds {
+            query = query.bind(bind);
+        }
+        let rows = query.fetch_all(db.write_pool()).await?;
+        let mut buckets: Vec<(Option<String>, i64)> = rows
+            .iter()
+            .map(|row| {
+                Ok((
+                    row.try_get::<Option<String>, _>("key")?,
+                    row.try_get::<i64, _>("n")?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        buckets.sort_by(|left, right| right.1.cmp(&left.1).then(left.0.cmp(&right.0)));
+        let total: i64 = buckets.iter().map(|(_, count)| *count).sum();
+        census.insert(
+            label.into(),
+            json!({
+                "shape": "counts",
+                "total": total,
+                "buckets": buckets
+                    .iter()
+                    .map(|(key, count)| json!({ "key": key, "count": count }))
+                    .collect::<Vec<_>>(),
+            }),
+        );
+    }
+    Ok(census)
+}
+
 async fn scan(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
     const TOOL: &str = "scan";
+    // A member copy holds only E(m), so the slice is the authorization
+    // universe: visibility is slice presence. Servable axes run at parity over
+    // the slice; the provenance census and the authored_by axis need excluded
+    // history and become explicit `unavailable_offline` markers with the shared
+    // shape (contract c323277 rev 8 §2.3(a)). Never an empty bucket or a zero
+    // standing in for a refusal.
+    let member = caller.is_member_copy();
     let args: ScanArgs = parse_args(TOOL, arguments)?;
     let recent_window_days = args
         .recent_window_days
@@ -4530,7 +5192,11 @@ async fn scan(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
     // in scope, of the named types. Built once, appended per axis.
     let mut corpus_clauses: Vec<String> = vec![
         "r.deleted_at IS NULL".into(),
-        crate::query::not_hidden_predicate("r"),
+        if member {
+            crate::query::member_not_hidden_predicate("r")
+        } else {
+            crate::query::not_hidden_predicate("r")
+        },
     ];
     let mut corpus_binds: Vec<String> = Vec::new();
     if !include_archived {
@@ -4547,12 +5213,29 @@ async fn scan(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
         }
     }
     if let Some(root) = &args.scope {
-        if !super::can_record(&db, &caller, root, crate::authorization::Capability::View).await? {
+        let scoped = if member {
+            // A member copy has no policy plane: the scope root must simply be
+            // present in the slice, and the subtree walk reads shipped rows.
+            let exists: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM records WHERE id = ? AND deleted_at IS NULL)",
+            )
+            .bind(root)
+            .fetch_one(db.write_pool())
+            .await?;
+            exists
+        } else {
+            super::can_record(&db, &caller, root, crate::authorization::Capability::View).await?
+        };
+        if !scoped {
             return Err(Error::engine(format!(
                 "{TOOL}: scope record {root} does not exist"
             )));
         }
-        let ids = crate::query::tree::subtree_ids(&db, root).await?;
+        let ids = if member {
+            crate::query::tree::member_subtree_ids(&db, root, false).await?
+        } else {
+            crate::query::tree::subtree_ids(&db, root).await?
+        };
         if ids.is_empty() {
             return Err(Error::engine(format!(
                 "{TOOL}: scope record {root} does not exist"
@@ -4585,45 +5268,62 @@ async fn scan(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
     };
 
     // Census: bucket counts along the spine axes (the type/kind/lifecycle
-    // orientation the contract names), via the pipeline's count terminal.
-    let census_filter = pipeline::Filter {
-        types: args.types.clone().unwrap_or_default(),
-        ancestor_id: args.scope.clone(),
-        include_archived,
-        ..pipeline::Filter::default()
+    // orientation the contract names). Online this is the pipeline's
+    // caller-relative count terminal; a member copy has no policy plane, so the
+    // same filter reduces to the slice corpus predicate and is counted directly
+    // (`member_not_hidden` = 1; slice presence is the authorization).
+    let mut census = if member {
+        member_scan_census(&db, &args, include_archived).await?
+    } else {
+        let census_filter = pipeline::Filter {
+            types: args.types.clone().unwrap_or_default(),
+            ancestor_id: args.scope.clone(),
+            include_archived,
+            ..pipeline::Filter::default()
+        };
+        let mut census = serde_json::Map::new();
+        for (label, axis_kind) in [
+            ("by_type", pipeline::CountAxis::Type),
+            ("by_kind", pipeline::CountAxis::Kind),
+            ("by_lifecycle", pipeline::CountAxis::Lifecycle),
+        ] {
+            let census_steps = [pipeline::Step::filter(census_filter.clone())];
+            let census_options = pipeline::PipelineOptions::default();
+            let (output, _) = pipeline::run_with_diagnostics_as(
+                &db,
+                super::principal(&caller),
+                &census_steps,
+                Some(axis_kind),
+                &census_options,
+            )
+            .await?;
+            census.insert(label.into(), serde_json::to_value(&output)?);
+        }
+        census
     };
-    let mut census = serde_json::Map::new();
-    for (label, axis_kind) in [
-        ("by_type", pipeline::CountAxis::Type),
-        ("by_kind", pipeline::CountAxis::Kind),
-        ("by_lifecycle", pipeline::CountAxis::Lifecycle),
-    ] {
-        let census_steps = [pipeline::Step::filter(census_filter.clone())];
-        let census_options = pipeline::PipelineOptions::default();
-        let (output, _) = pipeline::run_with_diagnostics_as(
-            &db,
-            super::principal(&caller),
-            &census_steps,
-            Some(axis_kind),
-            &census_options,
-        )
-        .await?;
-        census.insert(label.into(), serde_json::to_value(&output)?);
-    }
 
-    // Provenance is derived from each record's genesis event. The correlated
-    // MIN(seq) is an indexed first-row lookup through
-    // idx_content_events_record(record_id, seq), not a corpus-wide GROUP BY
-    // over the event log, so keeping authorship out of the records projection
-    // avoids schema/rebuild churn without turning the unconditional census
-    // into a full-log scan.
-    //
-    // The CASE order makes the origin classes disjoint: an agent run is the
-    // strongest signal, then an external binding, then the genesis account.
-    // `local` deliberately remains unknown even for Caller::local(): it is
-    // legacy fixture/pre-account history, not a portable account identity.
-    let provenance_sql = format!(
-        "SELECT record_id, provenance
+    if member {
+        // Rev 8 §2.3(a): provenance derives from each record's genesis
+        // `content_events` row and bindings, which the member profile excludes.
+        // It is an explicit marker, never invented empty buckets.
+        census.insert(
+            "provenance".into(),
+            member_unavailable_marker("scan.provenance"),
+        );
+    } else {
+        // Provenance is derived from each record's genesis event. The correlated
+        // MIN(seq) is an indexed first-row lookup through
+        // idx_content_events_record(record_id, seq), not a corpus-wide GROUP BY
+        // over the event log, so keeping authorship out of the records projection
+        // avoids schema/rebuild churn without turning the unconditional census
+        // into a full-log scan.
+        //
+        // The CASE order makes the origin classes disjoint: an agent run is the
+        // strongest signal, then an external binding, then the genesis account.
+        // `local` deliberately remains unknown even for Caller::local(): it is
+        // legacy fixture/pre-account history, not a portable account identity.
+        let provenance_sql = format!(
+            "SELECT record_id, provenance
            FROM (
              SELECT r.id AS record_id, CASE
                WHEN genesis.run_key IS NOT NULL THEN 'agent'
@@ -4655,38 +5355,39 @@ async fn scan(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
               WHERE {corpus_where}
            ) classified
           ORDER BY provenance, record_id"
-    );
-    let mut provenance_query = sqlx::query(&provenance_sql).bind(caller.credential());
-    for bind in &corpus_binds {
-        provenance_query = provenance_query.bind(bind);
-    }
-    let provenance_rows = provenance_query.fetch_all(db.write_pool()).await?;
-    let provenance_ids = provenance_rows
-        .iter()
-        .map(|row| row.try_get::<String, _>("record_id"))
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    let visible_provenance = super::visible_ids(&db, &caller, provenance_ids).await?;
-    let mut provenance_counts = std::collections::BTreeMap::<String, i64>::new();
-    for row in &provenance_rows {
-        let id: String = row.try_get("record_id")?;
-        if visible_provenance.contains(&id) {
-            *provenance_counts
-                .entry(row.try_get("provenance")?)
-                .or_default() += 1;
+        );
+        let mut provenance_query = sqlx::query(&provenance_sql).bind(caller.credential());
+        for bind in &corpus_binds {
+            provenance_query = provenance_query.bind(bind);
         }
+        let provenance_rows = provenance_query.fetch_all(db.write_pool()).await?;
+        let provenance_ids = provenance_rows
+            .iter()
+            .map(|row| row.try_get::<String, _>("record_id"))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let visible_provenance = super::visible_ids(&db, &caller, provenance_ids).await?;
+        let mut provenance_counts = std::collections::BTreeMap::<String, i64>::new();
+        for row in &provenance_rows {
+            let id: String = row.try_get("record_id")?;
+            if visible_provenance.contains(&id) {
+                *provenance_counts
+                    .entry(row.try_get("provenance")?)
+                    .or_default() += 1;
+            }
+        }
+        let provenance_buckets = provenance_counts
+            .into_iter()
+            .map(|(key, count)| json!({ "key": key, "count": count }))
+            .collect::<Vec<_>>();
+        census.insert(
+            "provenance".into(),
+            json!({
+                "shape": "counts",
+                "total": corpus_size,
+                "buckets": provenance_buckets,
+            }),
+        );
     }
-    let provenance_buckets = provenance_counts
-        .into_iter()
-        .map(|(key, count)| json!({ "key": key, "count": count }))
-        .collect::<Vec<_>>();
-    census.insert(
-        "provenance".into(),
-        json!({
-            "shape": "counts",
-            "total": corpus_size,
-            "buckets": provenance_buckets,
-        }),
-    );
 
     // The sampled axes. Each query orders by its own relevance; the head is
     // the sample, the full row count is the pool.
@@ -4706,26 +5407,35 @@ async fn scan(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
             "{TOOL}: authored_by may name only the current caller"
         )));
     }
-    let authored_person: Option<String> = sqlx::query_scalar(
-        "SELECT record_id FROM bindings WHERE system = 'account' AND identifier = ?",
-    )
-    .bind(authored_selector)
-    .fetch_optional(db.write_pool())
-    .await?;
-    if args.authored_by.is_some() && authored_person.is_none() {
-        return Err(Error::engine(format!(
-            "{TOOL}: 'authored_by' must be an account token present in this file"
-        )));
-    }
-    let (authored_predicate, authored_binds) = match authored_person {
+    if member {
+        // Rev 8 §2.3(a): authored_by joins each record's latest `content_events`
+        // row, which the member profile excludes. Explicit marker, never an
+        // empty axis or a zero count.
+        axes.insert(
+            "authored_by".into(),
+            member_unavailable_marker("scan.authored_by"),
+        );
+    } else {
+        let authored_person: Option<String> = sqlx::query_scalar(
+            "SELECT record_id FROM bindings WHERE system = 'account' AND identifier = ?",
+        )
+        .bind(authored_selector)
+        .fetch_optional(db.write_pool())
+        .await?;
+        if args.authored_by.is_some() && authored_person.is_none() {
+            return Err(Error::engine(format!(
+                "{TOOL}: 'authored_by' must be an account token present in this file"
+            )));
+        }
+        let (authored_predicate, authored_binds) = match authored_person {
         Some(person_id) => (
             "e.actor IN (SELECT identifier FROM bindings WHERE system = 'account' AND record_id = ?)".to_string(),
             vec![person_id],
         ),
         None => ("e.actor = ?".to_string(), vec![authored_selector.to_string()]),
     };
-    let authored_sql = format!(
-        "SELECT r.id, r.type, r.name, latest.created_at AS authored_at
+        let authored_sql = format!(
+            "SELECT r.id, r.type, r.name, latest.created_at AS authored_at
            FROM records r
            JOIN content_events latest
              ON latest.seq = (
@@ -4734,25 +5444,26 @@ async fn scan(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
              )
           WHERE {corpus_where}
           ORDER BY latest.seq DESC, r.id"
-    );
-    let mut authored_axis_binds = authored_binds;
-    authored_axis_binds.extend(corpus_binds.iter().cloned());
-    axes.insert(
-        "authored_by".into(),
-        axis(
-            &db,
-            &caller,
-            &authored_sql,
-            &authored_axis_binds,
-            Some(AxisMetricColumn {
-                sql_alias: "authored_at",
-                json_key: "authored_at",
-                kind: AxisMetricKind::Text,
-            }),
-        )
-        .await?
-        .to_json(corpus_size),
-    );
+        );
+        let mut authored_axis_binds = authored_binds;
+        authored_axis_binds.extend(corpus_binds.iter().cloned());
+        axes.insert(
+            "authored_by".into(),
+            axis(
+                &db,
+                &caller,
+                &authored_sql,
+                &authored_axis_binds,
+                Some(AxisMetricColumn {
+                    sql_alias: "authored_at",
+                    json_key: "authored_at",
+                    kind: AxisMetricKind::Text,
+                }),
+            )
+            .await?
+            .to_json(corpus_size),
+        );
+    }
 
     if let Some(query_text) = args.query.as_deref().filter(|q| !q.trim().is_empty()) {
         // Count and sample are two queries over the SAME filters: the pool
@@ -4763,6 +5474,11 @@ async fn scan(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
             include_archived,
             limit: Some(SCAN_SAMPLE_LIMIT as i64),
             types: args.types.clone().unwrap_or_default(),
+            // Unreachable for a member copy: the handler refuses member calls
+            // up front (below), and the dispatch gate refuses `scan` before the
+            // handler. The flag is derived rather than hardcoded so it cannot
+            // silently disagree with the caller if scan is ever served.
+            member: caller.is_member_copy(),
         };
         let trusted_local_bypass = super::is_legacy_local(&caller);
         let count = fts::search_pool_count_with_policy_bypass(
@@ -4837,6 +5553,7 @@ async fn scan(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
             &corpus_binds,
             DerivedAxisMetric::Degree,
             high_degree_min,
+            member,
         )
         .await?
         .to_json(corpus_size),
@@ -4853,20 +5570,24 @@ async fn scan(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
             &corpus_binds,
             DerivedAxisMetric::ChildCount,
             1,
+            member,
         )
         .await?
         .to_json(corpus_size),
     );
 
     annotate_scan_axes_lifecycle(&db, &caller, &mut axes).await?;
-    annotate_scan_axes_record_paths(&db, &mut axes).await?;
+    annotate_scan_axes_record_paths(&db, &caller, &mut axes).await?;
     annotate_scan_axes_superseded(&db, &caller, &mut axes).await?;
 
     // Convergence: described records surfacing in the SAMPLES of two or more
-    // axes — the strongest orientation signal a stateless scan can give.
+    // axes — the strongest orientation signal a stateless scan can give. It is
+    // computed over the served axes only; a member copy additionally declares
+    // which axes participated (rev 8 §2.3(a)). Marker axes carry no samples, so
+    // they contribute nothing by construction.
     let convergence = build_scan_convergence(&axes);
 
-    Ok(json!({
+    let mut output = json!({
         "corpus_size": corpus_size,
         "scope": args.scope,
         "census": census,
@@ -4879,7 +5600,22 @@ async fn scan(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
             "sample_limit": SCAN_SAMPLE_LIMIT,
             "saturation_threshold": SCAN_SATURATION_THRESHOLD,
         },
-    }))
+    });
+    if member {
+        let served = served_scan_axes(output["axes"].as_object().expect("scan axes is an object"));
+        output
+            .as_object_mut()
+            .expect("scan output is an object")
+            .insert(
+                "convergence_basis".into(),
+                json!({
+                    "kind": "served_axes",
+                    "axes": served,
+                    "excluded_axes": ["authored_by"],
+                }),
+            );
+    }
+    Ok(output)
 }
 
 // ---------------------------------------------------------------------------
@@ -4947,8 +5683,8 @@ pub fn register_query_tools(registry: &mut ToolRegistry) -> Result<()> {
     registry.register(
         ToolKind::QuerySql,
         "Caller-filtered engine-native read-only SQL: one validated SELECT/WITH \
-         against audited logical relations, with optional lossless tagged positional \
-         parameters. The sql_read descriptor carries the catalog card with relations, \
+         against audited logical relations, with optional typed or inferred bare-scalar \
+         positional parameters. The sql_read descriptor carries the catalog card with relations, \
          value model, placeholders and worked statements; engine_info and \
          read_guide(topic='query-sql') remain available for profile and revision \
          detail. Unsupported profiles fail closed. SQL is capped at 64 KiB; rows at 1000, \
@@ -4958,21 +5694,19 @@ pub fn register_query_tools(registry: &mut ToolRegistry) -> Result<()> {
     )?;
     registry.register(
         ToolKind::Scan,
-        "Cross-axis orientation before querying: a census (counts by type/kind/\
-         lifecycle/provenance) plus sampled axes — authored-by account, lexical \
-         (with a query), recent activity, high link degree, largest containers — \
-         each with its FULL pool count \
-         and a 3-record sample carrying evidence: authored_by has authored_at; \
-         lexical has score + snippet; recent has last_activity_at; high_degree \
-         has degree; containers has child_count. Convergence is an array of \
-         {id, type, name, axes, \
-         axis_count} for records surfacing in two or more sample heads, not the \
-         full axis pools, ordered by axis_count DESC, name, id. Stateless: \
-         refine by re-issuing with tighter filters, then drill in with \
-         query_record. The optional query is lexical text, not a record address: \
-         when you have a full or short record reference, use get_record with \
-         ids:[reference].",
-        json!({
+        "Orient before querying: census counts by type/kind/lifecycle/provenance; \
+         sampled axes are authored_by, lexical (requires query), recent, \
+         high_degree and containers. Each axis reports its full pool count and \
+         up to 3 records: authored_by has authored_at; lexical has score + snippet; \
+         recent has last_activity_at; high_degree has degree; containers has \
+         child_count. Convergence is an array of {id, type, name, axes, axis_count} \
+         for records in at least two sample heads, not the full axis pools, \
+         ordered by axis_count DESC, name, id. Refine with filters; drill into \
+         query_record. query is lexical text, not a record address; use get_record.ids \
+         for a short record reference. Offline member copies serve \
+         census and slice-computable axes; census.provenance and axes.authored_by \
+         return unavailable_offline markers. Convergence uses served axes.",
+         json!({
             "type": "object",
             "properties": {
                 "query": { "type": "string", "description": "Lexical free text over record names and bodies, not a record address; enables the lexical axis. For a known full or short record reference, use get_record.ids instead." },
@@ -5267,6 +6001,48 @@ mod governed_sql_tests {
     }
 
     #[test]
+    fn saved_sql_heading_relation_pins_identity_and_version() {
+        // Record-grouped counts have a stable record row identity; body heading
+        // ordinals themselves remain revision-local integers, never identifiers.
+        let mut valid = definition("SELECT count(DISTINCT block_index) AS name,record_id AS id FROM body_block_headings WHERE title=?1 AND title_truncated=0 GROUP BY record_id",10);
+        valid.relations = BTreeMap::from([(
+            "body_block_headings".into(),
+            SavedSqlRelationDependency {
+                identity: "native.query-sql.body-block-headings".into(),
+                semantic_version: 1,
+            },
+        )]);
+        valid.parameters = vec![crate::query::sql_contract::QuerySqlParameter::Text {
+            value: Some("Plan".into()),
+        }];
+        valid.output.columns[0].column_type = SavedSqlColumnType::Integer;
+        valid.output.schema_sha256 = saved_sql_schema_sha256(&valid.output.columns).unwrap();
+        assert_eq!(valid.catalog_revision, 4);
+        validate_saved_sql(&valid).unwrap();
+        validate_stored_saved_sql(&valid).unwrap();
+        for pin in [
+            SavedSqlRelationDependency {
+                identity: "native.query-sql.body-block-headings".into(),
+                semantic_version: 2,
+            },
+            SavedSqlRelationDependency {
+                identity: "native.query-sql.body-blocks".into(),
+                semantic_version: 1,
+            },
+        ] {
+            let mut wrong = valid.clone();
+            wrong.relations.insert("body_block_headings".into(), pin);
+            assert!(validate_saved_sql(&wrong)
+                .unwrap_err()
+                .to_string()
+                .contains("identity/version is incompatible"));
+        }
+        let mut missing = valid.clone();
+        missing.relations.clear();
+        assert!(validate_saved_sql(&missing).is_err());
+    }
+
+    #[test]
     fn saved_sql_admission_pins_versions_schema_identity_order_and_relations() {
         let valid = definition("SELECT name,id FROM records WHERE type=?1", 10);
         validate_saved_sql(&valid).unwrap();
@@ -5393,6 +6169,463 @@ mod governed_sql_tests {
                 "quote style {quoted} must not bypass logical-relation shadowing"
             );
         }
+        // A definition saved before `facet_times` joined the catalog (D2
+        // slice T2) may use that name for its own CTE. It never declared the
+        // relation, so the new relation must not invalidate it.
+        let pre_facet_times = definition(
+            "WITH facet_times(name,id) AS (SELECT name,id FROM records WHERE type=?1) SELECT name,id FROM facet_times",
+            10,
+        );
+        assert!(crate::query::sql_contract::is_logical_relation(
+            "facet_times"
+        ));
+        validate_saved_sql(&pre_facet_times)
+            .expect("a CTE may reuse the name of a relation the definition does not declare");
+    }
+
+    /// Adding a catalog relation (b1c8a94 added `actors`) must not
+    /// invalidate a stored definition. Each statement below validated on
+    /// main with only a `records` pin and must still validate: a column-less
+    /// read of an undeclared relation, CTEs named after on-demand relations
+    /// nested and at top level, and a CTE named `actors`.
+    #[test]
+    fn catalog_growth_keeps_stored_definitions_valid() {
+        for sql in [
+            "SELECT name,id FROM records WHERE type=?1 AND EXISTS (SELECT 1 FROM links)",
+            "SELECT name,id FROM records WHERE type=?1 AND EXISTS (WITH actors(x) AS (VALUES(1)), records AS (SELECT count(*) AS n FROM actors) SELECT n FROM records)",
+            "SELECT name,id FROM records WHERE type=?1 AND EXISTS (WITH agent_activity(x) AS (VALUES(1)), records AS (SELECT count(*) AS n FROM agent_activity) SELECT n FROM records)",
+            "WITH actors AS (SELECT name,id FROM records WHERE type=?1) SELECT name,id FROM actors",
+            "SELECT name,id FROM records WHERE type=?1 AND EXISTS (WITH messages_awaiting_reply(x) AS (VALUES(1)), records AS (SELECT count(*) AS n FROM messages_awaiting_reply) SELECT n FROM records)",
+            // 6867ce6 added `runs` and `run_intents`: stored CTEs of those
+            // names, top-level and nested, stay the definition's own tables.
+            "WITH runs AS (SELECT name,id FROM records WHERE type=?1) SELECT name,id FROM runs",
+            "WITH run_intents AS (SELECT name,id FROM records WHERE type=?1) SELECT name,id FROM run_intents",
+            "WITH runs AS (SELECT name,id FROM records WHERE type=?1), run_intents AS (SELECT name,id FROM runs) SELECT name,id FROM run_intents",
+            "SELECT name,id FROM records WHERE type=?1 AND EXISTS (WITH runs(x) AS (VALUES(1)), run_intents AS (SELECT count(*) AS n FROM runs) SELECT n FROM run_intents)",
+            // b2583dc added `my_message_state` and `my_mentions`: stored
+            // CTEs of those names stay the definition's own tables too.
+            "WITH my_message_state AS (SELECT name,id FROM records WHERE type=?1) SELECT name,id FROM my_message_state",
+            "WITH my_mentions AS (SELECT name,id FROM records WHERE type=?1) SELECT name,id FROM my_mentions",
+            "SELECT name,id FROM records WHERE type=?1 AND EXISTS (WITH my_message_state(x) AS (VALUES(1)), my_mentions AS (SELECT count(*) AS n FROM my_message_state) SELECT n FROM my_mentions)",
+        ] {
+            validate_saved_sql(&definition(sql, 10)).unwrap_or_else(|error| panic!("{sql}: {error}"));
+        }
+        // A CTE may now reuse the name of any relation the definition does
+        // not declare, including one that predates `actors`.
+        validate_saved_sql(&definition(
+            "WITH agent_activity AS (SELECT name,id FROM records WHERE type=?1) SELECT name,id FROM agent_activity",
+            10,
+        ))
+        .expect("an undeclared relation name is free for a CTE");
+        // Shadowing a declared relation stays refused.
+        assert!(validate_saved_sql(&definition(
+            "WITH records AS (SELECT 'fake' AS name, 'stable' AS id) SELECT name,id FROM records WHERE ?1 IS NOT NULL",
+            10,
+        ))
+        .unwrap_err()
+        .to_string()
+        .contains("cannot shadow logical relation 'records'"));
+    }
+
+    /// 6867ce6: a saved result over `runs` or `run_intents` is never called
+    /// replayable or complete, because run lifecycle and the read log sit
+    /// outside the content boundary its receipt carries.
+    #[test]
+    fn run_relation_receipts_are_not_replayable() {
+        for (relation, identity, completeness) in [
+            ("runs", "native.query-sql.runs", "best_effort"),
+            ("run_intents", "native.query-sql.run-intents", "best_effort"),
+        ] {
+            let mut definition = definition("SELECT name,id FROM records WHERE type=?1", 10);
+            definition.relations.insert(
+                relation.into(),
+                SavedSqlRelationDependency {
+                    identity: identity.into(),
+                    semantic_version: 1,
+                },
+            );
+            let result = crate::query::sql_contract::QuerySqlResult {
+                columns: vec!["name".into(), "id".into()],
+                rows: vec![],
+                row_count: 0,
+                truncated: false,
+                truncation_hint: None,
+                as_of_seq: 17,
+                now_ms_ms: None,
+                time_dependent: false,
+                assumed_order: None,
+            };
+            let output = finish_saved_sql(
+                &definition,
+                &definition.parameters,
+                "ndb_00000000000000000000000000000000",
+                crate::query::sql::GovernedSqlObservation {
+                    observed_at: "2026-08-31T00:00:00.000Z".into(),
+                    content_event_seq: Some(17),
+                    lifecycle_event_seq: None,
+                    authorization_boundary: "native.authorization-snapshot.v1.test".into(),
+                    transient_watermark: None,
+                    transient_available: true,
+                },
+                result,
+            )
+            .unwrap();
+            assert_eq!(output["receipt"]["replayable"], false, "{relation}");
+            assert_eq!(
+                output["receipt"]["completeness"], completeness,
+                "{relation}"
+            );
+            assert_eq!(output["receipt"]["observation_window_hours"], Value::Null);
+            assert_eq!(output["receipt"]["degraded_sources"], json!([]));
+        }
+        let plain = definition("SELECT name,id FROM records WHERE type=?1", 10);
+        let output = finish_saved_sql(
+            &plain,
+            &plain.parameters,
+            "ndb_00000000000000000000000000000000",
+            crate::query::sql::GovernedSqlObservation {
+                observed_at: "2026-08-31T00:00:00.000Z".into(),
+                content_event_seq: Some(17),
+                lifecycle_event_seq: None,
+                authorization_boundary: "native.authorization-snapshot.v1.test".into(),
+                transient_watermark: None,
+                transient_available: true,
+            },
+            crate::query::sql_contract::QuerySqlResult {
+                columns: vec!["name".into(), "id".into()],
+                rows: vec![],
+                row_count: 0,
+                truncated: false,
+                truncation_hint: None,
+                as_of_seq: 17,
+                now_ms_ms: None,
+                time_dependent: false,
+                assumed_order: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(output["receipt"]["replayable"], true);
+    }
+
+    /// b2583dc: a saved result over the caller's own message state or
+    /// mentions is never called replayable or complete, because awareness
+    /// moves without any content event.
+    #[test]
+    fn message_state_receipts_are_not_replayable() {
+        for (relation, identity, replayable, completeness) in [
+            (
+                "my_message_state",
+                "native.query-sql.my-message-state",
+                false,
+                "best_effort",
+            ),
+            (
+                "my_mentions",
+                "native.query-sql.my-mentions",
+                false,
+                "best_effort",
+            ),
+        ] {
+            let mut definition = definition("SELECT name,id FROM records WHERE type=?1", 10);
+            definition.relations.insert(
+                relation.into(),
+                SavedSqlRelationDependency {
+                    identity: identity.into(),
+                    semantic_version: 1,
+                },
+            );
+            let output = finish_saved_sql(
+                &definition,
+                &definition.parameters,
+                "ndb_00000000000000000000000000000000",
+                crate::query::sql::GovernedSqlObservation {
+                    observed_at: "2026-09-30T00:00:00.000Z".into(),
+                    content_event_seq: Some(17),
+                    lifecycle_event_seq: None,
+                    authorization_boundary: "native.authorization-snapshot.v1.test".into(),
+                    transient_watermark: None,
+                    transient_available: true,
+                },
+                crate::query::sql_contract::QuerySqlResult {
+                    columns: vec!["name".into(), "id".into()],
+                    rows: vec![],
+                    row_count: 0,
+                    truncated: false,
+                    truncation_hint: None,
+                    as_of_seq: 17,
+                    now_ms_ms: None,
+                    time_dependent: false,
+                    assumed_order: None,
+                },
+            )
+            .unwrap();
+            assert_eq!(output["receipt"]["replayable"], replayable, "{relation}");
+            assert_eq!(
+                output["receipt"]["completeness"], completeness,
+                "{relation}"
+            );
+        }
+    }
+
+    /// b2583dc: a column-less read of the caller's own message state or
+    /// mentions never enters the declared relations, yet its value moves
+    /// when the caller reads a Message. The receipt must still be
+    /// conservative.
+    #[tokio::test]
+    async fn column_less_message_state_reads_make_saved_receipts_conservative() {
+        let db = create_database(":memory:").await.unwrap();
+        for relation in ["my_message_state", "my_mentions"] {
+            let sql = format!(
+                "SELECT name,id FROM records WHERE type=?1 AND (SELECT count(*) FROM {relation}) >= 0"
+            );
+            let counted = definition(&sql, 10);
+            assert_eq!(
+                counted.relations.keys().collect::<Vec<_>>(),
+                ["records"],
+                "{relation}"
+            );
+            validate_saved_sql(&counted).unwrap_or_else(|error| panic!("{relation}: {error}"));
+            let output = execute_saved_sql(db.clone(), &Caller::local(), &counted, None)
+                .await
+                .unwrap();
+            assert_eq!(output["receipt"]["replayable"], false, "{relation}");
+            assert_eq!(
+                output["receipt"]["completeness"], "best_effort",
+                "{relation}"
+            );
+        }
+    }
+
+    /// 6867ce6 review: a column-less read of `runs` or `run_intents` never
+    /// enters the declared relations (the definition below declares only
+    /// `records`), yet its value moves when a run is added. The receipt must
+    /// still say non-replayable and not complete. A plain read keeps its
+    /// receipt.
+    #[tokio::test]
+    async fn column_less_run_reads_make_saved_receipts_conservative() {
+        let db = create_database(":memory:").await.unwrap();
+        let plain = definition("SELECT name,id FROM records WHERE type=?1", 10);
+        let output = execute_saved_sql(db.clone(), &Caller::local(), &plain, None)
+            .await
+            .unwrap();
+        assert_eq!(output["receipt"]["replayable"], true);
+        assert_eq!(output["receipt"]["completeness"], "complete");
+        for relation in ["runs", "run_intents"] {
+            let sql = format!(
+                "SELECT name,id FROM records WHERE type=?1 AND (SELECT count(*) FROM {relation}) >= 0"
+            );
+            let counted = definition(&sql, 10);
+            assert_eq!(
+                counted.relations.keys().collect::<Vec<_>>(),
+                ["records"],
+                "{relation}"
+            );
+            validate_saved_sql(&counted).unwrap_or_else(|error| panic!("{relation}: {error}"));
+            let output = execute_saved_sql(db.clone(), &Caller::local(), &counted, None)
+                .await
+                .unwrap();
+            assert_eq!(output["receipt"]["replayable"], false, "{relation}");
+            assert_eq!(
+                output["receipt"]["completeness"], "best_effort",
+                "{relation}"
+            );
+        }
+    }
+
+    #[test]
+    fn new_sql_determinism_rejections_gate_saves_but_not_stored() {
+        // I3 rejections are new-SQL-only: saving is refused (validate +
+        // write-time gate), stored inspection keeps working. Statements use
+        // the shared definition shape (outputs name/id over records).
+        for (sql, repair) in [
+            (
+                "SELECT name, id FROM records WHERE type = ?1 LIMIT 5",
+                "add ORDER BY over a unique key",
+            ),
+            (
+                "SELECT name, max(id) AS id FROM records WHERE type = ?1 GROUP BY type",
+                "must appear in GROUP BY or inside an aggregate",
+            ),
+            (
+                "SELECT name, count(*) AS id FROM records WHERE type = ?1",
+                "must appear in GROUP BY or inside an aggregate",
+            ),
+        ] {
+            let error = validate_saved_sql(&definition(sql, 10))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(repair), "{sql}: missing repair: {error}");
+            let stored = validate_stored_saved_sql(&definition(sql, 10));
+            assert!(
+                stored.is_ok(),
+                "{sql}: stored must stay working: {stored:?}"
+            );
+            let raw = serde_json::to_string(&definition(sql, 10)).unwrap();
+            let issue = saved_governed_sql_write_issue("test", &json!(raw));
+            assert!(
+                issue.is_some_and(|message| message.contains(repair)),
+                "{sql}: write-time gate must refuse"
+            );
+        }
+    }
+
+    #[test]
+    fn unordered_limit_save_refusal_names_the_exact_default() {
+        // E2: saving unordered top-level LIMIT still refuses everywhere, but
+        // names the default the ad-hoc path would apply. A nested-only
+        // unordered LIMIT refuses without it.
+        let sql = "SELECT name, id FROM records WHERE type = ?1 LIMIT 5";
+        let raw = serde_json::to_string(&definition(sql, 10)).unwrap();
+        let issue = saved_governed_sql_write_issue("test", &json!(raw))
+            .expect("unordered LIMIT save must refuse");
+        assert!(issue.contains("refusing to save governed SQL"), "{issue}");
+        assert!(
+            issue.contains("the ad-hoc default would order by (name, id): add ORDER BY 1, 2"),
+            "{issue}"
+        );
+        let error = validate_saved_sql(&definition(sql, 10))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("the ad-hoc default would order by (name, id): add ORDER BY 1, 2"),
+            "{error}"
+        );
+        let nested = "SELECT * FROM (SELECT name, id FROM records LIMIT 1) s ORDER BY id";
+        let nested_raw = serde_json::to_string(&definition(nested, 10)).unwrap();
+        let nested_issue = saved_governed_sql_write_issue("test", &json!(nested_raw))
+            .expect("nested unordered LIMIT save must refuse");
+        assert!(!nested_issue.contains("ad-hoc default"), "{nested_issue}");
+        // Top-level unordered over an unordered nest: the default would not
+        // cure it, so no repair suffix either.
+        let combo =
+            "SELECT * FROM (SELECT name, id FROM records WHERE type = ?1 LIMIT 1) s LIMIT 5";
+        let combo_raw = serde_json::to_string(&definition(combo, 10)).unwrap();
+        let combo_issue = saved_governed_sql_write_issue("test", &json!(combo_raw))
+            .expect("combined unordered LIMIT save must refuse");
+        assert!(
+            combo_issue.contains("LIMIT without ORDER BY"),
+            "{combo_issue}"
+        );
+        assert!(!combo_issue.contains("ad-hoc default"), "{combo_issue}");
+    }
+
+    #[test]
+    fn regexp_shape_and_bindings_gate_saves_stored_and_writes() {
+        // E1 M3 repair: unlike the I3 determinism rules above, the regexp
+        // shape rule (literal-or-?N, subset-checked bindings) applies to
+        // stored definitions too — a stored column pattern cannot predate
+        // a portable shape. All three gates refuse with the repair.
+        use crate::query::sql_contract::QuerySqlParameter;
+        let mut column_pattern = definition(
+            "SELECT name, id FROM records WHERE regexp(pattern, name) ORDER BY name",
+            10,
+        );
+        column_pattern.parameters = Vec::new();
+        for gate in ["validate", "stored", "write"] {
+            let refused = match gate {
+                "validate" => validate_saved_sql(&column_pattern).unwrap_err().to_string(),
+                "stored" => validate_stored_saved_sql(&column_pattern)
+                    .unwrap_err()
+                    .to_string(),
+                _ => {
+                    let raw = serde_json::to_string(&column_pattern).unwrap();
+                    saved_governed_sql_write_issue("test", &json!(raw))
+                        .expect("write-time gate must refuse")
+                }
+            };
+            assert!(
+                refused.contains("single-quoted text literal"),
+                "{gate}: missing repair: {refused}"
+            );
+        }
+        let mut bad_binding = definition(
+            "SELECT name, id FROM records WHERE regexp(?1, name) ORDER BY name",
+            10,
+        );
+        bad_binding.parameters = vec![QuerySqlParameter::Text {
+            value: Some("(?=".into()),
+        }];
+        assert!(validate_saved_sql(&bad_binding)
+            .unwrap_err()
+            .to_string()
+            .contains("outside the portable subset"));
+        assert!(validate_stored_saved_sql(&bad_binding)
+            .unwrap_err()
+            .to_string()
+            .contains("outside the portable subset"));
+        let mut good_binding = definition(
+            "SELECT name, id FROM records WHERE regexp(?1, name) ORDER BY name",
+            10,
+        );
+        good_binding.parameters = vec![QuerySqlParameter::Text {
+            value: Some("^A".into()),
+        }];
+        validate_saved_sql(&good_binding).unwrap();
+    }
+
+    #[test]
+    fn utc_date_label_bindings_gate_saves_stored_and_writes() {
+        // Native e25665c: a Text-bound label argument is refused with the
+        // integer repair at every saved-SQL gate — inspection (portable and
+        // stored allowances) and the facet write gate — mirroring the
+        // regexp bindings gate above. Literals never reach the bindings
+        // check: the classifier refuses them first, under both allowances.
+        use crate::query::sql_contract::QuerySqlParameter;
+        let mut text_bound = definition(
+            "SELECT name, id FROM records WHERE utc_date_label(?1) IS NOT NULL ORDER BY name",
+            10,
+        );
+        text_bound.parameters = vec![QuerySqlParameter::Text {
+            value: Some("0".into()),
+        }];
+        for gate in ["validate", "stored", "write"] {
+            let refused = match gate {
+                "validate" => validate_saved_sql(&text_bound).unwrap_err().to_string(),
+                "stored" => validate_stored_saved_sql(&text_bound)
+                    .unwrap_err()
+                    .to_string(),
+                _ => {
+                    let raw = serde_json::to_string(&text_bound).unwrap();
+                    saved_governed_sql_write_issue("test", &json!(raw))
+                        .expect("write-time gate must refuse")
+                }
+            };
+            assert!(
+                refused.contains("integer epoch milliseconds"),
+                "{gate}: missing repair: {refused}"
+            );
+        }
+        let mut text_literal = definition(
+            "SELECT name, id FROM records WHERE utc_date_label('0') IS NOT NULL ORDER BY name",
+            10,
+        );
+        text_literal.parameters = Vec::new();
+        for gate in ["validate", "stored", "write"] {
+            let refused = match gate {
+                "validate" => validate_saved_sql(&text_literal).unwrap_err().to_string(),
+                "stored" => validate_stored_saved_sql(&text_literal)
+                    .unwrap_err()
+                    .to_string(),
+                _ => {
+                    let raw = serde_json::to_string(&text_literal).unwrap();
+                    saved_governed_sql_write_issue("test", &json!(raw))
+                        .expect("write-time gate must refuse")
+                }
+            };
+            assert!(
+                refused.contains("integer epoch milliseconds"),
+                "{gate}: missing repair: {refused}"
+            );
+        }
+        let mut good_binding = definition(
+            "SELECT name, id FROM records WHERE utc_date_label(?1) IS NOT NULL ORDER BY name",
+            10,
+        );
+        good_binding.parameters = vec![QuerySqlParameter::Integer {
+            value: Some("0".into()),
+        }];
+        validate_saved_sql(&good_binding).unwrap();
+        validate_stored_saved_sql(&good_binding).unwrap();
     }
 
     /// Richard 25 Sep (Native e25665c): verbatim statements from
@@ -5641,6 +6874,113 @@ mod governed_sql_tests {
         assert!(row.get("w").and_then(Value::as_str).is_some(), "{row:#}");
         assert!(row.get("j").and_then(Value::as_f64).is_some(), "{row:#}");
         assert!(row.get("m").is_some(), "{row:#}");
+    }
+
+    fn now_ms_clock_definition() -> SavedSqlDefinition {
+        // E1 M3: a portable time-dependent saved definition — the same
+        // shape the e25665c migration will produce for the legacy clock
+        // queries (day/week helpers still undesigned, so none here).
+        legacy_definition(
+            "SELECT id, now_ms() AS t, now_ms() AS u FROM records WHERE id = '71000000-0000-4000-8000-000000000001'",
+            vec![],
+            &["records"],
+            vec![
+                ("id", SavedSqlColumnType::Identifier, false),
+                ("t", SavedSqlColumnType::Integer, false),
+                ("u", SavedSqlColumnType::Integer, false),
+            ],
+            vec![("id", SavedSqlDirection::Asc)],
+            "id",
+            10,
+        )
+    }
+
+    #[test]
+    fn now_ms_definition_validates_under_both_gates_and_inspects() {
+        // E1 M3: the portable clock is new-SQL-valid and stored-valid, so
+        // the saved-SQL gates and the pin advance honor time dependence
+        // instead of refusing the definition.
+        let definition = now_ms_clock_definition();
+        validate_saved_sql(&definition).unwrap();
+        validate_stored_saved_sql(&definition).unwrap();
+        assert!(
+            matches!(
+                inspect_saved_query(Some(&serde_json::to_string(&definition).unwrap())),
+                SavedQueryInspection::GovernedSql { .. }
+            ),
+            "now_ms definition must inspect as governed SQL"
+        );
+        assert!(
+            crate::query::sql_contract::statement_uses_now_ms(
+                crate::query::sql_contract::QuerySqlProfile::SqliteLocal,
+                &definition.sql
+            )
+            .unwrap(),
+            "the definition must read as time dependent"
+        );
+        // The write gate admits it too: a governed-SQL envelope carrying
+        // `now_ms()` is portable new SQL.
+        let raw = serde_json::to_string(&definition).unwrap();
+        assert_eq!(
+            saved_governed_sql_write_issue("test", &serde_json::json!(raw)),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn now_ms_saved_definition_executes_with_stamp() {
+        // E1 M3: a stored time-dependent definition runs through the saved
+        // path with one fixed value and a stamped, flagged output.
+        let db = create_database(":memory:").await.unwrap();
+        create_record(
+            &db,
+            json!({"id": "71000000-0000-4000-8000-000000000001", "type": "WorkItem", "kind": "task", "name": "clock probe"}),
+        )
+        .await
+        .unwrap();
+        let output = execute_saved_sql(db, &Caller::local(), &now_ms_clock_definition(), None)
+            .await
+            .unwrap();
+        assert_eq!(output["row_count"], 1);
+        assert_eq!(output["time_dependent"], true);
+        let stamp = output["now_ms_ms"]
+            .as_i64()
+            .expect("saved output must stamp the clock");
+        assert_eq!(output["rows"][0]["t"].as_i64().unwrap(), stamp);
+        assert_eq!(output["rows"][0]["u"].as_i64().unwrap(), stamp);
+    }
+
+    #[test]
+    fn now_ms_definition_can_advance_its_pin() {
+        // E1 M3: pin advance honors time dependence — a clock-using
+        // definition re-pins exactly like a clock-free one.
+        let mut definition = now_ms_clock_definition();
+        definition
+            .relations
+            .get_mut("records")
+            .expect("records dependency")
+            .semantic_version = 0;
+        let stale = serde_json::to_string(&definition).unwrap();
+        assert!(
+            matches!(
+                inspect_saved_query(Some(&stale)),
+                SavedQueryInspection::Invalid { .. }
+            ),
+            "{stale}"
+        );
+        definition
+            .relations
+            .get_mut("records")
+            .expect("records dependency")
+            .semantic_version = crate::query::sql_contract::LOGICAL_RELATION_VERSION;
+        let advanced = serde_json::to_string(&definition).unwrap();
+        assert!(
+            matches!(
+                inspect_saved_query(Some(&advanced)),
+                SavedQueryInspection::GovernedSql { .. }
+            ),
+            "{advanced}"
+        );
     }
 
     #[test]
@@ -5923,6 +7263,42 @@ mod governed_sql_tests {
     }
 
     #[test]
+    fn saved_sql_vocabulary_json_nodes_pins_are_additive_and_versioned() {
+        let old = definition("SELECT name,id FROM records WHERE type=?1", 10);
+        assert_eq!(old.catalog_revision, 4);
+        validate_saved_sql(&old).unwrap();
+        let mut nodes = definition(
+            "SELECT name,id FROM records WHERE type=?1 AND EXISTS (SELECT 1 FROM vocabulary_value_json_nodes WHERE bool_value=1)",
+            10,
+        );
+        nodes.relations.insert(
+            "vocabulary_value_json_nodes".into(),
+            SavedSqlRelationDependency {
+                identity: "native.query-sql.vocabulary-value-json-nodes".into(),
+                semantic_version: 1,
+            },
+        );
+        validate_saved_sql(&nodes).unwrap();
+        validate_stored_saved_sql(&nodes).unwrap();
+        nodes
+            .relations
+            .get_mut("vocabulary_value_json_nodes")
+            .unwrap()
+            .semantic_version = 2;
+        let error = validate_saved_sql(&nodes).unwrap_err().to_string();
+        assert!(
+            error.contains("identity/version is incompatible"),
+            "{error}"
+        );
+        nodes.relations.remove("vocabulary_value_json_nodes");
+        assert!(
+            validate_saved_sql(&nodes).is_err(),
+            "an observed relation needs its pin"
+        );
+        validate_saved_sql(&old).unwrap();
+    }
+
+    #[test]
     fn saved_sql_pinned_to_a_prior_catalog_revision_fails_legibly() {
         let valid = definition("SELECT name,id FROM records WHERE type=?1", 10);
         validate_saved_sql(&valid).unwrap();
@@ -5983,6 +7359,9 @@ mod governed_sql_tests {
             truncated: false,
             truncation_hint: None,
             as_of_seq: 17,
+            now_ms_ms: None,
+            time_dependent: false,
+            assumed_order: None,
         };
         let output = finish_saved_sql(
             &definition,
@@ -6054,6 +7433,9 @@ mod governed_sql_tests {
                 truncated: false,
                 truncation_hint: None,
                 as_of_seq: 17,
+                now_ms_ms: None,
+                time_dependent: false,
+                assumed_order: None,
             },
         )
         .unwrap();
@@ -6069,6 +7451,9 @@ mod governed_sql_tests {
             truncated: false,
             truncation_hint: None,
             as_of_seq: 17,
+            now_ms_ms: None,
+            time_dependent: false,
+            assumed_order: None,
         };
         let mut one_row = definition;
         one_row.bounds.rows = 1;
@@ -6621,7 +8006,7 @@ mod scan_record_path_tests {
             }),
         );
 
-        annotate_scan_axes_record_paths(&db, &mut axes)
+        annotate_scan_axes_record_paths(&db, &Caller::local(), &mut axes)
             .await
             .unwrap();
 
@@ -6658,7 +8043,7 @@ mod scan_record_path_tests {
             }),
         );
 
-        annotate_scan_axes_record_paths(&db, &mut axes)
+        annotate_scan_axes_record_paths(&db, &Caller::local(), &mut axes)
             .await
             .unwrap();
 
@@ -6708,7 +8093,7 @@ mod scan_record_path_tests {
             }),
         );
 
-        annotate_scan_axes_record_paths(&db, &mut axes)
+        annotate_scan_axes_record_paths(&db, &Caller::local(), &mut axes)
             .await
             .unwrap();
 

@@ -15,6 +15,10 @@ pub mod ddl;
 // Slice 0 is intentionally descriptive; delta materialisation consumes this
 // metadata in the next slice.
 #[allow(dead_code)]
+pub(crate) mod member_classification;
+#[allow(dead_code)]
+pub(crate) mod member_schema;
+#[allow(dead_code)]
 pub(crate) mod standby_classification;
 // Most presentation helpers are consumed by optional backend adapters; the
 // default build still uses the column-semantics subset for MCP orientation.
@@ -27,5 +31,6 @@ pub(crate) mod discovery;
 pub use contract::*;
 pub use ddl::{
     spine_facet_column, CONTROL_PROJECTION_TABLES, DDL_STATEMENTS, DERIVATION_PROJECTION_TABLES,
-    META_PROJECTION_TABLES, POLICY_PROJECTION_TABLES, PROJECTION_TABLES, SPINE_FACET_COLUMNS,
+    FACET_TIMES_DDL, META_PROJECTION_TABLES, POLICY_PROJECTION_TABLES, PROJECTION_TABLES,
+    SPINE_FACET_COLUMNS,
 };

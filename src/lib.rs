@@ -59,31 +59,62 @@ pub fn engine_version_string() -> String {
 pub use native_artifact_html::html as artifact_html;
 pub use native_artifact_html::verify as artifact_verify;
 pub mod act;
+mod alpha_tab_body_admission_v1;
+pub mod alpha_tab_sessions;
 pub mod attribution;
 pub mod authoring;
 pub mod authorization;
+mod authorization_grant;
 mod authorization_revision;
+#[cfg(test)]
+mod authorization_trigger_coverage;
 pub mod awareness;
 pub mod backup;
 pub mod blob;
+pub mod body_blocks;
+pub(crate) mod body_blocks_projection;
+// Request-bound PRIMARY SQLite service; body authority requires a genuine adopted source.
+#[doc(hidden)]
+pub mod body_read;
+/// E3 M3 increment 1: pure GFM task-list extraction over record-body text.
+/// No storage, projection, SQL surface, or migration lives here.
+pub mod body_task_items;
 mod canonical_json;
 pub mod canvas;
 pub mod change_summary;
 pub mod citations;
+pub mod coedit;
 pub mod comments;
 pub mod conformance;
 pub mod contribution;
 pub mod control;
 #[cfg(test)]
 mod control_tests;
+pub(crate) mod credential_file;
 pub mod db;
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+pub mod definition_registry;
 pub mod derivation;
 pub mod domain_transaction;
 pub mod embed;
 mod error;
 pub mod events;
 pub mod export;
+pub(crate) mod facet_value_json_nodes;
+pub mod json_nodes;
+pub(crate) mod json_nodes_projection;
+#[doc(hidden)]
+pub mod managed_custody;
+pub(crate) mod schema_config_json_nodes;
 pub use native_federation as federation;
+#[cfg(test)]
+mod dependency_authority_tests;
+#[cfg(test)]
+mod dependency_rule_tests;
+#[cfg(test)]
+mod dependency_tests;
+#[cfg(test)]
+mod dependency_transition_tests;
 pub mod freshness;
 pub mod generated;
 pub mod holding;
@@ -94,11 +125,34 @@ pub(crate) mod instructions;
 pub mod interchange;
 pub mod interpretation;
 pub mod interventions;
+pub mod keyed_freshness;
 pub mod mcp;
+pub mod member_copy_admission;
+pub mod member_copy_client;
+pub mod member_copy_driver;
+pub mod member_copy_lifecycle;
+pub mod member_copy_producer;
+pub mod member_copy_registry;
+pub mod member_copy_runtime;
+pub mod member_copy_serving;
+pub mod member_copy_transport;
+pub mod member_digest;
+#[cfg(test)]
+mod member_offline_fixtures;
+#[cfg(test)]
+mod member_offline_qualification;
 pub mod mentions;
 pub mod message_expectation;
 pub mod meta;
 pub mod migrations;
+pub(crate) mod need_metrics;
+/// Live tabs M2 need subscriptions (task `61e11ad`, design `ee12faf` rev 3).
+pub mod need_subscriptions;
+#[cfg(test)]
+mod package_adopt_tests;
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+pub mod package_manifest;
+pub mod plugins;
 pub mod policy;
 /// Bounded SQL portability for Native-owned relational statements.
 ///
@@ -113,17 +167,30 @@ pub mod query;
 pub mod realtime;
 pub mod recipe;
 pub mod record_body;
+pub mod replica_generation;
 #[doc(hidden)]
 pub mod request_work;
 pub(crate) mod write_contention;
 pub(crate) use native_record_type_correction_kernel as record_type_correction;
+#[cfg(test)]
+mod bare_kernel_probe;
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+pub mod dependency;
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+pub mod kernel;
 pub mod record_images;
 pub mod relationship;
 pub mod route_error;
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+pub mod rule_registry;
+#[cfg(test)]
+mod rule_registry_tests;
 /// Run keys — validation, repair, suggestion, and the `actor` resolution rule
 /// (spec `fbfaf25` §3.2–§3.4).
 pub mod runkey;
 pub mod schema;
+#[cfg(test)]
+mod specimen_probe;
 pub mod standby;
 pub mod standby_snapshot;
 /// Verified, fail-closed storage target migration and rollback.
@@ -133,8 +200,20 @@ pub mod store;
 pub(crate) mod suggestion_lifecycle;
 /// The general K3 surface-binding resolver (design `6e2acbd` §3).
 pub mod surface_binding;
+#[cfg(test)]
+mod surface_read_tests;
+#[cfg(test)]
+mod surface_view_tests;
 #[cfg(feature = "turso-local")]
 pub mod turso_local;
+/// Typed `date`, `instant` and `zoned` time values (task fef3469, D2 slice T1).
+pub mod typed_time;
+#[cfg(test)]
+mod v2_slice1_probe;
+#[cfg(test)]
+mod v2_slice2_probe;
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+pub mod v2_standard;
 pub(crate) mod visible_set_cache;
 /// The run-key wordlists (task `cb6c9da`) and the distance function that makes a
 /// mistyped key repairable rather than merely invalid. Static data plus one

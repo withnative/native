@@ -31,6 +31,7 @@ pub const HOLDING_CONTRACT: &str = "native.holding-disclosure.v1";
 /// The act range a replica holds. `from: None` means genesis — the whole log
 /// is held and the honest-absence contract is vacuous on this replica.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ActRange {
     /// Oldest act held, or `None` for genesis. Never `Some(_)` on a database
     /// that still holds pre-cutover rows: those predate the act number
@@ -44,13 +45,17 @@ pub struct ActRange {
 /// configured: a window is not a setting a replica can be wrong about, it is
 /// the shape of what the replica has.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum HoldingWindow {
     /// The log reaches genesis. What ships.
     Infinity,
     /// The log begins at `from_act`; everything below it has been compacted
     /// into the base projection.
     RetainedActs { from_act: i64 },
+    /// A member current-state copy (contract c323277 rev 4 §2.1): no act
+    /// window exists at all, so `is_complete()` is false — this base is
+    /// never genesis-complete and `below_window` is null, not `not_held`.
+    CurrentStateOnly,
 }
 
 /// What a read below the window is told. Absent at window = ∞, because there
@@ -75,6 +80,9 @@ pub enum BelowWindow {
 #[serde(rename_all = "snake_case")]
 pub enum RecordHolding {
     Complete,
+    /// A member copy holds every record in scope, which is a horizontal
+    /// subset of the workspace (contract c323277 rev 4 §2.1).
+    CompleteWithinScope,
 }
 
 /// How a replica describes what it holds.
@@ -241,6 +249,200 @@ impl HoldingDisclosure {
              The answer exists at the authority; this replica cannot produce it, and \
              retrying here will not change that."
         ))
+    }
+}
+
+/// Scope dimension shared by the replica envelope and the holding disclosure
+/// (contract c323277 rev 4 §1.3, §2.1).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ReplicaScope {
+    /// The owner scope: everything. No `scope_ref`: there is one everything.
+    Everything,
+    /// A member scope. The `scope_ref` is opaque and server-issued (§1.5);
+    /// it rotates on re-add, role change, re-binding, and profile bumps.
+    Member { scope_ref: String },
+}
+
+/// Ordering dimension of the holding disclosure (§2.1): slimmer than the
+/// envelope ordering, which additionally carries `head_act` and `window`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum HoldingOrdering {
+    Act,
+    /// Monotonic per `scope_ref`, assigned lazily in steps of 1 (§1.4 F4).
+    Scoped {
+        ordinal: i64,
+    },
+}
+
+pub const HOLDING_V2_CONTRACT: &str = "native.holding-disclosure.v2";
+
+/// Scoped honest absence (contract c323277 rev 4 §2.1). The `contract` is an
+/// owned `String` (unlike v1's `&'static str`) so manifests round-trip
+/// through owned JSON. Member values are fixed: `acts` and
+/// `projection_complete_at` are always null, `window` is always
+/// `current_state_only`, `records` is always `complete_within_scope`, and
+/// `below_window` is always null (never `not_held`: a current-state copy has
+/// no window for anything to be below).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HoldingDisclosureV2 {
+    pub contract: String,
+    pub scope: ReplicaScope,
+    pub ordering: HoldingOrdering,
+    pub acts: Option<ActRange>,
+    pub window: HoldingWindow,
+    pub projection_complete_at: Option<i64>,
+    pub records: RecordHolding,
+    pub below_window: Option<BelowWindow>,
+}
+
+impl HoldingDisclosureV2 {
+    /// The member-scope holding. Enforces the §2.1 member invariants by
+    /// construction; [`Self::validate_member`] re-checks them on receipt.
+    pub fn member(scope_ref: String, ordinal: i64) -> Self {
+        Self {
+            contract: HOLDING_V2_CONTRACT.to_owned(),
+            scope: ReplicaScope::Member { scope_ref },
+            ordering: HoldingOrdering::Scoped { ordinal },
+            acts: None,
+            window: HoldingWindow::CurrentStateOnly,
+            projection_complete_at: None,
+            records: RecordHolding::CompleteWithinScope,
+            below_window: None,
+        }
+    }
+
+    /// The owner-scope holding. v1 owner paths keep using
+    /// [`HoldingDisclosure`]; this is the v2 envelope spelling for scope
+    /// everything.
+    pub fn everything(
+        acts: ActRange,
+        window: HoldingWindow,
+        projection_complete_at: i64,
+        below_window: Option<BelowWindow>,
+    ) -> Self {
+        Self {
+            contract: HOLDING_V2_CONTRACT.to_owned(),
+            scope: ReplicaScope::Everything,
+            ordering: HoldingOrdering::Act,
+            acts: Some(acts),
+            window,
+            projection_complete_at: Some(projection_complete_at),
+            records: RecordHolding::Complete,
+            below_window,
+        }
+    }
+
+    /// Fail-closed receipt check for a member holding: every §2.1 member
+    /// invariant must hold exactly.
+    pub fn validate_member(&self) -> Result<()> {
+        if self.contract != HOLDING_V2_CONTRACT {
+            return Err(Error::engine("unknown holding disclosure contract"));
+        }
+        let scope_ref = match &self.scope {
+            ReplicaScope::Member { scope_ref } => scope_ref,
+            ReplicaScope::Everything => {
+                return Err(Error::engine("member holding must carry a member scope"));
+            }
+        };
+        if scope_ref.trim().is_empty() {
+            return Err(Error::engine("member holding scope_ref must not be empty"));
+        }
+        if !matches!(self.ordering, HoldingOrdering::Scoped { .. }) {
+            return Err(Error::engine("member holding must carry a scoped ordering"));
+        }
+        if self.acts.is_some() {
+            return Err(Error::engine("member holding acts must be null (R5)"));
+        }
+        if !matches!(self.window, HoldingWindow::CurrentStateOnly) {
+            return Err(Error::engine(
+                "member holding window must be current_state_only",
+            ));
+        }
+        if self.projection_complete_at.is_some() {
+            return Err(Error::engine(
+                "member holding projection_complete_at must be null",
+            ));
+        }
+        if self.records != RecordHolding::CompleteWithinScope {
+            return Err(Error::engine(
+                "member holding records must be complete_within_scope",
+            ));
+        }
+        if self.below_window.is_some() {
+            return Err(Error::engine("member holding below_window must be null"));
+        }
+        if Self::is_complete_for(&self.window) {
+            return Err(Error::engine("a member base is never genesis-complete"));
+        }
+        Ok(())
+    }
+
+    /// Fail-closed receipt check for an owner holding: scope everything,
+    /// act ordering, a present act range and completion point, record
+    /// completeness, and a window/below pair that coheres (infinity has
+    /// nothing below it; a retained window must say what is below).
+    pub fn validate_owner(&self) -> Result<()> {
+        if self.contract != HOLDING_V2_CONTRACT {
+            return Err(Error::engine("unknown holding disclosure contract"));
+        }
+        if self.scope != ReplicaScope::Everything {
+            return Err(Error::engine("owner holding must carry scope everything"));
+        }
+        if self.ordering != HoldingOrdering::Act {
+            return Err(Error::engine("owner holding must carry act ordering"));
+        }
+        if self.acts.is_none() {
+            return Err(Error::engine("owner holding acts must be present"));
+        }
+        match &self.window {
+            HoldingWindow::Infinity => {
+                // `observe` reports `grouping_unknown` at window infinity when
+                // pre-acd735f rows survive: the whole log is held, but the
+                // sub-cutover region cannot be grouped (see `observe`,
+                // `pre_cutover` arm). That is the one legal non-null value at
+                // infinity; `not_held` would contradict genesis.
+                if matches!(self.below_window, Some(BelowWindow::NotHeld)) {
+                    return Err(Error::engine(
+                        "owner holding below_window must not be not_held at window infinity",
+                    ));
+                }
+            }
+            HoldingWindow::RetainedActs { .. } => {
+                if self.below_window.is_none() {
+                    return Err(Error::engine(
+                        "owner holding below_window must say what is below a retained window",
+                    ));
+                }
+            }
+            HoldingWindow::CurrentStateOnly => {
+                return Err(Error::engine(
+                    "owner holding window must never be current_state_only",
+                ));
+            }
+        }
+        if self.projection_complete_at.is_none() {
+            return Err(Error::engine(
+                "owner holding projection_complete_at must be present",
+            ));
+        }
+        if self.records != RecordHolding::Complete {
+            return Err(Error::engine("owner holding records must be complete"));
+        }
+        Ok(())
+    }
+
+    /// `is_complete()` is false for `CurrentStateOnly` (§2.1).
+    pub fn is_complete_for(window: &HoldingWindow) -> bool {
+        matches!(window, HoldingWindow::Infinity)
+    }
+
+    /// Instance completeness query: true only at window infinity, so a
+    /// member holding (`CurrentStateOnly`) is never complete.
+    pub fn is_complete(&self) -> bool {
+        Self::is_complete_for(&self.window)
     }
 }
 
@@ -485,6 +687,171 @@ mod tests {
                 "records": "complete"
             }),
             "below_window is absent, not null, when nothing is below the window"
+        );
+    }
+
+    #[test]
+    fn member_holding_carries_exactly_the_section_2_1_values() {
+        let holding = HoldingDisclosureV2::member("scope-ref-1".to_owned(), 7);
+        holding
+            .validate_member()
+            .expect("constructor must satisfy its own check");
+        assert_eq!(
+            serde_json::to_value(&holding).unwrap(),
+            json!({
+                "contract": "native.holding-disclosure.v2",
+                "scope": { "kind": "member", "scope_ref": "scope-ref-1" },
+                "ordering": { "kind": "scoped", "ordinal": 7 },
+                "acts": null,
+                "window": "current_state_only",
+                "projection_complete_at": null,
+                "records": "complete_within_scope",
+                "below_window": null
+            }),
+            "member holding serializes exactly the §2.1 member values"
+        );
+        assert!(
+            !HoldingDisclosureV2::is_complete_for(&holding.window),
+            "a member base is never genesis-complete"
+        );
+        assert!(
+            !HoldingDisclosureV2::is_complete_for(&HoldingWindow::RetainedActs { from_act: 3 }),
+            "only window infinity is complete"
+        );
+        assert!(HoldingDisclosureV2::is_complete_for(
+            &HoldingWindow::Infinity
+        ));
+    }
+
+    #[test]
+    fn member_holding_validation_rejects_every_lie() {
+        let good = HoldingDisclosureV2::member("scope-ref-1".to_owned(), 7);
+        let mut bad = good.clone();
+        bad.acts = Some(ActRange {
+            from: None,
+            through: 7,
+        });
+        assert!(bad.validate_member().is_err(), "member acts must be null");
+        let mut bad = good.clone();
+        bad.window = HoldingWindow::Infinity;
+        assert!(
+            bad.validate_member().is_err(),
+            "member window must be current_state_only"
+        );
+        let mut bad = good.clone();
+        bad.records = RecordHolding::Complete;
+        assert!(
+            bad.validate_member().is_err(),
+            "member records must be complete_within_scope"
+        );
+        let mut bad = good.clone();
+        bad.below_window = Some(BelowWindow::NotHeld);
+        assert!(
+            bad.validate_member().is_err(),
+            "member below_window must be null, not not_held"
+        );
+        let mut bad = good.clone();
+        bad.projection_complete_at = Some(7);
+        assert!(
+            bad.validate_member().is_err(),
+            "member projection_complete_at must be null"
+        );
+        let mut bad = good.clone();
+        bad.ordering = HoldingOrdering::Act;
+        assert!(
+            bad.validate_member().is_err(),
+            "member ordering must be scoped"
+        );
+        let mut bad = good.clone();
+        bad.scope = ReplicaScope::Everything;
+        assert!(
+            bad.validate_member().is_err(),
+            "member scope must be member"
+        );
+        let mut bad = good.clone();
+        bad.scope = ReplicaScope::Member {
+            scope_ref: "  ".to_owned(),
+        };
+        assert!(
+            bad.validate_member().is_err(),
+            "scope_ref must not be blank"
+        );
+        let mut bad = good.clone();
+        bad.contract = HOLDING_CONTRACT.to_owned();
+        assert!(
+            bad.validate_member().is_err(),
+            "contract must be the v2 contract"
+        );
+        // Round-trip through owned JSON: the v2 contract field survives it.
+        let back: HoldingDisclosureV2 =
+            serde_json::from_value(serde_json::to_value(&good).unwrap()).unwrap();
+        assert_eq!(back, good);
+    }
+
+    #[test]
+    fn member_holding_rejects_smuggled_keys() {
+        // N2: the manifest is closed (§1.3 `deny_unknown_fields`), so a
+        // smuggled key is rejected at every level of the holding — top
+        // level, `acts`, `scope`, `ordering`, and the window variant.
+        // (RecordHolding/BelowWindow are pure unit enums: unknown variants
+        // already error, so there is no field to deny there.)
+        let good =
+            serde_json::to_value(HoldingDisclosureV2::member("scope-ref-1".to_owned(), 7)).unwrap();
+        let mut top = good.clone();
+        top["smuggled"] = json!(1);
+        assert!(
+            serde_json::from_value::<HoldingDisclosureV2>(top).is_err(),
+            "top-level smuggled key must be rejected"
+        );
+        let mut acts = good.clone();
+        acts["acts"] = json!({ "from": null, "through": 7, "smuggled": 1 });
+        assert!(
+            serde_json::from_value::<HoldingDisclosureV2>(acts).is_err(),
+            "smuggled key inside acts must be rejected"
+        );
+        let mut scope = good.clone();
+        scope["scope"] = json!({ "kind": "member", "scope_ref": "scope-ref-1", "smuggled": 1 });
+        assert!(
+            serde_json::from_value::<HoldingDisclosureV2>(scope).is_err(),
+            "smuggled key inside scope must be rejected"
+        );
+        let mut ordering = good.clone();
+        ordering["ordering"] = json!({ "kind": "scoped", "ordinal": 7, "smuggled": 1 });
+        assert!(
+            serde_json::from_value::<HoldingDisclosureV2>(ordering).is_err(),
+            "smuggled key inside ordering must be rejected"
+        );
+    }
+
+    /// NC1 (F-A review): `HoldingDisclosure::observe` reports
+    /// `grouping_unknown` at window infinity when pre-acd735f rows survive
+    /// (`observe`, `pre_cutover` arm). `validate_owner` must admit exactly
+    /// that pair; `not_held` at infinity still contradicts genesis.
+    #[test]
+    fn owner_holding_accepts_grouping_unknown_at_infinity() {
+        let acts = ActRange {
+            from: None,
+            through: 5,
+        };
+        let okay = HoldingDisclosureV2::everything(
+            acts,
+            HoldingWindow::Infinity,
+            5,
+            Some(BelowWindow::GroupingUnknown),
+        );
+        assert!(
+            okay.validate_owner().is_ok(),
+            "pre-cutover observe output must validate"
+        );
+        let not_held = HoldingDisclosureV2::everything(
+            acts,
+            HoldingWindow::Infinity,
+            5,
+            Some(BelowWindow::NotHeld),
+        );
+        assert!(
+            not_held.validate_owner().is_err(),
+            "not_held at window infinity contradicts genesis"
         );
     }
 }

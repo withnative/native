@@ -1,6 +1,6 @@
 #![cfg(feature = "turso-tests")]
 
-//! Characterization of Turso 0.7.2 `PRAGMA wal_checkpoint(TRUNCATE)` semantics.
+//! Characterization of Turso 0.8.0 `PRAGMA wal_checkpoint(TRUNCATE)` semantics.
 //!
 //! This is a tripwire, not an exploration. The "quiesce for copy" seam (task
 //! 8bcb06b) is built on the behaviours asserted below, and every one of them
@@ -8,7 +8,8 @@
 //! changes any of them, this file must fail loudly before a durability claim
 //! is made on top of the new behaviour.
 //!
-//! The three facts that matter:
+//! The facts that matter. The first three were measured on 0.7.2 and
+//! re-verified on 0.8.0; the fourth is new in 0.8.0:
 //!
 //! 1. The triple is `(busy, log, checkpointed)`, but **only `busy` is
 //!    meaningful**. `log` and `checkpointed` are hardcoded zeros, not frame
@@ -17,8 +18,13 @@
 //! 2. A contended checkpoint reports `busy = 1` with **NULL** counters. The
 //!    NULL is load-bearing: a strict `(i64, i64, i64)` decode errors on that
 //!    row rather than silently accepting it, which is a second guard.
-//! 3. `PRAGMA integrity_check` is unusable as a copy gate in either engine,
-//!    because of Turso's engine-native FTS overlay.
+//! 3. `PRAGMA integrity_check` is not a portable copy gate: Turso's own
+//!    checker now reports `["ok"]` on a pristine 0.8.0 runtime file (the
+//!    0.7.2 FTS entry miscount is fixed), but stock SQLite still cannot
+//!    parse the engine-native FTS overlay.
+//! 4. A checkpoint on a connection with any statement still active returns a
+//!    Busy **error** instead of the result triple: finish or drop cursors
+//!    before checkpointing.
 //!
 //! Deliberately **not** asserted, first observation: on 17 Aug 2026 a live
 //! writer issuing ordinary `INSERT` statements was seen to contend with a
@@ -100,6 +106,23 @@ async fn checkpoint_truncate(connection: &Connection) -> CheckpointResult {
     }
 }
 
+/// Issue `PRAGMA wal_checkpoint(TRUNCATE)` and return the step error, if any.
+/// Exact 0.8.0 returns a Busy *error* (rather than the result triple) when a
+/// statement is still active on the connection.
+async fn checkpoint_truncate_error(connection: &Connection) -> Option<String> {
+    let mut rows = connection
+        .query("PRAGMA wal_checkpoint(TRUNCATE)", ())
+        .await
+        .expect("wal_checkpoint(TRUNCATE) must execute");
+    loop {
+        match rows.next().await {
+            Ok(Some(_)) => continue,
+            Ok(None) => return None,
+            Err(error) => return Some(error.to_string()),
+        }
+    }
+}
+
 /// Every file name directly inside `directory`, sorted.
 fn directory_entries(directory: &std::path::Path) -> Vec<String> {
     let mut entries = std::fs::read_dir(directory)
@@ -171,6 +194,11 @@ async fn quiesced_checkpoint_reports_zero_busy_and_truncates_the_wal() {
         Value::Text("wal".to_string()),
         "the characterization below only holds in WAL mode"
     );
+    // Exact 0.8.0 requires no active statement on the connection: an
+    // unfinished cursor (the `journal` query above, only one row read) makes
+    // `wal_checkpoint` return a Busy error instead of the result triple.
+    // Finish the statement before checkpointing.
+    drop(journal);
     let main_before = file_len(&path);
     assert!(
         file_len(&wal) > 0,
@@ -266,6 +294,38 @@ async fn contended_checkpoint_reports_busy_with_null_counters() {
         checkpoint_truncate(&checkpointer).await.rows,
         clean_triple()
     );
+}
+
+#[tokio::test]
+async fn checkpoint_refuses_while_another_statement_is_active() {
+    // Exact 0.8.0: `wal_checkpoint` returns a Busy *error* while any
+    // statement is still active on the connection, rather than the result
+    // triple. Callers (and this suite) must finish or drop cursors first.
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("active-statement.db");
+    let (_database, connection) = raw_local(&path).await;
+    connection
+        .execute("CREATE TABLE probe(id INTEGER PRIMARY KEY)", ())
+        .await
+        .unwrap();
+    connection
+        .execute("INSERT INTO probe VALUES(1)", ())
+        .await
+        .unwrap();
+
+    let mut held = connection.query("SELECT id FROM probe", ()).await.unwrap();
+    assert!(held.next().await.unwrap().is_some());
+    let error = checkpoint_truncate_error(&connection)
+        .await
+        .expect("an active statement must make the checkpoint fail");
+    assert!(
+        error.contains("another statement is active"),
+        "unexpected checkpoint failure: {error}"
+    );
+
+    // Dropping the cursor releases the connection and the checkpoint runs.
+    drop(held);
+    assert_eq!(checkpoint_truncate(&connection).await.rows, clean_triple());
 }
 
 // ---------------------------------------------------------------------------
@@ -429,7 +489,7 @@ async fn a_checkpointed_copy_taken_from_a_live_handle_passes_every_runtime_gate(
         receipt.verification.schema_version,
         native_ce::CURRENT_ENGINE_SCHEMA_VERSION
     );
-    assert_eq!(receipt.verification.profile_revision, 4);
+    assert_eq!(receipt.verification.profile_revision, 5);
     assert!(receipt.verification.byte_len > 0);
     assert!(
         receipt.checkpoint_attempts >= 1,
@@ -692,13 +752,13 @@ async fn an_uncheckpointed_live_copy_fails_closed_at_user_version_zero() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn integrity_check_is_not_a_usable_gate_for_a_turso_runtime_file() {
-    // Recorded so nobody rebuilds the SQLite drill's final `integrity_check ==
-    // "ok"` step on Turso. This is measured on a *pristine* file: a clean,
-    // checkpointed database with the handle already dropped. Both engines
-    // report a problem, and neither problem is real — Turso's engine-native FTS
-    // overlay is simply not describable in stock SQLite's schema grammar, and
-    // Turso's own checker miscounts its entries.
+async fn integrity_check_is_engine_dependent_not_a_portable_gate() {
+    // Characterization on exact 0.8.0, measured on a *pristine* file: a
+    // clean, checkpointed database with the handle already dropped. Turso's
+    // own `integrity_check` now reports exactly `["ok"]` (the 0.7.2 FTS
+    // entry miscount is fixed), but stock SQLite still cannot parse the
+    // engine-native FTS overlay, so `integrity_check` is not a portable
+    // gate; the quiesce seam keeps its WAL-sidecar and reopen evidence.
     let logical = "checkpoint-semantics-integrity";
     let directory = tempfile::tempdir().unwrap();
     let source_config = config(directory.path(), logical);
@@ -729,12 +789,10 @@ async fn integrity_check_is_not_a_usable_gate_for_a_turso_runtime_file() {
     drop(rows);
     drop(sidecar_connection);
     drop(sidecar);
-    assert!(
-        !turso_lines.is_empty()
-            && turso_lines
-                .iter()
-                .all(|line| line.contains("wrong # of entries in index __turso_internal_fts")),
-        "turso's own integrity_check is not 'ok' on a pristine runtime file: {turso_lines:?}"
+    assert_eq!(
+        turso_lines,
+        vec!["ok".to_string()],
+        "turso's own integrity_check on a pristine exact-0.8.0 runtime file"
     );
 
     let stock = rusqlite::Connection::open_with_flags(

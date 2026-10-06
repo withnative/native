@@ -1,0 +1,18 @@
+[
+{"name":"ternary_true","expr":"true ? 1 : 2","bindings":{},"expect":{"value":{"int":"1"}}},
+{"name":"ternary_untaken_err","expr":"true ? 1 : (1/0)","bindings":{},"expect":{"value":{"int":"1"}},"spec":"Logical Operators: untaken branch presumed not executed"},
+{"name":"ternary_cond_err","expr":"(1/0) ? 1 : 2","bindings":{},"expect":{"error":"division_by_zero","note":"divide by zero"}},
+{"name":"ternary_nested_right","expr":"true ? 1 : false ? 2 : 3","bindings":{},"expect":{"value":{"int":"1"}},"spec":"?: is right-associative"},
+{"name":"and_true","expr":"true && true","bindings":{},"expect":{"value":{"bool":true}}},
+{"name":"or_false","expr":"false || false","bindings":{},"expect":{"value":{"bool":false}}},
+{"name":"not_err","expr":"!(1/0 == 1)","bindings":{},"expect":{"error":"division_by_zero","note":"divide by zero"}},
+{"name":"and_absorb_false_left","expr":"false && (1/0 == 1)","bindings":{},"expect":{"value":{"bool":false}},"spec":"Logical Operators: false uniquely determines &&, other operand's error ignored (commutative)"},
+{"name":"and_absorb_false_right","expr":"(1/0 == 1) && false","bindings":{},"expect":{"value":{"bool":false}},"spec":"Logical Operators: commutative error absorption"},
+{"name":"or_absorb_true_left","expr":"true || (1/0 == 1)","bindings":{},"expect":{"value":{"bool":true}},"spec":"Logical Operators: true uniquely determines ||"},
+{"name":"or_absorb_true_right","expr":"(1/0 == 1) || true","bindings":{},"expect":{"value":{"bool":true}},"spec":"Logical Operators: commutative error absorption"},
+{"name":"and_both_err","expr":"(1/0 == 1) && (2/0 == 2)","bindings":{},"expect":{"error":"division_by_zero","note":"divide by zero"},"spec":"Logical Operators: error propagates when no operand determines result"},
+{"name":"and_err_true","expr":"(1/0 == 1) && true","bindings":{},"expect":{"error":"division_by_zero","note":"divide by zero"}},
+{"name":"or_err_false","expr":"(1/0 == 1) || false","bindings":{},"expect":{"error":"division_by_zero","note":"divide by zero"}},
+{"name":"and_absorb_type_err","expr":"false && (1 + 'a' == 1)","bindings":{},"expect":{"value":{"bool":false}},"spec":"Logical Operators: error absorption covers overload errors too"},
+{"name":"precedence_and_before_or","expr":"true || false && false","bindings":{},"expect":{"value":{"bool":true}},"spec":"Syntax precedence table: && binds tighter than ||"}
+]

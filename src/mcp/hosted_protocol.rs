@@ -13,8 +13,9 @@ use crate::{Db, Error};
 use super::evidence::ToolResult;
 use super::lens_dispatch::LensDispatch;
 use super::protocol;
-use super::registry::{Caller, ToolRegistry};
+use super::registry::{Caller, EngineHandle, ToolRegistry};
 use super::render::Format;
+use super::DeploymentPersistenceLease;
 
 pub const PROTOCOL_VERSION: &str = protocol::PROTOCOL_VERSION;
 pub const PARSE_ERROR: i64 = protocol::PARSE_ERROR;
@@ -89,6 +90,47 @@ pub async fn handle_legacy_message(
         .into()
 }
 
+/// Dispatch one 2026-era MCP message reusing a deployment admission the
+/// transport admitted before authentication. A freeze registered after that
+/// admission drains instead of re-refusing; without a lease the call
+/// re-admits exactly as [`handle_modern_message`] does.
+pub async fn handle_modern_message_with_persistence(
+    registry: Arc<ToolRegistry>,
+    db: Db,
+    caller: Caller,
+    message: Value,
+    persistence_lease: Option<DeploymentPersistenceLease>,
+) -> HostedRpcOutcome {
+    protocol::handle_modern_engine_message_with_persistence(
+        registry,
+        EngineHandle::Sqlite(db),
+        caller,
+        message,
+        persistence_lease,
+    )
+    .await
+    .into()
+}
+
+/// Initialize-era counterpart to [`handle_modern_message_with_persistence`].
+pub async fn handle_legacy_message_with_persistence(
+    registry: Arc<ToolRegistry>,
+    db: Db,
+    caller: Caller,
+    message: Value,
+    persistence_lease: Option<DeploymentPersistenceLease>,
+) -> HostedRpcOutcome {
+    protocol::handle_legacy_engine_message_with_persistence(
+        registry,
+        EngineHandle::Sqlite(db),
+        caller,
+        message,
+        persistence_lease,
+    )
+    .await
+    .into()
+}
+
 pub async fn handle_modern_lens_message(
     registry: Arc<ToolRegistry>,
     dispatcher: Arc<dyn LensDispatch>,
@@ -143,7 +185,6 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-
     #[test]
     fn hosted_outcome_preserves_notification_and_protocol_error_code() {
         assert!(HostedRpcOutcome::from(protocol::RpcOutcome::Notification)
@@ -162,5 +203,88 @@ mod tests {
         assert_eq!(body["id"], 7);
         assert_eq!(body["error"]["code"], INVALID_PARAMS);
         assert_eq!(body["error"]["message"], "invalid hosted request");
+    }
+
+    /// A lease admitted before a freeze still dispatches through the
+    /// persistence facades once freeze intent is registered, while a fresh
+    /// dispatch re-admits and takes the frozen refusal. This is the exact
+    /// contract the hosted MCP transports rely on for mid-flight calls.
+    #[tokio::test]
+    async fn message_with_persistence_reuses_held_lease_under_freeze_intent() {
+        use super::super::{
+            register_builtin_tools, register_surface_tools, Caller, DeploymentAdmission,
+            DeploymentMutationBarrier, OperationAccess, ToolRegistry, DEPLOYMENT_READ_ONLY_ERROR,
+        };
+
+        let db = crate::db::create_database(":memory:").await.unwrap();
+        let barrier = DeploymentMutationBarrier::default();
+        let mut registry = ToolRegistry::new();
+        register_builtin_tools(&mut registry).unwrap();
+        register_surface_tools(&mut registry).unwrap();
+        registry.set_deployment_mutation_barrier(barrier.clone());
+        let registry = Arc::new(registry);
+
+        let arguments = json!({"not": "parsed"});
+        let (operation, access) = registry
+            .registered_operation("create_record", &arguments)
+            .unwrap();
+        assert_eq!(access, OperationAccess::Mutation);
+        let lease = match barrier.admit(&operation, access).unwrap() {
+            DeploymentAdmission::Writable(lease) => lease,
+            DeploymentAdmission::FrozenRead => panic!("open barrier refused a mutation"),
+        };
+        let freeze = {
+            let barrier = barrier.clone();
+            tokio::spawn(async move { barrier.freeze().await })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !barrier.is_read_only() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("freeze intent was not registered");
+
+        let message = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "create_record", "arguments": {"not": "parsed"}},
+        });
+        // Fresh dispatch re-admits and refuses with the frozen shape.
+        let refused = handle_legacy_message(
+            registry.clone(),
+            db.clone(),
+            Caller::local(),
+            message.clone(),
+        )
+        .await;
+        let (body, _) = refused.into_response().expect("refusal is a response");
+        assert_eq!(
+            body["result"]["structuredContent"]["error_code"],
+            DEPLOYMENT_READ_ONLY_ERROR
+        );
+
+        // The held lease reuses through the same barrier: past the freeze
+        // into argument validation, never the frozen refusal.
+        let through = handle_legacy_message_with_persistence(
+            registry.clone(),
+            db.clone(),
+            Caller::local(),
+            message,
+            Some(lease.clone()),
+        )
+        .await;
+        let (body, _) = through.into_response().expect("dispatch is a response");
+        assert_ne!(
+            body["result"]["structuredContent"].get("error_code"),
+            Some(&json!(DEPLOYMENT_READ_ONLY_ERROR))
+        );
+
+        drop(lease);
+        tokio::time::timeout(std::time::Duration::from_secs(2), freeze)
+            .await
+            .expect("freeze did not acquire after lease drain")
+            .unwrap();
     }
 }

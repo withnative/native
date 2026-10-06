@@ -77,9 +77,12 @@ pub(crate) const TABLE_CLASSIFICATIONS: &[(&str, StandbyTableKind)] = &[
     // Content-log projections.
     ("records", Fold),
     ("record_mentions", Fold),
+    ("body_task_items", Fold),
+    ("body_blocks", Fold),
     ("links", Fold),
     ("facet_values", Fold),
     ("facet_observations", Fold),
+    ("facet_times", Fold),
     ("annotation_targets", Fold),
     ("attribution_targets", Fold),
     ("attribution_assertions", Fold),
@@ -128,6 +131,7 @@ pub(crate) const TABLE_CLASSIFICATIONS: &[(&str, StandbyTableKind)] = &[
     ("policy_entries", Fold),
     ("bindings", Fold),
     ("database_identity", Fold),
+    ("authorization_grant_revision", Fold),
     ("authorization_revision", Fold),
     ("relationships", Fold),
     ("relationship_endpoints", Fold),
@@ -143,6 +147,7 @@ pub(crate) const TABLE_CLASSIFICATIONS: &[(&str, StandbyTableKind)] = &[
     ("member_obligation_progress", Fold),
     ("seeded_instruction_sources", Fold),
     ("alpha_tab_installs", Fold),
+    ("alpha_tab_orders", Fold),
     ("control_event_applications", Fold),
     ("derivation_series", Fold),
     ("derivation_revisions", Fold),
@@ -161,10 +166,24 @@ pub(crate) const TABLE_CLASSIFICATIONS: &[(&str, StandbyTableKind)] = &[
     ("derivation_confirmation_heads", Fold),
     ("vocabularies", Fold),
     ("vocabulary_values", Fold),
+    // Physical parser projection of `vocabulary_values.metadata`, folded by the
+    // same meta-event transaction that writes the value row (v76). The receiver
+    // regenerates it from the metadata cell rather than copying node rows.
+    ("vocabulary_value_json_nodes", Fold),
     ("schema_config", Fold),
+    ("workspace_rule_installations", Fold),
+    ("schema_config_json_nodes", Fold),
+    // Physical projection of `facet_values.value`, folded by the same content
+    // event that writes the value row (v82). The receiver regenerates it from
+    // the value cell rather than copying node rows.
+    ("facet_value_json_nodes", Fold),
     // Trigger-maintained search indexes are folds too, not transported state.
     ("records_fts", Fold),
     ("records_name_idx", Fold),
+    // Claim-shape metadata is trigger-maintained per content event, never
+    // copied as canonical state: the receiver regenerates it from the log.
+    ("content_event_claim_meta", Fold),
+    ("content_event_reaction_meta", Fold),
     // Receiver-local, operational, or disposable state.
     ("provenance_local_attestation_authority", Excluded),
     ("webhook_deliveries", Excluded),
@@ -191,6 +210,7 @@ mod tests {
     use crate::act::{
         ACT_STAMPED_TABLES, CANONICAL_EVENT_TABLES, NON_SEQUENCED_ACT_STAMPED_TABLES,
     };
+    use crate::schema::ddl::declared_table;
     use crate::schema::{DDL_STATEMENTS, REQUIRED_TABLES};
 
     fn names_of(kind: StandbyTableKind) -> BTreeSet<&'static str> {
@@ -202,66 +222,6 @@ mod tests {
 
     fn set(values: &[&'static str]) -> BTreeSet<&'static str> {
         values.iter().copied().collect()
-    }
-
-    fn declared_table(statement: &str) -> Result<Option<String>, String> {
-        let words = statement.split_ascii_whitespace().collect::<Vec<_>>();
-        if !words
-            .first()
-            .is_some_and(|word| word.eq_ignore_ascii_case("CREATE"))
-        {
-            return Ok(None);
-        }
-
-        let mentions_table = words.iter().any(|word| word.eq_ignore_ascii_case("TABLE"));
-        let mut cursor = 1;
-        if words.get(cursor).is_some_and(|word| {
-            word.eq_ignore_ascii_case("TEMP") || word.eq_ignore_ascii_case("TEMPORARY")
-        }) {
-            cursor += 1;
-        }
-        if words
-            .get(cursor)
-            .is_some_and(|word| word.eq_ignore_ascii_case("VIRTUAL"))
-        {
-            cursor += 1;
-        }
-        if !words
-            .get(cursor)
-            .is_some_and(|word| word.eq_ignore_ascii_case("TABLE"))
-        {
-            return if mentions_table {
-                Err(format!("unrecognised CREATE TABLE statement: {statement}"))
-            } else {
-                Ok(None)
-            };
-        }
-        cursor += 1;
-        if words
-            .get(cursor)
-            .is_some_and(|word| word.eq_ignore_ascii_case("IF"))
-        {
-            let guard = words.get(cursor..cursor + 3).unwrap_or_default();
-            if guard.len() != 3
-                || !guard[0].eq_ignore_ascii_case("IF")
-                || !guard[1].eq_ignore_ascii_case("NOT")
-                || !guard[2].eq_ignore_ascii_case("EXISTS")
-            {
-                return Err(format!("unrecognised CREATE TABLE guard: {statement}"));
-            }
-            cursor += 3;
-        }
-        let raw = words
-            .get(cursor)
-            .ok_or_else(|| format!("CREATE TABLE has no table name: {statement}"))?
-            .trim_end_matches('(');
-        let unqualified = raw.rsplit('.').next().unwrap_or(raw);
-        let table =
-            unqualified.trim_matches(|character| matches!(character, '`' | '"' | '[' | ']'));
-        if table.is_empty() {
-            return Err(format!("CREATE TABLE has an empty table name: {statement}"));
-        }
-        Ok(Some(table.to_owned()))
     }
 
     #[test]

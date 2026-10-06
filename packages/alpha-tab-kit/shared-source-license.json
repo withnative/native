@@ -1,0 +1,13 @@
+{
+  "format": "native.shared-source-license/v1",
+  "package": "@withnative/alpha-tab-kit",
+  "version": "0.1.0",
+  "license": "AGPL-3.0-only",
+  "component": "tier-1-node",
+  "sources": [
+    "packages/alpha-tab-kit/src/body-reader.mjs",
+    "packages/alpha-tab-kit/src/body-transport.mjs",
+    "packages/alpha-tab-kit/src/body-wire.mjs"
+  ],
+  "license_path": "packages/alpha-tab-kit/LICENSE.md"
+}

@@ -489,6 +489,156 @@ impl HumanInteractionTokenIssuer {
     }
 }
 
+/// Action name for a forward effect-gesture token (D7 §4C.4, slice G2).
+pub const EFFECT_GESTURE_ACTION: &str = "effect.v1";
+/// Action name for a reversal effect-gesture token.
+pub const EFFECT_GESTURE_REVERSAL_ACTION: &str = "effect_reversal.v1";
+/// Persisted verifier recorded in an event's `origin.gesture_evidence`.
+pub const EFFECT_GESTURE_VERIFIER: &str = "effect_gesture.v1";
+
+/// The completing gesture a host observed before it minted an effect-gesture
+/// token (D7 §4B). It rides on the `Caller`, never in the invocation body:
+/// the body's `gesture` field stays the provenance string, is not part of
+/// the binding, and neither breaks nor satisfies a token.
+///
+/// `Grant` is not a gesture: it records that the host applied a standing write
+/// grant the person gave the app (`docs/alpha-write-grant-design.md`), so a
+/// history reader sees a granted save as granted and never as a click.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum EffectGestureKind {
+    Click,
+    Drop,
+    Key,
+    Grant,
+}
+
+impl EffectGestureKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Click => "click",
+            Self::Drop => "drop",
+            Self::Key => "key",
+            Self::Grant => "grant",
+        }
+    }
+}
+
+/// Binding id list for one effect-gesture token (D7 §4B.3, §4C.3 A1).
+///
+/// The issuer sorts and digests this list unchanged, so these exact strings
+/// are the binding. `artifact_id` is bound always, so a token for one artifact
+/// never verifies on another that shares its package (or on any other
+/// unguarded artifact). `values_digest` is the canonical digest of the
+/// invocation's value-domain fillings, so swapping the written value
+/// invalidates the token. `package` is `(source, name)` — for an alpha tab,
+/// `("alpha", guard.package)` — and `generation` its install generation. An
+/// unguarded artifact binds neither package key: it has no install to name,
+/// and its token still binds viewer, artifact, entry, target, values, key and
+/// gesture, which is the whole invocation it authorizes. `target` is the
+/// invocation's record-domain slot ids (the reversal's resolved record for an
+/// undo), and `gesture` is the `Caller`'s kind, never the body field.
+#[allow(clippy::too_many_arguments)] // Every bound element is named; grouping would hide what is bound.
+pub fn effect_gesture_binding_ids(
+    account: &str,
+    artifact_id: &str,
+    package: Option<(&str, &str)>,
+    generation: Option<&str>,
+    entry: &str,
+    target: &[String],
+    idempotency_key: &str,
+    values_digest: &str,
+    gesture: EffectGestureKind,
+) -> Vec<String> {
+    let mut ids = vec![
+        format!("viewer={account}"),
+        format!("artifact={artifact_id}"),
+        format!("entry={entry}"),
+        format!("key={idempotency_key}"),
+        format!("values={values_digest}"),
+        format!("gesture={}", gesture.as_str()),
+    ];
+    if let Some((source, name)) = package {
+        ids.push(format!("pkg={source}:{name}"));
+    }
+    if let Some(generation) = generation {
+        ids.push(format!("gen={generation}"));
+    }
+    let mut target = target.to_vec();
+    target.sort();
+    ids.push(format!("target={}", target.join(",")));
+    ids.sort();
+    ids
+}
+
+/// Canonical digest of one invocation's value-domain fillings for the
+/// effect-gesture binding (D7 §4B.3, slice G3). Both the engine (over the
+/// parsed `values` map) and the hosted adapter (over the raw body `values`,
+/// defaulting a missing field to `{}`) digest through this helper, so both
+/// sides bind the identical string; it bottoms out in
+/// `canonical_json::digest_json`, which is the actual shared root.
+pub fn effect_gesture_values_digest(values: &serde_json::Value) -> String {
+    crate::canonical_json::digest_json(values)
+}
+
+/// A host-minted effect-gesture token and the gesture kind the host observed,
+/// attached to a `Caller` at trusted ingress (D7 §4B, slice G2). The engine
+/// verifies it against the parsed invocation; it is request-scoped and never
+/// persisted. The embedded issuer is secret material, so `Debug` redacts it.
+#[derive(Clone)]
+pub struct EffectGestureAttestation {
+    issuer: HumanInteractionTokenIssuer,
+    token: String,
+    kind: EffectGestureKind,
+}
+
+impl std::fmt::Debug for EffectGestureAttestation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("EffectGestureAttestation")
+            .field("kind", &self.kind)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for EffectGestureAttestation {
+    fn eq(&self, other: &Self) -> bool {
+        self.kind == other.kind && self.token == other.token
+    }
+}
+
+impl Eq for EffectGestureAttestation {}
+
+impl EffectGestureAttestation {
+    pub fn new(
+        issuer: HumanInteractionTokenIssuer,
+        token: impl Into<String>,
+        kind: EffectGestureKind,
+    ) -> Self {
+        Self {
+            issuer,
+            token: token.into(),
+            kind,
+        }
+    }
+
+    pub fn kind(&self) -> EffectGestureKind {
+        self.kind
+    }
+
+    /// Verify the token against exactly this binding (account, action and the
+    /// sorted id list). A bad signature, any binding mismatch, or an expired
+    /// token is an error; the caller maps it to `gesture_attestation_invalid`.
+    pub fn verify(
+        &self,
+        account: &str,
+        action: &str,
+        message_ids: &[String],
+    ) -> Result<VerifiedHumanInteraction> {
+        self.issuer
+            .verify(&self.token, account, action, message_ids)
+    }
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EvidenceInput {
@@ -2719,6 +2869,258 @@ pub async fn rebuild_projections(db: &crate::Db) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn effect_gesture_binding_ids_bind_every_element() {
+        let target = || vec!["rec-1".to_owned(), "rec-0".to_owned()];
+        #[allow(clippy::too_many_arguments)]
+        let bind = |account: &str,
+                    artifact: &str,
+                    package: Option<(&str, &str)>,
+                    generation: Option<&str>,
+                    entry: &str,
+                    targets: &[String],
+                    key: &str,
+                    values: &str,
+                    gesture: EffectGestureKind| {
+            effect_gesture_binding_ids(
+                account, artifact, package, generation, entry, targets, key, values, gesture,
+            )
+        };
+        let base = bind(
+            "acct:a",
+            "artifact-1",
+            Some(("alpha", "agent.tasks")),
+            Some("evt-1"),
+            "start_work",
+            &target(),
+            "key-1",
+            "values-digest",
+            EffectGestureKind::Click,
+        );
+        for expected in [
+            "viewer=acct:a",
+            "artifact=artifact-1",
+            "pkg=alpha:agent.tasks",
+            "gen=evt-1",
+            "entry=start_work",
+            "target=rec-0,rec-1",
+            "key=key-1",
+            "values=values-digest",
+            "gesture=click",
+        ] {
+            assert!(
+                base.iter().any(|id| id == expected),
+                "missing {expected}: {base:?}"
+            );
+        }
+        // Changing any single element changes the binding.
+        let moved = |ids: Vec<String>| assert_ne!(ids, base, "an element did not move the binding");
+        let tasks = Some(("alpha", "agent.tasks"));
+        moved(bind(
+            "acct:b",
+            "artifact-1",
+            tasks,
+            Some("evt-1"),
+            "start_work",
+            &target(),
+            "key-1",
+            "values-digest",
+            EffectGestureKind::Click,
+        ));
+        moved(bind(
+            "acct:a",
+            "artifact-2",
+            tasks,
+            Some("evt-1"),
+            "start_work",
+            &target(),
+            "key-1",
+            "values-digest",
+            EffectGestureKind::Click,
+        ));
+        moved(bind(
+            "acct:a",
+            "artifact-1",
+            Some(("app", "agent.tasks")),
+            Some("evt-1"),
+            "start_work",
+            &target(),
+            "key-1",
+            "values-digest",
+            EffectGestureKind::Click,
+        ));
+        moved(bind(
+            "acct:a",
+            "artifact-1",
+            Some(("alpha", "agent.pulse")),
+            Some("evt-1"),
+            "start_work",
+            &target(),
+            "key-1",
+            "values-digest",
+            EffectGestureKind::Click,
+        ));
+        moved(bind(
+            "acct:a",
+            "artifact-1",
+            tasks,
+            Some("evt-2"),
+            "start_work",
+            &target(),
+            "key-1",
+            "values-digest",
+            EffectGestureKind::Click,
+        ));
+        moved(bind(
+            "acct:a",
+            "artifact-1",
+            tasks,
+            Some("evt-1"),
+            "mark_triaged",
+            &target(),
+            "key-1",
+            "values-digest",
+            EffectGestureKind::Click,
+        ));
+        moved(bind(
+            "acct:a",
+            "artifact-1",
+            tasks,
+            Some("evt-1"),
+            "start_work",
+            &target(),
+            "key-2",
+            "values-digest",
+            EffectGestureKind::Click,
+        ));
+        moved(bind(
+            "acct:a",
+            "artifact-1",
+            tasks,
+            Some("evt-1"),
+            "start_work",
+            &["rec-0".to_owned()],
+            "key-1",
+            "values-digest",
+            EffectGestureKind::Click,
+        ));
+        moved(bind(
+            "acct:a",
+            "artifact-1",
+            tasks,
+            Some("evt-1"),
+            "start_work",
+            &target(),
+            "key-1",
+            "other-digest",
+            EffectGestureKind::Click,
+        ));
+        moved(bind(
+            "acct:a",
+            "artifact-1",
+            tasks,
+            Some("evt-1"),
+            "start_work",
+            &target(),
+            "key-1",
+            "values-digest",
+            EffectGestureKind::Drop,
+        ));
+        // An unguarded artifact binds neither package key, but still binds the
+        // artifact and the rest of the invocation.
+        let unguarded = bind(
+            "acct:a",
+            "artifact-1",
+            None,
+            None,
+            "entry",
+            &[],
+            "k",
+            "d",
+            EffectGestureKind::Key,
+        );
+        assert!(!unguarded.iter().any(|id| id.starts_with("pkg=")));
+        assert!(!unguarded.iter().any(|id| id.starts_with("gen=")));
+        assert!(unguarded.iter().any(|id| id == "artifact=artifact-1"));
+    }
+
+    #[test]
+    fn effect_gesture_attestation_verifies_its_exact_binding() {
+        let issuer = HumanInteractionTokenIssuer::random("test-host");
+        let account = "acct:a";
+        let action = EFFECT_GESTURE_ACTION;
+        let ids = effect_gesture_binding_ids(
+            account,
+            "artifact-1",
+            None,
+            None,
+            "mark_triaged",
+            &[],
+            "k",
+            "d",
+            EffectGestureKind::Click,
+        );
+        let token = issuer.issue(account, action, &ids, 30).unwrap();
+        let attestation = EffectGestureAttestation::new(issuer, token, EffectGestureKind::Click);
+        assert_eq!(attestation.kind(), EffectGestureKind::Click);
+        assert!(attestation.verify(account, action, &ids).is_ok());
+        // A moved binding element, or the wrong action, invalidates it.
+        let moved = effect_gesture_binding_ids(
+            account,
+            "artifact-1",
+            None,
+            None,
+            "mark_triaged",
+            &[],
+            "k2",
+            "d",
+            EffectGestureKind::Click,
+        );
+        assert!(attestation.verify(account, action, &moved).is_err());
+        assert!(attestation
+            .verify(account, EFFECT_GESTURE_REVERSAL_ACTION, &ids)
+            .is_err());
+    }
+
+    #[test]
+    fn grant_kind_is_bound_and_never_satisfied_by_a_click_token() {
+        let issuer = HumanInteractionTokenIssuer::random("test-host");
+        let account = "acct:a";
+        let bind = |kind| {
+            effect_gesture_binding_ids(
+                account,
+                "artifact-1",
+                None,
+                None,
+                "save",
+                &[],
+                "k",
+                "d",
+                kind,
+            )
+        };
+        assert_eq!(EffectGestureKind::Grant.as_str(), "grant");
+        let grant_ids = bind(EffectGestureKind::Grant);
+        let token = issuer
+            .issue(account, EFFECT_GESTURE_ACTION, &grant_ids, 30)
+            .unwrap();
+        let granted =
+            EffectGestureAttestation::new(issuer.clone(), token, EffectGestureKind::Grant);
+        assert!(granted
+            .verify(account, EFFECT_GESTURE_ACTION, &grant_ids)
+            .is_ok());
+        // A token minted for a click cannot be presented as a grant, nor the
+        // reverse: the kind is part of the binding.
+        let click_ids = bind(EffectGestureKind::Click);
+        let click_token = issuer
+            .issue(account, EFFECT_GESTURE_ACTION, &click_ids, 30)
+            .unwrap();
+        let as_grant = EffectGestureAttestation::new(issuer, click_token, EffectGestureKind::Grant);
+        assert!(as_grant
+            .verify(account, EFFECT_GESTURE_ACTION, &grant_ids)
+            .is_err());
+    }
 
     #[tokio::test]
     async fn exact_retry_is_stable_and_different_intent_fails() {

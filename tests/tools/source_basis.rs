@@ -1023,6 +1023,119 @@ async fn create_many_item_stores_empty_sources_distinctly_from_absent() {
 }
 
 #[tokio::test]
+async fn create_many_item_accepts_a_bare_source_id_and_stores_no_reason() {
+    let db = create_database(":memory:").await.unwrap();
+    let registry = registry();
+    let source_id = seed_source(&registry, &db, "bare-source").await;
+
+    let created = call(
+        &registry,
+        &db,
+        Caller::local(),
+        "create_many",
+        json!({
+            "reason": "bare id per item",
+            "records": [
+                {
+                    "type": "Document",
+                    "kind": "note",
+                    "name": "bare-source-target",
+                    "sources": [source_id],
+                },
+            ],
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(created["ok"], json!(true));
+
+    let target_id = created["ids"][0].as_str().unwrap();
+    let payload = created_payload(&db, target_id).await;
+    let stored = &payload["basis"]["sources"][0];
+    assert_eq!(stored["record_id"], json!(source_id), "{payload}");
+    assert_eq!(
+        stored["reason"],
+        json!(null),
+        "a bare id stores no reason: {payload}"
+    );
+    assert!(
+        stored["revision_event_id"].is_string(),
+        "the engine stamps the head: {payload}"
+    );
+}
+
+#[tokio::test]
+async fn a_bare_source_id_resolves_and_deduplicates_like_the_object_form() {
+    let db = create_database(":memory:").await.unwrap();
+    let registry = registry();
+    let source_id = seed_source(&registry, &db, "bare-resolved").await;
+
+    let created = create(
+        &registry,
+        &db,
+        Caller::local(),
+        json!({
+            "type": "Document",
+            "kind": "note",
+            "name": "bare-resolved-target",
+            "sources": [source_id.clone()],
+        }),
+    )
+    .await
+    .unwrap();
+    let payload = created_payload(&db, created["id"].as_str().unwrap()).await;
+    let stored = &payload["basis"]["sources"][0];
+    assert_eq!(stored["record_id"], json!(source_id));
+    assert_eq!(stored["reason"], json!(null));
+    assert_eq!(stored["revision_supplied_by"], json!("engine"));
+    assert_eq!(
+        stored["revision_event_id"],
+        json!(latest_body_event(&db, &source_id).await)
+    );
+
+    let duplicate = create(
+        &registry,
+        &db,
+        Caller::local(),
+        json!({
+            "type": "Document",
+            "kind": "note",
+            "name": "bare-duplicate",
+            "sources": [source_id.clone(), source_id.clone()],
+        }),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(duplicate.contains("sources[1]"), "{duplicate}");
+}
+
+#[tokio::test]
+async fn a_bare_source_id_that_is_not_visible_is_refused_by_ordinal() {
+    let db = create_database(":memory:").await.unwrap();
+    let registry = registry();
+    let error = create(
+        &registry,
+        &db,
+        Caller::local(),
+        json!({
+            "type": "Document",
+            "kind": "note",
+            "name": "missing-bare-source",
+            "sources": ["619e4732-8dda-444b-93c6-283ffe7b7d32"],
+        }),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("sources[0]"), "{error}");
+    assert!(
+        !error.contains("619e4732"),
+        "a refusal must never disclose the unseen id: {error}"
+    );
+}
+
+#[tokio::test]
 async fn a_facet_only_update_places_the_basis_on_the_first_facet_event() {
     let db = create_database(":memory:").await.unwrap();
     let registry = registry();

@@ -27,59 +27,69 @@
 //! decision.
 
 use std::collections::BTreeSet;
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
-use sqlx::SqliteConnection;
+use sqlx::sqlite::SqliteConnectOptions;
+use sqlx::{Connection, SqliteConnection};
 
 use crate::error::{Error, Result};
 
 /// Closed contract identity for the authority act-head probe.
-pub(crate) const AUTHORITY_ACT_HEAD_CONTRACT: &str = "native.standby-authority-act-head.v2";
+pub const AUTHORITY_ACT_HEAD_CONTRACT: &str = "native.standby-authority-act-head.v2";
 /// The only contract version this core understands.
-pub(crate) const AUTHORITY_ACT_HEAD_VERSION: u32 = 2;
+pub const AUTHORITY_ACT_HEAD_VERSION: u32 = 2;
 
 /// The only canonical-interchange revision an authority may author for
 /// exhaustively-carried canonical history. Kept mechanically tied to
 /// [`crate::interchange::REVISION`] by
 /// `required_native_revision_matches_interchange`, so a revision bump cannot
 /// silently change what this contract accepts.
-pub(crate) const REQUIRED_NATIVE_INTERCHANGE_REVISION: u64 = 5;
+pub const REQUIRED_NATIVE_INTERCHANGE_REVISION: u64 = 5;
 
 /// The closed authority act-head document. Every field is required and
 /// unknown fields are refused, so a newer producer cannot smuggle a
 /// coordinate past an older consumer.
+///
+/// This is the authoritative act-range evidence for one workspace database:
+/// [`head_act`](Self::head_act) is the equivalence/freshness coordinate (the
+/// act of the most recently committed write transaction, or 0), the cutovers
+/// record the grouping-unknown boundary, and the policy pin plus watermarks
+/// are the companions a head-only comparison would silently drop. Per-log
+/// `seq` maxima are diagnostics (local fold positions), and the engine
+/// schema is advisory provenance only.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct AuthorityActHeadV1 {
-    pub(crate) contract: String,
-    pub(crate) version: u32,
-    pub(crate) origin_database_id: String,
+pub struct AuthorityActHeadV1 {
+    pub contract: String,
+    pub version: u32,
+    pub origin_database_id: String,
     /// The workspace act counter: the act of the most recently committed
     /// write transaction, or 0 when no act-stamped write has committed.
-    pub(crate) head_act: i64,
+    pub head_act: i64,
     /// The canonical-interchange revision this authority authors.
-    pub(crate) native_interchange_revision: u64,
+    pub native_interchange_revision: u64,
     /// Advisory provenance only; engine identity never gates materialisation.
-    pub(crate) source_engine_schema: i64,
+    pub source_engine_schema: i64,
     /// Diagnostics: `MAX(seq)` per sequenced canonical log, in
     /// [`crate::act::CANONICAL_EVENT_TABLES`] order.
-    pub(crate) per_log_max_seq: Vec<LogMaxSeqV1>,
+    pub per_log_max_seq: Vec<LogMaxSeqV1>,
     /// Act watermarks of the non-sequenced act-stamped logs, in
     /// [`crate::act::NON_SEQUENCED_ACT_STAMPED_TABLES`] order.
-    pub(crate) non_sequenced_max_acts: Vec<NonSequencedMaxActV1>,
+    pub non_sequenced_max_acts: Vec<NonSequencedMaxActV1>,
     /// `None` is the compatible no-row state; `Some` carries the revision and
     /// the exact source pin the policy was computed against.
-    pub(crate) storage_portability_policy: Option<StoragePortabilityPolicyHeadV1>,
+    pub storage_portability_policy: Option<StoragePortabilityPolicyHeadV1>,
     /// All ten act cutovers, ordered by domain.
-    pub(crate) act_cutovers: Vec<ActCutoverV1>,
+    pub act_cutovers: Vec<ActCutoverV1>,
     /// The content-log causal cutover singleton.
-    pub(crate) content_causal_cutover: ContentCausalCutoverV1,
+    pub content_causal_cutover: ContentCausalCutoverV1,
     /// The four governed binding-system seeds, ordered by system.
-    pub(crate) binding_systems: Vec<BindingSystemSeedV1>,
+    pub binding_systems: Vec<BindingSystemSeedV1>,
     /// `webhook_endpoints` row count; must be zero for the v2 delta path.
-    pub(crate) webhook_endpoint_count: i64,
+    pub webhook_endpoint_count: i64,
     /// `webhook_credentials` row count; must be zero for the v2 delta path.
-    pub(crate) webhook_credential_count: i64,
+    pub webhook_credential_count: i64,
 }
 
 /// Backwards-compatible alias: the head struct keeps its V1 name so the
@@ -89,60 +99,60 @@ pub(crate) type AuthorityActHeadV2 = AuthorityActHeadV1;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct LogMaxSeqV1 {
-    pub(crate) table: String,
-    pub(crate) max_seq: i64,
+pub struct LogMaxSeqV1 {
+    pub table: String,
+    pub max_seq: i64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct NonSequencedMaxActV1 {
-    pub(crate) table: String,
-    pub(crate) max_act: i64,
+pub struct NonSequencedMaxActV1 {
+    pub table: String,
+    pub max_act: i64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct StoragePortabilityPolicyHeadV1 {
-    pub(crate) policy_revision: i64,
-    pub(crate) source_profile_id: String,
-    pub(crate) source_profile_revision: i64,
-    pub(crate) source_mode: String,
+pub struct StoragePortabilityPolicyHeadV1 {
+    pub policy_revision: i64,
+    pub source_profile_id: String,
+    pub source_profile_revision: i64,
+    pub source_mode: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct ActCutoverV1 {
-    pub(crate) domain: String,
-    pub(crate) last_legacy_seq: i64,
-    pub(crate) cutover_at: String,
-    pub(crate) from_engine_schema: Option<i64>,
+pub struct ActCutoverV1 {
+    pub domain: String,
+    pub last_legacy_seq: i64,
+    pub cutover_at: String,
+    pub from_engine_schema: Option<i64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct ContentCausalCutoverV1 {
-    pub(crate) last_legacy_local_seq: i64,
-    pub(crate) cutover_at: String,
-    pub(crate) from_engine_schema: Option<i64>,
+pub struct ContentCausalCutoverV1 {
+    pub last_legacy_local_seq: i64,
+    pub cutover_at: String,
+    pub from_engine_schema: Option<i64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct BindingSystemSeedV1 {
-    pub(crate) system: String,
-    pub(crate) normalizer: String,
-    pub(crate) compatible_type: Option<String>,
-    pub(crate) compatible_kind: Option<String>,
-    pub(crate) visibility: String,
-    pub(crate) add_policy: String,
-    pub(crate) remove_policy: String,
-    pub(crate) canonicalize_policy: String,
-    pub(crate) transfer_policy: String,
-    pub(crate) reconciliation_rule: String,
-    pub(crate) stub_allowed: i64,
-    pub(crate) authoritative_provenance: i64,
-    pub(crate) required_durable: i64,
+pub struct BindingSystemSeedV1 {
+    pub system: String,
+    pub normalizer: String,
+    pub compatible_type: Option<String>,
+    pub compatible_kind: Option<String>,
+    pub visibility: String,
+    pub add_policy: String,
+    pub remove_policy: String,
+    pub canonicalize_policy: String,
+    pub transfer_policy: String,
+    pub reconciliation_rule: String,
+    pub stub_allowed: i64,
+    pub authoritative_provenance: i64,
+    pub required_durable: i64,
 }
 
 impl StoragePortabilityPolicyHeadV1 {
@@ -184,7 +194,7 @@ impl AuthorityActHeadV1 {
     /// path: a missing or duplicate coordinate, a non-native interchange
     /// revision, a binding registry that is not exactly the governed seeds,
     /// or any webhook state at all.
-    pub(crate) fn validate(&self) -> Result<()> {
+    pub fn validate(&self) -> Result<()> {
         self.validate_without_engine_schema()?;
         require(
             self.source_engine_schema > 0,
@@ -409,6 +419,69 @@ pub(crate) async fn read_authority_act_head(db: &crate::Db) -> Result<AuthorityA
         (Ok(_), Err(error)) => Err(error.into()),
         (Ok(probe), Ok(())) => Ok(probe),
     }
+}
+
+/// Read the authoritative act-head evidence for one workspace database file,
+/// read-only, without opening it as an engine [`crate::Db`].
+///
+/// This is Slice A of the freeze-receipt work: the file-path entry point a
+/// release controller (or any external holder of managed fleet files) calls
+/// to observe the act-range coordinate. It runs the exact same one-statement
+/// probe and closed-contract validation as the `Db`-handle probe above —
+/// same SQL, same parse, same [`AuthorityActHeadV1::validate`] — so there is
+/// one coordinate definition, not two.
+///
+/// Read-only hardening mirrors the catalog inventory helper: the file is
+/// opened `read_only` (never created), `PRAGMA query_only = ON` is set before
+/// any read, and the probe runs inside `BEGIN DEFERRED` / `ROLLBACK`, so a
+/// future accidental write added below fails at SQLite's execution boundary.
+/// `immutable` is deliberately *not* set: live fleet files may carry a `-wal`
+/// sidecar and an immutable open would silently read a stale snapshot.
+/// SQLite may materialize an empty WAL during a read-only open. Callers that
+/// also bind exact file bytes must probe before hashing those bytes.
+///
+/// Point-in-time only. Stability across two reads is the caller's
+/// responsibility: observe under the deployment freeze (or any equivalent
+/// writer exclusion) and re-probe to detect drift. This function chooses no
+/// freeze-receipt policy.
+///
+/// Fail-closed (`Err`, never partial evidence) when the path is missing, the
+/// file is not a database, any act-coordinate table or singleton is absent —
+/// including pre-act schemas below engine 56, which have no `act_state`,
+/// `act` columns or `act_cutover` rows — or any closed-contract invariant is
+/// violated (binding seeds, webhook state, interchange revision, cutover
+/// shape, policy pin).
+pub async fn read_authority_act_head_from_path(path: &Path) -> Result<AuthorityActHeadV1> {
+    let options = SqliteConnectOptions::new()
+        .filename(path)
+        .create_if_missing(false)
+        .read_only(true)
+        .foreign_keys(true)
+        .busy_timeout(std::time::Duration::from_secs(5));
+    let mut connection = SqliteConnection::connect_with(&options).await?;
+    let result = async {
+        sqlx::query("PRAGMA query_only = ON")
+            .execute(&mut connection)
+            .await?;
+        sqlx::query("BEGIN DEFERRED")
+            .execute(&mut connection)
+            .await?;
+        let inner = read_authority_act_head_on(&mut connection).await;
+        let rollback = sqlx::query("ROLLBACK").execute(&mut connection).await;
+        match inner {
+            Err(error) => {
+                let _ = rollback;
+                Err(error)
+            }
+            Ok(probe) => {
+                rollback?;
+                Ok(probe)
+            }
+        }
+    }
+    .await;
+    connection.close().await?;
+    result
 }
 
 /// The one-statement seam: run the probe on an already-open connection that
@@ -773,6 +846,7 @@ mod tests {
                         activity_id: "probe-fixture-activity".into(),
                         account_id: "acct:probe-fixture".into(),
                         started_at: crate::store::now_iso(),
+                        channel: None,
                         reported_mcp_client_name: None,
                         reported_mcp_client_version: None,
                         reported_model: None,
@@ -1125,5 +1199,212 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(actual, expected_binding_system_seeds());
         db.close().await;
+    }
+
+    /// File-path probe fixtures: an on-disk engine database this test owns,
+    /// closed before probing so the probe never contends with an open writer.
+    async fn file_authority(dir: &tempfile::TempDir, name: &str) -> std::path::PathBuf {
+        let path = dir.path().join(name);
+        let db = crate::db::create_database(path.to_str().unwrap())
+            .await
+            .unwrap();
+        crate::store::append(
+            &db,
+            crate::store::AppendSpec {
+                record_id: RECORD_ID.into(),
+                event_type: "record.created".into(),
+                payload: serde_json::json!({
+                    "type": "Document",
+                    "kind": "note",
+                    "name": "file probe fixture",
+                }),
+                actor: None,
+            },
+        )
+        .await
+        .unwrap();
+        db.close().await;
+        path
+    }
+
+    /// The hashed content the probe promises not to touch: the main file
+    /// always, and the `-wal` sidecar's bytes when it carries any. An absent
+    /// sidecar and a zero-length sidecar are the same empty-content state:
+    /// SQLite teardown bookkeeping (shutdown-checkpoint TRUNCATE-then-unlink,
+    /// delayed pool-drop closes) can materialize or remove an empty `-wal`
+    /// without moving a single content byte, and every SQLite reader treats
+    /// both identically. `-shm` is ephemeral reader state and `-journal`
+    /// must never appear.
+    fn hashed_fleet_bytes(path: &std::path::Path) -> (Vec<u8>, Option<Vec<u8>>) {
+        let main = std::fs::read(path).unwrap();
+        let mut wal_path = path.as_os_str().to_owned();
+        wal_path.push("-wal");
+        let wal = std::fs::read(std::path::Path::new(&wal_path))
+            .ok()
+            .filter(|bytes| !bytes.is_empty());
+        (main, wal)
+    }
+
+    /// Content-free `-wal` churn normalizes away, but a sidecar carrying
+    /// bytes always stays represented. Pins the normalization above without
+    /// a database: absent and empty hash identically, non-empty exactly.
+    #[test]
+    fn wal_content_normalization_keeps_nonempty_sidecars() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("probe.db");
+        std::fs::write(&path, b"main-bytes").unwrap();
+        let mut wal_os = path.as_os_str().to_owned();
+        wal_os.push("-wal");
+        let wal_path = std::path::Path::new(&wal_os);
+        assert_eq!(hashed_fleet_bytes(&path), (b"main-bytes".to_vec(), None));
+        std::fs::write(wal_path, b"").unwrap();
+        assert_eq!(hashed_fleet_bytes(&path), (b"main-bytes".to_vec(), None));
+        std::fs::write(wal_path, b"wal-frame-bytes").unwrap();
+        assert_eq!(
+            hashed_fleet_bytes(&path),
+            (b"main-bytes".to_vec(), Some(b"wal-frame-bytes".to_vec()))
+        );
+    }
+
+    fn assert_no_journal(path: &std::path::Path) {
+        let mut journal = path.as_os_str().to_owned();
+        journal.push("-journal");
+        assert!(
+            std::fs::symlink_metadata(std::path::Path::new(&journal)).is_err(),
+            "probe created a -journal sidecar for {}",
+            path.display()
+        );
+    }
+
+    /// The file-path probe observes the same closed contract as the
+    /// `Db`-handle probe, is stable across reads, and writes nothing: every
+    /// hashed byte is identical afterwards and no journal appears.
+    #[tokio::test]
+    async fn file_probe_matches_closed_contract_is_stable_and_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = file_authority(&dir, "authority.db").await;
+
+        let before = hashed_fleet_bytes(&path);
+        let first = read_authority_act_head_from_path(&path).await.unwrap();
+        let second = read_authority_act_head_from_path(&path).await.unwrap();
+        assert_eq!(first, second, "probe must be stable");
+        assert_eq!(
+            hashed_fleet_bytes(&path),
+            before,
+            "probe must write nothing"
+        );
+        assert_no_journal(&path);
+
+        first.validate().unwrap();
+        assert_eq!(first.contract, AUTHORITY_ACT_HEAD_CONTRACT);
+        assert_eq!(first.version, AUTHORITY_ACT_HEAD_VERSION);
+        assert!(crate::identity::is_database_id(&first.origin_database_id));
+        assert!(first.head_act > 0, "the fixture committed one act");
+        assert_eq!(
+            first.native_interchange_revision,
+            REQUIRED_NATIVE_INTERCHANGE_REVISION
+        );
+        assert_eq!(
+            first.source_engine_schema,
+            crate::CURRENT_ENGINE_SCHEMA_VERSION
+        );
+        assert_eq!(first.act_cutovers.len(), 10);
+        assert_eq!(first.non_sequenced_max_acts.len(), 3);
+        assert_eq!(first.binding_systems, expected_binding_system_seeds());
+        assert_eq!(first.webhook_endpoint_count, 0);
+        assert_eq!(first.webhook_credential_count, 0);
+    }
+
+    /// The probe observes committed truth: one more write transaction moves
+    /// the head by exactly one act.
+    #[tokio::test]
+    async fn file_probe_observes_committed_advance() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = file_authority(&dir, "authority.db").await;
+        let before = read_authority_act_head_from_path(&path).await.unwrap();
+
+        let db = crate::db::open_existing_database(path.to_str().unwrap())
+            .await
+            .unwrap();
+        crate::store::append(
+            &db,
+            crate::store::AppendSpec {
+                record_id: RECORD_ID.into(),
+                event_type: "record.updated".into(),
+                payload: serde_json::json!({"summary": "second act"}),
+                actor: None,
+            },
+        )
+        .await
+        .unwrap();
+        db.close().await;
+
+        let after = read_authority_act_head_from_path(&path).await.unwrap();
+        assert_eq!(after.head_act, before.head_act + 1);
+        assert_eq!(after.origin_database_id, before.origin_database_id);
+    }
+
+    /// A missing path fails closed rather than probing nothing.
+    #[tokio::test]
+    async fn file_probe_fails_closed_on_missing_path() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            read_authority_act_head_from_path(&dir.path().join("absent.db"))
+                .await
+                .is_err()
+        );
+    }
+
+    /// A non-database file fails closed rather than yielding partial evidence.
+    #[tokio::test]
+    async fn file_probe_fails_closed_on_non_database_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("not-a-database.db");
+        std::fs::write(&path, b"this is not sqlite").unwrap();
+        assert!(read_authority_act_head_from_path(&path).await.is_err());
+    }
+
+    /// A pre-act schema — sequenced logs without `act_state`, `act` columns
+    /// or `act_cutover` rows — fails closed. This is the shape of every
+    /// engine below schema 56, including a cancellable-retiring tenant the
+    /// ready-only fleet migration never moved forward.
+    #[tokio::test]
+    async fn file_probe_fails_closed_on_pre_act_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pre-act.db");
+        let options = SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(true);
+        let mut connection = SqliteConnection::connect_with(&options).await.unwrap();
+        sqlx::query("CREATE TABLE content_events(seq INTEGER PRIMARY KEY)")
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO content_events(seq) VALUES(1)")
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        connection.close().await.unwrap();
+        assert!(read_authority_act_head_from_path(&path).await.is_err());
+    }
+
+    /// A schema-complete database with a damaged coordinate — one act
+    /// cutover row removed — fails closed rather than reporting a head
+    /// without its grouping-unknown boundary.
+    #[tokio::test]
+    async fn file_probe_fails_closed_on_incomplete_cutover() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = file_authority(&dir, "authority.db").await;
+        read_authority_act_head_from_path(&path).await.unwrap();
+
+        let options = SqliteConnectOptions::new().filename(&path);
+        let mut connection = SqliteConnection::connect_with(&options).await.unwrap();
+        sqlx::query("DELETE FROM act_cutover WHERE domain = 'content_events'")
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        connection.close().await.unwrap();
+
+        assert!(read_authority_act_head_from_path(&path).await.is_err());
     }
 }

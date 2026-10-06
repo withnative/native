@@ -402,6 +402,45 @@ pub async fn database_id(db: &Db) -> Result<String> {
         .cloned()
 }
 
+/// Private body-reader qualification seam. The current singleton is always
+/// checked in the owner's snapshot, even when the handle-local memo is warm.
+/// No secondary pool is borrowed and oversized/corrupt values are not copied.
+/// The caller owns the deadline, progress handler and transaction lifetime.
+pub(crate) async fn database_id_on(
+    db: &Db,
+    transaction: &mut Transaction<'_, Sqlite>,
+) -> Result<String> {
+    let metadata: Option<(String, Option<i64>)> = sqlx::query_as(
+        "SELECT typeof(origin_db_id), octet_length(origin_db_id) FROM database_identity WHERE singleton=1",
+    )
+    .fetch_optional(&mut **transaction)
+    .await?;
+    if metadata != Some(("text".into(), Some(36))) {
+        return Err(Error::engine(
+            "database identity singleton is not canonical",
+        ));
+    }
+    let current: String =
+        sqlx::query_scalar("SELECT origin_db_id FROM database_identity WHERE singleton=1")
+            .fetch_one(&mut **transaction)
+            .await?;
+    if !is_database_id(&current) {
+        return Err(Error::engine(
+            "database identity singleton is not canonical",
+        ));
+    }
+    let cached = db
+        .database_id_cell()
+        .get_or_try_init(|| async { Ok::<_, Error>(current.clone()) })
+        .await?;
+    if cached != &current {
+        return Err(Error::engine(
+            "database identity changed within live handle",
+        ));
+    }
+    Ok(current)
+}
+
 /// Stable workspace-local pseudonym for one portable account. The relation
 /// exposes this value instead of account, person-record, or host identifiers.
 #[doc(hidden)]
@@ -800,6 +839,7 @@ pub async fn rekey_database_offline(
     if reason.trim().is_empty() {
         return Err(Error::engine("database rekey requires a nonblank reason"));
     }
+    crate::managed_custody::refuse_maintenance(path)?;
     let path = std::fs::canonicalize(path)?;
     let verified_preimage_backup = std::fs::canonicalize(verified_preimage_backup)?;
     if path == verified_preimage_backup {

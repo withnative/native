@@ -21,8 +21,8 @@ its Issues, Discussions, and pull requests are not feedback or support routes.
 For current product information and ways to contact the Native team, visit
 [withnative.ai](https://www.withnative.ai/) — we would like to hear from you.
 
-The maturity table in [`README.md`](README.md) and evidence routes in
-[`docs/capability-map.md`](docs/capability-map.md) are the authorities for what
+[`README.md`](README.md) says what runs today, and the evidence routes in
+[`docs/capability-map.md`](docs/capability-map.md) are the authority for what
 is included, partial, experimental, held, or intended in this snapshot.
 
 ## Verification and provenance

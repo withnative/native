@@ -16,6 +16,21 @@ use super::PostgresDb;
 use crate::schema::ROOT_RECORD_ID;
 use crate::{Error, Result};
 
+#[derive(Clone, Copy)]
+enum ControlHistoryValidation {
+    NewAppend,
+    StoredReplay,
+}
+
+impl ControlHistoryValidation {
+    fn validate(self, event: &crate::control::ControlEventRow) -> Result<()> {
+        match self {
+            Self::NewAppend => crate::control::validate_control_event(event),
+            Self::StoredReplay => crate::control::validate_stored_control_event(event),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PostgresLogKind {
@@ -322,8 +337,14 @@ impl PostgresDb {
                     Error::Conflict(_) => "conflict",
                     Error::NotHeld(_) => "not_held",
                     Error::Auth(_) => "auth",
+                    Error::UnavailableOffline { .. } => "unavailable_offline",
+                    Error::CopyLocked { .. } => "copy_locked",
+                    Error::CopyUnavailable => "copy_unavailable",
+                    Error::CopyRemoved { .. } => "copy_removed",
+                    Error::StandbyReadOnly { .. } => "standby_read_only",
                     Error::Delivery(_) => "delivery",
                     Error::DeploymentReadOnly(_) => "deployment_read_only",
+                    Error::DeploymentDraining(_) => "deployment_draining",
                     Error::Sqlx(_) => "database",
                     Error::Json(_) => "json",
                     Error::Io(_) => "io",
@@ -685,6 +706,25 @@ impl PostgresDb {
     /// canonical control projection. The fold is performed by the shared
     /// SQLite projector so Postgres cannot drift into a second state machine.
     pub async fn append_control_event(&self, event: PostgresControlEvent) -> Result<i64> {
+        self.append_control_event_with_validation(event, ControlHistoryValidation::NewAppend)
+            .await
+    }
+
+    /// Only stored-history reconstruction may use legacy validation. This is
+    /// private to the Postgres module, never a new-event admission bypass.
+    pub(super) async fn replay_stored_control_event(
+        &self,
+        event: PostgresControlEvent,
+    ) -> Result<i64> {
+        self.append_control_event_with_validation(event, ControlHistoryValidation::StoredReplay)
+            .await
+    }
+
+    async fn append_control_event_with_validation(
+        &self,
+        event: PostgresControlEvent,
+        validation: ControlHistoryValidation,
+    ) -> Result<i64> {
         for (field, value) in [
             ("control event id", event.id.as_str()),
             ("control idempotency_key", event.idempotency_key.as_str()),
@@ -716,7 +756,7 @@ impl PostgresDb {
             created_at: event.created_at.clone(),
             act: event.act,
         };
-        crate::control::validate_control_event(&canonical_event)?;
+        validation.validate(&canonical_event)?;
         let mut tx = self.pool.begin().await?;
         // Allocate first: this locks the control cursor and serializes every
         // writer before the idempotency re-check. If the key already exists we
@@ -1196,5 +1236,115 @@ fn validate_nonempty(field: &str, value: &str) -> Result<()> {
         Err(Error::engine(format!("{field} cannot be empty")))
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod control_history_tests {
+    use super::ControlHistoryValidation;
+    use crate::control::{self, alpha_tab_provenance_tests as alpha, ALPHA_TAB_ADOPTION_VERIFIED};
+
+    #[tokio::test]
+    async fn postgres_import_refuses_adopted_alpha_tabs_before_provisioning() {
+        async fn check(db: &crate::Db) -> crate::Result<()> {
+            let bytes = crate::interchange::export_canonical_interchange(db)
+                .await
+                .unwrap();
+            let interchange = crate::interchange::validate_canonical_interchange(&bytes).unwrap();
+            super::super::validate_postgres_alpha_tab_import(&interchange).await
+        }
+        for method in [
+            ALPHA_TAB_ADOPTION_VERIFIED,
+            control::ALPHA_TAB_ADOPTION_SHELL_AUTO,
+        ] {
+            let (db, pin, token) = alpha::fixture(Some(method)).await;
+            let update = alpha::update(&db, &pin, &token, pin.consented_declaration.clone()).await;
+            let token = alpha::append_update(&db, &update).await;
+            let pin = alpha::updated_pin(&update);
+            let error = check(&db).await.unwrap_err().to_string();
+            assert!(error.contains("Postgres import does not yet support alpha-tab consent reset"));
+            assert!(error.contains(&pin.package));
+            let disabled = alpha::transition(&db, &pin, &token, "disable").await;
+            assert!(check(&db).await.is_err());
+            alpha::transition(&db, &pin, &disabled, "restore").await;
+            check(&db).await.unwrap();
+            db.close().await;
+        }
+        let (db, pin, token) = alpha::fixture(Some(ALPHA_TAB_ADOPTION_VERIFIED)).await;
+        alpha::transition(&db, &pin, &token, "remove").await;
+        assert!(check(&db).await.is_err());
+        let bytes = crate::interchange::export_canonical_interchange(&db)
+            .await
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let imported = crate::interchange::import_canonical_interchange(
+            &bytes,
+            &dir.path().join("pending.db"),
+            crate::interchange::ImportContinuity::ForeignBoundary,
+        )
+        .await
+        .unwrap();
+        check(&imported).await.unwrap();
+        imported.close().await;
+        db.close().await;
+        let (pending, _, _) = alpha::fixture(None).await;
+        check(&pending).await.unwrap();
+        pending.close().await;
+    }
+
+    #[tokio::test]
+    async fn postgres_control_replay_accepts_stored_boundaries_and_legacy_restores_only() {
+        let (db, pin, token) = alpha::fixture(Some(ALPHA_TAB_ADOPTION_VERIFIED)).await;
+        let disabled = alpha::transition(&db, &pin, &token, "disable").await;
+        alpha::transition(&db, &pin, &disabled, "restore").await;
+        let mut conn = db.pool().acquire().await.unwrap();
+        let mut history = control::read_all_control_events(&mut conn).await.unwrap();
+        drop(conn);
+        let restore = history.last_mut().unwrap();
+        let mut payload: serde_json::Value = serde_json::from_str(&restore.payload).unwrap();
+        payload["adoption"] = serde_json::json!(ALPHA_TAB_ADOPTION_VERIFIED);
+        restore.payload = serde_json::to_string(&payload).unwrap();
+        assert!(ControlHistoryValidation::NewAppend
+            .validate(restore)
+            .is_err());
+        assert!(ControlHistoryValidation::StoredReplay
+            .validate(restore)
+            .is_ok());
+        let record_ids = vec![pin.artifact_id.clone()];
+        control::canonical_projection_snapshot(&history, &record_ids)
+            .await
+            .unwrap();
+        let bytes = crate::interchange::export_canonical_interchange(&db)
+            .await
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let imported = crate::interchange::import_canonical_interchange(
+            &bytes,
+            &dir.path().join("import.db"),
+            crate::interchange::ImportContinuity::ForeignBoundary,
+        )
+        .await
+        .unwrap();
+        let mut conn = imported.pool().acquire().await.unwrap();
+        let history = control::read_all_control_events(&mut conn).await.unwrap();
+        drop(conn);
+        let reset = history.last().unwrap();
+        assert_eq!(reset.event_type, "alpha_tab.import_reset");
+        assert!(ControlHistoryValidation::NewAppend.validate(reset).is_err());
+        assert!(ControlHistoryValidation::StoredReplay
+            .validate(reset)
+            .is_ok());
+        control::canonical_projection_snapshot(&history, &record_ids)
+            .await
+            .unwrap();
+        let mut forged = reset.clone();
+        let mut payload: serde_json::Value = serde_json::from_str(&forged.payload).unwrap();
+        payload["pin"]["adoption"] = serde_json::json!(ALPHA_TAB_ADOPTION_VERIFIED);
+        forged.payload = serde_json::to_string(&payload).unwrap();
+        assert!(ControlHistoryValidation::StoredReplay
+            .validate(&forged)
+            .is_err());
+        imported.close().await;
+        db.close().await;
     }
 }

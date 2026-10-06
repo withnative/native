@@ -366,8 +366,14 @@ class PreviewPreparationTests(unittest.TestCase):
         self.assertIn("[contribution policy](CONTRIBUTING.md)", public_readme)
         self.assertNotIn("Private early preview", public_readme)
         self.assertNotIn("native-preview", public_readme)
-        self.assertIn('"name":"native-source","version"', public_readme)
-        self.assertEqual(public_readme.count("/tmp/native-source.db"), 2)
+        self_hosting = (PUBLICATION_ROOT / "SELF_HOSTING.md").read_text(encoding="utf-8")
+        self.assertIn('"name":"native-source","version"', self_hosting)
+        self.assertEqual(self_hosting.count("/tmp/native-source.db"), 2)
+        self.assertIn('"name":"engine_info"', self_hosting)
+        self.assertIn(
+            "NATIVE_CE_MCP_SURFACE=legacy target/debug/mcp-stdio", self_hosting
+        )
+        self.assertNotIn("/tmp/native-source.db", public_readme)
         self.assertIn(
             "# Exploring the public source snapshot",
             (self.output / "BUILDING.md").read_text(),

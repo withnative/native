@@ -468,16 +468,34 @@ fn value_at_dotted_path<'a>(value: &'a Value, path: &str) -> Option<&'a Value> {
         .try_fold(value, |current, segment| current.get(segment))
 }
 
-fn parse_temporal(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+/// A `temporal_order` endpoint: a floating full-date or an RFC3339 date-time.
+enum Temporal {
+    Date(chrono::NaiveDate),
+    DateTime(chrono::DateTime<chrono::FixedOffset>),
+}
+
+fn parse_temporal(value: &str) -> Option<Temporal> {
     chrono::DateTime::parse_from_rfc3339(value)
-        .map(|value| value.with_timezone(&chrono::Utc))
+        .map(Temporal::DateTime)
         .ok()
         .or_else(|| {
             chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d")
-                .ok()?
-                .and_hms_opt(0, 0, 0)
-                .map(|value| value.and_utc())
+                .ok()
+                .map(Temporal::Date)
         })
+}
+
+/// Whether `earlier` follows `later`. A full-date is a floating calendar day,
+/// not UTC midnight, so it compares by day: against another date directly,
+/// and against a date-time by that date-time's calendar day at its own
+/// written offset. Two date-times compare as instants.
+fn temporal_follows(earlier: &Temporal, later: &Temporal) -> bool {
+    match (earlier, later) {
+        (Temporal::DateTime(earlier), Temporal::DateTime(later)) => earlier > later,
+        (Temporal::Date(earlier), Temporal::Date(later)) => earlier > later,
+        (Temporal::Date(earlier), Temporal::DateTime(later)) => *earlier > later.date_naive(),
+        (Temporal::DateTime(earlier), Temporal::Date(later)) => earlier.date_naive() > *later,
+    }
 }
 
 /// Enforce one resolved object-facet declaration against a caller value.
@@ -523,7 +541,7 @@ pub fn validate_object_facet_value(shape: &Value, value: &Value) -> Result<()> {
                 "'{later_path}' must be an ISO full-date or RFC3339 date-time"
             ))
         })?;
-        if earlier > later {
+        if temporal_follows(&earlier, &later) {
             return Err(Error::engine(format!(
                 "'{earlier_path}' must not be later than '{later_path}'"
             )));
@@ -535,6 +553,7 @@ pub fn validate_object_facet_value(shape: &Value, value: &Value) -> Result<()> {
 fn parse_data(data: SchemaConfigData) -> Result<(Value, String)> {
     match data {
         SchemaConfigData::Text(text) => {
+            crate::schema_config_json_nodes::prepare(&text)?;
             let parsed: Value = serde_json::from_str(&text)
                 .map_err(|_| Error::engine("schema_config data must be valid JSON"))?;
             if !parsed.is_object() {
@@ -551,6 +570,7 @@ fn parse_data(data: SchemaConfigData) -> Result<(Value, String)> {
                 ));
             }
             let json = serde_json::to_string(&value)?;
+            crate::schema_config_json_nodes::prepare(&json)?;
             Ok((value, json))
         }
     }
@@ -766,6 +786,34 @@ pub async fn seed_recommended_pack_schema_config(db: &Db) -> Result<String> {
     .await
 }
 
+/// Enrolled serving cannot reconcile the pack through an unowned writer.
+pub(crate) async fn require_reconciled_recommended_pack(
+    conn: &mut sqlx::SqliteConnection,
+) -> Result<()> {
+    let id = format!("pack:{RECOMMENDED_PACK_NAME}");
+    let row = sqlx::query("SELECT layer,name,data,version_lineage,applies_to_collection_id FROM schema_config WHERE id=?")
+        .bind(id).fetch_optional(conn).await?;
+    let refused =
+        || Error::engine("enrolled storage needs recommended-pack reconciliation before serving");
+    let Some(row) = row else {
+        return Err(refused());
+    };
+    if row.try_get::<String, _>("layer")? != "pack"
+        || row.try_get::<Option<String>, _>("name")?.as_deref() != Some(RECOMMENDED_PACK_NAME)
+        || serde_json::from_str::<Value>(&row.try_get::<String, _>("data")?)?
+            != recommended_pack_schema_config()
+        || row
+            .try_get::<Option<String>, _>("version_lineage")?
+            .is_some()
+        || row
+            .try_get::<Option<String>, _>("applies_to_collection_id")?
+            .is_some()
+    {
+        return Err(refused());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod lifecycle_axis_tests {
     use super::*;
@@ -807,5 +855,80 @@ mod lifecycle_axis_tests {
             }
         }))
         .is_err());
+    }
+}
+
+#[cfg(test)]
+mod temporal_order_tests {
+    use super::validate_object_facet_value;
+    use serde_json::json;
+
+    fn window(start: &str, end: &str) -> crate::Result<()> {
+        validate_object_facet_value(
+            &json!({ "type": "object", "temporal_order": [{ "earlier": "start", "later": "end" }] }),
+            &json!({ "start": start, "end": end }),
+        )
+    }
+
+    #[test]
+    fn full_dates_order_as_calendar_days() {
+        assert!(window("2026-07-01", "2026-07-31").is_ok());
+        assert!(
+            window("2026-07-31", "2026-07-31").is_ok(),
+            "a one-day window"
+        );
+        assert!(window("2026-08-01", "2026-07-31").is_err());
+        assert!(window("2025-12-31", "2026-01-01").is_ok());
+    }
+
+    #[test]
+    fn a_full_date_is_not_utc_midnight_against_a_date_time() {
+        // 23:00 at -05:00 on 5 Oct is 04:00 UTC on 6 Oct. As UTC midnight
+        // the 6th would wrongly precede it; as calendar days the 5th comes
+        // first.
+        assert!(window("2026-10-05T23:00:00-05:00", "2026-10-06").is_ok());
+        // Conversely the 6th follows a date-time written on the 5th, even
+        // though that date-time is the 6th in UTC.
+        assert!(window("2026-10-06", "2026-10-05T23:00:00-05:00").is_err());
+        // 01:00 at +05:00 on 6 Oct is 20:00 UTC on 5 Oct, still the 6th as
+        // written, so a window starting on the 6th may end then.
+        assert!(window("2026-10-06", "2026-10-06T01:00:00+05:00").is_ok());
+        // A date covers its whole day, in either position.
+        assert!(window("2026-10-05", "2026-10-05T09:00:00Z").is_ok());
+        assert!(window("2026-10-05T09:00:00Z", "2026-10-05").is_ok());
+        assert!(window("2026-10-05T09:00:00Z", "2026-10-04").is_err());
+    }
+
+    /// A compatibility change, kept deliberately: as UTC midnight this window
+    /// was accepted, because the end is 04:00 UTC on the 6th. By calendar day
+    /// it ends on the 5th, before it starts, so re-validating a stored facet
+    /// with this window now refuses it.
+    #[test]
+    fn a_mixed_window_accepted_as_utc_midnight_is_now_refused() {
+        let error = window("2026-10-06", "2026-10-05T23:00:00-05:00")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("'start' must not be later than 'end'"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn date_times_still_order_as_instants() {
+        assert!(window("2026-08-01T00:00:00Z", "2026-08-02T00:00:00Z").is_ok());
+        assert!(window("2026-08-02T00:00:00Z", "2026-08-01T00:00:00Z").is_err());
+        // Same instant written at different offsets.
+        assert!(window("2026-10-05T10:00:00+01:00", "2026-10-05T09:00:00Z").is_ok());
+        assert!(window("2026-10-05T10:00:01+01:00", "2026-10-05T09:00:00Z").is_err());
+    }
+
+    #[test]
+    fn unparseable_endpoints_are_refused() {
+        let error = window("03/08/2026", "2026-08-04").unwrap_err().to_string();
+        assert!(
+            error.contains("'start' must be an ISO full-date or RFC3339 date-time"),
+            "{error}"
+        );
     }
 }

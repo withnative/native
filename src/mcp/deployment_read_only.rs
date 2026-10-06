@@ -13,6 +13,15 @@ use crate::{DeploymentReadOnlyOperation, Error, Result};
 
 pub const DEPLOYMENT_READ_ONLY_ERROR: &str = "DEPLOYMENT_READ_ONLY";
 
+pub const DEPLOYMENT_DRAINING_ERROR: &str = "DEPLOYMENT_DRAINING";
+
+/// Conservative recovery guidance for [`DEPLOYMENT_DRAINING_ERROR`]. The
+/// custody write never started, but earlier effects in the same operation may
+/// have committed — so unlike a pre-admission freeze refusal, this is never
+/// `applied=false` and never blanket-retryable. Restart the operation from
+/// its beginning rather than resending the refused request.
+pub const DEPLOYMENT_DRAINING_RECOVERY: &str = "Deployment writers are paused for a freeze drain (outcome unknown). The refused write did not start, but earlier effects in this operation may have committed: verify current state before acting rather than resending this request. Never assume the operation was unapplied.";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OperationAccess {
     Read,
@@ -23,6 +32,7 @@ pub enum OperationAccess {
 struct Gate {
     lock: Arc<tokio::sync::RwLock<()>>,
     freeze_waiters: AtomicUsize,
+    boot_frozen: bool,
 }
 
 impl Default for Gate {
@@ -30,6 +40,7 @@ impl Default for Gate {
         Self {
             lock: Arc::new(tokio::sync::RwLock::new(())),
             freeze_waiters: AtomicUsize::new(0),
+            boot_frozen: false,
         }
     }
 }
@@ -55,6 +66,22 @@ struct PersistenceLease {
     _gate: Arc<Gate>,
 }
 
+tokio::task_local! { static JOB_PERSISTENCE_LEASE: Option<DeploymentPersistenceLease>; }
+pub(crate) fn current_job_lease() -> Option<DeploymentPersistenceLease> {
+    JOB_PERSISTENCE_LEASE.try_with(Clone::clone).ok().flatten()
+}
+/// Retain already admitted deployment authority across an owned execution
+/// handoff. This scopes an existing unforgeable lease; it admits no new work.
+#[doc(hidden)]
+pub async fn scope_deployment_persistence<F: std::future::Future>(
+    lease: Option<DeploymentPersistenceLease>,
+    future: F,
+) -> F::Output {
+    JOB_PERSISTENCE_LEASE
+        .scope(lease.or_else(current_job_lease), future)
+        .await
+}
+
 /// Exclusive process freeze. Dropping this internal authority reopens writes.
 #[derive(Debug)]
 pub struct DeploymentFreezeLease {
@@ -75,13 +102,21 @@ pub enum DeploymentAdmission {
 pub struct DeploymentMutationBarrier(Arc<Gate>);
 
 impl DeploymentMutationBarrier {
+    /// A read-only serving process cannot thaw when a release lease expires.
+    pub fn boot_frozen() -> Self {
+        Self(Arc::new(Gate {
+            boot_frozen: true,
+            ..Gate::default()
+        }))
+    }
+
     /// Admit an operation without waiting behind a pending freeze.
     pub fn admit(
         &self,
         operation: &DeploymentReadOnlyOperation,
         access: OperationAccess,
     ) -> Result<DeploymentAdmission> {
-        if self.0.freeze_waiters.load(Ordering::SeqCst) > 0 {
+        if self.0.boot_frozen || self.0.freeze_waiters.load(Ordering::SeqCst) > 0 {
             return self.read_only_result(operation, access);
         }
         let guard = match self.0.lock.clone().try_read_owned() {
@@ -143,7 +178,8 @@ impl DeploymentMutationBarrier {
     /// Instantaneous state used only for early refusal and observability.
     /// Correct dispatch still relies on [`Self::admit`] and its retained lease.
     pub fn is_read_only(&self) -> bool {
-        self.0.freeze_waiters.load(Ordering::SeqCst) > 0
+        self.0.boot_frozen
+            || self.0.freeze_waiters.load(Ordering::SeqCst) > 0
             || self.0.lock.clone().try_read_owned().is_err()
     }
 }
@@ -165,6 +201,26 @@ mod tests {
         })
         .await
         .expect("freeze intent was not registered");
+    }
+
+    #[tokio::test]
+    async fn boot_frozen_never_thaws_when_a_freeze_lease_drops() {
+        let barrier = DeploymentMutationBarrier::boot_frozen();
+        assert!(barrier.is_read_only());
+        drop(barrier.freeze().await);
+        assert!(matches!(
+            barrier
+                .admit(&operation("get_record"), OperationAccess::Read)
+                .unwrap(),
+            DeploymentAdmission::FrozenRead
+        ));
+        assert_eq!(
+            barrier
+                .admit(&operation("create_record"), OperationAccess::Mutation)
+                .unwrap_err()
+                .deployment_read_only_operation(),
+            Some("create_record")
+        );
     }
 
     #[tokio::test]

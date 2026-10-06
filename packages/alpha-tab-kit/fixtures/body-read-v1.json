@@ -1,0 +1,142 @@
+[
+  {
+    "contract": "records.body.read.v1",
+    "error": {
+      "code": "invalid_params",
+      "reason": "request"
+    }
+  },
+  {
+    "contract": "records.body.read.v1",
+    "error": {
+      "code": "invalid_cursor",
+      "reason": "cursor"
+    }
+  },
+  {
+    "contract": "records.body.read.v1",
+    "error": {
+      "code": "cursor_expired",
+      "reason": "cursor"
+    }
+  },
+  {
+    "contract": "records.body.read.v1",
+    "error": {
+      "code": "resource_exhausted",
+      "reason": "result_budget"
+    }
+  },
+  {
+    "contract": "records.body.read.v1",
+    "error": {
+      "code": "unsupported_profile",
+      "reason": "primary_sqlite_required"
+    }
+  },
+  {
+    "contract": "records.body.read.v1",
+    "error": {
+      "code": "unsupported_capability",
+      "reason": "portability_policy"
+    }
+  },
+  {
+    "contract": "records.body.read.v1",
+    "error": {
+      "code": "source_integrity",
+      "reason": "source"
+    }
+  },
+  {
+    "contract": "records.body.read.v1",
+    "error": {
+      "code": "undeclared_read",
+      "reason": "descriptor"
+    }
+  },
+  {
+    "contract": "records.body.read.v1",
+    "error": {
+      "code": "adoption_required",
+      "reason": "source"
+    }
+  },
+  {
+    "contract": "records.body.read.v1",
+    "error": {
+      "code": "record_unavailable",
+      "reason": "target"
+    }
+  },
+  {
+    "contract": "records.body.read.v1",
+    "error": {
+      "code": "access_lost",
+      "reason": "target"
+    }
+  },
+  {
+    "contract": "records.body.read.v1",
+    "error": {
+      "code": "scope_denied",
+      "reason": "scope"
+    }
+  },
+  {
+    "contract": "records.body.read.v1",
+    "error": {
+      "code": "revision_changed",
+      "reason": "incarnation"
+    }
+  },
+  {
+    "contract": "records.body.read.v1",
+    "error": {
+      "code": "too_large",
+      "reason": "body_read_work_limit"
+    }
+  },
+  {
+    "contract": "records.body.read.v1",
+    "error": {
+      "code": "resource_exhausted",
+      "reason": "process_busy"
+    }
+  },
+  {
+    "contract": "records.body.read.v1",
+    "error": {
+      "code": "resource_exhausted",
+      "reason": "source_work_limit"
+    }
+  },
+  {
+    "contract": "records.body.read.v1",
+    "error": {
+      "code": "resource_exhausted",
+      "reason": "provenance_work_limit"
+    }
+  },
+  {
+    "contract": "records.body.read.v1",
+    "error": {
+      "code": "resource_exhausted",
+      "reason": "vm_work_limit"
+    }
+  },
+  {
+    "contract": "records.body.read.v1",
+    "error": {
+      "code": "timeout",
+      "reason": "request"
+    }
+  },
+  {
+    "contract": "records.body.read.v1",
+    "error": {
+      "code": "engine",
+      "reason": "integrity_or_execution"
+    }
+  }
+]

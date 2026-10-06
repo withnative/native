@@ -666,7 +666,7 @@ impl ToolKind {
             Self::ManageSchemaConfig => Actions(&["read"]),
             Self::ManageAttachments => Actions(&["list", "inspect"]),
             Self::StartWork => Actions(&["preview"]),
-            Self::ManageInstructions => Actions(&["list", "compare_seeded_default"]),
+            Self::ManageInstructions => Actions(&["list", "resolve", "compare_seeded_default"]),
             Self::ManageOnboarding => Actions(&["list_programmes", "preview_generation"]),
             Self::ManageMemberships => {
                 Actions(&["list", "invitations_list", "invitations_inspect"])
@@ -850,6 +850,16 @@ impl ToolKind {
             | Self::ManageAttributions
             | Self::ReachConnect => Class::NoRead,
         }
+    }
+
+    /// Member-scope answer for this surface (contract c323277 rev 7 §3.1,
+    /// §2.3). Data, not behaviour: the per-tool record of the §2.3
+    /// per-surface table, so a new `ToolKind` cannot compile until somebody
+    /// decides its member-offline answer. The table itself lives in
+    /// `super::member_scope`; this match being exhaustive (no wildcard) is
+    /// the enforcement.
+    pub const fn member_scope(self) -> super::member_scope::MemberScope {
+        super::member_scope::classify(self)
     }
 
     /// Complete exposure metadata for every production capability.
@@ -2239,8 +2249,14 @@ fn error_kind(error: &Error) -> &'static str {
         Error::Conflict(_) => "conflict",
         Error::NotHeld(_) => "not_held",
         Error::Auth(_) => "auth",
+        Error::UnavailableOffline { .. } => "unavailable_offline",
+        Error::CopyLocked { .. } => "copy_locked",
+        Error::CopyUnavailable => "copy_unavailable",
+        Error::CopyRemoved { .. } => "copy_removed",
+        Error::StandbyReadOnly { .. } => "standby_read_only",
         Error::Delivery(_) => "delivery",
         Error::DeploymentReadOnly(_) => "deployment_read_only",
+        Error::DeploymentDraining(_) => "deployment_draining",
         Error::Sqlx(_) => "database",
         Error::Json(_) => "json",
         Error::Io(_) => "io",
@@ -2494,6 +2510,7 @@ struct CaptureWorkerState {
 /// prefix; they never fail the call that produced them.
 pub(crate) struct CaptureQueue {
     sender: mpsc::Sender<PendingCapture>,
+    persistence_enabled: bool,
     shutdown: AtomicBool,
     /// Serializes admission, the send, and accepted accounting against
     /// `initiate_shutdown`, so the shutdown frontier provably includes every
@@ -2525,11 +2542,33 @@ impl CaptureQueue {
     }
 
     fn with_depth(depth: usize) -> Arc<Self> {
+        let (queue, receiver) = Self::channel(depth, true);
+        tokio::spawn({
+            let worker = Arc::clone(&queue.worker);
+            async move { drive_captures(receiver, worker).await }
+        });
+        queue
+    }
+
+    /// A handle with no persistence authority owns no capture worker. In
+    /// particular, declarations must not bypass this refusal as they do a
+    /// normal queue's shutdown frontier.
+    pub(crate) fn inert() -> Arc<Self> {
+        let (queue, receiver) = Self::channel(CAPTURE_QUEUE_DEPTH, false);
+        drop(receiver);
+        queue
+    }
+
+    fn channel(
+        depth: usize,
+        persistence_enabled: bool,
+    ) -> (Arc<Self>, mpsc::Receiver<PendingCapture>) {
         let depth = depth.max(1);
         let (sender, receiver) = mpsc::channel(depth);
         let queue = Arc::new(Self {
             sender,
-            shutdown: AtomicBool::new(false),
+            persistence_enabled,
+            shutdown: AtomicBool::new(!persistence_enabled),
             admission: std::sync::Mutex::new(()),
             depth,
             enqueued: AtomicU64::new(0),
@@ -2543,11 +2582,7 @@ impl CaptureQueue {
                 settled: Notify::new(),
             }),
         });
-        tokio::spawn({
-            let worker = Arc::clone(&queue.worker);
-            async move { drive_captures(receiver, worker).await }
-        });
-        queue
+        (queue, receiver)
     }
 
     /// Enqueue one prepared capture without blocking. Admission, the send,
@@ -2681,6 +2716,14 @@ impl CaptureQueue {
     /// only `declarations_*`, so a declaration completing after shutdown can
     /// never satisfy `drain_after_shutdown`'s queue-only frontier early.
     pub(crate) async fn record_declaration(self: &Arc<Self>, capture: PendingCapture) {
+        if !self.persistence_enabled {
+            self.declarations_failed.fetch_add(1, Ordering::Relaxed);
+            self.declarations_completed.fetch_add(1, Ordering::Relaxed);
+            eprintln!(
+                "interaction_capture declaration refused: handle has no persistence authority"
+            );
+            return;
+        }
         let task = tokio::spawn({
             let this = Arc::clone(self);
             async move { execute_declaration(capture, this).await }
@@ -3127,7 +3170,7 @@ fn prepare_capture(
 
 /// Atomically insert one prepared call envelope and all extracted touches.
 async fn record_call(capture: PendingCapture) -> Result<()> {
-    let begun = crate::db::begin_capture_write(capture.db.write_pool()).await?;
+    let begun = crate::db::begin_capture_write(capture.db.capture_write_pool().await?).await?;
     // Success-path retry counts are intentionally unreported: capture is
     // silent on success. Only exhaustion is reported, via the error string
     // `begin_capture_write` already carries.
@@ -3401,6 +3444,11 @@ mod tests {
 
         let links = ToolKind::ManageLinks.standby_disposition();
         assert!(links.admits(&json!({"action":"list"})));
+        // Post-compaction refresh is a read on both the live and standby
+        // paths; binding mutations stay closed.
+        let instructions = ToolKind::ManageInstructions.standby_disposition();
+        assert!(instructions.admits(&json!({"action":"resolve"})));
+        assert!(!instructions.admits(&json!({"action":"create_binding"})));
         for arguments in [
             json!({"action":"add"}),
             json!({"action":"future_read_like_name"}),
@@ -4626,6 +4674,29 @@ mod tests {
                 result_count: Some(2),
             },
             Case {
+                name: "manage_alpha_tabs unchanged resync surfaces the pin and counts no rows",
+                kind: ToolKind::ManageAlphaTabs,
+                arguments: json!({ "action": "live_read" }),
+                result: json!({
+                    "unchanged": true,
+                    "pin": { "artifact_id": "a1" },
+                    "revision": { "revision_digest": "d", "rows_sha256": "r" },
+                }),
+                touches: vec![surfaced("a1", 1)],
+                result_count: Some(0),
+            },
+            Case {
+                name: "manage_alpha_tabs live_unsubscribe touches no records",
+                kind: ToolKind::ManageAlphaTabs,
+                arguments: json!({ "action": "live_unsubscribe" }),
+                result: json!({
+                    "subscription": "s1",
+                    "unsubscribed": true,
+                }),
+                touches: vec![],
+                result_count: Some(0),
+            },
+            Case {
                 name: "manage_renderer_binding implicit unbind mutates both endpoints and counts its removed link",
                 kind: ToolKind::ManageRendererBinding,
                 arguments: json!({ "action": "unbind", "artifact_id": "renderer" }),
@@ -5023,6 +5094,49 @@ mod tests {
             gate: None,
             pre_gate: None,
         }
+    }
+
+    #[tokio::test]
+    async fn inert_capture_queue_refuses_queued_and_shutdown_bypassing_declarations() {
+        // Use a writable database: physical SQL refusal cannot mask an
+        // accidentally spawned worker or the declaration shutdown bypass.
+        let db = crate::db::create_database(":memory:").await.unwrap();
+        let count = || async {
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM read_log_calls")
+                .fetch_one(db.write_pool())
+                .await
+                .unwrap()
+        };
+        let before = count().await;
+        let queue = CaptureQueue::inert();
+        assert!(
+            queue.sender.is_closed(),
+            "inert handle retained a worker receiver"
+        );
+        assert!(!queue.enqueue(test_capture(&db, "inert_read")));
+        queue.initiate_shutdown();
+        queue
+            .record_declaration(test_capture(&db, "inert_declaration"))
+            .await;
+        queue.drain_after_shutdown().await;
+        assert_eq!(count().await, before);
+        let stats = queue.stats();
+        assert_eq!(stats.enqueued, 0);
+        assert_eq!(stats.completed, 0);
+        assert_eq!(stats.dropped_shutdown, 1);
+        assert_eq!(stats.declarations_completed, 1);
+        assert_eq!(stats.declarations_failed, 1);
+
+        // Ordinary queues keep their intentional declaration-after-shutdown
+        // semantics, and this fixture really can persist a capture.
+        let ordinary = CaptureQueue::with_depth(1);
+        ordinary.initiate_shutdown();
+        ordinary
+            .record_declaration(test_capture(&db, "ordinary_declaration"))
+            .await;
+        assert_eq!(ordinary.stats().declarations_failed, 0);
+        assert_eq!(count().await, before + 1);
+        db.close().await;
     }
 
     /// A full queue refuses without blocking: depth 1 with the worker parked

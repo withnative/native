@@ -47,6 +47,10 @@ Authored knowledge—briefs, decisions, analyses, plans, and write-ups—belongs
 
 When an external artifact will matter after this session or to another contributor, leave a durable, openable path to it and enough context to understand what it is, why it matters, and what state it is in. Do not replace the actual deliverable with a record describing a hypothetical one.
 
+## Large finished content
+
+Write a finished artifact once, not in pieces. `body_append` is for small additions only; each append re-stores the entire body in the record's history, so streaming a finished document through it grows the log quadratically. Commit a finished document with a single `body_set` (one request carries up to about 3 MB of text), and put an app artifact in one `body_set` of at most 512 KiB. Keep `body_append` for genuinely incremental progress where a small delta is the point.
+
 ## Correct forward
 
 When reusing an ordinary account, `records_read.get_reuse_context` supplies its current body and exact revision, declared basis coverage, bounded direct concerns and recorded treatment, inherited uncertainty, and a versioned drafting instruction. Read the completeness boundaries: a complete declared set or comment window is not all relevant organisational evidence.

@@ -1,0 +1,22 @@
+    Finished `release` profile [optimized] target(s) in 0.23s
+     Running unittests src/lib.rs (target/release/deps/cel-fcc85d09bc5566a9)
+
+running 2 tests
+
+running 1 test
+P1_REGEX_STACK_PASS stack=4194304 debug=false cases=25
+test native_regex_measure::tests::public_p1_regex_stack_headroom_on_explicit_four_and_eight_mib ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 277 filtered out; finished in 0.04s
+
+test native_regex_measure::tests::adversarial_tiers_and_searches_use_pinned_public_candidates ... ok
+
+running 1 test
+P1_REGEX_STACK_PASS stack=8388608 debug=false cases=25
+test native_regex_measure::tests::public_p1_regex_stack_headroom_on_explicit_four_and_eight_mib ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 277 filtered out; finished in 0.04s
+
+test native_regex_measure::tests::public_p1_regex_stack_headroom_on_explicit_four_and_eight_mib ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 276 filtered out; finished in 0.09s

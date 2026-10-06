@@ -443,6 +443,83 @@ async fn require_attachment<E: DomainStatementExecutor>(
     Ok(bearer)
 }
 
+#[derive(Clone, Copy)]
+enum AttachmentReadScope<'a> {
+    Canonical(Principal<'a>),
+    Member,
+}
+
+/// Member admission already confines rows to E(m). This read never consults
+/// the excluded authorization plane, and still rejects absent/deleted peers.
+async fn require_read_record<E: DomainStatementExecutor>(
+    executor: &mut E,
+    scope: AttachmentReadScope<'_>,
+    tool: &str,
+    record_id: &str,
+) -> Result<()> {
+    if let AttachmentReadScope::Canonical(principal) = scope {
+        return require_record(executor, principal, tool, record_id, Capability::View).await;
+    }
+    if !member_record_present(executor, record_id).await? {
+        return Err(Error::engine(format!(
+            "{tool}: record {record_id} does not exist"
+        )));
+    }
+    Ok(())
+}
+
+async fn member_record_present<E: DomainStatementExecutor>(
+    executor: &mut E,
+    record_id: &str,
+) -> Result<bool> {
+    let statement = statement(
+        "read member attachment scope",
+        "records",
+        &[
+            "SELECT id FROM {{relation}} WHERE id = ",
+            " AND deleted_at IS NULL",
+        ],
+    )?;
+    let rows = fetch(
+        executor,
+        "read member attachment scope",
+        &statement,
+        &[BindValue::Text(record_id.into())],
+        &[ColumnSpec::required("id", LogicalType::Text)],
+    )
+    .await?;
+    Ok(!rows.is_empty())
+}
+
+async fn require_read_attachment<E: DomainStatementExecutor>(
+    executor: &mut E,
+    scope: AttachmentReadScope<'_>,
+    tool: &str,
+    attachment_id: &str,
+) -> Result<String> {
+    if let AttachmentReadScope::Canonical(principal) = scope {
+        return require_attachment(executor, principal, tool, attachment_id, Capability::View)
+            .await;
+    }
+    member_attachment_bearer(executor, attachment_id)
+        .await?
+        .ok_or_else(|| attachment_not_found(tool, attachment_id))
+}
+
+async fn member_attachment_bearer<E: DomainStatementExecutor>(
+    executor: &mut E,
+    attachment_id: &str,
+) -> Result<Option<String>> {
+    let Some(bearer) = attachment_bearer(executor, attachment_id).await? else {
+        return Ok(None);
+    };
+    Ok(if member_record_present(executor, &bearer).await? {
+        Some(bearer)
+    } else {
+        None
+    })
+}
+
 async fn resolve_attachment<E: DomainStatementExecutor>(
     executor: &mut E,
     tool: &str,
@@ -574,7 +651,54 @@ pub(crate) async fn read_attachment<P>(
 where
     P: DomainStatementExecutor + AttachmentPhysicalPort,
 {
-    require_attachment(port, principal, tool, attachment_id, Capability::View).await?;
+    read_attachment_with_scope(
+        port,
+        AttachmentReadScope::Canonical(principal),
+        tool,
+        attachment_id,
+        offset,
+        length,
+        max_length,
+    )
+    .await
+}
+
+pub(crate) async fn read_member_attachment<P>(
+    port: &mut P,
+    tool: &str,
+    attachment_id: &str,
+    offset: u64,
+    length: u64,
+    max_length: u64,
+) -> Result<Value>
+where
+    P: DomainStatementExecutor + AttachmentPhysicalPort,
+{
+    read_attachment_with_scope(
+        port,
+        AttachmentReadScope::Member,
+        tool,
+        attachment_id,
+        offset,
+        length,
+        max_length,
+    )
+    .await
+}
+
+async fn read_attachment_with_scope<P>(
+    port: &mut P,
+    scope: AttachmentReadScope<'_>,
+    tool: &str,
+    attachment_id: &str,
+    offset: u64,
+    length: u64,
+    max_length: u64,
+) -> Result<Value>
+where
+    P: DomainStatementExecutor + AttachmentPhysicalPort,
+{
+    require_read_attachment(port, scope, tool, attachment_id).await?;
     let (name, deleted_at, _, blob_id) = resolve_attachment(port, tool, attachment_id).await?;
     if length == 0 || length > max_length {
         return Err(Error::engine(format!(
@@ -586,6 +710,11 @@ where
             "{tool}: blob {blob_id} referenced by attachment {attachment_id} does not exist"
         ))
     })?;
+    if matches!(scope, AttachmentReadScope::Member) && meta.storage_tier != "inline" {
+        return Err(Error::not_held(format!(
+            "{tool}: bytes for attachment {attachment_id} are not held offline"
+        )));
+    }
     let slice = port
         .read_blob_range(&blob_id, offset, length)
         .await?
@@ -616,7 +745,30 @@ pub(crate) async fn list_attachments<E: DomainStatementExecutor>(
     tool: &str,
     record_id: &str,
 ) -> Result<Value> {
-    require_record(executor, principal, tool, record_id, Capability::View).await?;
+    list_attachments_with_scope(
+        executor,
+        AttachmentReadScope::Canonical(principal),
+        tool,
+        record_id,
+    )
+    .await
+}
+
+pub(crate) async fn list_member_attachments<E: DomainStatementExecutor>(
+    executor: &mut E,
+    tool: &str,
+    record_id: &str,
+) -> Result<Value> {
+    list_attachments_with_scope(executor, AttachmentReadScope::Member, tool, record_id).await
+}
+
+async fn list_attachments_with_scope<E: DomainStatementExecutor>(
+    executor: &mut E,
+    scope: AttachmentReadScope<'_>,
+    tool: &str,
+    record_id: &str,
+) -> Result<Value> {
+    require_read_record(executor, scope, tool, record_id).await?;
     let statement = statement(
         "list attachments",
         "records",
@@ -653,11 +805,20 @@ pub(crate) async fn list_attachments<E: DomainStatementExecutor>(
     let mut attachments = Vec::new();
     for row in rows {
         let id = text(&row, "id", "attachment list")?;
-        if require_attachment(executor, principal, tool, &id, Capability::View)
-            .await
-            .is_err()
-        {
-            continue;
+        match scope {
+            AttachmentReadScope::Canonical(principal) => {
+                if require_attachment(executor, principal, tool, &id, Capability::View)
+                    .await
+                    .is_err()
+                {
+                    continue;
+                }
+            }
+            AttachmentReadScope::Member => {
+                if member_attachment_bearer(executor, &id).await?.is_none() {
+                    continue;
+                }
+            }
         }
         let Some(kind) = optional_text(&row, "kind", "attachment list")? else {
             continue;
@@ -692,7 +853,30 @@ pub(crate) async fn inspect_attachment<E: DomainStatementExecutor>(
     tool: &str,
     attachment_id: &str,
 ) -> Result<Value> {
-    require_attachment(executor, principal, tool, attachment_id, Capability::View).await?;
+    inspect_attachment_with_scope(
+        executor,
+        AttachmentReadScope::Canonical(principal),
+        tool,
+        attachment_id,
+    )
+    .await
+}
+
+pub(crate) async fn inspect_member_attachment<E: DomainStatementExecutor>(
+    executor: &mut E,
+    tool: &str,
+    attachment_id: &str,
+) -> Result<Value> {
+    inspect_attachment_with_scope(executor, AttachmentReadScope::Member, tool, attachment_id).await
+}
+
+async fn inspect_attachment_with_scope<E: DomainStatementExecutor>(
+    executor: &mut E,
+    scope: AttachmentReadScope<'_>,
+    tool: &str,
+    attachment_id: &str,
+) -> Result<Value> {
+    require_read_attachment(executor, scope, tool, attachment_id).await?;
     let (name, deleted_at, created_at, blob_id) =
         resolve_attachment(executor, tool, attachment_id).await?;
     let meta = blob_meta(executor, &blob_id).await?;

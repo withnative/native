@@ -611,6 +611,80 @@ pub async fn seed_vocabularies(db: &Db) -> Result<()> {
     Ok(())
 }
 
+/// Read-only enrolled-open counterpart to the compiled seed decisions. Missing
+/// values and proposed core identities require offline reconciliation; no repair
+/// event or write transaction is attempted through an ordinary guarded pool.
+pub(crate) async fn require_reconciled_seed_vocabularies(
+    conn: &mut SqliteConnection,
+) -> Result<()> {
+    let refused =
+        || Error::engine("enrolled storage needs vocabulary/default reconciliation before serving");
+    for (name, values) in SEED_VOCABULARIES {
+        let vid = vocabulary_id(name);
+        if sqlx::query("SELECT 1 FROM vocabularies WHERE id = ?")
+            .bind(&vid)
+            .fetch_optional(&mut *conn)
+            .await?
+            .is_none()
+        {
+            return Err(refused());
+        }
+        for (value, _, _) in values.seeded() {
+            let gloss = sqlx::query_scalar::<_, Option<String>>(
+                "SELECT gloss FROM vocabulary_values WHERE id=?",
+            )
+            .bind(value_id(&vid, value))
+            .fetch_optional(&mut *conn)
+            .await?;
+            let Some(gloss) = gloss else {
+                return Err(refused());
+            };
+            if built_in_lifecycle_gloss(name, value).is_some()
+                && gloss.as_deref().is_none_or(|gloss| gloss.trim().is_empty())
+            {
+                return Err(refused());
+            }
+        }
+    }
+    let manifest = core_kind_manifest()?;
+    for record_type in SPINE_TYPES {
+        let vid = kind_vocabulary_id(record_type);
+        let Some(vocabulary) = get_vocabulary_on(conn, &vid).await? else {
+            return Err(refused());
+        };
+        if vocabulary.id != vid || vocabulary.name != kind_vocabulary_name(record_type) {
+            return Err(refused());
+        }
+        for kind in manifest
+            .kinds
+            .iter()
+            .filter(|kind| kind.record_type == record_type)
+        {
+            let rows = sqlx::query("SELECT id,vocabulary_id,value,status,alias_of,metadata FROM vocabulary_values WHERE id=? OR (vocabulary_id=? AND value=?)")
+                .bind(&kind.value_id).bind(&vid).bind(&kind.token).fetch_all(&mut *conn).await?;
+            if rows.len() != 1 {
+                return Err(refused());
+            }
+            let row = &rows[0];
+            if row.try_get::<String, _>("id")? != kind.value_id
+                || row.try_get::<String, _>("vocabulary_id")? != vid
+                || row.try_get::<String, _>("value")? != kind.token
+                || !matches!(
+                    row.try_get::<String, _>("status")?.as_str(),
+                    "active" | "deprecated"
+                )
+                || row.try_get::<Option<String>, _>("alias_of")?.is_some()
+                || serde_json::from_str::<serde_json::Value>(
+                    &row.try_get::<String, _>("metadata")?,
+                )? != serde_json::to_value(&kind.metadata)?
+            {
+                return Err(refused());
+            }
+        }
+    }
+    Ok(())
+}
+
 // ---- Lookups --------------------------------------------------------------
 
 pub(crate) async fn get_vocabulary_on(

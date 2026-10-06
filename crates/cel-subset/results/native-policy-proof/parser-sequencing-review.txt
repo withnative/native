@@ -1,0 +1,9 @@
+primary: identical ordered ANTLR operations, arguments, context writes, predicates and recovery; 215 entries
+unary: identical ordered ANTLR operations, arguments, context writes, predicates and recovery; 66 entries
+member_rec: identical ordered ANTLR operations, arguments, context writes, predicates and recovery; 121 entries
+calc_rec: identical ordered ANTLR operations, arguments, context writes, predicates and recovery; 72 entries
+relation_rec: identical ordered ANTLR operations, arguments, context writes, predicates and recovery; 47 entries
+expr: identical ordered ANTLR operations, arguments, context writes, predicates and recovery; 30 entries
+conditionalOr: identical ordered ANTLR operations, arguments, context writes, predicates and recovery; 32 entries
+conditionalAnd: identical ordered ANTLR operations, arguments, context writes, predicates and recovery; 32 entries
+Every generated token outside eight approved methods + new rule_frame helper unchanged.

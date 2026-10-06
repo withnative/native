@@ -19,6 +19,48 @@ pub(crate) const LEGACY_LINK_REDUCER_ID: &str = "legacy_link";
 pub(crate) const LEGACY_SUPPORT_CLASS: &str = "source_authorised_support";
 pub(crate) const LEGACY_CONTEST_CLASS: &str = "source_authorised_contest";
 
+// Historical content events could supply a `rel:` link id before that
+// compatibility namespace was reserved. A physical row with such an id is
+// content-owned only while its matching content-classified add remains live.
+// Build the SQL token list from the same closed list used by `classify`.
+pub(crate) fn content_link_provenance() -> String {
+    let content_tokens = CONTENT_OWNED_RELATIONSHIPS
+        .iter()
+        .map(|token| format!("'{token}'"))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "EXISTS (
+    SELECT 1 FROM content_events added
+     WHERE added.type='link.added'
+       AND json_extract(added.payload,'$.id')=links.id
+       AND json_extract(added.payload,'$.source_id')=links.source_id
+       AND json_extract(added.payload,'$.target_id')=links.target_id
+       AND json_extract(added.payload,'$.relationship')=links.relationship
+       AND (links.relationship IN ({content_tokens})
+            OR EXISTS (
+              SELECT 1 FROM content_events born
+               WHERE born.record_id IN (links.source_id,links.target_id)
+                 AND born.type='record.created' AND born.seq<=added.seq
+                 AND json_extract(born.payload,'$.type')='Message'
+                 AND NOT EXISTS (
+                   SELECT 1 FROM content_events corrected
+                    WHERE corrected.record_id=born.record_id
+                      AND corrected.type='record.type_corrected.v1'
+                      AND corrected.seq>born.seq AND corrected.seq<=added.seq
+                 )
+            ))
+       AND NOT EXISTS (
+         SELECT 1 FROM content_events removed
+          WHERE removed.type='link.removed' AND removed.seq>added.seq
+            AND json_extract(removed.payload,'$.source_id')=links.source_id
+            AND json_extract(removed.payload,'$.target_id')=links.target_id
+            AND json_extract(removed.payload,'$.relationship')=links.relationship
+       )
+)"
+    )
+}
+
 /// Engine-semantic links retain content-log ownership. This is intentionally a
 /// closed list: adding a new internal producer requires an explicit replay
 /// compatibility decision here, not a heuristic based on caller or timing.

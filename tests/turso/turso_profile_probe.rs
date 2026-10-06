@@ -324,6 +324,10 @@ fn draft_storage_profiles_are_machine_readable_and_keep_axes_separate() {
             include_str!("../../protocol/storage-portability/v1/profiles/turso-local-v4.json"),
         ),
         (
+            "turso-local@5",
+            include_str!("../../protocol/storage-portability/v1/profiles/turso-local-v5.json"),
+        ),
+        (
             "turso-remote@2",
             include_str!("../../protocol/storage-portability/v1/profiles/turso-remote-v2.json"),
         ),
@@ -384,10 +388,10 @@ fn draft_storage_profiles_are_machine_readable_and_keep_axes_separate() {
         .all(|profile| profile["format"] == "native.storage-profile.v1"));
     assert_eq!(profiles[0]["engine"]["family"], "sqlite");
     assert_eq!(profiles[1]["engine"]["family"], "postgresql");
-    assert!(profiles[2..10]
+    assert!(profiles[2..11]
         .iter()
         .all(|profile| profile["engine"]["family"] == "turso"));
-    assert_eq!(profiles[10]["engine"]["family"], "libsql");
+    assert_eq!(profiles[11]["engine"]["family"], "libsql");
     assert_eq!(profiles[0]["frontend"]["dialect"], "sqlite");
     assert_eq!(profiles[1]["frontend"]["dialect"], "postgres");
     assert!(profiles[2..]
@@ -398,7 +402,7 @@ fn draft_storage_profiles_are_machine_readable_and_keep_axes_separate() {
         "sharing a dialect must not collapse SQLite and Turso into one engine"
     );
 
-    for index in [5, 6, 7, 8, 9, 10] {
+    for index in [5, 6, 7, 8, 9, 10, 11] {
         let mut incomplete = profiles[index].clone();
         incomplete
             .as_object_mut()
@@ -414,7 +418,7 @@ fn draft_storage_profiles_are_machine_readable_and_keep_axes_separate() {
 #[test]
 fn current_turso_profiles_pin_four_non_transferable_operational_identities() {
     let local = serde_json::from_str::<serde_json::Value>(include_str!(
-        "../../protocol/storage-portability/v1/profiles/turso-local-v4.json"
+        "../../protocol/storage-portability/v1/profiles/turso-local-v5.json"
     ))
     .unwrap();
     let remote = serde_json::from_str::<serde_json::Value>(include_str!(
@@ -494,10 +498,11 @@ fn turso_local_profile_claims_only_the_bounded_shared_runtime() {
     ))
     .unwrap();
     let profile: serde_json::Value = serde_json::from_str(include_str!(
-        "../../protocol/storage-portability/v1/profiles/turso-local-v4.json"
+        "../../protocol/storage-portability/v1/profiles/turso-local-v5.json"
     ))
     .unwrap();
     assert_eq!(immutable_v2["revision"], 2);
+    assert_eq!(profile["revision"], 5);
     assert_eq!(
         immutable_v2["capabilities"]["native.raw-sql"]["support"],
         "unsupported"

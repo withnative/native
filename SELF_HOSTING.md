@@ -4,7 +4,7 @@ This is the setup route for an agent helping someone run the **current public
 source snapshot** on their own computer. It produces a persistent, local SQLite
 database served to an MCP client over stdio. It does not produce a networked
 Native service or the browser Workbench. The [README](README.md#roadmap)
-describes the later Runnable Preview and meaningful self-hosting stages.
+describes what comes next, including self-hosting the whole product.
 
 ## Give this to your agent
 
@@ -80,10 +80,20 @@ policy layer; use the operating system's file permissions to protect it.
 If the binary exits at startup, run the same command in a terminal and read
 stderr. Confirm the binary exists, the database directory is writable, and
 the client passed the database path as one argument. For a direct protocol
-probe independent of a client, use the two-request example in the
-[README](README.md#source-exploration). That minimal protocol probe selects
-the legacy compatibility surface explicitly; keep the default executor
-surface for the client setup above.
+probe independent of a client, send these two requests to the built binary,
+using a separate disposable database:
+
+```sh
+printf '%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"native-source","version":"1.0.0"}}}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"engine_info","arguments":{}}}' \
+| NATIVE_CE_MCP_SURFACE=legacy target/debug/mcp-stdio /tmp/native-source.db
+```
+
+The second response should contain `result.structuredContent.engine` equal
+to `native-ce`. That minimal protocol probe selects the legacy compatibility
+surface explicitly; keep the default executor surface for the client setup
+above. Remove `/tmp/native-source.db` after the probe.
 
 ## Current limits
 

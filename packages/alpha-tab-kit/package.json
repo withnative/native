@@ -1,0 +1,56 @@
+{
+  "name": "@withnative/alpha-tab-kit",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Check, digest, locally host and install a Native alpha tab package against the real hosted contract, from outside native-ce.",
+  "license": "AGPL-3.0-only",
+  "repository": "withnative/native-ce",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.mjs",
+    "./fake-host": "./src/fake-host/playwright.mjs",
+    "./fake-host/server": "./src/fake-host/server.mjs",
+    "./limits.json": "./limits.json",
+    "./body-feature-plan": {
+      "types": "./src/body-feature-plan.d.mts",
+      "import": "./src/body-feature-plan.mjs"
+    },
+    "./body-reader": {
+      "types": "./src/body-reader.d.mts",
+      "import": "./src/body-reader.mjs"
+    },
+    "./body-wire": {
+      "types": "./src/body-wire.d.mts",
+      "import": "./src/body-wire.mjs"
+    },
+    "./body-transport": {
+      "types": "./src/body-transport.d.mts",
+      "import": "./src/body-transport.mjs"
+    }
+  },
+  "bin": {
+    "alpha-tab-kit": "bin/alpha-tab-kit.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "peerDependencies": {
+    "playwright": ">=1.40"
+  },
+  "peerDependenciesMeta": {
+    "playwright": {
+      "optional": true
+    }
+  },
+  "files": [
+    "bin/",
+    "src/",
+    "limits.json",
+    "README.md",
+    "docs/"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "proof": "node proof/prove-demo-tabs.mjs"
+  }
+}

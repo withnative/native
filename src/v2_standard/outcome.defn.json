@@ -1,0 +1,25 @@
+{
+  "family": "native.standard.outcome",
+  "version": 1,
+  "interpreter": "native.defn/3",
+  "primary_type": "Outcome",
+  "kinds": [
+    {
+      "token": "impact",
+      "description": "One claimed realised effect for a particular subject and effective period. Corrections to the same claim keep the record. If you give a magnitude, give value and unit together; if you give a measurement window, give start and end together, with start no later than end.",
+      "maturity": "current",
+      "identity": { "mode": "record" },
+      "fields": [
+        { "name": "claim", "type": "text", "required": true, "description": "The effect claimed, in one sentence." },
+        { "name": "method", "type": "choice", "values": ["declared", "derived"], "required": true },
+        { "name": "effective_at", "type": "date", "required": true },
+        { "name": "magnitude_value", "type": "number", "required": false },
+        { "name": "magnitude_unit", "type": "text", "required": false },
+        { "name": "magnitude_per", "type": "text", "required": false },
+        { "name": "window_start", "type": "date", "required": false },
+        { "name": "window_end", "type": "date", "required": false }
+      ],
+      "links": []
+    }
+  ]
+}

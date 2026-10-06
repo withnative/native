@@ -1,0 +1,26 @@
+{
+  "format": "native.package-manifest@2",
+  "namespace": "agent",
+  "name": "team-pulse",
+  "version": "0.1.0",
+  "files": [
+    {
+      "path": "dist/team-pulse.html",
+      "sha256": "9f867d33953dedc9a57000a21d2d445e478a634dc2edc76b9f4cf092098b480e",
+      "bytes_len": 6539,
+      "media_type": "text/html",
+      "role": "surface_bundle"
+    }
+  ],
+  "contributions": {
+    "surfaces": [
+      {
+        "name": "team-pulse",
+        "file": "dist/team-pulse.html"
+      }
+    ]
+  },
+  "declared_reads": [],
+  "declared_effects": [],
+  "requires": []
+}

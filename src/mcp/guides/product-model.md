@@ -44,7 +44,7 @@ Records make value durable, but QuickStart should first anchor on what the user 
 
 ## Declared source basis
 
-An ordinary write may name the records it rested on under `sources`: each entry is a `record_id`, a `reason`, an optional `role`, and an optional `revision_event_id`. The engine stores the declaration on the write event itself, beside the write's `reason`, under `native.source-basis.v1`, replacing each omitted revision with the source's current body head. An omitted `sources` means *not declared*; an explicit empty list means *declared as none*, and the two are stored distinguishably.
+An ordinary write may name the records it rested on under `sources`: each entry is the object form `{record_id, reason, role?, revision_event_id?}`, or a bare record id as shorthand for `{record_id}` with no reason. The object form's `reason` is required and non-empty; a bare id is stored with an absent (null) reason, never an invented placeholder. The engine stores the declaration on the write event itself, beside the write's `reason`, under `native.source-basis.v1`, replacing each omitted revision with the source's current body head. An omitted `sources` means *not declared*; an explicit empty list means *declared as none*, and the two are stored distinguishably.
 
 Declarations serve the agent that made them and whoever arrives next. The read log is disposable and is dropped; a declaration is canonical — recorded on the write event itself, durable, and readable from history — so it is not lost with your context window. A later agent can check whether the basis has moved instead of redoing your reading. The person you act for can see what you looked at before you acted, which is the oversight Native promises. Honesty is symmetrical: declaring none is as useful as declaring some, and not declaring is neither.
 
@@ -61,7 +61,7 @@ SELECT created_at_ms / 604800000 AS week_epoch,
  ORDER BY week_epoch DESC;
 ```
 
-The declared-or-declared-none fraction has no portable SQL form: the logical `content_events` relation exposes no payload or run-key column, so per-write `sources` declarations can be neither filtered nor aggregated in `query_sql`. Sample records and read their history instead, where each write event carries its `sources` declaration. To bound recency, add `WHERE created_at_ms >= ?1` with a client-computed epoch-millis cutoff passed as a parameter: a relative 'now' has no portable spelling (Native e25665c).
+The declared-or-declared-none fraction has no portable SQL form: the logical `content_events` relation exposes no payload column, so per-write `sources` declarations can be neither filtered nor aggregated in `query_sql`. Its `actor`, `run_key` and `parent_key` columns are disclosed under the same rule as history reads, and its `channel_kind` column travels only where the actor is disclosed. Sample records and read their history instead, where each write event carries its `sources` declaration. To bound recency, add `WHERE created_at_ms >= ?1` with a client-computed epoch-millis cutoff passed as a parameter: a relative 'now' has no portable spelling (Native e25665c).
 
 ## Applying the model
 

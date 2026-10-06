@@ -553,6 +553,32 @@ pub(crate) async fn resolve_with<E: DomainStatementExecutor>(
     record_type: &str,
     raw_kind: &str,
 ) -> Result<KindResolution> {
+    let mut resolution = resolve_identity_with(executor, record_type, raw_kind).await?;
+    if resolution.classification == KindClassification::Unknown {
+        let governed_types = governed_types_for_token_with(executor, raw_kind).await?;
+        let active_kind_tokens = active_kind_tokens_with(
+            executor,
+            record_type,
+            crate::schema::GOVERNANCE_INLINE_ALTERNATIVES_LIMIT as i64 + 1,
+        )
+        .await?;
+        resolution.warning = Some(unknown_kind_warning(
+            record_type,
+            raw_kind,
+            &governed_types,
+            &active_kind_tokens,
+        ));
+    }
+    Ok(resolution)
+}
+
+/// Exact governed identity, without warning/repair scans. Scoped consumers
+/// record only reads that decide identity; diagnostic alternatives are separate.
+pub(crate) async fn resolve_identity_with<E: DomainStatementExecutor>(
+    executor: &mut E,
+    record_type: &str,
+    raw_kind: &str,
+) -> Result<KindResolution> {
     if raw_kind.is_empty() {
         return Err(Error::engine("kind must not be empty"));
     }
@@ -588,13 +614,6 @@ pub(crate) async fn resolve_with<E: DomainStatementExecutor>(
         .map_err(|error| crate::domain_transaction::stable_storage_error("resolve kind", &error))?;
 
     let Some(row) = rows.first() else {
-        let governed_types = governed_types_for_token_with(executor, raw_kind).await?;
-        let active_kind_tokens = active_kind_tokens_with(
-            executor,
-            record_type,
-            crate::schema::GOVERNANCE_INLINE_ALTERNATIVES_LIMIT as i64 + 1,
-        )
-        .await?;
         return Ok(KindResolution {
             record_type: record_type.into(),
             raw_kind: raw_kind.into(),
@@ -604,12 +623,7 @@ pub(crate) async fn resolve_with<E: DomainStatementExecutor>(
             lifecycle_status: None,
             metadata: None,
             quarantined: true,
-            warning: Some(unknown_kind_warning(
-                record_type,
-                raw_kind,
-                &governed_types,
-                &active_kind_tokens,
-            )),
+            warning: None,
         });
     };
 

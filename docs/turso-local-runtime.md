@@ -3,12 +3,12 @@
 Build `mcp-stdio` with the `turso-local` feature and set
 `NATIVE_CE_TURSO_LOCAL_CONFIG` to a JSON file to select one authoritative local
 Turso database. This is a production-shaped route for the immutable
-`turso-local@4` identity, not a support or operational-qualification claim; the
+`turso-local@5` identity, not a support or operational-qualification claim; the
 compiled profile remains `spike`.
 
 The stdio boundary is trusted-local and rejects `NATIVE_CE_ACCOUNT`, positional
 database paths, SQLite target configuration, and simultaneous Postgres
-configuration. The runtime uses the stable, exact `turso` 0.7.2 driver selected
+configuration. The runtime uses the stable, exact `turso` 0.8.0 driver selected
 by the `turso-local` feature.
 
 ## Configuration and ownership
@@ -41,18 +41,18 @@ closed. Writes inside the owner process are serialized before Turso's
 
 ### Existing files and local trust boundary
 
-Fresh files use physical engine schema v39 and profile revision 4. Exact v2 and
-v3 runtime markers are upgraded atomically on reopen: v2 first crosses its
-previously qualified v3 marker step, then v3 advances to v4. Revision 4 changes
-only the declared Native lexical-search capability and marker constraint, not
-the v39 authoritative content topology. Each step verifies the immutable
-predecessor marker and logical database identity, then transactionally rebuilds
-only that marker; content and projection tables are not rewritten. A non-empty
-target with any earlier or malformed profile marker, a different logical
-identity, an old engine schema, missing physical overlays, or incomplete
-content and governed-kind genesis fails closed. Moving other data into this
-topology remains unqualified until a canonical export/import or migration path
-is separately implemented.
+Fresh files use the current shared physical engine schema and profile revision 5.
+Revision 5 is qualified only against the exact `turso` 0.8.0 driver, so the exact-engine
+boundary is deliberate: a non-empty target carrying any earlier profile marker
+(2, 3, or 4) is refused before shared schema migrations or reconciliation
+mutations rather than restamped. Automatic in-place marker upgrades belonged to the 0.7.2 line and
+would falsely assert 0.8.0 qualification, so this version requires a fresh
+provision; the refusal leaves the existing database unmodified and nothing
+asks a caller to delete a non-disposable store. A target with a different
+logical identity, an old engine schema, missing physical overlays, or
+incomplete content and governed-kind genesis also fails closed. Moving other
+data into this topology remains unqualified until a canonical export/import or
+migration path is separately implemented.
 
 The stdio route is trusted-local, not a sandbox against a malicious process
 running as the same operating-system user. Leaf symlinks and non-regular
@@ -157,7 +157,7 @@ projection independently fails atomically above the same row and byte
 ceilings. The isolated database receives no source path and has attach, views,
 and vacuum disabled.
 
-Caller SQL then passes the exact `turso_parser =0.7.2` SELECT-only AST walker,
+Caller SQL then passes the exact `turso_parser =0.8.0` SELECT-only AST walker,
 which rejects qualified/catalog/table-function/hidden-rowid access and unsafe
 functions, casts, collations, or CTE collisions. Core preparation must compile
 a read-only program. One absolute two-second control spans source extraction,

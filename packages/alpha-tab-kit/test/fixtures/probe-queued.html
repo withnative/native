@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Kit probe</title>
+</head>
+<body>
+<main>
+<h1>Kit probe</h1>
+<ul id="list"></ul>
+<section id="detail"><h2>Detail</h2><p id="body">Nothing open</p><p id="links"></p></section>
+</main>
+<script>
+// One read in flight, busy (or a synchronous bridge refusal) retried with
+// bounded backoff: the pattern the 0.1.1 tabs adopted.
+const queue = [];
+let active = false;
+function pump() {
+  if (active || !queue.length) return;
+  active = true;
+  const job = queue.shift();
+  const attempt = (tries) => {
+    let request;
+    try { request = window.nativeArtifact.read(job.need, job.params); } catch (error) { request = Promise.resolve({ status: "busy" }); }
+    request.then((reply) => {
+      if (reply && reply.status === "busy" && tries < 8) { setTimeout(() => attempt(tries + 1), 120 * (tries + 1)); return; }
+      active = false;
+      job.resolve(reply && reply.status === "ok" ? reply.result.rows : null);
+      pump();
+    }, () => { active = false; job.resolve(null); pump(); });
+  };
+  attempt(0);
+}
+const read = (need, params) => new Promise((resolve) => { queue.push({ need, params, resolve }); pump(); });
+function open(id) {
+  document.getElementById("body").textContent = "Loading";
+  read("probe.body", { id }).then((rows) => { document.getElementById("body").textContent = rows && rows[0] ? rows[0].body : "The record body could not be read"; });
+  read("probe.links", { id }).then((rows) => { document.getElementById("links").textContent = rows ? rows.length + " links" : "Links could not be read"; });
+}
+function render(input) {
+  const list = document.getElementById("list");
+  list.textContent = "";
+  const section = input.sql && input.sql["probe.list"];
+  for (const row of section ? section.rows : []) {
+    const item = document.createElement("li");
+    const button = document.createElement("button");
+    button.type = "button"; button.textContent = row.name; button.dataset.id = row.id;
+    button.addEventListener("click", () => { open(row.id); window.nativeArtifact.setViewState({ open: row.id }); });
+    item.append(button);
+    list.append(item);
+  }
+  list.dataset.count = section ? section.row_count + (section.truncated ? " truncated" : "") : "sample";
+}
+window.nativeArtifact.ready.then((delivery) => render(delivery.input));
+window.nativeArtifact.onInput((delivery) => render(delivery.input));
+</script>
+</body>
+</html>

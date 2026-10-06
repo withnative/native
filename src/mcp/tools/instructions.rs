@@ -40,6 +40,7 @@ enum ManageInstructionsArgs {
     List {
         scope: Option<InstructionScope>,
     },
+    Resolve {},
     CreateBinding {
         scope: InstructionScope,
         source_record_id: String,
@@ -652,7 +653,14 @@ async fn apply_or_reset_seeded_default(
             &mut act_alloc,
         )
         .await?;
-        let stacks = instructions::validate_all_known_stacks_in(&mut tx, tool).await?;
+        let stacks = instructions::validate_all_known_stacks_in(
+            &mut tx,
+            tool,
+            caller.credential(),
+            caller.is_host_member(),
+            caller.is_host_owner(),
+        )
+        .await?;
         tx.commit().await?;
         let template = crate::instruction_templates::instruction_template(&payload.template_key);
         return echo_act(
@@ -745,7 +753,14 @@ async fn apply_or_reset_seeded_default(
         &mut act_alloc,
     )
     .await?;
-    let stacks = instructions::validate_all_known_stacks_in(&mut tx, tool).await?;
+    let stacks = instructions::validate_all_known_stacks_in(
+        &mut tx,
+        tool,
+        caller.credential(),
+        caller.is_host_member(),
+        caller.is_host_owner(),
+    )
+    .await?;
     if body_changed {
         db.commit_content(tx).await?;
     } else {
@@ -777,7 +792,8 @@ async fn manage_instructions(db: Db, caller: Caller, arguments: Value) -> Result
             let mut tx = crate::db::begin_write(db.write_pool()).await?;
             let rows = sqlx::query(
                 "SELECT b.id,b.scope_kind,b.scope_id,b.source_record_id,b.position,b.enabled,
-                        r.name,r.updated_at,s.template_key,s.template_version,s.last_applied_digest
+                        r.name,r.updated_at,r.type record_type,r.deleted_at,
+                        s.template_key,s.template_version,s.last_applied_digest
                    FROM instruction_bindings b
                    JOIN records r ON r.id=b.source_record_id
                    LEFT JOIN seeded_instruction_sources s ON s.source_record_id=r.id
@@ -791,8 +807,14 @@ async fn manage_instructions(db: Db, caller: Caller, arguments: Value) -> Result
             .fetch_all(&mut *tx)
             .await?;
             let mut bindings = Vec::with_capacity(rows.len());
+            let caller_is_owner = caller.is_host_owner();
             for row in rows {
                 let source_record_id: String = row.try_get("source_record_id")?;
+                let scope_kind: String = row.try_get("scope_kind")?;
+                let record_type: Option<String> = row.try_get("record_type")?;
+                let deleted_at: Option<String> = row.try_get("deleted_at")?;
+                let live_document =
+                    record_type.as_deref() == Some("Document") && deleted_at.is_none();
                 let readable = authorization::effective_capability_on(
                     &mut tx,
                     Principal::bound(caller.credential(), caller.is_host_member()),
@@ -801,7 +823,27 @@ async fn manage_instructions(db: Db, caller: Caller, arguments: Value) -> Result
                 .await
                 .map(|capability| capability.allows(Capability::View))
                 .unwrap_or(false);
-                if !readable {
+                if scope_kind == "database" {
+                    if !caller_is_owner {
+                        // A member sees a workspace binding only when its
+                        // source is a live Document they can View. A hidden,
+                        // missing, deleted or non-Document source is omitted
+                        // alike, so deleted and hidden are indistinguishable
+                        // (no id oracle).
+                        if !readable || !live_document {
+                            continue;
+                        }
+                    } else if !readable {
+                        // Owners keep the fail-closed error for a workspace
+                        // source they cannot read or that is missing/deleted,
+                        // so they can repair it.
+                        return Err(Error::auth(format!(
+                            "{TOOL}: an instruction source is not readable"
+                        )));
+                    }
+                } else if !readable {
+                    // Own member-scope bindings stay strict so the member can
+                    // repair them.
                     return Err(Error::auth(format!(
                         "{TOOL}: an instruction source is not readable"
                     )));
@@ -825,6 +867,37 @@ async fn manage_instructions(db: Db, caller: Caller, arguments: Value) -> Result
             Ok(
                 json!({ "bindings": bindings, "limit_bytes": instructions::MAX_RESOLVED_INSTRUCTION_BYTES }),
             )
+        }
+        ManageInstructionsArgs::Resolve {} => {
+            // Post-compaction refresh of the current effective stack. Read-only:
+            // it resolves in a read transaction that rolls back, nothing is
+            // minted, and bootstrap is never called. The caller must already
+            // hold a run key (lifted out of the arguments onto the caller by
+            // the registry seam); an absent or malformed key arrives here as
+            // `None` and is refused. The `"new"` sentinel is refused earlier,
+            // before run-key issuance in `execute_request`, so reaching this
+            // arm always means a well-formed existing key. Run-key liveness is
+            // deliberately NOT checked: keys are hashtags with no issuance
+            // registry (see `runkey`), so presence of a well-formed key is the
+            // entire requirement.
+            let Some(run_key) = caller.run_key() else {
+                return Err(Error::engine(format!(
+                    "{TOOL}: resolve requires an existing run_key; pass the run_key from bootstrap on this call"
+                )));
+            };
+            let resolution = instructions::resolve_for_account(
+                db.pool(),
+                caller.credential(),
+                caller.is_host_member(),
+                caller.is_host_owner(),
+                Some(run_key),
+            )
+            .await?;
+            let resolution = instructions::prepend_engine_instruction(resolution);
+            Ok(json!({
+                "instructions": resolution.instructions,
+                "pending_obligations": resolution.pending_obligations,
+            }))
         }
         ManageInstructionsArgs::CreateBinding {
             scope,
@@ -874,7 +947,14 @@ async fn manage_instructions(db: Db, caller: Caller, arguments: Value) -> Result
                 &mut act_alloc,
             )
             .await?;
-            let measures = instructions::validate_all_known_stacks_in(&mut tx, TOOL).await?;
+            let measures = instructions::validate_all_known_stacks_in(
+                &mut tx,
+                TOOL,
+                caller.credential(),
+                caller.is_host_member(),
+                caller.is_host_owner(),
+            )
+            .await?;
             tx.commit().await?;
             Ok(echo_act(
                 json!({ "binding_id": id, "source_record_id": source_record_id, "changed": true, "stacks": measures }),
@@ -912,7 +992,14 @@ async fn manage_instructions(db: Db, caller: Caller, arguments: Value) -> Result
                 &mut act_alloc,
             )
             .await?;
-            let measures = instructions::validate_all_known_stacks_in(&mut tx, TOOL).await?;
+            let measures = instructions::validate_all_known_stacks_in(
+                &mut tx,
+                TOOL,
+                caller.credential(),
+                caller.is_host_member(),
+                caller.is_host_owner(),
+            )
+            .await?;
             tx.commit().await?;
             Ok(echo_act(
                 json!({ "binding_id": binding_id, "source_record_id": source_record_id, "changed": true, "stacks": measures }),
@@ -991,7 +1078,16 @@ async fn manage_instructions(db: Db, caller: Caller, arguments: Value) -> Result
             )
             .await?;
             let measures = if enable {
-                Some(instructions::validate_all_known_stacks_in(&mut tx, TOOL).await?)
+                Some(
+                    instructions::validate_all_known_stacks_in(
+                        &mut tx,
+                        TOOL,
+                        caller.credential(),
+                        caller.is_host_member(),
+                        caller.is_host_owner(),
+                    )
+                    .await?,
+                )
             } else {
                 None
             };
@@ -1476,7 +1572,16 @@ async fn manage_onboarding(db: Db, caller: Caller, arguments: Value) -> Result<V
             )
             .await?;
             let measures = if enabling {
-                Some(instructions::validate_all_known_stacks_in(&mut tx, TOOL).await?)
+                Some(
+                    instructions::validate_all_known_stacks_in(
+                        &mut tx,
+                        TOOL,
+                        caller.credential(),
+                        caller.is_host_member(),
+                        caller.is_host_owner(),
+                    )
+                    .await?,
+                )
             } else {
                 None
             };
@@ -1545,7 +1650,14 @@ async fn manage_onboarding(db: Db, caller: Caller, arguments: Value) -> Result<V
                 &mut act_alloc,
             )
             .await?;
-            let measures = instructions::validate_all_known_stacks_in(&mut tx, TOOL).await?;
+            let measures = instructions::validate_all_known_stacks_in(
+                &mut tx,
+                TOOL,
+                caller.credential(),
+                caller.is_host_member(),
+                caller.is_host_owner(),
+            )
+            .await?;
             tx.commit().await?;
             Ok(echo_act(
                 json!({ "programme_id": programme_id, "source_record_id": source_record_id, "changed": true, "stacks": measures }),
@@ -1804,7 +1916,14 @@ async fn manage_onboarding(db: Db, caller: Caller, arguments: Value) -> Result<V
                 )
                 .await?;
             }
-            let measures = instructions::validate_all_known_stacks_in(&mut tx, TOOL).await?;
+            let measures = instructions::validate_all_known_stacks_in(
+                &mut tx,
+                TOOL,
+                caller.credential(),
+                caller.is_host_member(),
+                caller.is_host_owner(),
+            )
+            .await?;
             tx.commit().await?;
             let mut result = preview_json(&preview);
             result["changed"] = json!(true);
@@ -2574,6 +2693,7 @@ async fn manage_onboarding(db: Db, caller: Caller, arguments: Value) -> Result<V
                     TOOL,
                     Some(caller.credential()),
                     caller.is_host_member(),
+                    caller.is_host_owner(),
                 )
                 .await?;
             }
@@ -2652,6 +2772,7 @@ async fn manage_onboarding(db: Db, caller: Caller, arguments: Value) -> Result<V
                     TOOL,
                     Some(caller.credential()),
                     caller.is_host_member(),
+                    caller.is_host_owner(),
                 )
                 .await?;
                 tx.commit().await?;
@@ -2686,6 +2807,7 @@ async fn manage_onboarding(db: Db, caller: Caller, arguments: Value) -> Result<V
                 TOOL,
                 Some(caller.credential()),
                 caller.is_host_member(),
+                caller.is_host_owner(),
             )
             .await?;
             tx.commit().await?;
@@ -2700,11 +2822,11 @@ async fn manage_onboarding(db: Db, caller: Caller, arguments: Value) -> Result<V
 pub fn register_instruction_tools(registry: &mut ToolRegistry) -> Result<()> {
     registry.register(
         ToolKind::ManageInstructions,
-        "Read and configure portable workspace/member standing instruction bindings, and inspect or safely update seeded defaults. Member scope is always the authenticated caller; workspace scope is database-owner-only.",
+        "Manage workspace/member bindings and seeded defaults. Resolve returns the current effective bodies for an existing run key without calling bootstrap. Member scope is the authenticated caller; workspace scope is database-owner-only.",
         json!({
             "type":"object",
             "properties":{
-                "action":{"type":"string","enum":["list","create_binding","retarget_binding","reorder_binding","enable_binding","disable_binding","remove_binding","compare_seeded_default","apply_seeded_default","reset_seeded_default"]},
+                "action":{"type":"string","enum":["list","resolve","create_binding","retarget_binding","reorder_binding","enable_binding","disable_binding","remove_binding","compare_seeded_default","apply_seeded_default","reset_seeded_default"]},
                 "scope":{"type":"string","enum":["workspace","member"]}, "source_record_id":{"type":"string"}, "binding_id":{"type":"string"},
                 "position":{"type":"integer","minimum":0}, "enabled":{"type":"boolean"}, "idempotency_key":{"type":"string","minLength":1},
                 "expected_body_digest":{"type":"string","pattern":"^[0-9a-fA-F]{64}$"}, "confirm":{"type":"boolean"},

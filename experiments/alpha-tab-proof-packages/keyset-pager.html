@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Keyset pager</title>
+<style>
+body { margin: 0; padding: 1.25rem; font: 15px/1.5 system-ui, sans-serif; color: #1a201a; background: #f5f6f2; }
+main { max-width: 48rem; margin: 0 auto; }
+.banner { padding: 0.6rem 0.9rem; border: 1px solid #b9c4ad; background: #eef3e4; }
+.controls { margin: 0.8rem 0; font-size: 0.85rem; }
+.controls button { font: inherit; padding: 0.2rem 0.6rem; background: #fff; border: 1px solid #d5dacd; border-radius: 4px; cursor: pointer; }
+ol.records { columns: 2; font-size: 0.85rem; padding-left: 2.5rem; }
+.pages { font-size: 0.8rem; color: #4a5245; }
+.note { margin-top: 1.5rem; font-size: 0.8rem; color: #6a7265; }
+</style>
+</head>
+<body>
+<main>
+<h1>Keyset pager</h1>
+<p id="banner" class="banner" role="status">Loading host input.</p>
+<div class="controls"><button type="button" id="reload">Read again</button></div>
+<p id="pages" class="pages"></p>
+<ol id="records" class="records"></ol>
+<p class="note">A proof tab for the canonical keyset paging pattern. It reads the names of every record you can see in pages of 200, ordered by id, at most 25 page reads per load. Each page runs as you when it is read, so a page shows only records you could see at that moment, and a record you lose access to is left out of later pages. Rows already on screen stay until you read again. It cannot change anything.</p>
+</main>
+<script>
+(function () {
+  "use strict";
+  // The one declared read, mirrored here so the declaration cannot drift
+  // from what this frame pages over. It is parameterised, so it runs on
+  // request only. The canonical keyset shape: a predicate on a unique key
+  // (`id > ?1`), `ORDER BY` that same key, and `LIMIT` equal to the 200-row
+  // delivery cap so every page arrives whole. The cursor starts at "" (an
+  // omitted param would bind NULL, and `id > NULL` matches nothing).
+  var PAGE_KEY = "pager.page";
+  var DECLARED_PAGE_SQL = "SELECT id, name FROM records WHERE deleted_at IS NULL AND id > ?1 ORDER BY id ASC LIMIT 200";
+  var PAGE = 200;
+  var MAX_PAGES = 25;
+  var MAX_BUSY_RETRIES = 2;
+  var host = window.nativeArtifact;
+
+  // Params for the next page, null when this page ends the set, or
+  // "truncated" when the host cut the page short (the statement no longer
+  // fits the delivery cap, so the last delivered key is not a safe cursor).
+  // A key that fails to move past `after` also stops paging. Pure.
+  function nextParams(result, after) {
+    if (!result || !Array.isArray(result.rows)) return null;
+    if (result.truncated === true) return "truncated";
+    if (result.rows.length < PAGE) return null;
+    var last = result.rows[result.rows.length - 1].id;
+    if (typeof last !== "string" || last <= after) return "stalled";
+    return { after_key: last };
+  }
+
+  // What one page says about its own completeness. `row_count` is only a
+  // total when `row_count_complete` is true; otherwise it is a floor. Pure.
+  function pageNote(result) {
+    var shown = result.rows.length;
+    if (result.truncated !== true) return shown + " rows";
+    if (result.row_count_complete === false) {
+      return shown + " of more than " + result.row_count + " rows (cut short)";
+    }
+    return shown + " of " + result.row_count + " rows (cut short)";
+  }
+
+  // Page the whole visible set with `read(params)`, which answers the
+  // bridge's `{status, result}`. Sequential: the shell allows one read in
+  // flight. `isCurrent`, when given, is asked before every read, so a load
+  // superseded by a newer one stops at once instead of reading on.
+  // Resolves `{rows, pages, notes, stopped}`; `stopped` is null when the
+  // set was read to its end.
+  function pageAll(read, onPage, isCurrent) {
+    var rows = [];
+    var notes = [];
+    var pages = 0;
+    var after = "";
+    function next() {
+      if (isCurrent && !isCurrent()) return Promise.resolve({ rows: rows, pages: pages, notes: notes, stopped: "superseded" });
+      if (pages >= MAX_PAGES) return Promise.resolve({ rows: rows, pages: pages, notes: notes, stopped: "page budget" });
+      return read({ after_key: after }).then(function (answer) {
+        if (!answer || answer.status !== "ok" || !answer.result || !Array.isArray(answer.result.rows)) {
+          return { rows: rows, pages: pages, notes: notes, stopped: (answer && answer.code) || "unavailable" };
+        }
+        var result = answer.result;
+        pages += 1;
+        rows = rows.concat(result.rows);
+        notes.push(pageNote(result));
+        if (onPage) onPage(rows.length, pages);
+        var following = nextParams(result, after);
+        if (following === null) return { rows: rows, pages: pages, notes: notes, stopped: null };
+        if (typeof following === "string") return { rows: rows, pages: pages, notes: notes, stopped: following };
+        after = following.after_key;
+        return next();
+      });
+    }
+    return next();
+  }
+
+  // One page read, retried at most MAX_BUSY_RETRIES times while the shell
+  // is busy. `isCurrent`, when given, is asked again after each wait, so a
+  // retry scheduled by a superseded load never reads.
+  function readWithRetry(params, tried, isCurrent) {
+    var attempt = tried || 0;
+    var answer;
+    try {
+      answer = host.read(PAGE_KEY, params);
+    } catch (error) {
+      answer = Promise.resolve({ status: "unavailable", code: "unavailable" });
+    }
+    return Promise.resolve(answer).then(function (result) {
+      if (result && result.status === "busy" && attempt < MAX_BUSY_RETRIES) {
+        return new Promise(function (resolve) { setTimeout(resolve, 300); })
+          .then(function () {
+            if (isCurrent && !isCurrent()) return { status: "unavailable", code: "superseded" };
+            return readWithRetry(params, attempt + 1, isCurrent);
+          });
+      }
+      return result;
+    }, function () { return { status: "unavailable", code: "unavailable" }; });
+  }
+
+  var banner = document.getElementById("banner");
+  var pagesLine = document.getElementById("pages");
+  var list = document.getElementById("records");
+  var reload = document.getElementById("reload");
+  var generation = 0;
+
+  function render(outcome) {
+    list.textContent = "";
+    outcome.rows.forEach(function (row) {
+      var item = document.createElement("li");
+      item.textContent = row.name || row.id;
+      list.appendChild(item);
+    });
+    pagesLine.textContent = outcome.notes.map(function (note, index) { return "Page " + (index + 1) + ": " + note; }).join(" · ");
+    var read = outcome.rows.length + " records you can see, read in " + outcome.pages + (outcome.pages === 1 ? " page" : " pages") + " in id order";
+    if (outcome.stopped === null) {
+      banner.textContent = read + ". Pages are read one after another, so a change between pages shows only in later pages.";
+    } else if (outcome.stopped === "truncated") {
+      banner.textContent = read + ", then a page came back cut short, so paging stopped. This is not the whole set.";
+    } else {
+      banner.textContent = read + ", then paging stopped (" + outcome.stopped + "). This is not the whole set.";
+    }
+  }
+
+  function load(expected) {
+    banner.textContent = "Reading the records you can see…";
+    function current() { return expected === generation; }
+    pageAll(function (params) { return readWithRetry(params, 0, current); }, function (count, pages) {
+      if (current()) banner.textContent = "Read " + count + " records in " + pages + " pages so far…";
+    }, current).then(function (outcome) {
+      if (current()) render(outcome);
+    });
+  }
+
+  function start(input) {
+    if (input && input.sample_preview === true) {
+      banner.textContent = "Sample preview: no live read occurred.";
+      return;
+    }
+    if (!host || typeof host.read !== "function") {
+      banner.textContent = "This host does not offer on-request reads.";
+      return;
+    }
+    load(++generation);
+  }
+
+  reload.addEventListener("click", function () { load(++generation); });
+
+  if (host && host.ready && typeof host.ready.then === "function") {
+    host.ready.then(function (delivery) { start(delivery && delivery.input); },
+      function () { banner.textContent = "Host input unavailable."; });
+  } else {
+    banner.textContent = "The keyset pager is only available inside the Native host.";
+  }
+})();
+</script>
+</body>
+</html>

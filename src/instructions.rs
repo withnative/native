@@ -20,7 +20,7 @@ pub const MAX_BOOTSTRAP_INSTRUCTION_ENTRIES: usize = 128;
 pub const MAX_BOOTSTRAP_PENDING_OBLIGATIONS: usize = 64;
 pub const MAX_BOOTSTRAP_CONTEXT_METADATA_BYTES: usize = 64 * 1024;
 pub const ENGINE_ORIENTATION_TEMPLATE_KEY: &str = "engine-orientation";
-pub const ENGINE_ORIENTATION_TEMPLATE_VERSION: i64 = 9;
+pub const ENGINE_ORIENTATION_TEMPLATE_VERSION: i64 = 10;
 pub const ENGINE_ORIENTATION: &str = include_str!("mcp/posture-capsule.md");
 pub const DURABLE_ORIENTATION_GUIDANCE: &str = "Bootstrap is read-only. Repeating or ending a session does not complete, decline, reopen, or otherwise consume an onboarding obligation; it remains pending until an explicit member action changes it.";
 pub const NEUTRAL_PRECEDENCE_GUIDANCE: &str = "Consider all active instructions together. Their scopes describe where they came from, not an automatic priority. If they materially conflict, exercise judgement and ask the user when necessary.";
@@ -236,10 +236,12 @@ pub async fn resolve_for_account(
     pool: &SqlitePool,
     account_id: &str,
     is_member: bool,
+    is_owner: bool,
     current_run_key: Option<&str>,
 ) -> Result<BootstrapInstructionResolution> {
     let mut tx = pool.begin().await?;
-    let result = resolve_for_account_in(&mut tx, account_id, is_member, current_run_key).await;
+    let result =
+        resolve_for_account_in(&mut tx, account_id, is_member, is_owner, current_run_key).await;
     tx.rollback().await?;
     result
 }
@@ -248,6 +250,7 @@ async fn resolve_for_account_in(
     tx: &mut Transaction<'_, Sqlite>,
     account_id: &str,
     is_member: bool,
+    is_owner: bool,
     current_run_key: Option<&str>,
 ) -> Result<BootstrapInstructionResolution> {
     let obligation_rows = sqlx::query(
@@ -451,10 +454,19 @@ async fn resolve_for_account_in(
     .bind(is_member as i64)
     .bind(account_id)
     .bind(account_id)
-    .bind((MAX_BOOTSTRAP_INSTRUCTION_ENTRIES + 1) as i64)
+    // Owners keep the historical bound (and therefore the same overflow
+    // point). Member footing may skip layer-0 rows below, so the row set is
+    // unbounded and the ceiling is applied after the skip; otherwise a
+    // hidden or deleted layer-0 binding could flip `ready` to
+    // `instruction_entry_count_exceeded` near the limit (round 3 F2).
+    .bind(if is_owner {
+        (MAX_BOOTSTRAP_INSTRUCTION_ENTRIES + 1) as i64
+    } else {
+        -1
+    })
     .fetch_all(&mut **tx)
     .await?;
-    if rows.len() > MAX_BOOTSTRAP_INSTRUCTION_ENTRIES {
+    if is_owner && rows.len() > MAX_BOOTSTRAP_INSTRUCTION_ENTRIES {
         return metadata_overflow(
             pending_obligations,
             0,
@@ -465,11 +477,20 @@ async fn resolve_for_account_in(
 
     let mut entries = Vec::with_capacity(rows.len());
     let mut resolved_bytes = 0usize;
+    let mut counted = 0usize;
     for row in rows {
         let source_record_id: String = row.try_get("source_record_id")?;
+        let layer: i64 = row.try_get("layer")?;
         let record_type: Option<String> = row.try_get("record_type")?;
         let deleted_at: Option<String> = row.try_get("deleted_at")?;
         if record_type.as_deref() != Some("Document") || deleted_at.is_some() {
+            // For a non-owner caller a layer-0 source that is missing,
+            // deleted or not a Document is skipped exactly like a hidden
+            // one, so deleted and hidden are indistinguishable (no oracle).
+            // Owners keep the fail-closed diagnostic so they can repair.
+            if layer == 0 && !is_owner {
+                continue;
+            }
             return Ok(invalid_resolution(
                 pending_obligations,
                 resolved_bytes,
@@ -487,6 +508,16 @@ async fn resolve_for_account_in(
         .map(|capability| capability.allows(Capability::View))
         .unwrap_or(false);
         if !readable {
+            // Database-scope bindings are workspace content shared with every
+            // member. A source this caller cannot View is skipped silently so
+            // the member's stack is byte-identical to a world where the
+            // binding does not exist (no oracle). Other layers stay strict:
+            // onboarding/member sources the caller cannot read keep the
+            // invalid diagnostic because the caller is entitled to repair
+            // their own bindings.
+            if layer == 0 && !is_owner {
+                continue;
+            }
             return Ok(invalid_resolution(
                 pending_obligations,
                 resolved_bytes,
@@ -494,6 +525,19 @@ async fn resolve_for_account_in(
                 "An active instruction source is not readable by this caller. Ask the database owner to grant view access or remove the active control reference; no partial instruction stack is authoritative.",
                 None,
             ));
+        }
+        // Count only rows the caller actually keeps. For member footing the
+        // historical pre-loop ceiling above cannot be used: hidden, deleted
+        // and missing layer-0 rows have already been skipped, so they must
+        // not count towards the ceiling (round 3 F2).
+        counted += 1;
+        if counted > MAX_BOOTSTRAP_INSTRUCTION_ENTRIES {
+            return metadata_overflow(
+                pending_obligations,
+                resolved_bytes,
+                "instruction_entry_count_exceeded",
+                "The caller has too many active instruction sources for the bounded bootstrap contract. Consolidate or disable sources before relying on this stack.",
+            );
         }
         let body_type: Option<String> = row.try_get("body_type")?;
         if !matches!(body_type.as_deref(), Some("text" | "null")) {
@@ -520,8 +564,7 @@ async fn resolve_for_account_in(
             }),
             None => None,
         };
-        let layer: i64 = row.try_get("layer")?;
-        let scope = match layer {
+        let layer_scope = match layer {
             0 => "workspace",
             1 => "onboarding",
             2 => "member",
@@ -546,7 +589,7 @@ async fn resolve_for_account_in(
             continue;
         }
         let identity = format!(
-            "{scope}\0{}\0{}\0{}\0{source_record_id}",
+            "{layer_scope}\0{}\0{}\0{}\0{source_record_id}",
             binding_id.as_deref().unwrap_or(""),
             programme_id.as_deref().unwrap_or(""),
             generation
@@ -572,7 +615,7 @@ async fn resolve_for_account_in(
         }
         entries.push(ResolvedInstructionEntry {
             entry_id,
-            scope: scope.into(),
+            scope: layer_scope.into(),
             kind: if layer == 1 {
                 "programme_source"
             } else {
@@ -657,25 +700,26 @@ pub async fn measure_stack_in(
     tx: &mut Transaction<'_, Sqlite>,
     account_id: Option<&str>,
     is_member: bool,
+    is_owner: bool,
 ) -> Result<StackMeasure> {
     // Guests resolve no database-scope layer (see resolve_for_account_in);
     // the prospective-member system probe keeps the full stack.
     let include_workspace = account_id.is_none() || is_member;
     let rows = sqlx::query(
-        "SELECT scope,source_record_id,title,body_bytes,deleted_at,binding_id,programme_id,generation,source_role FROM (
-           SELECT 'workspace' scope,b.source_record_id,r.name title,length(CAST(COALESCE(r.body,'') AS BLOB)) body_bytes,r.deleted_at,
+        "SELECT scope,source_record_id,title,body_bytes,deleted_at,record_type,binding_id,programme_id,generation,source_role FROM (
+           SELECT 'workspace' scope,b.source_record_id,r.name title,length(CAST(COALESCE(r.body,'') AS BLOB)) body_bytes,r.deleted_at,r.type record_type,
                   b.id binding_id,NULL programme_id,NULL generation,NULL source_role,0 layer,b.position outer_pos,0 inner_pos
              FROM instruction_bindings b LEFT JOIN records r ON r.id=b.source_record_id
             WHERE b.scope_kind='database' AND b.scope_id='native:database' AND b.enabled=1
               AND ? <> 0
            UNION ALL
-           SELECT 'onboarding',s.source_record_id,r.name,length(CAST(COALESCE(r.body,'') AS BLOB)),r.deleted_at,NULL,p.id,o.generation,s.source_role,1,p.position,s.position
+           SELECT 'onboarding',s.source_record_id,r.name,length(CAST(COALESCE(r.body,'') AS BLOB)),r.deleted_at,r.type,NULL,p.id,o.generation,s.source_role,1,p.position,s.position
              FROM member_obligations o JOIN onboarding_programmes p ON p.id=o.programme_id AND p.enabled=1
              JOIN onboarding_programme_sources s ON s.programme_id=p.id
              LEFT JOIN records r ON r.id=s.source_record_id
             WHERE ? IS NOT NULL AND o.account_id=? AND o.state='pending'
            UNION ALL
-           SELECT 'member',b.source_record_id,r.name,length(CAST(COALESCE(r.body,'') AS BLOB)),r.deleted_at,b.id,NULL,NULL,NULL,2,b.position,0
+           SELECT 'member',b.source_record_id,r.name,length(CAST(COALESCE(r.body,'') AS BLOB)),r.deleted_at,r.type,b.id,NULL,NULL,NULL,2,b.position,0
              FROM instruction_bindings b LEFT JOIN records r ON r.id=b.source_record_id
             WHERE ? IS NOT NULL AND b.scope_kind='account' AND b.scope_id=? AND b.enabled=1
          ) ORDER BY layer,outer_pos,inner_pos,source_record_id",
@@ -691,8 +735,21 @@ pub async fn measure_stack_in(
     let mut contributors = Vec::with_capacity(rows.len());
     for row in rows {
         let source_record_id: String = row.try_get("source_record_id")?;
+        let scope: String = row.try_get("scope")?;
         let title: Option<String> = row.try_get("title")?;
         let deleted_at: Option<String> = row.try_get("deleted_at")?;
+        let record_type: Option<String> = row.try_get("record_type")?;
+        // A non-owner caller must never receive a diagnostic naming (or an
+        // error depending on) a workspace source it cannot use: a hidden,
+        // missing, deleted or non-Document source is skipped exactly as
+        // `resolve_for_account_in` skips it. Owners keep the fail-closed
+        // error so they can repair the binding.
+        let skip_workspace = scope == "workspace" && !is_owner;
+        let structurally_invalid =
+            title.is_none() || deleted_at.is_some() || record_type.as_deref() != Some("Document");
+        if skip_workspace && structurally_invalid {
+            continue;
+        }
         let Some(title) = title else {
             return Err(Error::engine(format!(
                 "instruction stack contains dangling active source {source_record_id}; remove or retarget its binding/programme source"
@@ -708,18 +765,25 @@ pub async fn measure_stack_in(
         // workspace-wide sources, not a caller; it keeps member footing. A
         // real account resolves with its folded membership footing.
         let principal_is_member = account_id.is_none() || is_member;
-        let capability = authorization::effective_capability_on(
+        let capability = match authorization::effective_capability_on(
             tx,
             Principal::bound(principal_id, principal_is_member),
             &source_record_id,
         )
         .await
-        .map_err(|_| {
-            Error::engine(format!(
-                "instruction source {source_record_id} cannot be authorized; repair its policy or remove it"
-            ))
-        })?;
+        {
+            Ok(capability) => capability,
+            Err(_) if skip_workspace => continue,
+            Err(_) => {
+                return Err(Error::engine(format!(
+                    "instruction source {source_record_id} cannot be authorized; repair its policy or remove it"
+                )))
+            }
+        };
         if !capability.allows(Capability::View) {
+            if skip_workspace {
+                continue;
+            }
             return Err(Error::engine(format!(
                 "instruction source {source_record_id} is unreadable by account {principal_id}; grant view access or remove it"
             )));
@@ -759,8 +823,9 @@ pub async fn measure_stack_in(
 async fn measure_future_trigger_stack_in(
     tx: &mut Transaction<'_, Sqlite>,
     trigger_key: &str,
+    is_owner: bool,
 ) -> Result<StackMeasure> {
-    let mut measure = measure_stack_in(tx, None, true).await?;
+    let mut measure = measure_stack_in(tx, None, true, is_owner).await?;
     measure.account_id = Some(format!("<future:{trigger_key}>"));
     let rows = sqlx::query(
         "SELECT s.source_record_id,s.source_role,r.name,r.body,r.deleted_at,s.position,p.id programme_id,p.position programme_position
@@ -839,8 +904,9 @@ pub async fn validate_account_stack_in(
     tool: &str,
     account_id: Option<&str>,
     is_member: bool,
+    is_owner: bool,
 ) -> Result<StackMeasure> {
-    let measure = measure_stack_in(tx, account_id, is_member).await?;
+    let measure = measure_stack_in(tx, account_id, is_member, is_owner).await?;
     if measure.resolved_bytes <= measure.limit_bytes {
         return Ok(measure);
     }
@@ -867,7 +933,21 @@ pub async fn validate_account_stack_in(
 pub async fn validate_all_known_stacks_in(
     tx: &mut Transaction<'_, Sqlite>,
     tool: &str,
+    caller_account: &str,
+    caller_is_member: bool,
+    caller_is_owner: bool,
 ) -> Result<Vec<StackMeasure>> {
+    if !caller_is_owner {
+        // Member-facing mutations measure only the caller's own stack under
+        // member footing. Sweeping every known account (or the
+        // prospective-member workspace probe) would both error on and echo
+        // workspace sources the member cannot View, and would disclose other
+        // accounts' ids in the returned `stacks`.
+        return Ok(vec![
+            validate_account_stack_in(tx, tool, Some(caller_account), caller_is_member, false)
+                .await?,
+        ]);
+    }
     let accounts: Vec<String> = sqlx::query_scalar(
         "SELECT account_id FROM member_contexts
          UNION SELECT scope_id FROM instruction_bindings WHERE scope_kind='account'
@@ -875,19 +955,19 @@ pub async fn validate_all_known_stacks_in(
     )
     .fetch_all(&mut **tx)
     .await?;
-    let mut measures = vec![validate_account_stack_in(tx, tool, None, true).await?];
+    let mut measures = vec![validate_account_stack_in(tx, tool, None, true, true).await?];
     for account in accounts {
         // Portable validation scans stored accounts without catalog context;
         // it preserves the historical member footing. Hosted callers resolve
         // with their folded footing at their own call sites.
-        measures.push(validate_account_stack_in(tx, tool, Some(&account), true).await?);
+        measures.push(validate_account_stack_in(tx, tool, Some(&account), true, true).await?);
     }
     for trigger_key in [
         "on_owner_first_run",
         "on_member_joined",
         "on_guest_welcomed",
     ] {
-        let measure = measure_future_trigger_stack_in(tx, trigger_key).await?;
+        let measure = measure_future_trigger_stack_in(tx, trigger_key, true).await?;
         measures.push(assert_measure_within_budget(tool, measure)?);
     }
     Ok(measures)

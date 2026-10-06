@@ -1,0 +1,522 @@
+{
+  "version": "alpha-tab-body-admission.v1",
+  "baseline": "26f5a47e2cbb6e56c8760e6565d45bcdbfb6915b",
+  "note": "Fixed commitments use b3c kit JCS for needs/effects; optional sessions are independently restored from immutable Rust baseline26f5 canonical_sessions (kit omitted them). No current parser is an oracle at replay.",
+  "vectors": [
+    {
+      "name": "historical empty",
+      "declaration": {
+        "needs": [],
+        "effects": []
+      },
+      "canonical": {
+        "needs": [],
+        "effects": []
+      },
+      "canonical_bytes": "{\"effects\":[],\"needs\":[]}",
+      "declaration_digest": "4681a6706ccbee8a85a2ad7c390945b65564e47211b087e2b3bd86df086546e9"
+    },
+    {
+      "name": "historical exact duplicate strings",
+      "declaration": {
+        "needs": [
+          " z ",
+          "a",
+          "a"
+        ],
+        "effects": [
+          "z",
+          "a",
+          "a"
+        ]
+      },
+      "canonical": {
+        "needs": [
+          " z ",
+          "a",
+          "a"
+        ],
+        "effects": [
+          "a",
+          "a",
+          "z"
+        ]
+      },
+      "canonical_bytes": "{\"effects\":[\"a\",\"a\",\"z\"],\"needs\":[\" z \",\"a\",\"a\"]}",
+      "declaration_digest": "5f25bc67910edad8b0e5490ff295635ca532106fd53bf7635ee10b15f836afa6"
+    },
+    {
+      "name": "baseline SQL params effects sessions",
+      "declaration": {
+        "needs": [
+          {
+            "need": "sql.snapshot.v1",
+            "key": "rows",
+            "label": "Visible records",
+            "sql": "SELECT id FROM records WHERE name = ?1 ORDER BY id",
+            "params": [
+              {
+                "name": "name",
+                "type": "text"
+              }
+            ]
+          }
+        ],
+        "effects": [
+          {
+            "effect": "records.facet-set.v1",
+            "key": "priority",
+            "values": [
+              "z",
+              "a"
+            ],
+            "target": {
+              "need": "rows"
+            }
+          },
+          {
+            "effect": "comment.create.v1",
+            "positions": [
+              "root",
+              "reply"
+            ],
+            "max_body_bytes": 4096,
+            "target": {
+              "need": "rows"
+            }
+          },
+          {
+            "effect": "message.react.v1",
+            "emoji": [
+              "👀",
+              "👍"
+            ],
+            "target": {
+              "need": "rows"
+            }
+          },
+          {
+            "effect": "records.title-set.v1",
+            "target": {
+              "need": "rows"
+            }
+          }
+        ],
+        "sessions": [
+          {
+            "session": "session.body.v1",
+            "key": "z",
+            "scope": {
+              "type": "Document",
+              "kind": "*"
+            },
+            "mode": "view",
+            "presence": false
+          },
+          {
+            "session": "session.body.v1",
+            "key": "a",
+            "scope": {
+              "type": "Document",
+              "kind": "note"
+            },
+            "mode": "edit",
+            "presence": true
+          }
+        ]
+      },
+      "canonical": {
+        "needs": [],
+        "effects": [
+          {
+            "effect": "records.title-set.v1",
+            "target": {
+              "need": "rows"
+            }
+          },
+          {
+            "effect": "comment.create.v1",
+            "positions": [
+              "reply",
+              "root"
+            ],
+            "target": {
+              "need": "rows"
+            },
+            "max_body_bytes": 4096
+          },
+          {
+            "effect": "records.facet-set.v1",
+            "key": "priority",
+            "target": {
+              "need": "rows"
+            },
+            "values": [
+              "a",
+              "z"
+            ]
+          },
+          {
+            "effect": "message.react.v1",
+            "emoji": [
+              "👀",
+              "👍"
+            ],
+            "target": {
+              "need": "rows"
+            }
+          }
+        ],
+        "sql_needs": [
+          {
+            "key": "rows",
+            "label": "Visible records",
+            "need": "sql.snapshot.v1",
+            "sql": "SELECT id FROM records WHERE name = ?1 ORDER BY id",
+            "params": [
+              {
+                "name": "name",
+                "type": "text",
+                "max_len": 256,
+                "required": true
+              }
+            ]
+          }
+        ],
+        "sessions": [
+          {
+            "session": "session.body.v1",
+            "key": "a",
+            "scope": {
+              "type": "Document",
+              "kind": "note"
+            },
+            "mode": "edit",
+            "presence": true
+          },
+          {
+            "session": "session.body.v1",
+            "key": "z",
+            "scope": {
+              "type": "Document",
+              "kind": "*"
+            },
+            "mode": "view",
+            "presence": false
+          }
+        ]
+      },
+      "canonical_bytes": "{\"effects\":[{\"effect\":\"records.title-set.v1\",\"target\":{\"need\":\"rows\"}},{\"effect\":\"comment.create.v1\",\"max_body_bytes\":4096,\"positions\":[\"reply\",\"root\"],\"target\":{\"need\":\"rows\"}},{\"effect\":\"records.facet-set.v1\",\"key\":\"priority\",\"target\":{\"need\":\"rows\"},\"values\":[\"a\",\"z\"]},{\"effect\":\"message.react.v1\",\"emoji\":[\"👀\",\"👍\"],\"target\":{\"need\":\"rows\"}}],\"needs\":[],\"sessions\":[{\"key\":\"a\",\"mode\":\"edit\",\"presence\":true,\"scope\":{\"kind\":\"note\",\"type\":\"Document\"},\"session\":\"session.body.v1\"},{\"key\":\"z\",\"mode\":\"view\",\"presence\":false,\"scope\":{\"kind\":\"*\",\"type\":\"Document\"},\"session\":\"session.body.v1\"}],\"sql_needs\":[{\"key\":\"rows\",\"label\":\"Visible records\",\"need\":\"sql.snapshot.v1\",\"params\":[{\"max_len\":256,\"name\":\"name\",\"required\":true,\"type\":\"text\"}],\"sql\":\"SELECT id FROM records WHERE name = ?1 ORDER BY id\"}]}",
+      "declaration_digest": "a3b3adb376983630db5f452b19c786ae2a8f85d874305c63faa8dc07d40c955a"
+    },
+    {
+      "name": "baseline numeric params and explicit empty",
+      "declaration": {
+        "needs": [
+          {
+            "need": "sql.snapshot.v1",
+            "key": "n",
+            "label": "Visible records",
+            "sql": "SELECT id FROM records WHERE created_at_ms > ?1 AND updated_at_ms > ?2 ORDER BY id",
+            "params": [
+              {
+                "name": "after",
+                "type": "integer",
+                "required": false
+              },
+              {
+                "name": "at",
+                "type": "timestamp_ms"
+              }
+            ]
+          },
+          {
+            "need": "sql.snapshot.v1",
+            "key": "e",
+            "label": "empty",
+            "sql": "SELECT id FROM records ORDER BY id",
+            "params": []
+          }
+        ],
+        "effects": [],
+        "sessions": []
+      },
+      "canonical": {
+        "needs": [],
+        "effects": [],
+        "sql_needs": [
+          {
+            "key": "e",
+            "label": "empty",
+            "need": "sql.snapshot.v1",
+            "sql": "SELECT id FROM records ORDER BY id"
+          },
+          {
+            "key": "n",
+            "label": "Visible records",
+            "need": "sql.snapshot.v1",
+            "sql": "SELECT id FROM records WHERE created_at_ms > ?1 AND updated_at_ms > ?2 ORDER BY id",
+            "params": [
+              {
+                "name": "after",
+                "type": "integer",
+                "required": false
+              },
+              {
+                "name": "at",
+                "type": "timestamp_ms",
+                "required": true
+              }
+            ]
+          }
+        ],
+        "sessions": []
+      },
+      "canonical_bytes": "{\"effects\":[],\"needs\":[],\"sessions\":[],\"sql_needs\":[{\"key\":\"e\",\"label\":\"empty\",\"need\":\"sql.snapshot.v1\",\"sql\":\"SELECT id FROM records ORDER BY id\"},{\"key\":\"n\",\"label\":\"Visible records\",\"need\":\"sql.snapshot.v1\",\"params\":[{\"name\":\"after\",\"required\":false,\"type\":\"integer\"},{\"name\":\"at\",\"required\":true,\"type\":\"timestamp_ms\"}],\"sql\":\"SELECT id FROM records WHERE created_at_ms > ?1 AND updated_at_ms > ?2 ORDER BY id\"}]}",
+      "declaration_digest": "ac56212dbc15bb94cce43b347ea3cb3d1ed4aea4019965e4cee530efbe1bab98"
+    },
+    {
+      "name": "same old SQL key remains SQL",
+      "declaration": {
+        "needs": [
+          {
+            "need": "sql.snapshot.v1",
+            "key": "records.body.read.v1",
+            "label": "ordinary SQL",
+            "sql": "SELECT id FROM records ORDER BY id"
+          }
+        ],
+        "effects": []
+      },
+      "canonical": {
+        "needs": [],
+        "effects": [],
+        "sql_needs": [
+          {
+            "key": "records.body.read.v1",
+            "label": "ordinary SQL",
+            "need": "sql.snapshot.v1",
+            "sql": "SELECT id FROM records ORDER BY id"
+          }
+        ]
+      },
+      "canonical_bytes": "{\"effects\":[],\"needs\":[],\"sql_needs\":[{\"key\":\"records.body.read.v1\",\"label\":\"ordinary SQL\",\"need\":\"sql.snapshot.v1\",\"sql\":\"SELECT id FROM records ORDER BY id\"}]}",
+      "declaration_digest": "0f3c338c8741cbe5a444fffe0fdcca7afba470216dd4b41971f6c7b2fab979af"
+    },
+    {
+      "name": "same bare string inert",
+      "declaration": {
+        "needs": [
+          "records.body.read.v1"
+        ],
+        "effects": []
+      },
+      "canonical": {
+        "needs": [
+          "records.body.read.v1"
+        ],
+        "effects": []
+      },
+      "canonical_bytes": "{\"effects\":[],\"needs\":[\"records.body.read.v1\"]}",
+      "declaration_digest": "914433578a9fd9c09e8627a5bd23c3e54018a6b19bb7523801381a252575fc8d"
+    },
+    {
+      "name": "descriptor only",
+      "declaration": {
+        "needs": [
+          {
+            "need": "records.body.read.v1",
+            "scope": "viewer-visible-current-bodies"
+          }
+        ],
+        "effects": []
+      },
+      "canonical": {
+        "needs": [],
+        "effects": [],
+        "body_read_needs": [
+          {
+            "need": "records.body.read.v1",
+            "scope": "viewer-visible-current-bodies"
+          }
+        ]
+      },
+      "canonical_bytes": "{\"body_read_needs\":[{\"need\":\"records.body.read.v1\",\"scope\":\"viewer-visible-current-bodies\"}],\"effects\":[],\"needs\":[]}",
+      "declaration_digest": "b543054776df55c1cee9a703a50ea398e88ac3df40f322e437264ab6d450cae4"
+    },
+    {
+      "name": "descriptor SQL params effects sessions",
+      "declaration": {
+        "needs": [
+          {
+            "need": "records.body.read.v1",
+            "scope": "viewer-visible-current-bodies"
+          },
+          {
+            "need": "sql.snapshot.v1",
+            "key": "rows",
+            "label": "Visible records",
+            "sql": "SELECT id FROM records WHERE name = ?1 ORDER BY id",
+            "params": [
+              {
+                "name": "name",
+                "type": "text"
+              }
+            ]
+          }
+        ],
+        "effects": [
+          {
+            "effect": "records.facet-set.v1",
+            "key": "priority",
+            "values": [
+              "z",
+              "a"
+            ],
+            "target": {
+              "need": "rows"
+            }
+          },
+          {
+            "effect": "comment.create.v1",
+            "positions": [
+              "root",
+              "reply"
+            ],
+            "max_body_bytes": 4096,
+            "target": {
+              "need": "rows"
+            }
+          },
+          {
+            "effect": "message.react.v1",
+            "emoji": [
+              "👀",
+              "👍"
+            ],
+            "target": {
+              "need": "rows"
+            }
+          },
+          {
+            "effect": "records.title-set.v1",
+            "target": {
+              "need": "rows"
+            }
+          }
+        ],
+        "sessions": [
+          {
+            "session": "session.body.v1",
+            "key": "z",
+            "scope": {
+              "type": "Document",
+              "kind": "*"
+            },
+            "mode": "view",
+            "presence": false
+          },
+          {
+            "session": "session.body.v1",
+            "key": "a",
+            "scope": {
+              "type": "Document",
+              "kind": "note"
+            },
+            "mode": "edit",
+            "presence": true
+          }
+        ]
+      },
+      "canonical": {
+        "needs": [],
+        "effects": [
+          {
+            "effect": "records.title-set.v1",
+            "target": {
+              "need": "rows"
+            }
+          },
+          {
+            "effect": "comment.create.v1",
+            "positions": [
+              "reply",
+              "root"
+            ],
+            "target": {
+              "need": "rows"
+            },
+            "max_body_bytes": 4096
+          },
+          {
+            "effect": "records.facet-set.v1",
+            "key": "priority",
+            "target": {
+              "need": "rows"
+            },
+            "values": [
+              "a",
+              "z"
+            ]
+          },
+          {
+            "effect": "message.react.v1",
+            "emoji": [
+              "👀",
+              "👍"
+            ],
+            "target": {
+              "need": "rows"
+            }
+          }
+        ],
+        "sql_needs": [
+          {
+            "key": "rows",
+            "label": "Visible records",
+            "need": "sql.snapshot.v1",
+            "sql": "SELECT id FROM records WHERE name = ?1 ORDER BY id",
+            "params": [
+              {
+                "name": "name",
+                "type": "text",
+                "max_len": 256,
+                "required": true
+              }
+            ]
+          }
+        ],
+        "body_read_needs": [
+          {
+            "need": "records.body.read.v1",
+            "scope": "viewer-visible-current-bodies"
+          }
+        ],
+        "sessions": [
+          {
+            "session": "session.body.v1",
+            "key": "a",
+            "scope": {
+              "type": "Document",
+              "kind": "note"
+            },
+            "mode": "edit",
+            "presence": true
+          },
+          {
+            "session": "session.body.v1",
+            "key": "z",
+            "scope": {
+              "type": "Document",
+              "kind": "*"
+            },
+            "mode": "view",
+            "presence": false
+          }
+        ]
+      },
+      "canonical_bytes": "{\"body_read_needs\":[{\"need\":\"records.body.read.v1\",\"scope\":\"viewer-visible-current-bodies\"}],\"effects\":[{\"effect\":\"records.title-set.v1\",\"target\":{\"need\":\"rows\"}},{\"effect\":\"comment.create.v1\",\"max_body_bytes\":4096,\"positions\":[\"reply\",\"root\"],\"target\":{\"need\":\"rows\"}},{\"effect\":\"records.facet-set.v1\",\"key\":\"priority\",\"target\":{\"need\":\"rows\"},\"values\":[\"a\",\"z\"]},{\"effect\":\"message.react.v1\",\"emoji\":[\"👀\",\"👍\"],\"target\":{\"need\":\"rows\"}}],\"needs\":[],\"sessions\":[{\"key\":\"a\",\"mode\":\"edit\",\"presence\":true,\"scope\":{\"kind\":\"note\",\"type\":\"Document\"},\"session\":\"session.body.v1\"},{\"key\":\"z\",\"mode\":\"view\",\"presence\":false,\"scope\":{\"kind\":\"*\",\"type\":\"Document\"},\"session\":\"session.body.v1\"}],\"sql_needs\":[{\"key\":\"rows\",\"label\":\"Visible records\",\"need\":\"sql.snapshot.v1\",\"params\":[{\"max_len\":256,\"name\":\"name\",\"required\":true,\"type\":\"text\"}],\"sql\":\"SELECT id FROM records WHERE name = ?1 ORDER BY id\"}]}",
+      "declaration_digest": "15220762b37599ea97b31be1a3c1de9aefa57d153d03496a52536dde28a7851b"
+    }
+  ]
+}

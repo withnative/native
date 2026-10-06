@@ -9,11 +9,11 @@ without a top-level action discriminator.
 
 ## Current operation census
 
-- **86 registered tools / 220 operations**.
-- **13 ordinary, 86 high-risk, and 121 specialized operations**.
-- **95 read-only and 125 mutating operations**.
-- **215 operations carry a non-disclosure obligation**.
-- All **125 mutating operations** carry an explicit no-write-on-deny obligation
+- **86 registered tools / 226 operations**.
+- **13 ordinary, 86 high-risk, and 127 specialized operations**.
+- **97 read-only and 129 mutating operations**.
+- **221 operations carry a non-disclosure obligation**.
+- All **129 mutating operations** carry an explicit no-write-on-deny obligation
   and named negative evidence.
 - **5 read operations** have justified `negative_evidence: not_applicable`:
   `ping.$tool`, `engine_info.$tool`, `quickstart.$tool`, `read_guide.$tool`, and
@@ -76,3 +76,6 @@ reviewable assertions owned by the cited suites. The contract intentionally
 does not claim canonical allow/deny execution for every action in this one
 test binary, and it does not replace differential predicate parity or
 property-generated policy trees. Those remain separate proof obligations.
+
+Alpha-tab update retains the shared numeric X.Y.Z version format and imposes
+no version ordering; equal versions and rollback are allowed.

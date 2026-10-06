@@ -649,7 +649,7 @@ async fn attention_person_id_in(
     .await?)
 }
 
-async fn require_local_message_in(
+pub(crate) async fn require_local_message_in(
     tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
     caller: &Caller,
     message_id: &str,
@@ -669,7 +669,7 @@ async fn require_local_message_in(
     Ok(())
 }
 
-async fn reaction_present_in(
+pub(crate) async fn reaction_present_in(
     tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
     message_id: &str,
     actor: &str,
@@ -884,17 +884,20 @@ async fn message_state_in(
     }))
 }
 
-struct ReactionCommandSpec<'a> {
-    message_id: &'a str,
-    emoji: &'a str,
-    command: &'a str,
-    idempotency_key: &'a str,
-    reason: &'a str,
-    adding: bool,
-    changed: bool,
+pub(crate) struct ReactionCommandSpec<'a> {
+    pub message_id: &'a str,
+    pub emoji: &'a str,
+    pub command: &'a str,
+    pub idempotency_key: &'a str,
+    pub reason: &'a str,
+    pub adding: bool,
+    pub changed: bool,
+    /// Artifact origin for tab-governed reactions; `None` on the ordinary
+    /// path, whose events keep serializing without it.
+    pub origin: Option<serde_json::Value>,
 }
 
-async fn append_reaction_command_in(
+pub(crate) async fn append_reaction_command_in(
     db: &Db,
     tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
     caller: &Caller,
@@ -912,6 +915,7 @@ async fn append_reaction_command_in(
         executor_kind: executor_kind.into(),
         executor_ref,
         reason: spec.reason.into(),
+        origin: spec.origin.clone(),
     };
     payload.validate(Some(caller.actor()))?;
     append_in(
@@ -934,7 +938,7 @@ async fn append_reaction_command_in(
     Ok(())
 }
 
-fn verify_reaction_retry(
+pub(crate) fn verify_reaction_retry(
     existing: &(String, crate::events::MessageReactionPayload),
     message_id: &str,
     expected_type: &str,
@@ -1049,6 +1053,7 @@ async fn mutate_reaction(
             reason: &reason,
             adding,
             changed,
+            origin: None,
         },
         &mut act_alloc,
     )
@@ -1339,6 +1344,7 @@ async fn satisfy_acknowledgement_expectation_with_reaction(
             reason: &reason,
             adding: true,
             changed,
+            origin: None,
         },
         &mut act_alloc,
     )

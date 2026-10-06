@@ -335,6 +335,41 @@ drag producing neither `click` nor `drop` cannot arm a proposal, and a
 widget proposing only from `keydown` never earns the gesture mark, so both
 settle through the tray at best.
 
+### Bounded document body writes
+
+An adopted HTML v2 package can declare a `body.set` interaction with one
+explicit named `bound_input` record slot and `body: { "max_bytes": 32768 }`.
+Its adopted declaration must also admit `records.body-set.v1`, bounded by
+`max_body_bytes` and a declared singleton SQL target need with exactly one
+required Text `record_id` parameter (`max_len: 128`). The server binds the
+requested record and requires a complete single-id result. Invocation carries
+exactly two values, `body` and `expected_body_digest`, with no facet observed
+tokens. Rendered `interaction_availability` supplies the bound record cohort
+and current Edit hints; the write rechecks the installation, exact source,
+binding, target-need membership, View/Edit access and body digest in its own
+transaction.
+
+This route supports ordinary `Document` records on non-enrolled SQLite.
+Runtime-bearing records, artifact and instruction sources, deleted targets,
+and bodies or prior values over 32 KiB are refused. MDX body writes and
+enrolled databases remain unsupported. The engine does not infer an ordinary
+database from a filename or a storage-policy setting.
+
+A successful write returns `native.artifact-intent-result.v2` with one
+`body` change: bounded before/after summaries and a `rec:<i64>` version token.
+The public projection omits an empty `refresh`. Keep the version as a string.
+The authenticated host retains the exact invocation and idempotency key for
+same-attempt retry; a timeout can follow a commit, so it cannot establish that
+the write failed. An editor verifies a complete current body read before
+showing Saved and retains its draft on conflicts or unverified outcomes.
+
+Body Undo uses the matching history-backed reversal through
+`invoke_artifact_interaction`. It restores the exact prior nullable body and
+checks the version left by the Save; an intervening record update refuses
+the reversal. An identical retry returns the original receipt without a
+second event. Generic facet writes and generic body replacement are not a
+fallback for this interaction.
+
 ## `native.mdx.v1`
 
 `native.mdx.v1` is genuine MDX source compiled and executed on the server. The
@@ -857,3 +892,105 @@ schema setup, or replay. One permit is held across exactly one replay and the
 subsequent render; the already-materialized snapshot path cannot acquire a
 second permit or replay again. Combining `as_of` with `revalidate` always
 takes the full historical path; the short-circuit is live-only.
+
+## Showing an MDX artifact inside an app tab (`artifact.render.v1`)
+
+Sandboxed app packages (`native.html.v1` tab packages on bridge
+`native.html.bridge.v1`) cannot run `render_artifact` themselves. They can
+declare the host-named, on-request need `artifact.render.v1` and ask the host
+for the safe tree of one MDX artifact, so an app such as Docs or Spaces can
+show a plain MDX document in its own page styling. The consent card reads
+"Show MDX documents you can see, rendered by Native exactly as they appear to
+you. Display only: the tab cannot use a document's controls or change
+anything. Read-only."
+
+It is declared as a plain string, like the other host needs:
+`{"needs": ["artifact.render.v1"], "effects": []}`. The frame asks with
+`nativeArtifact.read("artifact.render.v1", { artifact_id })`, where
+`artifact_id` is a full record id in canonical lowercase hyphenated form.
+Short references, `as_of`, `revalidate` and every other parameter are refused
+`invalid_params`.
+
+**Authority.** The host runs the ordinary live `render_artifact` under the
+viewer's own `Caller`, never `as_of`, so the answer is exactly what the
+viewer's own render in the workbench would contain. The artifact's input
+bindings and exact-source grants are the artifact's, and they apply as they
+always do: they decide which ports the artifact may read, while every bound
+Collection, module subject and record is still checked against the viewer's
+own visibility. Two viewers of the same artifact therefore see different
+records in the same tree. The tab adds no authority and gains none; its
+consent only decides whether the viewer's render may cross into that frame.
+The tab's gates (install generation, adoption, the viewer's View on the tab's
+own artifact) and its consent are checked before the render, in the same
+read-only snapshot as the viewer's View on the requested artifact and its
+shape, and checked again after the render: a tab whose consent is withdrawn or
+whose install moves on mid-render receives nothing.
+
+**Answer.** A rendered artifact answers:
+
+```json
+{
+  "version": "artifact.render.v1",
+  "status": "rendered",
+  "artifact_id": "<id>",
+  "runtime": { "id": "native.mdx.v1 | native.mdx.v2" },
+  "plan": {
+    "kind": "safe_tree",
+    "version": "1",
+    "tree": { "type": "Fragment", "props": {}, "children": [] },
+    "styles": { "digest": "…", "flags": [] },
+    "provenance": {
+      "record_id": "<id>", "source_event_id": "…", "event_seq": 0,
+      "snapshot_event_id": "…", "snapshot_event_seq": 0,
+      "body_sha256": "…", "render_sha256": "…"
+    }
+  }
+}
+```
+
+`styles` is present only when the artifact has an authored stylesheet, and
+provenance members appear when the runtime supplies them. The answer is
+display-only. Interaction declarations, `observed` CAS tokens,
+`interaction_availability`, the input envelope, cache state, timing, write
+diagnostics and the stylesheet's `href` are withheld, and so are
+`caller_sha256` and the v2 revalidation token, which carry a fingerprint of the
+viewer's principal. Interactive nodes (`DropTarget`, `RecordCreate`,
+`FacetControl`, `PlacementPreview`) can still appear in the tree, so an app
+can tell that a document is interactive and send the person to the workbench
+instead.
+
+Every other outcome is an ordinary refused read: the frame receives
+`{status: "refused", code}` from the bridge, as for any on-request need, and
+nothing else about the artifact. The codes, in the order they are checked:
+
+- the usual gate and consent codes (`undeclared_need`, `cas_mismatch`,
+  `unauthorized`, …), and `invalid_params` for anything but one canonical
+  `artifact_id`. The registry does not expand a short reference for this
+  need, so a prefix is refused rather than resolved, and no lookup of the
+  target runs ahead of the tab's gates;
+- `not_found` for an artifact the viewer cannot see, and identically for one
+  that does not exist;
+- `not_mdx_artifact` for any visible record that is not a live `Document
+  kind:artifact` whose runtime is exactly `native.mdx.v1` or `native.mdx.v2`:
+  HTML tab packages, boards, folders and ordinary pages included;
+- `render_failed` when the render itself does not produce an MDX safe tree,
+  for example on a policy violation or a binding the viewer can no longer
+  read. No part of the diagnostic or error crosses; the workbench shows it.
+  If the viewer lost View on the artifact, or it was deleted, while it
+  rendered, the answer is `not_found` instead: the host re-checks the
+  viewer's View in a fresh snapshot, never reading the render's error;
+- `too_large` when the answer would pass 786,432 UTF-16 code units. The
+  engine measures the RFC 8785 canonical (key-sorted) JSON serialisation of
+  the answer in UTF-16 code units (`es_json_len`), which has the same length
+  as the frame bridge's own `JSON.stringify(...).length` check. That leaves a
+  quarter of the bridge's 1,048,576-unit answer cap for the host's wrapper. A
+  render is refused whole, never cut.
+
+**Bounds and caching.** The read reuses the render's own limits, admission
+permits, compiled-graph cache and Collection-port input cache, so a repeated
+read of an unchanged document is a cache hit. The host's 10-second read
+timeout and four-in-flight queue apply as for any on-request read.
+
+**Liveness.** The answer carries no revision token. An app re-reads when its
+own signal (for example a SQL pulse need) says something changed, and can
+compare `plan.provenance.render_sha256` to skip redrawing an unchanged tree.

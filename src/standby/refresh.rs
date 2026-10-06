@@ -11,7 +11,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::future::Future;
 use std::io::{Read as _, Write as _};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -38,6 +38,8 @@ use super::authority_probe::read_authority_act_head;
 use super::delta_transport::AuthorityActTransport;
 use super::{GenerationStore, InstalledGeneration, StandbyRuntimeConfig};
 
+mod binary;
+
 const STATE_CONTRACT: &str = "native.standby-refresh-state.v1";
 const CONFIG_CONTRACT: &str = "native.standby-refresh-config.v1";
 const PROTOCOL_VERSION: &str = "2026-07-28";
@@ -46,12 +48,13 @@ const MAX_PAGE_BYTES: usize = crate::mcp::SNAPSHOT_MAX_PAGE_BYTES;
 // One maximum-sized (512 KiB) page therefore expands to roughly 1.4 MiB after
 // base64 and JSON framing.
 const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
-const MAX_CREDENTIAL_BYTES: usize = 4096;
 const SCHEDULE_INTERVAL: Duration = Duration::from_secs(120);
 const MANUAL_POLL_INTERVAL: Duration = Duration::from_secs(1);
 // Export handles expire after five minutes. Leave time for state finalization
 // and never splice a timed-out transfer into a new export.
-const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(270);
+// Allow the server's thirty-minute initial capture plus download and local
+// verification. Subsequent refreshes still coalesce under the same controller.
+const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(45 * 60);
 const NETWORK_RECOVERY_PROBE_INTERVAL: Duration = Duration::from_secs(10);
 const WAKE_DETECTION_SLOP: Duration = Duration::from_secs(5);
 
@@ -80,7 +83,7 @@ impl StandbyRefreshConfig {
         // Availability and metadata are checked on every attempt so an
         // initially missing or atomically rotated credential can recover
         // without restarting the local reader.
-        validate_credential_path(&self.credential_file)
+        crate::credential_file::validate_credential_path(&self.credential_file, "standby")
     }
 }
 
@@ -578,10 +581,82 @@ pub struct StandbyRefreshController {
     observed: ObservedInstalledConsumerIdentity,
     refresh_dir: PathBuf,
     client: Arc<dyn SnapshotPageClient>,
+    binary_client: Arc<dyn binary::BinarySnapshotClient>,
+    binary_snapshot_enabled: bool,
     delta_enabled: bool,
 }
 
+/// Authenticated whole-copy acquisition, NOT an admitted/serving generation.
+/// Drop removes its private files; an operator may preserve them for separate
+/// complete offline admission. No current pointer or refresh success is set.
+pub struct StandbySnapshotDownload {
+    snapshot_path: PathBuf,
+    manifest_path: PathBuf,
+    cleanup: bool,
+}
+
+impl StandbySnapshotDownload {
+    pub fn snapshot_path(&self) -> &Path {
+        &self.snapshot_path
+    }
+
+    pub fn manifest_path(&self) -> &Path {
+        &self.manifest_path
+    }
+
+    /// Preserve the exact downloaded bytes and producer manifest for the
+    /// offline admission command. This does not certify or publish either.
+    pub fn preserve(mut self) -> (PathBuf, PathBuf) {
+        self.cleanup = false;
+        (self.snapshot_path.clone(), self.manifest_path.clone())
+    }
+}
+
+impl Drop for StandbySnapshotDownload {
+    fn drop(&mut self) {
+        if self.cleanup {
+            remove_owned_staging_file(&self.snapshot_path);
+            remove_owned_staging_file(&self.manifest_path);
+        }
+    }
+}
+
 impl StandbyRefreshController {
+    /// Deliberately acquire ONE full snapshot without delta fallback, admission
+    /// or pruning. Network acquisition retains its existing bounded transport,
+    /// credential rotation, manifest binding and digest checks. Expensive
+    /// offline verification is a separate step and cannot expire this download.
+    pub async fn acquire_snapshot_only(&self) -> Result<StandbySnapshotDownload> {
+        // Never overlap the normal refresh daemon or another acquisition.
+        let controller_lock = open_private_lock(&self.refresh_dir.join("controller.lock"))?;
+        controller_lock.try_lock_exclusive()?;
+        let attempt_lock = open_private_lock(&self.refresh_dir.join("attempt.lock"))?;
+        attempt_lock.try_lock_exclusive()?;
+        let id = uuid::Uuid::new_v4();
+        let download = StandbySnapshotDownload {
+            snapshot_path: self
+                .store
+                .staging_dir()
+                .join(format!("acquire-{id}.snapshot.db")),
+            manifest_path: self
+                .store
+                .staging_dir()
+                .join(format!("acquire-{id}.manifest.json")),
+            cleanup: true,
+        };
+        let bearer = read_credential(&self.config.credential_file).map_err(|error| error.source)?;
+        let manifest = tokio::time::timeout(
+            ATTEMPT_TIMEOUT,
+            self.download_binary_only(bearer, download.snapshot_path()),
+        )
+        .await
+        .map_err(|_| Error::engine("standby acquisition timed out; no generation published"))?
+        .map_err(|error| error.source)?;
+        self.write_downloaded_manifest(&manifest, download.manifest_path())
+            .map_err(|error| error.source)?;
+        Ok(download)
+    }
+
     pub fn new(
         runtime: StandbyRuntimeConfig,
         config: StandbyRefreshConfig,
@@ -599,6 +674,8 @@ impl StandbyRefreshController {
             observed,
             refresh_dir,
             client: Arc::new(HttpSnapshotPageClient::new()?),
+            binary_client: Arc::new(binary::HttpBinarySnapshotClient::new()?),
+            binary_snapshot_enabled: true,
             delta_enabled: true,
         })
     }
@@ -613,6 +690,7 @@ impl StandbyRefreshController {
     ) -> Result<Self> {
         let mut controller = Self::new(runtime, config, store, observed)?;
         controller.client = client;
+        controller.binary_snapshot_enabled = false;
         // Existing snapshot-controller fixtures intentionally exercise the
         // legacy path in isolation. Dedicated delta tests cover the new path.
         controller.delta_enabled = false;
@@ -867,8 +945,12 @@ impl StandbyRefreshController {
             utf8_percent_encode(&self.runtime.hosted_route_database_id, NON_ALPHANUMERIC)
         );
         let mut delta_fallback = None;
+        // The head probe checks pointer/manifest identity, not snapshot bytes.
+        // It is only a candidate for the delta path, never proof that the
+        // existing generation can safely justify the legacy snapshot path.
+        let probe_base = self.store.current_for_head_probe().ok().flatten();
         if self.delta_enabled {
-            if let Ok(Some(current)) = self.store.current_for_head_probe() {
+            if let Some(current) = probe_base.clone() {
                 match self.try_delta_attempt(&bearer, current).await? {
                     DeltaAttempt::Installed {
                         generation,
@@ -907,10 +989,21 @@ impl StandbyRefreshController {
             snapshot: snapshot_path.clone(),
             manifest: manifest_path.clone(),
         };
-        let (generation, retention_warnings) = self
-            .download_and_install(&endpoint, bearer, &snapshot_path, &manifest_path)
-            .await
-            .map_err(|error| match delta_fallback {
+        // Every full snapshot uses the bounded binary capture/transfer path,
+        // including fallback from a valid local generation. The legacy MCP
+        // first page awaits the whole capture under a ten-second HTTP budget;
+        // a trusted base does not make a large authority capture any smaller.
+        // GenerationStore still verifies both the candidate and current base
+        // before promotion. Tests may explicitly select the paged fixture path.
+        let acquisition = if self.binary_snapshot_enabled {
+            self.download_binary_and_install(bearer, &snapshot_path, &manifest_path)
+                .await
+        } else {
+            self.download_and_install(&endpoint, bearer, &snapshot_path, &manifest_path)
+                .await
+        };
+        let (generation, retention_warnings) =
+            acquisition.map_err(|error| match delta_fallback {
                 Some(diagnostic) => error.after_delta_fallback(diagnostic),
                 None => error,
             })?;
@@ -1211,6 +1304,15 @@ impl StandbyRefreshController {
                 Error::engine("missing standby manifest"),
             )
         })?;
+        self.install_downloaded_snapshot(manifest, snapshot_path, manifest_path)
+            .await
+    }
+
+    fn write_downloaded_manifest(
+        &self,
+        manifest: &StandbySnapshotManifest,
+        manifest_path: &Path,
+    ) -> std::result::Result<(), AttemptError> {
         let manifest_bytes = manifest.canonical_json().map_err(|error| {
             AttemptError::new(
                 RefreshFailureClass::Verification,
@@ -1228,6 +1330,17 @@ impl StandbyRefreshController {
         File::open(self.store.staging_dir())
             .and_then(|file| file.sync_all())
             .map_err(|error| local_io(error.into()))?;
+
+        Ok(())
+    }
+
+    async fn install_downloaded_snapshot(
+        &self,
+        manifest: StandbySnapshotManifest,
+        snapshot_path: &Path,
+        manifest_path: &Path,
+    ) -> std::result::Result<(InstalledGeneration, Vec<String>), AttemptError> {
+        self.write_downloaded_manifest(&manifest, manifest_path)?;
 
         self.record_active_candidate(&manifest)?;
 
@@ -1643,7 +1756,7 @@ fn validate_page(
     Ok(())
 }
 
-pub(super) fn validate_exact_origin(raw: &str) -> Result<()> {
+pub(crate) fn validate_exact_origin(raw: &str) -> Result<()> {
     let url = url::Url::parse(raw)
         .map_err(|_| Error::engine("standby hosted_origin must be an exact URL origin"))?;
     let loopback = match url.host() {
@@ -1667,91 +1780,13 @@ pub(super) fn validate_exact_origin(raw: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_credential_path(path: &Path) -> Result<()> {
-    if !path.is_absolute() {
-        return Err(Error::engine("standby credential_file must be absolute"));
-    }
-    let mut resolved = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::RootDir => resolved.push(component.as_os_str()),
-            Component::Normal(name) => {
-                resolved.push(name);
-                match fs::symlink_metadata(&resolved) {
-                    Ok(metadata) if metadata.file_type().is_symlink() => {
-                        return Err(Error::engine(
-                            "standby credential_file must not traverse symbolic links",
-                        ));
-                    }
-                    Ok(_) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(error.into()),
-                }
-            }
-            Component::Prefix(_) | Component::CurDir | Component::ParentDir => {
-                return Err(Error::engine(
-                    "standby credential_file must be lexically unambiguous",
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
 fn read_credential(path: &Path) -> std::result::Result<String, AttemptError> {
-    validate_credential_path(path).map_err(local_io)?;
-    validate_credential_metadata(path).map_err(local_io)?;
-    let before = fs::metadata(path).map_err(|error| local_io(error.into()))?;
-    let file = File::open(path).map_err(|error| local_io(error.into()))?;
-    let opened = file.metadata().map_err(|error| local_io(error.into()))?;
-    let after = fs::symlink_metadata(path).map_err(|error| local_io(error.into()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt as _;
-        if before.dev() != opened.dev()
-            || before.ino() != opened.ino()
-            || opened.dev() != after.dev()
-            || opened.ino() != after.ino()
-            || after.file_type().is_symlink()
-        {
-            return Err(local_io(Error::engine(
-                "standby credential file changed while opening",
-            )));
-        }
-    }
-    let mut bytes = Vec::new();
-    file.take((MAX_CREDENTIAL_BYTES + 1) as u64)
-        .read_to_end(&mut bytes)
-        .map_err(|error| local_io(error.into()))?;
-    if bytes.len() > MAX_CREDENTIAL_BYTES {
-        return Err(local_io(Error::engine(
-            "standby credential exceeded its bound",
-        )));
-    }
-    let token = std::str::from_utf8(&bytes)
-        .map_err(|_| local_io(Error::engine("standby credential is not UTF-8")))?
-        .trim_end_matches(['\r', '\n']);
-    if token.is_empty() || token.chars().any(char::is_whitespace) {
-        return Err(local_io(Error::engine(
-            "standby credential is empty or contains whitespace",
-        )));
-    }
-    Ok(token.to_string())
-}
-
-fn validate_credential_metadata(path: &Path) -> Result<()> {
-    require_regular_file(path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-        let metadata = fs::metadata(path)?;
-        if metadata.permissions().mode() & 0o077 != 0 || metadata.nlink() != 1 {
-            return Err(Error::engine(
-                "standby credential file is not owner-only or is hard-linked",
-            ));
-        }
-    }
-    Ok(())
+    // Shared, hardened reader; the member-copy adapter reuses the same
+    // discipline. `label` preserves the standby diagnostics and error class.
+    let bytes =
+        crate::credential_file::read_guarded_credential(path, "standby").map_err(local_io)?;
+    String::from_utf8(bytes.to_vec())
+        .map_err(|_| local_io(Error::engine("standby credential is not UTF-8")))
 }
 
 fn create_private_directory(path: &Path) -> Result<()> {
@@ -2049,6 +2084,16 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
+    use axum::body::Body;
+    use axum::extract::{Path as HttpPath, State as HttpState};
+    use axum::http::header::{
+        ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG, RANGE,
+    };
+    use axum::http::{HeaderMap, HeaderValue, StatusCode};
+    use axum::response::{IntoResponse, Response};
+    use axum::routing::{get, post};
+    use axum::{Json, Router};
+
     use super::*;
     use crate::standby_snapshot::{
         HostedStandbyManifestContext, ProducerBuildIdentity, StandbyConsumerPlatform,
@@ -2240,6 +2285,926 @@ mod tests {
         let store = GenerationStore::open(&replica_root, "route-1", Some(origin)).unwrap();
         StandbyRefreshController::new_with_client(runtime, config, store, observed(), client)
             .unwrap()
+    }
+
+    #[derive(Clone, Copy)]
+    enum BinaryWireFault {
+        None,
+        ContentRange,
+        Etag,
+        Length,
+        Unsatisfiable,
+        FailedPoll,
+        Redirect,
+        Unauthorized,
+        InterruptedOnce,
+        InterruptedAlways,
+    }
+
+    #[derive(Clone)]
+    struct BinaryHttpFixture {
+        bytes: Arc<Vec<u8>>,
+        manifest: StandbySnapshotManifest,
+        authority: Option<crate::Db>,
+        fault: BinaryWireFault,
+        starts: Arc<AtomicUsize>,
+        ranges: Arc<Mutex<Vec<String>>>,
+        polls: Arc<AtomicUsize>,
+        mcp_calls: Arc<AtomicUsize>,
+        cancels: Arc<AtomicUsize>,
+    }
+
+    const BINARY_TEST_HANDLE: &str = "0dc9aadc-46b9-438d-8fca-5f719a8d6dc7";
+    const BINARY_TEST_API: &str = "native.standby-snapshot-export.v1";
+
+    fn binary_json(status: StatusCode, body: Value) -> Response {
+        let mut response = (status, Json(body)).into_response();
+        response.headers_mut().insert(
+            "x-native-export-api",
+            HeaderValue::from_static(BINARY_TEST_API),
+        );
+        response
+    }
+
+    async fn binary_start_fixture(
+        HttpState(fixture): HttpState<BinaryHttpFixture>,
+        HttpPath(database): HttpPath<String>,
+        headers: HeaderMap,
+        Json(body): Json<Value>,
+    ) -> Response {
+        assert_eq!(database, "route-1");
+        assert_eq!(headers.get("authorization").unwrap(), "Bearer secret");
+        assert_eq!(body["contract"], BINARY_TEST_API);
+        assert_eq!(body["version"], 1);
+        assert_eq!(body["consumer"], serde_json::to_value(consumer()).unwrap());
+        fixture.starts.fetch_add(1, Ordering::SeqCst);
+        binary_json(
+            StatusCode::ACCEPTED,
+            json!({"api":BINARY_TEST_API,"export_handle":BINARY_TEST_HANDLE,
+                   "status":"pending","expires_at":"2026-09-29T21:00:00Z"}),
+        )
+    }
+
+    async fn binary_poll_fixture(
+        HttpState(fixture): HttpState<BinaryHttpFixture>,
+        HttpPath((database, handle)): HttpPath<(String, String)>,
+        headers: HeaderMap,
+    ) -> Response {
+        assert_eq!(database, "route-1");
+        assert_eq!(handle, BINARY_TEST_HANDLE);
+        assert_eq!(headers.get("authorization").unwrap(), "Bearer secret");
+        if fixture.polls.fetch_add(1, Ordering::SeqCst) == 0 {
+            return binary_json(
+                StatusCode::OK,
+                json!({"api":BINARY_TEST_API,"export_handle":BINARY_TEST_HANDLE,
+                       "status":"pending","expires_at":"2026-09-29T21:00:00Z"}),
+            );
+        }
+        if matches!(fixture.fault, BinaryWireFault::FailedPoll) {
+            return binary_json(
+                StatusCode::OK,
+                json!({"api":BINARY_TEST_API,"export_handle":BINARY_TEST_HANDLE,
+                       "status":"failed","expires_at":"2026-09-29T21:00:00Z",
+                       "error_code":"capture_failed"}),
+            );
+        }
+        binary_json(
+            StatusCode::OK,
+            json!({"api":BINARY_TEST_API,"export_handle":BINARY_TEST_HANDLE,
+                   "status":"ready","expires_at":"2026-09-29T21:00:00Z",
+                   "manifest":fixture.manifest,"size_bytes":fixture.bytes.len(),
+                   "sha256":fixture.manifest.snapshot.sha256}),
+        )
+    }
+
+    async fn binary_bytes_fixture(
+        HttpState(fixture): HttpState<BinaryHttpFixture>,
+        HttpPath((database, handle)): HttpPath<(String, String)>,
+        headers: HeaderMap,
+    ) -> Response {
+        assert_eq!(database, "route-1");
+        assert_eq!(handle, BINARY_TEST_HANDLE);
+        assert_eq!(headers.get("authorization").unwrap(), "Bearer secret");
+        let range = headers.get(RANGE).unwrap().to_str().unwrap().to_owned();
+        let range_attempt = {
+            let mut ranges = fixture.ranges.lock().unwrap();
+            ranges.push(range.clone());
+            ranges.iter().filter(|request| *request == &range).count()
+        };
+        if matches!(fixture.fault, BinaryWireFault::Redirect) {
+            let mut response = StatusCode::FOUND.into_response();
+            response.headers_mut().insert(
+                axum::http::header::LOCATION,
+                HeaderValue::from_static("http://127.0.0.1/should-not-follow"),
+            );
+            return response;
+        }
+        if matches!(fixture.fault, BinaryWireFault::Unauthorized) {
+            return binary_json(
+                StatusCode::FORBIDDEN,
+                json!({"error":{"code":"owner_required"}}),
+            );
+        }
+        let (start, end) = range
+            .strip_prefix("bytes=")
+            .unwrap()
+            .split_once('-')
+            .unwrap();
+        let start: usize = start.parse().unwrap();
+        let end: usize = end.parse().unwrap();
+        assert!(end < fixture.bytes.len());
+        if matches!(fixture.fault, BinaryWireFault::Unsatisfiable) {
+            let mut response = binary_json(
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                json!({"error":{"code":"range_not_satisfiable"}}),
+            );
+            response.headers_mut().insert(
+                CONTENT_RANGE,
+                HeaderValue::from_str(&format!("bytes */{}", fixture.bytes.len())).unwrap(),
+            );
+            return response;
+        }
+        let bytes = fixture.bytes[start..=end].to_vec();
+        let byte_length = bytes.len();
+        let interrupted = start > 0
+            && match fixture.fault {
+                BinaryWireFault::InterruptedOnce => range_attempt == 1,
+                BinaryWireFault::InterruptedAlways => true,
+                _ => false,
+            };
+        // A streamed body has no exact size hint, so this fixture can put a
+        // deliberately false Content-Length on the wire without Hyper
+        // rejecting the test response before the client sees it.
+        let body = if matches!(fixture.fault, BinaryWireFault::Length) || interrupted {
+            let bytes = if interrupted {
+                bytes[..byte_length - 1].to_vec()
+            } else {
+                bytes
+            };
+            Body::from_stream(futures::stream::once(async move {
+                Ok::<_, std::io::Error>(axum::body::Bytes::from(bytes))
+            }))
+        } else {
+            Body::from(bytes.clone())
+        };
+        let mut response = Response::new(body);
+        *response.status_mut() = StatusCode::PARTIAL_CONTENT;
+        let headers = response.headers_mut();
+        headers.insert(
+            "x-native-export-api",
+            HeaderValue::from_static(BINARY_TEST_API),
+        );
+        headers.insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static(STANDBY_SNAPSHOT_MEDIA_TYPE),
+        );
+        headers.insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+        let claimed_length = if matches!(fixture.fault, BinaryWireFault::Length) {
+            byte_length + 1
+        } else {
+            byte_length
+        };
+        headers.insert(
+            CONTENT_LENGTH,
+            HeaderValue::from_str(&claimed_length.to_string()).unwrap(),
+        );
+        let content_range = if matches!(fixture.fault, BinaryWireFault::ContentRange) {
+            format!("bytes {start}-{end}/{}", fixture.bytes.len() + 1)
+        } else {
+            format!("bytes {start}-{end}/{}", fixture.bytes.len())
+        };
+        headers.insert(
+            CONTENT_RANGE,
+            HeaderValue::from_str(&content_range).unwrap(),
+        );
+        let etag = if matches!(fixture.fault, BinaryWireFault::Etag) {
+            format!("\"{}\"", "0".repeat(64))
+        } else {
+            format!("\"{}\"", fixture.manifest.snapshot.sha256)
+        };
+        headers.insert(ETAG, HeaderValue::from_str(&etag).unwrap());
+        response
+    }
+
+    async fn binary_cancel_fixture(
+        HttpState(fixture): HttpState<BinaryHttpFixture>,
+        HttpPath((database, handle)): HttpPath<(String, String)>,
+        headers: HeaderMap,
+    ) -> Response {
+        assert_eq!(database, "route-1");
+        assert_eq!(handle, BINARY_TEST_HANDLE);
+        assert_eq!(headers.get("authorization").unwrap(), "Bearer secret");
+        fixture.cancels.fetch_add(1, Ordering::SeqCst);
+        binary_json(
+            StatusCode::OK,
+            json!({"api":BINARY_TEST_API,"status":"cancelled"}),
+        )
+    }
+
+    async fn binary_authority_fixture(
+        HttpState(fixture): HttpState<BinaryHttpFixture>,
+        HttpPath(database): HttpPath<String>,
+        headers: HeaderMap,
+        Json(body): Json<Value>,
+    ) -> Response {
+        assert_eq!(database, "route-1");
+        assert_eq!(headers.get("authorization").unwrap(), "Bearer secret");
+        fixture.mcp_calls.fetch_add(1, Ordering::SeqCst);
+        let authority = fixture.authority.expect("delta authority fixture");
+        let operation = body["params"]["arguments"]["operation"].as_str().unwrap();
+        let result = match operation {
+            super::super::delta_transport::AUTHORITY_ACT_HEAD_OPERATION => {
+                super::super::delta_transport::observe_authority_act_head(&authority, "route-1")
+                    .await
+                    .map(|value| serde_json::to_value(value).unwrap())
+            }
+            super::super::delta_transport::AUTHORITY_ACT_DELTA_OPERATION => {
+                let from = body["params"]["arguments"]["arguments"]["from_exclusive_act"]
+                    .as_i64()
+                    .unwrap();
+                super::super::delta_transport::observe_authority_act_delta(
+                    &authority, "route-1", from,
+                )
+                .await
+                .map(|value| serde_json::to_value(value).unwrap())
+            }
+            other => panic!("unexpected authority operation {other}"),
+        };
+        let envelope = match result {
+            Ok(structured) => json!({
+                "jsonrpc":"2.0","id":1,
+                "result":{"content":[],"structuredContent":structured,
+                          "isError":false,"resultType":"complete","_meta":{}}
+            }),
+            Err(_) => json!({"jsonrpc":"2.0","id":1,
+                              "error":{"code":-32000,"message":"authority refused"}}),
+        };
+        (StatusCode::OK, Json(envelope)).into_response()
+    }
+
+    async fn serve_binary_fixture(
+        fixture: BinaryHttpFixture,
+    ) -> (u16, tokio::task::JoinHandle<()>) {
+        let router = Router::new()
+            .route("/mcp/{database}", post(binary_authority_fixture))
+            .route(
+                "/v1/databases/{database}/standby-snapshot/exports",
+                post(binary_start_fixture),
+            )
+            .route(
+                "/v1/databases/{database}/standby-snapshot/exports/{handle}",
+                get(binary_poll_fixture).delete(binary_cancel_fixture),
+            )
+            .route(
+                "/v1/databases/{database}/standby-snapshot/exports/{handle}/bytes",
+                get(binary_bytes_fixture),
+            )
+            .with_state(fixture);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        (port, task)
+    }
+
+    #[tokio::test]
+    async fn binary_capture_and_transfer_observe_rotated_credentials() {
+        type Reply<T> = Pin<Box<dyn Future<Output = std::result::Result<T, AttemptError>> + Send>>;
+        struct RotatingClient {
+            credential: PathBuf,
+            bytes: Vec<u8>,
+            manifest: StandbySnapshotManifest,
+            expected: Mutex<String>,
+            reads: AtomicUsize,
+        }
+        impl binary::BinarySnapshotClient for RotatingClient {
+            fn start(
+                &self,
+                _origin: String,
+                _database: String,
+                bearer: String,
+                _consumer: StandbyConsumerIdentity,
+            ) -> Reply<String> {
+                assert_eq!(bearer, "secret");
+                fs::write(&self.credential, "after-capture-start").unwrap();
+                *self.expected.lock().unwrap() = "after-capture-start".into();
+                Box::pin(async { Ok(BINARY_TEST_HANDLE.into()) })
+            }
+            fn poll(
+                &self,
+                _origin: String,
+                _database: String,
+                bearer: String,
+                _handle: String,
+            ) -> Reply<binary::BinaryPoll> {
+                assert_eq!(bearer, *self.expected.lock().unwrap());
+                fs::write(&self.credential, "after-capture-ready").unwrap();
+                *self.expected.lock().unwrap() = "after-capture-ready".into();
+                let reply = binary::BinaryPoll::Ready {
+                    manifest: Box::new(self.manifest.clone()),
+                    size: self.bytes.len() as u64,
+                    sha256: self.manifest.snapshot.sha256.clone(),
+                };
+                Box::pin(async { Ok(reply) })
+            }
+            fn read(&self, request: binary::BinaryReadRequest) -> Reply<Vec<u8>> {
+                assert_eq!(request.bearer, *self.expected.lock().unwrap());
+                let next = format!("after-chunk-{}", self.reads.fetch_add(1, Ordering::SeqCst));
+                fs::write(&self.credential, &next).unwrap();
+                *self.expected.lock().unwrap() = next;
+                let start = request.offset as usize;
+                let bytes = self.bytes[start..start + request.length].to_vec();
+                Box::pin(async { Ok(bytes) })
+            }
+            fn cancel(
+                &self,
+                _origin: String,
+                _database: String,
+                bearer: String,
+                _handle: String,
+            ) -> Reply<()> {
+                assert_eq!(bearer, *self.expected.lock().unwrap());
+                Box::pin(async { Ok(()) })
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let db = crate::create_database(":memory:").await.unwrap();
+        let origin = crate::identity::database_id(&db).await.unwrap();
+        sqlx::query(
+            "INSERT INTO blobs (id, bytes, size_bytes, storage_tier, created_at)
+             VALUES ('credential-padding', zeroblob(1200000), 1200000, 'inline', '2026-07-31T00:00:00Z')",
+        )
+        .execute(db.write_pool())
+        .await
+        .unwrap();
+        let (bytes, manifest) = snapshot_fixture(&db).await;
+        let mut controller = controller_for_origin(
+            &directory,
+            origin,
+            Arc::new(AlwaysFailClient {
+                class: RefreshFailureClass::Protocol,
+                calls: AtomicUsize::new(0),
+            }),
+        );
+        let client = Arc::new(RotatingClient {
+            credential: controller.config.credential_file.clone(),
+            bytes,
+            manifest,
+            expected: Mutex::new("secret".into()),
+            reads: AtomicUsize::new(0),
+        });
+        controller.binary_client = client.clone();
+        controller.binary_snapshot_enabled = true;
+        let result = controller.refresh_once(RefreshCause::Manual).await.unwrap();
+        assert!(matches!(result, StandbyRefreshOutcome::Installed { .. }));
+        assert!(client.reads.load(Ordering::SeqCst) >= 2);
+    }
+
+    fn acquisition_fixture(bytes: Vec<u8>, manifest: StandbySnapshotManifest) -> BinaryHttpFixture {
+        BinaryHttpFixture {
+            bytes: Arc::new(bytes),
+            manifest,
+            authority: None,
+            fault: BinaryWireFault::None,
+            starts: Arc::default(),
+            ranges: Arc::default(),
+            polls: Arc::default(),
+            mcp_calls: Arc::default(),
+            cancels: Arc::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn acquisition_only_preserves_producer_binding_without_admitting_or_publishing() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = crate::create_database(":memory:").await.unwrap();
+        let origin = crate::identity::database_id(&db).await.unwrap();
+        let (_, mut manifest) = snapshot_fixture(&db).await;
+        // Authenticated, digest-correct bytes still require the separate kernel
+        // admission. Deliberately invalid SQLite proves that this is acquisition only.
+        let bytes = b"not an admitted SQLite database".to_vec();
+        manifest.snapshot.size_bytes = bytes.len() as u64;
+        manifest.snapshot.sha256 = hex::encode(Sha256::digest(&bytes));
+        let fixture = acquisition_fixture(bytes.clone(), manifest.clone());
+        let (port, server) = serve_binary_fixture(fixture.clone()).await;
+        let mut controller = controller_for_origin(
+            &directory,
+            origin,
+            Arc::new(AlwaysFailClient {
+                class: RefreshFailureClass::Protocol,
+                calls: AtomicUsize::new(0),
+            }),
+        );
+        controller.config.hosted_origin = format!("http://127.0.0.1:{port}");
+        let first = controller.acquire_snapshot_only().await.unwrap();
+        let snapshot = first.snapshot_path().to_owned();
+        let metadata = first.manifest_path().to_owned();
+        assert_eq!(fs::read(&snapshot).unwrap(), bytes);
+        assert_eq!(
+            fs::read(&metadata).unwrap(),
+            manifest.canonical_json().unwrap()
+        );
+        assert!(!controller
+            .runtime
+            .replica_root
+            .join("accepted/current.json")
+            .exists());
+        assert!(!controller.refresh_dir.join("state.json").exists());
+        assert_eq!(fixture.mcp_calls.load(Ordering::SeqCst), 0);
+        drop(first);
+        assert!(!snapshot.exists());
+        assert!(!metadata.exists());
+        let (snapshot, metadata) = controller.acquire_snapshot_only().await.unwrap().preserve();
+        assert_eq!(fs::read(&snapshot).unwrap(), bytes);
+        assert_eq!(
+            fs::read(&metadata).unwrap(),
+            manifest.canonical_json().unwrap()
+        );
+        assert!(!controller
+            .runtime
+            .replica_root
+            .join("accepted/current.json")
+            .exists());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn acquisition_only_refuses_bad_binding_and_digest_without_leaving_staging() {
+        for fault in ["digest", "consumer", "origin"] {
+            let directory = tempfile::tempdir().unwrap();
+            let db = crate::create_database(":memory:").await.unwrap();
+            let origin = crate::identity::database_id(&db).await.unwrap();
+            let (mut bytes, mut manifest) = snapshot_fixture(&db).await;
+            match fault {
+                "consumer" => manifest.consumer.artifact_sha256 = "f".repeat(64),
+                "origin" => manifest.origin_database_id = format!("ndb_{}", "f".repeat(32)),
+                _ => bytes[0] ^= 1,
+            }
+            let fixture = acquisition_fixture(bytes, manifest);
+            let (port, server) = serve_binary_fixture(fixture.clone()).await;
+            let mut controller = controller_for_origin(
+                &directory,
+                origin,
+                Arc::new(AlwaysFailClient {
+                    class: RefreshFailureClass::Protocol,
+                    calls: AtomicUsize::new(0),
+                }),
+            );
+            controller.config.hosted_origin = format!("http://127.0.0.1:{port}");
+            assert!(controller.acquire_snapshot_only().await.is_err());
+            if fault != "digest" {
+                assert!(
+                    fixture.ranges.lock().unwrap().is_empty(),
+                    "identity refusal must precede download"
+                );
+            }
+            assert_eq!(
+                fs::read_dir(controller.store.staging_dir())
+                    .unwrap()
+                    .count(),
+                0
+            );
+            assert!(!controller
+                .runtime
+                .replica_root
+                .join("accepted/current.json")
+                .exists());
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn acquisition_only_refuses_refresh_locks_before_starting_capture() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = crate::create_database(":memory:").await.unwrap();
+        let origin = crate::identity::database_id(&db).await.unwrap();
+        let (bytes, manifest) = snapshot_fixture(&db).await;
+        let fixture = acquisition_fixture(bytes, manifest);
+        let (port, server) = serve_binary_fixture(fixture.clone()).await;
+        let mut controller = controller_for_origin(
+            &directory,
+            origin,
+            Arc::new(AlwaysFailClient {
+                class: RefreshFailureClass::Protocol,
+                calls: AtomicUsize::new(0),
+            }),
+        );
+        controller.config.hosted_origin = format!("http://127.0.0.1:{port}");
+        for name in ["controller.lock", "attempt.lock"] {
+            let lock = open_private_lock(&controller.refresh_dir.join(name)).unwrap();
+            lock.try_lock_exclusive().unwrap();
+            assert!(controller.acquire_snapshot_only().await.is_err());
+            assert_eq!(fixture.starts.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                fs::read_dir(controller.store.staging_dir())
+                    .unwrap()
+                    .count(),
+                0
+            );
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn binary_first_install_uses_raw_ranges_and_verified_generation_store() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = crate::create_database(":memory:").await.unwrap();
+        let origin = crate::identity::database_id(&db).await.unwrap();
+        sqlx::query(
+            "INSERT INTO blobs (id, bytes, size_bytes, storage_tier, created_at)
+             VALUES ('binary-padding', zeroblob(1200000), 1200000, 'inline', '2026-07-31T00:00:00Z')",
+        )
+        .execute(db.write_pool())
+        .await
+        .unwrap();
+        let (bytes, manifest) = snapshot_fixture(&db).await;
+        assert!(bytes.len() > 1024 * 1024);
+        let fixture = BinaryHttpFixture {
+            bytes: Arc::new(bytes.clone()),
+            manifest: manifest.clone(),
+            authority: None,
+            fault: BinaryWireFault::None,
+            starts: Arc::default(),
+            ranges: Arc::default(),
+            polls: Arc::default(),
+            mcp_calls: Arc::default(),
+            cancels: Arc::default(),
+        };
+        let (port, server) = serve_binary_fixture(fixture.clone()).await;
+        let mut controller = controller_for_origin(
+            &directory,
+            origin,
+            Arc::new(AlwaysFailClient {
+                class: RefreshFailureClass::Protocol,
+                calls: AtomicUsize::new(0),
+            }),
+        );
+        controller.config.hosted_origin = format!("http://127.0.0.1:{port}");
+        controller.binary_snapshot_enabled = true;
+        let outcome = controller
+            .refresh_once(RefreshCause::Startup)
+            .await
+            .unwrap();
+        let StandbyRefreshOutcome::Installed { generation, .. } = outcome else {
+            panic!("first install must promote the binary snapshot")
+        };
+        assert_eq!(fs::read(&generation.snapshot_path).unwrap(), bytes);
+        assert_eq!(generation.manifest, manifest);
+        assert!(directory
+            .path()
+            .join("replica/accepted/current.json")
+            .exists());
+        let ranges = fixture.ranges.lock().unwrap().clone();
+        assert_eq!(ranges[0], "bytes=0-1048575");
+        assert!(ranges.len() >= 2, "snapshot must use more than one range");
+        assert!(fixture.polls.load(Ordering::SeqCst) >= 2);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while fixture.cancels.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn binary_interrupted_range_retries_same_handle_and_offset_boundedly() {
+        let authority = crate::create_database(":memory:").await.unwrap();
+        let origin = crate::identity::database_id(&authority).await.unwrap();
+        sqlx::query(
+            "INSERT INTO blobs (id, bytes, size_bytes, storage_tier, created_at)
+             VALUES ('retry-padding', zeroblob(1200000), 1200000, 'inline', '2026-07-31T00:00:00Z')",
+        )
+        .execute(authority.write_pool())
+        .await
+        .unwrap();
+        let (bytes, manifest) = snapshot_fixture(&authority).await;
+        assert!(bytes.len() > 1024 * 1024);
+        for (fault, succeeds) in [
+            (BinaryWireFault::InterruptedOnce, true),
+            (BinaryWireFault::InterruptedAlways, false),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let fixture = BinaryHttpFixture {
+                bytes: Arc::new(bytes.clone()),
+                manifest: manifest.clone(),
+                authority: None,
+                fault,
+                starts: Arc::default(),
+                ranges: Arc::default(),
+                polls: Arc::default(),
+                mcp_calls: Arc::default(),
+                cancels: Arc::default(),
+            };
+            let (port, server) = serve_binary_fixture(fixture.clone()).await;
+            let mcp_pages = Arc::new(AlwaysFailClient {
+                class: RefreshFailureClass::Protocol,
+                calls: AtomicUsize::new(0),
+            });
+            let mut controller =
+                controller_for_origin(&directory, origin.clone(), mcp_pages.clone());
+            controller.config.hosted_origin = format!("http://127.0.0.1:{port}");
+            controller.binary_snapshot_enabled = true;
+            let outcome = controller.refresh_once(RefreshCause::Startup).await;
+            if succeeds {
+                let StandbyRefreshOutcome::Installed { generation, .. } = outcome.unwrap() else {
+                    panic!("same-handle retry must install")
+                };
+                assert_eq!(fs::read(&generation.snapshot_path).unwrap(), bytes);
+            } else {
+                assert!(outcome.is_err());
+                assert_eq!(
+                    controller.state().unwrap().last_failure_class,
+                    Some(RefreshFailureClass::Network)
+                );
+                assert!(!directory
+                    .path()
+                    .join("replica/accepted/current.json")
+                    .exists());
+                assert_eq!(
+                    fs::read_dir(controller.store.staging_dir())
+                        .unwrap()
+                        .count(),
+                    0
+                );
+            }
+            assert_eq!(fixture.starts.load(Ordering::SeqCst), 1);
+            assert_eq!(mcp_pages.calls.load(Ordering::SeqCst), 0);
+            let ranges = fixture.ranges.lock().unwrap().clone();
+            assert_eq!(ranges[0], "bytes=0-1048575");
+            let retry_range = &ranges[1];
+            assert!(retry_range.starts_with("bytes=1048576-"));
+            assert_eq!(
+                ranges.iter().filter(|range| *range == retry_range).count(),
+                if succeeds { 2 } else { 3 },
+                "retry must request the same interrupted range on the same export handle"
+            );
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while fixture.cancels.load(Ordering::SeqCst) == 0 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            server.abort();
+        }
+        authority.close().await;
+    }
+
+    #[tokio::test]
+    async fn binary_valid_base_with_unqualified_authority_uses_binary_fallback() {
+        let directory = tempfile::tempdir().unwrap();
+        let authority = crate::create_database(":memory:").await.unwrap();
+        let origin = crate::identity::database_id(&authority).await.unwrap();
+        let (bytes, manifest) = snapshot_fixture(&authority).await;
+        let mut controller = controller_for_origin(
+            &directory,
+            origin,
+            Arc::new(ScriptedClient::new(paged_replies(
+                "valid-base",
+                &bytes,
+                &manifest,
+            ))),
+        );
+        assert!(matches!(
+            controller
+                .refresh_once(RefreshCause::Startup)
+                .await
+                .unwrap(),
+            StandbyRefreshOutcome::Installed { .. }
+        ));
+        assert!(controller
+            .store
+            .current_for_refresh(&controller.observed)
+            .await
+            .unwrap()
+            .is_some());
+        // This matches a legacy production authority: it cannot qualify
+        // exhaustive history for delta, even though its full snapshot is valid.
+        sqlx::query("PRAGMA application_id = 0")
+            .execute(authority.write_pool())
+            .await
+            .unwrap();
+        let (bytes, manifest) = snapshot_fixture(&authority).await;
+        let fixture = BinaryHttpFixture {
+            bytes: Arc::new(bytes),
+            manifest,
+            authority: Some(authority.clone()),
+            fault: BinaryWireFault::None,
+            starts: Arc::default(),
+            ranges: Arc::default(),
+            polls: Arc::default(),
+            mcp_calls: Arc::default(),
+            cancels: Arc::default(),
+        };
+        let (port, server) = serve_binary_fixture(fixture.clone()).await;
+        controller.config.hosted_origin = format!("http://127.0.0.1:{port}");
+        controller.delta_enabled = true;
+        controller.binary_snapshot_enabled = true;
+        let mcp_pages = Arc::new(AlwaysFailClient {
+            class: RefreshFailureClass::Protocol,
+            calls: AtomicUsize::new(0),
+        });
+        controller.client = mcp_pages.clone();
+        assert!(matches!(
+            controller
+                .refresh_once(RefreshCause::Scheduled)
+                .await
+                .unwrap(),
+            StandbyRefreshOutcome::Installed { .. }
+        ));
+        assert!(fixture.starts.load(Ordering::SeqCst) > 0);
+        assert!(!fixture.ranges.lock().unwrap().is_empty());
+        assert_eq!(mcp_pages.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.mcp_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            controller.state().unwrap().last_delta_fallback_class,
+            Some(DeltaFallbackClass::HeadCompatibility)
+        );
+        server.abort();
+        authority.close().await;
+    }
+
+    #[tokio::test]
+    async fn corrupted_present_generation_uses_binary_fallback_not_mcp_pages() {
+        let directory = tempfile::tempdir().unwrap();
+        let authority = crate::create_database(":memory:").await.unwrap();
+        let origin = crate::identity::database_id(&authority).await.unwrap();
+        let (base_bytes, base_manifest) = snapshot_fixture(&authority).await;
+        let mut controller = controller_for_origin(
+            &directory,
+            origin,
+            Arc::new(ScriptedClient::new(paged_replies(
+                "corrupt-base",
+                &base_bytes,
+                &base_manifest,
+            ))),
+        );
+        let first = controller
+            .refresh_once(RefreshCause::Startup)
+            .await
+            .unwrap();
+        let StandbyRefreshOutcome::Installed {
+            generation: first, ..
+        } = first
+        else {
+            panic!("fixture base must install")
+        };
+        let pointer = fs::read(directory.path().join("replica/accepted/current.json")).unwrap();
+        set_mode(&first.snapshot_path, 0o600).unwrap();
+        OpenOptions::new()
+            .append(true)
+            .open(&first.snapshot_path)
+            .unwrap()
+            .write_all(b"deep verification must reject this present base")
+            .unwrap();
+        set_mode(&first.snapshot_path, 0o400).unwrap();
+        assert!(controller.store.current_for_head_probe().unwrap().is_some());
+        assert!(controller
+            .store
+            .current_for_refresh(&controller.observed)
+            .await
+            .is_err());
+
+        crate::store::append(
+            &authority,
+            crate::store::AppendSpec {
+                record_id: "1a7e4000-0000-4000-8000-00000000d203".into(),
+                event_type: "record.created".into(),
+                payload: json!({"type":"Document","kind":"note","name":"binary fallback"}),
+                actor: None,
+            },
+        )
+        .await
+        .unwrap();
+        let (bytes, manifest) = snapshot_fixture(&authority).await;
+        let fixture = BinaryHttpFixture {
+            bytes: Arc::new(bytes),
+            manifest,
+            authority: Some(authority.clone()),
+            fault: BinaryWireFault::None,
+            starts: Arc::default(),
+            ranges: Arc::default(),
+            polls: Arc::default(),
+            mcp_calls: Arc::default(),
+            cancels: Arc::default(),
+        };
+        let (port, server) = serve_binary_fixture(fixture.clone()).await;
+        controller.config.hosted_origin = format!("http://127.0.0.1:{port}");
+        controller.delta_enabled = true;
+        controller.binary_snapshot_enabled = true;
+        let mcp_pages = Arc::new(AlwaysFailClient {
+            class: RefreshFailureClass::Protocol,
+            calls: AtomicUsize::new(0),
+        });
+        controller.client = mcp_pages.clone();
+
+        // The new snapshot is downloaded through HTTP, then admission safely
+        // refuses promotion against the corrupted current generation.
+        assert!(controller
+            .refresh_once(RefreshCause::Scheduled)
+            .await
+            .is_err());
+        assert_eq!(fixture.mcp_calls.load(Ordering::SeqCst), 2);
+        assert!(!fixture.ranges.lock().unwrap().is_empty());
+        assert_eq!(mcp_pages.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            controller.state().unwrap().last_delta_fallback_class,
+            Some(DeltaFallbackClass::UntrustedLocalBase)
+        );
+        assert_eq!(
+            fs::read(directory.path().join("replica/accepted/current.json")).unwrap(),
+            pointer
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while fixture.cancels.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        server.abort();
+        authority.close().await;
+    }
+
+    #[tokio::test]
+    async fn binary_first_install_rejects_invalid_wire_without_promotion() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let origin = crate::identity::database_id(&db).await.unwrap();
+        let (bytes, manifest) = snapshot_fixture(&db).await;
+        for fault in [
+            BinaryWireFault::ContentRange,
+            BinaryWireFault::Etag,
+            BinaryWireFault::Length,
+            BinaryWireFault::Unsatisfiable,
+            BinaryWireFault::FailedPoll,
+            BinaryWireFault::Redirect,
+            BinaryWireFault::Unauthorized,
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let fixture = BinaryHttpFixture {
+                bytes: Arc::new(bytes.clone()),
+                manifest: manifest.clone(),
+                authority: None,
+                fault,
+                starts: Arc::default(),
+                ranges: Arc::default(),
+                polls: Arc::default(),
+                mcp_calls: Arc::default(),
+                cancels: Arc::default(),
+            };
+            let (port, server) = serve_binary_fixture(fixture.clone()).await;
+            let mut controller = controller_for_origin(
+                &directory,
+                origin.clone(),
+                Arc::new(AlwaysFailClient {
+                    class: RefreshFailureClass::Protocol,
+                    calls: AtomicUsize::new(0),
+                }),
+            );
+            controller.config.hosted_origin = format!("http://127.0.0.1:{port}");
+            controller.binary_snapshot_enabled = true;
+            assert!(controller
+                .refresh_once(RefreshCause::Startup)
+                .await
+                .is_err());
+            let expected_class = match fault {
+                BinaryWireFault::FailedPoll | BinaryWireFault::Redirect => {
+                    RefreshFailureClass::Protocol
+                }
+                BinaryWireFault::Unauthorized => RefreshFailureClass::Authentication,
+                _ => RefreshFailureClass::DownloadIntegrity,
+            };
+            assert_eq!(
+                controller.state().unwrap().last_failure_class,
+                Some(expected_class)
+            );
+            assert!(!controller
+                .state()
+                .unwrap()
+                .last_failure
+                .as_deref()
+                .unwrap()
+                .contains("secret"));
+            assert!(!directory
+                .path()
+                .join("replica/accepted/current.json")
+                .exists());
+            assert_eq!(
+                fs::read_dir(controller.store.staging_dir())
+                    .unwrap()
+                    .count(),
+                0
+            );
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while fixture.cancels.load(Ordering::SeqCst) == 0 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            server.abort();
+        }
     }
 
     async fn read_http_request(stream: &mut TcpStream) -> (String, Value) {
@@ -3364,6 +4329,7 @@ mod tests {
     /// the executor envelope, the surface's `run_context` annotation and its
     /// optional `resultType` are proven against real dispatch code. A future
     /// change to any of the three breaks this test instead of only production.
+    #[cfg(feature = "mcp-executor-prototype")]
     #[tokio::test]
     async fn page_client_parses_a_real_executor_surface_response() {
         use crate::mcp::{

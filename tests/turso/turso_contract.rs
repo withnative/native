@@ -63,10 +63,24 @@ async fn turso_local_describe_schema_is_normalized_allowlisted_and_owner_gated()
     assert_eq!(owner["engine"]["storage_profile"], "turso-local");
     assert_eq!(
         owner["engine"]["ddl_fingerprint"],
-        "cb602bcd40071ca3e66a1b3ca41f4f3fafa0024d2fd448204b72d697f4bcb9c9"
+        "b5ab158cdd8a07541875e9cdeb43976ce78bbc550b577756d99c3610ec5f884f"
     );
-    assert_eq!(owner["tables"].as_array().unwrap().len(), 34);
-    assert_eq!(owner["ddl_statements"].as_array().unwrap().len(), 90);
+    assert_eq!(owner["tables"].as_array().unwrap().len(), 40);
+    assert_eq!(owner["ddl_statements"].as_array().unwrap().len(), 119);
+    let claim_meta = owner["tables"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|table| table["name"] == "content_event_claim_meta")
+        .unwrap();
+    assert_eq!(claim_meta["columns"].as_array().unwrap().len(), 5);
+    let facet_times = owner["tables"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|table| table["name"] == "facet_times")
+        .unwrap();
+    assert_eq!(facet_times["columns"].as_array().unwrap().len(), 10);
     let ddl = owner["ddl_statements"]
         .as_array()
         .unwrap()

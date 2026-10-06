@@ -115,6 +115,173 @@ pub fn verify_evaluation_trace(trace: &Value, expected_digest: &str) -> Result<(
     Ok(())
 }
 
+/// The stand-in a non-owner response carries where an unreadable policy
+/// source's identifier would otherwise appear. It is a fixed string so a fresh
+/// response and an idempotent retry of the same persisted trace render
+/// byte-identically.
+pub const REDACTED_POLICY_SOURCE_ID: &str = "redacted:policy-source-unreadable";
+
+/// Record ids of every policy source named anywhere in a trace: the admitted
+/// `sources` list and every conflict item. Readability is tested against these
+/// record ids; a binding id is not a record id and is collected by
+/// [`collect_hidden_identifiers`] once its source is known to be hidden.
+fn policy_source_record_ids(trace: &Value) -> Vec<String> {
+    fn walk(value: &Value, ids: &mut Vec<String>) {
+        match value {
+            Value::Object(map) => {
+                for key in ["record_id", "source_record_id"] {
+                    if let Some(id) = map.get(key).and_then(Value::as_str) {
+                        if !ids.iter().any(|seen| seen == id) {
+                            ids.push(id.to_string());
+                        }
+                    }
+                }
+                for child in map.values() {
+                    walk(child, ids);
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    walk(item, ids);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut ids = Vec::new();
+    walk(trace, &mut ids);
+    ids
+}
+
+fn push_unique(out: &mut Vec<String>, text: &str) {
+    if !out.iter().any(|seen| seen == text) {
+        out.push(text.to_string());
+    }
+}
+
+/// Every identifier the trace keeps beside a source whose record id is hidden:
+/// its binding id, source digest, issuer principal id, and statement ids. A
+/// reader who cannot name the source cannot hold any of its descriptors either.
+/// Walked recursively from objects that carry a hidden `record_id` /
+/// `source_record_id`.
+fn collect_hidden_identifiers(value: &Value, hidden: &[String], out: &mut Vec<String>) {
+    match value {
+        Value::Object(map) => {
+            let source_hidden = ["record_id", "source_record_id"].iter().any(|key| {
+                map.get(*key)
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| hidden.iter().any(|hidden_id| hidden_id == id))
+            });
+            if source_hidden {
+                for key in ["binding_id", "source_digest", "issuer_principal_id"] {
+                    if let Some(text) = map.get(key).and_then(Value::as_str) {
+                        push_unique(out, text);
+                    }
+                }
+                if let Some(statement) = map.get("statement_id").and_then(Value::as_str) {
+                    push_unique(out, statement);
+                }
+                if let Some(statements) = map.get("statement_ids").and_then(Value::as_array) {
+                    for statement in statements.iter().filter_map(Value::as_str) {
+                        push_unique(out, statement);
+                    }
+                }
+            }
+            for child in map.values() {
+                collect_hidden_identifiers(child, hidden, out);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_hidden_identifiers(item, hidden, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Apply the replacement for a known-hidden record-id set. The pure core of
+/// [`redact_trace_for_caller`], kept separately testable.
+fn redact_trace_with_hidden(trace: &Value, hidden_record_ids: &[String]) -> Value {
+    if hidden_record_ids.is_empty() {
+        return trace.clone();
+    }
+    let mut identifiers = hidden_record_ids.to_vec();
+    collect_hidden_identifiers(trace, hidden_record_ids, &mut identifiers);
+    let mut redacted = trace.clone();
+    redact_policy_source_ids(&mut redacted, &identifiers);
+    redacted
+}
+
+/// Replace every exact occurrence of a hidden identifier anywhere in `value`.
+/// The trace's shape, conflicts, disposition and digests are otherwise
+/// preserved; only the caller-facing clone is touched.
+fn redact_policy_source_ids(value: &mut Value, hidden: &[String]) {
+    match value {
+        Value::String(text) => {
+            if hidden.iter().any(|identifier| identifier == text) {
+                *text = REDACTED_POLICY_SOURCE_ID.to_string();
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                redact_policy_source_ids(item, hidden);
+            }
+        }
+        Value::Object(map) => {
+            for item in map.values_mut() {
+                redact_policy_source_ids(item, hidden);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The policy trace as `caller` may see it, evaluated against the caller's
+/// **current** readability. A host owner — the same footing `require_owner`
+/// gates on — keeps the full trace. Everyone else has every identifier of a
+/// policy source they cannot View now replaced by
+/// [`REDACTED_POLICY_SOURCE_ID`]; the disposition, the conflicts and the
+/// digests are untouched.
+///
+/// Readability is re-checked here rather than trusted from the trace's own
+/// `policy_source_unreadable` entries, because the idempotent-retry path
+/// returns a trace evaluated under earlier capabilities: a source the sender
+/// could View at the first send may since have been revoked, and the retry
+/// must not name it.
+///
+/// Residual (accepted): the returned `evaluation_digest` (and the intervention
+/// view's `trace_digest`) is SHA-256 over the *unredacted* trace, so someone
+/// who already knows a hidden source's random id — or a low-entropy
+/// caller-supplied binding id — could confirm a guess by recomputing it. We
+/// deliberately do not change digest inputs: that digest is the resume
+/// compare-and-swap guard (`mcp/tools/interventions.rs` view and
+/// `resume_delivery`), so it must stay identical to the persisted value.
+/// Closing the residual needs a digest of the redacted trace computed
+/// consistently in both the view and `resume_delivery`; that is a separate
+/// change.
+pub async fn redact_trace_for_caller(
+    db: &crate::db::Db,
+    caller: &Caller,
+    trace: &Value,
+) -> Result<Value> {
+    if caller.is_host_owner() {
+        return Ok(trace.clone());
+    }
+    let principal = Principal::bound(caller.credential(), caller.is_host_member());
+    let mut hidden = Vec::new();
+    for record_id in policy_source_record_ids(trace) {
+        let viewable = authorization::effective_capability(db, principal, &record_id)
+            .await
+            .map(|capability| capability.allows(Capability::View))
+            .unwrap_or(false);
+        if !viewable && !hidden.iter().any(|seen| seen == &record_id) {
+            hidden.push(record_id);
+        }
+    }
+    Ok(redact_trace_with_hidden(trace, &hidden))
+}
+
 pub fn canonical_route(database_id: &str, intervention_id: &str) -> String {
     let encode = |value: &str| {
         percent_encoding::utf8_percent_encode(value, percent_encoding::NON_ALPHANUMERIC).to_string()
@@ -581,4 +748,107 @@ pub fn intervention_request(action_digest: &str, recipients: &[String]) -> Value
         "summary":"Approve delivery of this exact Message draft",
         "intended_recipient_ids":recipients,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn trace_with_source(binding_id: &str, record_id: &str) -> Value {
+        json!({
+            "format":TRACE_FORMAT,
+            "sources":[{
+                "binding_id":binding_id,
+                "record_id":record_id,
+                "source_digest":"source-digest-1",
+                "scope":"workspace",
+                "issuer_principal_id":"native/issuer",
+                "statement_ids":["statement-1"]
+            }],
+            "matched_hard_rules":[{
+                "statement_id":"statement-1",
+                "source_record_id":record_id,
+                "disposition":"block_and_request_authority"
+            }],
+            "conflicts":[],
+            "final_disposition":"block_and_request_authority",
+            "evaluation_digest":"digest",
+        })
+    }
+
+    fn trace_with_unreadable(binding_id: &str, record_id: &str) -> Value {
+        json!({
+            "format":TRACE_FORMAT,
+            "sources":[],
+            "conflicts":[{"code":"invalid_active_policy","items":[
+                {"binding_id":binding_id,"source_record_id":record_id,"code":"policy_source_unreadable"}
+            ]}],
+            "final_disposition":"block_and_request_authority",
+            "evaluation_digest":"digest",
+        })
+    }
+
+    #[test]
+    fn record_ids_are_collected_from_sources_and_conflicts() {
+        let admitted = trace_with_source("binding-1", "record-1");
+        assert_eq!(policy_source_record_ids(&admitted), vec!["record-1"]);
+        let unreadable = trace_with_unreadable("binding-2", "record-2");
+        assert_eq!(policy_source_record_ids(&unreadable), vec!["record-2"]);
+    }
+
+    #[test]
+    fn hidden_unreadable_source_keeps_the_conflict_but_loses_every_identifier() {
+        let trace = trace_with_unreadable("binding-1", "record-1");
+        let redacted = redact_trace_with_hidden(&trace, &["record-1".to_string()]);
+        let text = redacted.to_string();
+        for hidden in ["binding-1", "record-1"] {
+            assert!(!text.contains(hidden), "{text}");
+        }
+        assert_eq!(redacted["final_disposition"], "block_and_request_authority");
+        assert_eq!(
+            redacted["conflicts"][0]["items"][0]["code"],
+            "policy_source_unreadable"
+        );
+        assert_eq!(
+            redacted["conflicts"][0]["items"][0]["binding_id"],
+            REDACTED_POLICY_SOURCE_ID
+        );
+    }
+
+    #[test]
+    fn hidden_admitted_source_loses_digest_issuer_and_statements() {
+        let trace = trace_with_source("binding-1", "record-1");
+        let redacted = redact_trace_with_hidden(&trace, &["record-1".to_string()]);
+        let text = redacted.to_string();
+        for hidden in [
+            "binding-1",
+            "record-1",
+            "source-digest-1",
+            "native/issuer",
+            "statement-1",
+        ] {
+            assert!(!text.contains(hidden), "{hidden} survived: {text}");
+        }
+        // Shape is unchanged; only the source's descriptors are replaced.
+        assert_eq!(redacted["sources"][0]["scope"], "workspace");
+        assert_eq!(
+            redacted["sources"][0]["record_id"],
+            REDACTED_POLICY_SOURCE_ID
+        );
+        assert_eq!(
+            redacted["matched_hard_rules"][0]["source_record_id"],
+            REDACTED_POLICY_SOURCE_ID
+        );
+    }
+
+    #[test]
+    fn redaction_is_stable_and_readable_sources_are_untouched() {
+        let readable = trace_with_source("binding-1", "record-1");
+        assert_eq!(redact_trace_with_hidden(&readable, &[]), readable);
+        let hidden = vec!["record-1".to_string()];
+        assert_eq!(
+            redact_trace_with_hidden(&readable, &hidden),
+            redact_trace_with_hidden(&readable, &hidden)
+        );
+    }
 }

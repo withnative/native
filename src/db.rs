@@ -5,6 +5,47 @@
 //! connection-level state in SQLite, not schema state, so they are applied per
 //! connection by the pool's connect options rather than living in the DDL.
 
+mod body_connection;
+#[doc(hidden)]
+pub use body_connection::BodyHostAvailability;
+#[cfg(test)]
+mod body_lifecycle_tests;
+pub(crate) mod enrolled;
+
+type BodyRetirementFuture = futures::future::Shared<futures::future::BoxFuture<'static, bool>>;
+
+/// Closed, nonauthorizing handle/pool retirement custody for Hosting.
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct BodyRetirementWitness {
+    db: Db,
+    future: BodyRetirementFuture,
+}
+impl BodyRetirementWitness {
+    pub fn handle_id(&self) -> uuid::Uuid {
+        self.db.handle_id()
+    }
+    pub fn body_complete(&self) -> bool {
+        self.db.body_jobs.retirement_ready()
+    }
+    pub fn retirement_complete(&self) -> bool {
+        self.body_complete() && self.db.enrolled_retirement_complete()
+    }
+    pub async fn drain(&self) -> bool {
+        // Ordinary readiness may recover after an independent cut/Leave or
+        // retained writer close. Never cache that observation as physical ACK.
+        if !self
+            .db
+            .execution_jobs
+            .stop_and_drain(self.db.execution_owner.as_ref())
+            .await
+        {
+            return false;
+        }
+        self.future.clone().await && self.retirement_complete()
+    }
+}
+
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::error::Error as StdError;
 use std::ffi::c_void;
@@ -25,8 +66,18 @@ use tempfile::TempDir;
 
 use crate::embed::EmbedderRef;
 use crate::error::{Error, Result};
+use crate::mcp::advisors::AdvisorRegistry;
 use crate::schema::DDL_STATEMENTS;
 use crate::write_contention::WriteDomain;
+
+mod candidate_read_only;
+pub use candidate_read_only::open_current_database_wal_read_only_at;
+mod control_commit_test;
+#[doc(hidden)]
+pub use control_commit_test::{
+    ControlCommitTestGate, ControlCommitTestPhase, ControlCommitTestRelease,
+    PendingControlCommitMark, PendingControlCommitProbe, PendingControlCommitRelease,
+};
 
 const ROLLUP_CACHE_MAX_ENTRIES: usize = 128;
 const ROLLUP_CACHE_MAX_BYTES: usize = 1024 * 1024;
@@ -110,7 +161,7 @@ impl RollupCache {
 
 /// Engine schema stored in each ejectable user database's file header.
 /// This is independent of the product's SemVer and the catalog schema.
-pub const CURRENT_ENGINE_SCHEMA_VERSION: i64 = 65;
+pub const CURRENT_ENGINE_SCHEMA_VERSION: i64 = 82;
 /// The deliberately selected historical support baseline, once one exists.
 ///
 /// `None` is a product contract, not an implementation gap: development
@@ -285,6 +336,96 @@ pub(crate) const ENGINE_63_SHAPE_CONTRACT_SHA256: &str = ENGINE_62_SHAPE_CONTRAC
 /// test, which reconstructs this shape from current by dropping exactly the
 /// `alpha_tab_installs` projection table and its index.
 pub(crate) const ENGINE_64_SHAPE_CONTRACT_SHA256: &str = ENGINE_63_SHAPE_CONTRACT_SHA256;
+
+/// Released engine-77 shape before alpha-tab adoption provenance.
+pub(crate) const ENGINE_77_SHAPE_CONTRACT_SHA256: &str =
+    "bbd7fb7dd5604b8c8e69d16c2f3e669b9450ac3b5b68713828e50d7025054daa";
+
+/// Released engine-76 shape before reaction metadata, derived from exact main
+/// 2e5ddbdb9 canonical DDL; the migration fixture verifies this fingerprint.
+pub(crate) const ENGINE_76_SHAPE_CONTRACT_SHA256: &str =
+    "d52fbeb85341196e7d6050a6f6fe076fc889294397288663da8303517c7be2c7";
+
+/// Engine 65's released shape (task 26ba75a alpha-tab installs plus all
+/// earlier edges, before the 65→66 grant-only realtime authorization
+/// revision). Measured from the pre-66 tree and held honest by the 65→66
+/// migration test, which reconstructs this shape from current by dropping
+/// exactly the `authorization_grant_revision` table and its triggers.
+pub(crate) const ENGINE_65_SHAPE_CONTRACT_SHA256: &str =
+    "a244bcfcf120d824e31555ee038b6ab32427dc9005071c73c595594f2891500a";
+
+/// Engine 66's released shape (65→66 grant-only realtime authorization
+/// revision, before the 66→67 archived-projection edge). Measured from the
+/// pre-67 tree and held honest by the 66→67 migration test, which
+/// reconstructs this shape from current by dropping exactly the
+/// `records.archived` column.
+pub(crate) const ENGINE_66_SHAPE_CONTRACT_SHA256: &str =
+    "041b07659558af8d4841421be54278a8d728c44cd907b9f33eadbaa801fca379";
+
+/// Engine 67's released shape (66→67 archived projection, before the 67→68
+/// alpha-tab order edge). Measured from the pre-68 tree and held honest by
+/// the 67→68 migration test, which reconstructs this shape from current by
+/// dropping exactly the `alpha_tab_orders` table.
+pub(crate) const ENGINE_67_SHAPE_CONTRACT_SHA256: &str =
+    "4aa7b6cee06b5ca9dd8481e8159fec97c1bdc5b8d9ab1e0b6d42b4a6d70613a5";
+
+/// Engine 68's released shape (67→68 alpha-tab orders, before the 68→69
+/// content-event claim-metadata edge). Measured from the pre-69 tree and held
+/// honest by the 68→69 migration test, which reconstructs this shape from
+/// current by dropping exactly the `content_event_claim_meta` table and its
+/// insert trigger.
+pub(crate) const ENGINE_68_SHAPE_CONTRACT_SHA256: &str =
+    "396832b8dc8aadd8f119f3a436f633146ba3d2d01454eeb6b6a186c25ef8ee65";
+
+/// Engine 69's released shape (68→69 content-event claim metadata, before the
+/// 69→70 `facet_times` edge). Measured from the pre-70 tree and held honest by
+/// the 69→70 migration test, which reconstructs this shape from current by
+/// dropping exactly the `facet_times` table and its indexes.
+pub(crate) const ENGINE_69_SHAPE_CONTRACT_SHA256: &str =
+    "bb954bfe0a538cc814346759fee9934773dacf2551845e84b43c91fe8a97aa5a";
+
+/// Engine 70's released shape (69→70 `facet_times`, before the 70→71
+/// field-change index). Measured on a fresh database built by main
+/// `2e03ecc05` (the last tree compiling engine 70) and held honest by the
+/// 70→71 migration test, which reconstructs this shape from current by
+/// dropping exactly the `idx_content_events_record_changes` index.
+pub(crate) const ENGINE_70_SHAPE_CONTRACT_SHA256: &str =
+    "6beec7a825260d5f1ade84519aaf674245b00b1e2e5adbfac461ba01979d2375";
+
+/// Engine 71's released shape (70→71 field-change index, before the 71→72
+/// alpha-tab request + shell-auto edge). Measured on main 17f35ed1a, the last
+/// main tree compiling v71 before this edge, and held honest by the 71→72
+/// migration test, which reconstructs this shape from current by rebuilding
+/// `alpha_tab_installs` to its two-value adoption CHECK with no request
+/// column.
+pub(crate) const ENGINE_71_SHAPE_CONTRACT_SHA256: &str =
+    "a8f727d29e9e39cb15c18d9b6250aa2d30520d5211930f5c62b9dc2daa951268";
+
+/// Engine 72's released shape (71→72 alpha-tab request + shell-auto, before
+/// the 72→73 currency-counts edge). Measured on main `8eb9b2861`, the last
+/// main tree compiling v72 before this edge, and held honest by the 72→73
+/// migration test, which reconstructs this shape from current by dropping
+/// exactly the `records.is_current` and `records.successor_count` columns.
+pub(crate) const ENGINE_72_SHAPE_CONTRACT_SHA256: &str =
+    "f6bb621ab7113d4cdd87c637a8807f5cfb0a7f699415915d6c9d24ca9f67bdda";
+
+/// Released v73 structural shape before the v74 body-task projection.
+pub(crate) const ENGINE_73_SHAPE_CONTRACT_SHA256: &str =
+    "6a2876d3a7c07bafa73e0a9a9282bbb6cc2885f7c196901597466c78efff2e61";
+
+/// Released v74 shape before the v75 body-block projection. Reconstructed
+/// from fresh v74 DDL by the 74→75 migration test and independently pinned
+/// here so preflight refuses any drifted source file.
+pub(crate) const ENGINE_74_SHAPE_CONTRACT_SHA256: &str =
+    "eca547754ea067d7ab03f4a80d57c68cd65664db8e5966ac5efc822f576f97ba";
+/// Released v75 shape before the v76 vocabulary metadata node projection.
+/// Independently remeasured from fresh v75 DDL; the same harness reproduced
+/// the frozen v74 shape after stripping the v75 body-block table.
+pub(crate) const ENGINE_75_SHAPE_CONTRACT_SHA256: &str =
+    "75c017d384c8e6cc7f8bcd74b1981054d0c11caa9fbd82392e0d2ae1ab24acc8";
+/// Released main269 engine78 shape. Measured by the schema79 Rust contract harness.
+pub(crate) const ENGINE_78_SHAPE_CONTRACT_SHA256: &str =
+    "243dd69acbd554d4080ffce4d10c7cd577f8348afcfd1a1ae7538646307667ff";
 /// A read-only classification of an on-disk SQLite database.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(tag = "state", content = "detail", rename_all = "snake_case")]
@@ -297,6 +438,22 @@ pub enum DatabaseVersionState {
     Unreadable(String),
 }
 
+/// Released exact9f2a9d3 schema79, measured by the authoritative Rust shape harness.
+pub(crate) const ENGINE_79_SHAPE_CONTRACT_SHA256: &str =
+    "4e0d87b74b7facb2ce66ef4bab29d79fd24ed2ff3ebe276f84a9bd68e7a28095";
+
+/// Genuine main375 workspace80 shape, measured by schema81_measure_contracts
+/// on exact ce3f5694. Its reconstructed80 DDL agrees by hash, length and count
+/// with immutable `37524cedb45f5dccb63b4e33dd364092ad91ff68`'s independently
+/// evaluated canonical DDL (356 statements / 150015 bytes, frozen ef05dfa0).
+pub(crate) const ENGINE_80_SHAPE_CONTRACT_SHA256: &str =
+    "a5c0e65d4d1f709940ab7cd8b158b2d2d885e086af6771780310bd728528aab5";
+
+/// Engine81 shape before the facet-value node table, measured by the
+/// authoritative Rust shape harness on the released schema81 tree.
+pub(crate) const ENGINE_81_SHAPE_CONTRACT_SHA256: &str =
+    "4929a4a2b0286f781161c738216dab424eb784d7bc27d8e6fa2062e4a1c54aa4";
+
 /// The SQLite authority granted to an open [`Db`] handle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DatabaseOpenMode {
@@ -306,6 +463,11 @@ pub enum DatabaseOpenMode {
     /// Local standby operation: both query tiers are opened by SQLite with
     /// `SQLITE_OPEN_READONLY`; no startup reconciliation is performed.
     StandbyReadOnly,
+    /// Member-copy operation (contract c323277 rev 7 §1.3 physical form): the
+    /// admitted `member-read-v1` generation opened read-only. It is never the
+    /// canonical engine-open path, so it skips the engine-shape and
+    /// authorization/identity state checks that a member file cannot satisfy.
+    MemberReadOnly,
 }
 
 impl std::fmt::Display for DatabaseVersionState {
@@ -328,9 +490,17 @@ impl std::fmt::Display for DatabaseVersionState {
 /// directory is removed when the last clone drops.
 #[derive(Clone, Debug)]
 pub struct Db {
-    /// Engine-internal pool. Every mutation must enter through `begin_write`;
-    /// this handle is never exposed outside the crate.
+    /// Engine-internal ordinary pool, never exposed outside the crate.
+    /// Unmanaged mutations use `begin_write`; enrolled main writes are denied.
+    /// Enrolled Document jobs and read capture use separate private permanent
+    /// roles, with owned completion and capture admission respectively.
     write_pool: SqlitePool,
+    execution_owner: Option<Arc<enrolled::ExecutionOwner>>,
+    execution_jobs: Arc<enrolled::HandleJobs>,
+    body_jobs: Arc<enrolled::BodyHandleJobs>,
+    body_retirement: Arc<OnceLock<BodyRetirementFuture>>,
+    capture_pool: Arc<tokio::sync::OnceCell<SqlitePool>>,
+    pending_commit_probes: Option<Arc<control_commit_test::PoolProbeRegistry>>,
     /// Public observation pool opened by SQLite with `SQLITE_OPEN_READONLY`.
     /// Keeping this physically separate makes raw external SQL useful for
     /// inspection without exposing an alternate mutation path.
@@ -356,6 +526,9 @@ pub struct Db {
     /// database rather than process-global because the hosted tier runs many
     /// user databases in one process (`hosting::router`).
     embedder: Option<EmbedderRef>,
+    /// Post-commit advisors for this handle (S1). Clones share the registry;
+    /// fresh opens start empty, so production writes pay nothing.
+    advisors: AdvisorRegistry,
     /// Disposable successful rollup results for this opened handle. Clones
     /// share it; reopening the same file deliberately starts cold.
     rollup_cache: Arc<Mutex<RollupCache>>,
@@ -1490,6 +1663,10 @@ impl Db {
         self.handle_id
     }
 
+    pub(crate) fn owned_portability_policy_gate(&self) -> Arc<tokio::sync::RwLock<()>> {
+        self.portability_policy_gate.clone()
+    }
+
     pub(crate) fn portability_policy_gate(&self) -> &tokio::sync::RwLock<()> {
         &self.portability_policy_gate
     }
@@ -1514,8 +1691,22 @@ impl Db {
         self.embedder.as_ref()
     }
 
+    /// The post-commit advisor registry for this handle. Empty unless
+    /// advisors were registered; clones share it.
+    pub fn advisors(&self) -> &AdvisorRegistry {
+        &self.advisors
+    }
+
     pub(crate) fn with_realtime_hub(mut self, hub: Arc<crate::realtime::RealtimeHub>) -> Self {
         self.realtime_hub = Some(hub);
+        self
+    }
+
+    /// Detach the hub for hub-held storage: the hub keeps the current handle
+    /// without forming a `Db ↔ hub` reference cycle (`Db` holds
+    /// `Option<Arc<RealtimeHub>>`; the stored clone holds none).
+    pub(crate) fn without_realtime_hub(mut self) -> Self {
+        self.realtime_hub = None;
         self
     }
 
@@ -1567,7 +1758,10 @@ impl Db {
         crate::provenance::issue_pending_action_in(&mut tx).await?;
         let committed_attestations =
             crate::provenance::pending_attestations_visible_in(&mut tx).await?;
+        enrolled::phase(enrolled::Phase::BeforeCommit).await;
         tx.commit().await?;
+        enrolled::note_committed();
+        enrolled::phase(enrolled::Phase::AfterCommit).await;
         crate::provenance::confirm_committed_attestations(&committed_attestations);
         self.complete_realtime_commit();
         Ok(())
@@ -1594,6 +1788,78 @@ impl Db {
             )
         })?;
         crate::provenance::confirm_committed_attestations(&committed_attestations);
+        self.complete_realtime_commit();
+        Ok(())
+    }
+
+    /// Trusted-Rust, task-scoped test scheduling; no production scope by default.
+    /// Bound to this concrete open handle (clones share it), never portable ID.
+    #[doc(hidden)]
+    pub async fn with_control_commit_test_gate<F: std::future::Future>(
+        &self,
+        phase: ControlCommitTestPhase,
+        gate: Arc<ControlCommitTestGate>,
+        future: F,
+    ) -> F::Output {
+        control_commit_test::scoped(self.handle_id, phase, gate, future).await
+    }
+
+    /// Trusted Rust scheduling scope, bound to this exact writable pool/handle.
+    #[doc(hidden)]
+    pub async fn with_pending_control_commit_probe<F: std::future::Future>(
+        &self,
+        probe: Arc<PendingControlCommitProbe>,
+        future: F,
+    ) -> F::Output {
+        match self.pending_commit_probes.as_ref() {
+            Some(registry) => {
+                control_commit_test::pending_scoped(self.handle_id, registry.clone(), probe, future)
+                    .await
+            }
+            None => future.await,
+        }
+    }
+
+    /// Commit a dedicated control-only transaction, then wake the durable hub.
+    /// Do not use this for content-bearing work: commit_content owns provenance
+    /// issuance and confirmation. A wake is only latency machinery, never a
+    /// mutation receipt or authority to expose control payloads.
+    pub(crate) async fn commit_control(
+        &self,
+        tx: sqlx::Transaction<'static, sqlx::Sqlite>,
+    ) -> Result<()> {
+        control_commit_test::checkpoint(
+            self.handle_id,
+            ControlCommitTestPhase::BeforeDriver,
+            || {
+                REQUEST_REALTIME_COMPLETION
+                    .try_with(|marker| marker.committed.load(Ordering::Acquire))
+                    .ok()
+            },
+        )
+        .await;
+        // Construct and poll the driver future only after the pre-driver gate.
+        control_commit_test::commit(
+            self.handle_id,
+            self.pending_commit_probes.as_ref(),
+            tx,
+            || {
+                REQUEST_REALTIME_COMPLETION
+                    .try_with(|marker| marker.committed.load(Ordering::Acquire))
+                    .ok()
+            },
+        )
+        .await?;
+        control_commit_test::checkpoint(
+            self.handle_id,
+            ControlCommitTestPhase::AfterDurableBeforeCompletion,
+            || {
+                REQUEST_REALTIME_COMPLETION
+                    .try_with(|marker| marker.committed.load(Ordering::Acquire))
+                    .ok()
+            },
+        )
+        .await;
         self.complete_realtime_commit();
         Ok(())
     }
@@ -2489,15 +2755,100 @@ impl Db {
     /// failing them on a closed pool. Leftovers past the cap fail on the
     /// closed pool and are counted, never silently lost. Ephemeral backing
     /// files are deleted once every clone of this handle has dropped.
+    /// Hosting handoff must not release volume authority after a failed drain.
+    #[doc(hidden)]
+    pub async fn drain_enrolled_execution_for_shutdown(&self) -> bool {
+        self.execution_jobs
+            .stop_and_drain(self.execution_owner.as_ref())
+            .await
+    }
+    #[doc(hidden)]
+    pub fn enrolled_retirement_complete(&self) -> bool {
+        self.execution_jobs
+            .retirement_ready(self.execution_owner.as_ref())
+            && self.write_pool.is_closed()
+            && self.write_pool.size() == 0
+            && self.read_pool.is_closed()
+            && self.read_pool.size() == 0
+            && self.governed_pool.is_closed()
+            && self.governed_pool.size() == 0
+            && self
+                .capture_pool
+                .get()
+                .is_none_or(|pool| pool.is_closed() && pool.size() == 0)
+    }
+    #[doc(hidden)]
+    pub fn poison_enrolled_execution(&self) {
+        if let Some(owner) = self.execution_owner.as_ref() {
+            owner.poison();
+        }
+    }
+    #[doc(hidden)]
+    pub fn has_enrolled_execution(&self) -> bool {
+        self.is_enrolled()
+    }
+
+    /// Exact selected options, not a filename reconstructed from Db.path.
+    /// H3 owned filename/guard setup is deliberately not implemented here.
+    pub(crate) fn body_connection_options(&self) -> SqliteConnectOptions {
+        self.governed_pool
+            .connect_options()
+            .as_ref()
+            .clone()
+            .create_if_missing(false)
+            .optimize_on_close(false, None)
+    }
+
+    /// Reader H5 must acquire its EXISTING process slot and retain startup,
+    /// admissions and CPU custody before registration/first physical poll.
+    pub(crate) fn register_body_job(&self) -> Result<enrolled::BodyJobTicket> {
+        self.body_jobs.register()
+    }
+
+    /// Synchronous fence and SAME retained close future; clones, cancellation
+    /// and router retries cannot construct a new raw-close future or lose it.
+    #[doc(hidden)]
+    pub fn fence_body_retirement(&self) -> BodyRetirementWitness {
+        self.body_jobs.stop_submission();
+        self.execution_jobs.stop_submission();
+        let future = self
+            .body_retirement
+            .get_or_init(|| {
+                use futures::FutureExt;
+                let db = self.clone();
+                async move { db.close_retained().await }.boxed().shared()
+            })
+            .clone();
+        BodyRetirementWitness {
+            db: self.clone(),
+            future,
+        }
+    }
+
     pub async fn close(&self) {
+        let _ = self.fence_body_retirement().drain().await;
+    }
+
+    async fn close_retained(&self) -> bool {
+        // The SAME one-shot physical cleanup survives abandoned observers.
+        // Ordinary readiness is retried outside this cached future.
+        if !self.body_jobs.drain().await {
+            return false;
+        }
         self.capture_queue.initiate_shutdown();
         self.capture_queue.drain_capped().await;
+        if let Some(pool) = self.capture_pool.get() {
+            close_pool_and_drain(pool).await;
+        }
         self.mark_pools_closed();
         tokio::join!(
             close_pool_and_drain(&self.read_pool),
             close_pool_and_drain(&self.write_pool),
             close_pool_and_drain(&self.governed_pool)
         );
+        // The witness checks live ordinary AND pool readiness after this
+        // physical result; a recoverable ordinary refusal must not be cached.
+        self.body_jobs.retirement_ready()
     }
 
     /// Monotonic counters for this handle's background capture queue.
@@ -2551,7 +2902,8 @@ impl Db {
     }
 
     /// End a shared handle from a synchronous lifecycle boundary such as LRU
-    /// eviction. All three pools are marked closed before this function returns;
+    /// eviction. Unmanaged pools are marked closed before this function returns;
+    /// enrolled jobs stop admission and drain before their response pools close.
     /// when a runtime is available it also drains their physical shutdown in
     /// the background.
     ///
@@ -2559,19 +2911,19 @@ impl Db {
     /// fail on the closed pool and are counted as failures (never silently
     /// lost). Use [`Self::close`] where captures must be kept.
     pub(crate) fn close_in_background(&self) {
-        self.capture_queue.initiate_shutdown();
-        self.mark_pools_closed();
-        let read_pool = self.read_pool.clone();
-        let write_pool = self.write_pool.clone();
-        let governed_pool = self.governed_pool.clone();
+        let witness = self.fence_body_retirement();
+        if self.execution_owner.is_none() {
+            // Preserve main's unmanaged synchronous ordinary-pool fence.
+            // This is NOT classification for body availability or guard setup.
+            self.capture_queue.initiate_shutdown();
+            self.mark_pools_closed();
+        }
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
-                tokio::join!(
-                    close_pool_and_drain(&read_pool),
-                    close_pool_and_drain(&write_pool),
-                    close_pool_and_drain(&governed_pool)
-                );
+                let _ = witness.drain().await;
             });
+        } else if let Some(owner) = self.execution_owner.as_ref() {
+            owner.poison();
         }
     }
 }
@@ -3516,6 +3868,7 @@ fn connect_options(path: &str, create_if_missing: bool) -> Result<SqliteConnectO
         "sqlite:{}",
         path.strip_prefix("file:").unwrap_or(path)
     ))?;
+    crate::managed_custody::admit_writable_filename(options.get_filename())?;
     Ok(options
         .create_if_missing(create_if_missing)
         .journal_mode(SqliteJournalMode::Wal)
@@ -3527,6 +3880,46 @@ fn connect_options(path: &str, create_if_missing: bool) -> Result<SqliteConnectO
             WAL_JOURNAL_SIZE_LIMIT_BYTES.to_string(),
         )
         .foreign_keys(true)
+        // E1 M3: the portable `regexp(pattern, haystack)` scalar (sqlx's
+        // bundled implementation over the shared `regex` crate version).
+        .with_regexp()
+        .busy_timeout(Duration::from_secs(5)))
+}
+
+// Admitted physical paths are filenames, not URI strings. Preserve bytes;
+// settings match ordinary writable options but cannot reinterpret ?/#/aliases.
+fn enrolled_connect_options(path: &Path) -> Result<SqliteConnectOptions> {
+    if path.to_str().is_none() {
+        return Err(Error::engine(
+            "enrolled filename is not representable by SQLite",
+        ));
+    }
+    crate::managed_custody::admit_writable_filename(path)?;
+    Ok(SqliteConnectOptions::new()
+        .filename(path)
+        .create_if_missing(false)
+        .journal_mode(SqliteJournalMode::Wal)
+        .pragma(
+            "journal_size_limit",
+            WAL_JOURNAL_SIZE_LIMIT_BYTES.to_string(),
+        )
+        .foreign_keys(true)
+        .with_regexp()
+        .busy_timeout(Duration::from_secs(5)))
+}
+fn enrolled_immutable_options(path: &Path) -> Result<SqliteConnectOptions> {
+    if path.to_str().is_none() {
+        return Err(Error::engine(
+            "enrolled filename is not representable by SQLite",
+        ));
+    }
+    Ok(SqliteConnectOptions::new()
+        .filename(path)
+        .create_if_missing(false)
+        .read_only(true)
+        .immutable(true)
+        .foreign_keys(true)
+        .with_regexp()
         .busy_timeout(Duration::from_secs(5)))
 }
 
@@ -3539,6 +3932,9 @@ fn read_only_connect_options(path: &str) -> Result<SqliteConnectOptions> {
         .create_if_missing(false)
         .read_only(true)
         .foreign_keys(true)
+        // E1 M3: see `connect_options` — every read connection evaluates
+        // caller `regexp()` too.
+        .with_regexp()
         .busy_timeout(Duration::from_secs(5)))
 }
 
@@ -3553,7 +3949,9 @@ fn immutable_read_only_connect_options(path: &str) -> Result<SqliteConnectOption
 // VIEW_COUNT below must stay in step with their number.
 const QUERY_SQL_TEMP_CONTRACT_OBJECTS: &[&str] = &[
     "records",
+    "record_lifecycle_interpretations",
     "content_events",
+    "body_blocks",
     "links",
     "facet_values",
     "facet_observations",
@@ -3563,13 +3961,25 @@ const QUERY_SQL_TEMP_CONTRACT_OBJECTS: &[&str] = &[
     "vocabulary_values",
     "schema_config",
     "effective_relationships",
+    "effective_relationship_endpoints",
     "agent_activity",
     "agent_activity_claims",
+    "actors",
+    "runs",
+    "run_intents",
     "messages_awaiting_reply",
+    "my_message_state",
+    "my_mentions",
+    "facet_times",
+    "body_task_items",
     "catalog_relations",
     "catalog_columns",
+    "_query_sql_my_person",
+    "_query_sql_run_principals",
+    "_query_sql_disclosable_persons",
     "_query_sql_visible_records",
     "_query_sql_authorization_subjects",
+    "_query_sql_lifecycle_interpretations",
     "_query_sql_principal",
     "_query_sql_activity_observations",
     "_query_sql_activity_capture",
@@ -3577,8 +3987,10 @@ const QUERY_SQL_TEMP_CONTRACT_OBJECTS: &[&str] = &[
     "_query_sql_messages_awaiting_reply",
     "_query_sql_claim_candidates",
     "_query_sql_claim_releases",
+    "_query_sql_disclosable_actors",
+    "_query_sql_visible_ids",
 ];
-const QUERY_SQL_TEMP_VIEW_COUNT: usize = QUERY_SQL_TEMP_CONTRACT_OBJECTS.len() - 7;
+const QUERY_SQL_TEMP_VIEW_COUNT: usize = QUERY_SQL_TEMP_CONTRACT_OBJECTS.len() - 10;
 
 #[cfg(test)]
 mod wal_journal_size_limit_tests {
@@ -3687,14 +4099,155 @@ enum WritePoolKind {
     HostCatalog,
 }
 
+async fn install_enrolled_guard(
+    connection: &mut SqliteConnection,
+    read_only: bool,
+) -> sqlx::Result<()> {
+    let filename = body_connection::actual_main_filename(connection).await?;
+    if filename.as_os_str().is_empty() {
+        return Ok(());
+    }
+    if read_only {
+        if crate::managed_custody::enrolled_read_filename(&filename)
+            .map_err(|e| sqlx::Error::Protocol(e.to_string()))?
+        {
+            enrolled::install_read_guard(connection).await?;
+        }
+        return Ok(());
+    }
+    if let Some(owner) = crate::managed_custody::execution_for_filename(&filename)
+        .map_err(|e| sqlx::Error::Protocol(e.to_string()))?
+    {
+        enrolled::install(connection, owner, enrolled::Role::Ordinary, None).await?;
+    }
+    Ok(())
+}
+
+async fn require_reconciled_meta_tier(db: &Db) -> Result<()> {
+    let mut transaction = db.pool().begin().await?;
+    crate::meta::vocabulary::require_reconciled_seed_vocabularies(&mut transaction).await?;
+    crate::meta::schema_config::require_reconciled_recommended_pack(&mut transaction).await?;
+    transaction.rollback().await?;
+    Ok(())
+}
+
+impl Db {
+    pub(crate) fn coedit_owner(&self) -> Result<Arc<enrolled::ExecutionOwner>> {
+        self.execution_owner
+            .clone()
+            .ok_or_else(|| Error::engine("coedit stage 1 requires enrolled SQLite storage"))
+    }
+
+    pub(crate) fn is_enrolled(&self) -> bool {
+        self.execution_owner.is_some()
+    }
+    pub(crate) async fn capture_write_pool(&self) -> Result<&SqlitePool> {
+        let Some(owner) = self.execution_owner.as_ref() else {
+            return Ok(self.write_pool());
+        };
+        // Refuse a known permanent failure before SQLx can retry it as a
+        // connection setup error. This is a preflight, not an atomic fence:
+        // poison racing physical creation is still checked by install(), and
+        // an already admitted capture retains its lease until it completes.
+        owner.check()?;
+        let pool = self
+            .capture_pool
+            .get_or_try_init(|| async {
+                owner.check()?;
+                let path = owner.path.clone();
+                let owner = owner.clone();
+                Ok::<_, Error>(
+                    SqlitePoolOptions::new()
+                        .max_connections(1)
+                        .after_connect(move |connection, _| {
+                            let owner = owner.clone();
+                            Box::pin(async move {
+                                let actual = {
+                                    let mut handle = connection.lock_handle().await?;
+                                    let filename = unsafe {
+                                        libsqlite3_sys::sqlite3_db_filename(
+                                            handle.as_raw_handle().as_ptr(),
+                                            c"main".as_ptr(),
+                                        )
+                                    };
+                                    if filename.is_null() {
+                                        return Err(sqlx::Error::Protocol(
+                                            "capture missing main filename".into(),
+                                        ));
+                                    }
+                                    std::path::PathBuf::from(
+                                        unsafe { std::ffi::CStr::from_ptr(filename) }
+                                            .to_str()
+                                            .map_err(|_| {
+                                                sqlx::Error::Protocol(
+                                                    "capture filename is not UTF-8".into(),
+                                                )
+                                            })?,
+                                    )
+                                };
+                                let actual_owner =
+                                    crate::managed_custody::execution_for_filename(&actual)
+                                        .map_err(|error| {
+                                            sqlx::Error::Protocol(error.to_string())
+                                        })?;
+                                if !actual_owner
+                                    .as_ref()
+                                    .is_some_and(|actual| Arc::ptr_eq(actual, &owner))
+                                {
+                                    return Err(sqlx::Error::Protocol(
+                                        "capture physical owner mismatch".into(),
+                                    ));
+                                }
+                                enrolled::install(connection, owner, enrolled::Role::Capture, None)
+                                    .await
+                            })
+                        })
+                        .connect_with(
+                            enrolled_connect_options(&path)?.optimize_on_close(false, None),
+                        )
+                        .await?,
+                )
+            })
+            .await?;
+        // Initialization may have waited behind another caller. Do not return
+        // an existing pool for acquisition after observing owner poison.
+        owner.check()?;
+        Ok(pool)
+    }
+}
+
+#[cfg(test)]
 async fn open_pool(path: &str, create_if_missing: bool, kind: WritePoolKind) -> Result<SqlitePool> {
+    open_pool_with_probes(path, create_if_missing, kind, None).await
+}
+async fn open_pool_with_probes(
+    path: &str,
+    create_if_missing: bool,
+    kind: WritePoolKind,
+    probes: Option<Arc<control_commit_test::PoolProbeRegistry>>,
+) -> Result<SqlitePool> {
+    if matches!(kind, WritePoolKind::HostCatalog)
+        && crate::managed_custody::execution_for_filename(
+            connect_options(path, create_if_missing)?.get_filename(),
+        )?
+        .is_some()
+    {
+        return Err(Error::engine(
+            "enrolled workspace storage cannot be opened as a host catalog",
+        ));
+    }
     let options = match kind {
         WritePoolKind::Workspace => SqlitePoolOptions::new()
             .max_connections(5)
             // Both hooks are required: SQLx uses `before_acquire` for an idle
             // connection and `after_connect` for a newly opened one.
             .before_acquire(count_write_pool_reuse)
-            .after_connect(count_write_pool_new_connection),
+            .after_connect(|connection, metadata| {
+                Box::pin(async move {
+                    count_write_pool_new_connection(connection, metadata).await?;
+                    install_enrolled_guard(connection, false).await
+                })
+            }),
         WritePoolKind::HostCatalog => SqlitePoolOptions::new()
             .max_connections(5)
             .before_acquire(attach_catalog_trace_on_reuse)
@@ -3707,13 +4260,15 @@ async fn open_pool(path: &str, create_if_missing: bool, kind: WritePoolKind) -> 
         // serve any later request, including an ordinary non-SQL query whose
         // unqualified relation names must never resolve to the TEMP contract.
         .after_release(move |connection, _metadata| {
+            let probes = probes.clone();
             Box::pin(async move {
                 // The reserved lock is gone by the time a connection comes
                 // back, whether it committed, rolled back, or was dropped, so
                 // this is the unbiased close for the critical-section
                 // measurement. A connection that never opened one — an
                 // ordinary query on the write pool — closes nothing.
-                if let Some(key) = connection_key(connection).await {
+                let physical_key = connection_key(connection).await;
+                if let Some(key) = physical_key {
                     crate::write_contention::close_critical_section(
                         match kind {
                             WritePoolKind::Workspace => WriteDomain::Workspace,
@@ -3728,7 +4283,21 @@ async fn open_pool(path: &str, create_if_missing: bool, kind: WritePoolKind) -> 
                     // deliberately outside that interval.
                     detach_catalog_trace(connection).await?;
                 }
-                sanitize_released_write_connection(connection).await
+                let cleanup = probes
+                    .as_ref()
+                    .and_then(|registry| control_commit_test::matching(registry, physical_key));
+                if let Some(lease) = cleanup.as_ref() {
+                    if !lease.remove(connection).await? {
+                        return Ok(false);
+                    }
+                }
+                let sanitized = sanitize_released_write_connection(connection).await?;
+                if sanitized {
+                    if let Some(lease) = cleanup.as_ref() {
+                        lease.clean();
+                    }
+                }
+                Ok(sanitized)
             })
         })
         .connect_with(connect_options(path, create_if_missing)?)
@@ -3799,6 +4368,7 @@ async fn sanitize_released_write_connection(
         }
     }
     for table in [
+        "_query_sql_lifecycle_interpretations",
         "_query_sql_principal",
         "_query_sql_activity_observations",
         "_query_sql_activity_capture",
@@ -3806,6 +4376,8 @@ async fn sanitize_released_write_connection(
         "_query_sql_messages_awaiting_reply",
         "_query_sql_claim_candidates",
         "_query_sql_claim_releases",
+        "_query_sql_disclosable_actors",
+        "_query_sql_visible_ids",
     ] {
         if sqlx::query(&format!("DROP TABLE IF EXISTS temp.{table}"))
             .execute(&mut *connection)
@@ -3886,6 +4458,33 @@ mod released_write_connection_tests {
                 .execute(&mut *connection)
                 .await
                 .unwrap();
+            sqlx::query("CREATE TABLE main.body_task_items (id INTEGER)")
+                .execute(&mut *connection)
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO main.body_task_items VALUES (42)")
+                .execute(&mut *connection)
+                .await
+                .unwrap();
+            for relation in [
+                "body_task_items",
+                "my_message_state",
+                "my_mentions",
+                "record_lifecycle_interpretations",
+            ] {
+                sqlx::query(&format!(
+                    "CREATE TEMP VIEW temp.{relation} AS SELECT 1 AS id"
+                ))
+                .execute(&mut *connection)
+                .await
+                .unwrap();
+            }
+            sqlx::query(
+                "CREATE TEMP TABLE temp._query_sql_lifecycle_interpretations (record_id TEXT)",
+            )
+            .execute(&mut *connection)
+            .await
+            .unwrap();
             sqlx::query("CREATE TEMP VIEW temp.catalog_columns AS SELECT 1 AS column_position")
                 .execute(&mut *connection)
                 .await
@@ -3905,11 +4504,21 @@ mod released_write_connection_tests {
             let leftover: bool = sqlx::query_scalar(
                 "SELECT EXISTS (
                    SELECT 1 FROM temp.sqlite_schema
-                    WHERE name IN ('records', 'catalog_columns', '_query_sql_principal'))",
+                    WHERE name IN ('records', 'catalog_columns', '_query_sql_principal',
+                                   'body_task_items', 'my_message_state', 'my_mentions',
+                                   'record_lifecycle_interpretations', '_query_sql_lifecycle_interpretations'))",
             )
             .fetch_one(&mut *connection)
             .await
             .unwrap();
+            let physical_id: i64 = sqlx::query_scalar("SELECT id FROM body_task_items")
+                .fetch_one(&mut *connection)
+                .await
+                .unwrap();
+            assert_eq!(
+                physical_id, 42,
+                "a leftover TEMP view shadows the physical table"
+            );
             leftover
         };
         assert!(
@@ -3924,7 +4533,12 @@ async fn open_read_pool(path: &str) -> Result<SqlitePool> {
     Ok(SqlitePoolOptions::new()
         .max_connections(5)
         .before_acquire(count_read_pool_reuse)
-        .after_connect(count_read_pool_new_connection)
+        .after_connect(|connection, metadata| {
+            Box::pin(async move {
+                count_read_pool_new_connection(connection, metadata).await?;
+                install_enrolled_guard(connection, true).await
+            })
+        })
         .connect_with(read_only_connect_options(path)?)
         .await?)
 }
@@ -3982,10 +4596,14 @@ fn parse_governed_sql_pool_size(raw: Option<&str>) -> u32 {
 /// migration instruments, which a third pool must not inflate. Like the write
 /// pool, the hook drops the TEMP contract, clears the progress handler, and
 /// restores per-connection limits, so no principal state survives a borrow.
-/// Rung 1.3 may retain the *contract* portion of that teardown — safe only
-/// here, because these connections never serve the unqualified-name queries
-/// (`bootstrap`, `get_structure`) that retained TEMP state would shadow — but
-/// principal cleanup stays regardless of what 1.3 retains.
+/// Declared-SQL tab reads share one governed transaction for gates and data:
+/// the gate helpers run unqualified domain SQL on these connections, so the
+/// in-transaction engine must tear its TEMP views down before fresh
+/// gate/domain reads run, and this release hook remains the backstop when
+/// cancellation drops the read first. No retention of the contract portion
+/// is safe here without an explicit schema-qualification and isolation proof
+/// covering gate reads — not just `bootstrap`/`get_structure` — and
+/// principal cleanup stays regardless.
 async fn open_governed_pool(path: &str, create_if_missing: bool) -> Result<SqlitePool> {
     open_governed_pool_with_size(path, create_if_missing, governed_sql_pool_size()).await
 }
@@ -3998,6 +4616,7 @@ async fn open_governed_pool_with_size(
     let pool = SqlitePoolOptions::new()
         .max_connections(size.max(1))
         .acquire_timeout(GOVERNED_SQL_ACQUIRE_TIMEOUT)
+        .after_connect(|connection, _| Box::pin(install_enrolled_guard(connection, false)))
         .after_release(|connection, _metadata| {
             Box::pin(sanitize_released_write_connection(connection))
         })
@@ -4062,7 +4681,12 @@ async fn open_immutable_read_pool(path: &str) -> Result<SqlitePool> {
     Ok(SqlitePoolOptions::new()
         .max_connections(5)
         .before_acquire(count_read_pool_reuse)
-        .after_connect(count_read_pool_new_connection)
+        .after_connect(|connection, metadata| {
+            Box::pin(async move {
+                count_read_pool_new_connection(connection, metadata).await?;
+                install_enrolled_guard(connection, true).await
+            })
+        })
         .connect_with(immutable_read_only_connect_options(path)?)
         .await?)
 }
@@ -4076,14 +4700,85 @@ pub async fn open_database(url: &str) -> Result<Db> {
     open_database_with_write_pool_kind(url, WritePoolKind::Workspace).await
 }
 
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct ReadPoolOpenFailure {
+    pub reached: tokio::sync::Notify,
+    pub release: tokio::sync::Notify,
+    pub write_pool: Mutex<Option<SqlitePool>>,
+}
+#[cfg(test)]
+tokio::task_local! {
+    pub(crate) static READ_POOL_OPEN_FAILURE: Arc<ReadPoolOpenFailure>;
+}
+
+async fn open_database_read_pool(path: &str, _write_pool: &SqlitePool) -> Result<SqlitePool> {
+    #[cfg(test)]
+    if let Ok(failure) = READ_POOL_OPEN_FAILURE.try_with(Clone::clone) {
+        *failure.write_pool.lock().unwrap() = Some(_write_pool.clone());
+        failure.reached.notify_one();
+        failure.release.notified().await;
+        return Err(Error::engine("injected read-pool setup failure"));
+    }
+    open_read_pool(path).await
+}
+
+// A later-stage open failure must physically drain already-open pools before
+// returning. Resource admission owners (such as historical replay) may release
+// capacity as soon as this function returns Err.
+async fn open_database_companion_pools(
+    path: &str,
+    write_pool: &SqlitePool,
+) -> Result<(SqlitePool, SqlitePool)> {
+    let read_pool = match open_database_read_pool(path, write_pool).await {
+        Ok(pool) => pool,
+        Err(error) => {
+            close_pool_and_drain(write_pool).await;
+            return Err(error);
+        }
+    };
+    let governed_pool = match open_governed_pool(path, true).await {
+        Ok(pool) => pool,
+        Err(error) => {
+            tokio::join!(
+                close_pool_and_drain(write_pool),
+                close_pool_and_drain(&read_pool)
+            );
+            return Err(error);
+        }
+    };
+    Ok((read_pool, governed_pool))
+}
+
 async fn open_database_with_write_pool_kind(url: &str, kind: WritePoolKind) -> Result<Db> {
     if url == ":memory:" {
         let (path, tmp) = ephemeral_file()?;
-        let write_pool = open_pool(&path, true, kind).await?;
-        let read_pool = open_read_pool(&path).await?;
-        let governed_pool = open_governed_pool(&path, true).await?;
+        let pending_commit_probes = matches!(kind, WritePoolKind::Workspace)
+            .then(|| Arc::new(control_commit_test::PoolProbeRegistry::default()));
+        let write_pool =
+            open_pool_with_probes(&path, true, kind, pending_commit_probes.clone()).await?;
+        let (read_pool, governed_pool) = open_database_companion_pools(&path, &write_pool).await?;
+        let execution_owner = match crate::managed_custody::execution_for_filename(
+            write_pool.connect_options().get_filename(),
+        ) {
+            Ok(owner) => owner,
+            Err(error) => {
+                tokio::join!(
+                    close_pool_and_drain(&write_pool),
+                    close_pool_and_drain(&read_pool),
+                    close_pool_and_drain(&governed_pool)
+                );
+                return Err(error);
+            }
+        };
         return Ok(Db {
+            execution_owner,
+            execution_jobs: Arc::new(enrolled::HandleJobs::default()),
+            body_jobs: Arc::new(enrolled::BodyHandleJobs::default()),
+            body_retirement: Arc::new(OnceLock::new()),
+            capture_pool: Arc::new(tokio::sync::OnceCell::new()),
             write_pool,
+            pending_commit_probes,
             read_pool,
             governed_pool,
             location: Arc::new(DatabaseLocation {
@@ -4092,6 +4787,7 @@ async fn open_database_with_write_pool_kind(url: &str, kind: WritePoolKind) -> R
             }),
             handle_id: uuid::Uuid::new_v4(),
             embedder: None,
+            advisors: crate::mcp::advisors::startup::registry_with_defaults(),
             rollup_cache: Arc::new(Mutex::new(RollupCache::default())),
             visible_set_cache: Arc::new(Mutex::new(
                 crate::visible_set_cache::VisibleSetCache::default(),
@@ -4110,18 +4806,31 @@ async fn open_database_with_write_pool_kind(url: &str, kind: WritePoolKind) -> R
             _tmp: Some(tmp),
         });
     }
-    let write_pool = open_pool(url, true, kind).await?;
-    let read_pool = open_read_pool(url).await?;
-    let governed_pool = match open_governed_pool(url, true).await {
-        Ok(pool) => pool,
+    let pending_commit_probes = matches!(kind, WritePoolKind::Workspace)
+        .then(|| Arc::new(control_commit_test::PoolProbeRegistry::default()));
+    let write_pool = open_pool_with_probes(url, true, kind, pending_commit_probes.clone()).await?;
+    let (read_pool, governed_pool) = open_database_companion_pools(url, &write_pool).await?;
+    let execution_owner = match crate::managed_custody::execution_for_filename(
+        write_pool.connect_options().get_filename(),
+    ) {
+        Ok(owner) => owner,
         Err(error) => {
-            write_pool.close().await;
-            read_pool.close().await;
+            tokio::join!(
+                close_pool_and_drain(&write_pool),
+                close_pool_and_drain(&read_pool),
+                close_pool_and_drain(&governed_pool)
+            );
             return Err(error);
         }
     };
-    Ok(Db {
+    let db = Db {
+        execution_owner,
+        execution_jobs: Arc::new(enrolled::HandleJobs::default()),
+        body_jobs: Arc::new(enrolled::BodyHandleJobs::default()),
+        body_retirement: Arc::new(OnceLock::new()),
+        capture_pool: Arc::new(tokio::sync::OnceCell::new()),
         write_pool,
+        pending_commit_probes,
         read_pool,
         governed_pool,
         location: Arc::new(DatabaseLocation {
@@ -4130,6 +4839,7 @@ async fn open_database_with_write_pool_kind(url: &str, kind: WritePoolKind) -> R
         }),
         handle_id: uuid::Uuid::new_v4(),
         embedder: None,
+        advisors: crate::mcp::advisors::startup::registry_with_defaults(),
         rollup_cache: Arc::new(Mutex::new(RollupCache::default())),
         visible_set_cache: Arc::new(Mutex::new(
             crate::visible_set_cache::VisibleSetCache::default(),
@@ -4146,7 +4856,19 @@ async fn open_database_with_write_pool_kind(url: &str, kind: WritePoolKind) -> R
         capture_queue: crate::mcp::interactions::CaptureQueue::spawn(),
         database_id_cache: Arc::new(tokio::sync::OnceCell::new()),
         _tmp: None,
-    })
+    };
+    if db.is_enrolled() {
+        let validation = async {
+            validate_current_engine_shape_read_only(db.path()).await?;
+            require_reconciled_meta_tier(&db).await
+        }
+        .await;
+        if let Err(error) = validation {
+            db.close().await;
+            return Err(error);
+        }
+    }
+    Ok(db)
 }
 
 /// Open a database at a filesystem path (convenience over [`open_database`]).
@@ -4556,6 +5278,91 @@ pub(crate) async fn validate_engine_shape_on(
             schema_shape_contract_sha256(&actual_contract) == ENGINE_64_SHAPE_CONTRACT_SHA256
         );
     }
+    if version == 65 {
+        return Ok(
+            schema_shape_contract_sha256(&actual_contract) == ENGINE_65_SHAPE_CONTRACT_SHA256
+        );
+    }
+    if version == 66 {
+        return Ok(
+            schema_shape_contract_sha256(&actual_contract) == ENGINE_66_SHAPE_CONTRACT_SHA256
+        );
+    }
+    if version == 67 {
+        return Ok(
+            schema_shape_contract_sha256(&actual_contract) == ENGINE_67_SHAPE_CONTRACT_SHA256
+        );
+    }
+    if version == 68 {
+        return Ok(
+            schema_shape_contract_sha256(&actual_contract) == ENGINE_68_SHAPE_CONTRACT_SHA256
+        );
+    }
+    if version == 69 {
+        return Ok(
+            schema_shape_contract_sha256(&actual_contract) == ENGINE_69_SHAPE_CONTRACT_SHA256
+        );
+    }
+    if version == 70 {
+        return Ok(
+            schema_shape_contract_sha256(&actual_contract) == ENGINE_70_SHAPE_CONTRACT_SHA256
+        );
+    }
+    if version == 71 {
+        return Ok(
+            schema_shape_contract_sha256(&actual_contract) == ENGINE_71_SHAPE_CONTRACT_SHA256
+        );
+    }
+    if version == 72 {
+        return Ok(
+            schema_shape_contract_sha256(&actual_contract) == ENGINE_72_SHAPE_CONTRACT_SHA256
+        );
+    }
+    if version == 73 {
+        return Ok(
+            schema_shape_contract_sha256(&actual_contract) == ENGINE_73_SHAPE_CONTRACT_SHA256
+        );
+    }
+    if version == 74 {
+        return Ok(
+            schema_shape_contract_sha256(&actual_contract) == ENGINE_74_SHAPE_CONTRACT_SHA256
+        );
+    }
+    if version == 75 {
+        return Ok(
+            schema_shape_contract_sha256(&actual_contract) == ENGINE_75_SHAPE_CONTRACT_SHA256
+        );
+    }
+    if version == 76 {
+        return Ok(
+            schema_shape_contract_sha256(&actual_contract) == ENGINE_76_SHAPE_CONTRACT_SHA256
+        );
+    }
+    if version == 77 {
+        return Ok(
+            schema_shape_contract_sha256(&actual_contract) == ENGINE_77_SHAPE_CONTRACT_SHA256
+        );
+    }
+    if version == 78 {
+        return Ok(
+            schema_shape_contract_sha256(&actual_contract) == ENGINE_78_SHAPE_CONTRACT_SHA256
+        );
+    }
+    if version == 79 {
+        return Ok(
+            schema_shape_contract_sha256(&actual_contract) == ENGINE_79_SHAPE_CONTRACT_SHA256
+        );
+    }
+    if version == 80 {
+        return Ok(
+            schema_shape_contract_sha256(&actual_contract) == ENGINE_80_SHAPE_CONTRACT_SHA256
+        );
+    }
+    if version == 81 {
+        return Ok(
+            schema_shape_contract_sha256(&actual_contract) == ENGINE_81_SHAPE_CONTRACT_SHA256
+        );
+    }
     if version != CURRENT_ENGINE_SCHEMA_VERSION {
         return Err(Error::engine(format!(
             "no frozen engine structural shape is registered for schema {version}"
@@ -4898,7 +5705,14 @@ pub async fn open_existing_database(url: &str) -> Result<Db> {
             path.display()
         )));
     }
-    let write_pool = open_pool(url, false, WritePoolKind::Workspace).await?;
+    let pending_commit_probes = Some(Arc::new(control_commit_test::PoolProbeRegistry::default()));
+    let write_pool = open_pool_with_probes(
+        url,
+        false,
+        WritePoolKind::Workspace,
+        pending_commit_probes.clone(),
+    )
+    .await?;
     let read_pool = open_read_pool(url).await?;
     let governed_pool = match open_governed_pool(url, false).await {
         Ok(pool) => pool,
@@ -4909,7 +5723,15 @@ pub async fn open_existing_database(url: &str) -> Result<Db> {
         }
     };
     let db = Db {
+        execution_owner: crate::managed_custody::execution_for_filename(
+            write_pool.connect_options().get_filename(),
+        )?,
+        execution_jobs: Arc::new(enrolled::HandleJobs::default()),
+        body_jobs: Arc::new(enrolled::BodyHandleJobs::default()),
+        body_retirement: Arc::new(OnceLock::new()),
+        capture_pool: Arc::new(tokio::sync::OnceCell::new()),
         write_pool,
+        pending_commit_probes,
         read_pool,
         governed_pool,
         location: Arc::new(DatabaseLocation {
@@ -4918,6 +5740,7 @@ pub async fn open_existing_database(url: &str) -> Result<Db> {
         }),
         handle_id: uuid::Uuid::new_v4(),
         embedder: None,
+        advisors: crate::mcp::advisors::startup::registry_with_defaults(),
         rollup_cache: Arc::new(Mutex::new(RollupCache::default())),
         visible_set_cache: Arc::new(Mutex::new(
             crate::visible_set_cache::VisibleSetCache::default(),
@@ -4941,6 +5764,14 @@ pub async fn open_existing_database(url: &str) -> Result<Db> {
         return Err(crate::error::Error::engine(format!(
             "refusing to open malformed authorization revision state: {}",
             revision_violations.join("; ")
+        )));
+    }
+    let grant_violations = crate::authorization_grant::state_violations(&db).await?;
+    if !grant_violations.is_empty() {
+        db.close().await;
+        return Err(crate::error::Error::engine(format!(
+            "refusing to open malformed grant revision state: {}",
+            grant_violations.join("; ")
         )));
     }
     let violations = crate::authorization::state_violations(&db).await?;
@@ -4975,7 +5806,11 @@ pub async fn open_existing_database(url: &str) -> Result<Db> {
             identity_violations.join("; ")
         )));
     }
-    seed_meta_tier(&db).await?;
+    if db.execution_owner.is_some() {
+        require_reconciled_meta_tier(&db).await?;
+    } else {
+        seed_meta_tier(&db).await?;
+    }
     Ok(db)
 }
 
@@ -5002,6 +5837,7 @@ pub async fn open_existing_database_standby_read_only(url: &str) -> Result<Db> {
 
     validate_current_engine_shape_immutable(path).await?;
 
+    let pending_commit_probes = None;
     let write_pool = open_immutable_read_pool(url).await?;
     let read_pool = match open_immutable_read_pool(url).await {
         Ok(pool) => pool,
@@ -5024,7 +5860,13 @@ pub async fn open_existing_database_standby_read_only(url: &str) -> Result<Db> {
         }
     };
     let db = Db {
+        execution_owner: None,
+        execution_jobs: Arc::new(enrolled::HandleJobs::default()),
+        body_jobs: Arc::new(enrolled::BodyHandleJobs::default()),
+        body_retirement: Arc::new(OnceLock::new()),
+        capture_pool: Arc::new(tokio::sync::OnceCell::new()),
         write_pool,
+        pending_commit_probes,
         read_pool,
         governed_pool,
         location: Arc::new(DatabaseLocation {
@@ -5033,6 +5875,9 @@ pub async fn open_existing_database_standby_read_only(url: &str) -> Result<Db> {
         }),
         handle_id: uuid::Uuid::new_v4(),
         embedder: None,
+        // No default advisors: a read-only standby takes no writes, so no
+        // write can fire them.
+        advisors: AdvisorRegistry::default(),
         rollup_cache: Arc::new(Mutex::new(RollupCache::default())),
         visible_set_cache: Arc::new(Mutex::new(
             crate::visible_set_cache::VisibleSetCache::default(),
@@ -5054,6 +5899,10 @@ pub async fn open_existing_database_standby_read_only(url: &str) -> Result<Db> {
         (
             "authorization revision state",
             crate::authorization_revision::state_violations(&db).await?,
+        ),
+        (
+            "grant revision state",
+            crate::authorization_grant::state_violations(&db).await?,
         ),
         (
             "authorization state",
@@ -5083,6 +5932,139 @@ pub async fn open_existing_database_standby_read_only(url: &str) -> Result<Db> {
     Ok(db)
 }
 
+/// Whether a table name belongs to the compiled member profile (shipped or
+/// locally derived). FTS shadow tables of the rebuilt derived indexes are
+/// named after their virtual table.
+fn member_profile_allows_table(table: &str) -> bool {
+    use crate::schema::member_classification::{MemberTableKind, MEMBER_TABLE_DISPOSITIONS};
+    if MEMBER_TABLE_DISPOSITIONS.iter().any(|(name, kind)| {
+        *name == table
+            && matches!(
+                kind,
+                MemberTableKind::Included
+                    | MemberTableKind::CallerBound
+                    | MemberTableKind::ServerComputed
+                    | MemberTableKind::DerivedLocal
+            )
+    }) {
+        return true;
+    }
+    // FTS5 shadow tables of the two rebuilt derived indexes, exactly. A
+    // prefix allow would admit `records_fts_evil`.
+    const SHADOW_SUFFIXES: &[&str] = &["", "_data", "_idx", "_content", "_docsize", "_config"];
+    ["records_fts", "records_name_idx"].iter().any(|base| {
+        SHADOW_SUFFIXES
+            .iter()
+            .any(|suffix| table == format!("{base}{suffix}"))
+    })
+}
+
+/// Open an admitted member-read-v1 generation read-only (contract c323277
+/// rev 7 §1.3 physical form). Returns the same [`Db`] handle the query tiers
+/// use, with every pool opened `SQLITE_OPEN_READONLY` and immutable.
+///
+/// It deliberately performs **no** engine-shape, migration, authorization or
+/// identity validation: a member file has none of the tables those checks
+/// read. Admission (§3.4, `member_copy_admission`) already proved closure.
+pub async fn open_member_database_read_only(url: &str) -> Result<Db> {
+    if url == ":memory:" {
+        return Err(crate::error::Error::engine(
+            "member copy read-only open requires an existing on-disk database",
+        ));
+    }
+    let path = path_from_url(url);
+    if !path.is_file() {
+        return Err(crate::error::Error::engine(
+            "member copy read-only open requires an existing database file",
+        ));
+    }
+    let pending_commit_probes = None;
+    let write_pool = open_immutable_read_pool(url).await?;
+    let read_pool = match open_immutable_read_pool(url).await {
+        Ok(pool) => pool,
+        Err(error) => {
+            write_pool.close().await;
+            return Err(error);
+        }
+    };
+    let governed_pool = match open_immutable_read_pool(url).await {
+        Ok(pool) => pool,
+        Err(error) => {
+            write_pool.close().await;
+            read_pool.close().await;
+            return Err(error);
+        }
+    };
+    // Member-profile marker: a canonical engine database has no
+    // `member_display_references` table (it is member-only DDL). This keeps a
+    // shape-unchecked immutable open from silently serving a canonical file,
+    // which would expose rows outside E(m).
+    let is_member_profile: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master \
+         WHERE type = 'table' AND name = 'member_display_references')",
+    )
+    .fetch_one(&write_pool)
+    .await?;
+    // Also refuse any canonical-only table: a member profile ships exactly the
+    // Included/CallerBound/ServerComputed/DerivedLocal tables plus the derived
+    // FTS shadow tables. A canonical engine file carries Excluded tables
+    // (`policy_entries`, `content_events`, ...) and is refused by name.
+    let foreign_table: Option<String> = if is_member_profile {
+        let tables: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+        )
+        .fetch_all(&write_pool)
+        .await?;
+        tables
+            .into_iter()
+            .find(|table| !member_profile_allows_table(table))
+    } else {
+        None
+    };
+    if !is_member_profile || foreign_table.is_some() {
+        write_pool.close().await;
+        read_pool.close().await;
+        governed_pool.close().await;
+        return Err(crate::error::Error::engine(
+            "refusing member read-only open: not a member-read-v1 profile",
+        ));
+    }
+    Ok(Db {
+        execution_owner: None,
+        execution_jobs: Arc::new(enrolled::HandleJobs::default()),
+        body_jobs: Arc::new(enrolled::BodyHandleJobs::default()),
+        body_retirement: Arc::new(OnceLock::new()),
+        capture_pool: Arc::new(tokio::sync::OnceCell::new()),
+        write_pool,
+        pending_commit_probes,
+        read_pool,
+        governed_pool,
+        location: Arc::new(DatabaseLocation {
+            path: path.to_path_buf(),
+            open_mode: DatabaseOpenMode::MemberReadOnly,
+        }),
+        handle_id: uuid::Uuid::new_v4(),
+        embedder: None,
+        advisors: AdvisorRegistry::default(),
+        rollup_cache: Arc::new(Mutex::new(RollupCache::default())),
+        visible_set_cache: Arc::new(Mutex::new(
+            crate::visible_set_cache::VisibleSetCache::default(),
+        )),
+        inbox_snapshots: Arc::new(Mutex::new(HashMap::new())),
+        realtime_hub: None,
+        workspace_index: Arc::new(tokio::sync::RwLock::new(None)),
+        workspace_index_fold: Arc::new(AtomicBool::new(false)),
+        workspace_index_refused: Arc::new(Mutex::new(None)),
+        workspace_snapshots: Arc::new(Mutex::new(
+            crate::workspace_snapshot::SnapshotStore::default(),
+        )),
+        portability_policy_gate: Arc::new(tokio::sync::RwLock::new(())),
+        capture_queue: crate::mcp::interactions::CaptureQueue::spawn(),
+        database_id_cache: Arc::new(tokio::sync::OnceCell::new()),
+        _tmp: None,
+    })
+}
+
 #[cfg(test)]
 mod standby_read_only_open_tests {
     use super::*;
@@ -5100,6 +6082,86 @@ mod standby_read_only_open_tests {
         assert!(open_existing_database_standby_read_only(":memory:")
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn existing_open_refuses_missing_grant_revision_row() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("missing-grant-row.db");
+        let source = create_database(path.to_str().unwrap()).await.unwrap();
+        sqlx::query("DELETE FROM authorization_grant_revision WHERE id = 1")
+            .execute(source.write_pool())
+            .await
+            .unwrap();
+        checkpoint_and_close_hosted_adoption_database(source)
+            .await
+            .unwrap();
+
+        for result in [
+            open_existing_database(path.to_str().unwrap()).await,
+            open_existing_database_standby_read_only(path.to_str().unwrap()).await,
+        ] {
+            let error = match result {
+                Ok(db) => {
+                    db.close().await;
+                    panic!("malformed grant revision was admitted");
+                }
+                Err(error) => error,
+            };
+            assert!(
+                error.to_string().contains("grant revision state"),
+                "unexpected refusal: {error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn grant_revision_ignores_policy_cascade_on_record_purge() {
+        let db = create_database(":memory:").await.unwrap();
+        let record_id = "b313ec0b-bcc6-4304-aa2d-59ecb4f76439";
+        sqlx::query("INSERT INTO records(id, type, kind) VALUES(?, 'Document', 'note')")
+            .bind(record_id)
+            .execute(db.write_pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO record_policies(record_id) VALUES(?)")
+            .bind(record_id)
+            .execute(db.write_pool())
+            .await
+            .unwrap();
+        let entry = "INSERT INTO policy_entries(policy_anchor_id, subject_kind, subject_id, capability) VALUES(?, 'account', 'viewer', 'view')";
+        sqlx::query(entry)
+            .bind(record_id)
+            .execute(db.write_pool())
+            .await
+            .unwrap();
+        let epoch = || async {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT epoch FROM authorization_grant_revision WHERE id = 1",
+            )
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap()
+        };
+        let before = epoch().await;
+        sqlx::query("DELETE FROM policy_entries WHERE policy_anchor_id = ?")
+            .bind(record_id)
+            .execute(db.write_pool())
+            .await
+            .unwrap();
+        assert_eq!(epoch().await, before + 1, "explicit revocation must wake");
+        sqlx::query(entry)
+            .bind(record_id)
+            .execute(db.write_pool())
+            .await
+            .unwrap();
+        let before_purge = epoch().await;
+        sqlx::query("DELETE FROM records WHERE id = ?")
+            .bind(record_id)
+            .execute(db.write_pool())
+            .await
+            .unwrap();
+        assert_eq!(epoch().await, before_purge, "cascade must stay quiet");
     }
 
     #[tokio::test]
@@ -5147,6 +6209,7 @@ pub async fn open_existing_database_at(path: &Path) -> Result<Db> {
 
 /// Apply the full v1 candidate schema to a fresh database.
 pub async fn apply_schema(db: &Db) -> Result<()> {
+    crate::managed_custody::refuse_maintenance(db.path())?;
     // Statements are ordered so every FK target exists before its referrer;
     // applied in one write transaction (the libSQL client's `batch('write')`).
     let mut tx = begin_write(&db.write_pool).await?;
@@ -5165,6 +6228,13 @@ pub async fn apply_schema(db: &Db) -> Result<()> {
         return Err(crate::error::Error::engine(format!(
             "schema application left malformed authorization revision state: {}",
             revision_violations.join("; ")
+        )));
+    }
+    let grant_violations = crate::authorization_grant::state_violations(db).await?;
+    if !grant_violations.is_empty() {
+        return Err(crate::error::Error::engine(format!(
+            "schema application left malformed grant revision state: {}",
+            grant_violations.join("; ")
         )));
     }
     Ok(())
@@ -5664,5 +6734,713 @@ mod release_preflight_shape_tests {
         validate_current_engine_shape_read_only(&valid)
             .await
             .unwrap();
+    }
+}
+
+/// Standalone SQLx investigation; never installed on an engine/hosted pool.
+#[cfg(test)]
+mod personal_alpha_registry_commit_probe_tests {
+    use std::borrow::Cow;
+    use std::future::Future;
+    use std::panic::AssertUnwindSafe;
+    use std::sync::{Arc, Condvar, Mutex};
+    use std::time::{Duration, Instant};
+
+    use futures::FutureExt;
+    use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
+    use sqlx::{Connection, Sqlite, SqliteConnection, Transaction};
+    use tokio::sync::Notify;
+
+    #[derive(Clone, Copy, Debug)]
+    enum Lane {
+        Progress,
+        CommitHook,
+    }
+    #[derive(Clone, Copy, Debug)]
+    enum Mark {
+        Armed,
+        Pending,
+        Ready,
+        Entered,
+        HeldPending,
+        Cancelled,
+        Released,
+        Deadline,
+        Exited,
+        Drained,
+        HandlersRemoved,
+        ConnectionClosed,
+        PoolClosed,
+        Observed,
+    }
+    struct State {
+        start: Instant,
+        held_since: Option<Instant>,
+        held: bool,
+        released: bool,
+        deadline: bool,
+        cancelled: bool,
+        entries: usize,
+        // Fixed capacity: callback recording cannot allocate or index-panic.
+        timeline: [Option<(Mark, u128)>; 24],
+    }
+    impl State {
+        fn record(&mut self, mark: Mark) {
+            if let Some(slot) = self.timeline.iter_mut().find(|slot| slot.is_none()) {
+                *slot = Some((mark, self.start.elapsed().as_micros()));
+            }
+        }
+    }
+    struct Callback {
+        state: Mutex<State>,
+        release: Condvar,
+        entered: Notify,
+    }
+    impl Callback {
+        fn new() -> Self {
+            Self {
+                state: Mutex::new(State {
+                    start: Instant::now(),
+                    held_since: None,
+                    held: false,
+                    released: false,
+                    deadline: false,
+                    cancelled: false,
+                    entries: 0,
+                    timeline: [None; 24],
+                }),
+                release: Condvar::new(),
+                entered: Notify::new(),
+            }
+        }
+        fn lock(&self) -> std::sync::MutexGuard<'_, State> {
+            self.state
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+        }
+        fn permit(&self) -> bool {
+            let mut state = self.lock();
+            state.entries = state.entries.saturating_add(1);
+            if state.entries != 1 || state.released {
+                return true; // one-shot/pass-through during cleanup
+            }
+            state.held = true;
+            state.held_since = Some(Instant::now());
+            state.record(Mark::Entered);
+            self.entered.notify_one();
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !state.released {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    state.deadline = true;
+                    state.record(Mark::Deadline);
+                    break;
+                }
+                let (next, _) = self
+                    .release
+                    .wait_timeout(state, remaining)
+                    .unwrap_or_else(|poison| poison.into_inner());
+                state = next;
+            }
+            state.held = false;
+            state.record(Mark::Exited);
+            true // never panic/false/interruption/intentional rollback
+        }
+        fn release(&self) {
+            let mut state = self.lock();
+            if !state.released {
+                state.released = true;
+                state.record(Mark::Released);
+            }
+            drop(state);
+            self.release.notify_all();
+        }
+        fn record(&self, mark: Mark) {
+            self.lock().record(mark);
+        }
+    }
+    struct ReleaseOnDrop(Arc<Callback>);
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            self.0.release();
+        }
+    }
+
+    async fn operation(
+        connection: &mut SqliteConnection,
+        callback: &Arc<Callback>,
+        lane: Lane,
+    ) -> Result<bool, String> {
+        let mut tx =
+            Transaction::<Sqlite>::begin(&mut *connection, Some(Cow::Borrowed("BEGIN IMMEDIATE")))
+                .await
+                .map_err(|error| error.to_string())?;
+        sqlx::query("INSERT INTO pending_commit_probe(k,v) VALUES(1,'retained')")
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| error.to_string())?;
+        {
+            let mut handle = tx.lock_handle().await.map_err(|error| error.to_string())?;
+            let hook = callback.clone();
+            match lane {
+                Lane::Progress => handle.set_progress_handler(1, move || hook.permit()),
+                Lane::CommitHook => handle.set_commit_hook(move || hook.permit()),
+            }
+        } // no LockedSqliteHandle across commit, no intervening SQL
+        callback.record(Mark::Armed);
+        let mut commit = Some(Box::pin(tx.commit()));
+        let mut entered = Box::pin(callback.entered.notified());
+        let witness = tokio::time::timeout(
+            Duration::from_secs(10),
+            std::future::poll_fn(|cx| {
+                // Only a short fixture state lock: actual poll and future Drop queue
+                // commands; neither calls SQLite synchronously or awaits this lock.
+                let mut state = callback.lock();
+                let held = state.held
+                    && !state.released
+                    && !state.deadline
+                    && state
+                        .held_since
+                        .is_some_and(|start| start.elapsed() < Duration::from_secs(30));
+                if !held && entered.as_mut().poll(cx).is_ready() {
+                    entered = Box::pin(callback.entered.notified());
+                    let _ = entered.as_mut().poll(cx);
+                }
+                let Some(future) = commit.as_mut() else {
+                    return std::task::Poll::Ready(Err(
+                        "commit future no longer retained".to_owned()
+                    ));
+                };
+                match future.as_mut().poll(cx) {
+                    std::task::Poll::Pending if held => {
+                        // A FRESH real Pending while SAME callback is CURRENTLY held.
+                        state.record(Mark::HeldPending);
+                        drop(commit.take()); // ends borrow/queues rollback BEFORE release
+                        state.cancelled = true;
+                        state.record(Mark::Cancelled);
+                        std::task::Poll::Ready(Ok(true))
+                    }
+                    std::task::Poll::Pending => {
+                        state.record(Mark::Pending);
+                        std::task::Poll::Pending
+                    }
+                    std::task::Poll::Ready(result) => {
+                        state.record(Mark::Ready);
+                        std::task::Poll::Ready(
+                            result.map(|_| false).map_err(|error| error.to_string()),
+                        )
+                    }
+                }
+            }),
+        )
+        .await;
+        drop(commit); // all paths end borrow before controller cleanup
+        witness.map_err(|_| "fresh-held Pending witness timeout (unqualified)".to_owned())?
+    }
+
+    fn log(lane: Lane, callback: &Callback, detail: &str) {
+        use std::io::Write;
+        let state = callback.lock();
+        let _ = writeln!(std::io::stderr().lock(),
+            "commit-probe {lane:?}: {detail}; entries={} held={} deadline={} cancelled={} timeline_us={:?}",
+            state.entries,state.held,state.deadline,state.cancelled,state.timeline);
+    }
+
+    async fn lane(lane: Lane) -> Result<bool, String> {
+        let dir = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let path = dir.path().join("probe.db");
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(&path)
+                    .create_if_missing(true)
+                    .journal_mode(SqliteJournalMode::Wal),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut connection = match pool.acquire().await {
+            Ok(connection) => connection,
+            Err(error) => {
+                pool.close().await;
+                return Err(error.to_string());
+            }
+        };
+        connection.close_on_drop(); // fallback only; physical owner stays HERE
+        let callback = Arc::new(Callback::new());
+        let release = ReleaseOnDrop(callback.clone()); // outside cancelled operation
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(20),
+            AssertUnwindSafe(async {
+                sqlx::query(
+                    "CREATE TABLE pending_commit_probe(k INTEGER PRIMARY KEY,v TEXT NOT NULL)",
+                )
+                .execute(&mut *connection)
+                .await
+                .map_err(|error| error.to_string())?;
+                let version: String = sqlx::query_scalar("SELECT sqlite_version()")
+                    .fetch_one(&mut *connection)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let journal: String = sqlx::query_scalar("PRAGMA journal_mode")
+                    .fetch_one(&mut *connection)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                if journal != "wal" {
+                    return Err("standalone lane is not WAL".to_owned());
+                }
+                log(
+                    lane,
+                    &callback,
+                    &format!("SQLx0.8.6/libsqlite3-sys0.30.1 SQLite={version} journal={journal}"),
+                );
+                operation(&mut connection, &callback, lane).await
+            })
+            .catch_unwind(),
+        )
+        .await;
+        // Operation/commit future is gone before release/drain on every exit.
+        drop(release);
+        let drain =
+            tokio::time::timeout(Duration::from_secs(30), Connection::ping(&mut *connection)).await;
+        let drain_ok = matches!(drain, Ok(Ok(())));
+        let removed = if drain_ok {
+            callback.record(Mark::Drained);
+            match tokio::time::timeout(Duration::from_secs(30), connection.lock_handle()).await {
+                Ok(Ok(mut handle)) => {
+                    handle.remove_progress_handler();
+                    handle.remove_commit_hook();
+                    drop(handle);
+                    callback.record(Mark::HandlersRemoved);
+                    true
+                }
+                _ => false,
+            }
+        } else {
+            false
+        };
+        let closed = matches!(
+            tokio::time::timeout(Duration::from_secs(30), connection.close()).await,
+            Ok(Ok(()))
+        );
+        if closed {
+            callback.record(Mark::ConnectionClosed);
+        }
+        let pool_closed = tokio::time::timeout(Duration::from_secs(30), pool.close())
+            .await
+            .is_ok();
+        if pool_closed {
+            callback.record(Mark::PoolClosed);
+        }
+        log(lane,&callback,&format!("cleanup fifo_drain={drain_ok} handlers_removed={removed} connection_closed={closed} pool_closed={pool_closed}"));
+        if !(drain_ok && removed && closed && pool_closed) {
+            let _preserved = dir.keep(); // no storage deletion with missing acknowledgement
+            return Err(
+                "cleanup unresolved; diagnostic storage retained; no independent outcome"
+                    .to_owned(),
+            );
+        }
+        let qualified = match outcome {
+            Ok(Ok(Ok(qualified))) => qualified,
+            Ok(Ok(Err(error))) => return Err(error),
+            Ok(Err(panic)) => std::panic::resume_unwind(panic),
+            Err(_) => return Err("controller operation watchdog (unqualified)".to_owned()),
+        };
+        if callback.lock().deadline {
+            return Err("callback safety deadline won; ordering unqualified".to_owned());
+        }
+        // Independent file read ONLY after SAME owner drain/removal/close + pool close.
+        let mut reader = SqliteConnection::connect_with(
+            &SqliteConnectOptions::new().filename(&path).read_only(true),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        let row = sqlx::query_scalar::<_, String>("SELECT v FROM pending_commit_probe WHERE k=1")
+            .fetch_optional(&mut reader)
+            .await;
+        let reader_closed = reader.close().await;
+        if let Err(error) = reader_closed {
+            let _preserved = dir.keep();
+            return Err(format!(
+                "reader close unacknowledged; storage retained: {error}"
+            ));
+        }
+        let row = row.map_err(|error| error.to_string())?;
+        if row.as_deref().is_some_and(|value| value != "retained") {
+            return Err("independent file outcome diverged".to_owned());
+        }
+        callback.record(Mark::Observed);
+        log(
+            lane,
+            &callback,
+            &format!(
+                "specificity={} file_row_present={} reader_closed=true (not hosted sanitation)",
+                if qualified {
+                    "held-Pending-cancelled-before-release"
+                } else {
+                    "unsupported/no-held-Pending"
+                },
+                row.is_some()
+            ),
+        );
+        Ok(qualified)
+    }
+
+    #[tokio::test]
+    async fn personal_alpha_registry_commit_probe_safe_callbacks() {
+        // Progress is diagnostic only: its callback has no statement identity.
+        let progress = lane(Lane::Progress)
+            .await
+            .expect("progress diagnostic/cleanup resolved");
+        let hook = lane(Lane::CommitHook)
+            .await
+            .expect("commit-hook specificity/cleanup resolved");
+        assert!(hook,"commit-specific currently-held/fresh-Pending witness unsupported; stop, do not blindly rerun");
+        use std::io::Write;
+        let _ = writeln!(std::io::stderr().lock(),"commit-probe summary: progress_held_pending={progress} (generic VM diagnostic); commit_hook_held_pending={hook}; one standalone case/two sequential lanes, no hosted qualification");
+    }
+}
+
+#[cfg(test)]
+mod pending_commit_pool_release_tests {
+    use super::*;
+    use std::future::Future;
+
+    #[tokio::test]
+    async fn personal_alpha_registry_pending_commit_pool_release() {
+        let mut dir = tempfile::tempdir().unwrap();
+        let db = open_database(dir.path().join("workspace.db").to_str().unwrap())
+            .await
+            .unwrap();
+        let probe = Arc::new(PendingControlCommitProbe::default());
+        let release = probe.release_on_drop();
+        let outcome = std::panic::AssertUnwindSafe(async {
+            sqlx::query("CREATE TABLE pending_pool_probe(v TEXT)")
+                .execute(db.write_pool())
+                .await
+                .unwrap();
+            // Retain four real siblings: the remaining physical connection
+            // must own the actual transaction and later be the first reused.
+            let mut siblings = Vec::new();
+            for _ in 0..4 {
+                siblings.push(db.write_pool().acquire().await.unwrap());
+            }
+            let mut tx = begin_write(db.write_pool()).await.unwrap();
+            let key = connection_key(&mut tx).await.unwrap();
+            sqlx::query("INSERT INTO pending_pool_probe VALUES('durable')")
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            let mut request = Some(Box::pin(db.with_pending_control_commit_probe(
+                probe.clone(),
+                db.with_request_realtime_completion(db.commit_control(tx)),
+            )));
+            tokio::time::timeout(Duration::from_secs(10), async {
+                tokio::select! {
+                    result = request.as_mut().unwrap() => panic!("driver completed before held Pending: {result:?}"),
+                    _ = probe.wait_held_pending() => {}
+                }
+                std::future::poll_fn(|cx| {
+                    assert!(request.as_mut().unwrap().as_mut().poll(cx).is_pending());
+                    std::task::Poll::Ready(())
+                }).await;
+                assert!(probe.request_completion_unmarked());
+                assert!(probe.cancel_if_currently_held(|| drop(request.take())));
+            }).await.unwrap();
+            probe.release();
+            assert!(
+                tokio::time::timeout(Duration::from_secs(30), probe.wait_cleanup_ack())
+                    .await
+                    .unwrap()
+            );
+            let mut reused = db.write_pool().acquire().await.unwrap();
+            assert_eq!(
+                connection_key(&mut reused).await.unwrap(),
+                key,
+                "actual target reused only after exact cleanup ACK"
+            );
+            let entries = probe.callback_entries();
+            let mut later = reused.begin_with("BEGIN IMMEDIATE").await.unwrap();
+            sqlx::query("INSERT INTO pending_pool_probe VALUES('later')")
+                .execute(&mut *later)
+                .await
+                .unwrap();
+            later.commit().await.unwrap();
+            assert_eq!(
+                probe.callback_entries(),
+                entries,
+                "old commit hook removed before reuse"
+            );
+            reused.return_to_pool().await;
+            // A nonmatching sibling keeps the real release sanitizer: TEMP
+            // contract removed, progress handler cleared, ordinary admission.
+            let mut sibling = siblings.pop().unwrap();
+            let sibling_key = connection_key(&mut sibling).await.unwrap();
+            sqlx::query("CREATE TEMP TABLE _query_sql_principal(v TEXT)")
+                .execute(&mut *sibling)
+                .await
+                .unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let counter = calls.clone();
+            sibling
+                .lock_handle()
+                .await
+                .unwrap()
+                .set_progress_handler(1, move || {
+                    counter.fetch_add(1, Ordering::Relaxed);
+                    true
+                });
+            sqlx::query("SELECT 1")
+                .execute(&mut *sibling)
+                .await
+                .unwrap();
+            let before = calls.load(Ordering::Relaxed);
+            // Occupy the cleaned target too, leaving only this sibling idle.
+            let held_target = db.write_pool().acquire().await.unwrap();
+            sibling.return_to_pool().await;
+            let mut clean = db.write_pool().acquire().await.unwrap();
+            assert_eq!(connection_key(&mut clean).await.unwrap(), sibling_key);
+            let sentinel: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM temp.sqlite_schema WHERE name='_query_sql_principal'",
+            )
+            .fetch_one(&mut *clean)
+            .await
+            .unwrap();
+            assert_eq!(sentinel, 0);
+            assert_eq!(
+                calls.load(Ordering::Relaxed),
+                before,
+                "unmarked sibling progress removed before sanitation SQL"
+            );
+            drop(clean);
+            drop(held_target);
+            drop(siblings);
+            let mut normal = begin_write(db.write_pool()).await.unwrap();
+            sqlx::query("INSERT INTO pending_pool_probe VALUES('ordinary')")
+                .execute(&mut *normal)
+                .await
+                .unwrap();
+            db.commit_control(normal).await.unwrap();
+            assert_eq!(probe.callback_entries(), entries);
+            eprintln!("pending-pool: exact target cleanup/reuse/oldhook absence and sibling sanitation; {:?}",probe.timeline());
+        });
+        use futures::FutureExt;
+        let result = tokio::time::timeout(Duration::from_secs(90), outcome.catch_unwind()).await;
+        drop(release);
+        let closed = tokio::time::timeout(Duration::from_secs(45), db.close())
+            .await
+            .is_ok();
+        if !matches!(result, Ok(Ok(()))) || !closed {
+            dir.disable_cleanup(true);
+        }
+        assert!(
+            closed,
+            "pool shutdown unacknowledged; diagnostic storage retained"
+        );
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(panic)) => std::panic::resume_unwind(panic),
+            Err(_) => panic!("pool release qualification timeout"),
+        }
+    }
+
+    #[tokio::test]
+    async fn personal_alpha_registry_pending_commit_pool_retirement() {
+        use control_commit_test::PendingControlCommitMark as Mark;
+        use futures::FutureExt;
+        use sqlx::Connection;
+        use std::io::Write as _;
+
+        let mut dir = tempfile::tempdir().unwrap();
+        // Retain diagnostics on every unqualified path, including cancellation.
+        dir.disable_cleanup(true);
+        let path = dir.path().join("workspace.db");
+        let db = tokio::time::timeout(
+            Duration::from_secs(30),
+            open_database(path.to_str().unwrap()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let write_pool = db.write_pool().clone();
+        let probe = Arc::new(PendingControlCommitProbe::default());
+        let release = probe.release_on_drop();
+        // These owners outlive the caught/timed caller. In particular, the
+        // synchronous closed flag is not owned by the cancelled commit future.
+        let mut request = None;
+        let mut siblings = Vec::new();
+        let mut pool_close = None;
+        let case = std::panic::AssertUnwindSafe(async {
+            let mut earlier = begin_write(&write_pool).await.unwrap();
+            sqlx::query(
+                "CREATE TABLE pending_retirement_probe(k TEXT PRIMARY KEY,v TEXT NOT NULL)",
+            )
+            .execute(&mut *earlier)
+            .await
+            .unwrap();
+            sqlx::query("INSERT INTO pending_retirement_probe VALUES('earlier','retained')")
+                .execute(&mut *earlier)
+                .await
+                .unwrap();
+            db.commit_control(earlier).await.unwrap();
+            // Existing default pool footing: four siblings leave one target.
+            for _ in 0..4 {
+                siblings.push(write_pool.acquire().await.unwrap());
+            }
+            let mut tx = begin_write(&write_pool).await.unwrap();
+            let target_key = connection_key(&mut tx).await.unwrap();
+            assert_ne!(target_key, 0);
+            sqlx::query("INSERT INTO pending_retirement_probe VALUES('target-a','first'),('target-b','second')")
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            request = Some(Box::pin(db.with_pending_control_commit_probe(
+                probe.clone(),
+                db.with_request_realtime_completion(db.commit_control(tx)),
+            )));
+            tokio::time::timeout(Duration::from_secs(10), async {
+                tokio::select! {
+                    _ = request.as_mut().unwrap() => panic!("commit completed before installed held Pending"),
+                    _ = probe.wait_held_pending() => {}
+                }
+                // The witness comes from a poll of THIS actual driver future
+                // while its uniquely installed commit callback is held.
+                assert!(probe.request_completion_unmarked());
+                assert_eq!(probe.callback_entries(), 1);
+                pool_close = Some(Box::pin(write_pool.close()));
+                assert!(write_pool.is_closed()); // close() fences synchronously
+                // Fresh poll AFTER the fence, then drop under the same short
+                // currently-held witness lock, before permitting release.
+                std::future::poll_fn(|cx| {
+                    assert!(request.as_mut().unwrap().as_mut().poll(cx).is_pending());
+                    std::task::Poll::Ready(())
+                })
+                .await;
+                assert!(probe.cancel_if_currently_held(|| drop(request.take())));
+            })
+            .await
+            .unwrap();
+        });
+        let result = tokio::time::timeout(Duration::from_secs(90), case.catch_unwind()).await;
+        // Independent supervision, even if the caller panicked/timed out.
+        drop(request.take());
+        drop(release); // unconditional TRUE permit; no synthetic driver error
+        siblings.clear();
+        let destruction = if pool_close.is_some() {
+            tokio::time::timeout(Duration::from_secs(30), probe.wait_cleanup_ack())
+                .await
+                .ok()
+        } else {
+            None
+        };
+        let retained_close_drained = match pool_close.take() {
+            Some(close) => tokio::time::timeout(Duration::from_secs(45), close)
+                .await
+                .is_ok(),
+            None => false,
+        };
+        let db_drained = tokio::time::timeout(Duration::from_secs(45), db.close())
+            .await
+            .is_ok();
+        let mut pools_refuse = true;
+        for pool in [&db.read_pool, &db.write_pool, &db.governed_pool] {
+            pools_refuse &= pool.is_closed() && pool.size() == 0;
+            pools_refuse &= matches!(
+                tokio::time::timeout(Duration::from_secs(5), pool.acquire()).await,
+                Ok(Err(sqlx::Error::PoolClosed))
+            );
+        }
+        let timeline = probe.timeline();
+        let position = |wanted: fn(Mark) -> bool| {
+            timeline
+                .iter()
+                .position(|entry| entry.is_some_and(|(mark, _)| wanted(mark)))
+        };
+        let stages = [
+            position(|m| matches!(m, Mark::Armed)),
+            position(|m| matches!(m, Mark::Entered)),
+            position(|m| matches!(m, Mark::HeldPending)),
+            position(|m| matches!(m, Mark::Cancelled)),
+            position(|m| matches!(m, Mark::Released)),
+            position(|m| matches!(m, Mark::Exited)),
+            position(|m| matches!(m, Mark::Unresolved)),
+        ];
+        let ordered =
+            stages.iter().all(Option::is_some) && stages.windows(2).all(|pair| pair[0] < pair[1]);
+        let no_clean = timeline.iter().flatten().all(|(mark, _)| {
+            !matches!(
+                mark,
+                Mark::CleanupClean | Mark::Drained | Mark::Removed | Mark::Deadline
+            )
+        });
+        // False is the existing exact lease's HookCapture destruction result.
+        // SQLx Floating::close swallows raw.close errors: these checks are
+        // NORMAL pool drain/accounting, never a successful worker-close ACK.
+        let qualified = matches!(result, Ok(Ok(())))
+            && destruction == Some(false)
+            && retained_close_drained
+            && db_drained
+            && pools_refuse
+            && ordered
+            && no_clean
+            && probe.request_completion_unmarked()
+            && probe.callback_entries() == 1;
+        let _ = writeln!(std::io::stderr().lock(), "pending-retirement: normal-drain={db_drained} retained-close={retained_close_drained} closed-refusal={pools_refuse} destruction={destruction:?}; {timeline:?}");
+        assert!(
+            qualified,
+            "retirement witness/drain unresolved; storage retained"
+        );
+
+        // Only after target destruction and all normal pool drain/refusal.
+        // Retain the independent reader outside its caught observation too.
+        let mut reader = Some(
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                SqliteConnection::connect_with(
+                    &SqliteConnectOptions::new().filename(&path).read_only(true),
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap(),
+        );
+        let observation = std::panic::AssertUnwindSafe(async {
+            let mut snapshot = reader.as_mut().unwrap().begin().await.unwrap();
+            let rows: Vec<(String, String)> =
+                sqlx::query_as("SELECT k,v FROM pending_retirement_probe ORDER BY k")
+                    .fetch_all(&mut *snapshot)
+                    .await
+                    .unwrap();
+            snapshot.commit().await.unwrap();
+            let earlier = vec![("earlier".to_owned(), "retained".to_owned())];
+            let complete = vec![
+                ("earlier".to_owned(), "retained".to_owned()),
+                ("target-a".to_owned(), "first".to_owned()),
+                ("target-b".to_owned(), "second".to_owned()),
+            ];
+            assert!(
+                rows == earlier || rows == complete,
+                "partial diagnostic outcome"
+            );
+            rows == complete
+        });
+        let observed =
+            tokio::time::timeout(Duration::from_secs(10), observation.catch_unwind()).await;
+        let reader_closed = matches!(
+            tokio::time::timeout(Duration::from_secs(10), reader.take().unwrap().close()).await,
+            Ok(Ok(()))
+        );
+        assert!(
+            reader_closed,
+            "independent reader close unresolved; storage retained"
+        );
+        match observed {
+            Ok(Ok(durable)) => {
+                let _ = writeln!(std::io::stderr().lock(), "pending-retirement: diagnostic-pair-durable={durable}; reader closed; no target-worker-close ACK claim");
+                dir.disable_cleanup(false);
+            }
+            Ok(Err(panic)) => std::panic::resume_unwind(panic),
+            Err(_) => panic!("readonly outcome deadline; storage retained"),
+        }
     }
 }

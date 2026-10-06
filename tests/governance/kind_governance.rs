@@ -919,6 +919,10 @@ async fn metadata_events_replay_bytes_and_schema_advertises_active_only() {
         .unwrap()
         .get("metadata");
     assert_eq!(stored, serde_json::to_string(&metadata).unwrap());
+    let definition: String = sqlx::query_scalar(
+        "SELECT text_value FROM vocabulary_value_json_nodes WHERE value_id=? AND path='/definition'",
+    ).bind(&id).fetch_one(db.pool()).await.unwrap();
+    assert_eq!(definition, metadata.definition);
     assert!(rebuild_and_diff_meta(&db).await.unwrap().equal);
 
     let proposed = install_kind(&db, "WorkItem", "not_yet", false).await;

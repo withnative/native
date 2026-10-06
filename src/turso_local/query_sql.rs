@@ -57,6 +57,28 @@ fn projection_too_large(detail: impl AsRef<str>) -> Error {
     )
 }
 
+/// A lifecycle row is serialized before it joins the growing vector. The
+/// surrounding JSON array costs two brackets and a comma between rows, so
+/// this exactly matches the isolated core's eventual encoded-size charge.
+pub(super) fn reserve_lifecycle_encoded_bytes(
+    used: usize,
+    limit: usize,
+    row: &NormalizedRow,
+    needs_comma: bool,
+) -> Result<usize> {
+    let row_bytes = serde_json::to_vec(row)?.len();
+    let next = used
+        .saturating_add(usize::from(needs_comma))
+        .saturating_add(row_bytes);
+    if next > limit {
+        return Err(projection_too_large(format!(
+            "record_lifecycle_interpretations exceeds the {}-byte encoded projection limit",
+            crate::query::turso_sql::MAX_PROJECTION_ENCODED_BYTES
+        )));
+    }
+    Ok(next)
+}
+
 fn columns(relation: &str) -> Vec<ColumnSpec> {
     if relation == "semantic_units" {
         return vec![ColumnSpec::nullable("unit_id", LogicalType::Text)];
@@ -74,7 +96,14 @@ fn columns(relation: &str) -> Vec<ColumnSpec> {
             let logical_type = match (relation, *column) {
                 ("content_events", "local_seq")
                 | ("facet_observations", "event_seq")
-                | ("blobs", "size_bytes") => LogicalType::Integer,
+                | ("blobs", "size_bytes")
+                | ("records", "is_current")
+                | ("records", "successor_count")
+                | ("records", "archived")
+                | (
+                    "body_task_items",
+                    "item_index" | "checked" | "in_quote" | "start_offset" | "end_offset",
+                ) => LogicalType::Integer,
                 ("bindings", "is_canonical") => LogicalType::Bool,
                 ("facet_values", "value_num") | ("vocabulary_values", "ordinal") => {
                     LogicalType::Real
@@ -102,13 +131,49 @@ async fn source_rows(
     relation: &'static str,
     fragments: &'static [&'static str],
 ) -> Result<Vec<NormalizedRow>> {
-    let preflight = statement(StatementKind::Select, relation, source_preflight(relation))
+    source_rows_extra(transaction, budget, relation, fragments, &[]).await
+}
+
+/// [`source_rows`] plus transient helper columns that never reach the
+/// projection: the fetch fragment must project them and they are stripped
+/// by the caller before `IsolatedProjection::insert`, whose column contract
+/// is exact. Their bytes ride in the source budget slack (a 6x text
+/// multiplier over the measured cells against a 16 MiB cap).
+async fn source_rows_extra(
+    transaction: &mut TursoDomainTransaction<'_>,
+    budget: &mut SourceBudget,
+    relation: &'static str,
+    fragments: &'static [&'static str],
+    extra: &[ColumnSpec],
+) -> Result<Vec<NormalizedRow>> {
+    source_rows_bound(
+        transaction,
+        budget,
+        relation,
+        source_preflight(relation),
+        fragments,
+        &[],
+        extra,
+    )
+    .await
+}
+
+async fn source_rows_bound(
+    transaction: &mut TursoDomainTransaction<'_>,
+    budget: &mut SourceBudget,
+    relation: &'static str,
+    preflight_fragments: &'static [&'static str],
+    fragments: &'static [&'static str],
+    bindings: &[BindValue],
+    extra: &[ColumnSpec],
+) -> Result<Vec<NormalizedRow>> {
+    let preflight = statement(StatementKind::Select, relation, preflight_fragments)
         .map_err(|error| stable("query_sql projection preflight", error))?;
     let preflight = transaction
         .rows(
             "query_sql projection preflight",
             &preflight,
-            &[],
+            bindings,
             &[
                 ColumnSpec::required("candidate_count", LogicalType::Integer),
                 ColumnSpec::nullable("max_cell_bytes", LogicalType::Integer),
@@ -144,8 +209,10 @@ async fn source_rows(
     )?;
     let statement = statement(StatementKind::Select, relation, fragments)
         .map_err(|error| stable("query_sql projection", error))?;
+    let mut specs = columns(relation);
+    specs.extend(extra.iter().cloned());
     let rows = transaction
-        .rows("query_sql projection", &statement, &[], &columns(relation))
+        .rows("query_sql projection", &statement, bindings, &specs)
         .await?;
     if rows.len() != candidate_count {
         return Err(Error::engine(format!(
@@ -161,9 +228,9 @@ async fn source_rows(
 // candidate bounds have been admitted.
 fn source_preflight(relation: &str) -> &'static [&'static str] {
     match relation {
-        "records" => &["SELECT count(*) AS candidate_count,max(max(coalesce(length(CAST(id AS BLOB)),0),coalesce(length(CAST(type AS BLOB)),0),coalesce(length(CAST(kind AS BLOB)),0),coalesce(length(CAST(name AS BLOB)),0),coalesce(length(CAST(body AS BLOB)),0),coalesce(length(CAST(home_id AS BLOB)),0),coalesce(length(CAST(lifecycle AS BLOB)),0),coalesce(length(CAST(persistence AS BLOB)),0),coalesce(length(CAST(maturity AS BLOB)),0),coalesce(length(CAST(summary AS BLOB)),0),coalesce(length(CAST(last_activity_at AS BLOB)),0),coalesce(length(CAST(created_at AS BLOB)),0),coalesce(length(CAST(updated_at AS BLOB)),0),coalesce(length(CAST(deleted_at AS BLOB)),0))) AS max_cell_bytes,sum(128+coalesce(length(CAST(id AS BLOB)),0)+coalesce(length(CAST(type AS BLOB)),0)+coalesce(length(CAST(kind AS BLOB)),0)+coalesce(length(CAST(name AS BLOB)),0)+coalesce(length(CAST(body AS BLOB)),0)+coalesce(length(CAST(home_id AS BLOB)),0)+coalesce(length(CAST(lifecycle AS BLOB)),0)+coalesce(length(CAST(persistence AS BLOB)),0)+coalesce(length(CAST(maturity AS BLOB)),0)+coalesce(length(CAST(summary AS BLOB)),0)+coalesce(length(CAST(last_activity_at AS BLOB)),0)+coalesce(length(CAST(created_at AS BLOB)),0)+coalesce(length(CAST(updated_at AS BLOB)),0)+coalesce(length(CAST(deleted_at AS BLOB)),0)) AS candidate_bytes FROM (SELECT id,type,kind,name,body,home_id,lifecycle,persistence,maturity,summary,last_activity_at,created_at,updated_at,deleted_at FROM {{relation}} WHERE deleted_at IS NULL LIMIT 20001)"],
+        "records" => &["SELECT count(*) AS candidate_count,max(max(coalesce(length(CAST(id AS BLOB)),0),coalesce(length(CAST(type AS BLOB)),0),coalesce(length(CAST(kind AS BLOB)),0),coalesce(length(CAST(name AS BLOB)),0),coalesce(length(CAST(body AS BLOB)),0),coalesce(length(CAST(home_id AS BLOB)),0),coalesce(length(CAST(lifecycle AS BLOB)),0),coalesce(length(CAST(persistence AS BLOB)),0),coalesce(length(CAST(maturity AS BLOB)),0),coalesce(length(CAST(summary AS BLOB)),0),coalesce(length(CAST(is_current AS BLOB)),0),coalesce(length(CAST(successor_count AS BLOB)),0),coalesce(length(CAST(archived AS BLOB)),0),coalesce(length(CAST(last_activity_at AS BLOB)),0),coalesce(length(CAST(created_at AS BLOB)),0),coalesce(length(CAST(updated_at AS BLOB)),0),coalesce(length(CAST(deleted_at AS BLOB)),0))) AS max_cell_bytes,sum(152+coalesce(length(CAST(id AS BLOB)),0)+coalesce(length(CAST(type AS BLOB)),0)+coalesce(length(CAST(kind AS BLOB)),0)+coalesce(length(CAST(name AS BLOB)),0)+coalesce(length(CAST(body AS BLOB)),0)+coalesce(length(CAST(home_id AS BLOB)),0)+coalesce(length(CAST(lifecycle AS BLOB)),0)+coalesce(length(CAST(persistence AS BLOB)),0)+coalesce(length(CAST(maturity AS BLOB)),0)+coalesce(length(CAST(summary AS BLOB)),0)+coalesce(length(CAST(is_current AS BLOB)),0)+coalesce(length(CAST(successor_count AS BLOB)),0)+coalesce(length(CAST(archived AS BLOB)),0)+coalesce(length(CAST(last_activity_at AS BLOB)),0)+coalesce(length(CAST(created_at AS BLOB)),0)+coalesce(length(CAST(updated_at AS BLOB)),0)+coalesce(length(CAST(deleted_at AS BLOB)),0)) AS candidate_bytes FROM (SELECT id,type,kind,name,body,home_id,lifecycle,persistence,maturity,summary,is_current,successor_count,last_activity_at,created_at,updated_at,deleted_at,archived FROM {{relation}} WHERE deleted_at IS NULL LIMIT 20001)"],
         "semantic_units" => &["SELECT count(*) AS candidate_count,max(coalesce(length(CAST(unit_id AS BLOB)),0)) AS max_cell_bytes,sum(32+coalesce(length(CAST(unit_id AS BLOB)),0)) AS candidate_bytes FROM (SELECT unit_id FROM {{relation}} LIMIT 20001)"],
-        "content_events" => &["SELECT count(*) AS candidate_count,max(max(coalesce(length(CAST(local_seq AS BLOB)),0),coalesce(length(CAST(id AS BLOB)),0),coalesce(length(CAST(record_id AS BLOB)),0),coalesce(length(CAST(type AS BLOB)),0),coalesce(length(CAST(created_at AS BLOB)),0))) AS max_cell_bytes,sum(64+coalesce(length(CAST(local_seq AS BLOB)),0)+coalesce(length(CAST(id AS BLOB)),0)+coalesce(length(CAST(record_id AS BLOB)),0)+coalesce(length(CAST(type AS BLOB)),0)+coalesce(length(CAST(created_at AS BLOB)),0)) AS candidate_bytes FROM (SELECT seq AS local_seq,id,record_id,type,created_at FROM {{relation}} LIMIT 20001)"],
+        "content_events" => &["SELECT count(*) AS candidate_count,max(max(coalesce(length(CAST(local_seq AS BLOB)),0),coalesce(length(CAST(id AS BLOB)),0),coalesce(length(CAST(record_id AS BLOB)),0),coalesce(length(CAST(type AS BLOB)),0),coalesce(length(CAST(actor AS BLOB)),0),coalesce(length(CAST(run_key AS BLOB)),0),coalesce(length(CAST(parent_key AS BLOB)),0),coalesce(length(CAST(created_at AS BLOB)),0))) AS max_cell_bytes,sum(64+coalesce(length(CAST(local_seq AS BLOB)),0)+coalesce(length(CAST(id AS BLOB)),0)+coalesce(length(CAST(record_id AS BLOB)),0)+coalesce(length(CAST(type AS BLOB)),0)+coalesce(length(CAST(actor AS BLOB)),0)+coalesce(length(CAST(run_key AS BLOB)),0)+coalesce(length(CAST(parent_key AS BLOB)),0)+coalesce(length(CAST(created_at AS BLOB)),0)) AS candidate_bytes FROM (SELECT seq AS local_seq,id,record_id,type,actor,run_key,parent_key,created_at FROM {{relation}} LIMIT 20001)"],
         "links" => &["SELECT count(*) AS candidate_count,max(max(coalesce(length(CAST(id AS BLOB)),0),coalesce(length(CAST(source_id AS BLOB)),0),coalesce(length(CAST(target_id AS BLOB)),0),coalesce(length(CAST(relationship AS BLOB)),0),coalesce(length(CAST(note AS BLOB)),0),coalesce(length(CAST(created_at AS BLOB)),0))) AS max_cell_bytes,sum(64+coalesce(length(CAST(id AS BLOB)),0)+coalesce(length(CAST(source_id AS BLOB)),0)+coalesce(length(CAST(target_id AS BLOB)),0)+coalesce(length(CAST(relationship AS BLOB)),0)+coalesce(length(CAST(note AS BLOB)),0)+coalesce(length(CAST(created_at AS BLOB)),0)) AS candidate_bytes FROM (SELECT id,source_id,target_id,relationship,note,created_at FROM {{relation}} LIMIT 20001)"],
         "facet_values" => &["SELECT count(*) AS candidate_count,max(max(coalesce(length(CAST(id AS BLOB)),0),coalesce(length(CAST(record_id AS BLOB)),0),coalesce(length(CAST(key AS BLOB)),0),coalesce(length(CAST(value AS BLOB)),0),coalesce(length(CAST(value_num AS BLOB)),0),coalesce(length(CAST(vocab_ref AS BLOB)),0),coalesce(length(CAST(created_at AS BLOB)),0))) AS max_cell_bytes,sum(64+coalesce(length(CAST(id AS BLOB)),0)+coalesce(length(CAST(record_id AS BLOB)),0)+coalesce(length(CAST(key AS BLOB)),0)+coalesce(length(CAST(value AS BLOB)),0)+coalesce(length(CAST(value_num AS BLOB)),0)+coalesce(length(CAST(vocab_ref AS BLOB)),0)+coalesce(length(CAST(created_at AS BLOB)),0)) AS candidate_bytes FROM (SELECT id,record_id,key,value,value_num,vocab_ref,created_at FROM {{relation}} LIMIT 20001)"],
         "facet_observations" => &["SELECT count(*) AS candidate_count,max(max(coalesce(length(CAST(id AS BLOB)),0),coalesce(length(CAST(record_id AS BLOB)),0),coalesce(length(CAST(key AS BLOB)),0),coalesce(length(CAST(value AS BLOB)),0),coalesce(length(CAST(op AS BLOB)),0),coalesce(length(CAST(vocab_ref AS BLOB)),0),coalesce(length(CAST(as_of AS BLOB)),0),coalesce(length(CAST(observed_at AS BLOB)),0),coalesce(length(CAST(event_seq AS BLOB)),0))) AS max_cell_bytes,sum(96+coalesce(length(CAST(id AS BLOB)),0)+coalesce(length(CAST(record_id AS BLOB)),0)+coalesce(length(CAST(key AS BLOB)),0)+coalesce(length(CAST(value AS BLOB)),0)+coalesce(length(CAST(op AS BLOB)),0)+coalesce(length(CAST(vocab_ref AS BLOB)),0)+coalesce(length(CAST(as_of AS BLOB)),0)+coalesce(length(CAST(observed_at AS BLOB)),0)+coalesce(length(CAST(event_seq AS BLOB)),0)) AS candidate_bytes FROM (SELECT id,record_id,key,value,op,vocab_ref,as_of,observed_at,event_seq FROM {{relation}} LIMIT 20001)"],
@@ -172,6 +239,7 @@ fn source_preflight(relation: &str) -> &'static [&'static str] {
         "vocabularies" => &["SELECT count(*) AS candidate_count,max(max(coalesce(length(CAST(id AS BLOB)),0),coalesce(length(CAST(name AS BLOB)),0),coalesce(length(CAST(created_at AS BLOB)),0))) AS max_cell_bytes,sum(32+coalesce(length(CAST(id AS BLOB)),0)+coalesce(length(CAST(name AS BLOB)),0)+coalesce(length(CAST(created_at AS BLOB)),0)) AS candidate_bytes FROM (SELECT id,name,created_at FROM {{relation}} LIMIT 20001)"],
         "vocabulary_values" => &["SELECT count(*) AS candidate_count,max(max(coalesce(length(CAST(id AS BLOB)),0),coalesce(length(CAST(vocabulary_id AS BLOB)),0),coalesce(length(CAST(value AS BLOB)),0),coalesce(length(CAST(gloss AS BLOB)),0),coalesce(length(CAST(status AS BLOB)),0),coalesce(length(CAST(ordinal AS BLOB)),0),coalesce(length(CAST(terminality AS BLOB)),0),coalesce(length(CAST(metadata AS BLOB)),0),coalesce(length(CAST(alias_of AS BLOB)),0))) AS max_cell_bytes,sum(96+coalesce(length(CAST(id AS BLOB)),0)+coalesce(length(CAST(vocabulary_id AS BLOB)),0)+coalesce(length(CAST(value AS BLOB)),0)+coalesce(length(CAST(gloss AS BLOB)),0)+coalesce(length(CAST(status AS BLOB)),0)+coalesce(length(CAST(ordinal AS BLOB)),0)+coalesce(length(CAST(terminality AS BLOB)),0)+coalesce(length(CAST(metadata AS BLOB)),0)+coalesce(length(CAST(alias_of AS BLOB)),0)) AS candidate_bytes FROM (SELECT id,vocabulary_id,value,gloss,status,ordinal,terminality,metadata,alias_of FROM {{relation}} LIMIT 20001)"],
         "schema_config" => &["SELECT count(*) AS candidate_count,max(max(coalesce(length(CAST(id AS BLOB)),0),coalesce(length(CAST(layer AS BLOB)),0),coalesce(length(CAST(name AS BLOB)),0),coalesce(length(CAST(data AS BLOB)),0),coalesce(length(CAST(applies_to_collection_id AS BLOB)),0),coalesce(length(CAST(version_lineage AS BLOB)),0),coalesce(length(CAST(created_at AS BLOB)),0))) AS max_cell_bytes,sum(64+coalesce(length(CAST(id AS BLOB)),0)+coalesce(length(CAST(layer AS BLOB)),0)+coalesce(length(CAST(name AS BLOB)),0)+coalesce(length(CAST(data AS BLOB)),0)+coalesce(length(CAST(applies_to_collection_id AS BLOB)),0)+coalesce(length(CAST(version_lineage AS BLOB)),0)+coalesce(length(CAST(created_at AS BLOB)),0)) AS candidate_bytes FROM (SELECT id,layer,name,data,applies_to_collection_id,version_lineage,created_at FROM {{relation}} LIMIT 20001)"],
+        "body_task_items" => &["SELECT count(*) AS candidate_count,max(max(coalesce(length(CAST(record_id AS BLOB)),0),coalesce(length(CAST(item_index AS BLOB)),0),coalesce(length(CAST(marker AS BLOB)),0),coalesce(length(CAST(checked AS BLOB)),0),coalesce(length(CAST(in_quote AS BLOB)),0),coalesce(length(CAST(start_offset AS BLOB)),0),coalesce(length(CAST(end_offset AS BLOB)),0))) AS max_cell_bytes,sum(64+coalesce(length(CAST(record_id AS BLOB)),0)+coalesce(length(CAST(item_index AS BLOB)),0)+coalesce(length(CAST(marker AS BLOB)),0)+coalesce(length(CAST(checked AS BLOB)),0)+coalesce(length(CAST(in_quote AS BLOB)),0)+coalesce(length(CAST(start_offset AS BLOB)),0)+coalesce(length(CAST(end_offset AS BLOB)),0)) AS candidate_bytes FROM (SELECT record_id,item_index,marker,checked,in_quote,start_offset,end_offset FROM {{relation}} WHERE record_id IN (SELECT value FROM json_each(", ")) LIMIT 20001)"],
         _ => unreachable!("known query_sql source relation"),
     }
 }
@@ -261,6 +329,31 @@ async fn source_blob_rows(
         blobs.extend(rows);
     }
     Ok(blobs)
+}
+
+async fn source_task_item_rows(
+    transaction: &mut TursoDomainTransaction<'_>,
+    budget: &mut SourceBudget,
+    visible: &BTreeSet<String>,
+) -> Result<Vec<NormalizedRow>> {
+    if visible.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Admission and fetch use the same visible-id predicate inside this
+    // snapshot. Hidden task rows never consume the caller's source budget.
+    let bindings = [BindValue::Text(
+        serde_json::to_string(visible).expect("string set serializes to JSON"),
+    )];
+    source_rows_bound(
+        transaction,
+        budget,
+        "body_task_items",
+        source_preflight("body_task_items"),
+        &["SELECT record_id,item_index,marker,checked,in_quote,start_offset,end_offset FROM {{relation}} WHERE record_id IN (SELECT value FROM json_each(", ")) LIMIT 20001"],
+        &bindings,
+        &[],
+    )
+    .await
 }
 
 /// Workspace content head inside the current backend snapshot. Unfiltered
@@ -391,6 +484,8 @@ fn with_millis(mut rows: Vec<NormalizedRow>, columns: &[&str]) -> Vec<Normalized
 async fn build_projection(
     transaction: &mut TursoDomainTransaction<'_>,
     caller: &crate::mcp::Caller,
+    include_task_items: bool,
+    include_lifecycle: bool,
 ) -> Result<crate::query::turso_sql::IsolatedProjection> {
     // Freshness stamp (E1 M1 slice A): the workspace content sequence
     // observed inside this same backend snapshot, before any projection row
@@ -402,7 +497,7 @@ async fn build_projection(
             transaction,
             &mut budget,
             "records",
-            &["SELECT id,type,kind,name,body,home_id,lifecycle,persistence,maturity,summary,last_activity_at,created_at,updated_at,deleted_at FROM {{relation}} WHERE deleted_at IS NULL LIMIT 20001"],
+            &["SELECT id,type,kind,name,body,home_id,lifecycle,persistence,maturity,summary,is_current,successor_count,last_activity_at,created_at,updated_at,deleted_at,archived FROM {{relation}} WHERE deleted_at IS NULL LIMIT 20001"],
         )
         .await?,
         &[
@@ -477,45 +572,132 @@ async fn build_projection(
         }
     }
     records.retain(|row| value_text(row, "id").is_some_and(|id| visible.contains(id)));
+    // Preserve the physical bearer for interpretation before the public
+    // records projection withholds a hidden home_id. It never enters SQL.
+    let lifecycle_contexts = include_lifecycle.then(|| {
+        records
+            .iter()
+            .map(|row| {
+                (
+                    value_text(row, "id").unwrap_or_default().to_owned(),
+                    value_text(row, "type").unwrap_or_default().to_owned(),
+                    value_text(row, "kind").map(str::to_owned),
+                    value_text(row, "home_id").map(str::to_owned),
+                    value_text(row, "lifecycle").map(str::to_owned),
+                )
+            })
+            .collect::<Vec<_>>()
+    });
     for row in &mut records {
         if value_text(row, "home_id").is_some_and(|home| !visible.contains(home)) {
             row.insert("home_id".into(), NormalizedValue::Null);
         }
     }
 
-    let events = with_millis(
-        source_rows(
+    // The claim-shaped flag is computed backend-side so payload bytes never
+    // cross the projection boundary; it is stripped before serving and only
+    // decides run_key/parent_key withholding below. The `->` operator (not
+    // `->>`) preserves an explicit-null claim key as JSON text, so key
+    // presence matches the history rule exactly; it also keeps `$` out of
+    // the portable template, which forbids placeholders.
+    // Transport follows SQLite's output/event precedence and invalidation
+    // rule, then the actor disclosure gate below. The shared channel CHECK
+    // bounds this label to seven bytes, covered by the preflight row slack.
+    let fetched = with_millis(
+        source_rows_extra(
             transaction,
             &mut budget,
             "content_events",
-            &["SELECT seq AS local_seq,id,record_id,type,created_at FROM {{relation}} LIMIT 20001"],
+            &["SELECT e.seq AS local_seq,e.id,e.record_id,e.type,e.actor,e.run_key,e.parent_key,e.created_at,((e.payload->'claimed_by_account') IS NOT NULL OR (e.payload->'claimed_run_key') IS NOT NULL OR (e.payload->'released_from_run_key') IS NOT NULL) AS claim_shaped,
+                COALESCE((SELECT CASE WHEN EXISTS (
+                    SELECT 1 FROM provenance_attestation_validity_events AS v
+                    WHERE v.attestation_id=first_att.attestation_id AND v.status='invalidated'
+                      AND v.ordinal=(SELECT MAX(v2.ordinal) FROM provenance_attestation_validity_events AS v2 WHERE v2.attestation_id=v.attestation_id))
+                    THEN 'unknown' ELSE first_att.channel END
+                  FROM (SELECT a.channel AS channel,a.id AS attestation_id,0 AS src
+                        FROM provenance_action_outputs AS o
+                        JOIN provenance_action_attestations AS a ON a.id=o.action_attestation_id
+                        WHERE o.output_domain='content' AND o.output_event_id=e.id
+                        UNION ALL
+                        SELECT a.channel,a.id,1 AS src
+                        FROM provenance_action_events AS ev
+                        JOIN provenance_action_attestations AS a ON a.id=ev.action_attestation_id
+                        WHERE ev.output_event_id=e.id ORDER BY 3 LIMIT 1) AS first_att),'unknown') AS channel_kind
+                FROM {{relation}} AS e LIMIT 20001"],
+            &[ColumnSpec::nullable("claim_shaped", LogicalType::Integer)],
         )
         .await?,
         &["created_at"],
-    )
-    .into_iter()
-    .filter_map(|mut row| {
-        let record_id = value_text(&row, "record_id")?;
-        let event_type = value_text(&row, "type")?;
-        if !visible.contains(record_id)
-            || matches!(
-                event_type,
-                "reconciliation.recorded.v1"
-                    | "unit.superseded.v1"
-                    | "receipt.dependency_audited.v1"
-            )
-        {
-            return None;
+    );
+    // Attribution follows the single shared rule (`authorization`), resolved
+    // once per distinct actor: a projection holds many events but few actors.
+    // Trusted-local callers bypass redaction wholesale, exactly as history
+    // does; a NULL actor discloses nothing.
+    let credential = caller.credential().to_string();
+    let bypass = caller.is_trusted_local();
+    let mut disclosable = std::collections::HashMap::new();
+    if !bypass {
+        let mut actors: Vec<String> = fetched
+            .iter()
+            .filter_map(|row| value_text(row, "actor").map(str::to_owned))
+            .collect();
+        actors.sort();
+        actors.dedup();
+        for actor in actors {
+            let visible = actor == credential
+                || crate::authorization::actor_disclosable_with(
+                    transaction,
+                    principal(caller),
+                    &actor,
+                )
+                .await?;
+            disclosable.insert(actor, visible);
         }
-        if event_type == "receipt.committed.v1" {
-            row.insert(
-                "type".into(),
-                NormalizedValue::Text("record.updated".into()),
+    }
+    let events = fetched
+        .into_iter()
+        .filter_map(|mut row| {
+            let visible_hit = value_text(&row, "record_id").is_some_and(|id| visible.contains(id));
+            let event_type = value_text(&row, "type").map(str::to_owned)?;
+            let actor = value_text(&row, "actor").map(str::to_owned);
+            let claim_shaped = matches!(
+                row.get("claim_shaped"),
+                Some(NormalizedValue::Integer(1)) | Some(NormalizedValue::Bool(true))
             );
-        }
-        Some(row)
-    })
-    .collect();
+            if !visible_hit
+                || matches!(
+                    event_type.as_str(),
+                    "reconciliation.recorded.v1"
+                        | "unit.superseded.v1"
+                        | "receipt.dependency_audited.v1"
+                )
+            {
+                return None;
+            }
+            let disclosed = bypass
+                || actor
+                    .as_deref()
+                    .is_some_and(|actor| disclosable.get(actor).copied().unwrap_or(false));
+            let holder = actor.as_deref() == Some(credential.as_str());
+            row.remove("claim_shaped");
+            if !disclosed {
+                row.insert("actor".into(), NormalizedValue::Null);
+                row.insert("run_key".into(), NormalizedValue::Null);
+                row.insert("parent_key".into(), NormalizedValue::Null);
+                row.insert("channel_kind".into(), NormalizedValue::Null);
+            } else if claim_shaped && !bypass && !holder {
+                row.insert("run_key".into(), NormalizedValue::Null);
+                row.insert("parent_key".into(), NormalizedValue::Null);
+            }
+            if event_type == "receipt.committed.v1" {
+                row.insert(
+                    "type".into(),
+                    NormalizedValue::Text("record.updated".into()),
+                );
+            }
+            Some(row)
+        })
+        .collect();
     let links = with_millis(
         source_rows(
             transaction,
@@ -654,6 +836,11 @@ async fn build_projection(
         _ => value_text(row, "applies_to_collection_id").is_some_and(|id| visible.contains(id)),
     })
     .collect();
+    let task_items = if include_task_items {
+        source_task_item_rows(transaction, &mut budget, &visible).await?
+    } else {
+        Vec::new()
+    };
 
     let mut projection = crate::query::turso_sql::IsolatedProjection::default();
     projection.as_of_seq = as_of_seq;
@@ -667,6 +854,7 @@ async fn build_projection(
     projection.insert("vocabularies", vocabularies)?;
     projection.insert("vocabulary_values", vocabulary_values)?;
     projection.insert("schema_config", schema_config)?;
+    projection.insert("body_task_items", task_items)?;
     // Served catalog rows are generated from LOGICAL_RELATIONS (E2 I-2),
     // so Turso returns the same catalog as every other engine.
     projection.insert("catalog_relations", catalog_relation_rows())?;
@@ -685,6 +873,104 @@ async fn build_projection(
             projection.insert(relation.name, Vec::new())?;
         }
     }
+    let lifecycle_rows = if let Some(contexts) = lifecycle_contexts {
+        use crate::query::lifecycle::{LifecycleInterpretation, LifecycleInterpreter};
+        if contexts.len() > 20_000 {
+            return Err(projection_too_large(
+                "record_lifecycle_interpretations exceeds the 20000 visible-record limit",
+            ));
+        }
+        // The same snapshot and visible bearer set govern schema rows and
+        // record rows. Loading through a second connection would mix epochs.
+        let schema_rows = crate::query::cascade::schema_config_rows_with(transaction)
+            .await?
+            .into_iter()
+            .filter(|row| {
+                row.applies_to_collection_id
+                    .as_deref()
+                    .is_none_or(|id| visible.contains(id))
+            })
+            .collect();
+        let interpreter =
+            LifecycleInterpreter::load_from_rows_with(transaction, schema_rows).await?;
+        let mut rows = Vec::with_capacity(contexts.len());
+        let remaining = projection.remaining_encoded_bytes();
+        let mut encoded_bytes = 2usize; // JSON array brackets
+        if encoded_bytes > remaining {
+            return Err(projection_too_large(
+                "lifecycle projection has no encoded-byte budget",
+            ));
+        }
+        for (index, (record_id, record_type, kind, home_id, raw)) in
+            contexts.into_iter().enumerate()
+        {
+            if index % 64 == 0
+                && (transaction.control.is_cancelled() || transaction.control.deadline_expired())
+            {
+                return Err(crate::query::turso_sql::control_error(&transaction.control));
+            }
+            let mut row = NormalizedRow::new();
+            row.insert("record_id".into(), NormalizedValue::Text(record_id));
+            for column in [
+                "status",
+                "raw",
+                "axis_key",
+                "axis_label",
+                "vocabulary_id",
+                "vocabulary_name",
+                "value_id",
+                "canonical",
+                "terminality",
+                "reason",
+            ] {
+                row.insert(column.into(), NormalizedValue::Null);
+            }
+            let mut put = |column: &str, value: String| {
+                row.insert(column.into(), NormalizedValue::Text(value));
+            };
+            match interpreter.interpret(
+                &record_type,
+                kind.as_deref(),
+                home_id.as_deref(),
+                raw.as_deref(),
+            ) {
+                LifecycleInterpretation::Governed(value) => {
+                    put("status", "governed".into());
+                    put("raw", value.value.raw);
+                    put("axis_key", value.axis.key);
+                    put("axis_label", value.axis.label);
+                    put("vocabulary_id", value.vocabulary.id);
+                    put("vocabulary_name", value.vocabulary.name);
+                    put("value_id", value.value.id);
+                    put("canonical", value.value.canonical);
+                    put("terminality", value.terminality);
+                }
+                LifecycleInterpretation::Absent(value) => {
+                    put("status", "absent".into());
+                    if let Some(axis) = value.axis {
+                        put("axis_key", axis.key);
+                        put("axis_label", axis.label);
+                    }
+                    if let Some(vocabulary) = value.vocabulary {
+                        put("vocabulary_id", vocabulary.id);
+                        put("vocabulary_name", vocabulary.name);
+                    }
+                }
+                LifecycleInterpretation::Unclassified(value) => {
+                    put("status", "unclassified".into());
+                    put("raw", value.raw);
+                    put("reason", value.reason.into());
+                }
+            }
+            encoded_bytes =
+                reserve_lifecycle_encoded_bytes(encoded_bytes, remaining, &row, index != 0)?;
+            rows.push(row);
+        }
+        rows
+    } else {
+        Vec::new()
+    };
+    projection.insert("record_lifecycle_interpretations", lifecycle_rows)?;
     Ok(projection)
 }
 
@@ -719,7 +1005,14 @@ async fn query_sql_inner(
     let request: crate::query::sql_contract::QuerySqlRequest =
         parse_arguments("query_sql", arguments)?;
     request.validate()?;
-    crate::query::turso_validate::validate(&request.sql)?;
+    // E2 ad-hoc default ORDER BY: an unordered top-level LIMIT is spliced
+    // inside execute() (which owns a connection for label discovery), so the
+    // determinism pre-check below would refuse it first — skip exactly that
+    // case. execute() runs the full validation on the rewritten text, and
+    // every other statement validates here unchanged.
+    if !crate::query::turso_ast_rules::top_level_unordered_limit(&request.sql) {
+        crate::query::turso_validate::validate(&request.sql)?;
+    }
     let dependencies = crate::query::sql::validated_relation_dependencies(&request.sql)?;
     if let Some(relation) = crate::query::sql_contract::LOGICAL_RELATIONS
         .iter()
@@ -749,8 +1042,12 @@ async fn query_sql_inner(
     ));
     let mut cancel_on_drop = CancelOnDrop(Some(control.clone()));
     let caller = caller.clone();
+    let include_task_items = dependencies.contains("body_task_items");
+    let include_lifecycle = dependencies.contains("record_lifecycle_interpretations");
     let projection = run_db_snapshot(db, &control, move |transaction| {
-        Box::pin(async move { build_projection(transaction, &caller).await })
+        Box::pin(async move {
+            build_projection(transaction, &caller, include_task_items, include_lifecycle).await
+        })
     })
     .await?;
     let worker_control = control.clone();
@@ -762,9 +1059,12 @@ async fn query_sql_inner(
                 request,
                 worker_control,
                 probe,
+                false,
             );
         }
-        crate::query::turso_sql::execute(projection, request, worker_control)
+        // E2 ad-hoc default ORDER BY is enabled: this is the ad-hoc
+        // `query_sql` entry, the only Turso caller that may assume an order.
+        crate::query::turso_sql::execute(projection, request, worker_control, true)
     })
     .await
     .map_err(|error| Error::engine(format!("query_sql core worker failed: {error}")))?;

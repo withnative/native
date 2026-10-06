@@ -54,13 +54,14 @@ pub(crate) use transaction_lifecycle::{
 mod facets;
 pub(crate) use facets::{
     active_vocabulary_value, assert_open_facet_key, assert_required_not_worsened,
-    assess_facet_write, classify_facet_key, facet_set_spec, govern_facet_writes,
-    governed_alias_target, governed_alias_warnings_for_sets, governed_relationship_admits_subject,
-    governed_relationship_guidance, index_warning_for_batch, observation_write_response,
-    parse_facet_write_value, push_receipt_warning, push_receipt_warnings, required_violations,
+    assess_facet_write, classify_facet_key, declared_disambiguation, declared_type_is_json_object,
+    facet_set_spec, govern_facet_writes, governed_alias_target, governed_alias_warnings_for_sets,
+    governed_relationship_admits_subject, governed_relationship_guidance, index_warning_for_batch,
+    observation_write_response, parse_facet_write_value, push_receipt_warning,
+    push_receipt_warnings, required_violations, stored_non_numeric_facet_value,
     FacetKeyClassification, FacetPredicateAssessment, FacetWrite, RequiredViolation,
-    GOVERNED_ALIAS_ISSUE, GOVERNED_RELATIONSHIP_FACET_DIFFERENCE, GOVERNED_RELATIONSHIP_ISSUE,
-    GOVERNED_RELATIONSHIP_SUGGESTED_OPERATION,
+    DECLARED_FACET_TYPES, GOVERNED_ALIAS_ISSUE, GOVERNED_RELATIONSHIP_FACET_DIFFERENCE,
+    GOVERNED_RELATIONSHIP_ISSUE, GOVERNED_RELATIONSHIP_SUGGESTED_OPERATION,
 };
 #[cfg(any(feature = "postgres", feature = "turso-local"))]
 pub(crate) use facets::{
@@ -75,7 +76,8 @@ mod identity_bindings;
 #[cfg(any(feature = "postgres", feature = "turso-local"))]
 pub(crate) use attachments::require_live_attachment_bearer;
 pub(crate) use attachments::{
-    create_attachment, detach_attachment, inspect_attachment, list_attachments, read_attachment,
+    create_attachment, detach_attachment, inspect_attachment, inspect_member_attachment,
+    list_attachments, list_member_attachments, read_attachment, read_member_attachment,
     AttachmentCreate, AttachmentPhysicalPort,
 };
 #[cfg(feature = "mcp-executor-prototype")]
@@ -469,7 +471,7 @@ pub enum ProjectorIntent {
     RecordUpdated(Map<String, Value>),
     RecordTypeCorrected(crate::events::RecordTypeCorrectedPayload),
     RecordDeleted,
-    FacetSet(FacetSetPayload),
+    FacetSet(FacetSetPayload, Option<crate::typed_time::TimeFacetType>),
     FacetUnset(FacetUnsetPayload),
     LinkAdded(LinkAddedPayload),
     LinkRemoved(LinkRemovedPayload),
@@ -497,6 +499,14 @@ impl ProjectorIntent {
             }
             "record.updated" => {
                 let fields = object_payload(event, payload)?;
+                // m7 reserved version metadata (contributors/session/
+                // merged_offline) is validated here, once, before any
+                // backend-specific SQL appends or projects the event. The
+                // ordinary payload carries none of those keys and passes
+                // untouched; the known-field mapping below still ignores
+                // unknown keys, so present metadata is preserved in the
+                // event payload and never projected.
+                crate::coedit::version_metadata::validate_version_metadata(&fields)?;
                 Ok(Self::RecordUpdated(fields))
             }
             "record.type_corrected.v1" => {
@@ -506,7 +516,26 @@ impl ProjectorIntent {
                 object_payload(event, payload)?;
                 Ok(Self::RecordDeleted)
             }
-            "facet.set" => Ok(Self::FacetSet(serde_json::from_value(payload)?)),
+            "facet.set" => {
+                let time_type = match payload.get(crate::events::FACET_TIME_KIND_MEMBER) {
+                    None => None,
+                    Some(Value::String(name)) => Some(
+                        crate::typed_time::TimeFacetType::parse(name).ok_or_else(|| {
+                            Error::engine(format!(
+                                "event {} (facet.set) names unknown time_kind '{name}'",
+                                event.id
+                            ))
+                        })?,
+                    ),
+                    Some(_) => {
+                        return Err(Error::engine(format!(
+                            "event {} (facet.set) time_kind must be a string",
+                            event.id
+                        )))
+                    }
+                };
+                Ok(Self::FacetSet(serde_json::from_value(payload)?, time_type))
+            }
             "facet.unset" => Ok(Self::FacetUnset(serde_json::from_value(payload)?)),
             "link.added" => {
                 let link: LinkAddedPayload = serde_json::from_value(payload)?;
@@ -528,6 +557,28 @@ impl ProjectorIntent {
                 )?;
                 Ok(Self::LinkRemoved(link))
             }
+            #[cfg(any(test, feature = "v2-kernel-probe"))]
+            event_type
+                if matches!(
+                    event_type,
+                    crate::events::KERNEL_GENESIS_EVENT
+                        | "kernel.record_created.v1"
+                        | "kernel.link_added.v1"
+                        | "kernel.principal_created.v1"
+                        | "kernel.home_created.v1"
+                        | "kernel.home_policy_replaced.v1"
+                        | "kernel.root_admin_bootstrapped.v1"
+                        | "kernel.record_rehomed.v1"
+                        | "kernel.definition_adopted.v1"
+                        | "kernel.package_adopted.v1"
+                        | "kernel.record_revised.v1"
+                ) =>
+            {
+                Ok(Self::Extended {
+                    event_type: event_type.to_string(),
+                    payload,
+                })
+            }
             event_type if crate::events::EVENT_TYPES.contains(&event_type) => Ok(Self::Extended {
                 event_type: event_type.to_string(),
                 payload,
@@ -542,7 +593,7 @@ impl ProjectorIntent {
             Self::RecordUpdated(_) => "record.updated",
             Self::RecordTypeCorrected(_) => "record.type_corrected.v1",
             Self::RecordDeleted => "record.deleted",
-            Self::FacetSet(_) => "facet.set",
+            Self::FacetSet(..) => "facet.set",
             Self::FacetUnset(_) => "facet.unset",
             Self::LinkAdded(_) => "link.added",
             Self::LinkRemoved(_) => "link.removed",
@@ -714,6 +765,10 @@ pub(crate) enum ProjectionPlan {
     FacetSet {
         payload: FacetSetPayload,
         spine: Option<SpineFacet>,
+        /// The `facet_times` row the current value folds to. `None` on a
+        /// current-state write deletes any row the key held before; it is
+        /// ignored for observation-only and spine writes.
+        time: Option<crate::typed_time::FacetTimeRow>,
     },
     FacetUnset {
         payload: FacetUnsetPayload,
@@ -765,7 +820,9 @@ pub(crate) async fn plan_projection<S: ContentSemanticStatePort>(
             assert_no_live_children(state, &event.record_id, &event.event_type).await?;
             Ok(ProjectionPlan::RecordDeleted)
         }
-        ProjectorIntent::FacetSet(payload) => plan_facet_set(state, event, payload.clone()).await,
+        ProjectorIntent::FacetSet(payload, time_type) => {
+            plan_facet_set(state, event, payload.clone(), *time_type).await
+        }
         ProjectorIntent::FacetUnset(payload) => {
             plan_facet_unset(state, event, payload.clone()).await
         }
@@ -1148,6 +1205,7 @@ async fn plan_facet_set<S: ContentSemanticStatePort>(
     state: &mut S,
     event: &EventRow,
     payload: FacetSetPayload,
+    time_type: Option<crate::typed_time::TimeFacetType>,
 ) -> Result<ProjectionPlan> {
     let current = live_record(state, &event.record_id, &event.event_type).await?;
     if payload.key == crate::message_expectation::EXPECTATION_FACET_KEY
@@ -1193,7 +1251,54 @@ async fn plan_facet_set<S: ContentSemanticStatePort>(
             payload.key
         )));
     }
-    Ok(ProjectionPlan::FacetSet { payload, spine })
+    let time = match time_type {
+        None => None,
+        Some(_) if spine.is_some() => {
+            return Err(Error::engine(format!(
+                "cannot project facet.set: spine facet '{}' cannot carry a time_kind",
+                payload.key
+            )))
+        }
+        Some(time_type) => Some(facet_time_row(
+            &event.id,
+            &payload.key,
+            payload.value.as_deref(),
+            time_type,
+        )?),
+    };
+    Ok(ProjectionPlan::FacetSet {
+        payload,
+        spine,
+        time,
+    })
+}
+
+/// Fold a typed time value from one `facet.set` event into its
+/// `facet_times` row. The value was normalised by the writer, so a failure
+/// here is a malformed event, and the event is refused rather than projected
+/// without its row.
+pub(crate) fn facet_time_row(
+    event_id: &str,
+    key: &str,
+    value: Option<&str>,
+    time_type: crate::typed_time::TimeFacetType,
+) -> Result<crate::typed_time::FacetTimeRow> {
+    let malformed = |detail: String| {
+        Error::engine(format!(
+            "cannot project facet.set {event_id}: facet '{key}' with time_kind '{time_type}' {detail}"
+        ))
+    };
+    let raw = value.ok_or_else(|| malformed("has no value".into()))?;
+    let stored = match time_type {
+        crate::typed_time::TimeFacetType::Date | crate::typed_time::TimeFacetType::Instant => {
+            Value::String(raw.into())
+        }
+        crate::typed_time::TimeFacetType::Zoned | crate::typed_time::TimeFacetType::When => {
+            serde_json::from_str(raw).map_err(|_| malformed("is not a JSON object".into()))?
+        }
+    };
+    crate::typed_time::project_facet_value(time_type, &stored)
+        .map_err(|error| malformed(format!("does not project: {error}")))
 }
 
 async fn plan_facet_unset<S: ContentSemanticStatePort>(
@@ -1553,6 +1658,57 @@ mod tests {
                 crate::events::CausalFrontierV1::empty(),
             ),
             act: None,
+        }
+    }
+
+    #[test]
+    fn record_updated_version_metadata_is_validated_at_admission() {
+        // Ordinary payloads carry no reserved keys and pass untouched, even
+        // with ordinary keys the projector does not map.
+        assert!(ProjectorIntent::from_event(&event(
+            "record.updated",
+            json!({"summary": "x", "unknown_ordinary_key": 1})
+        ))
+        .is_ok());
+        // Valid metadata: contributors may be empty; merged_offline true.
+        assert!(ProjectorIntent::from_event(&event(
+            "record.updated",
+            json!({
+                "session": "sess-1",
+                "contributors": [{"principal": "acct:a", "executor_kind": "agent"}],
+            })
+        ))
+        .is_ok());
+        assert!(ProjectorIntent::from_event(&event(
+            "record.updated",
+            json!({"session": "sess-1", "contributors": [], "merged_offline": true})
+        ))
+        .is_ok());
+        // A structurally optional run_key is accepted for a future source.
+        assert!(ProjectorIntent::from_event(&event(
+            "record.updated",
+            json!({
+                "session": "sess-1",
+                "contributors": [
+                    {"principal": "a", "executor_kind": "agent", "run_key": "h-r-1"}
+                ],
+            })
+        ))
+        .is_ok());
+        // Reserved-key misuse is refused before any backend SQL runs.
+        for bad in [
+            json!({"session": "sess-1"}),
+            json!({"contributors": []}),
+            json!({"merged_offline": true}),
+            json!({"session": "", "contributors": []}),
+            json!({"session": "s", "contributors": [], "merged_offline": false}),
+            json!({"session": "s", "contributors": [{"principal": "a"}]}),
+            json!({"session": "s", "contributors": [{"principal": "a", "executor_kind": "k", "extra": 1}]}),
+        ] {
+            assert!(
+                ProjectorIntent::from_event(&event("record.updated", bad.clone())).is_err(),
+                "expected refusal for {bad}"
+            );
         }
     }
 

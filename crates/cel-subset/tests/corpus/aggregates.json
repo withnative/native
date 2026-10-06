@@ -1,0 +1,22 @@
+[
+{"name":"list_index","expr":"[7, 8, 9][0]","bindings":{},"expect":{"value":{"int":"7"}}},
+{"name":"list_index_double","expr":"[7, 8, 9][dyn(0.0)]","bindings":{},"expect":{"value":{"int":"7"}},"spec":"Time Complexity: list index; numeric index converted"},
+{"name":"list_index_oob_err","expr":"[1, 2, 3][3]","bindings":{},"expect":{"error":"invalid_argument","note":"index out of bounds"},"spec":"Runtime Errors"},
+{"name":"list_index_str_err","expr":"[1, 2, 3]['0']","bindings":{},"expect":{"error":"invalid_argument","note":"no_matching_overload"}},
+{"name":"list_index_nested","expr":"[[1, 2], [3, 4]][1][0]","bindings":{},"expect":{"value":{"int":"3"}}},
+{"name":"list_concat","expr":"[0, 1, 2] + [3, 4]","bindings":{},"expect":{"value":{"list":[{"int":"0"},{"int":"1"},{"int":"2"},{"int":"3"},{"int":"4"}]}},"spec":"Addition: list concatenation"},
+{"name":"in_list","expr":"3 in [5, 4, 3]","bindings":{},"expect":{"value":{"bool":true}}},
+{"name":"in_list_absent","expr":"'x' in ['a', 'b']","bindings":{},"expect":{"value":{"bool":false}}},
+{"name":"map_index_int","expr":"{0:1, 2:2, 5:true}[5]","bindings":{},"expect":{"value":{"bool":true}}},
+{"name":"map_index_string","expr":"{'name':100u}['name']","bindings":{},"expect":{"value":{"uint":"100"}}},
+{"name":"map_field_select","expr":"row.amount","bindings":{"row":{"map":[[{"string":"amount"},{"int":"150"}]]}},"expect":{"value":{"int":"150"}},"spec":"Field Selection: on a map e.f equals e['f']"},
+{"name":"map_missing_key_err","expr":"{0:1, 2:2, 5:3}[1]","bindings":{},"expect":{"error":"no_such_key","note":"no such key"},"spec":"Field Selection / Runtime Errors: no_such_field"},
+{"name":"in_map","expr":"'George' in {'John':'smart', 'George':'quiet'}","bindings":{},"expect":{"value":{"bool":true}}},
+{"name":"map_nested","expr":"{'map': {'k': 'v'}}['map']","bindings":{},"expect":{"value":{"map":[[{"string":"k"},{"string":"v"}]]}}},
+{"name":"structured_return","expr":"{'total': a + b, 'ok': true}","bindings":{"a":{"int":"100"},"b":{"int":"50"}},"expect":{"value":{"map":[[{"string":"ok"},{"bool":true}],[{"string":"total"},{"int":"150"}]]}},"spec":"Aggregate Values: map literals are values"},
+{"name":"list_of_maps_index","expr":"rows[0].amount","bindings":{"rows":{"list":[{"map":[[{"string":"amount"},{"int":"100"}]]},{"map":[[{"string":"amount"},{"int":"200"}]]}]}},"expect":{"value":{"int":"100"}}},
+{"name":"map_cross_key_uint","expr":"{1u: 1.0, 2: 2.0}[2u]","bindings":{},"expect":{"value":{"double":2.0}},"spec":"Lists and Maps: int/uint keys cross-lookup"},
+{"name":"has_map_key","expr":"has(m.k)","bindings":{"m":{"map":[[{"string":"k"},{"int":"1"}]]}},"expect":{"value":{"bool":true}},"spec":"Field Selection: has(e.f) on a map tests key presence"},
+{"name":"has_map_missing","expr":"has(m.nope)","bindings":{"m":{"map":[[{"string":"k"},{"int":"1"}]]}},"expect":{"value":{"bool":false}}},
+{"name":"has_map_empty","expr":"has({}.a)","bindings":{},"expect":{"value":{"bool":false}}}
+]

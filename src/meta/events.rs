@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 
 /// The canonical meta event types the meta projector folds. CLOSED — anything
 /// else is `unknown meta event type` at the fold, exactly as on the content tier.
-pub const META_EVENT_TYPES: [&str; 11] = [
+pub const META_EVENT_TYPES: [&str; 12] = [
     "vocabulary.created",
     "vocabulary.deleted",
     "vocab_value.proposed",
@@ -31,6 +31,22 @@ pub const META_EVENT_TYPES: [&str; 11] = [
     "vocab_value.metadata_set",
     "vocab_value.deleted",
     "schema_config.set",
+    "workspace_rule_installation.set.v1",
+];
+
+/// Gated v2 kernel event types (test-only prototype). Deliberately
+/// NOT merged into [`META_EVENT_TYPES`]: test builds enable the gate, so any
+/// test pinning that list would change. The gated fold arms in
+/// `crate::projector::meta` match exactly these three types (see the
+/// `kernel_event_list_matches_fold_arms` consistency test there).
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+pub const META_KERNEL_EVENT_TYPES: [&str; 6] = [
+    "definition_artifact.installed",
+    "definition_adoption.set.v1",
+    "package_artifact.installed.v1",
+    "consumer_required.v1",
+    "consumer_retired.v1",
+    "rule_installation.set.v1",
 ];
 
 /// A row as stored in / read from the `meta_events` log. `payload` is JSON text.
@@ -127,6 +143,59 @@ pub struct VocabValueAliasedPayload {
     pub alias_of: String,
 }
 
+/// Payload of `definition_artifact.installed` — one immutable definition
+/// revision (gated E1 test-only prototype; the adoption payload and
+/// `META_KERNEL_EVENT_TYPES` follow in Increment 3).
+///
+/// The payload carries the full row state the fold needs: `artifact_bytes`
+/// are the exact validated UTF-8 definition bytes whose SHA-256 is `digest`.
+/// The fold recomputes the digest from `artifact_bytes`, re-parses the
+/// envelope, and fails on any mismatch, which is what makes a poisoned log
+/// row break the rebuild instead of projecting a lying revision.
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DefinitionArtifactInstalledPayload {
+    pub vocabulary_id: String,
+    pub value: String,
+    pub family: String,
+    pub version: u32,
+    pub digest: String,
+    pub artifact_bytes: String,
+}
+
+/// Payload of `package_artifact.installed.v1` — one immutable package
+/// revision (gated slice-3 S2a test-only prototype).
+///
+/// The payload carries the full row state the fold needs: `manifest_bytes`
+/// is the exact canonical (JCS) JSON text of the validated manifest whose
+/// `digest_json` is `digest`. The fold re-parses, re-validates, recomputes
+/// the digest, and verifies every embedded definition revision against the
+/// installed projection, so a forged log row breaks the rebuild instead of
+/// projecting a lying package.
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PackageArtifactInstalledV1Payload {
+    pub namespace: String,
+    pub name: String,
+    pub version: u32,
+    pub digest: String,
+    pub manifest_bytes: String,
+}
+
+/// Selected installed revision, or an explicit disable tombstone. This is
+/// separate from artifact installation and from generic vocabulary state
+/// (gated E1 test-only prototype; `RevisionIdentity` lives in
+/// `crate::meta::definition_artifact`).
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DefinitionAdoptionSetV1Payload {
+    pub family: String,
+    pub selected: Option<crate::meta::definition_artifact::RevisionIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_key: Option<String>,
+}
+
 /// Payload of `schema_config.set` — the full row, both layers.
 ///
 /// One type covers the user-layer upsert and the pack-layer seed because events
@@ -150,3 +219,61 @@ pub struct SchemaConfigSetPayload {
 // `vocabulary.deleted`, `vocab_value.promoted`, `vocab_value.deprecated` and
 // `vocab_value.deleted` need no payload beyond `subject_id` — the verb plus the
 // subject is the whole event. They are appended with an empty JSON object.
+
+/// Payload of `consumer_required.v1` — one generic exact-pin requirement
+/// (gated task e2bfaf5, Increment 1). Whole-definition pin only: no kind
+/// list, no field sets. The fold upserts the projection row with active = 1.
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConsumerRequiredV1Payload {
+    pub scope_home: String,
+    pub consumer_kind: String,
+    pub consumer_namespace: String,
+    pub consumer_name: String,
+    pub family: String,
+    pub version: u32,
+    pub digest: String,
+}
+
+/// Payload of `consumer_retired.v1` — retire one requirement key (gated task
+/// e2bfaf5, Increment 1). Key plus the pin being retired: the fold requires
+/// the pin to equal the live row's pin, and reads require the row's retained
+/// pin to equal the latest retirement's pin, so a tampered inactive pin can
+/// never be blessed. The row stays with active = 0.
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConsumerRetiredV1Payload {
+    pub scope_home: String,
+    pub consumer_kind: String,
+    pub consumer_namespace: String,
+    pub consumer_name: String,
+    pub family: String,
+    pub version: u32,
+    pub digest: String,
+}
+
+/// Payload of `rule_installation.set.v1` — one full installation snapshot
+/// (task 81c1d95, S1). Key is `(scope_home, namespace, name)` with the latter
+/// two taken from the embedded revision. Carries the immutable revision, the
+/// opaque engine settings, all digests, exact catalog/profile pins, the host
+/// read-set map, the host-issued receipt, the active flag, and the previous
+/// event seq (`None` = create-only). The fold recomputes every digest from
+/// stored bytes; it never prepares SQL or consults the live catalog.
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuleInstallationSetV1Payload {
+    pub scope_home: String,
+    pub revision: crate::query::rule_install::RuleRevision,
+    pub revision_digest: String,
+    pub settings: serde_json::Value,
+    pub settings_digest: String,
+    pub catalog_revision: u32,
+    pub profile_id: String,
+    pub profile_revision: u32,
+    pub readsets:
+        std::collections::BTreeMap<String, native_query_contract::rule_contract::RuleInputReadset>,
+    pub readset_digest: String,
+    pub receipt: crate::query::rule_install::RuleAdmissionReceipt,
+    pub active: bool,
+    pub previous_seq: Option<i64>,
+}

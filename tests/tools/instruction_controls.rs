@@ -43,6 +43,10 @@ const APPLY_SEED: &str = "1c700000-0000-4000-8000-00000000000f";
 const RESET_SEED: &str = "1c700000-0000-4000-8000-000000000010";
 /// `empty-criteria`
 const EMPTY_CRITERIA: &str = "1c700000-0000-4000-8000-000000000011";
+/// `hidden-db-source`
+const HIDDEN_DB_SOURCE: &str = "1c700000-0000-4000-8000-000000000012";
+/// `visible-db-source`
+const VISIBLE_DB_SOURCE: &str = "1c700000-0000-4000-8000-000000000013";
 
 fn registry() -> ToolRegistry {
     let mut registry = ToolRegistry::new();
@@ -1123,4 +1127,350 @@ async fn empty_completion_criteria_are_rejected_on_admission_and_completion() {
     let state: String = sqlx::query_scalar("SELECT state FROM member_obligations WHERE account_id='acct:member' AND programme_id='criteria-programme' AND generation=1")
         .fetch_one(db.pool()).await.unwrap();
     assert_eq!(state, "pending");
+}
+
+/// Brief 0b7d366 item 1/3: a database-scope binding whose source the caller
+/// cannot View is skipped silently on resolve and omitted from `list` (no id
+/// oracle), and the member's resolve is byte-identical to a world where the
+/// binding does not exist. The owner, who can View the source, is unaffected.
+#[tokio::test]
+async fn hidden_database_binding_is_skipped_for_members_and_visible_to_owner() {
+    let db = create_database(":memory:").await.unwrap();
+    let registry = registry();
+    let owner = "acct:owner";
+    let member = "acct:member";
+
+    create_document(&registry, &db, HIDDEN_DB_SOURCE, "hidden db guidance").await;
+    create_document(&registry, &db, VISIBLE_DB_SOURCE, "visible db guidance").await;
+
+    // Both bindings are created while the prospective-member probe can still
+    // read the sources: `create_binding` refuses a workspace-wide source that
+    // is not readable by every affected member, and every mutation re-measures
+    // the stacks. Only afterwards is the hidden source narrowed to the owner.
+    for (binding, source, position, key) in [
+        ("hidden-db-binding", HIDDEN_DB_SOURCE, 100, "test:hidden-db"),
+        (
+            "visible-db-binding",
+            VISIBLE_DB_SOURCE,
+            101,
+            "test:visible-db",
+        ),
+    ] {
+        call_as(
+            &registry,
+            &db,
+            Caller::local(),
+            "manage_instructions",
+            json!({
+                "action":"create_binding", "scope":"workspace", "binding_id":binding,
+                "source_record_id":source, "position":position,
+                "idempotency_key":key, "reason":"create db binding fixture"
+            }),
+        )
+        .await
+        .unwrap();
+    }
+    replace_explicit_policy(
+        &db,
+        "test:hidden-db-restrict",
+        HIDDEN_DB_SOURCE,
+        vec![AllowEntry::account(owner, Capability::View)],
+    )
+    .await
+    .unwrap();
+
+    let member_caller = Caller::authenticated(member)
+        .with_hosting_context("host:db", "db:test")
+        .with_hosting_owner(false)
+        .with_hosting_member(true);
+    let owner_caller = Caller::authenticated(owner)
+        .with_hosting_context("host:db", "db:test")
+        .with_hosting_owner(true)
+        .with_hosting_member(true);
+
+    let bootstrap = call_as(
+        &registry,
+        &db,
+        member_caller.clone(),
+        "bootstrap",
+        json!({}),
+    )
+    .await
+    .unwrap();
+    let run_key = bootstrap["run"]["run_key"].as_str().unwrap().to_string();
+    let resolved = call_as(
+        &registry,
+        &db,
+        member_caller.clone(),
+        "manage_instructions",
+        json!({"action":"resolve", "run_key": run_key}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(resolved["instructions"]["status"], "ready");
+    let resolved_text = serde_json::to_string(&resolved).unwrap();
+    assert!(
+        !resolved_text.contains(HIDDEN_DB_SOURCE),
+        "member resolve leaked the hidden source id: {resolved_text}"
+    );
+    assert!(
+        resolved_text.contains(VISIBLE_DB_SOURCE),
+        "member resolve dropped the visible source in the same stack: {resolved_text}"
+    );
+
+    let listed = call_as(
+        &registry,
+        &db,
+        member_caller.clone(),
+        "manage_instructions",
+        json!({"action":"list"}),
+    )
+    .await
+    .unwrap();
+    let listed_text = serde_json::to_string(&listed).unwrap();
+    assert!(
+        !listed_text.contains("hidden-db-binding") && !listed_text.contains(HIDDEN_DB_SOURCE),
+        "member list leaked the hidden binding: {listed_text}"
+    );
+    assert!(
+        listed_text.contains("visible-db-binding"),
+        "member list dropped the visible binding: {listed_text}"
+    );
+
+    let owner_listed = call_as(
+        &registry,
+        &db,
+        owner_caller,
+        "manage_instructions",
+        json!({"action":"list"}),
+    )
+    .await
+    .unwrap();
+    let owner_text = serde_json::to_string(&owner_listed).unwrap();
+    assert!(
+        owner_text.contains("hidden-db-binding") && owner_text.contains(HIDDEN_DB_SOURCE),
+        "owner list must still include the hidden binding: {owner_text}"
+    );
+
+    // Byte-identical to the no-binding world. A raw delete bypasses the
+    // mutation stack validation (which still rejects member-unreadable
+    // sources, `src/instructions.rs:722-726`); this isolates the read path.
+    sqlx::query("DELETE FROM instruction_bindings WHERE id='hidden-db-binding'")
+        .execute(&crate::common::fixture_write_pool(&db).await)
+        .await
+        .unwrap();
+    let without = call_as(
+        &registry,
+        &db,
+        member_caller,
+        "manage_instructions",
+        json!({"action":"resolve", "run_key": run_key}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        serde_json::to_value(&resolved).unwrap(),
+        serde_json::to_value(&without).unwrap(),
+        "hidden database binding must be byte-identical to the no-binding world"
+    );
+}
+
+/// Brief 0b7d366 round 2 item 1: a member mutating their own member-scope
+/// binding must not receive an error, nor a `stacks` entry, naming a
+/// database-scope source they cannot View. Reproduces the residual id leak
+/// through `validate_all_known_stacks_in` → `measure_stack_in`.
+#[tokio::test]
+async fn member_mutation_does_not_leak_hidden_workspace_source() {
+    let db = create_database(":memory:").await.unwrap();
+    let registry = registry();
+    let owner = "acct:owner";
+    let member = "acct:member";
+
+    create_document(&registry, &db, HIDDEN_DB_SOURCE, "hidden db guidance").await;
+    create_document(&registry, &db, VISIBLE_DB_SOURCE, "visible db guidance").await;
+    for (binding, source, position, key) in [
+        (
+            "hidden-db-binding",
+            HIDDEN_DB_SOURCE,
+            100,
+            "test:r2:hidden-db",
+        ),
+        (
+            "visible-db-binding",
+            VISIBLE_DB_SOURCE,
+            101,
+            "test:r2:visible-db",
+        ),
+    ] {
+        call_as(
+            &registry,
+            &db,
+            Caller::local(),
+            "manage_instructions",
+            json!({
+                "action":"create_binding", "scope":"workspace", "binding_id":binding,
+                "source_record_id":source, "position":position,
+                "idempotency_key":key, "reason":"create db binding fixture"
+            }),
+        )
+        .await
+        .unwrap();
+    }
+    replace_explicit_policy(
+        &db,
+        "test:r2:hidden-db-restrict",
+        HIDDEN_DB_SOURCE,
+        vec![AllowEntry::account(owner, Capability::View)],
+    )
+    .await
+    .unwrap();
+    create_document(&registry, &db, MEMBER_SOURCE, "member guidance").await;
+
+    let member_caller = Caller::authenticated(member)
+        .with_hosting_context("host:db", "db:test")
+        .with_hosting_owner(false)
+        .with_hosting_member(true);
+    let response = call_as(
+        &registry,
+        &db,
+        member_caller,
+        "manage_instructions",
+        json!({
+            "action":"create_binding", "scope":"member", "binding_id":"member-binding",
+            "source_record_id":MEMBER_SOURCE, "position":100,
+            "idempotency_key":"test:r2:member-binding", "reason":"member creates own binding"
+        }),
+    )
+    .await
+    .expect("member mutation must not fail on a workspace source it cannot View");
+    let text = serde_json::to_string(&response).unwrap();
+    assert!(
+        !text.contains(HIDDEN_DB_SOURCE) && !text.contains("hidden-db-binding"),
+        "member mutation leaked the hidden workspace source: {text}"
+    );
+    assert!(
+        text.contains(VISIBLE_DB_SOURCE),
+        "member's own stack should still include the visible workspace source: {text}"
+    );
+}
+
+/// Brief 0b7d366 round 2 item 2: a deleted workspace source is skipped in
+/// `list` and in mutation validation exactly like a hidden one for a member
+/// (byte-identical listing), while the owner still gets the fail-closed error.
+#[tokio::test]
+async fn deleted_workspace_binding_is_skipped_like_hidden_for_members() {
+    let db = create_database(":memory:").await.unwrap();
+    let registry = registry();
+    let owner = "acct:owner";
+
+    create_document(&registry, &db, HIDDEN_DB_SOURCE, "hidden db guidance").await;
+    create_document(&registry, &db, VISIBLE_DB_SOURCE, "visible db guidance").await;
+    for (binding, source, position, key) in [
+        (
+            "hidden-db-binding",
+            HIDDEN_DB_SOURCE,
+            100,
+            "test:r2d:hidden-db",
+        ),
+        (
+            "visible-db-binding",
+            VISIBLE_DB_SOURCE,
+            101,
+            "test:r2d:visible-db",
+        ),
+    ] {
+        call_as(
+            &registry,
+            &db,
+            Caller::local(),
+            "manage_instructions",
+            json!({
+                "action":"create_binding", "scope":"workspace", "binding_id":binding,
+                "source_record_id":source, "position":position,
+                "idempotency_key":key, "reason":"create db binding fixture"
+            }),
+        )
+        .await
+        .unwrap();
+    }
+    replace_explicit_policy(
+        &db,
+        "test:r2d:hidden-db-restrict",
+        HIDDEN_DB_SOURCE,
+        vec![AllowEntry::account(owner, Capability::View)],
+    )
+    .await
+    .unwrap();
+    create_document(&registry, &db, MEMBER_SOURCE, "member guidance").await;
+
+    let member_caller = Caller::authenticated("acct:member")
+        .with_hosting_context("host:db", "db:test")
+        .with_hosting_owner(false)
+        .with_hosting_member(true);
+    let hidden_list = call_as(
+        &registry,
+        &db,
+        member_caller.clone(),
+        "manage_instructions",
+        json!({"action":"list"}),
+    )
+    .await
+    .unwrap();
+
+    sqlx::query("UPDATE records SET deleted_at='2026-02-01T00:00:00Z' WHERE id=?")
+        .bind(HIDDEN_DB_SOURCE)
+        .execute(&crate::common::fixture_write_pool(&db).await)
+        .await
+        .unwrap();
+    let deleted_list = call_as(
+        &registry,
+        &db,
+        member_caller.clone(),
+        "manage_instructions",
+        json!({"action":"list"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        hidden_list, deleted_list,
+        "member listing must be byte-identical for hidden vs deleted workspace sources"
+    );
+    let listed_text = serde_json::to_string(&deleted_list).unwrap();
+    assert!(
+        !listed_text.contains("hidden-db-binding") && !listed_text.contains(HIDDEN_DB_SOURCE),
+        "member listing leaked the deleted workspace binding: {listed_text}"
+    );
+    assert!(listed_text.contains("visible-db-binding"));
+
+    // Mutation validation must not fail on the deleted source for a member.
+    let response = call_as(
+        &registry,
+        &db,
+        member_caller,
+        "manage_instructions",
+        json!({
+            "action":"create_binding", "scope":"member", "binding_id":"member-binding",
+            "source_record_id":MEMBER_SOURCE, "position":100,
+            "idempotency_key":"test:r2d:member-binding", "reason":"member creates own binding"
+        }),
+    )
+    .await
+    .expect("member mutation must not fail on a deleted workspace source");
+    assert!(!serde_json::to_string(&response)
+        .unwrap()
+        .contains(HIDDEN_DB_SOURCE));
+
+    // The owner still sees the fail-closed error for the deleted source.
+    let owner_error = call_as(
+        &registry,
+        &db,
+        Caller::local(),
+        "manage_instructions",
+        json!({"action":"list"}),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(owner_error.contains("not readable"), "{owner_error}");
+    assert!(!owner_error.contains(HIDDEN_DB_SOURCE), "{owner_error}");
 }

@@ -441,6 +441,7 @@ pub(crate) async fn append_migration_on(
     spec: AppendSpec,
     created_at: &str,
 ) -> Result<EventRow> {
+    crate::db::enrolled::require_content_connection(conn, None).await?;
     let payload = normalize_payload(&spec.record_id, &spec.event_type, spec.payload);
     let mut event = EventRow {
         local_seq: -1,
@@ -493,6 +494,16 @@ fn normalize_payload(record_id: &str, event_type: &str, payload: Value) -> Value
 /// its own source facts and envelope.
 fn prepare_sealed_local_event(event_id: String, spec: AppendSpec) -> Result<PreparedEvent> {
     let payload = normalize_payload(&spec.record_id, &spec.event_type, spec.payload);
+    if spec.event_type == "link.added"
+        && payload
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|id| id.starts_with("rel:"))
+    {
+        return Err(Error::engine(
+            "rel: link ids are reserved for relationship compatibility rows",
+        ));
+    }
     let annotations = current_event_annotations();
     let event = EventRow {
         local_seq: -1, // filled in after insert
@@ -552,6 +563,7 @@ async fn append_prepared_admitted(
     admission: PreparedAdmission,
     act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<EventRow> {
+    crate::db::enrolled::require_content_connection(tx, Some(db)).await?;
     if prepared.event.event_type == "record.deleted" {
         let active_binding: bool = sqlx::query_scalar(
             "SELECT EXISTS(
@@ -750,7 +762,15 @@ async fn append_prepared_admitted(
     // after projection exposes the resulting state but before the transaction
     // can commit. Keeping this out of the projector preserves pure replay: the
     // content rebuild intentionally has an empty meta tier.
-    assert_one_current_definition_per_term(tx, &prepared.event.record_id).await?;
+    // v2 kernel events project into kernel tables only; the v1 definition
+    // slot check reads `records`, which a v2 database does not have. This
+    // gate is unreachable in production: kernel types fail intent parsing
+    // there before this line (the test-only arm in `from_event`).
+    if !(cfg!(any(test, feature = "v2-kernel-probe"))
+        && prepared.event.event_type.starts_with("kernel."))
+    {
+        assert_one_current_definition_per_term(tx, &prepared.event.record_id).await?;
+    }
     // The embed() seam (decision 3bc7fd0), AFTER the fold so the projected
     // name/body are visible, and on the caller's transaction so anything an
     // implementation writes commits with the mutation that caused it. No-op at
@@ -1637,5 +1657,107 @@ mod append_identity_tests {
                 .await
                 .unwrap();
         assert_eq!(sources, 0);
+    }
+}
+
+#[cfg(test)]
+mod version_metadata_tests {
+    use super::*;
+    use crate::coedit::version_metadata::{record_updated_payload, VersionMetadata};
+    use crate::coedit::AcknowledgedContributor;
+
+    fn updated(record_id: &str, payload: Value) -> AppendSpec {
+        AppendSpec {
+            record_id: record_id.into(),
+            event_type: "record.updated".into(),
+            payload,
+            actor: Some("acct:test".into()),
+        }
+    }
+
+    async fn seed_document(db: &Db, id: &str) {
+        append(
+            db,
+            AppendSpec {
+                record_id: id.into(),
+                event_type: "record.created".into(),
+                payload: json!({"type": "Document", "kind": "note", "name": "doc"}),
+                actor: Some("acct:test".into()),
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn malformed_version_metadata_is_refused_before_any_mutation() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let id = "4e900000-0000-4000-8000-000000000101";
+        seed_document(&db, id).await;
+        let before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM content_events")
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap();
+        let error = append(&db, updated(id, json!({"session": "sess-1"})))
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("'session' and 'contributors' together"),
+            "{error}"
+        );
+        let after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM content_events")
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap();
+        assert_eq!(before, after, "no event row may be appended on refusal");
+        let name: String = sqlx::query_scalar("SELECT name FROM records WHERE id = ?")
+            .bind(id)
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap();
+        assert_eq!(name, "doc", "no record projection change on refusal");
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn valid_version_metadata_preserves_history_and_projects_known_fields() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let id = "4e900000-0000-4000-8000-000000000102";
+        seed_document(&db, id).await;
+        let contributors = [AcknowledgedContributor {
+            principal: "acct:human".into(),
+            executor_kind: "human".into(),
+        }];
+        let metadata = VersionMetadata {
+            contributors: &contributors,
+            session_ref: "sess-1",
+            merged_offline: true,
+        };
+        let base = json!({"summary": "carried"}).as_object().unwrap().clone();
+        let payload = record_updated_payload(base, Some(&metadata)).unwrap();
+        append(&db, updated(id, Value::Object(payload)))
+            .await
+            .unwrap();
+        let summary: String = sqlx::query_scalar("SELECT summary FROM records WHERE id = ?")
+            .bind(id)
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap();
+        assert_eq!(summary, "carried");
+        let stored: String = sqlx::query_scalar(
+            "SELECT payload FROM content_events
+              WHERE record_id = ? AND type = 'record.updated' ORDER BY seq DESC LIMIT 1",
+        )
+        .bind(id)
+        .fetch_one(db.write_pool())
+        .await
+        .unwrap();
+        let stored: Value = serde_json::from_str(&stored).unwrap();
+        assert!(stored.get("contributors").is_some());
+        assert_eq!(stored["session"], json!("sess-1"));
+        assert_eq!(stored["merged_offline"], json!(true));
+        db.close().await;
     }
 }

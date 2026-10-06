@@ -295,6 +295,7 @@ async fn create_exploration(db: Db, caller: Caller, arguments: Value) -> Result<
                 key: SELECTION_ROLE_FACET.into(),
                 value: Value::String(ALTERNATIVE_SET_ROLE.into()),
                 vocab_ref: None,
+                time_type: None,
             }];
             assert_facet_value_predicates_in(
                 &mut tx,

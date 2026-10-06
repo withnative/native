@@ -18,6 +18,8 @@ mod definitions;
 mod facet_history;
 #[path = "governance/facet_value_binding.rs"]
 mod facet_value_binding;
+#[path = "governance/facet_value_json_nodes.rs"]
+mod facet_value_json_nodes;
 #[path = "governance/home_contract.rs"]
 mod home_contract;
 #[path = "governance/kind_governance.rs"]
@@ -46,3 +48,5 @@ mod source_boundary;
 mod type_immutability;
 #[path = "governance/typed_facets.rs"]
 mod typed_facets;
+#[path = "governance/typed_time_facets.rs"]
+mod typed_time_facets;

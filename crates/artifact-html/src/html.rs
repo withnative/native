@@ -36,7 +36,7 @@ use url::Url;
 use crate::{Error, Result};
 
 pub const RUNTIME_ID: &str = "native.html.v1";
-pub const ADAPTER_REVISION: u64 = 1;
+pub const ADAPTER_REVISION: u64 = 3;
 pub const BRIDGE_VERSION: &str = "native.html.bridge.v1";
 /// The static declaration contract embedded in an authored HTML document.
 ///
@@ -62,9 +62,12 @@ pub const DATA_ASSET_TOTAL_LIMIT: usize = 393_216;
 pub const DOM_NODE_LIMIT: usize = 10_000;
 pub const CSS_RULE_LIMIT: usize = 5_000;
 pub const SLIDE_LIMIT: usize = 200;
-pub const INPUT_RECORD_LIMIT: usize = 5_000;
-pub const INPUT_JSON_LIMIT: usize = 4_194_304;
-pub const BRIDGE_MESSAGE_LIMIT: usize = 4_194_304;
+/// Workspace metadata can exceed 4 MiB before 5,000 records. Allow practical
+/// growth without narrowing a bound Collection's authorized membership. These
+/// are per-render budgets; launch/harness ticket stores retain aggregate caps.
+pub const INPUT_RECORD_LIMIT: usize = 20_000;
+pub const INPUT_JSON_LIMIT: usize = 16 * 1024 * 1024;
+pub const BRIDGE_MESSAGE_LIMIT: usize = INPUT_JSON_LIMIT;
 pub const TICKET_TTL: Duration = Duration::from_secs(30);
 const LAUNCH_TICKET_MAX_COUNT: usize = 128;
 const LAUNCH_TICKET_MAX_PER_PRINCIPAL: usize = 32;
@@ -89,11 +92,15 @@ let channel=null, initialized=false, current=0, slides=[], queued=[], heldInput,
 let resolveReady, rejectReady;
 const ready=new Promise((resolve,reject)=>{resolveReady=resolve;rejectReady=reject});
 const jsonStringify=JSON.stringify,jsonParse=JSON.parse,isArray=Array.isArray,NativePromise=Promise,pendingIntents=Object.create(null);let pendingIntentCount=0;
+let armFeature=false,pendingArm=null,armTimer=null;
+const LOCATION_FEATURE="surface.location.v1",locationPattern=/^[A-Za-z0-9._:-]{1,128}(?![\s\S])/,locationTest=RegExp.prototype.test;
+let locationFeature=false;
+const publishLocation=recordId=>{if(contextClosed)throw new TypeError("location observation unavailable");if(recordId!==null&&(typeof recordId!=="string"||!apply(locationTest,locationPattern,[recordId])))throw new TypeError("invalid record location");if(locationFeature)send({type:"location",version:VERSION,location_version:LOCATION_FEATURE,record_id:recordId})};
 /* Disarm on a macrotask, not a microtask. Chromium runs a microtask checkpoint
    between a capture listener and the target listener, so a microtask disarm
    cleared the flag before the author's own click handler ran. The consumed flag
    still bounds the event at one proposal. */
-const setTimer=setTimeout,requestFrame=requestAnimationFrame;
+const setTimer=setTimeout,clearTimer=clearTimeout,requestFrame=requestAnimationFrame;
 const intentId=value=>typeof value==="string"&&value.length>0&&value.length<=128&&value.trim()===value&&!/[\u0000-\u001f\u007f]/.test(value);
 const intentMap=value=>!!value&&typeof value==="object"&&!isArray(value)&&objectKeys(value).length<=32;
 /* Layer 1 of the activation gate, mirroring navigation's trusted-click runtime.
@@ -109,7 +116,7 @@ const intentMap=value=>!!value&&typeof value==="object"&&!isArray(value)&&object
    frame-supplied claim, so the host treats it as necessary but never
    sufficient. */
 const gestureEvents=["click","drop"];
-let gestureArmed=false,gestureUsed=false,keyRepeating=false;
+let gestureArmed=false,gestureUsed=false,keyRepeating=false,gestureEpoch=0;
 const releaseGesture=()=>{gestureArmed=false;gestureUsed=false};
 /* `gestureArmed` also bounds a single physical action that dispatches more than
    one terminal event in one task: a click on a label[for] dispatches a trusted
@@ -117,7 +124,7 @@ const releaseGesture=()=>{gestureArmed=false;gestureUsed=false};
    on the second would reset the consumed flag, so an armed gesture stays armed
    until its macrotask release. Separate gestures are separate tasks, so the
    release has always run before the next one. */
-const armGesture=event=>{if(!trusted(event))return;const type=read(eventType,event);if(!apply(arrayIncludes,gestureEvents,[type]))return;if(type==="click"&&keyRepeating)return;if(gestureArmed)return;gestureArmed=true;gestureUsed=false;setTimer(releaseGesture,0)};
+const armGesture=event=>{if(!trusted(event))return;const type=read(eventType,event);if(!apply(arrayIncludes,gestureEvents,[type]))return;if(type==="click"&&keyRepeating)return;if(gestureArmed)return;gestureArmed=true;gestureUsed=false;gestureEpoch++;setTimer(releaseGesture,0)};
 for(const name of gestureEvents)listen(window,name,armGesture,true);
 /* A held key autorepeats trusted keydown, and on a control each repeat also
    dispatches a trusted click. Track the repeat state so only the click from the
@@ -138,7 +145,7 @@ for(const name of ["pointerdown","mousedown","touchstart"])listen(window,name,cl
 let refusalReported=false,refusalReports=0;
 const reportBoundedRefusal=(code,reason)=>{if(refusalReports>=16||refusalReported)return;refusalReported=true;refusalReports+=1;setTimer(()=>{refusalReported=false},250);report(code,{reason})};
 const refuseProposal=(reason,message)=>{reportBoundedRefusal("html_intent_refused",reason);throw new TypeError(message)};
-const propose=intent=>{const backed=gestureArmed&&!gestureUsed;if(backed)gestureUsed=true;if(!intent||typeof intent!=="object"||isArray(intent)||objectKeys(intent).some(key=>!["request_id","entry_id","slots","values"].includes(key)))refuseProposal("malformed","artifact intent contains unsupported fields");const request_id=intent.request_id,entry_id=intent.entry_id,slots=intent.slots??{},values=intent.values??{};if(!intentId(request_id)||!intentId(entry_id)||!intentMap(slots)||!intentMap(values)||objectKeys(slots).some(key=>!intentId(key)||typeof slots[key]!=="string"||slots[key].length>256)||objectKeys(values).some(key=>!intentId(key)))refuseProposal("malformed","artifact intent is malformed");if(own(pendingIntents,request_id)||pendingIntentCount>=32)refuseProposal("duplicate","artifact intent request is duplicate or queue is full");const encoded=jsonStringify({request_id,entry_id,slots,values});if(encoded.length>65536)refuseProposal("too_large","artifact intent exceeds bridge limit");const payload=jsonParse(encoded);return new NativePromise((resolve,reject)=>{pendingIntents[request_id]={resolve,reject};pendingIntentCount+=1;try{send({version:VERSION,type:"intent",intent:payload,gesture_backed:backed})}catch(error){delete pendingIntents[request_id];pendingIntentCount-=1;reject(error)}})};
+const propose=intent=>{const backed=gestureArmed&&!gestureUsed;if(backed)gestureUsed=true;if(!intent||typeof intent!=="object"||isArray(intent)||objectKeys(intent).some(key=>!["request_id","entry_id","slots","values"].includes(key)))refuseProposal("malformed","artifact intent contains unsupported fields");const request_id=intent.request_id,entry_id=intent.entry_id,slots=intent.slots??{},values=intent.values??{};if(!intentId(request_id)||!intentId(entry_id)||!intentMap(slots)||!intentMap(values)||objectKeys(slots).some(key=>!intentId(key)||typeof slots[key]!=="string"||slots[key].length>256)||objectKeys(values).some(key=>!intentId(key)))refuseProposal("malformed","artifact intent is malformed");if(own(pendingIntents,request_id)||(pendingArm&&pendingArm.request_id===request_id)||pendingIntentCount>=32)refuseProposal("duplicate","artifact intent request is duplicate or queue is full");const encoded=jsonStringify({request_id,entry_id,slots,values});if(encoded.length>65536)refuseProposal("too_large","artifact intent exceeds bridge limit");const payload=jsonParse(encoded);return new NativePromise((resolve,reject)=>{pendingIntents[request_id]={resolve,reject};pendingIntentCount+=1;try{send({version:VERSION,type:"intent",intent:payload,gesture_backed:backed})}catch(error){delete pendingIntents[request_id];pendingIntentCount-=1;reject(error)}})};
 const settleIntent=data=>{if(!intentId(data.request_id)||!own(pendingIntents,data.request_id)||!data.result||typeof data.result!=="object"||isArray(data.result))return;let result;try{const encoded=jsonStringify(data.result);if(encoded.length>65536)return;result=freeze(jsonParse(encoded))}catch{return}const pending=pendingIntents[data.request_id];delete pendingIntents[data.request_id];pendingIntentCount-=1;pending.resolve(result)};
 /* Eager view-state publish for the successor frame. A body change is a new
    document, so no framework state survives it; the frame hands its own view
@@ -172,9 +179,521 @@ const pushValue=(array,value)=>apply(arrayPush,array,[value]),indexOfValue=(arra
 let offeredNeeds=[],pendingReadCount=0,readSeq=0;const pendingReads=Object.create(null);
 const refuseRead=(reason,message)=>{reportBoundedRefusal("html_read_refused",reason);throw new TypeError(message)};
 const readNeed=(need,params)=>{if(!intentId(need)||!apply(arrayIncludes,offeredNeeds,[need]))refuseRead("undeclared","this host offers no such read");const given=params===undefined?{}:params;if(!given||typeof given!=="object"||isArray(given))refuseRead("malformed","read params must be an object");let encoded;try{encoded=jsonStringify(given)}catch{refuseRead("malformed","read params must be JSON-serializable")}if(typeof encoded!=="string"||encoded.length>4096)refuseRead("too_large","read params exceed bridge limit");if(pendingReadCount>=8)refuseRead("busy","too many reads in flight");readSeq+=1;const request_id="read-"+readSeq;const payload=jsonParse(encoded);return new NativePromise((resolve,reject)=>{pendingReads[request_id]={resolve,reject};pendingReadCount+=1;try{send({version:VERSION,type:"read",request_id,need,params:payload})}catch(error){delete pendingReads[request_id];pendingReadCount-=1;reject(error)}})};
-const settleRead=data=>{if(typeof data.request_id!=="string"||!own(pendingReads,data.request_id))return;let answer;try{const encoded=jsonStringify({status:data.status,code:data.code,need:data.need,result:data.result});answer=encoded.length>1048576?freezeObject({status:"unavailable",code:"too_large"}):freeze(jsonParse(encoded))}catch{answer=freezeObject({status:"unavailable",code:"malformed"})}const pending=pendingReads[data.request_id];delete pendingReads[data.request_id];pendingReadCount-=1;pending.resolve(answer)};
+const settleRead=data=>{if(typeof data.request_id!=="string"||!own(pendingReads,data.request_id))return;let answer;try{const encoded=jsonStringify({status:data.status,code:data.code,need:data.need,result:data.result,keyed_freshness:data.keyed_freshness});answer=encoded.length>1048576?freezeObject({status:"unavailable",code:"too_large"}):freeze(jsonParse(encoded))}catch{answer=freezeObject({status:"unavailable",code:"malformed"})}const pending=pendingReads[data.request_id];delete pendingReads[data.request_id];pendingReadCount-=1;pending.resolve(answer)};
 const onInput=callback=>{if(typeof callback!=="function")throw new TypeError("input subscriber must be a function");pushValue(inputSubscribers,callback);return()=>{const index=indexOfValue(inputSubscribers,callback);if(index>=0)spliceValue(inputSubscribers,index,1)}};
-define(window,"nativeArtifact",{value:freezeObject({ready,propose,read:readNeed,onInput,setViewState,get input(){return heldInput},get viewState(){return heldViewState}}),writable:false,configurable:false});
+/* Inbound reveal (task fb8564c). The host may reveal one already-authorized
+   record to an opted-in frame AFTER backend admission; this is advisory only,
+   with no ack and no effect authority, and stays separate from input
+   rows/digest/revision and P7. The callback receives one deep-frozen
+   {record_id}: an exact persisted id over [A-Za-z0-9._:-], 1..128,
+   matching backend admission — never names, bodies, ancestors, installs
+   or sequences, and the frame invokes no tools for it. A reveal arriving
+   after init but before registration is retained latest-one and replayed
+   once to the first subscriber; the slot clears before the callback runs,
+   so reentrant registration cannot re-deliver it. Unsupported payload
+   fields are dropped, never frozen in. */
+const REVEAL_FEATURE="surface.reveal.v1";
+let revealSubscribers=[],pendingReveal=null;
+/* Exact persisted-id shape, matching backend admission. The pristine exec
+   is captured at load and applied to the owned pattern, so later author
+   tampering with RegExp.prototype.test/exec, the RegExp global, or string
+   helpers cannot change the verdict; only a primitive bounded string is
+   ever tested. The pattern carries no flags, so exec holds no lastIndex
+   state across calls. */
+const revealPattern=/^[A-Za-z0-9._:-]{1,128}$/;
+const regExpExec=RegExp.prototype.exec;
+const revealId=value=>typeof value==="string"&&value.length>0&&value.length<=128&&apply(regExpExec,revealPattern,[value])!==null;
+const deliverRevealTo=target=>{const count=revealSubscribers.length;for(let index=0;index<count;index+=1){const subscriber=revealSubscribers[index];if(typeof subscriber!=="function")continue;try{apply(subscriber,undefined,[target])}catch(error){report("html_reveal_failed",{message:detailOf(error)})}}};
+const deliverReveal=data=>{if(data?.version!==VERSION||!initialized)return;const record_id=data?.record_id;if(!revealId(record_id)){report("html_reveal_dropped",{reason:"malformed"});return}let target;try{target=freezeObject({record_id})}catch{report("html_reveal_dropped",{reason:"freeze-failed"});return}if(!revealSubscribers.length){pendingReveal=target;return}deliverRevealTo(target)};
+const onReveal=callback=>{if(typeof callback!=="function")throw new TypeError("reveal subscriber must be a function");pushValue(revealSubscribers,callback);if(pendingReveal!==null){const retained=pendingReveal;pendingReveal=null;deliverRevealTo(retained)}return()=>{const index=indexOfValue(revealSubscribers,callback);if(index>=0)spliceValue(revealSubscribers,index,1)}};
+const clearReveal=()=>{pendingReveal=null};
+/* ARM transport: confirmation-first and non-authorizing. The frame may ASK the
+   trusted host to prepare a confirmation for one strict request; only the host
+   decides and only a later trusted host Apply submits. arm() is injected
+   unconditionally so malformed requests fail synchronously, but it succeeds
+   only when the host advertised intent-arm-confirm.v1 on the pinned init AND
+   the private channel is open: an absent/malformed advertisement, a
+   new-runtime/old-host pair, or a pre-init call resolves unavailable LOCALLY
+   with NO message, so an old host never sees a speculative ARM and there is NO
+   propose()/type:intent fallback. The request reuses propose()'s exact strict
+   request_id/entry_id/slots/values shape, and the wire envelope carries no
+   package nonce and no gesture mark. At most one ARM is outstanding; a second
+   request, or a request id already pending as a proposal, resolves busy rather
+   than sharing identity. One matching armed ack (duplicates ignored) clears the
+   15000ms pre-ack timer and sends intent-arm-ready, a liveness receipt that
+   carries NO authority. A timeout instead sends intent-arm-cancel (only on the
+   captured channel) and resolves unavailable, never submitted-uncertain. The
+   terminal intent-arm-result settles the promise for the host's full result
+   vocabulary: cancelled/rejected/committed/conflict/uncertain plus the
+   unavailable/busy/needs_confirmation cancellation forms; no write-success
+   timeout is invented after ack. A post that throws before it sends resolves
+   unavailable rather than rejecting, since nothing was submitted. */
+const ARM_TIMEOUT_MS=15000,ARM_RESULTS=["cancelled","rejected","committed","conflict","uncertain","unavailable","busy","needs_confirmation"];
+const refuseArm=(reason,message)=>{reportBoundedRefusal("html_arm_refused",reason);throw new TypeError(message)};
+const unavailableArm=code=>freezeObject({status:"unavailable",code});
+const clearArmTimer=()=>{if(armTimer!==null){clearTimer(armTimer);armTimer=null}};
+const arm=intent=>{if(!armFeature||!channel)return NativePromise.resolve(unavailableArm("arm_unavailable"));if(pendingArm)return NativePromise.resolve(unavailableArm("arm_busy"));if(!intent||typeof intent!=="object"||isArray(intent)||objectKeys(intent).some(key=>!["request_id","entry_id","slots","values"].includes(key)))refuseArm("malformed","artifact arm contains unsupported fields");const request_id=intent.request_id,entry_id=intent.entry_id,slots=intent.slots??{},values=intent.values??{};if(!intentId(request_id)||!intentId(entry_id)||!intentMap(slots)||!intentMap(values)||objectKeys(slots).some(key=>!intentId(key)||typeof slots[key]!=="string"||slots[key].length>256)||objectKeys(values).some(key=>!intentId(key)))refuseArm("malformed","artifact arm is malformed");if(own(pendingIntents,request_id))return NativePromise.resolve(unavailableArm("arm_busy"));const encoded=jsonStringify({request_id,entry_id,slots,values});if(encoded.length>65536)refuseArm("too_large","artifact arm exceeds bridge limit");const payload=jsonParse(encoded);return new NativePromise(resolve=>{const activeChannel=channel;pendingArm={resolve,request_id,acked:false};armTimer=setTimer(()=>{armTimer=null;const pending=pendingArm;if(!pending)return;pendingArm=null;if(channel===activeChannel){try{post(channel,{version:VERSION,type:"intent-arm-cancel",request_id:pending.request_id})}catch{}}pending.resolve(unavailableArm("arm_timeout"))},ARM_TIMEOUT_MS);try{post(activeChannel,{version:VERSION,type:"intent-arm",intent:payload})}catch(error){clearArmTimer();pendingArm=null;resolve(unavailableArm("arm_unavailable"))}})};
+const settleArmAck=data=>{if(!pendingArm||pendingArm.acked||data?.request_id!==pendingArm.request_id||data?.status!=="armed"||!channel)return;pendingArm.acked=true;clearArmTimer();try{post(channel,{version:VERSION,type:"intent-arm-ready",request_id:pendingArm.request_id})}catch{}};
+const settleArmResult=data=>{if(!pendingArm||data?.request_id!==pendingArm.request_id||!data.result||typeof data.result!=="object"||isArray(data.result))return;let result;try{const encoded=jsonStringify(data.result);if(encoded.length>65536)return;result=freeze(jsonParse(encoded))}catch{return}if(typeof result.status!=="string"||!apply(arrayIncludes,ARM_RESULTS,[result.status]))return;const pending=pendingArm;pendingArm=null;clearArmTimer();pending.resolve(result)};
+/* Closed optional Body attempts. A prepare is never a grant. Only an opaque
+   channel-bound handle crosses submit; a timeout is always unverified. A submit
+   is always forwarded with its own gesture mark and the count of completed
+   trusted gestures: the host, not this frame, decides whether a click or the
+   person's autosave consent authorises it, and refuses `gesture_required`
+   otherwise. */
+const BODY_ATTEMPT_FEATURE="native.html.body-attempt.v1";
+let bodyAttemptGeneration=null,bodyAttemptClosed=false,bodyAttemptSeq=0;
+const bodyAttemptPending=Object.create(null);
+const bodyAttemptRefused=code=>freezeObject({status:"refused",code,message:"Body Save is unavailable. Your draft is retained."});
+const bodyAttemptUncertain=()=>freezeObject({status:"uncertain",code:"uncertain",message:"The outcome is unverified. Retain the draft and retry the same attempt."});
+const bodyAttemptId=v=>typeof v==="string"&&v.length>0&&v.length<=128&&apply(regExpExec,/^[A-Za-z0-9._:-]{1,128}$/,[v])!==null;
+const bodyAttemptRequest=(type,value)=>{
+ if(!initialized||!channel||bodyAttemptClosed||!bodyAttemptGeneration)return new NativePromise(resolve=>resolve(bodyAttemptRefused("unsupported")));
+ if(objectKeys(bodyAttemptPending).length>=8)return new NativePromise(resolve=>resolve(bodyAttemptRefused("busy")));
+ let backed=false;
+ if(type==="body-attempt-submit"){backed=gestureArmed&&!gestureUsed;if(backed)gestureUsed=true;}
+ const request_id="body-attempt-"+(++bodyAttemptSeq),activeChannel=channel,generation=bodyAttemptGeneration;
+ const envelope={version:VERSION,type,request_id,generation,...value,...(type==="body-attempt-submit"?{gesture_backed:backed,gesture_epoch:gestureEpoch}:{})};
+ let encoded;try{encoded=jsonStringify(envelope)}catch{throw new TypeError("Body request is malformed")}
+ if(encoded.length>3211264||contextBytes(encoded,3211264)>3211264)throw new TypeError("Complete Body request exceeds bridge limit");
+ return new NativePromise(resolve=>{const pending={resolve,type,generation,channel:activeChannel,timer:null};bodyAttemptPending[request_id]=pending;
+ pending.timer=setTimer(()=>{if(bodyAttemptPending[request_id]!==pending)return;delete bodyAttemptPending[request_id];resolve(type==="body-attempt-submit"?bodyAttemptUncertain():bodyAttemptRefused("prepare_timeout"))},15000);
+ try{post(activeChannel,jsonParse(encoded))}catch{delete bodyAttemptPending[request_id];clearTimer(pending.timer);resolve(bodyAttemptRefused("not_submitted"))}
+ });
+};
+const bodyAttemptPrepare=candidate=>{
+ if(!candidate||typeof candidate!=="object"||isArray(candidate)||objectKeys(candidate).length!==4||objectKeys(candidate).some(k=>!["entry_id","target_id","body","expected_body_digest"].includes(k))
+  ||!bodyAttemptId(candidate.entry_id)||!bodyAttemptId(candidate.target_id)||typeof candidate.body!=="string"||typeof candidate.expected_body_digest!=="string"
+  ||apply(regExpExec,/^[0-9a-f]{64}$/,[candidate.expected_body_digest])===null)throw new TypeError("Body candidate is malformed");
+ const text=candidate.body;for(let i=0;i<text.length;i++){const n=apply(contextCharCode,text,[i]);if(n===0)throw new TypeError("Body source contains NUL");if(n>=55296&&n<=56319){const next=apply(contextCharCode,text,[++i]);if(!(next>=56320&&next<=57343))throw new TypeError("Body source contains unpaired surrogate")}else if(n>=56320&&n<=57343)throw new TypeError("Body source contains unpaired surrogate")}
+ if(contextBytes(text,524288)>524288)throw new TypeError("Body source exceeds byte limit");
+ return bodyAttemptRequest("body-attempt-prepare",{candidate:jsonParse(jsonStringify(candidate))});
+};
+const bodyAttemptHandle=(type,attempt_id)=>{if(!bodyAttemptId(attempt_id))throw new TypeError("Body attempt handle is malformed");return bodyAttemptRequest(type,{attempt_id})};
+const settleBodyAttempt=data=>{
+ const p=bodyAttemptPending[data?.request_id];if(!p||p.channel!==channel||p.generation!==bodyAttemptGeneration||data.generation!==p.generation)return;
+ let result;try{const encoded=jsonStringify(data.result);if(typeof encoded!=="string"||encoded.length>65536)return;result=freeze(jsonParse(encoded))}catch{return}
+ if(!result||typeof result!=="object"||isArray(result))return;
+ delete bodyAttemptPending[data.request_id];clearTimer(p.timer);p.resolve(result);
+};
+const closeBodyAttempts=()=>{bodyAttemptClosed=true;bodyAttemptGeneration=null;for(const k of objectKeys(bodyAttemptPending)){const p=bodyAttemptPending[k];delete bodyAttemptPending[k];clearTimer(p.timer);p.resolve(p.type==="body-attempt-submit"?bodyAttemptUncertain():bodyAttemptRefused("closed"))}};
+const bodyAttemptApi=freezeObject({get offering(){return !bodyAttemptClosed&&bodyAttemptGeneration?freezeObject({generation:bodyAttemptGeneration}):null},prepare:bodyAttemptPrepare,
+ prepareUndo:attempt_id=>bodyAttemptHandle("body-attempt-undo",attempt_id),submit:attempt_id=>bodyAttemptHandle("body-attempt-submit",attempt_id)});
+/* Optional on-demand app observations. Registration is capability-only; no
+   report leaves this private port without a live host request. Input delivery
+   acknowledgements are deliberately not promoted to committed-render evidence. */
+const CONTEXT_FEATURE="app-view-report.v1",contextAbort=AbortController,contextAbortMethod=AbortController.prototype.abort,contextNow=Date.now,contextClock=performance.now.bind(performance),contextResolve=Promise.resolve.bind(Promise),contextCharCode=String.prototype.charCodeAt,contextFinite=Number.isFinite,contextInteger=Number.isSafeInteger,contextMin=Math.min,contextSignal=getter(AbortController.prototype,"signal");
+// Every app can report rendered text; a custom reporter adds app-specific state.
+let renderedContextSeq=0;
+const contextClip=(value,max)=>{let text="",bytes=0;for(const point of NativeString(value??"")){const n=contextBytes(point);if(bytes+n>max)break;text+=point;bytes+=n}return text};
+const contextVisible=element=>{
+ if(!element?.isConnected||closest(element,"script,style,svg,input,textarea,[data-view-private]"))return null;
+ let box={left:0,top:0,right:innerWidth,bottom:innerHeight};
+ for(let node=element,depth=0;node&&depth++<64;node=node.parentElement){const style=getComputedStyle(node);
+  if(node.hidden||node.getAttribute("aria-hidden")==="true"||style.display==="none"||style.visibility==="hidden"||style.visibility==="collapse"||style.opacity==="0"||style.contentVisibility==="hidden")return null;
+  if(node.tagName==="DETAILS"&&!node.open&&!node.querySelector("summary")?.contains(element))return null;
+  if(/auto|scroll|hidden|clip/.test(style.overflow+style.overflowX+style.overflowY)){const r=node.getBoundingClientRect();box={left:Math.max(box.left,r.left),top:Math.max(box.top,r.top),right:Math.min(box.right,r.right),bottom:Math.min(box.bottom,r.bottom)}}
+ }
+ const r=element.getBoundingClientRect();return r.right>box.left&&r.left<box.right&&r.bottom>box.top&&r.top<box.bottom?box:null;
+};
+const renderedContextReport=request=>{
+ if(request.signal.aborted||!document.body)throw new Error("view unavailable");
+ const walker=document.createTreeWalker(document.body,4),chunks=[];let node,visited=0,points=0,truncated=false;
+ const deadline=contextClock()+Math.min(request.remainingMs,100);
+ while((node=walker.nextNode())&&++visited<=1024&&points<8192&&contextClock()<deadline){
+  const parent=node.parentElement,clip=parent&&contextVisible(parent);if(!clip)continue;
+  const value=node.textContent??"";if(!value.trim())continue;
+  const range=document.createRange();range.selectNodeContents(node);const rects=[...range.getClientRects()];
+  const overlaps=r=>r.right>clip.left&&r.left<clip.right&&r.bottom>clip.top&&r.top<clip.bottom;
+  if(!rects.some(overlaps))continue;
+  let visible=value;
+  if(!rects.every(r=>r.left>=clip.left&&r.right<=clip.right&&r.top>=clip.top&&r.bottom<=clip.bottom)){
+   visible="";let offset=0;for(const point of value){if(++points>8192||contextClock()>=deadline)break;range.setStart(node,offset);offset+=point.length;range.setEnd(node,offset);if([...range.getClientRects()].some(overlaps))visible+=point}
+  }else points+=value.length;
+  if(visible)pushValue(chunks,visible);
+ }
+ truncated=!!node;
+ const omitted=["structured_state","source_references","drafts","pixels"],text=contextClip(chunks.join("\n").trim(),16384);
+ if(truncated||text.length<chunks.join("\n").trim().length)pushValue(omitted,"text_budget");
+ const report={version:"native.app-view-report.v1",viewSeq:++renderedContextSeq,observedAt:contextNow(),coherence:"unknown",completeness:"partial",omitted,committedInput:{status:"unknown"},regions:[{id:"rendered",role:"document",text}]};
+ const selection=getSelection();if(selection&&!selection.isCollapsed&&selection.rangeCount===1){const range=selection.getRangeAt(0),start=range.startContainer.parentElement,end=range.endContainer.parentElement;
+  let valid=!!start&&!!end&&document.body.contains(start)&&document.body.contains(end)&&!!contextVisible(start)&&!!contextVisible(end);
+  if(valid){const selected=document.createTreeWalker(document.body,4);let piece,count=0;while((piece=selected.nextNode())){if(++count>1024||contextClock()>=deadline){valid=false;break}if(range.intersectsNode(piece)&&piece.textContent?.trim()&&!contextVisible(piece.parentElement)){valid=false;break}}}
+  if(valid)report.selection={regionId:"rendered",quote:contextClip(selection.toString(),4096),draft:!!closest(start,"[contenteditable]:not([contenteditable=false])")};
+  else pushValue(omitted,"selection_unverified");
+ }
+ return report;
+};
+let contextFeature=false,contextReporter=renderedContextReport,contextGeneration=1,contextLastSeq=0,contextClosed=false;
+const contextPending=Object.create(null);let contextCount=0;
+const contextBytes=(value,limit=65536)=>{let n=0;for(let i=0;i<value.length;i++){const c=apply(contextCharCode,value,[i]);if(c<128)n++;else if(c<2048)n+=2;else if(c>=55296&&c<=56319&&i+1<value.length&&apply(contextCharCode,value,[i+1])>=56320&&apply(contextCharCode,value,[i+1])<=57343){n+=4;i++}else n+=3;if(n>limit)return n}return n};
+const cancelContext=id=>{const p=contextPending[id];if(!p)return;delete contextPending[id];contextCount--;clearTimer(p.timer);apply(contextAbortMethod,p.controller,[])};
+const clearContext=()=>{for(const id of objectKeys(contextPending))cancelContext(id)};
+const closeContext=()=>{clearContext();contextClosed=true;contextReporter=null};
+const publishContextRegistration=()=>{if(contextFeature&&!contextClosed)send({version:VERSION,type:"context-register",context_version:CONTEXT_FEATURE,generation:contextGeneration,available:contextReporter!==null})};
+const registerContextReporter=reporter=>{if(typeof reporter!=="function")throw new TypeError("context reporter must be a function");if(contextClosed)throw new TypeError("context channel closed");clearContext();contextReporter=reporter;contextGeneration++;const generation=contextGeneration;publishContextRegistration();return()=>{if(contextGeneration!==generation)return;clearContext();contextReporter=renderedContextReport;contextGeneration++;publishContextRegistration()}};
+const receiveContext=data=>{
+ if(!contextFeature||contextClosed||data.context_version!==CONTEXT_FEATURE||!intentId(data.request_id)||data.generation!==contextGeneration)return;
+ if(data.type==="context-cancel"){const p=contextPending[data.request_id];if(p&&p.seq===data.request_seq)cancelContext(data.request_id);return}
+ if(data.type!=="context-request"||!contextReporter||!contextInteger(data.request_seq)||data.request_seq<=contextLastSeq||own(contextPending,data.request_id)||contextCount>=4||!contextFinite(data.remaining_ms)||!contextFinite(data.deadline_ms))return;
+ contextLastSeq=data.request_seq;
+ const remaining=contextMin(750,data.remaining_ms,data.deadline_ms-contextNow());if(remaining<=0)return;
+ const id=data.request_id,generation=contextGeneration,controller=new contextAbort(),deadline=contextClock()+remaining,reporter=contextReporter;
+ const p={controller,seq:data.request_seq,timer:setTimer(()=>cancelContext(id),remaining)};contextPending[id]=p;contextCount++;
+ const finish=(report,failed)=>{if(contextPending[id]!==p||contextGeneration!==generation||contextClock()>=deadline)return;
+  let encoded,status="available",reason="source_unavailable";try{if(failed)throw new Error("report unavailable");encoded=jsonStringify(report);if(typeof encoded!=="string")throw new Error("report unavailable");if(encoded.length>65536||contextBytes(encoded)>65536){reason="too_large";throw new Error("report too large")}}catch{status="unavailable";encoded=undefined}
+  cancelContext(id);send({version:VERSION,type:"context-report",context_version:CONTEXT_FEATURE,request_id:id,request_seq:p.seq,generation,status,...(encoded===undefined?{reason}:{report_json:encoded})})};
+ try{contextResolve(reporter(freezeObject({signal:read(contextSignal,controller),remainingMs:remaining}))).then(report=>finish(report,false),()=>finish(null,true))}catch{finish(null,true)}
+};
+/* BEGIN GENERATED BODY FACTORIES */
+// Owning pure source. Generated ESM only in P0; bootstrap embedding is deferred.
+// Intrinsics are supplied by a realm owner before untrusted author execution.
+function bodyWireFactory(I) {
+  const apply = I.apply, create = I.create, define = I.define, freeze = I.freeze;
+  const own = I.own, ownKeys = I.ownKeys, proto = I.proto, isArray = I.isArray;
+  const cc = (s, n) => apply(I.charCode, s, [n]);
+  const slice = (s, a, b) => apply(I.slice, s, [a, b]);
+  const set = (o, k, v) => {
+    // Native ToPropertyDescriptor reads inherited members even when define is
+    // captured. Keep the descriptor itself free of authored prototype hooks.
+    const descriptor = create(null);
+    descriptor.value = v;
+    descriptor.enumerable = true;
+    define(o, k, descriptor);
+    return o;
+  };
+  const tree = () => create(null);
+  const answer = (kind, key, value) => freeze(set(set(tree(), 'kind', kind), key, value));
+  const invalid = answer('invalid', 'reason', 'protocol');
+  const badRequest = answer('invalid', 'reason', 'invalid_message');
+  const CONTRACT = 'records.body.read.v1', TRANSPORT = 'records.body.transport.v1';
+  const VERSION = 'native.html.bridge.v1', EMPTY = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
+  const PAGE = ['contract', 'record_id', 'revision', 'body_digest', 'body_present', 'encoding',
+    'start_byte', 'end_byte', 'total_bytes', 'text', 'complete', 'next_cursor', 'limits'];
+  const LIMITS = ['max_page_bytes', 'max_response_bytes', 'max_body_bytes', 'max_source_bytes',
+    'max_provenance_payload_bytes', 'max_provenance_events', 'request_timeout_ms'];
+  const ROOT = [...PAGE, 'error', 'reason'], ERROR = ['code', 'reason'];
+  const HTTP = ['invalid_message', 'busy', 'mount_unavailable', 'timeout', 'cancelled', 'protocol'];
+  const LOCAL = [...HTTP, 'not_offered', 'closed', 'network'];
+  const PAIRS = [
+    ['invalid_params', 'request'], ['invalid_cursor', 'cursor'], ['cursor_expired', 'cursor'],
+    ['resource_exhausted', 'result_budget'], ['unsupported_profile', 'primary_sqlite_required'],
+    ['unsupported_capability', 'portability_policy'], ['source_integrity', 'source'],
+    ['undeclared_read', 'descriptor'], ['adoption_required', 'source'], ['record_unavailable', 'target'],
+    ['access_lost', 'target'], ['scope_denied', 'scope'], ['revision_changed', 'incarnation'],
+    ['too_large', 'body_read_work_limit'], ['resource_exhausted', 'process_busy'],
+    ['resource_exhausted', 'source_work_limit'], ['resource_exhausted', 'provenance_work_limit'],
+    ['resource_exhausted', 'vm_work_limit'], ['timeout', 'request'], ['engine', 'integrity_or_execution'],
+  ];
+  const decoder = new I.Decoder('utf-8', { fatal: true, ignoreBOM: true });
+  const integer = n => I.safeInteger(n) && n >= 0;
+  const find = (a, value) => { for (let i = 0; i < a.length; i++) if (a[i] === value) return i; return -1; };
+  const ascii = (s, max, graphic = false) => {
+    if (typeof s !== 'string' || !s.length || s.length > max) return false;
+    for (let i = 0; i < s.length; i++) { const c = cc(s, i); if (c > (graphic ? 126 : 127) || (graphic && c < 33)) return false; }
+    return true;
+  };
+  // Scalar validation precedes encoding, so TextEncoder never replaces a surrogate.
+  const utf8 = (s, cap) => {
+    if (typeof s !== 'string' || s.length > cap) return -1;
+    let bytes = 0;
+    for (let i = 0; i < s.length; i++) {
+      const c = cc(s, i);
+      if (c < 128) bytes++; else if (c < 2048) bytes += 2;
+      else if (c >= 0xd800 && c <= 0xdbff) {
+        const low = cc(s, ++i); if (!(low >= 0xdc00 && low <= 0xdfff)) return -1;
+        bytes += 4;
+      } else if (c >= 0xdc00 && c <= 0xdfff) return -1;
+      else bytes += 3;
+      if (bytes > cap) return -1;
+    }
+    return bytes;
+  };
+  const hex = s => {
+    if (typeof s !== 'string' || s.length !== 64) return false;
+    for (let i = 0; i < 64; i++) { const c = cc(s, i); if (!(c >= 48 && c <= 57) && !(c >= 97 && c <= 102)) return false; }
+    return true;
+  };
+  // One native ownKeys enumeration is unavoidable for exact structured shapes.
+  // Check its size before descriptor reads/copies; no descriptor map or token list.
+  const shape = (v, names, required = names.length) => {
+    if (!v || typeof v !== 'object' || isArray(v)) return null;
+    const p = proto(v); if (p !== null && p !== I.objectProto) return null;
+    const ks = ownKeys(v);
+    if (ks.length < required || ks.length > names.length) return null;
+    const out = tree(); let bits = 0;
+    for (let i = 0; i < ks.length; i++) {
+      const k = ks[i], n = find(names, k); if (n < 0) return null;
+      const d = own(v, k); if (!d || !d.enumerable || !own(d, 'value')) return null;
+      set(out, k, d.value); bits |= 1 << n;
+    }
+    if ((bits & ((1 << required) - 1)) !== (1 << required) - 1) return null;
+    return out;
+  };
+  const has = (v, k) => !!own(v, k);
+  const encodedSize = (v, cap) => {
+    const text = I.stringify(v);
+    return utf8(text, cap);
+  };
+  const expectedOf = value => {
+    if (value === undefined) return null;
+    const e = shape(value, ['recordId', 'pageBytes']);
+    if (!e || !ascii(e.recordId, 128, true) || !integer(e.pageBytes) || e.pageBytes < 4 || e.pageBytes > 32768) return false;
+    return e;
+  };
+  const checkedBody = (value, e) => {
+    if (value && typeof value === 'object' && has(value, 'error')) {
+      const r = shape(value, ['contract', 'error']);
+      if (!r || r.contract !== CONTRACT) return null;
+      const error = shape(r.error, ERROR); if (!error || !ascii(error.code, 128, true) || !ascii(error.reason, 128, true)) return null;
+      let known = false;
+      for (let i = 0; i < PAIRS.length; i++) if (PAIRS[i][0] === error.code && PAIRS[i][1] === error.reason) known = true;
+      if (!known) return null;
+      const result = set(set(tree(), 'contract', CONTRACT), 'error', freeze(error));
+      return encodedSize(result, 262144) < 0 ? null : freeze(result);
+    }
+    const p = shape(value, PAGE); if (!p || p.contract !== CONTRACT || p.encoding !== 'utf-8'
+      || !ascii(p.record_id, 128, true) || (e && p.record_id !== e.recordId)
+      || !ascii(p.revision, 1024) || !hex(p.body_digest) || typeof p.body_present !== 'boolean'
+      || typeof p.complete !== 'boolean' || !integer(p.start_byte) || !integer(p.end_byte) || !integer(p.total_bytes)
+      || p.start_byte > p.end_byte || p.end_byte > p.total_bytes) return null;
+    const limits = shape(p.limits, LIMITS, 2);
+    if (!limits || !integer(limits.max_page_bytes) || limits.max_page_bytes < 4 || limits.max_page_bytes > 32768
+      || !integer(limits.max_response_bytes) || limits.max_response_bytes < 1 || limits.max_response_bytes > 262144) return null;
+    for (let i = 2; i < LIMITS.length; i++) if (has(limits, LIMITS[i]) && (!integer(limits[LIMITS[i]]) || limits[LIMITS[i]] < 1)) return null;
+    const bytes = utf8(p.text, 32768);
+    if (bytes < 0 || bytes !== p.end_byte - p.start_byte || bytes > limits.max_page_bytes || (e && bytes > e.pageBytes)) return null;
+    if (p.complete ? p.end_byte !== p.total_bytes || p.next_cursor !== null
+      : p.end_byte >= p.total_bytes || !ascii(p.next_cursor, 1024) || bytes === 0) return null;
+    if (!p.body_present && (!p.complete || p.total_bytes !== 0 || p.text !== '')) return null;
+    if (p.total_bytes === 0 && p.body_digest !== EMPTY) return null;
+    if (has(limits, 'max_body_bytes') && p.total_bytes > limits.max_body_bytes) return null;
+    // Rebuild rather than replacing a nonwritable validated property.
+    const result = tree();
+    for (let i = 0; i < PAGE.length; i++) set(result, PAGE[i], PAGE[i] === 'limits' ? freeze(limits) : p[PAGE[i]]);
+    return encodedSize(result, limits.max_response_bytes) < 0 ? null : freeze(result);
+  };
+  // Nonrecursive grammar pass. Fixed two frames, fixed vocabulary bitsets,
+  // no token/AST list. Key decoding is bounded; values are scanned in place.
+  const scan = text => {
+    let at = 0, depth = 1, done = false;
+    const frames = [{ names: ROOT, bits: 0, mode: 0, key: '' }, null];
+    const ws = () => { while (at < text.length) { const c = cc(text, at); if (c !== 32 && c !== 9 && c !== 10 && c !== 13) break; at++; } };
+    const digit = c => c >= 48 && c <= 57;
+    const hexDigit = c => c >= 48 && c <= 57 ? c - 48 : c >= 65 && c <= 70 ? c - 55 : c >= 97 && c <= 102 ? c - 87 : -1;
+    const string = key => {
+      if (cc(text, at++) !== 34) return null;
+      let decoded = '', units = 0;
+      while (at < text.length) {
+        let c = cc(text, at++);
+        if (c === 34) return key ? decoded : true;
+        if (c < 32) return null;
+        if (c === 92) {
+          c = cc(text, at++);
+          if (c === 117) {
+            c = 0;
+            for (let n = 0; n < 4; n++) { const h = hexDigit(cc(text, at++)); if (h < 0) return null; c = c * 16 + h; }
+          } else if (c === 98) c = 8; else if (c === 102) c = 12; else if (c === 110) c = 10;
+          else if (c === 114) c = 13; else if (c === 116) c = 9;
+          else if (c !== 34 && c !== 92 && c !== 47) return null;
+        }
+        if (key) { if (++units > 64 || c > 127) return null; decoded += I.fromCharCode(c); }
+      }
+      return null;
+    };
+    const number = () => {
+      if (cc(text, at) === 45) at++;
+      if (cc(text, at) === 48) at++;
+      else { if (!(cc(text, at) >= 49 && cc(text, at) <= 57)) return false; while (digit(cc(text, at))) at++; }
+      if (cc(text, at) === 46) { at++; if (!digit(cc(text, at))) return false; while (digit(cc(text, at))) at++; }
+      if (cc(text, at) === 101 || cc(text, at) === 69) {
+        at++; if (cc(text, at) === 43 || cc(text, at) === 45) at++;
+        if (!digit(cc(text, at))) return false; while (digit(cc(text, at))) at++;
+      }
+      return true;
+    };
+    ws(); if (cc(text, at++) !== 123) return false;
+    while (depth) {
+      ws(); const f = frames[depth - 1], c = cc(text, at);
+      if ((f.mode === 0 || f.mode === 4) && c === 125) {
+        const complete = f.names === ROOT
+          ? f.bits === (1 << 13) - 1 || f.bits === ((1 << 13) | 1) || f.bits === ((1 << 14) | 1)
+          : f.names === LIMITS ? (f.bits & 3) === 3 : f.bits === 3;
+        if (!complete) return false;
+        at++; frames[depth - 1] = null; depth--; if (!depth) done = true; continue;
+      }
+      if (f.mode === 0 || f.mode === 1) {
+        const key = string(true); if (key === null) return false;
+        const n = find(f.names, key); if (n < 0 || (f.bits & (1 << n))) return false;
+        f.bits |= 1 << n; f.key = key; f.mode = 2;
+      } else if (f.mode === 2) { if (c !== 58) return false; at++; f.mode = 3; }
+      else if (f.mode === 4) { if (c !== 44) return false; at++; f.mode = 1; }
+      else {
+        f.mode = 4;
+        if (c === 123) {
+          if (depth !== 1 || (f.key !== 'limits' && f.key !== 'error')) return false;
+          frames[depth++] = { names: f.key === 'limits' ? LIMITS : ERROR, bits: 0, mode: 0, key: '' }; at++;
+        } else if (c === 34) { if (string(false) === null) return false; }
+        else if (c === 45 || digit(c)) { if (!number()) return false; }
+        else if (slice(text, at, at + 4) === 'true' || slice(text, at, at + 4) === 'null') at += 4;
+        else if (slice(text, at, at + 5) === 'false') at += 5;
+        else return false;
+      }
+    }
+    ws(); return done && at === text.length;
+  };
+  const validateBody = (value, expected) => {
+    try {
+      const e = expectedOf(expected); if (e === false) return invalid;
+      const body = checkedBody(value, e); return body ? answer('body', 'response', body) : invalid;
+    } catch { return invalid; }
+  };
+  const decodeHttp = (bytes, expected) => {
+    try {
+      const e = expectedOf(expected); if (e === false) return invalid;
+      if (apply(I.typedName, bytes, []) !== 'Uint8Array') return invalid;
+      const length = apply(I.byteLength, bytes, []); if (!length || length > 262144) return invalid;
+      // Fixed owned snapshot: a growable/shared input cannot enlarge decoding
+      // after the length check. Native set refuses growth beyond this capacity.
+      const snapshot = new I.Bytes(length);
+      apply(I.setBytes, snapshot, [bytes]);
+      const text = apply(I.decode, decoder, [snapshot]); if (!scan(text)) return invalid;
+      const v = I.parse(text); // Only after the complete duplicate-aware scan.
+      if (v && own(v, 'contract')?.value === TRANSPORT) {
+        const t = shape(v, ['contract', 'reason']);
+        if (!t || length > 512 || find(HTTP, t.reason) < 0) return invalid;
+        return answer('transport', 'reason', t.reason);
+      }
+      const body = checkedBody(v, e); return body ? answer('body', 'response', body) : invalid;
+    } catch { return invalid; }
+  };
+  const validateRawRequest = value => {
+    try { return utf8(value, 4096) < 0 ? badRequest : answer('request', 'request_json', value); } catch { return badRequest; }
+  };
+  const validateTypedRequest = value => {
+    try {
+      const r = shape(value, ['record_id', 'page_bytes', 'revision', 'cursor'], 1);
+      if (!r || !ascii(r.record_id, 128, true) || (has(r, 'page_bytes') && (!integer(r.page_bytes) || r.page_bytes < 4 || r.page_bytes > 32768))
+        || has(r, 'revision') !== has(r, 'cursor') || (has(r, 'revision') && (!ascii(r.revision, 1024) || !ascii(r.cursor, 1024)))) return badRequest;
+      const text = I.stringify(r); return utf8(text, 4096) < 0 ? badRequest : answer('request', 'request_json', text);
+    } catch { return badRequest; }
+  };
+  const encodeChannel = (value, kind) => {
+    try {
+      let data, cap;
+      if (kind === 'offering') {
+        const names = ['contract', 'scope', 'max_request_bytes', 'max_response_bytes', 'max_page_bytes', 'max_body_bytes', 'request_timeout_ms', 'max_inflight'];
+        data = shape(value, names);
+        if (!data || data.contract !== CONTRACT || data.scope !== 'viewer-visible-current-bodies' || data.max_request_bytes !== 4096
+          || data.max_response_bytes !== 262144 || data.max_page_bytes !== 32768 || data.max_body_bytes !== 16777216
+          || data.request_timeout_ms !== 5000 || data.max_inflight !== 1) return invalid;
+        cap = 512;
+      } else {
+        const extra = kind === 'request' ? 'request_json' : kind === 'result' ? 'response' : kind === 'transport' ? 'reason' : null;
+        if (!extra && kind !== 'cancel') return invalid;
+        const names = extra ? ['version', 'type', 'request_id', extra] : ['version', 'type', 'request_id'];
+        const input = shape(value, names);
+        const type = kind === 'request' ? 'body-read' : kind === 'result' ? 'body-read-result' : kind === 'transport' ? 'body-read-transport' : 'body-read-cancel';
+        if (!input || input.version !== VERSION || input.type !== type || !ascii(input.request_id, 128, true)) return invalid;
+        data = tree();
+        for (let i = 0; i < 3; i++) set(data, names[i], input[names[i]]);
+        if (kind === 'request') {
+          if (utf8(input.request_json, 4096) < 0) return invalid; set(data, extra, input.request_json); cap = 32768;
+        } else if (kind === 'result') {
+          const body = checkedBody(input.response, null); if (!body) return invalid; set(data, extra, body); cap = 262656;
+        } else if (kind === 'transport') {
+          if (find(LOCAL, input.reason) < 0) return invalid; set(data, extra, input.reason); cap = 512;
+        } else cap = 512;
+      }
+      freeze(data); const bytes = encodedSize(data, cap); if (bytes < 0) return invalid;
+      return freeze(set(set(set(tree(), 'kind', 'encoded'), 'data', data), 'utf8Bytes', bytes));
+    } catch { return invalid; }
+  };
+  // Pure literal mapping only, never reads an exception or server Reply object.
+  const mapHostRefusal = variant => {
+    if (typeof variant !== 'string') return 'protocol';
+    if (variant === 'InvalidIngress') return 'invalid_message';
+    if (variant === 'Busy') return 'busy';
+    if (variant === 'MountUnavailable' || variant === 'AuthCatalog') return 'mount_unavailable';
+    if (variant === 'Deadline') return 'timeout';
+    if (variant === 'Cancelled') return 'cancelled';
+    return 'protocol';
+  };
+  return freeze({ decodeHttp, validateBody, validateTypedRequest, validateRawRequest, encodeChannel, mapHostRefusal });
+}
+// Trusted bootstrap capture precedes author code. This lane has no source/token.
+function bodyFrameFactory(I) {
+  const {wire,apply,create,define,freeze,own,keys,proto,objectProto,Promise: BasePromise,then,parse,
+    listen,unlisten,post,timer,clear,aborted,safeInteger} = I;
+  const data=(o,k,v)=>{const d=create(null);d.value=v;d.enumerable=true;define(o,k,d);return o;};
+  const P=class extends BasePromise {};const species=create(null);species.value=P;define(P,I.species,species);freeze(P.prototype);freeze(P);
+  const error=reason=>freeze(data(data(create(null),'name','BodyTransportError'),'reason',reason));
+  const reject=reason=>{const p=new P((_,no)=>no(error(reason)));apply(then,p,[undefined,()=>{}]);return p;};
+  const shape=o=>{if(!o||typeof o!=='object'||(proto(o)!==objectProto&&proto(o)!==null))throw 0;
+    const list=keys(o);if(list.length>1)throw 0;let signal;
+    for(let n=0;n<list.length;n++){if(list[n]!=='signal')throw 0;const d=own(o,'signal');if(!d||!d.enumerable||!own(d,'value'))throw 0;signal=d.value;}
+    if(signal!==undefined)apply(aborted,signal,[]);return signal;};
+  let port=null,offering=null,enabled=false,closed=false,pending=null,sequence=0;
+  const isAborted=s=>s!==undefined&&apply(aborted,s,[])===true;
+  const send=(id,kind,extra)=>{const v=create(null);data(v,'version','native.html.bridge.v1');data(v,'type',kind==='request'?'body-read':'body-read-cancel');data(v,'request_id',id);
+    if(kind==='request')data(v,'request_json',extra);const e=wire.encodeChannel(v,kind);if(e.kind!=='encoded')throw 0;post(port,e.data);};
+  const finish=(p,reason,value,cancel)=>{if(pending!==p)return;if(cancel){try{send(p.id,'cancel');}catch{}}
+    pending=null;clear(p.timer);if(p.signal!==undefined)try{unlisten(p.signal,'abort',p.abort);}catch{}
+    if(reason)p.no(error(reason));else p.yes(value);};
+  const close=()=>{if(closed)return;closed=true;enabled=false;offering=null;if(pending)finish(pending,'closed',undefined,true);port=null;};
+  const request=(value,options,raw)=>{
+    try {
+      const signal=options===undefined?undefined:shape(options);
+      if(isAborted(signal))return reject('cancelled');
+      if(closed)return reject('closed');if(!enabled||!port||!offering)return reject('not_offered');
+      const checked=raw?wire.validateRawRequest(value):wire.validateTypedRequest(value);
+      if(checked.kind!=='request')return reject('invalid_message');if(pending)return reject('busy');
+      if(!safeInteger(sequence+1)){close();return reject('closed');}
+      let expected=null;if(!raw){const q=parse(checked.request_json),id=own(q,'record_id'),size=own(q,'page_bytes');expected={id:id.value,bytes:size?size.value:32768};}
+      const id='body-'+(++sequence);
+      const promise=new P((yes,no)=>{
+        const p={id,yes,no,signal,expected,timer:null,abort:null};pending=p;
+        p.abort=()=>{try{if(isAborted(signal))finish(p,'cancelled',undefined,true);}catch{finish(p,'invalid_message',undefined,true);}};
+        p.timer=timer(()=>{finish(p,'timeout',undefined,true);close();},10000);
+        try{if(signal!==undefined)listen(signal,'abort',p.abort);if(isAborted(signal)){finish(p,'cancelled',undefined,true);return;}send(id,'request',checked.request_json);}catch{finish(p,'protocol',undefined,false);close();}
+      });
+      // Observe rejection even if author abandons the promise; no diagnostics.
+      apply(then,promise,[undefined,()=>{}]);return promise;
+    } catch { return reject('invalid_message'); }
+  };
+  const api=create(null);data(api,'readPage',(value,options)=>request(value,options,false));data(api,'readPageRaw',(value,options)=>request(value,options,true));
+  const d=create(null);d.get=()=>enabled&&!closed?offering:null;d.enumerable=true;define(api,'offering',d);freeze(api);
+  return freeze({api,close,
+    connect:(p,candidate,feature)=>{try{if(closed||port)return;port=p;const e=wire.encodeChannel(candidate,'offering');if(feature===true&&e.kind==='encoded')offering=e.data;}catch{offering=null;}},
+    ready:()=>{enabled=!!offering&&!closed;return enabled;},
+    receive:(value,ports)=>{try{
+      const t=own(value,'type');if(!t||!own(t,'value')||(t.value!=='body-read-result'&&t.value!=='body-read-transport'))return false;
+      if(ports.length!==0){close();return true;}const kind=t.value==='body-read-result'?'result':'transport';const e=wire.encodeChannel(value,kind);
+      if(e.kind!=='encoded'){close();return true;}const v=e.data,p=pending;if(!p||v.request_id!==p.id)return true;
+      if(isAborted(p.signal)){finish(p,'cancelled',undefined,true);return true;}
+      if(kind==='transport'){finish(p,v.reason);return true;}
+      const b=v.response;if(p.expected&&!b.error&&(b.record_id!==p.expected.id||b.end_byte-b.start_byte>p.expected.bytes)){finish(p,'protocol');close();return true;}
+      finish(p,null,b);return true;
+    }catch{close();return true;}}
+  });
+}
+/* END GENERATED BODY FACTORIES */
+const bodySafeInteger=Number.isSafeInteger,bodyTyped=parentOf(Uint8Array.prototype),bodyWire=bodyWireFactory({
+ apply,create:Object.create,define,freeze:freezeObject,own,ownKeys:Reflect.ownKeys,proto:parentOf,objectProto:Object.prototype,isArray,
+ charCode:String.prototype.charCodeAt,slice:String.prototype.slice,fromCharCode:String.fromCharCode,safeInteger:Number.isSafeInteger,
+ parse:jsonParse,stringify:jsonStringify,Encoder:TextEncoder,Decoder:TextDecoder,decode:TextDecoder.prototype.decode,
+ Bytes:Uint8Array,setBytes:Uint8Array.prototype.set,byteLength:own(bodyTyped,"byteLength").get,typedName:own(bodyTyped,Symbol.toStringTag).get
+});
+const bodyLane=bodyFrameFactory({wire:bodyWire,apply,create:Object.create,define,freeze:freezeObject,own,keys:Reflect.ownKeys,proto:parentOf,objectProto:Object.prototype,
+ Promise:NativePromise,species:Symbol.species,then:NativePromise.prototype.then,parse:jsonParse,listen,unlisten,post,timer:setTimer,clear:clearTimer,
+ aborted:getter(parentOf(read(contextSignal,new contextAbort())),"aborted"),safeInteger:Number.isSafeInteger});
+// Body-only initialization never sends an arbitrary failure to legacy diagnostics.
+function initializeBody(data){try{const offered=own(data,"body_read"),features=own(data,"host_features");let feature=false;
+ if(features&&features.enumerable&&own(features,"value")&&isArray(features.value)){const count=own(features.value,"length");
+  if(count&&own(count,"value")&&bodySafeInteger(count.value)&&count.value<=32){for(let i=0;i<count.value;i++){const d=own(features.value,NativeString(i));if(!d||!d.enumerable||!own(d,"value")||typeof d.value!=="string"){feature=false;break;}if(d.value==="records.body.read.v1")feature=true;}}}
+ bodyLane.connect(channel,offered&&offered.enumerable&&own(offered,"value")?offered.value:undefined,feature);bodyLane.ready();
+}catch{bodyLane.close();}}
+define(window,"nativeArtifact",{value:freezeObject({ready,propose,arm,bodyAttempt:bodyAttemptApi,publishLocation,read:readNeed,body:bodyLane.api,onInput,onReveal,setViewState,registerContextReporter,get input(){return heldInput},get inputDelivery(){return freezeObject({basis:"delivery_only",digest:typeof heldDigest==="string"?heldDigest:null,deliverySeq:contextInteger(heldSeq)&&heldSeq>=0?heldSeq:null})},get viewState(){return heldViewState}}),writable:false,configurable:false});
 const bounded=value=>NativeString(value??"").slice(0,512);
 const send=value=>{if(channel)post(channel,value);else if(queued.length<32)pushValue(queued,value)};
 const report=(code,detail={})=>send({version:VERSION,type:"diagnostic",code,detail});
@@ -193,15 +712,16 @@ function navigationDisposition(event){return read(mouseCtrl,event)===true||read(
 function navigationMessage(link,newTab){const message={version:VERSION,type:"navigation",recordId:attribute(link,"data-native-record-id"),href:attribute(link,"data-native-external-url")};if(newTab===true)message.newTab=true;return message}
 listen(window,"click",event=>{if(!trusted(event)||prevented(event))return;const target=read(eventTarget,event),link=isElement(target)?closest(target,"[data-native-record-id],[data-native-external-url]"):null;if(!link)return;prevent(event);send(navigationMessage(link,navigationDisposition(event)))},true);
 listen(window,"auxclick",event=>{if(!trusted(event)||prevented(event))return;if(read(mouseButton,event)!==1)return;const target=read(eventTarget,event),link=isElement(target)?closest(target,"[data-native-record-id],[data-native-external-url]"):null;if(!link)return;prevent(event);send(navigationMessage(link,true))},true);
-function receive(event){const data=read(messageData,event),ports=read(messagePorts,event);if(initialized||read(messageSource,event)!==parent||read(messageOrigin,event)!==HOST||data?.type!=="native-html-init"||data?.version!==VERSION||ports.length!==1)return;stop(event);initialized=true;unlisten(window,"message",receive,true);channel=ports[0];listen(channel,"message",message=>{const commandData=read(messageData,message);if(commandData?.version!==VERSION)return;if(commandData?.type==="command"&&["first","previous","next","last"].includes(commandData.action))command(commandData.action);else if(commandData?.type==="input")deliverInput(commandData);else if(commandData?.type==="intent-result")settleIntent(commandData);else if(commandData?.type==="read-result")settleRead(commandData)});start(channel);listen(window,"pagehide",event=>{if(trusted(event)&&read(pageTransitionPersisted,event)!==true)send({version:VERSION,type:"unloading"})},true);try{if(isArray(data.needs))for(const need of data.needs)if(intentId(need)&&offeredNeeds.length<32)pushValue(offeredNeeds,need);const input=freeze(data.input);heldInput=input;if(typeof data.input_digest==="string")heldDigest=data.input_digest;const initRevision=data.revision;if(initRevision&&typeof initRevision==="object"&&typeof initRevision.content_event_seq==="number")heldSeq=initRevision.content_event_seq;const incomingViewState=data.view_state;if(incomingViewState&&typeof incomingViewState==="object"&&!isArray(incomingViewState)&&"value"in incomingViewState){const envelope={value:incomingViewState.value};if(incomingViewState.schema!==undefined)envelope.schema=incomingViewState.schema;if(incomingViewState.from_body_digest!==undefined)envelope.from_body_digest=incomingViewState.from_body_digest;heldViewState=freeze(envelope)}setupSlides();resolveReady(heldViewState===undefined?freezeObject({input}):freezeObject({input,viewState:heldViewState}));send({version:VERSION,type:"ready",profile:slides.length?"slides":"document",slides:slides.length});for(const item of queued)post(channel,item);queued=[]}catch(error){rejectReady(error);report("html_delivery_failed",{message:bounded(error)})}}
+function receive(event){const data=read(messageData,event),ports=read(messagePorts,event);if(initialized||read(messageSource,event)!==parent||read(messageOrigin,event)!==HOST||data?.type!=="native-html-init"||data?.version!==VERSION||ports.length!==1)return;stop(event);initialized=true;unlisten(window,"message",receive,true);channel=ports[0];listen(channel,"message",message=>{const commandData=read(messageData,message);if(bodyLane.receive(commandData,read(messagePorts,message)))return;if(commandData?.version!==VERSION)return;if(commandData?.type==="command"&&["first","previous","next","last"].includes(commandData.action))command(commandData.action);else if(commandData?.type==="input")deliverInput(commandData);else if(commandData?.type==="body-attempt-result")settleBodyAttempt(commandData);else if(commandData?.type==="intent-result")settleIntent(commandData);else if(commandData?.type==="read-result")settleRead(commandData);else if(commandData?.type==="intent-arm-ack")settleArmAck(commandData);else if(commandData?.type==="intent-arm-result")settleArmResult(commandData);else if(commandData?.type==="reveal")deliverReveal(commandData);else if(commandData?.type==="reveal-clear")pendingReveal=null;else if(commandData?.type==="context-request"||commandData?.type==="context-cancel")receiveContext(commandData)});start(channel);listen(channel,"messageerror",closeBodyAttempts);listen(channel,"close",closeBodyAttempts);listen(window,"pagehide",closeBodyAttempts,true);listen(channel,"messageerror",bodyLane.close);listen(channel,"close",bodyLane.close);listen(window,"pagehide",bodyLane.close,true);listen(window,"unload",bodyLane.close,true);listen(channel,"messageerror",clearReveal);listen(channel,"close",clearReveal);listen(channel,"messageerror",closeContext);listen(channel,"close",closeContext);listen(window,"pagehide",event=>{pendingReveal=null;if(trusted(event)&&read(pageTransitionPersisted,event)!==true){closeContext();send({version:VERSION,type:"unloading"})}},true);listen(window,"unload",clearReveal,true);listen(window,"unload",closeContext,true);try{if(isArray(data.needs))for(const need of data.needs)if(intentId(need)&&offeredNeeds.length<32)pushValue(offeredNeeds,need);if(isArray(data.host_features))for(const feature of data.host_features)if(feature==="intent-arm-confirm.v1")armFeature=true;else if(feature===CONTEXT_FEATURE)contextFeature=true;else if(feature===LOCATION_FEATURE)locationFeature=true;if(isArray(data.host_features)&&apply(arrayIncludes,data.host_features,[BODY_ATTEMPT_FEATURE])&&bodyAttemptId(data.body_attempt?.generation))bodyAttemptGeneration=data.body_attempt.generation;initializeBody(data);const input=freeze(data.input);heldInput=input;if(typeof data.input_digest==="string")heldDigest=data.input_digest;const initRevision=data.revision;if(initRevision&&typeof initRevision==="object"&&typeof initRevision.content_event_seq==="number")heldSeq=initRevision.content_event_seq;const incomingViewState=data.view_state;if(incomingViewState&&typeof incomingViewState==="object"&&!isArray(incomingViewState)&&"value"in incomingViewState){const envelope={value:incomingViewState.value};if(incomingViewState.schema!==undefined)envelope.schema=incomingViewState.schema;if(incomingViewState.from_body_digest!==undefined)envelope.from_body_digest=incomingViewState.from_body_digest;heldViewState=freeze(envelope)}setupSlides();resolveReady(heldViewState===undefined?freezeObject({input}):freezeObject({input,viewState:heldViewState}));send({version:VERSION,type:"ready",profile:slides.length?"slides":"document",slides:slides.length,features:[REVEAL_FEATURE,...(contextFeature?[CONTEXT_FEATURE]:[]),...(locationFeature?[LOCATION_FEATURE]:[]),...(bodyLane.api.offering?["records.body.read.v1"]:[])]});publishContextRegistration();for(const item of queued)post(channel,item);queued=[]}catch(error){rejectReady(error);report("html_delivery_failed",{message:bounded(error)})}}
 listen(window,"message",receive,true);
-const hostPost=parent.postMessage;apply(hostPost,parent,[{type:"native-html-bootstrap",version:VERSION},HOST]);
+const hostPost=parent.postMessage;apply(hostPost,parent,[{type:"native-html-bootstrap",version:VERSION,features:[CONTEXT_FEATURE,"records.body.read.v1"]},HOST]);
 })();"#;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeConfig {
     pub workbench_origin: String,
     pub artifact_origin: String,
+    additional_parent_origins: Vec<String>,
 }
 
 impl RuntimeConfig {
@@ -219,7 +739,96 @@ impl RuntimeConfig {
         Ok(Self {
             workbench_origin,
             artifact_origin,
+            additional_parent_origins: Vec::new(),
         })
+    }
+
+    pub fn with_parent_origins(
+        mut self,
+        origins: impl IntoIterator<Item = impl AsRef<str>>,
+    ) -> Result<Self> {
+        for raw in origins {
+            let raw = raw.as_ref();
+            let canonical = Self::exact_parent_origin(raw)?;
+            if canonical == self.artifact_origin {
+                return Err(Error::engine(
+                    "parent origin must not equal artifact origin",
+                ));
+            }
+            if canonical == self.workbench_origin {
+                continue;
+            }
+            if !self.additional_parent_origins.contains(&canonical) {
+                self.additional_parent_origins.push(canonical);
+            }
+        }
+        Ok(self)
+    }
+
+    pub fn resolve_parent_origin(&self, requested: Option<&str>) -> Result<String> {
+        let Some(raw) = requested else {
+            if self.workbench_origin == self.artifact_origin {
+                return Err(Error::engine(
+                    "parent origin must not equal artifact origin",
+                ));
+            }
+            return Ok(self.workbench_origin.clone());
+        };
+        let canonical = Self::exact_parent_origin(raw)?;
+        if canonical == self.artifact_origin {
+            return Err(Error::engine(
+                "parent origin must not equal artifact origin",
+            ));
+        }
+        if canonical == self.workbench_origin || self.additional_parent_origins.contains(&canonical)
+        {
+            return Ok(canonical);
+        }
+        Err(Error::engine("parent origin is not allowlisted"))
+    }
+
+    fn exact_parent_origin(raw: &str) -> Result<String> {
+        if raw.trim() != raw || raw.chars().any(char::is_control) || raw.contains('*') {
+            return Err(Error::engine(
+                "parent origin must be exact, without whitespace, controls or wildcards",
+            ));
+        }
+        // URL parsing normalizes dot paths and backslashes. Check the raw
+        // authority too, so those spellings cannot masquerade as exact origins.
+        let authority = raw
+            .split_once("://")
+            .map(|(_, rest)| rest)
+            .ok_or_else(|| Error::engine("parent origin must contain a scheme and authority"))?;
+        let authority = authority.strip_suffix('/').unwrap_or(authority);
+        if authority.contains(['/', '\\', '@', '?', '#']) {
+            return Err(Error::engine(
+                "parent origin must contain only an authority",
+            ));
+        }
+        let canonical = exact_origin(raw, "parent origin")?;
+        if canonical.contains('*') {
+            return Err(Error::engine("parent origin must not contain '*'"));
+        }
+        Self::check_parent_scheme(&canonical)?;
+        Ok(canonical)
+    }
+
+    fn check_parent_scheme(canonical: &str) -> Result<()> {
+        let parsed = Url::parse(canonical).map_err(|_| Error::engine("invalid parent origin"))?;
+        if parsed.scheme() == "https" {
+            return Ok(());
+        }
+        let host = parsed.host_str().unwrap_or("");
+        // Keep this identical to the serving binary's public-origin rule.
+        // Url::host_str retains brackets around IPv6 addresses.
+        let loopback = matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]")
+            || host.ends_with(".localhost");
+        if parsed.scheme() == "http" && loopback {
+            return Ok(());
+        }
+        Err(Error::engine(
+            "parent origin must be HTTPS (HTTP allowed only on loopback)",
+        ))
     }
 }
 
@@ -416,7 +1025,7 @@ struct Inspection {
     profile: Option<String>,
     mains: usize,
     h1: usize,
-    headings: Vec<u8>,
+    headings: Vec<(u8, String)>,
     css: Vec<String>,
     assets: Vec<String>,
     deck_slides: Vec<(String, String, bool)>,
@@ -430,7 +1039,67 @@ struct Inspection {
     /// scan can pair bodies by index and recover the body offset each script
     /// parsed at. Non-JS bodies are recorded but never analyzed.
     scripts: Vec<crate::write_diagnostics::ScriptElement>,
+    /// Elements seen so far per lower-case tag name, so a finding can name
+    /// which occurrence of its element it came from.
+    tag_counts: HashMap<String, usize>,
+    /// Every rejection found by the walk, in document order. The walk records
+    /// rather than returns so that one write reports all of them.
+    violations: Vec<Violation>,
+    /// Accessibility and layout conventions the source does not meet. These
+    /// become located write warnings and never reject a write.
+    advisories: Vec<Advisory>,
 }
+
+/// An element's lower-case tag name and its zero-based occurrence among
+/// elements of that name, in DOM order.
+type ElementRef = (String, usize);
+
+struct Violation {
+    failure: ValidationFailure,
+    element: Option<ElementRef>,
+}
+
+impl From<ValidationFailure> for Violation {
+    fn from(failure: ValidationFailure) -> Self {
+        Self {
+            failure,
+            element: None,
+        }
+    }
+}
+
+struct Advisory {
+    code: &'static str,
+    message: String,
+    element: Option<ElementRef>,
+}
+
+impl Inspection {
+    fn violate(&mut self, failure: ValidationFailure, element: &ElementRef) {
+        self.violations.push(Violation {
+            failure,
+            element: Some(element.clone()),
+        });
+    }
+
+    fn advise(
+        &mut self,
+        code: &'static str,
+        message: impl Into<String>,
+        element: Option<ElementRef>,
+    ) {
+        self.advisories.push(Advisory {
+            code,
+            message: message.into(),
+            element,
+        });
+    }
+}
+
+/// The most rejections one failure lists; the rest are counted, not named.
+const VIOLATION_REPORT_LIMIT: usize = 20;
+/// The most accessibility warnings one write reports.
+const ADVISORY_REPORT_LIMIT: usize = 20;
 
 fn attrs(handle: &Handle) -> BTreeMap<String, String> {
     let NodeData::Element { attrs, .. } = &handle.data else {
@@ -792,39 +1461,253 @@ pub(crate) fn source_position(source: &str, byte_offset: usize) -> (usize, usize
     (line, column)
 }
 
-fn attach_source_location(source: &str, failure: &mut ValidationFailure) {
-    let rule = failure
-        .details
-        .get("rule")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
+/// Byte offsets of authored start tags, grouped by lower-case tag name, in
+/// source order. Comments, raw-text element bodies and `<template>` contents
+/// (which the parsed DOM keeps outside the walked tree) are skipped, so a
+/// lookalike inside them is never counted as an element. The parsed DOM
+/// remains the authority for which elements exist: callers use an offset only
+/// when the DOM and the source agree on how many elements of that name exist.
+fn start_tag_offsets(source: &str) -> HashMap<String, Vec<usize>> {
     let lower = source.to_ascii_lowercase();
-    let needle = match rule {
-        "external-script" | "import-map" => Some("<script"),
-        "external-link-resource" => Some("<link"),
-        "meta-http-equiv" => Some("<meta"),
-        "forbidden-element" => [
-            "<iframe",
-            "<frame",
-            "<fencedframe",
-            "<portal",
-            "<object",
-            "<embed",
-        ]
-        .into_iter()
-        .find(|needle| lower.contains(needle)),
-        "form-action" => Some("<form"),
-        "host-navigation" => Some("data-native-"),
-        _ => None,
-    };
-    let Some(offset) = needle.and_then(|needle| lower.find(needle)) else {
-        return;
-    };
-    let (line, column) = source_position(source, offset);
-    if let Some(details) = failure.details.as_object_mut() {
-        details.insert("line".into(), json!(line));
-        details.insert("column".into(), json!(column));
+    let bytes = lower.as_bytes();
+    let mut found: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut cursor = 0;
+    while let Some(relative) = lower[cursor..].find('<') {
+        let start = cursor + relative;
+        if lower[start..].starts_with("<!--") {
+            cursor = lower[start + 4..]
+                .find("-->")
+                .map_or(lower.len(), |end| start + 4 + end + 3);
+            continue;
+        }
+        let name_start = start + 1;
+        let name_end = bytes[name_start..]
+            .iter()
+            .take_while(|byte| byte.is_ascii_alphanumeric() || **byte == b'-')
+            .count()
+            + name_start;
+        let name = &lower[name_start..name_end];
+        let Some(end) = tag_end(source, name_end) else {
+            break;
+        };
+        let is_tag = bytes.get(name_start).is_some_and(u8::is_ascii_alphabetic)
+            && bytes
+                .get(name_end)
+                .is_some_and(|byte| byte.is_ascii_whitespace() || *byte == b'>' || *byte == b'/');
+        if is_tag {
+            found.entry(name.to_owned()).or_default().push(start);
+        }
+        if is_tag && name == "plaintext" {
+            break;
+        }
+        if is_tag
+            && matches!(
+                name,
+                "script"
+                    | "style"
+                    | "title"
+                    | "textarea"
+                    | "noscript"
+                    | "xmp"
+                    | "noembed"
+                    | "noframes"
+                    | "iframe"
+                    | "template"
+            )
+        {
+            let close = format!("</{name}");
+            cursor = lower[end..]
+                .find(&close)
+                .map_or(lower.len(), |offset| end + offset);
+            if cursor == lower.len() {
+                break;
+            }
+            cursor += 2;
+            continue;
+        }
+        cursor = end;
     }
+    found
+}
+
+/// Where an element's start tag was authored, when the DOM and the source
+/// agree on how many elements of that name exist.
+fn element_position(
+    source: &str,
+    offsets: &HashMap<String, Vec<usize>>,
+    dom_counts: &HashMap<String, usize>,
+    (name, index): &ElementRef,
+) -> Option<(usize, usize)> {
+    let found = offsets.get(name)?;
+    if found.len() != dom_counts.get(name).copied().unwrap_or_default() {
+        return None;
+    }
+    found
+        .get(*index)
+        .map(|offset| source_position(source, *offset))
+}
+
+fn advisory_diagnostics(
+    source: &str,
+    offsets: &HashMap<String, Vec<usize>>,
+    inspection: &Inspection,
+) -> Vec<crate::write_diagnostics::WriteDiagnostic> {
+    inspection
+        .advisories
+        .iter()
+        .take(ADVISORY_REPORT_LIMIT)
+        .map(|advisory| {
+            let position = advisory.element.as_ref().and_then(|element| {
+                element_position(source, offsets, &inspection.tag_counts, element)
+            });
+            let mut message = advisory.message.clone();
+            if position.is_none() && advisory.element.is_some() {
+                message.push_str(" (source position unavailable)");
+            }
+            let (line, column) = position.unwrap_or((1, 1));
+            crate::write_diagnostics::WriteDiagnostic::new(
+                advisory.code,
+                message,
+                None,
+                line,
+                column,
+            )
+        })
+        .collect()
+}
+
+/// Fold every rejection into one failure. A lone rejection is returned as it
+/// always was; several are listed in the message, each with its location, and
+/// carried structurally under `details.violations`.
+fn report_violations(
+    source: &str,
+    offsets: &HashMap<String, Vec<usize>>,
+    dom_counts: &HashMap<String, usize>,
+    violations: Vec<Violation>,
+) -> ValidationFailure {
+    let count = violations.len();
+    let mut failures: Vec<ValidationFailure> = violations
+        .into_iter()
+        .map(|violation| {
+            let mut failure = violation.failure;
+            let position = violation
+                .element
+                .as_ref()
+                .and_then(|element| element_position(source, offsets, dom_counts, element));
+            if let (Some((line, column)), Some(details)) =
+                (position, failure.details.as_object_mut())
+            {
+                details.entry("line").or_insert(json!(line));
+                details.entry("column").or_insert(json!(column));
+            }
+            failure
+        })
+        .collect();
+    if count == 1 {
+        return failures.remove(0);
+    }
+    let listed = failures
+        .iter()
+        .take(VIOLATION_REPORT_LIMIT)
+        .enumerate()
+        .map(|(index, failure)| {
+            let location = match (
+                failure.details.get("line").and_then(Value::as_u64),
+                failure.details.get("column").and_then(Value::as_u64),
+            ) {
+                (Some(line), Some(column)) => format!(" at line {line}, column {column}"),
+                _ => String::new(),
+            };
+            let rule = failure
+                .details
+                .get("rule")
+                .and_then(Value::as_str)
+                .unwrap_or(failure.code);
+            format!("({}) {}{location} [{rule}]", index + 1, failure.message)
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    let mut message = format!("{count} problems; fix all of them before resubmitting: {listed}");
+    if count > VIOLATION_REPORT_LIMIT {
+        message.push_str(&format!("; and {} more", count - VIOLATION_REPORT_LIMIT));
+    }
+    let first = &failures[0];
+    let mut details = first.details.clone();
+    if let Some(object) = details.as_object_mut() {
+        object.remove("line");
+        object.remove("column");
+        object.insert("violation_count".into(), json!(count));
+        object.insert(
+            "violations".into(),
+            Value::Array(
+                failures
+                    .iter()
+                    .take(VIOLATION_REPORT_LIMIT)
+                    .map(|failure| {
+                        json!({"code":failure.code,"message":failure.message,"details":failure.details})
+                    })
+                    .collect(),
+            ),
+        );
+    }
+    ValidationFailure::new(first.code, message, details)
+}
+
+fn heading_order_diagnostics(
+    source: &str,
+    tag_offsets: &HashMap<String, Vec<usize>>,
+    headings: &[(u8, String)],
+) -> Vec<crate::write_diagnostics::WriteDiagnostic> {
+    let mut offsets = (1..=6u8)
+        .flat_map(|level| {
+            tag_offsets
+                .get(&format!("h{level}"))
+                .into_iter()
+                .flatten()
+                .map(move |offset| (level, *offset))
+        })
+        .collect::<Vec<_>>();
+    offsets.sort_by_key(|(_, offset)| *offset);
+    let positions_match = offsets.len() == headings.len()
+        && offsets
+            .iter()
+            .zip(headings)
+            .all(|(offset, heading)| offset.0 == heading.0);
+    headings
+        .windows(2)
+        .enumerate()
+        .filter(|(_, pair)| pair[1].0 > pair[0].0 + 1)
+        .take(20)
+        .map(|(index, pair)| {
+            let (line, column) = if positions_match {
+                source_position(source, offsets[index + 1].1)
+            } else {
+                (1, 1)
+            };
+            let label = |heading: &(u8, String)| {
+                format!(
+                    "h{} {:?}",
+                    heading.0,
+                    heading.1.trim().chars().take(80).collect::<String>()
+                )
+            };
+            let mut message = format!(
+                "heading levels skip from {} to {}; review the hierarchy",
+                label(&pair[0]),
+                label(&pair[1])
+            );
+            if !positions_match {
+                message.push_str(" (source position unavailable)");
+            }
+            crate::write_diagnostics::WriteDiagnostic::new(
+                "heading-order",
+                message,
+                None,
+                line,
+                column,
+            )
+        })
+        .collect()
 }
 
 pub(crate) fn tag_end(source: &str, start: usize) -> Option<usize> {
@@ -937,6 +1820,9 @@ fn inspect_node(
     if let NodeData::Element { name, .. } = &node.data {
         let tag = name.local.to_string().to_ascii_lowercase();
         let attributes = attrs(node);
+        let occurrence = inspection.tag_counts.entry(tag.clone()).or_default();
+        let element = (tag.clone(), *occurrence);
+        *occurrence += 1;
         if let Some(id) = attributes.get("id") {
             if valid_js_identifier(id) {
                 inspection.element_ids.push(id.clone());
@@ -957,11 +1843,14 @@ fn inspect_node(
                     children_in_deck = true;
                 }
             }
-            "h1" => {
-                inspection.h1 += 1;
-                inspection.headings.push(1);
+            "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
+                if tag == "h1" {
+                    inspection.h1 += 1;
+                }
+                inspection
+                    .headings
+                    .push((tag.as_bytes()[1] - b'0', text_content(node)));
             }
-            "h2" | "h3" | "h4" | "h5" | "h6" => inspection.headings.push(tag.as_bytes()[1] - b'0'),
             "style" => inspection.css.push(text_content(node)),
             "meta" => {
                 let http_equiv = attributes.get("http-equiv").map(|v| v.to_ascii_lowercase());
@@ -981,46 +1870,59 @@ fn inspect_node(
                 }
                 if meta_name.as_deref() == Some("native-artifact-profile") {
                     if inspection.profile.is_some() {
-                        return Err(policy(
-                            "profile meta must occur at most once",
-                            "profile-count",
-                        ));
+                        inspection.violate(
+                            policy("profile meta must occur at most once", "profile-count"),
+                            &element,
+                        );
+                    } else {
+                        inspection.profile = attributes
+                            .get("content")
+                            .map(|v| v.trim().to_ascii_lowercase());
                     }
-                    inspection.profile = attributes
-                        .get("content")
-                        .map(|v| v.trim().to_ascii_lowercase());
                 }
                 if meta_name.as_deref() == Some("native-artifact-manifest") {
-                    let Some(value) = attributes.get("content") else {
-                        return Err(declaration_failure(
-                            "native-artifact-manifest meta requires a content attribute",
-                            "declaration-content",
-                        ));
-                    };
-                    inspection.declaration_values.push(value.clone());
+                    match attributes.get("content") {
+                        Some(value) => inspection.declaration_values.push(value.clone()),
+                        None => inspection.violate(
+                            declaration_failure(
+                                "native-artifact-manifest meta requires a content attribute",
+                                "declaration-content",
+                            ),
+                            &element,
+                        ),
+                    }
                 }
                 if matches!(
                     http_equiv.as_deref(),
                     Some("content-security-policy" | "refresh")
                 ) {
-                    return Err(policy(
-                        "authored CSP and refresh meta are forbidden",
-                        "meta-http-equiv",
-                    ));
+                    inspection.violate(
+                        policy(
+                            "authored CSP and refresh meta are forbidden",
+                            "meta-http-equiv",
+                        ),
+                        &element,
+                    );
                 }
             }
             "base" | "iframe" | "frame" | "fencedframe" | "portal" | "object" | "embed" => {
-                return Err(policy(format!("<{tag}> is forbidden"), "forbidden-element"))
+                inspection.violate(
+                    policy(format!("<{tag}> is forbidden"), "forbidden-element"),
+                    &element,
+                );
             }
             "script" => {
                 if attributes.contains_key("src") {
-                    return Err(policy("script[src] is forbidden", "external-script"));
+                    inspection.violate(
+                        policy("script[src] is forbidden", "external-script"),
+                        &element,
+                    );
                 }
                 if attributes
                     .get("type")
                     .is_some_and(|v| v.eq_ignore_ascii_case("importmap"))
                 {
-                    return Err(policy("import maps are forbidden", "import-map"));
+                    inspection.violate(policy("import maps are forbidden", "import-map"), &element);
                 }
                 let is_manifest = attributes
                     .get("type")
@@ -1044,21 +1946,21 @@ fn inspect_node(
                             ),
                     });
             }
-            "link" => {
-                return Err(policy(
+            "link" => inspection.violate(
+                policy(
                     "link elements are forbidden; artifacts are self-contained",
                     "external-link-resource",
-                ))
-            }
+                ),
+                &element,
+            ),
             "form" if attributes.contains_key("action") => {
-                return Err(policy("form[action] is forbidden", "form-action"))
+                inspection.violate(policy("form[action] is forbidden", "form-action"), &element)
             }
-            "img" if !attributes.contains_key("alt") => {
-                return Err(policy(
-                    "every image must carry alt (empty for decorative images)",
-                    "image-alt",
-                ));
-            }
+            "img" if !attributes.contains_key("alt") => inspection.advise(
+                "image-alt",
+                "image has no alt; describe it, or use alt=\"\" if it is decorative",
+                Some(element.clone()),
+            ),
             "section" if in_deck && attributes.contains_key("data-native-slide") => {
                 let id = attributes.get("id").cloned().unwrap_or_default();
                 let labelled = attributes
@@ -1072,17 +1974,32 @@ fn inspect_node(
         }
         if attributes
             .get("tabindex")
-            .and_then(|v| v.parse::<i32>().ok())
+            .and_then(|v| v.trim().parse::<i32>().ok())
             .is_some_and(|v| v > 0)
         {
-            return Err(policy(
-                "positive tabindex is forbidden",
+            inspection.advise(
                 "positive-tabindex",
-            ));
+                format!("<{tag}> has a positive tabindex, which overrides the natural focus order; use 0 or -1"),
+                Some(element.clone()),
+            );
         }
         if let Some(style) = attributes.get("style") {
             inspection.css.push(style.clone());
         }
+        // An element already rejected by name (link, script[src], iframe,
+        // form[action]) is reported once, not again for its URL attribute.
+        let element_rejected = inspection.violations.last().is_some_and(|violation| {
+            violation.element.as_ref() == Some(&element)
+                && matches!(
+                    violation.failure.details["rule"].as_str(),
+                    Some(
+                        "external-script"
+                            | "external-link-resource"
+                            | "forbidden-element"
+                            | "form-action"
+                    )
+                )
+        });
         for (key, value) in &attributes {
             if key.starts_with("on")
                 || key == "style"
@@ -1138,36 +2055,51 @@ fn inspect_node(
             if matches!(
                 key.as_str(),
                 "href" | "src" | "srcset" | "poster" | "action" | "formaction" | "xlink:href"
-            ) {
-                return Err(policy(
-                    format!("URL-bearing attribute {key} on <{tag}> is forbidden"),
-                    "url-attribute",
-                ));
+            ) && !element_rejected
+            {
+                inspection.violate(
+                    policy(
+                        format!("URL-bearing attribute {key} on <{tag}> is forbidden"),
+                        "url-attribute",
+                    ),
+                    &element,
+                );
             }
         }
         if let Some(record_id) = attributes.get("data-native-record-id") {
             if record_id.trim().is_empty() || attributes.contains_key("data-native-external-url") {
-                return Err(policy(
-                    "host-mediated navigation must name exactly one non-empty destination",
-                    "host-navigation",
-                ));
+                inspection.violate(
+                    policy(
+                        "host-mediated navigation must name exactly one non-empty destination",
+                        "host-navigation",
+                    ),
+                    &element,
+                );
             }
         }
         if let Some(href) = attributes.get("data-native-external-url") {
-            let parsed = Url::parse(href).map_err(|_| {
-                policy(
-                    "data-native-external-url must be an absolute http(s) URL",
-                    "host-navigation",
-                )
-            })?;
-            if !matches!(parsed.scheme(), "http" | "https")
-                || !parsed.username().is_empty()
-                || parsed.password().is_some()
-            {
-                return Err(policy(
-                    "data-native-external-url must be an absolute http(s) URL without credentials",
-                    "host-navigation",
-                ));
+            match Url::parse(href) {
+                Err(_) => inspection.violate(
+                    policy(
+                        "data-native-external-url must be an absolute http(s) URL",
+                        "host-navigation",
+                    ),
+                    &element,
+                ),
+                Ok(parsed)
+                    if !matches!(parsed.scheme(), "http" | "https")
+                        || !parsed.username().is_empty()
+                        || parsed.password().is_some() =>
+                {
+                    inspection.violate(
+                        policy(
+                            "data-native-external-url must be an absolute http(s) URL without credentials",
+                            "host-navigation",
+                        ),
+                        &element,
+                    )
+                }
+                Ok(_) => {}
             }
         }
     }
@@ -1268,62 +2200,97 @@ pub fn validate(source: &str) -> std::result::Result<Manifest, ValidationFailure
         ));
     }
     let mut inspection = Inspection::default();
-    if let Err(mut failure) = inspect_node(&dom.document, &mut inspection, false) {
-        attach_source_location(source, &mut failure);
-        return Err(failure);
-    }
+    inspect_node(&dom.document, &mut inspection, false)?;
+    let mut violations = std::mem::take(&mut inspection.violations);
+    let head = Some(("head".to_owned(), 0));
+    let body = Some(("body".to_owned(), 0));
     if inspection.html != 1
         || inspection.head != 1
         || inspection.body != 1
         || !inspection.lang
-        || !inspection.charset
-        || !inspection.viewport
         || inspection.title.len() != 1
         || inspection.title[0].trim().is_empty()
     {
-        return Err(ValidationFailure::new("html_invalid_document", "document requires one html[lang], head, body, non-empty title, UTF-8 charset and responsive viewport", json!({"phase":"validation","rule":"document-envelope","body_digest":digest})));
+        violations.push(
+            ValidationFailure::new(
+                "html_invalid_document",
+                "document requires one html[lang], head, body and non-empty title",
+                json!({"phase":"validation","rule":"document-envelope","body_digest":digest}),
+            )
+            .into(),
+        );
+    }
+    if !inspection.charset {
+        inspection.advise(
+            "document-charset",
+            "head has no <meta charset=\"utf-8\">; the host serves UTF-8 regardless, but declare it so the file stands alone",
+            head.clone(),
+        );
+    }
+    if !inspection.viewport {
+        inspection.advise(
+            "document-viewport",
+            "head has no <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">, so narrow screens render a zoomed-out desktop layout",
+            head,
+        );
     }
     let profile = match inspection.profile.as_deref() {
-        None | Some("document") => Profile::Document,
-        Some("slides") => Profile::Slides,
+        None | Some("document") => Some(Profile::Document),
+        Some("slides") => Some(Profile::Slides),
         Some(other) => {
-            return Err(policy(
-                format!("unknown native artifact profile '{other}'"),
-                "profile",
-            ))
+            violations.push(
+                policy(
+                    format!("unknown native artifact profile '{other}'"),
+                    "profile",
+                )
+                .into(),
+            );
+            None
         }
     };
-    if inspection.mains != 1 || inspection.h1 != 1 {
-        return Err(policy(
-            "artifact requires exactly one main landmark and one H1",
-            "landmarks-headings",
-        ));
+    match inspection.mains {
+        1 => {}
+        0 => inspection.advise(
+            "landmarks",
+            "artifact has no <main> landmark; wrap the primary content in one <main> so assistive technology can skip to it",
+            body.clone(),
+        ),
+        count => inspection.advise(
+            "landmarks",
+            format!("artifact has {count} <main> elements; keep exactly one visible <main>"),
+            Some(("main".to_owned(), 1)),
+        ),
     }
-    for pair in inspection.headings.windows(2) {
-        if pair[1] > pair[0] + 1 {
-            return Err(policy("heading levels must not skip", "heading-order"));
-        }
+    if inspection.h1 == 0 {
+        inspection.advise(
+            "missing-h1",
+            "artifact has no <h1>; give it at least one top-level heading (it may be visually hidden)",
+            body,
+        );
     }
     let mut css_rules = 0usize;
     let css_url = Regex::new(r#"(?is)url\(\s*['\"]?([^'\")]+)['\"]?\s*\)"#).expect("CSS URL regex");
-    let mut assets = inspection.assets;
+    let mut assets = std::mem::take(&mut inspection.assets);
     let css_comments = Regex::new(r"(?s)/\*.*?\*/").expect("CSS comment regex");
     for css in &inspection.css {
         let normalized = css_comments.replace_all(css, "").to_ascii_lowercase();
         if normalized.contains("@import") {
-            return Err(policy("CSS @import is forbidden", "css-import"));
+            violations.push(policy("CSS @import is forbidden", "css-import").into());
         }
         if normalized.contains("image-set(") || normalized.contains("-webkit-image-set(") {
-            return Err(policy(
-                "CSS image-set is forbidden; use a single quota-checked data URL",
-                "css-image-set",
-            ));
+            violations.push(
+                policy(
+                    "CSS image-set is forbidden; use a single quota-checked data URL",
+                    "css-image-set",
+                )
+                .into(),
+            );
         }
         if normalized.contains("http:")
             || normalized.contains("https:")
             || normalized.contains("url(//")
         {
-            return Err(policy("external CSS authority is forbidden", "css-url"));
+            violations.push(policy("external CSS authority is forbidden", "css-url").into());
         }
         css_rules += css.bytes().filter(|b| *b == b'{').count();
         for capture in css_url.captures_iter(css) {
@@ -1331,59 +2298,107 @@ pub fn validate(source: &str) -> std::result::Result<Manifest, ValidationFailure
             if value.starts_with("data:") {
                 assets.push(value.to_string());
             } else if !value.starts_with('#') {
-                return Err(policy(
-                    "CSS URLs must be permitted data assets or fragments",
-                    "css-url",
-                ));
+                violations.push(
+                    policy(
+                        format!(
+                            "CSS url({}) is not a permitted data asset or fragment",
+                            value.chars().take(80).collect::<String>()
+                        ),
+                        "css-url",
+                    )
+                    .into(),
+                );
             }
         }
     }
     if css_rules > CSS_RULE_LIMIT {
-        return Err(policy("CSS rule limit exceeded", "css-rules"));
+        violations.push(policy("CSS rule limit exceeded", "css-rules").into());
     }
     let mut asset_total = 0usize;
     for asset in assets {
-        asset_total += decode_data_url(&asset)?;
+        match decode_data_url(&asset) {
+            Ok(decoded) => asset_total += decoded,
+            Err(failure) => violations.push(failure.into()),
+        }
         if asset_total > DATA_ASSET_TOTAL_LIMIT {
-            return Err(ValidationFailure::new(
-                "html_asset_too_large",
-                "decoded data assets exceed aggregate limit",
-                json!({"phase":"validation","limit":"data_asset_decoded_bytes_total","maximum":DATA_ASSET_TOTAL_LIMIT,"actual":asset_total}),
-            ));
+            violations.push(
+                ValidationFailure::new(
+                    "html_asset_too_large",
+                    "decoded data assets exceed aggregate limit",
+                    json!({"phase":"validation","limit":"data_asset_decoded_bytes_total","maximum":DATA_ASSET_TOTAL_LIMIT,"actual":asset_total}),
+                )
+                .into(),
+            );
+            break;
         }
     }
-    let slides = if profile == Profile::Slides {
-        if inspection.deck_count != 1 || !(2..=SLIDE_LIMIT).contains(&inspection.deck_slides.len())
-        {
-            return Err(policy(
-                "slides require one main[data-native-deck] with 2–200 direct slides",
-                "slides-structure",
-            ));
-        }
-        let mut ids = std::collections::BTreeSet::new();
-        for (id, labelled, heading) in &inspection.deck_slides {
-            if id.is_empty() || labelled.is_empty() || !heading || !ids.insert(id) {
-                return Err(policy(
-                    "every slide needs a unique id, aria-labelledby, and visible heading",
-                    "slide-accessible-name",
-                ));
+    let mut slides = 0;
+    match profile {
+        Some(Profile::Slides) => {
+            if inspection.deck_count != 1
+                || !(2..=SLIDE_LIMIT).contains(&inspection.deck_slides.len())
+            {
+                violations.push(
+                    policy(
+                        "slides require one main[data-native-deck] with 2–200 direct slides",
+                        "slides-structure",
+                    )
+                    .into(),
+                );
             }
+            let mut ids = std::collections::BTreeSet::new();
+            if inspection
+                .deck_slides
+                .iter()
+                .any(|(id, labelled, heading)| {
+                    id.is_empty() || labelled.is_empty() || !heading || !ids.insert(id)
+                })
+            {
+                violations.push(
+                    policy(
+                        "every slide needs a unique id, aria-labelledby, and visible heading",
+                        "slide-accessible-name",
+                    )
+                    .into(),
+                );
+            }
+            slides = inspection.deck_slides.len();
         }
-        inspection.deck_slides.len()
-    } else {
-        if inspection.deck_count != 0 {
-            return Err(policy(
+        Some(Profile::Document) if inspection.deck_count != 0 => violations.push(
+            policy(
                 "document profile cannot declare a slide deck",
                 "profile-structure",
-            ));
-        }
-        0
-    };
+            )
+            .into(),
+        ),
+        _ => {}
+    }
+    let tag_offsets = start_tag_offsets(source);
     let (artifact_ports, capability_requests, interactions, named_inputs_declared) =
-        parse_named_declaration(&inspection.declaration_values)?;
+        match parse_named_declaration(&inspection.declaration_values) {
+            Ok(declaration) if violations.is_empty() => declaration,
+            result => {
+                if let Err(failure) = result {
+                    violations.push(failure.into());
+                }
+                return Err(report_violations(
+                    source,
+                    &tag_offsets,
+                    &inspection.tag_counts,
+                    violations,
+                ));
+            }
+        };
+    let profile = profile.expect("an unknown profile is reported as a violation above");
     // The script pass runs last so it can name declared ports and interaction
     // entries. It is warning-only: a finding never reaches the failure path.
-    let diagnostics = crate::write_diagnostics::html_write_diagnostics(
+    let mut diagnostics = advisory_diagnostics(source, &tag_offsets, &inspection);
+    diagnostics.extend(heading_order_diagnostics(
+        source,
+        &tag_offsets,
+        &inspection.headings,
+    ));
+    diagnostics.extend(crate::write_diagnostics::html_write_diagnostics(
         source,
         &inspection.scripts,
         &artifact_ports.keys().cloned().collect::<Vec<_>>(),
@@ -1392,7 +2407,7 @@ pub fn validate(source: &str) -> std::result::Result<Manifest, ValidationFailure
             .map(|entry| entry.id.clone())
             .collect::<Vec<_>>(),
         &inspection.element_ids,
-    );
+    ));
     // Test probe: only a body with an executable script runs the pass, so a
     // no-script body proves the fast path and a repeated body proves the cache.
     #[cfg(test)]
@@ -1475,7 +2490,7 @@ pub fn descriptor() -> Value {
     json!({
         "id":RUNTIME_ID,"contract_version":1,"adapter_revision":ADAPTER_REVISION,
         "body_media_type":"text/html; charset=utf-8",
-        "validator":{"id":"native-ce.html-policy","version":1,"html_parser":"html5ever@0.39.0"},
+        "validator":{"id":"native-ce.html-policy","version":3,"html_parser":"html5ever@0.39.0"},
         "delivery_transform":{"id":"native-ce.html-bootstrap","version":1,"digest":bootstrap_digest},
         "input_envelope_version":"native.artifact-input.v1","named_input_envelope_version":NAMED_INPUT_ABI,
         "collection_envelope_version":COLLECTION_ENVELOPE,"relation_envelope_version":RELATION_ENVELOPE,
@@ -1514,7 +2529,7 @@ struct Ticket {
     _artifact_id: String,
     _body_digest: String,
     _adapter_revision: u64,
-    _workbench_origin: String,
+    parent_origin: String,
     attestation: Option<Attestation>,
 }
 
@@ -1666,12 +2681,143 @@ pub struct Launch {
     pub expires_in_ms: u64,
 }
 
+/// Caller-owned, bounded launch delivery with an immutable configuration.
+/// Clones share tickets; separately constructed handles are isolated. Dropping
+/// the last handle and router releases the store. Legacy APIs retain their
+/// process-wide store independently of these instances.
+#[doc(hidden)]
+mod body_delivery;
+mod sample_delivery;
+#[doc(hidden)]
+pub use body_delivery::{
+    BodyDeliveryFailure, BodyLaunchContext, BodyMountMeta, BodyReservation, PreparedLaunch,
+    PublishedLaunch,
+};
+pub use sample_delivery::{
+    LaunchOutcome, LaunchRefusal, SampleFailure, SamplePublicationLease, SamplePublicationMarker,
+    SampleTicketReservation, StoreUnavailable, TicketLookup,
+};
+
+#[derive(Clone)]
+pub struct LaunchDelivery {
+    config: Arc<RuntimeConfig>,
+    tickets: Arc<Mutex<sample_delivery::SampleStore>>,
+    body: Arc<body_delivery::BodyOwner>,
+    #[cfg(any(test, feature = "test-support"))]
+    legacy_fixture: Option<Arc<Mutex<TicketStore<Ticket>>>>,
+}
+
+impl LaunchDelivery {
+    pub fn new(config: RuntimeConfig) -> Self {
+        let config = Arc::new(config);
+        let body = body_delivery::BodyOwner::new(config.clone());
+        Self {
+            tickets: Arc::new(Mutex::new(sample_delivery::SampleStore::new(
+                body.0.clone(),
+            ))),
+            body,
+            config,
+            #[cfg(any(test, feature = "test-support"))]
+            legacy_fixture: None,
+        }
+    }
+
+    /// Test fixture with its own legacy, sample and body stores. Normal
+    /// construction continues to use the process-wide legacy store.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn isolated_fixture(config: RuntimeConfig) -> Self {
+        let mut delivery = Self::new(config);
+        // Busy and poisoned legacy-lane tests must not alter sibling routers.
+        // Clones retain the same three stores and exercise the normal lookup.
+        delivery.legacy_fixture = Some(Arc::new(Mutex::new(TicketStore::default())));
+        delivery
+    }
+
+    fn legacy_tickets(&self) -> &Mutex<TicketStore<Ticket>> {
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(store) = &self.legacy_fixture {
+            return store;
+        }
+        tickets()
+    }
+
+    pub fn issue_launch(
+        &self,
+        source: &str,
+        manifest: &Manifest,
+        principal: &str,
+        database: Option<&str>,
+        artifact_id: &str,
+    ) -> std::result::Result<Launch, ValidationFailure> {
+        let pending = self
+            .reserve_sample_launch(source, manifest, principal, database, artifact_id)
+            .map_err(|_| {
+                ValidationFailure::new(
+                    "html_delivery_failed",
+                    "sample delivery refused",
+                    json!({"phase":"delivery"}),
+                )
+            })?;
+        let launch = Launch {
+            url: pending.descriptor().url.clone(),
+            expires_in_ms: pending.descriptor().expires_in_ms,
+        };
+        pending
+            .try_lock_for_publication(pending.original_ticket_deadline())
+            .and_then(|lease| lease.commit(pending.original_ticket_deadline()))
+            .map_err(|_| {
+                ValidationFailure::new(
+                    "html_delivery_failed",
+                    "sample publication refused",
+                    json!({"phase":"delivery"}),
+                )
+            })?;
+        Ok(launch)
+    }
+
+    /// Serve typed instance launches plus the terminal global legacy lane. Harnesses remain on
+    /// the legacy router and are never exposed through an instance handle.
+    pub fn router(&self) -> Router {
+        Router::new()
+            .route("/artifact-runtime/v1/launch/{ticket}", get(instance_launch))
+            .with_state(self.clone())
+    }
+
+    /// Configured production composition: one typed launch lane, with the
+    /// existing global verification harness retained on its separate path.
+    pub fn configured_router(&self, config: RuntimeConfig) -> Router {
+        self.router().merge(
+            Router::new()
+                .route(
+                    "/internal/artifacts/verification/{ticket}",
+                    get(verification_harness),
+                )
+                .with_state(Arc::new(config)),
+        )
+    }
+}
+
 pub fn issue_launch(
     source: &str,
     manifest: &Manifest,
     principal: &str,
     database: Option<&str>,
     artifact_id: &str,
+) -> std::result::Result<Launch, ValidationFailure> {
+    issue_launch_for_parent(source, manifest, principal, database, artifact_id, None)
+}
+
+/// Issue a one-use launch bound to an exact deployment-allowlisted parent.
+/// The selected parent is frozen into both bootstrap HOST and delivered CSP.
+/// Omitting it retains the configured workbench parent.
+pub fn issue_launch_for_parent(
+    source: &str,
+    manifest: &Manifest,
+    principal: &str,
+    database: Option<&str>,
+    artifact_id: &str,
+    parent_origin: Option<&str>,
 ) -> std::result::Result<Launch, ValidationFailure> {
     let config = configuration().ok_or_else(|| {
         ValidationFailure::new(
@@ -1687,10 +2833,12 @@ pub fn issue_launch(
         database,
         artifact_id,
         &config,
+        parent_origin,
         None,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn issue_launch_with_attestation(
     source: &str,
     manifest: &Manifest,
@@ -1698,14 +2846,58 @@ fn issue_launch_with_attestation(
     database: Option<&str>,
     artifact_id: &str,
     config: &RuntimeConfig,
+    parent_origin: Option<&str>,
     attestation: Option<Attestation>,
 ) -> std::result::Result<Launch, ValidationFailure> {
-    let html = inject(source, &config.workbench_origin)?;
+    issue_launch_in_store(
+        source,
+        manifest,
+        principal,
+        database,
+        artifact_id,
+        config,
+        parent_origin,
+        attestation,
+        tickets(),
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn issue_launch_in_store(
+    source: &str,
+    manifest: &Manifest,
+    principal: &str,
+    database: Option<&str>,
+    artifact_id: &str,
+    config: &RuntimeConfig,
+    parent_origin: Option<&str>,
+    attestation: Option<Attestation>,
+    tickets: &Mutex<TicketStore<Ticket>>,
+    now: Option<Instant>,
+) -> std::result::Result<Launch, ValidationFailure> {
+    // Policy lives at issuance, before any ticket or bearer token is minted.
+    // A router's later configuration cannot change this binding.
+    let parent_origin = config.resolve_parent_origin(parent_origin).map_err(|_| {
+        ValidationFailure::new(
+            "html_parent_origin_denied",
+            "requested HTML parent origin is invalid or not allowlisted",
+            json!({"phase":"delivery","artifact_id":artifact_id}),
+        )
+    })?;
+    let html = inject(source, &parent_origin)?;
     let mut random = [0u8; 32];
     rand::rng().fill_bytes(&mut random);
     let token = hex::encode(random);
-    let now = Instant::now();
-    let mut store = tickets().lock().expect("ticket store poisoned");
+    let now = now.unwrap_or_else(Instant::now);
+    let mut store = tickets.lock().expect("ticket store poisoned");
+    if store.entries.contains_key(&token) {
+        return Err(ValidationFailure::new(
+            "html_delivery_failed",
+            "ticket collision",
+            json!({"phase":"delivery"}),
+        ));
+    }
     make_room(
         &mut store,
         now,
@@ -1730,7 +2922,7 @@ fn issue_launch_with_attestation(
             _artifact_id: artifact_id.into(),
             _body_digest: manifest.body_digest.clone(),
             _adapter_revision: ADAPTER_REVISION,
-            _workbench_origin: config.workbench_origin.clone(),
+            parent_origin,
             attestation,
         },
     );
@@ -1858,6 +3050,7 @@ pub fn issue_verification_harness(
         database,
         artifact_id,
         &config,
+        None,
         Some(attestation.clone()),
     )?;
     let actual_launch_json = serde_json::to_string(&launch.url).expect("launch URL JSON");
@@ -1934,16 +3127,44 @@ async fn launch(
     Path(token): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    if !host_matches_origin(&headers, &config.artifact_origin) {
+    launch_response(&config, tickets(), &token, &headers, None)
+}
+
+async fn instance_launch(
+    State(delivery): State<LaunchDelivery>,
+    Path(token): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    delivery
+        .lookup_launch(&token, &headers)
+        .into_response(&headers, &delivery.config)
+}
+
+fn launch_response(
+    config: &RuntimeConfig,
+    tickets: &Mutex<TicketStore<Ticket>>,
+    token: &str,
+    headers: &HeaderMap,
+    now: Option<Instant>,
+) -> Response {
+    if !host_matches_origin(headers, &config.artifact_origin) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let ticket = take_launch_ticket(&token);
+    let ticket = remove_stored(
+        &mut tickets.lock().expect("ticket store poisoned"),
+        token,
+        |ticket| ticket.html.len(),
+    );
     let Some(ticket) = ticket else {
         return StatusCode::GONE.into_response();
     };
-    if ticket.expires <= Instant::now() {
+    if ticket.expires <= now.unwrap_or_else(Instant::now) {
         return StatusCode::GONE.into_response();
     }
+    ticket_response(ticket)
+}
+
+fn ticket_response(ticket: Ticket) -> Response {
     let mut response = ticket.html.into_response();
     let h = response.headers_mut();
     for (name, value) in [
@@ -1960,7 +3181,7 @@ async fn launch(
     h.insert("origin-agent-cluster", HeaderValue::from_static("?1"));
     h.insert(
         CONTENT_SECURITY_POLICY,
-        HeaderValue::from_str(&csp(&config.workbench_origin)).expect("validated CSP origin"),
+        HeaderValue::from_str(&csp(&ticket.parent_origin)).expect("validated CSP origin"),
     );
     h.insert(
         "permissions-policy",
@@ -2100,6 +3321,150 @@ mod tests {
         document(&format!(
             "<script type=\"application/json\" id=\"native-artifact-manifest\">{declaration}</script>"
         ))
+    }
+
+    #[test]
+    fn heading_skips_warn_with_the_authored_location_and_multiple_h1s_are_accepted() {
+        let source =
+            document("\n<h2>Workflow</h2>\n<h4>Your Mac</h4>\n<h1>Another top-level section</h1>");
+        let manifest = validate(&source).expect("heading order is advisory");
+        assert_eq!(manifest.diagnostics.len(), 1);
+        let warning = &manifest.diagnostics[0];
+        assert_eq!(warning.code, "heading-order");
+        assert_eq!(warning.severity, "warning");
+        assert_eq!((warning.line, warning.column), (3, 1));
+        assert!(warning.message.contains("h2 \"Workflow\""));
+        assert!(warning.message.contains("h4 \"Your Mac\""));
+    }
+
+    #[test]
+    fn accessibility_conventions_warn_at_their_authored_location_instead_of_rejecting() {
+        let source = "<!doctype html><html lang=\"en\"><head><title>Desktop</title></head><body>\n<div class=\"desktop\">\n<img src=\"data:image/png;base64,aQ==\">\n<button tabindex=\"2\">Start</button>\n</div></body></html>";
+        let manifest = validate(source).expect("accessibility conventions are advisory");
+        let found = manifest
+            .diagnostics
+            .iter()
+            .map(|warning| (warning.code, warning.severity, warning.line))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            found,
+            [
+                ("image-alt", "warning", 3),
+                ("positive-tabindex", "warning", 4),
+                ("document-charset", "warning", 1),
+                ("document-viewport", "warning", 1),
+                ("landmarks", "warning", 1),
+                ("missing-h1", "warning", 1),
+            ]
+        );
+        assert!(manifest
+            .diagnostics
+            .iter()
+            .all(|warning| !warning.message.contains("position unavailable")));
+        let two_mains = document("\n<main>Second</main>");
+        let warning = validate(&two_mains).unwrap().diagnostics.remove(0);
+        assert_eq!(warning.code, "landmarks");
+        assert!(warning.message.contains("2 <main> elements"));
+        // lang and a non-empty title stay required: the host names the
+        // artifact by its title and assistive technology reads by its lang.
+        let untitled = document("").replace("<title>Fixture</title>", "<title> </title>");
+        assert_eq!(
+            validate(&untitled).unwrap_err().details["rule"],
+            "document-envelope"
+        );
+    }
+
+    #[test]
+    fn every_rejection_is_reported_in_one_failure_with_its_own_location() {
+        let source = document(
+            "\n<link rel=\"stylesheet\" href=\"x.css\">\n<p>ok</p>\n<script src=\"https://evil.test/x.js\"></script>\n<iframe></iframe>\n<link rel=\"icon\" href=\"y.png\">",
+        )
+        .replace("<style>body{margin:0}</style>", "<style>@import 'x.css';</style>");
+        let failure = validate(&source).unwrap_err();
+        assert_eq!(failure.code, "html_policy_violation");
+        assert_eq!(failure.details["violation_count"], 5);
+        assert!(failure.details.get("line").is_none());
+        let listed = failure.details["violations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|violation| {
+                (
+                    violation["details"]["rule"].as_str().unwrap().to_owned(),
+                    violation["details"]["line"].as_u64(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            listed,
+            [
+                ("external-link-resource".to_owned(), Some(2)),
+                ("external-script".to_owned(), Some(4)),
+                ("forbidden-element".to_owned(), Some(5)),
+                ("external-link-resource".to_owned(), Some(6)),
+                ("css-import".to_owned(), None),
+            ]
+        );
+        assert!(failure.message.starts_with("5 problems; fix all of them"));
+        assert!(failure
+            .message
+            .contains("(3) <iframe> is forbidden at line 5, column 1 [forbidden-element]"));
+        // One rejection keeps its original shape.
+        let single = validate(&document("<iframe></iframe>")).unwrap_err();
+        assert_eq!(single.message, "<iframe> is forbidden");
+        assert!(single.details.get("violations").is_none());
+        assert_eq!(single.details["line"], 1);
+    }
+
+    #[test]
+    fn only_a_rejection_by_name_absorbs_the_elements_url_attribute() {
+        // profile-count is not about URLs, so the href is its own rejection.
+        let source = document("").replace(
+            "<title>",
+            "<meta name=\"native-artifact-profile\" content=\"document\"><meta name=\"native-artifact-profile\" content=\"document\" href=\"https://evil.test/\"><title>",
+        );
+        let failure = validate(&source).unwrap_err();
+        let rules = failure.details["violations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|violation| violation["details"]["rule"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(rules, ["profile-count", "url-attribute"]);
+    }
+
+    #[test]
+    fn template_contents_do_not_skew_locations() {
+        let source = document(
+            "<template><div><img></div></template>\n<div><a href=\"https://evil.test/\">x</a></div>",
+        );
+        let failure = validate(&source).unwrap_err();
+        assert_eq!(failure.details["rule"], "url-attribute");
+        assert_eq!(failure.details["line"], 2);
+    }
+
+    #[test]
+    fn a_long_list_of_rejections_is_capped() {
+        let source = document(&"<iframe></iframe>".repeat(VIOLATION_REPORT_LIMIT + 3));
+        let failure = validate(&source).unwrap_err();
+        assert_eq!(
+            failure.details["violation_count"],
+            VIOLATION_REPORT_LIMIT + 3
+        );
+        assert_eq!(
+            failure.details["violations"].as_array().unwrap().len(),
+            VIOLATION_REPORT_LIMIT
+        );
+        assert!(failure.message.ends_with("; and 3 more"));
+    }
+
+    #[test]
+    fn heading_location_ignores_comment_and_script_lookalikes() {
+        let source = document("<!-- <h2>Fake</h2> -->\n<script>const sample = '<h3>Fake</h3>';</script>\n<h2>Real</h2>\n<h4>Nested</h4>");
+        let warning = validate(&source).unwrap().diagnostics.remove(0);
+        assert_eq!(warning.code, "heading-order");
+        assert_eq!(warning.line, 4);
+        assert!(warning.message.contains("h2 \"Real\""));
     }
 
     #[test]
@@ -2686,6 +4051,50 @@ mod tests {
     }
 
     #[test]
+    fn body_set_html_uses_shared_closed_grammar_without_execution() {
+        let mut declaration = json!({
+            "schema": INTERACTIVE_MANIFEST_SCHEMA,
+            "inputs":{"rows":{"envelope":COLLECTION_ENVELOPE,"required":true,"expose_to_root":true}},
+            "capability_requests":[{"capability":"input.read","scope":{"port":"rows"}}],
+            "interactions":[{"id":"save","label":"Save","effect":"body.set",
+                "slots":{"page":{"domain":{"kind":"bound_input","port":"rows"}}},
+                "body":{"max_bytes":32768}}]
+        });
+        let source = |v: &Value| {
+            document(&format!(
+                "<script type=\"application/json\" id=\"native-artifact-manifest\">{v}</script>"
+            ))
+        };
+        let parsed = validate(&source(&declaration)).unwrap();
+        assert_eq!(parsed.interactions[0].effect.as_str(), "body.set");
+        declaration["interactions"][0]["body"]["max_bytes"] =
+            json!(native_artifact_runtime::mdx_v2::BODY_SET_MAX_BODY_BYTES);
+        assert!(validate(&source(&declaration)).is_ok());
+        for cap in [
+            json!(0),
+            json!(native_artifact_runtime::mdx_v2::BODY_SET_MAX_BODY_BYTES + 1),
+            json!(true),
+            json!(1.5),
+        ] {
+            let mut bad = declaration.clone();
+            bad["interactions"][0]["body"]["max_bytes"] = cap;
+            assert!(validate(&source(&bad)).is_err());
+        }
+        declaration["interactions"][0]["body"]["extra"] = json!(1);
+        assert!(validate(&source(&declaration)).is_err());
+        declaration["interactions"][0]["body"]
+            .as_object_mut()
+            .unwrap()
+            .remove("extra");
+        declaration["interactions"][0]["effect"] = json!("title.set");
+        declaration["interactions"][0]["title"] = json!({});
+        assert_eq!(
+            validate(&source(&declaration)).unwrap_err().code,
+            "interaction_entry_invalid"
+        );
+    }
+
+    #[test]
     fn interactive_declaration_reuses_closed_entries_and_keeps_v1_read_only() {
         let mut declaration = json!({
             "schema": INTERACTIVE_MANIFEST_SCHEMA,
@@ -2756,8 +4165,27 @@ mod tests {
         assert!(BOOTSTRAP.contains("encoded.length>4096"));
         assert!(BOOTSTRAP.contains("commandData?.type===\"read-result\")settleRead(commandData)"));
         assert!(BOOTSTRAP.contains("own(pendingReads,data.request_id)"));
+        // Keyed reads: the host's opaque variant/eviction metadata rides the
+        // same bounded clone/freeze/size cap as the rows, so packages can map
+        // later keyed hints. Absent metadata serializes away (old-host shape).
+        assert!(BOOTSTRAP.contains("result:data.result,keyed_freshness:data.keyed_freshness}"));
         assert!(BOOTSTRAP.contains("if(isArray(data.needs))"));
         assert!(BOOTSTRAP.contains("pending.resolve(result)"));
+    }
+
+    #[test]
+    fn bootstrap_forwards_a_body_submit_with_its_gesture_mark_and_click_count() {
+        // The frame cannot know whether the person consented to autosave, so it
+        // no longer refuses a click-less Body submit itself: the host decides
+        // and answers `gesture_required` when neither a click nor consent holds.
+        assert!(!BOOTSTRAP.contains("bodyAttemptRefused(\"gesture_required\")"));
+        assert!(BOOTSTRAP.contains(
+            "if(type===\"body-attempt-submit\"){backed=gestureArmed&&!gestureUsed;if(backed)gestureUsed=true;}"
+        ));
+        // The click count only moves on a trusted completing gesture, and the
+        // frame reports it so the host can keep autosave on the open record.
+        assert!(BOOTSTRAP.contains("gestureArmed=true;gestureUsed=false;gestureEpoch++;"));
+        assert!(BOOTSTRAP.contains("{gesture_backed:backed,gesture_epoch:gestureEpoch}"));
     }
 
     #[test]
@@ -2892,6 +4320,53 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_carries_the_reveal_surface() {
+        // Task fb8564c: inbound reveal is additive throughout. A document
+        // that never calls the new API sees no behavioural change; the
+        // transport version is untouched.
+        assert!(BOOTSTRAP.contains("onReveal"));
+        assert!(BOOTSTRAP.contains("reveal subscriber must be a function"));
+        assert!(BOOTSTRAP.contains("surface.reveal.v1"));
+        assert!(BOOTSTRAP.contains("commandData?.type===\"reveal\")deliverReveal(commandData)"));
+        assert!(BOOTSTRAP.contains("commandData?.type===\"reveal-clear\")pendingReveal=null"));
+        assert!(BOOTSTRAP
+            .contains("features:[REVEAL_FEATURE,...(contextFeature?[CONTEXT_FEATURE]:[]),...(locationFeature?[LOCATION_FEATURE]:[]),...(bodyLane.api.offering?[\"records.body.read.v1\"]:[])]"));
+        assert!(BOOTSTRAP.contains("CONTEXT_FEATURE=\"app-view-report.v1\""));
+        assert!(BOOTSTRAP.contains("if(contextFeature&&!contextClosed)send("));
+        assert!(BOOTSTRAP.contains("if(!contextFeature||contextClosed||"));
+        // No ack or effect authority on this path: delivery reports only
+        // bounded diagnostics, and the retained slot clears before replay.
+        assert!(BOOTSTRAP.contains("html_reveal_failed"));
+        assert!(BOOTSTRAP.contains("html_reveal_dropped"));
+        assert!(!BOOTSTRAP.contains("reveal-applied"));
+        assert!(!BOOTSTRAP.contains("reveal-unhandled"));
+        assert!(BOOTSTRAP.contains("pendingReveal=null;deliverRevealTo(retained)"));
+        // Unsupported payload fields never reach the callback: only the
+        // validated record id is frozen into the delivery.
+        assert!(BOOTSTRAP.contains("freezeObject({record_id})"));
+        // The id shape is the exact backend alphabet, pinned literally,
+        // checked through the captured pristine exec rather than any
+        // prototype method author code could replace.
+        assert!(BOOTSTRAP.contains("revealPattern=/^[A-Za-z0-9._:-]{1,128}$/"));
+        assert!(BOOTSTRAP.contains("regExpExec=RegExp.prototype.exec"));
+        assert!(BOOTSTRAP.contains("apply(regExpExec,revealPattern,[value])!==null"));
+        assert!(!BOOTSTRAP.contains("[\\x20-\\x7E]"));
+        // The retained target clears on teardown as well as on replay.
+        assert!(BOOTSTRAP.contains("listen(channel,\"messageerror\",clearReveal)"));
+        assert!(BOOTSTRAP.contains("listen(channel,\"close\",clearReveal)"));
+        assert!(BOOTSTRAP.contains("listen(window,\"unload\",clearReveal,true)"));
+    }
+
+    #[test]
+    fn bootstrap_location_is_scalar_negotiated_and_closed_with_document() {
+        assert!(BOOTSTRAP.contains("surface.location.v1"));
+        assert!(BOOTSTRAP.contains("publishLocation=recordId=>{if(contextClosed)throw"));
+        assert!(BOOTSTRAP.contains("apply(locationTest,locationPattern,[recordId])"));
+        assert!(BOOTSTRAP.contains("if(locationFeature)send({type:\"location\""));
+        assert!(BOOTSTRAP.contains("else if(feature===LOCATION_FEATURE)locationFeature=true"));
+    }
+
+    #[test]
     fn bootstrap_carries_the_view_state_handoff() {
         // Eager publish, boot-time delivery: the frame hands its own view
         // state to the host, which holds the opaque blob and delivers it in
@@ -2917,8 +4392,34 @@ mod tests {
         assert!(!BOOTSTRAP.contains("viewStateReported"));
         assert_eq!(
             BOOTSTRAP.matches("setTimer(").count(),
-            2,
-            "the only wall-clock arms are the gesture release and the one shared refusal throttle"
+            5,
+            "only gesture release, shared refusal throttle, feature-gated pre-ACK ARM wait, negotiated context deadline, and bounded Body attempt deadline arm wall clocks"
+        );
+        assert!(BOOTSTRAP.contains("timer:setTimer(()=>cancelContext(id),remaining)"));
+        // Body requests get one exact 15-second deadline through captured
+        // timers. Expiry clears only this pending request; submit stays
+        // uncertain while preparation reports its bounded timeout.
+        assert!(BOOTSTRAP.contains("pending.timer=setTimer(()=>{if(bodyAttemptPending[request_id]!==pending)return;delete bodyAttemptPending[request_id];resolve(type===\"body-attempt-submit\"?bodyAttemptUncertain():bodyAttemptRefused(\"prepare_timeout\"))},15000)"));
+        assert!(BOOTSTRAP.contains(
+            "const setTimer=setTimeout,clearTimer=clearTimeout,requestFrame=requestAnimationFrame;"
+        ));
+        assert!(BOOTSTRAP.contains("clearTimer(pending.timer)"));
+        assert!(
+            BOOTSTRAP.find("const setTimer=setTimeout").unwrap()
+                < BOOTSTRAP.find("const bodyAttemptRequest=").unwrap()
+        );
+        // The additional context deadline uses primitives captured before
+        // authored scripts execute, rather than looking up mutable clocks
+        // when a private-port request arrives.
+        assert_eq!(BOOTSTRAP.matches("Date.now").count(), 1);
+        assert_eq!(BOOTSTRAP.matches("performance.now").count(), 1);
+        assert!(BOOTSTRAP
+            .contains("contextNow=Date.now,contextClock=performance.now.bind(performance)"));
+        assert!(BOOTSTRAP.contains("data.deadline_ms-contextNow()"));
+        assert!(BOOTSTRAP.contains("contextClock()>=deadline"));
+        assert!(
+            BOOTSTRAP.find("contextNow=Date.now").unwrap()
+                < BOOTSTRAP.find("define(window,\"nativeArtifact\"").unwrap()
         );
         // The advisory schema is read once into a local, so a getter cannot
         // pass validation and then return something else.
@@ -2990,6 +4491,336 @@ mod tests {
             &headers,
             "https://artifact.example.test"
         ));
+    }
+
+    fn launch_delivery_fixture() -> (LaunchDelivery, String, Manifest) {
+        let delivery = LaunchDelivery::isolated_fixture(
+            RuntimeConfig::new("https://workbench.test", "https://artifacts.test").unwrap(),
+        );
+        let source = document("");
+        let manifest = validate(&source).unwrap();
+        (delivery, source, manifest)
+    }
+
+    #[derive(Clone)]
+    struct OrdinaryLaunchFixture {
+        config: Arc<RuntimeConfig>,
+        tickets: Arc<Mutex<TicketStore<Ticket>>>,
+    }
+
+    impl OrdinaryLaunchFixture {
+        fn new(config: RuntimeConfig) -> Self {
+            Self {
+                config: Arc::new(config),
+                tickets: Arc::new(Mutex::new(TicketStore::default())),
+            }
+        }
+    }
+
+    fn ordinary_launch_fixture() -> (OrdinaryLaunchFixture, String, Manifest) {
+        let delivery = OrdinaryLaunchFixture::new(
+            RuntimeConfig::new("https://workbench.test", "https://artifacts.test").unwrap(),
+        );
+        let source = document("");
+        let manifest = validate(&source).unwrap();
+        (delivery, source, manifest)
+    }
+
+    fn issue_at(
+        delivery: &OrdinaryLaunchFixture,
+        source: &str,
+        manifest: &Manifest,
+        principal: &str,
+        now: Instant,
+    ) -> Launch {
+        issue_launch_in_store(
+            source,
+            manifest,
+            principal,
+            Some("db:test"),
+            "artifact",
+            &delivery.config,
+            None,
+            None,
+            &delivery.tickets,
+            Some(now),
+        )
+        .unwrap()
+    }
+
+    fn redeem_at(delivery: &OrdinaryLaunchFixture, issued: &Launch, now: Instant) -> Response {
+        let mut headers = HeaderMap::new();
+        headers.insert(HOST, HeaderValue::from_static("artifacts.test"));
+        launch_response(
+            &delivery.config,
+            &delivery.tickets,
+            issued.url.rsplit('/').next().unwrap(),
+            &headers,
+            Some(now),
+        )
+    }
+
+    #[tokio::test]
+    async fn launch_global_pressure_is_instance_scoped_and_oldest_first_at_real_cap() {
+        let (target, source, manifest) = ordinary_launch_fixture();
+        let pressure = OrdinaryLaunchFixture::new((*target.config).clone());
+        let now = Instant::now();
+        let victim = issue_at(&target, &source, &manifest, "victim", now);
+        let other_victim = issue_at(&pressure, &source, &manifest, "victim", now);
+        let mut newest = None;
+        for index in 0..LAUNCH_TICKET_MAX_COUNT {
+            newest = Some(issue_at(
+                &pressure,
+                &source,
+                &manifest,
+                &format!("distinct-owner-{index}"),
+                now,
+            ));
+        }
+        {
+            let store = pressure.tickets.lock().unwrap();
+            assert_eq!(store.entries.len(), 128);
+            assert_eq!(store.oldest.len(), 128);
+            assert!(store.bytes < LAUNCH_TICKET_MAX_BYTES);
+            assert_eq!(
+                store.bytes,
+                store.entries.values().map(|t| t.html.len()).sum::<usize>()
+            );
+            assert!(store
+                .entries
+                .values()
+                .all(|t| t.expires == now + TICKET_TTL));
+        }
+        assert_eq!(
+            redeem_at(&pressure, &other_victim, now).status(),
+            StatusCode::GONE
+        );
+        assert_eq!(
+            redeem_at(&pressure, &newest.unwrap(), now).status(),
+            StatusCode::OK
+        );
+        let response = redeem_at(&target.clone(), &victim, now);
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[CACHE_CONTROL], "no-store, private");
+        assert!(response.headers()[CONTENT_SECURITY_POLICY]
+            .to_str()
+            .unwrap()
+            .contains("frame-ancestors https://workbench.test;"));
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8_lossy(&body);
+        for marker in [
+            "setViewState",
+            "viewState",
+            "view_state",
+            "from_body_digest",
+            "native-html-init",
+        ] {
+            assert!(
+                body.contains(marker),
+                "isolated launch lost bridge marker: {marker}"
+            );
+        }
+        assert_eq!(redeem_at(&target, &victim, now).status(), StatusCode::GONE);
+    }
+
+    #[test]
+    fn launch_per_principal_pressure_preserves_other_owners_below_global_cap() {
+        let (delivery, source, manifest) = ordinary_launch_fixture();
+        let now = Instant::now();
+        let victim = issue_at(&delivery, &source, &manifest, "same-owner", now);
+        let unrelated = issue_at(&delivery, &source, &manifest, "other-owner", now);
+        for _ in 0..LAUNCH_TICKET_MAX_PER_PRINCIPAL {
+            issue_at(&delivery, &source, &manifest, "same-owner", now);
+        }
+        let store = delivery.tickets.lock().unwrap();
+        assert_eq!(store.entries.len(), 33);
+        assert!(store.bytes < LAUNCH_TICKET_MAX_BYTES);
+        assert!(store
+            .entries
+            .values()
+            .all(|t| t.expires == now + TICKET_TTL));
+        drop(store);
+        assert_eq!(
+            redeem_at(&delivery, &victim, now).status(),
+            StatusCode::GONE
+        );
+        assert_eq!(
+            redeem_at(&delivery, &unrelated, now).status(),
+            StatusCode::OK
+        );
+    }
+
+    #[test]
+    fn launch_ttl_boundary_and_issuance_cleanup_use_fixed_time() {
+        let (delivery, source, manifest) = ordinary_launch_fixture();
+        let now = Instant::now();
+        assert_eq!(TICKET_TTL, Duration::from_secs(30));
+        let before = issue_at(&delivery, &source, &manifest, "owner", now);
+        let exact = issue_at(&delivery, &source, &manifest, "owner", now);
+        assert_eq!(before.expires_in_ms, 30_000);
+        assert_eq!(
+            redeem_at(
+                &delivery,
+                &before,
+                now + TICKET_TTL - Duration::from_nanos(1)
+            )
+            .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            redeem_at(&delivery, &exact, now + TICKET_TTL).status(),
+            StatusCode::GONE
+        );
+        let expired = issue_at(&delivery, &source, &manifest, "owner", now);
+        let fresh = issue_at(&delivery, &source, &manifest, "owner", now + TICKET_TTL);
+        assert_eq!(delivery.tickets.lock().unwrap().entries.len(), 1);
+        assert_eq!(
+            redeem_at(&delivery, &expired, now + TICKET_TTL).status(),
+            StatusCode::GONE
+        );
+        assert_eq!(
+            redeem_at(&delivery, &fresh, now + TICKET_TTL).status(),
+            StatusCode::OK
+        );
+    }
+
+    #[test]
+    fn ticket_store_real_byte_cap_evicts_without_count_principal_or_ttl_pressure() {
+        struct Item {
+            expires: Instant,
+            principal: &'static str,
+            bytes: usize,
+        }
+        let now = Instant::now();
+        let mut store = TicketStore::<Item>::default();
+        assert_eq!(LAUNCH_TICKET_MAX_BYTES, 64 * 1024 * 1024);
+        let item_bytes = LAUNCH_TICKET_MAX_BYTES / 2 + 1;
+        // Model payload sizes rather than allocate 64MiB of HTML. The same
+        // production make_room implementation receives the real launch caps.
+        for (token, principal) in [("old", "p"), ("new", "q")] {
+            make_room(
+                &mut store,
+                now,
+                principal,
+                item_bytes,
+                LAUNCH_TICKET_MAX_COUNT,
+                LAUNCH_TICKET_MAX_PER_PRINCIPAL,
+                LAUNCH_TICKET_MAX_BYTES,
+                |item| item.expires,
+                |item| item.principal,
+                |item| item.bytes,
+            )
+            .unwrap();
+            store.bytes += item_bytes;
+            store.oldest.push_back(token.into());
+            store.entries.insert(
+                token.into(),
+                Item {
+                    expires: now + TICKET_TTL,
+                    principal,
+                    bytes: item_bytes,
+                },
+            );
+        }
+        assert_eq!(store.entries.len(), 1);
+        assert_eq!(store.oldest, VecDeque::from(["new".to_string()]));
+        assert_eq!(store.bytes, item_bytes);
+        assert!(make_room(
+            &mut store,
+            now,
+            "r",
+            LAUNCH_TICKET_MAX_BYTES + 1,
+            LAUNCH_TICKET_MAX_COUNT,
+            LAUNCH_TICKET_MAX_PER_PRINCIPAL,
+            LAUNCH_TICKET_MAX_BYTES,
+            |item| item.expires,
+            |item| item.principal,
+            |item| item.bytes,
+        )
+        .is_err());
+        assert_eq!(store.entries.len(), 1);
+        assert_eq!(store.bytes, item_bytes);
+    }
+
+    #[tokio::test]
+    async fn launch_configuration_interleaving_rejects_host_without_consuming_ticket() {
+        let (delivery, source, manifest) = launch_delivery_fixture();
+        let issued = delivery
+            .issue_launch(&source, &manifest, "owner", None, "artifact")
+            .unwrap();
+        // Deterministically construct the legacy interleaving: the test writes
+        // *.test, a competing artifacts.rs test overwrites it with localhost,
+        // then the test snapshots config for its router. A LOCAL slot avoids
+        // racing actual global configuration or unrelated tests. Both routers
+        // share the same ticket, just as legacy routers share the default store.
+        let slot = RwLock::new((*delivery.config).clone());
+        *slot.write().unwrap() =
+            RuntimeConfig::new("http://localhost:8080", "http://artifact.localhost:8080").unwrap();
+        let stale_router = LaunchDelivery {
+            config: Arc::new(slot.read().unwrap().clone()),
+            ..delivery.clone()
+        }
+        .router();
+        let request = || {
+            Request::builder()
+                .uri(Url::parse(&issued.url).unwrap().path())
+                .header(HOST, "artifacts.test")
+                .body(Body::empty())
+                .unwrap()
+        };
+        assert_eq!(
+            stale_router.oneshot(request()).await.unwrap().status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(delivery.sample_counts().0, 1);
+        let app = delivery.router();
+        let response = app.clone().oneshot(request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[CACHE_CONTROL], "no-store, private");
+        assert!(response.headers()[CONTENT_SECURITY_POLICY]
+            .to_str()
+            .unwrap()
+            .contains("frame-ancestors https://workbench.test;"));
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains("native.html.bridge.v1"));
+        assert!(body.contains("setViewState"));
+        assert_eq!(
+            app.oneshot(request()).await.unwrap().status(),
+            StatusCode::GONE
+        );
+    }
+
+    #[tokio::test]
+    async fn launch_delivery_router_excludes_harness_and_owns_store_lifetime() {
+        let (delivery, source, manifest) = launch_delivery_fixture();
+        let weak = Arc::downgrade(&delivery.tickets);
+        let issued = delivery
+            .issue_launch(&source, &manifest, "owner", None, "artifact")
+            .unwrap();
+        let app = delivery.clone().router();
+        drop(delivery);
+        assert!(weak.upgrade().is_some());
+        let harness = Request::builder()
+            .uri("/internal/artifacts/verification/unused")
+            .header(HOST, "workbench.test")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(harness).await.unwrap().status(),
+            StatusCode::NOT_FOUND
+        );
+        let request = Request::builder()
+            .uri(Url::parse(&issued.url).unwrap().path())
+            .header(HOST, "artifacts.test")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(request).await.unwrap().status(),
+            StatusCode::OK
+        );
+        drop(app);
+        assert!(weak.upgrade().is_none());
     }
 
     #[test]
@@ -3148,9 +4979,125 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn launch_parent_is_immutable_per_ticket_and_rejection_mints_nothing() {
+        let config = RuntimeConfig::new("http://localhost:8080", "http://artifact.localhost:8080")
+            .unwrap()
+            .with_parent_origins(["http://127.0.0.1:4319", "https://shell.example"])
+            .unwrap();
+        let source = document("");
+        let manifest = validate(&source).unwrap();
+        let mut issued = Vec::new();
+        for parent in [
+            None,
+            Some("http://127.0.0.1:4319/"),
+            Some("https://SHELL.example:443"),
+        ] {
+            let launch = issue_launch_with_attestation(
+                &source,
+                &manifest,
+                "parent-binding-fixture",
+                None,
+                "artifact",
+                &config,
+                parent,
+                None,
+            )
+            .unwrap();
+            issued.push((launch, config.resolve_parent_origin(parent).unwrap()));
+        }
+        for parent in [
+            "https://unlisted.example",
+            "http://127.0.0.1:4320",
+            "https://*.example",
+            "null",
+            "https://shell.example/path",
+            "http://artifact.localhost:8080",
+        ] {
+            let failure = issue_launch_with_attestation(
+                &source,
+                &manifest,
+                "parent-binding-denied",
+                None,
+                "artifact",
+                &config,
+                Some(parent),
+                None,
+            )
+            .err()
+            .unwrap();
+            assert_eq!(failure.code, "html_parent_origin_denied");
+        }
+        assert!(tickets()
+            .lock()
+            .unwrap()
+            .entries
+            .values()
+            .all(|ticket| ticket.principal != "parent-binding-denied"));
+        // The router has a different workbench origin from issuance. Delivered
+        // policies must come from each already-issued ticket, including default.
+        let app = router(
+            RuntimeConfig::new("https://changed.example", "http://artifact.localhost:8080")
+                .unwrap(),
+        );
+        for (launch, parent) in issued {
+            let url = Url::parse(&launch.url).unwrap();
+            let request = |host: &str| {
+                Request::builder()
+                    .uri(url.path())
+                    .header("host", host)
+                    .body(Body::empty())
+                    .unwrap()
+            };
+            assert_eq!(
+                app.clone()
+                    .oneshot(request("localhost:8080"))
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::NOT_FOUND
+            );
+            let response = app
+                .clone()
+                .oneshot(request("artifact.localhost:8080"))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()[CONTENT_SECURITY_POLICY], csp(&parent));
+            assert_eq!(response.headers()[CACHE_CONTROL], "no-store, private");
+            assert_eq!(response.headers()[REFERRER_POLICY], "no-referrer");
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            assert_eq!(body.as_ref(), inject(&source, &parent).unwrap().as_bytes());
+            assert_eq!(
+                app.clone()
+                    .oneshot(request("artifact.localhost:8080"))
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::GONE
+            );
+        }
+        assert_eq!(
+            descriptor()["delivery_transform"]["digest"],
+            bootstrap_digest()
+        );
+        // Pin the template bytes independently of the descriptor. The default
+        // rendered-text reporter changes delivery bytes. Install/source pins
+        // are unaffected: alpha-tab-digest.v1
+        // binds bundle, declaration and runtime only, never bootstrap bytes.
+        // This current pin covers the composed body reader, default text
+        // reporter, and bounded Body-attempt negotiation.
+        assert_eq!(
+            bootstrap_digest(),
+            "f4a0cfb3da85ea40b076914c776a2d73aca65428c1d28f8e9a492487ebc8d4aa"
+        );
+    }
+
+    #[tokio::test]
     async fn verification_harness_and_its_child_are_single_use_and_child_is_attested() {
-        let config =
-            RuntimeConfig::new("http://localhost:8080", "http://artifact.localhost:8080").unwrap();
+        let config = RuntimeConfig::new("http://localhost:8080", "http://artifact.localhost:8080")
+            .unwrap()
+            .with_parent_origins(["http://127.0.0.1:4319", "https://shell.example"])
+            .unwrap();
         configure(config.clone());
         let source = document("");
         let manifest = validate(&source).unwrap();
@@ -3222,14 +5169,25 @@ mod tests {
             child.headers()["x-native-csp-digest"],
             content_security_policy_digest("http://localhost:8080").unwrap()
         );
-        assert_eq!(child.headers()["x-native-adapter-revision"], "1");
+        assert_eq!(
+            child.headers()["x-native-adapter-revision"],
+            ADAPTER_REVISION.to_string()
+        );
         assert_eq!(child.headers()["x-native-runtime-id"], RUNTIME_ID);
         assert_eq!(child.headers()["x-native-input-mode"], "standalone");
         assert_eq!(child.headers()["x-native-input-count"], "0");
         let child_csp = child.headers()[CONTENT_SECURITY_POLICY].to_str().unwrap();
         assert_eq!(
+            child_csp,
+            content_security_policy("http://localhost:8080").unwrap()
+        );
+        assert_eq!(
             hex::encode(Sha256::digest(child_csp.as_bytes())),
             child.headers()["x-native-csp-digest"]
+        );
+        let child_body = to_bytes(child.into_body(), usize::MAX).await.unwrap();
+        assert!(
+            String::from_utf8_lossy(&child_body).contains("const HOST=\"http://localhost:8080\"")
         );
         assert_eq!(
             app.clone().oneshot(child_request()).await.unwrap().status(),
@@ -3239,5 +5197,126 @@ mod tests {
             app.oneshot(request()).await.unwrap().status(),
             StatusCode::GONE
         );
+    }
+
+    #[test]
+    fn parent_allowlist_resolves_default_canonical_and_rejects_other() {
+        let config = RuntimeConfig::new("https://app.test", "https://artifact.test")
+            .unwrap()
+            .with_parent_origins(["http://127.0.0.1:4319"])
+            .unwrap();
+        assert_eq!(
+            config.resolve_parent_origin(None).unwrap(),
+            "https://app.test"
+        );
+        assert_eq!(
+            config
+                .resolve_parent_origin(Some("https://app.test"))
+                .unwrap(),
+            "https://app.test"
+        );
+        assert_eq!(
+            config
+                .resolve_parent_origin(Some("http://127.0.0.1:4319"))
+                .unwrap(),
+            "http://127.0.0.1:4319"
+        );
+        assert_eq!(
+            config
+                .resolve_parent_origin(Some("HTTP://127.0.0.1:4319"))
+                .unwrap(),
+            "http://127.0.0.1:4319"
+        );
+        assert!(config
+            .resolve_parent_origin(Some("https://evil.test"))
+            .is_err());
+        assert!(config
+            .resolve_parent_origin(Some("https://artifact.test"))
+            .is_err());
+        assert!(config.resolve_parent_origin(Some("http://*.test")).is_err());
+        assert!(config
+            .resolve_parent_origin(Some("http://example.com"))
+            .is_err());
+    }
+
+    #[test]
+    fn parent_allowlist_canonicalizes_loopback_and_rejects_controls_and_partial_origins() {
+        let base = || RuntimeConfig::new("https://app.test", "https://artifact.test").unwrap();
+        let config = base()
+            .with_parent_origins([
+                "http://SHELL.localhost:80/",
+                "http://[::1]:4319",
+                "https://SHELL.test:443/",
+                "https://bücher.test",
+            ])
+            .unwrap();
+        for (raw, canonical) in [
+            ("http://shell.localhost", "http://shell.localhost"),
+            ("http://[0:0:0:0:0:0:0:1]:4319/", "http://[::1]:4319"),
+            ("https://shell.test", "https://shell.test"),
+            (
+                "https://xn--bcher-kva.test:443",
+                "https://xn--bcher-kva.test",
+            ),
+        ] {
+            assert_eq!(config.resolve_parent_origin(Some(raw)).unwrap(), canonical);
+        }
+        for raw in [
+            "",
+            " ",
+            "null",
+            "https://shell.te\nst",
+            "https://shell.test\t",
+            " https://shell.test",
+            "https://shell.test/path",
+            "https://shell.test/..",
+            "https://@shell.test",
+            "https://shell.test\\",
+            "https://shell.test?q=1",
+            "https://shell.test#x",
+            "https://user:password@shell.test",
+            "https://%2A.test",
+            "https://shell.localhost",
+            "http://shell.localhost:81",
+            "http://[::1]:4320",
+            "http://remote.test",
+        ] {
+            assert!(config.resolve_parent_origin(Some(raw)).is_err(), "{raw:?}");
+        }
+        for raw in [
+            "",
+            " ",
+            "null",
+            "https://shell.te\nst",
+            "https://shell.test\t",
+            " https://shell.test",
+            "https://shell.test/path",
+            "https://shell.test/..",
+            "https://@shell.test",
+            "https://shell.test\\",
+            "https://shell.test?q=1",
+            "https://shell.test#x",
+            "https://user:password@shell.test",
+            "https://%2A.test",
+        ] {
+            assert!(base().with_parent_origins([raw]).is_err(), "{raw:?}");
+        }
+        let mut invalid = base();
+        invalid.workbench_origin = invalid.artifact_origin.clone();
+        assert!(invalid.resolve_parent_origin(None).is_err());
+    }
+
+    #[test]
+    fn parent_allowlist_builder_rejects_wildcard_artifact_and_plain_http() {
+        let base = || RuntimeConfig::new("https://app.test", "https://artifact.test").unwrap();
+        assert!(base().with_parent_origins(["https://*.test"]).is_err());
+        assert!(base()
+            .with_parent_origins(["https://artifact.test"])
+            .is_err());
+        assert!(base().with_parent_origins(["http://example.com"]).is_err());
+        assert!(base().with_parent_origins(["not-an-origin"]).is_err());
+        assert!(base()
+            .with_parent_origins(["https://shell.test", "https://shell.test"])
+            .is_ok());
     }
 }

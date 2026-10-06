@@ -13,12 +13,9 @@ with selected evidence, **Partial** is a real bounded implementation,
 
 ## Start here
 
-- [What Native makes possible](../README.md#what-native-makes-possible) — three
-  scenes from one imagined launch: adaptable views, useful feedback and a
-  correction recovered by a later contributor. Current foundations and further
-  possibilities are distinguished beside each scene. The
-  [hosted starting route](../README.md#start-with-native) includes a small
-  continuity exercise.
+- [Quick start](../README.md#quick-start) — connect Claude, ChatGPT or another
+  MCP client to a hosted workspace. [What you can run today](../README.md#what-you-can-run-today)
+  separates what works from this repository from what is hosted or coming.
 - [Architecture map](../ARCHITECTURE.md) — **Current:** the main write and read
   paths, subsystem invariants, executable evidence, and change-routing table.
 - [Capability and evidence map](capability-map.md) — **Current**, **Partial**,
@@ -170,8 +167,8 @@ and generated backend attestations are **Held** outside this snapshot.
 
 - [`BUILDING.md`](../BUILDING.md) describes the source-snapshot exploration and
   test loop and how to choose optional features.
-- The root README gives optional source-exploration entrypoints, the inspection
-  snapshot's runtime-qualification boundary, and the license boundary.
+- The root README says what runs today, what is hosted or coming, and the
+  licence boundary.
 - [`CONTRIBUTING.md`](../CONTRIBUTING.md) explains how development works here: a
   private upstream, contribution by invitation after a conversation, and the
   routes this public mirror does not use.

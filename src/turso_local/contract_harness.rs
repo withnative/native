@@ -2054,8 +2054,8 @@ async fn projection_snapshot(connection: &turso::Connection) -> Result<Value> {
 /// Snapshot ordering for one projection table.
 ///
 /// Every table is compared in physical insertion order (`rowid`) except
-/// `record_mentions`, whose 58→59 migration backfill inserts rows in
-/// `source_id` order while replay folds them in content-event order. Its
+/// `record_mentions` and `body_blocks`, whose migrations insert rows in
+/// record ID order while replay folds them in content-event order. Their
 /// natural primary key is order-independent, matches the SQLite conformance
 /// comparison, and still compares the row values exactly, so two record sets
 /// with the same members compare equal whichever path built them. Other tables
@@ -2064,6 +2064,7 @@ async fn projection_snapshot(connection: &turso::Connection) -> Result<Value> {
 fn projection_snapshot_order(table: &str) -> &'static str {
     match table {
         "record_mentions" => "source_id, occurrence_ix",
+        "body_blocks" => "record_id, block_index, chunk_index",
         _ => "rowid",
     }
 }

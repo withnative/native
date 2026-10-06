@@ -84,8 +84,8 @@ outside this snapshot.
 Start with the [capability and evidence map](capability-map.md). It labels each
 claim as current, partial, experimental or directional, names selected
 implementation and executable evidence, and keeps the material boundary beside
-the claim. The root README's source-exploration path names selected
-SQLite and MCP entry points.
+the claim. [SELF_HOSTING.md](../SELF_HOSTING.md) and [BUILDING.md](../BUILDING.md)
+name the selected SQLite and MCP entry points.
 
 An evaluation should be able to answer all of these from the selected
 tree:

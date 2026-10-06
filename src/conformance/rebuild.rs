@@ -63,6 +63,17 @@ const RELATIONSHIP_REBUILD_TABLES: [&str; 8] = [
     "links",
 ];
 
+// The ledger identifies a generated id, while the content event log identifies
+// historical caller-owned rows that used the same id before reservation.
+fn relationship_link_owner() -> String {
+    format!(
+        "EXISTS (SELECT 1 FROM relationships r WHERE links.id = \
+         'rel:' || r.relationship_origin_db_id || ':' || r.relationship_id) \
+         AND NOT {}",
+        crate::relationship::legacy::content_link_provenance()
+    )
+}
+
 /// Explicit column lists keep the comparison stable regardless of engine column
 /// ordering, and exclude rowid.
 fn columns_for(table: &str) -> &'static [&'static str] {
@@ -83,6 +94,15 @@ fn columns_for(table: &str) -> &'static [&'static str] {
             // replacement boundaries are not content-log projections.
             "persistence",
             "maturity",
+            // E3 M1 slice 1: caller-independent archived projection is
+            // content-log state (archive/restore fold), so replay must prove
+            // it converges byte-identically.
+            "archived",
+            // E3 M1 (v73): caller-independent currency counts are content-log
+            // state (supersedes link add/remove + successor tombstone fold),
+            // so replay must prove they converge like archived.
+            "is_current",
+            "successor_count",
             "summary",
             "last_activity_at",
             "created_at",
@@ -98,6 +118,19 @@ fn columns_for(table: &str) -> &'static [&'static str] {
             "created_at",
         ],
         "facet_values" => &["id", "record_id", "key", "value", "vocab_ref", "created_at"],
+        // D2 slice T2: the typed time fold must converge under replay.
+        "facet_times" => &[
+            "record_id",
+            "key",
+            "kind",
+            "all_day",
+            "start_date",
+            "end_date",
+            "start_ms",
+            "end_ms",
+            "tz",
+            "tzdb_version",
+        ],
         "facet_observations" => &[
             "id",
             "record_id",
@@ -221,6 +254,31 @@ fn columns_for(table: &str) -> &'static [&'static str] {
             "lookup_key",
             "form",
             "parser_version",
+        ],
+        // E3 M3 increment 2A: body-task rows are content-log state (body
+        // folds on create/update, kept on tombstone), so replay must prove
+        // they converge byte-identically.
+        "body_task_items" => &[
+            "record_id",
+            "item_index",
+            "source_event_seq",
+            "marker",
+            "checked",
+            "in_quote",
+            "start_offset",
+            "end_offset",
+        ],
+        "body_blocks" => &[
+            "record_id",
+            "block_index",
+            "chunk_index",
+            "chunk_count",
+            "source_event_seq",
+            "heading_path",
+            "block_kind",
+            "text",
+            "start_offset",
+            "end_offset",
         ],
         "module_releases" => &[
             "publication_event_id",
@@ -482,6 +540,58 @@ fn columns_for(table: &str) -> &'static [&'static str] {
             "metadata",
             "alias_of",
         ],
+        "vocabulary_value_json_nodes" => &[
+            "value_id",
+            "ordinal",
+            "path",
+            "parent_path",
+            "parent_ordinal",
+            "member_key",
+            "array_index",
+            "depth",
+            "node_type",
+            "text_value",
+            "number_text",
+            "bool_value",
+        ],
+        "schema_config_json_nodes" => &[
+            "config_id",
+            "ordinal",
+            "path",
+            "parent_path",
+            "parent_ordinal",
+            "member_key",
+            "array_index",
+            "depth",
+            "node_type",
+            "text_value",
+            "number_text",
+            "bool_value",
+        ],
+        "facet_value_json_nodes" => &[
+            "facet_id",
+            "ordinal",
+            "path",
+            "parent_path",
+            "parent_ordinal",
+            "member_key",
+            "array_index",
+            "depth",
+            "node_type",
+            "text_value",
+            "number_text",
+            "bool_value",
+        ],
+        "workspace_rule_installations" => &[
+            "root",
+            "namespace",
+            "name",
+            "snapshot_json",
+            "snapshot_digest",
+            "event_seq",
+            "actor",
+            "created_at",
+        ],
         "schema_config" => &[
             "id",
             "layer",
@@ -589,7 +699,17 @@ fn columns_for(table: &str) -> &'static [&'static str] {
             "declaration_digest",
             "consented_declaration",
             "adoption",
+            "adoption_provenance",
+            "body_read_admission_event_id",
+            "request",
             "status",
+            "event_id",
+            "event_seq",
+            "updated_at",
+        ],
+        "alpha_tab_orders" => &[
+            "account_id",
+            "tab_order",
             "event_id",
             "event_seq",
             "updated_at",
@@ -788,6 +908,23 @@ fn columns_for(table: &str) -> &'static [&'static str] {
             "ops_sha256",
             "origin_kind",
         ],
+        "content_event_reaction_meta" => &[
+            "event_seq",
+            "record_id",
+            "actor",
+            "legacy_emoji",
+            "emoji",
+            "executor_kind",
+            "reaction_class",
+            "created_at",
+        ],
+        "content_event_claim_meta" => &[
+            "event_seq",
+            "has_claimed_by",
+            "has_claimed_run",
+            "has_released_from",
+            "claim_class",
+        ],
         other => unreachable!("not a projection table: {other}"),
     }
 }
@@ -922,7 +1059,9 @@ pub struct RebuildDiffResult {
     pub event_count: usize,
 }
 
-async fn read_all_events(conn: &mut SqliteConnection) -> Result<Vec<EventRow>> {
+pub(crate) async fn read_all_events(conn: &mut SqliteConnection) -> Result<Vec<EventRow>> {
+    // `pub(crate)` for the test-only v2 kernel replay path
+    // (`crate::kernel::replay_all_projections`); no non-test caller.
     let rows = sqlx::query(
         "SELECT seq, id, record_id, type, payload, actor,
                 run_key, parent_key, intent, created_at, act,
@@ -983,12 +1122,7 @@ async fn dump_table(
     table: &str,
     columns: &[&str],
 ) -> Result<Vec<String>> {
-    let predicate = if table == "links" {
-        "id NOT LIKE 'rel:%'"
-    } else {
-        "1"
-    };
-    dump_table_where(conn, table, columns, predicate).await
+    dump_table_where(conn, table, columns, "1").await
 }
 
 async fn dump_relationship_table(
@@ -997,11 +1131,11 @@ async fn dump_relationship_table(
     columns: &[&str],
 ) -> Result<Vec<String>> {
     let predicate = if table == "links" {
-        "id LIKE 'rel:%'"
+        relationship_link_owner()
     } else {
-        "1"
+        "1".to_string()
     };
-    dump_table_where(conn, table, columns, predicate).await
+    dump_table_where(conn, table, columns, &predicate).await
 }
 
 async fn dump_table_where(
@@ -1023,6 +1157,13 @@ async fn dump_table_where(
         "message_conversations" => "message_id, conversation_id",
         "message_mentions" => "message_id, mention_id",
         "record_mentions" => "source_id, occurrence_ix",
+        "facet_times" => "record_id, key",
+        "body_task_items" => "record_id, item_index",
+        "body_blocks" => "record_id, block_index, chunk_index",
+        "vocabulary_value_json_nodes" => "value_id, ordinal",
+        "schema_config_json_nodes" => "config_id, ordinal",
+        "facet_value_json_nodes" => "facet_id, ordinal",
+        "workspace_rule_installations" => "root, namespace, name",
         "record_policies" => "record_id",
         "policy_entries" => "policy_anchor_id, subject_kind, subject_id, effect, capability",
         "agent_runs" => "activity_id",
@@ -1032,6 +1173,7 @@ async fn dump_table_where(
         "member_obligation_progress" => "account_id, programme_id, generation",
         "seeded_instruction_sources" => "source_record_id",
         "alpha_tab_installs" => "account_id, package",
+        "alpha_tab_orders" => "account_id",
         "control_event_applications" => "event_seq",
         "derivation_revision_inputs" => "revision_id, ordinal",
         "derivation_target_bindings" => "target_kind, target_record_id, target_slot, generation",
@@ -1076,6 +1218,8 @@ async fn dump_table_where(
         "dependency_audits" => "audit_event_id",
         "canvas_objects" => "canvas_id, object_id",
         "canvas_batches" => "canvas_id, batch_id",
+        "content_event_claim_meta" => "event_seq",
+        "content_event_reaction_meta" => "event_seq",
         _ => "id",
     };
     let rows = sqlx::query(&format!(
@@ -1096,11 +1240,17 @@ async fn dump_table_where(
                 .map(|(i, column)| {
                     if (matches!(
                         table,
-                        "facet_observations"
-                            | "message_audiences"
-                            | "message_origin_principals"
-                            | "message_conversations"
-                    ) && *column == "event_seq")
+                        "vocabulary_value_json_nodes"
+                            | "schema_config_json_nodes"
+                            | "facet_value_json_nodes"
+                    ) && matches!(*column, "ordinal" | "depth"))
+                        || (matches!(
+                            table,
+                            "facet_observations"
+                                | "message_audiences"
+                                | "message_origin_principals"
+                                | "message_conversations"
+                        ) && *column == "event_seq")
                         || (table == "message_mentions"
                             && matches!(
                                 *column,
@@ -1114,6 +1264,26 @@ async fn dump_table_where(
                                     | "span_start"
                                     | "span_end"
                                     | "parser_version"
+                            ))
+                        || (table == "body_task_items"
+                            && matches!(
+                                *column,
+                                "item_index"
+                                    | "source_event_seq"
+                                    | "checked"
+                                    | "in_quote"
+                                    | "start_offset"
+                                    | "end_offset"
+                            ))
+                        || (table == "body_blocks"
+                            && matches!(
+                                *column,
+                                "block_index"
+                                    | "chunk_index"
+                                    | "chunk_count"
+                                    | "source_event_seq"
+                                    | "start_offset"
+                                    | "end_offset"
                             ))
                         || (table == "module_releases"
                             && matches!(*column, "local_event_seq" | "status_event_seq"))
@@ -1157,6 +1327,15 @@ async fn dump_table_where(
                                 "deleted" | "geometry_seq" | "content_seq" | "created_seq"
                             ))
                         || (table == "canvas_batches" && *column == "event_seq")
+                        || (table == "content_event_reaction_meta" && *column == "event_seq")
+                        || (table == "content_event_claim_meta"
+                            && matches!(
+                                *column,
+                                "event_seq"
+                                    | "has_claimed_by"
+                                    | "has_claimed_run"
+                                    | "has_released_from"
+                            ))
                         || matches!(
                             (table, *column),
                             ("attribution_targets", "bound_event_seq")
@@ -1181,6 +1360,18 @@ async fn dump_table_where(
                         )
                     {
                         row.try_get::<i64, _>(i).map(serde_json::Value::from)
+                    } else if matches!(
+                        table,
+                        "vocabulary_value_json_nodes"
+                            | "schema_config_json_nodes"
+                            | "facet_value_json_nodes"
+                    ) && matches!(
+                        *column,
+                        "parent_ordinal" | "array_index" | "bool_value"
+                    ) {
+                        row.try_get::<Option<i64>, _>(i).map(|value| {
+                            value.map_or(serde_json::Value::Null, serde_json::Value::from)
+                        })
                     } else if table == "message_origin_state"
                         && matches!(
                             *column,
@@ -1193,6 +1384,10 @@ async fn dump_table_where(
                     } else if matches!(table, "message_audience_state" | "message_origin_state")
                         && matches!(*column, "declaration_event_seq" | "participant_count")
                     {
+                        row.try_get::<Option<i64>, _>(i).map(|value| {
+                            value.map_or(serde_json::Value::Null, serde_json::Value::from)
+                        })
+                    } else if table == "facet_times" && matches!(*column, "start_ms" | "end_ms") {
                         row.try_get::<Option<i64>, _>(i).map(|value| {
                             value.map_or(serde_json::Value::Null, serde_json::Value::from)
                         })
@@ -1214,7 +1409,10 @@ async fn dump_table_where(
                         })
                     } else if matches!(
                         (table, *column),
-                        ("instruction_bindings", "position" | "enabled")
+                        ("records", "archived")
+                            | ("records", "successor_count")
+                            | ("facet_times", "all_day")
+                            | ("instruction_bindings", "position" | "enabled")
                             | ("agent_runs", "start_event_seq")
                             | (
                                 "onboarding_programmes",
@@ -1224,7 +1422,9 @@ async fn dump_table_where(
                             | ("member_obligations", "generation")
                             | ("member_obligation_progress", "generation")
                             | ("seeded_instruction_sources", "template_version")
+                            | ("workspace_rule_installations", "event_seq")
                             | ("alpha_tab_installs", "event_seq")
+                            | ("alpha_tab_orders", "event_seq")
                             | ("control_event_applications", "event_seq")
                             | ("derivation_series", "created_event_seq")
                             | ("derivation_revisions", "completed_event_seq")
@@ -1258,6 +1458,13 @@ async fn dump_table_where(
                             | ("derivation_confirmation_heads", "head_event_seq")
                     ) {
                         row.try_get::<i64, _>(i).map(serde_json::Value::from)
+                    } else if table == "records" && *column == "is_current" {
+                        // Tri-state currency: 1 or NULL (0 reserved, never
+                        // written). Nullable-integer decoding keeps the NULL
+                        // scope-unknown side comparable across replay.
+                        row.try_get::<Option<i64>, _>(i).map(|value| {
+                            value.map_or(serde_json::Value::Null, serde_json::Value::from)
+                        })
                     } else if table == "derivation_target_bindings"
                         && *column == "detached_event_seq"
                     {
@@ -1283,6 +1490,17 @@ pub async fn rebuild_and_diff(live: &Db) -> Result<RebuildDiffResult> {
     // read transaction so a concurrent write between the reads can't look like drift.
     let mut snapshot = live.write_pool().begin().await?;
     let events = read_all_events(&mut snapshot).await?;
+    // Relationship-owned compatibility links are folded from a separate log.
+    // They affect currency on records, so retain this snapshot's rows as
+    // external inputs to the content comparison. A content-owned link can
+    // also have a caller-supplied `rel:` id; replay owns that row already.
+    let relationship_links =
+        sqlx::query_as::<_, (String, String, String, String, Option<String>, String)>(
+            "SELECT id,source_id,target_id,relationship,note,created_at
+           FROM links WHERE id LIKE 'rel:%' ORDER BY id",
+        )
+        .fetch_all(&mut *snapshot)
+        .await?;
     let mut live_dumps: Vec<(&str, Vec<String>)> = Vec::new();
     for table in PROJECTION_TABLES {
         live_dumps.push((
@@ -1300,6 +1518,42 @@ pub async fn rebuild_and_diff(live: &Db) -> Result<RebuildDiffResult> {
             // target events. Do not copy direct-write blob bytes into the
             // scratch rebuild, especially for large finance attachments.
             replay_with_blob_seeds(live, &mut conn, &events, None).await?;
+            let mut currency_targets = std::collections::BTreeSet::new();
+            for (id, source_id, target_id, relationship, note, created_at) in &relationship_links {
+                sqlx::query(
+                    "INSERT INTO links(id,source_id,target_id,relationship,note,created_at)
+                     VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(id) DO NOTHING",
+                )
+                .bind(id)
+                .bind(source_id)
+                .bind(target_id)
+                .bind(relationship)
+                .bind(note)
+                .bind(created_at)
+                .execute(&mut *conn)
+                .await?;
+                if relationship == "supersedes" {
+                    currency_targets.insert(target_id);
+                }
+            }
+            for target_id in currency_targets {
+                let count: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM links l JOIN records s ON s.id=l.source_id
+                      WHERE l.target_id=?1 AND l.relationship='supersedes'
+                        AND s.deleted_at IS NULL",
+                )
+                .bind(target_id)
+                .fetch_one(&mut *conn)
+                .await?;
+                sqlx::query(
+                    "UPDATE records SET successor_count=?1,
+                       is_current=CASE WHEN ?1 > 0 THEN NULL ELSE 1 END WHERE id=?2",
+                )
+                .bind(count)
+                .bind(target_id)
+                .execute(&mut *conn)
+                .await?;
+            }
         }
         diff_against(&rebuilt, &live_dumps, events.len()).await
     }
@@ -1404,8 +1658,8 @@ pub async fn rebuild_and_diff_policy(live: &Db) -> Result<RebuildDiffResult> {
 
 /// Replay the independent relationship ledger and re-derive receiver-local
 /// admission from the live snapshot's immutable provenance evidence. Content
-/// links are copied only as inert ownership guards; this lane compares `rel:`
-/// compatibility rows and the content lane compares everything else.
+/// links are copied only as inert ownership guards; this lane compares
+/// compatibility rows backed by the relationship ledger.
 pub async fn rebuild_and_diff_relationship(live: &Db) -> Result<RebuildDiffResult> {
     let mut snapshot = live.write_pool().begin().await?;
     let events = crate::relationship::read_all_relationship_events(&mut snapshot).await?;
@@ -1478,10 +1732,11 @@ pub async fn rebuild_and_diff_relationship(live: &Db) -> Result<RebuildDiffResul
             });
         }
     }
-    let legacy_rows = sqlx::query(
+    let legacy_rows = sqlx::query(&format!(
         "SELECT id,source_id,target_id,relationship,note,created_at
-           FROM links WHERE id NOT LIKE 'rel:%' ORDER BY id",
-    )
+           FROM links WHERE NOT ({}) ORDER BY id",
+        relationship_link_owner()
+    ))
     .fetch_all(&mut *snapshot)
     .await?;
     let mut legacy_links = Vec::with_capacity(legacy_rows.len());
@@ -1499,6 +1754,21 @@ pub async fn rebuild_and_diff_relationship(live: &Db) -> Result<RebuildDiffResul
             row.try_get::<String, _>("created_at")?,
         ));
     }
+    // The relationship replay's compatibility projector uses content-event
+    // provenance to protect historical caller-owned `rel:` rows. Preserve
+    // that narrow history in scratch only when such a row was seeded above.
+    let content_provenance = if legacy_links.iter().any(|(id, ..)| id.starts_with("rel:")) {
+        sqlx::query_as::<_, (i64, String, String, String, Option<String>, i64, String, String)>(
+            "SELECT seq,id,record_id,type,payload,causal_envelope_version,causal_status,created_at
+               FROM content_events
+              WHERE type IN ('record.created','record.type_corrected.v1','link.added','link.removed')
+              ORDER BY seq",
+        )
+        .fetch_all(&mut *snapshot)
+        .await?
+    } else {
+        Vec::new()
+    };
     let mut live_dumps = Vec::new();
     for table in RELATIONSHIP_REBUILD_TABLES {
         live_dumps.push((
@@ -1550,6 +1820,25 @@ pub async fn rebuild_and_diff_relationship(live: &Db) -> Result<RebuildDiffResul
             .bind(target_id)
             .bind(relationship)
             .bind(note)
+            .bind(created_at)
+            .execute(&mut *tx)
+            .await?;
+        }
+        for (seq, id, record_id, event_type, payload, envelope_version, status, created_at) in
+            content_provenance
+        {
+            sqlx::query(
+                "INSERT INTO content_events
+                   (seq,id,record_id,type,payload,causal_envelope_version,causal_status,created_at)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+            )
+            .bind(seq)
+            .bind(id)
+            .bind(record_id)
+            .bind(event_type)
+            .bind(payload)
+            .bind(envelope_version)
+            .bind(status)
             .bind(created_at)
             .execute(&mut *tx)
             .await?;

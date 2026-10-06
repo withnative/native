@@ -174,6 +174,9 @@ async fn insert_raw_event(
     actor: Option<&str>,
     run_key: Option<&str>,
 ) {
+    // Model legacy malformed storage, which the current live trigger rejects.
+    let legacy_malformed =
+        payload.is_some_and(|value| serde_json::from_str::<Value>(value).is_err());
     let id = format!(
         "event:{}",
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) + 1 FROM content_events")
@@ -181,6 +184,17 @@ async fn insert_raw_event(
             .await
             .unwrap()
     );
+    let mut tx = crate::common::fixture_write_pool(db)
+        .await
+        .begin()
+        .await
+        .unwrap();
+    if legacy_malformed {
+        sqlx::query("DROP TRIGGER content_event_claim_meta_insert")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+    }
     sqlx::query(
         "INSERT INTO content_events
             (id, record_id, type, payload, actor, run_key, created_at, causal_envelope_version, causal_status)
@@ -193,9 +207,17 @@ async fn insert_raw_event(
     .bind(payload)
     .bind(actor)
     .bind(run_key)
-    .execute(&crate::common::fixture_write_pool(db).await)
+    .execute(&mut *tx)
     .await
     .unwrap();
+    if legacy_malformed {
+        let trigger = native_ce::schema::DDL_STATEMENTS
+            .iter()
+            .find(|sql| sql.starts_with("CREATE TRIGGER content_event_claim_meta_insert"))
+            .unwrap();
+        sqlx::query(trigger).execute(&mut *tx).await.unwrap();
+    }
+    tx.commit().await.unwrap();
 }
 
 fn seqs(value: &Value) -> Vec<i64> {
@@ -1169,16 +1191,38 @@ async fn every_declared_content_event_type_is_summarized_rather_than_fatal() {
     let registry = registry();
     insert_record(&db, "record:types", "Every declared type", None, false).await;
     for event_type in native_ce::events::EVENT_TYPES {
-        // Two types carry a payload the read path genuinely requires, and both
-        // are modelled rather than unknown: `facet.*` carries the key reported
-        // as a changed field, and `receipt.committed.v1` is rewritten into a
-        // body-only `record.updated` before any caller sees it. An absent
-        // payload on either is a real integrity failure and stays fatal; that
-        // is a different thing from failing on a type nobody taught this
-        // aggregate about, which is what this test is here to prevent.
+        // The read path requires facet keys and the receipt body rewritten
+        // into `record.updated`. Reaction payloads are required by the live
+        // write projection instead. This raw-event helper bypasses the domain
+        // projector, so supply valid payloads without adding a Message target
+        // prerequisite to this event-type summary test.
         let payload = match event_type {
             "facet.set" | "facet.unset" => Some(json!({ "key": "priority", "value": "high" })),
             "receipt.committed.v1" => Some(json!({ "body": "committed" })),
+            "message.reaction.added.v1" | "message.reaction.removed.v1" => {
+                let payload = json!({
+                    "format": "native.message-reaction.v1",
+                    "emoji": "👍",
+                    "idempotency_key": format!("summary:{event_type}"),
+                    "command": if event_type == "message.reaction.added.v1" {
+                        "add_reaction"
+                    } else {
+                        "remove_reaction"
+                    },
+                    "changed": true,
+                    "actor_account_id": SELF,
+                    "executor_kind": "authenticated_principal",
+                    "executor_ref": null,
+                    "reason": "Exercise every declared event type in the summary."
+                });
+                serde_json::from_value::<native_ce::events::MessageReactionPayload>(
+                    payload.clone(),
+                )
+                .unwrap()
+                .validate(Some(SELF))
+                .unwrap();
+                Some(payload)
+            }
             _ => None,
         };
         insert_event(

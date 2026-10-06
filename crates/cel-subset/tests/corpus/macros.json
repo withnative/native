@@ -1,0 +1,18 @@
+[
+{"name":"all_empty","expr":"[].all(e, e > 0)","bindings":{},"expect":{"value":{"bool":true}},"spec":"Macros: all() over empty list is true"},
+{"name":"all_error_exhaustive","expr":"[1, 2, 3].all(e, e / 0 != 17)","bindings":{},"expect":{"error":"division_by_zero","note":"divide by zero"},"spec":"Macros: all() ignores errors only when a false is found"},
+{"name":"all_error_absorbed","expr":"[1, 2, 3].all(e, 6 / (2 - e) == 6)","bindings":{},"expect":{"value":{"bool":false}},"spec":"Macros: all() combines with &&, so a false absorbs other predicate errors"},
+{"name":"all_type_exhaustive","expr":"[1, 'foo', 3].all(e, e % 2 == 1)","bindings":{},"expect":{"error":"no_matching_overload","note":"no_matching_overload"},"spec":"Macros: all()"},
+{"name":"exists_empty","expr":"[].exists(e, e == 2)","bindings":{},"expect":{"value":{"bool":false}},"spec":"Macros: exists() over empty list is false"},
+{"name":"exists_error","expr":"[1, 2, 3].exists(e, e / 0 == 17)","bindings":{},"expect":{"error":"division_by_zero","note":"divide by zero"},"spec":"Macros: exists() raises when no true absorbs predicate errors"},
+{"name":"exists_error_absorbed","expr":"[1, 2, 3].exists(e, e == 2 || 6 / (e - 2) == 6)","bindings":{},"expect":{"value":{"bool":true}},"spec":"Macros: exists() combines with ||"},
+{"name":"exists_one_one_of","expr":"[6, 7, 8].exists_one(foo, foo % 5 == 2)","bindings":{},"expect":{"value":{"bool":true}},"spec":"Macros: exists_one()"},
+{"name":"exists_one_many","expr":"[0, 1, 2, 3, 4].exists_one(n, n % 2 == 1)","bindings":{},"expect":{"value":{"bool":false}}},
+{"name":"exists_one_error","expr":"[1, 2, 3].exists_one(e, e / 0 == 1)","bindings":{},"expect":{"error":"division_by_zero","note":"divide by zero"},"spec":"Macros: exists_one() any predicate error raises"},
+{"name":"map_double","expr":"[2, 4, 6].map(n, n / 2)","bindings":{},"expect":{"value":{"list":[{"int":"1"},{"int":"2"},{"int":"3"}]}},"spec":"Macros: map()"},
+{"name":"map_extract_keys","expr":"{'John': 'smart'}.map(k, k)","bindings":{},"expect":{"value":{"list":[{"string":"John"}]}},"spec":"Macros: map() over a map yields keys"},
+{"name":"map_error","expr":"[1, 2, 3].map(n, 1 / (n - 2))","bindings":{},"expect":{"error":"division_by_zero","note":"divide by zero"},"spec":"Macros: map() any element error raises"},
+{"name":"filter_odd","expr":"[0, 1, 2, 3, 4].filter(x, x % 2 == 1)","bindings":{},"expect":{"value":{"list":[{"int":"1"},{"int":"3"}]}},"spec":"Macros: filter()"},
+{"name":"filter_map_keys","expr":"{'John': 'smart', 'Paul': 'cute'}.filter(k, k == 'Paul')","bindings":{},"expect":{"value":{"list":[{"string":"Paul"}]}},"spec":"Macros: filter() over a map yields keys"},
+{"name":"nested_map_all","expr":"[[1, 2], [3, 4]].map(r, r.all(j, j > 0))","bindings":{},"expect":{"value":{"list":[{"bool":true},{"bool":true}]}},"spec":"Macros: nesting"}
+]

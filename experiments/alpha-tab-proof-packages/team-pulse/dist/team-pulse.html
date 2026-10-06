@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Team pulse — sample preview</title>
+<style>
+body { margin: 0; padding: 1.5rem; font: 15px/1.5 system-ui, sans-serif; color: #1a201a; background: #f5f6f2; }
+main { max-width: 52rem; margin: 0 auto; }
+.banner { padding: 0.6rem 0.9rem; border: 1px solid #b9c4ad; background: #eef3e4; }
+table { border-collapse: collapse; width: 100%; margin-top: 1rem; background: #ffffff; }
+caption { text-align: left; font-weight: 600; padding: 0.25rem 0; }
+th, td { border: 1px solid #d5dacd; padding: 0.4rem 0.6rem; text-align: left; }
+button { padding: 0.3rem 0.7rem; }
+.note { margin-top: 1.5rem; font-size: 0.85rem; color: #4a5245; }
+</style>
+<script type="application/json" id="native-artifact-manifest">{"capability_requests":[{"capability":"input.read","scope":{"port":"records"}}],"inputs":{"records":{"envelope":"native.collection-envelope.v1","expose_to_root":true,"required":true}},"schema":"native.html.artifact.v1"}</script>
+</head>
+<body>
+<main>
+<h1>Team pulse</h1>
+<p id="sample-banner" class="banner" role="status">Loading preview input.</p>
+<p id="summary" class="summary">Waiting for host input.</p>
+<table id="counts">
+<caption>Visible items by shape</caption>
+<thead><tr><th scope="col">Group</th><th scope="col">Count</th></tr></thead>
+<tbody></tbody>
+</table>
+<table id="spotlight">
+<caption>Spotlight (first eight by name)</caption>
+<thead><tr><th scope="col">Name</th><th scope="col">Type</th><th scope="col">Kind</th><th scope="col">Open</th></tr></thead>
+<tbody></tbody>
+</table>
+<p class="note">Read-only preview on native.html.artifact.v1: counts and rows derive only from the host-delivered input bundle. Record navigation is not wired in the sample preview — the alpha sample frame ignores frame navigation messages, so the Open controls render disabled. The frame itself holds no authority, credential, or network access. This package is sample-only: it carries no provisional live need (see the directory note).</p>
+</main>
+<script>
+(function () {
+  "use strict";
+  function cohortRecords(input) {
+    if (!input || typeof input !== "object") return [];
+    var port = input.inputs && input.inputs.records;
+    if (port && Array.isArray(port.records)) return port.records;
+    if (Array.isArray(input.records)) return input.records;
+    return [];
+  }
+  function isSample(input) {
+    return !!input && (input.sample_preview === true || input.mode === "sample");
+  }
+  function text(value) {
+    if (value === null || value === undefined) return "";
+    return String(value);
+  }
+  function clearBody(table) {
+    var body = table.getElementsByTagName("tbody")[0];
+    while (body.firstChild) body.removeChild(body.firstChild);
+    return body;
+  }
+  function render(bundle) {
+    var input = (bundle && bundle.input) || bundle;
+    var records = cohortRecords(input);
+    var banner = document.getElementById("sample-banner");
+    var summary = document.getElementById("summary");
+    var counts = document.getElementById("counts");
+    var spotlight = document.getElementById("spotlight");
+    var countsBody = clearBody(counts);
+    var spotlightBody = clearBody(spotlight);
+    if (isSample(input)) {
+      banner.textContent = "Sample preview \u2014 host-supplied fixture data, not live records. No live read occurred to paint this view.";
+    } else {
+      banner.textContent = "Host-delivered input bundle. The frame renders only what the host resolved under viewer authority.";
+    }
+    if (!records.length) {
+      summary.textContent = "No visible items.";
+      return;
+    }
+    summary.textContent = records.length + (records.length === 1 ? " visible item." : " visible items.");
+    var byType = {};
+    var byKind = {};
+    records.forEach(function (record) {
+      var type = text(record.type) || "(untyped)";
+      var kind = text(record.kind) || "(no kind)";
+      byType[type] = (byType[type] || 0) + 1;
+      byKind[kind] = (byKind[kind] || 0) + 1;
+    });
+    Object.keys(byType).sort().forEach(function (type) {
+      var row = document.createElement("tr");
+      var group = document.createElement("td");
+      group.textContent = "type: " + type;
+      var count = document.createElement("td");
+      count.textContent = String(byType[type]);
+      row.appendChild(group);
+      row.appendChild(count);
+      countsBody.appendChild(row);
+    });
+    Object.keys(byKind).sort().forEach(function (kind) {
+      var row = document.createElement("tr");
+      var group = document.createElement("td");
+      group.textContent = "kind: " + kind;
+      var count = document.createElement("td");
+      count.textContent = String(byKind[kind]);
+      row.appendChild(group);
+      row.appendChild(count);
+      countsBody.appendChild(row);
+    });
+    records.slice().sort(function (a, b) {
+      return text(a.name).localeCompare(text(b.name));
+    }).slice(0, 8).forEach(function (record) {
+      var row = document.createElement("tr");
+      var name = document.createElement("td");
+      name.textContent = text(record.name) || "(unnamed record)";
+      var type = document.createElement("td");
+      type.textContent = text(record.type);
+      var kind = document.createElement("td");
+      kind.textContent = text(record.kind);
+      var openCell = document.createElement("td");
+      if (text(record.id)) {
+        var open = document.createElement("button");
+        open.setAttribute("type", "button");
+        open.setAttribute("disabled", "");
+        open.setAttribute("title", "Record navigation is not wired in the sample preview.");
+        open.textContent = "Open (unavailable in preview)";
+        openCell.appendChild(open);
+      } else {
+        openCell.textContent = "\u2014";
+      }
+      row.appendChild(name);
+      row.appendChild(type);
+      row.appendChild(kind);
+      row.appendChild(openCell);
+      spotlightBody.appendChild(row);
+    });
+  }
+  function boot(delivery) { render(delivery); }
+  if (window.nativeArtifact && window.nativeArtifact.ready && typeof window.nativeArtifact.ready.then === "function") {
+    window.nativeArtifact.ready.then(boot, function () {
+      document.getElementById("summary").textContent = "Preview input unavailable.";
+    });
+    if (typeof window.nativeArtifact.onInput === "function") {
+      window.nativeArtifact.onInput(boot);
+    }
+  } else {
+    document.getElementById("summary").textContent = "Preview input unavailable outside the artifact host.";
+  }
+})();
+</script>
+</body>
+</html>

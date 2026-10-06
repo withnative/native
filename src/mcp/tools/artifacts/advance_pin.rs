@@ -816,6 +816,7 @@ pub(super) async fn advance_artifact_port_pin(
                     key: "query".into(),
                     value: Value::String(serde_json::to_string(&definition)?),
                     vocab_ref: None,
+                    time_type: None,
                 },
                 caller.actor(),
             ),

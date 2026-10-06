@@ -1,0 +1,13 @@
+{
+  "note": "runtime descriptor from render_artifact on a native.html.v1 artifact in Native HQ (production), 28 Sep 2026 ~08:10 UTC",
+  "status": "rendered",
+  "runtime": {
+    "id": "native.html.v1",
+    "contract_version": 1,
+    "adapter_revision": 1,
+    "validator": { "id": "native-ce.html-policy", "version": 1, "html_parser": "html5ever@0.39.0" },
+    "delivery_transform": { "id": "native-ce.html-bootstrap", "version": 1, "digest": "89574d1d419a426988b0c751c1e004c28b26edc1a39b9b5022d7a11f9e477c2a" },
+    "bridge_version": "native.html.bridge.v1",
+    "limits": { "body_utf8_bytes": 524288, "data_asset_decoded_bytes_each": 262144, "data_asset_decoded_bytes_total": 393216, "static_dom_nodes": 10000, "css_rules": 5000, "slides": 200, "input_records": 5000, "input_json_bytes": 4194304, "bridge_message_bytes": 4194304, "ready_timeout_ms": 2000 }
+  }
+}

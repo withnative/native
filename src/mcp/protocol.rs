@@ -199,6 +199,16 @@ pub(crate) async fn handle_modern_lens_message(
     .await
 }
 
+/// A database-less `tools/call` refusal for a member copy that holds no
+/// admitted snapshot. The transport supplies the typed member classification
+/// (R6 copy state, or `STANDBY_READ_ONLY` for writes); the shared dispatcher
+/// keeps every other protocol concern (validation, discovery, catalog and
+/// resource methods) identical to the held path. It is pure: no canonical
+/// record or storage IO.
+pub(crate) trait NoHeldToolCall: Send + Sync {
+    fn refuse(&self, name: &str, arguments: &Value) -> Error;
+}
+
 #[allow(clippy::large_enum_variant)]
 enum ProtocolToolDispatch {
     Single {
@@ -206,6 +216,10 @@ enum ProtocolToolDispatch {
         caller: Caller,
     },
     Lens(Arc<dyn LensDispatch>),
+    /// No engine is held; `tools/call` answers the supplied typed refusal while
+    /// every engine-free method (discovery, catalog, resources, list) reuses
+    /// the exact shared path.
+    Refusing(Arc<dyn NoHeldToolCall>),
 }
 
 impl ProtocolToolDispatch {
@@ -216,6 +230,7 @@ impl ProtocolToolDispatch {
                 .cloned()
                 .unwrap_or_else(|| ResolvedToolExposure::new(registry.exposure_profile())),
             Self::Lens(dispatcher) => dispatcher.exposure_policy(registry),
+            Self::Refusing(_) => ResolvedToolExposure::new(registry.exposure_profile()),
         }
     }
 
@@ -230,8 +245,69 @@ impl ProtocolToolDispatch {
                     .await
             }
             Self::Lens(dispatcher) => dispatcher.run_context(registry, arguments).await,
+            // No engine/caller is held, so no run context exists.
+            Self::Refusing(_) => Value::Null,
         }
     }
+}
+
+/// Shared `tools/call` handling for a no-held member copy. Unknown names and a
+/// missing name keep the shared `INVALID_PARAMS` JSON-RPC semantics; a known
+/// tool answers the supplied typed refusal as a tool result. Mirrors
+/// [`tools_call_kernel`]'s pre-dispatch shape without touching storage.
+fn no_held_call_result(
+    registry: &ToolRegistry,
+    refusal: &dyn NoHeldToolCall,
+    params: &serde_json::Map<String, Value>,
+) -> std::result::Result<Value, (i64, String)> {
+    let Some(name) = params.get("name").and_then(Value::as_str) else {
+        return Err((INVALID_PARAMS, "invalid params: missing tool name".into()));
+    };
+    let Some(tool) = registry.get(name) else {
+        return Err((INVALID_PARAMS, format!("unknown tool: {name}")));
+    };
+    let arguments = params
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let error = refusal.refuse(name, &arguments);
+    Ok(call_error_content(
+        &error,
+        Value::Null,
+        tool.ui.as_ref().map(|ui| ui.resource_uri),
+    ))
+}
+
+/// Handle one stateless 2026-era MCP message for a member copy holding no
+/// admitted snapshot. Validation, discovery, catalog and resource methods are
+/// the shared path; only `tools/call` is answered by `refusal`.
+pub(crate) async fn handle_modern_member_message(
+    registry: Arc<ToolRegistry>,
+    refusal: Arc<dyn NoHeldToolCall>,
+    message: Value,
+) -> RpcOutcome {
+    handle_modern_message_with_dispatch(
+        registry,
+        ProtocolToolDispatch::Refusing(refusal),
+        message,
+        None,
+    )
+    .await
+}
+
+/// Legacy initialize-era counterpart of [`handle_modern_member_message`].
+pub(crate) async fn handle_legacy_member_message(
+    registry: Arc<ToolRegistry>,
+    refusal: Arc<dyn NoHeldToolCall>,
+    message: Value,
+) -> RpcOutcome {
+    handle_legacy_message_with_dispatch(
+        registry,
+        ProtocolToolDispatch::Refusing(refusal),
+        message,
+        None,
+    )
+    .await
 }
 
 async fn handle_modern_message_with_dispatch(
@@ -406,7 +482,7 @@ async fn handle_modern_message_with_dispatch(
     let outcome = match method {
         "server/discover" => Ok(discover_result()),
         "tools/list" => match &dispatch {
-            ProtocolToolDispatch::Single { .. } => {
+            ProtocolToolDispatch::Single { .. } | ProtocolToolDispatch::Refusing(_) => {
                 tools_list_result(&registry, &dispatch.exposure_policy(&registry))
                     .map_err(|error| (INTERNAL_ERROR, error.to_string()))
             }
@@ -429,6 +505,12 @@ async fn handle_modern_message_with_dispatch(
             }
             ProtocolToolDispatch::Lens(dispatcher) => {
                 dispatcher.tools_call(&registry, params, true).await
+            }
+            ProtocolToolDispatch::Refusing(refusal) => {
+                no_held_call_result(&registry, refusal.as_ref(), params).map(|mut result| {
+                    add_modern_result_fields(&mut result);
+                    result
+                })
             }
         },
         "initialize" => Err((
@@ -568,7 +650,7 @@ async fn handle_legacy_message_with_dispatch(
         "initialize" => Ok(legacy_initialize_result(&params)),
         "ping" => Ok(json!({})),
         "tools/list" => match &dispatch {
-            ProtocolToolDispatch::Single { .. } => {
+            ProtocolToolDispatch::Single { .. } | ProtocolToolDispatch::Refusing(_) => {
                 legacy_tools_list_result(&registry, &dispatch.exposure_policy(&registry))
                     .map_err(|error| (INTERNAL_ERROR, error.to_string()))
             }
@@ -597,6 +679,13 @@ async fn handle_legacy_message_with_dispatch(
             }
             ProtocolToolDispatch::Lens(dispatcher) => match params.as_object() {
                 Some(params) => dispatcher.tools_call(&registry, params, false).await,
+                None => Err((
+                    INVALID_PARAMS,
+                    "invalid params: tools/call params must be an object".into(),
+                )),
+            },
+            ProtocolToolDispatch::Refusing(refusal) => match params.as_object() {
+                Some(params) => no_held_call_result(&registry, refusal.as_ref(), params),
                 None => Err((
                     INVALID_PARAMS,
                     "invalid params: tools/call params must be an object".into(),
@@ -761,15 +850,76 @@ fn attach_mcp_evidence(result: &mut Value, evidence: &[super::evidence::Transien
         );
 }
 
+/// Structured wire fields for the typed member-copy refusals (§2.2, §6.1,
+/// §6.2). Returns `Some((message, extra))` for the five member variants and
+/// `None` for every other error, so the rendering of every non-member error
+/// stays byte-identical.
+fn member_refusal_wire(error: &Error) -> Option<(String, Value)> {
+    match error {
+        Error::StandbyReadOnly {
+            code,
+            message,
+            retryable,
+            retry,
+            effect,
+        } => Some((
+            (*message).to_string(),
+            json!({
+                "error_code": code,
+                "message": message,
+                "retryable": retryable,
+                "retry": retry,
+                "effect": effect,
+            }),
+        )),
+        Error::UnavailableOffline {
+            surface,
+            requirement,
+        } => Some((
+            format!("this offline copy cannot answer {surface}"),
+            json!({
+                "error_code": "unavailable_offline",
+                "surface": surface,
+                "requirement": requirement,
+                "retry": "when_online",
+            }),
+        )),
+        Error::CopyLocked { retry } => Some((
+            "sign in to open your offline copy".to_string(),
+            json!({ "error_code": "copy_locked", "retry": retry }),
+        )),
+        Error::CopyUnavailable => Some((
+            "this offline copy is not available".to_string(),
+            json!({ "error_code": "copy_unavailable" }),
+        )),
+        Error::CopyRemoved { cause, deletion } => Some((
+            "this offline copy was removed".to_string(),
+            json!({
+                "error_code": "copy_removed",
+                "cause": cause,
+                "deletion": deletion,
+            }),
+        )),
+        _ => None,
+    }
+}
+
 pub(crate) fn call_error_content(
     error: &Error,
     run_context: Value,
     resource_uri: Option<&str>,
 ) -> Value {
-    let standby_read_only = error.to_string() == super::registry::STANDBY_READ_ONLY_ERROR;
+    let member = member_refusal_wire(error);
+    // The untyped owner-standby engine string keeps its existing rendering;
+    // the typed member variant is handled above so agents see the §6.2 text.
+    let standby_read_only = error.to_string() == super::registry::STANDBY_READ_ONLY_ERROR
+        && !matches!(error, Error::StandbyReadOnly { .. });
     let deployment_operation = error.deployment_read_only_operation();
+    let draining_operation = error.deployment_draining_operation();
     let pool_timeout = matches!(error, Error::Sqlx(sqlx::Error::PoolTimedOut));
-    let message = if standby_read_only {
+    let message = if let Some((message, _)) = &member {
+        message.clone()
+    } else if standby_read_only {
         "this Native server is a read-only standby".to_string()
     } else if deployment_operation.is_some() {
         "this Native deployment is temporarily read-only".to_string()
@@ -777,11 +927,14 @@ pub(crate) fn call_error_content(
         error.to_string()
     };
     let mut text = message.clone();
-    // Text clients do not necessarily read structuredContent, so the pool
-    // recovery guidance rides in the text body too — not only in `recovery`.
+    // Text clients do not necessarily read structuredContent, so recovery
+    // guidance rides in the text body too — not only in `recovery`.
     if pool_timeout {
         text.push_str("\n\nRecovery: ");
         text.push_str(DATABASE_POOL_TIMEOUT_RECOVERY);
+    } else if draining_operation.is_some() {
+        text.push_str("\n\nRecovery: ");
+        text.push_str(super::DEPLOYMENT_DRAINING_RECOVERY);
     }
     text.push_str(&render::render_run_context(&run_context));
     let mut result = json!({
@@ -799,6 +952,14 @@ pub(crate) fn call_error_content(
         result["structuredContent"]["retryable"] = json!(true);
         result["structuredContent"]["applied"] = json!(false);
         result["structuredContent"]["operation"] = json!(operation);
+    } else if let Some(operation) = draining_operation {
+        // A drain-paused refusal lands mid-operation: earlier effects may
+        // have committed, so never claim `applied: false` or blanket
+        // retryability — outcome unknown, like a pool timeout.
+        result["structuredContent"]["error_code"] = json!(super::DEPLOYMENT_DRAINING_ERROR);
+        result["structuredContent"]["outcome"] = json!("unknown");
+        result["structuredContent"]["recovery"] = json!(super::DEPLOYMENT_DRAINING_RECOVERY);
+        result["structuredContent"]["operation"] = json!(operation);
     } else if pool_timeout {
         // A pool acquisition timeout leaves the outcome unknown: the timed-out
         // call may or may not have applied. Never claim `applied: false`, and
@@ -809,6 +970,17 @@ pub(crate) fn call_error_content(
         result["structuredContent"]["error_code"] = json!(DATABASE_POOL_TIMEOUT);
         result["structuredContent"]["outcome"] = json!("unknown");
         result["structuredContent"]["recovery"] = json!(DATABASE_POOL_TIMEOUT_RECOVERY);
+    }
+    if let Some((message, extra)) = member {
+        // The typed member refusals replace the generic error text and carry
+        // their §2.2/§6.1/§6.2 fields into the wire.
+        let object = result["structuredContent"]
+            .as_object_mut()
+            .expect("tool error structuredContent is an object");
+        object.insert("error".into(), json!(message));
+        if let Some(extra) = extra.as_object() {
+            object.extend(extra.clone());
+        }
     }
     if let Some(resource_uri) = resource_uri {
         result
@@ -909,7 +1081,20 @@ async fn tools_call_kernel(
     let call = match dispatched {
         Ok(call) => call,
         Err(error @ Error::DeploymentReadOnly(_))
+        | Err(error @ Error::DeploymentDraining(_))
         | Err(error @ Error::Sqlx(sqlx::Error::PoolTimedOut)) => {
+            return Ok(call_error_content(
+                &error,
+                Value::Null,
+                tool.ui.as_ref().map(|ui| ui.resource_uri),
+            ));
+        }
+        // The typed member refusals the dispatch gate raises before any handler
+        // (a retired/unbound/removed/locked copy, a write, or an unserved
+        // surface) are tool results carrying their §2.2/§6.1/§6.2 wire fields.
+        // `member_refusal_wire` is the single source of truth for exactly those
+        // variants, so every other Single/Lens error path is unchanged.
+        Err(error) if member_refusal_wire(&error).is_some() => {
             return Ok(call_error_content(
                 &error,
                 Value::Null,
@@ -929,7 +1114,16 @@ async fn tools_call_kernel(
             ))
         }
         Err(err @ (Error::Engine(_) | Error::Conflict(_) | Error::Auth(_)))
+        | Err(err @ Error::DeploymentDraining(_))
         | Err(err @ Error::Sqlx(sqlx::Error::PoolTimedOut)) => Ok(call_error_content(
+            &err,
+            call.run_context,
+            tool.ui.as_ref().map(|ui| ui.resource_uri),
+        )),
+        // Same contract as the dispatch-gate arm: a typed member refusal
+        // returned by a handler keeps its wire fields rather than collapsing to
+        // `INTERNAL_ERROR`.
+        Err(err) if member_refusal_wire(&err).is_some() => Ok(call_error_content(
             &err,
             call.run_context,
             tool.ui.as_ref().map(|ui| ui.resource_uri),
@@ -1318,6 +1512,7 @@ pub(crate) fn unsupported_protocol_response(id: Value, requested: &str) -> Value
 mod tests {
     use super::*;
     use crate::mcp::{register_surface_tools, TransientEvidence};
+    use crate::member_offline_fixtures::assert_no_counter_fields;
 
     fn complete_record_payload() -> Value {
         json!({
@@ -1894,6 +2089,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deployment_draining_is_in_band_and_outcome_unknown_across_protocol_eras() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let mut registry = ToolRegistry::new();
+        registry
+            .register(
+                crate::mcp::ToolKind::Bootstrap,
+                "drain fault fixture",
+                json!({"type":"object","properties":{},"additionalProperties":false}),
+                |_db: crate::Db, _caller: Caller, _args: Value| async {
+                    Err::<Value, Error>(Error::DeploymentDraining(
+                        crate::DeploymentReadOnlyOperation::server("ensure_public_principal"),
+                    ))
+                },
+            )
+            .unwrap();
+        let registry = std::sync::Arc::new(registry);
+        for modern_era in [false, true] {
+            let params = json!({"name":"bootstrap","arguments":{}});
+            let request = if modern_era {
+                modern(76, "tools/call", params)
+            } else {
+                json!({"jsonrpc":"2.0","id":76,"method":"tools/call","params":params})
+            };
+            let reply = if modern_era {
+                response(
+                    handle_modern_message(registry.clone(), db.clone(), Caller::local(), request)
+                        .await,
+                )
+            } else {
+                response(
+                    handle_legacy_message(registry.clone(), db.clone(), Caller::local(), request)
+                        .await,
+                )
+            };
+            assert!(reply.get("error").is_none(), "{reply}");
+            assert_eq!(reply["result"]["isError"], true);
+            let body = &reply["result"]["structuredContent"];
+            assert_eq!(body["error_code"], crate::mcp::DEPLOYMENT_DRAINING_ERROR);
+            assert_eq!(body["outcome"], "unknown");
+            assert_eq!(body["operation"], "ensure_public_principal");
+            assert!(body.get("applied").is_none());
+            assert!(body.get("retryable").is_none());
+            assert!(reply["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("Recovery:"));
+        }
+        db.close().await;
+    }
+
+    #[tokio::test]
     async fn pool_timeout_is_in_band_across_protocol_eras() {
         let db = crate::create_database(":memory:").await.unwrap();
         let mut registry = ToolRegistry::new();
@@ -2169,5 +2415,76 @@ mod tests {
             );
         }
         db.close().await;
+    }
+
+    fn member_refusal_content(error: &Error) -> Value {
+        let content = call_error_content(error, Value::Null, None);
+        assert_no_counter_fields(&content, "member refusal wire");
+        content
+    }
+
+    #[test]
+    fn typed_member_refusals_render_structured_fields() {
+        // §6.2 write refusal keeps the code string and carries its fields.
+        let content = member_refusal_content(&Error::standby_read_only());
+        let sc = &content["structuredContent"];
+        assert_eq!(
+            sc["error_code"],
+            json!(crate::error::STANDBY_READ_ONLY_CODE)
+        );
+        assert_eq!(sc["retryable"], json!(true));
+        assert_eq!(sc["retry"], json!("when_online"));
+        assert_eq!(sc["effect"], json!("not_applied"));
+        assert!(sc["message"]
+            .as_str()
+            .expect("message")
+            .contains("offline and read-only"));
+
+        // §2.2 unavailable surface carries surface + requirement.
+        let content = member_refusal_content(&Error::unavailable_offline("get_record", "as_of"));
+        let sc = &content["structuredContent"];
+        assert_eq!(sc["error_code"], json!("unavailable_offline"));
+        assert_eq!(sc["surface"], json!("get_record"));
+        assert_eq!(sc["requirement"], json!("as_of"));
+        assert_eq!(sc["retry"], json!("when_online"));
+
+        // §6.1 locked carries the retry.
+        let content = member_refusal_content(&Error::copy_locked());
+        let sc = &content["structuredContent"];
+        assert_eq!(sc["error_code"], json!("copy_locked"));
+        assert_eq!(sc["retry"], json!("after_sign_in"));
+
+        // §2.2 unavailable copy carries no reason.
+        let content = member_refusal_content(&Error::copy_unavailable());
+        assert_eq!(
+            content["structuredContent"]["error_code"],
+            json!("copy_unavailable")
+        );
+
+        // §2.2 removed copy carries cause + deletion.
+        let content = member_refusal_content(&Error::copy_removed(
+            crate::member_copy_lifecycle::RemovedCause::MembershipEnded,
+            crate::member_copy_lifecycle::DeletionState::InProgress,
+        ));
+        let sc = &content["structuredContent"];
+        assert_eq!(sc["error_code"], json!("copy_removed"));
+        assert_eq!(sc["cause"], json!("membership_ended"));
+        assert_eq!(sc["deletion"], json!("in_progress"));
+
+        // The untyped owner-standby string renders exactly as before.
+        let owner = call_error_content(
+            &Error::engine(crate::mcp::registry::STANDBY_READ_ONLY_ERROR),
+            Value::Null,
+            None,
+        );
+        assert_eq!(
+            owner["structuredContent"]["error_code"],
+            json!(crate::mcp::registry::STANDBY_READ_ONLY_ERROR)
+        );
+        assert_eq!(
+            owner["structuredContent"]["error"],
+            json!("this Native server is a read-only standby")
+        );
+        assert!(owner["structuredContent"].get("retry").is_none());
     }
 }

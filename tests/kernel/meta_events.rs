@@ -93,9 +93,24 @@ async fn the_guarded_deletes_append_too() {
     let db = db().await;
     let vid = create_vocabulary(&db, "moods", None).await.unwrap();
     let typo = propose_value(&db, &vid, "clam", None).await.unwrap();
+    let node_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM vocabulary_value_json_nodes WHERE value_id=?")
+            .bind(&typo)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(node_count, 1, "the default metadata object has a root node");
     // Neither seeded nor referenced, so the guard permits the hard delete.
     delete_value(&db, &typo).await.unwrap();
     delete_vocabulary(&db, &vid).await.unwrap();
+    let node_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM vocabulary_value_json_nodes WHERE value_id=?")
+            .bind(&typo)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(node_count, 0);
+    assert!(rebuild_and_diff_meta(&db).await.unwrap().equal);
 
     let types = types_in_order(&db).await;
     assert_eq!(types.last().unwrap(), "vocabulary.deleted");

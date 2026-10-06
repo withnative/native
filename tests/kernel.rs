@@ -50,6 +50,8 @@ mod previous_seq;
 mod query;
 #[path = "kernel/query_contract_compat.rs"]
 mod query_contract_compat;
+#[path = "kernel/query_sql_attribution.rs"]
+mod query_sql_attribution;
 #[path = "kernel/robustness.rs"]
 mod robustness;
 #[path = "kernel/smoke.rs"]
@@ -58,3 +60,13 @@ mod smoke;
 mod whats_changed;
 #[path = "kernel/write_path.rs"]
 mod write_path;
+// Fresh-agent harness smoke (needs the example binary): runs only with the
+// `v2-kernel-probe` feature. The test locates the example via its own
+// executable path (`current_exe` -> `../examples/v2_contract`); CI builds it
+// explicitly with `cargo build --example v2_contract` first.
+#[cfg(feature = "v2-kernel-probe")]
+#[path = "kernel/v2_contract_smoke.rs"]
+mod v2_contract_smoke;
+
+#[path = "kernel/workspace_rule_storage.rs"]
+mod workspace_rule_storage;

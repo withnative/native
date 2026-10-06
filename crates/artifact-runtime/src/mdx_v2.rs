@@ -44,11 +44,16 @@ pub const ARTIFACT_RECORD_SCHEMA: &str = "native.artifact-record.v1";
 /// inputs gained their content-safe per-port execution receipt. Moved 10 to 11
 /// when relation ports gained optional exact semantic dependency pins. Moved
 /// 11 to 12 when `record.create` and its closed `RecordCreate` control joined
-/// the declaration language. A bump
+/// the declaration language. Moved 12 to 13 when `comment.create` and its
+/// optional `comment` envelope joined the declaration language (declared but
+/// not yet executable). Moved 13 to 14 when `message.react` and its
+/// optional `react` envelope joined the declaration language (declared but
+/// not yet executable). Moved 14 to 15 when `title.set` and its optional
+/// `title` envelope joined the declaration language. A bump
 /// invalidates every compiled-graph key and every parsed-source key; the cold
 /// pass is intentional because a cached artifact must never claim an older
 /// declaration language or component policy.
-pub const ADAPTER_REVISION: u64 = 12;
+pub const ADAPTER_REVISION: u64 = 16;
 pub const CACHE_NAMESPACE: &str = "native.artifact-compiled-cache";
 
 /// The element an author stylesheet is scoped to.
@@ -299,6 +304,14 @@ pub struct InteractionEntry {
     pub value: Option<ValueSource>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub create: Option<RecordCreateDecl>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<CommentCreateDecl>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub react: Option<MessageReactDecl>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<TitleSetDecl>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<BodySetDecl>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -309,6 +322,14 @@ pub enum InteractionEffect {
     FacetUnset,
     #[serde(rename = "record.create")]
     RecordCreate,
+    #[serde(rename = "comment.create")]
+    CommentCreate,
+    #[serde(rename = "message.react")]
+    MessageReact,
+    #[serde(rename = "title.set")]
+    TitleSet,
+    #[serde(rename = "body.set")]
+    BodySet,
 }
 
 impl InteractionEffect {
@@ -317,8 +338,84 @@ impl InteractionEffect {
             Self::FacetSet => "facet.set",
             Self::FacetUnset => "facet.unset",
             Self::RecordCreate => "record.create",
+            Self::CommentCreate => "comment.create",
+            Self::MessageReact => "message.react",
+            Self::TitleSet => "title.set",
+            Self::BodySet => "body.set",
         }
     }
+}
+
+/// Thread position a `comment.create` entry may post: a new root or a flat
+/// reply to an existing governed root. Replies never nest.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CommentPosition {
+    Root,
+    Reply,
+}
+
+/// The frame-supplied body of a `comment.create` entry: the invocation
+/// `values` key carrying the UTF-8 text and its byte cap. The cap must fit
+/// both this manifest bound and the consented catalogue bound.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct CommentBodyDecl {
+    pub input: String,
+    #[serde(deserialize_with = "deserialize_manifest_usize")]
+    pub max_bytes: usize,
+}
+
+/// The manifest-authored part of a governed comment creation: the thread
+/// position and the body input. The bearer record travels in the entry's
+/// single `bound_input` slot; the destination home is derived from the
+/// bearer's current placement by the engine wrapper, never the frame.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct CommentCreateDecl {
+    pub position: CommentPosition,
+    pub body: CommentBodyDecl,
+}
+
+/// Byte cap range for one `comment.create` body bound (UTF-8 bytes,
+/// 1..=4096). Manifest and consent bounds each live in this range; the
+/// effective cap is their minimum.
+pub const COMMENT_CREATE_MAX_BODY_BYTES: usize = 4096;
+
+/// Canonical message-reaction emoji for `message.react` (task `07ae879`).
+/// Must stay identical to `MESSAGE_REACTION_EMOJIS` in `src/events.rs`;
+/// the manifest subset and the consented subset each draw from this list.
+pub const MESSAGE_REACT_EMOJIS: [&str; 5] = ["👍", "❤️", "😂", "🎉", "👀"];
+
+/// The manifest-authored part of a governed message reaction: the admitted
+/// emoji subset. The target message travels in the entry's single
+/// `bound_input` slot; the desired emoji and `reacted` state travel in the
+/// invocation values. The effective emoji set is the intersection of this
+/// manifest bound and the consented catalogue bound.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct MessageReactDecl {
+    pub emoji: Vec<String>,
+}
+
+/// The manifest-authored part of a governed title rename (task `da148be`):
+/// a presence marker only. The target record travels in the entry's single
+/// `bound_input` slot; the new title travels in the invocation values under
+/// the fixed `title` key, preserved exactly (UTF-8, free text). There is no
+/// manifest-side bound: scope comes from the consented catalogue need, and
+/// blank titles refuse at invocation.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct TitleSetDecl {}
+
+/// Provisional raw UTF-8 cap only; encoded sendability and execution remain unqualified.
+pub const BODY_SET_MAX_BODY_BYTES: usize = 512 * 1024;
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct BodySetDecl {
+    #[serde(deserialize_with = "deserialize_manifest_usize")]
+    pub max_bytes: usize,
 }
 
 /// The manifest-authored part of a governed record creation. The host resolves
@@ -1842,8 +1939,13 @@ pub(crate) const MAX_FACET_KEY_BYTES: usize = 128;
 /// This crate cannot depend on the engine, so the list is duplicated here and a
 /// host test (`engine_dispatched_facet_keys_cover_the_engine_contract`) fails
 /// if the two drift.
-pub const ENGINE_DISPATCHED_FACET_KEYS: [&str; 4] =
-    ["archived", "blob_ref", "runtime", "canvas.promoted_from"];
+pub const ENGINE_DISPATCHED_FACET_KEYS: [&str; 5] = [
+    "archived",
+    "blob_ref",
+    "runtime",
+    "canvas.promoted_from",
+    "retraction",
+];
 pub const RECORD_CREATE_FIELD_KEYS: [&str; 6] = [
     "name",
     "body",
@@ -1900,11 +2002,46 @@ pub fn validate_interactions(
         {
             return failure("label is blank, too long, or contains control characters".into());
         }
+        // Screen this new envelope before legacy branches' early continues.
+        if entry.effect != InteractionEffect::BodySet && entry.body.is_some() {
+            return failure(format!(
+                "{} cannot declare a body envelope",
+                entry.effect.as_str()
+            ));
+        }
+        if entry.effect == InteractionEffect::BodySet {
+            if !entry.facet.is_empty()
+                || entry.value.is_some()
+                || entry.create.is_some()
+                || entry.comment.is_some()
+                || entry.react.is_some()
+                || entry.title.is_some()
+            {
+                return failure(
+                    "body.set cannot declare other effect envelopes or facet operands".into(),
+                );
+            }
+            let Some(body) = &entry.body else {
+                return failure("body.set declares no body envelope".into());
+            };
+            validate_body_set(body, &entry.slots, inputs).map_err(|message| {
+                mdx::Failure::new(
+                    "interaction_entry_invalid",
+                    "manifest",
+                    format!("interaction entry '{}': {message}", entry.id),
+                )
+                .detail("entry_id", entry.id.clone())
+            })?;
+            continue;
+        }
         if entry.effect == InteractionEffect::RecordCreate {
             if !entry.slots.is_empty() || !entry.facet.is_empty() || entry.value.is_some() {
                 return failure(
                     "record.create cannot declare facet operands or legacy slots".into(),
                 );
+            }
+            if entry.comment.is_some() {
+                return failure("record.create cannot declare a comment envelope".into());
             }
             let Some(create) = &entry.create else {
                 return failure("record.create declares no create envelope".into());
@@ -1919,9 +2056,100 @@ pub fn validate_interactions(
             })?;
             continue;
         }
+        if entry.effect == InteractionEffect::CommentCreate {
+            // Declared but not yet executable: the governed comment
+            // transaction is a later increment. Validation admits only the
+            // bounded shape here; dispatch refuses before any write.
+            if !entry.facet.is_empty() || entry.value.is_some() || entry.create.is_some() {
+                return failure(
+                    "comment.create cannot declare facet, value or record.create envelopes".into(),
+                );
+            }
+            let Some(comment) = &entry.comment else {
+                return failure("comment.create declares no comment envelope".into());
+            };
+            validate_comment_create(comment, &entry.slots, inputs).map_err(|message| {
+                mdx::Failure::new(
+                    "interaction_entry_invalid",
+                    "manifest",
+                    format!("interaction entry '{}': {message}", entry.id),
+                )
+                .detail("entry_id", entry.id.clone())
+            })?;
+            continue;
+        }
+        if entry.effect == InteractionEffect::MessageReact {
+            // Declaration only (task `07ae879` I1): validation admits the
+            // bounded shape here; dispatch refuses before any write.
+            if !entry.facet.is_empty() || entry.value.is_some() || entry.create.is_some() {
+                return failure(
+                    "message.react cannot declare facet, value or record.create envelopes".into(),
+                );
+            }
+            if entry.comment.is_some() {
+                return failure("message.react cannot declare a comment envelope".into());
+            }
+            let Some(react) = &entry.react else {
+                return failure("message.react declares no react envelope".into());
+            };
+            validate_message_react(react, &entry.slots, inputs).map_err(|message| {
+                mdx::Failure::new(
+                    "interaction_entry_invalid",
+                    "manifest",
+                    format!("interaction entry '{}': {message}", entry.id),
+                )
+                .detail("entry_id", entry.id.clone())
+            })?;
+            continue;
+        }
+        if entry.effect == InteractionEffect::TitleSet {
+            // Validation admits the bounded shape here; the governed title
+            // transaction behind dispatch enforces consent and CAS.
+            if !entry.facet.is_empty() || entry.value.is_some() || entry.create.is_some() {
+                return failure(
+                    "title.set cannot declare facet, value or record.create envelopes".into(),
+                );
+            }
+            if entry.comment.is_some() {
+                return failure("title.set cannot declare a comment envelope".into());
+            }
+            if entry.react.is_some() {
+                return failure("title.set cannot declare a react envelope".into());
+            }
+            let Some(title) = &entry.title else {
+                return failure("title.set declares no title envelope".into());
+            };
+            validate_title_set(title, &entry.slots, inputs).map_err(|message| {
+                mdx::Failure::new(
+                    "interaction_entry_invalid",
+                    "manifest",
+                    format!("interaction entry '{}': {message}", entry.id),
+                )
+                .detail("entry_id", entry.id.clone())
+            })?;
+            continue;
+        }
         if entry.create.is_some() {
             return failure(format!(
                 "{} cannot declare a record.create envelope",
+                entry.effect.as_str()
+            ));
+        }
+        if entry.comment.is_some() {
+            return failure(format!(
+                "{} cannot declare a comment envelope",
+                entry.effect.as_str()
+            ));
+        }
+        if entry.react.is_some() {
+            return failure(format!(
+                "{} cannot declare a react envelope",
+                entry.effect.as_str()
+            ));
+        }
+        if entry.title.is_some() {
+            return failure(format!(
+                "{} cannot declare a title envelope",
                 entry.effect.as_str()
             ));
         }
@@ -2029,6 +2257,251 @@ pub fn validate_interactions(
                 return failure(format!("slot '{name}' is declared but unused"));
             }
         }
+    }
+    // Reserved observed-map key: a manifest that posts comments must not
+    // also move a facet under the key carrying the comment target-state
+    // token — the token reader could not tell a facet precondition from a
+    // thread precondition. Legacy facet-only manifests keep validating;
+    // there is no global facet-name reservation.
+    if entries
+        .iter()
+        .any(|entry| entry.effect == InteractionEffect::CommentCreate)
+    {
+        if let Some(entry) = entries.iter().find(|entry| {
+            matches!(
+                entry.effect,
+                InteractionEffect::FacetSet | InteractionEffect::FacetUnset
+            ) && entry.facet == crate::artifact_intents::COMMENT_TARGET_KEY
+        }) {
+            return Err(mdx::Failure::new(
+                "interaction_entry_invalid",
+                "manifest",
+                format!(
+                    "interaction entry '{}': facet '{}' is reserved for the comment target-state token while this manifest posts comments",
+                    entry.id,
+                    crate::artifact_intents::COMMENT_TARGET_KEY,
+                ),
+            )
+            .detail("entry_id", entry.id.clone()));
+        }
+    }
+    Ok(())
+}
+
+/// Validate one `comment.create` envelope against the entry's slots and the
+/// declared inputs: exactly one explicitly named `bound_input` slot on a
+/// record (collection) port, a stable body input name distinct from that
+/// slot (invocations forbid a key in both `slots` and `values`), and a byte
+/// cap in `1..=COMMENT_CREATE_MAX_BODY_BYTES`. The effective cap is the
+/// minimum of this manifest bound and the consented catalogue bound; this
+/// check requires neither order between them.
+fn validate_comment_create(
+    comment: &CommentCreateDecl,
+    slots: &BTreeMap<String, SlotDecl>,
+    inputs: &BTreeMap<String, InputDecl>,
+) -> Result<(), String> {
+    if !(1..=COMMENT_CREATE_MAX_BODY_BYTES).contains(&comment.body.max_bytes) {
+        return Err(format!(
+            "comment body 'max_bytes' must hold 1..={} (got {})",
+            COMMENT_CREATE_MAX_BODY_BYTES, comment.body.max_bytes
+        ));
+    }
+    if !valid_port(&comment.body.input) {
+        return Err(format!(
+            "comment body 'input' '{}' is not a stable identifier",
+            comment.body.input
+        ));
+    }
+    if slots.len() != 1 {
+        return Err(format!(
+            "comment.create declares {} slots (expected exactly one bound_input slot)",
+            slots.len()
+        ));
+    }
+    let Some((slot_name, slot_decl)) = slots.iter().next() else {
+        return Err(
+            "comment.create declares no bound_input slot, so it names no bearer to post to".into(),
+        );
+    };
+    if !valid_port(slot_name) {
+        return Err(format!(
+            "slot name '{slot_name}' is not a stable identifier"
+        ));
+    }
+    if slot_name == &comment.body.input {
+        return Err(format!(
+            "comment body input '{}' must differ from the bound record slot name",
+            comment.body.input
+        ));
+    }
+    let SlotDomain::BoundInput { port: Some(port) } = &slot_decl.domain else {
+        return Err(
+            "comment.create slot must declare an explicit bound_input port on a record input"
+                .into(),
+        );
+    };
+    let Some(input) = inputs.get(port) else {
+        return Err(format!(
+            "bound_input slot names undeclared input port '{port}'"
+        ));
+    };
+    if input.envelope != COLLECTION_ENVELOPE {
+        return Err(format!(
+            "bound_input slot names non-record input port '{port}'"
+        ));
+    }
+    Ok(())
+}
+
+/// Validate one `message.react` envelope against the entry's slots and the
+/// declared inputs: exactly one explicitly named `bound_input` slot on a
+/// record (collection) port naming the target message, and a nonempty
+/// unique subset of the canonical reaction emoji. The effective emoji set
+/// is the intersection of this manifest bound and the consented catalogue
+/// bound; this check requires neither order between them.
+fn validate_message_react(
+    react: &MessageReactDecl,
+    slots: &BTreeMap<String, SlotDecl>,
+    inputs: &BTreeMap<String, InputDecl>,
+) -> Result<(), String> {
+    if react.emoji.is_empty() || react.emoji.len() > MESSAGE_REACT_EMOJIS.len() {
+        return Err(format!(
+            "message.react 'emoji' must hold 1..={} canonical values (got {})",
+            MESSAGE_REACT_EMOJIS.len(),
+            react.emoji.len()
+        ));
+    }
+    let mut sorted = react.emoji.clone();
+    sorted.sort();
+    sorted.dedup();
+    if sorted.len() != react.emoji.len() {
+        return Err("message.react 'emoji' must not duplicate".into());
+    }
+    for emoji in &react.emoji {
+        if !MESSAGE_REACT_EMOJIS.contains(&emoji.as_str()) {
+            return Err(format!(
+                "message.react emoji '{emoji}' is not a canonical v1 picker value"
+            ));
+        }
+    }
+    if slots.len() != 1 {
+        return Err(format!(
+            "message.react declares {} slots (expected exactly one bound_input slot)",
+            slots.len()
+        ));
+    }
+    let Some((slot_name, slot_decl)) = slots.iter().next() else {
+        return Err(
+            "message.react declares no bound_input slot, so it names no message to react to".into(),
+        );
+    };
+    if !valid_port(slot_name) {
+        return Err(format!(
+            "slot name '{slot_name}' is not a stable identifier"
+        ));
+    }
+    let SlotDomain::BoundInput { port: Some(port) } = &slot_decl.domain else {
+        return Err(
+            "message.react slot must declare an explicit bound_input port on a record input".into(),
+        );
+    };
+    let Some(input) = inputs.get(port) else {
+        return Err(format!(
+            "bound_input slot names undeclared input port '{port}'"
+        ));
+    };
+    if input.envelope != COLLECTION_ENVELOPE {
+        return Err(format!(
+            "bound_input slot names non-record input port '{port}'"
+        ));
+    }
+    Ok(())
+}
+
+/// Validate one `title.set` envelope against the entry's slots and the
+/// declared inputs: exactly one explicitly named `bound_input` slot on a
+/// record (collection) port naming the record to rename. The envelope
+/// itself carries no bounds — the new title arrives at invocation — so
+/// this only proves the single-record shape.
+fn validate_title_set(
+    _title: &TitleSetDecl,
+    slots: &BTreeMap<String, SlotDecl>,
+    inputs: &BTreeMap<String, InputDecl>,
+) -> Result<(), String> {
+    if slots.len() != 1 {
+        return Err(format!(
+            "title.set declares {} slots (expected exactly one bound_input slot)",
+            slots.len()
+        ));
+    }
+    let Some((slot_name, slot_decl)) = slots.iter().next() else {
+        return Err(
+            "title.set declares no bound_input slot, so it names no record to rename".into(),
+        );
+    };
+    if !valid_port(slot_name) {
+        return Err(format!(
+            "slot name '{slot_name}' is not a stable identifier"
+        ));
+    }
+    let SlotDomain::BoundInput { port: Some(port) } = &slot_decl.domain else {
+        return Err(
+            "title.set slot must declare an explicit bound_input port on a record input".into(),
+        );
+    };
+    let Some(input) = inputs.get(port) else {
+        return Err(format!(
+            "bound_input slot names undeclared input port '{port}'"
+        ));
+    };
+    if input.envelope != COLLECTION_ENVELOPE {
+        return Err(format!(
+            "bound_input slot names non-record input port '{port}'"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_body_set(
+    body: &BodySetDecl,
+    slots: &BTreeMap<String, SlotDecl>,
+    inputs: &BTreeMap<String, InputDecl>,
+) -> Result<(), String> {
+    if !(1..=BODY_SET_MAX_BODY_BYTES).contains(&body.max_bytes) {
+        return Err(format!(
+            "body.set max_bytes must be 1..={BODY_SET_MAX_BODY_BYTES}"
+        ));
+    }
+    if slots.len() != 1 {
+        return Err(format!(
+            "body.set declares {} slots (expected exactly one bound_input slot)",
+            slots.len()
+        ));
+    }
+    let Some((slot_name, slot_decl)) = slots.iter().next() else {
+        return Err(
+            "body.set declares no bound_input slot, so it names no record to replace".into(),
+        );
+    };
+    if !valid_port(slot_name) {
+        return Err(format!(
+            "slot name '{slot_name}' is not a stable identifier"
+        ));
+    }
+    let SlotDomain::BoundInput { port: Some(port) } = &slot_decl.domain else {
+        return Err(
+            "body.set slot must declare an explicit bound_input port on a record input".into(),
+        );
+    };
+    let Some(input) = inputs.get(port) else {
+        return Err(format!(
+            "bound_input slot names undeclared input port '{port}'"
+        ));
+    };
+    if input.envelope != COLLECTION_ENVELOPE {
+        return Err(format!(
+            "bound_input slot names non-record input port '{port}'"
+        ));
     }
     Ok(())
 }
@@ -2814,9 +3287,9 @@ mod tests {
     const EVENT_ID: &str = "77777777-7777-4777-8777-777777777777";
     const DIGEST: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const NO_STYLES_CACHE_KEY: &str =
-        "4a6036b30e75629a72816eac6b166beb4fa63fbe301add53a95f251abd78cf36";
+        "fedd1c72db82222dad33980996c29f052bcc5f02e89897c0473a5fe821ae984c";
     const STYLED_CACHE_KEY: &str =
-        "f79177dfc7a7a89de7c7bc494851524cc75c552b7f6970052cda38894daa891b";
+        "ceb5ba7f5b631b3e83d8c3312954ced52f22e271740414c70bec547f8ad65908";
 
     #[test]
     fn descriptor_and_diagnostics_share_the_adapter_revision() {
@@ -3272,7 +3745,7 @@ export const nativeStyles = ".card { color: red }"
         // field list it hashed before author CSS existed. Update this only
         // together with a deliberate `ADAPTER_REVISION` bump — which is what
         // makes changing the key list safe in the first place. Last moved when
-        // record.create moved the revision from 11 to 12.
+        // dormant body.set moved the revision from 15 to 16.
         assert_eq!(without, NO_STYLES_CACHE_KEY);
     }
 
@@ -4151,6 +4624,18 @@ export const nativeStyles = ".card { color: red }"
             (
                 r#"{ id: "mark_triaged", label: "A", effect: "facet.set",
                      slots: { record: { domain: { kind: "bound_input" } } },
+                     facet: "retraction", value: { from: "literal", value: "author" } }"#,
+                "facet 'retraction' is engine-dispatched",
+            ),
+            (
+                r#"{ id: "mark_triaged", label: "A", effect: "facet.unset",
+                     slots: { record: { domain: { kind: "bound_input" } } },
+                     facet: "retraction" }"#,
+                "facet 'retraction' is engine-dispatched",
+            ),
+            (
+                r#"{ id: "mark_triaged", label: "A", effect: "facet.set",
+                     slots: { record: { domain: { kind: "bound_input" } } },
                      facet: "triage", value: { from: "literal", value: true } }"#,
                 "value literal is not a string, number or object",
             ),
@@ -4196,6 +4681,499 @@ export const nativeStyles = ".card { color: red }"
         let scoped =
             parse_artifact(&unknown_field).expect_err("an entry cannot state its own scope");
         assert_eq!(scoped.code, "module_descriptor_invalid");
+    }
+
+    #[test]
+    fn comment_create_entries_validate_bounded_shape() {
+        let comment = |id: &str, position: &str, slots: &str, body: &str, extra: &str| {
+            format!(
+                r#"{{ id: "{id}", label: "Post", effect: "comment.create",
+                     slots: {slots},
+                     comment: {{ position: "{position}", body: {body} }}{extra} }}"#
+            )
+        };
+        let bearer_slot =
+            r#"{ bearer: { domain: { kind: "bound_input", port: "orders" } } }"#.to_string();
+        let body = r#"{ input: "text", max_bytes: 4096 }"#.to_string();
+        for position in ["root", "reply"] {
+            let parsed = parse_artifact(&interaction_artifact(&comment(
+                "post",
+                position,
+                &bearer_slot,
+                &body,
+                "",
+            )))
+            .expect("bounded comment.create entry parses");
+            let normalized = parsed.manifest.normalized();
+            let Manifest::Artifact(manifest) = parsed.manifest else {
+                unreachable!("artifact parser returns an artifact manifest")
+            };
+            assert_eq!(
+                manifest.interactions[0].effect,
+                InteractionEffect::CommentCreate
+            );
+            assert_eq!(manifest.interactions[0].effect.as_str(), "comment.create");
+            let envelope = manifest.interactions[0]
+                .comment
+                .as_ref()
+                .expect("comment envelope survives parsing");
+            assert_eq!(envelope.body.input, "text");
+            assert_eq!(envelope.body.max_bytes, 4096);
+            assert_eq!(
+                normalized["interactions"][0]["comment"]["body"]["max_bytes"], 4096,
+                "comment envelope participates in the normalized manifest"
+            );
+        }
+        for (entry, expected) in [
+            (
+                comment("post", "root", &bearer_slot, &body, ", facet: \"x\""),
+                "comment.create cannot declare facet",
+            ),
+            (
+                comment(
+                    "post",
+                    "root",
+                    &bearer_slot,
+                    &body,
+                    ", value: { from: \"literal\", value: \"x\" }",
+                ),
+                "comment.create cannot declare facet",
+            ),
+            (
+                r#"{ id: "post", label: "Post", effect: "comment.create",
+                     slots: { bearer: { domain: { kind: "bound_input", port: "orders" } } } }"#
+                    .to_string(),
+                "comment.create declares no comment envelope",
+            ),
+            (
+                comment("post", "root", "{}", &body, ""),
+                "declares 0 slots (expected exactly one bound_input slot)",
+            ),
+            (
+                comment(
+                    "post",
+                    "root",
+                    r#"{ bearer: { domain: { kind: "bound_input", port: "orders" } },
+                        spare: { domain: { kind: "bound_input", port: "orders" } } }"#,
+                    &body,
+                    "",
+                ),
+                "exactly one bound_input slot",
+            ),
+            (
+                comment(
+                    "post",
+                    "root",
+                    r#"{ bearer: { domain: { kind: "bound_input" } } }"#,
+                    &body,
+                    "",
+                ),
+                "must declare an explicit bound_input port",
+            ),
+            (
+                comment(
+                    "post",
+                    "root",
+                    r#"{ bearer: { domain: { kind: "bound_input", port: "absent" } } }"#,
+                    &body,
+                    "",
+                ),
+                "undeclared input port 'absent'",
+            ),
+            (
+                comment(
+                    "post",
+                    "root",
+                    &bearer_slot,
+                    r#"{ input: "text", max_bytes: 0 }"#,
+                    "",
+                ),
+                "'max_bytes' must hold 1..=4096",
+            ),
+            (
+                comment(
+                    "post",
+                    "root",
+                    &bearer_slot,
+                    r#"{ input: "text", max_bytes: 5000 }"#,
+                    "",
+                ),
+                "'max_bytes' must hold 1..=4096",
+            ),
+            (
+                comment(
+                    "post",
+                    "root",
+                    &bearer_slot,
+                    r#"{ input: "bearer", max_bytes: 100 }"#,
+                    "",
+                ),
+                "must differ from the bound record slot name",
+            ),
+            (
+                comment(
+                    "post",
+                    "root",
+                    &bearer_slot,
+                    r#"{ input: "Text", max_bytes: 100 }"#,
+                    "",
+                ),
+                "is not a stable identifier",
+            ),
+        ] {
+            let failure = parse_artifact(&interaction_artifact(&entry))
+                .expect_err("invalid comment.create entry is refused at compile");
+            assert_eq!(failure.code, "interaction_entry_invalid", "{expected}");
+            assert!(
+                failure.message.contains(expected),
+                "expected {expected:?} in {:?}",
+                failure.message
+            );
+        }
+        // A comment envelope on any other effect is refused.
+        let misplaced = TRIAGE_ENTRY.replace(
+            "value: { from: \"literal\", value: \"triaged\" }",
+            "value: { from: \"literal\", value: \"triaged\" }, comment: { position: \"root\", body: { input: \"text\", max_bytes: 10 } }",
+        );
+        let failure = parse_artifact(&interaction_artifact(&misplaced))
+            .expect_err("facet.set cannot carry a comment envelope");
+        assert!(
+            failure
+                .message
+                .contains("cannot declare a comment envelope"),
+            "{failure:?}"
+        );
+        // Legacy entries serialize with no comment key, so pinned
+        // source digests are byte-identical with this slice applied.
+        let legacy =
+            parse_artifact(&interaction_artifact(TRIAGE_ENTRY)).expect("legacy entry still parses");
+        assert!(
+            legacy.manifest.normalized()["interactions"][0]
+                .get("comment")
+                .is_none(),
+            "absent comment envelope skips serialization"
+        );
+    }
+
+    #[test]
+    fn comment_create_refuses_facet_collision_on_the_reserved_key() {
+        let comment = r#"{ id: "post", label: "Post", effect: "comment.create",
+             slots: { bearer: { domain: { kind: "bound_input", port: "orders" } } },
+             comment: { position: "root", body: { input: "text", max_bytes: 100 } } }"#;
+        let facet = |effect: &str, facet: &str| {
+            format!(
+                r#"{{ id: "mark", label: "A", effect: "{effect}",
+                     slots: {{ record: {{ domain: {{ kind: "bound_input" }} }} }},
+                     facet: "{facet}"{value} }}"#,
+                value = if effect == "facet.set" {
+                    r#", value: { from: "literal", value: "x" }"#
+                } else {
+                    ""
+                }
+            )
+        };
+        // Ordinary facets coexist with comment posting.
+        parse_artifact(&interaction_artifact(&format!(
+            "{comment}, {}",
+            facet("facet.set", "triage")
+        )))
+        .expect("comment.create coexists with ordinary facets");
+        // Either facet effect on the reserved key collides.
+        for effect in ["facet.set", "facet.unset"] {
+            let failure = parse_artifact(&interaction_artifact(&format!(
+                "{comment}, {}",
+                facet(effect, "comment_target")
+            )))
+            .expect_err("reserved-key collision is refused at compile");
+            assert_eq!(failure.code, "interaction_entry_invalid");
+            assert!(failure.message.contains("reserved"), "{failure:?}");
+            assert_eq!(failure.details["entry_id"], "mark");
+        }
+        // Legacy facet-only manifests keep validating: no global name ban.
+        parse_artifact(&interaction_artifact(&facet("facet.set", "comment_target")))
+            .expect("facet-only use of the key stays valid");
+    }
+
+    #[test]
+    fn body_set_closed_manifest_and_legacy_none_bytes() {
+        let valid = serde_json::json!({
+            "id":"save", "label":"Save", "effect":"body.set",
+            "slots":{"page":{"domain":{"kind":"bound_input","port":"orders"}}},
+            "body":{"max_bytes":32768}
+        });
+        let parsed = parse_artifact(&interaction_artifact(&valid.to_string())).unwrap();
+        let Manifest::Artifact(manifest) = parsed.manifest else {
+            panic!("artifact");
+        };
+        assert_eq!(manifest.interactions[0].effect.as_str(), "body.set");
+        assert_eq!(
+            manifest.interactions[0].body.as_ref().unwrap().max_bytes,
+            32768
+        );
+        let mut maximum = valid.clone();
+        maximum["body"]["max_bytes"] = serde_json::json!(BODY_SET_MAX_BODY_BYTES);
+        assert!(parse_artifact(&interaction_artifact(&maximum.to_string())).is_ok());
+        let mut minimum = valid.clone();
+        minimum["body"]["max_bytes"] = serde_json::json!(1);
+        assert!(parse_artifact(&interaction_artifact(&minimum.to_string())).is_ok());
+        let mut non_record_inputs = manifest.inputs.clone();
+        non_record_inputs.get_mut("orders").unwrap().envelope =
+            "native.grouped-count-envelope.v1".into();
+        assert!(validate_interactions(&manifest.interactions, &non_record_inputs).is_err());
+        for cap in [
+            serde_json::json!(0),
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!(true),
+            serde_json::json!("32"),
+            serde_json::json!(BODY_SET_MAX_BODY_BYTES + 1),
+        ] {
+            let mut bad = valid.clone();
+            bad["body"]["max_bytes"] = cap;
+            assert!(parse_artifact(&interaction_artifact(&bad.to_string())).is_err());
+        }
+        for extra in ["facet", "value", "create", "comment", "react", "title"] {
+            let mut bad = valid.clone();
+            bad[extra] = match extra {
+                "facet" => serde_json::json!("priority"),
+                "value" => serde_json::json!({"from":"literal","value":"high"}),
+                _ => serde_json::json!({}),
+            };
+            assert!(
+                parse_artifact(&interaction_artifact(&bad.to_string())).is_err(),
+                "{extra}"
+            );
+        }
+        for body in [
+            serde_json::json!({}),
+            serde_json::json!({"max_bytes":1,"extra":1}),
+            serde_json::json!(null),
+        ] {
+            let mut bad = valid.clone();
+            bad["body"] = body;
+            assert!(parse_artifact(&interaction_artifact(&bad.to_string())).is_err());
+        }
+        for slots in [
+            serde_json::json!({}),
+            serde_json::json!({"page":{"domain":{"kind":"bound_input"}}}),
+            serde_json::json!({"page":{"domain":{"kind":"bound_input","port":"missing"}}}),
+            serde_json::json!({"page":{"domain":{"kind":"values","values":["x"]}}}),
+            serde_json::json!({"page":{"domain":{"kind":"bound_input","port":"orders"}},
+                "other":{"domain":{"kind":"bound_input","port":"orders"}}}),
+        ] {
+            let mut bad = valid.clone();
+            bad["slots"] = slots;
+            assert!(parse_artifact(&interaction_artifact(&bad.to_string())).is_err());
+        }
+        // A body envelope cannot hide in a legacy early-continue branch.
+        for effect in [
+            "record.create",
+            "comment.create",
+            "message.react",
+            "title.set",
+            "facet.set",
+            "facet.unset",
+        ] {
+            let mut bad = valid.clone();
+            bad["effect"] = serde_json::json!(effect);
+            assert!(
+                parse_artifact(&interaction_artifact(&bad.to_string())).is_err(),
+                "{effect}"
+            );
+        }
+        // Fixed pre-Body bytes: absence and explicit None must not serialize body:null.
+        const OLD: &str =
+            r#"{"id":"clear","label":"Clear","effect":"facet.unset","facet":"priority"}"#;
+        let mut legacy: InteractionEntry = serde_json::from_str(OLD).unwrap();
+        assert_eq!(serde_json::to_string(&legacy).unwrap(), OLD);
+        legacy.body = None;
+        assert_eq!(serde_json::to_string(&legacy).unwrap(), OLD);
+    }
+
+    #[test]
+    fn message_react_entries_validate_bounded_shape() {
+        let react = |id: &str, emoji: &str, slots: &str, extra: &str| {
+            format!(
+                r#"{{ id: "{id}", label: "React", effect: "message.react",
+                     slots: {slots},
+                     react: {{ emoji: {emoji} }}{extra} }}"#
+            )
+        };
+        let message_slot =
+            r#"{ message: { domain: { kind: "bound_input", port: "orders" } } }"#.to_string();
+        let parsed = parse_artifact(&interaction_artifact(&react(
+            "react",
+            r#"["👍"]"#,
+            &message_slot,
+            "",
+        )))
+        .expect("bounded message.react entry parses");
+        let Manifest::Artifact(manifest) = parsed.manifest else {
+            unreachable!("artifact parser returns an artifact manifest")
+        };
+        assert_eq!(
+            manifest.interactions[0].effect,
+            InteractionEffect::MessageReact
+        );
+        assert_eq!(manifest.interactions[0].effect.as_str(), "message.react");
+        let envelope = manifest.interactions[0]
+            .react
+            .as_ref()
+            .expect("react envelope survives parsing");
+        assert_eq!(envelope.emoji, vec!["👍".to_string()]);
+        for (entry, expected) in [
+            (
+                react("react", r#"["👍"]"#, &message_slot, ", facet: \"x\""),
+                "message.react cannot declare facet",
+            ),
+            (
+                react(
+                    "react",
+                    r#"["👍"]"#,
+                    &message_slot,
+                    ", value: { from: \"literal\", value: \"x\" }",
+                ),
+                "message.react cannot declare facet",
+            ),
+            (
+                r#"{ id: "react", label: "React", effect: "message.react",
+                     slots: { message: { domain: { kind: "bound_input", port: "orders" } } } }"#
+                    .to_string(),
+                "message.react declares no react envelope",
+            ),
+            (
+                react("react", r#"[]"#, &message_slot, ""),
+                "'emoji' must hold 1..=5",
+            ),
+            (
+                react("react", r#"["👍", "👍"]"#, &message_slot, ""),
+                "'emoji' must not duplicate",
+            ),
+            (
+                react("react", r#"["nope"]"#, &message_slot, ""),
+                "is not a canonical v1 picker value",
+            ),
+            (
+                react("react", r#"["👍"]"#, "{}", ""),
+                "declares 0 slots (expected exactly one bound_input slot)",
+            ),
+        ] {
+            let failure = parse_artifact(&interaction_artifact(&entry))
+                .expect_err("invalid message.react entry is refused at compile");
+            assert_eq!(failure.code, "interaction_entry_invalid", "{expected}");
+            assert!(
+                failure.message.contains(expected),
+                "expected {expected:?} in {:?}",
+                failure.message
+            );
+        }
+        // A react envelope on any other effect is refused.
+        let misplaced = TRIAGE_ENTRY.replace(
+            "value: { from: \"literal\", value: \"triaged\" }",
+            "value: { from: \"literal\", value: \"triaged\" }, react: { emoji: [\"👍\"] }",
+        );
+        let failure = parse_artifact(&interaction_artifact(&misplaced))
+            .expect_err("facet.set cannot carry a react envelope");
+        assert!(
+            failure.message.contains("cannot declare a react envelope"),
+            "{failure:?}"
+        );
+        // Legacy entries serialize with no react key, so pinned
+        // source digests are byte-identical with this slice applied.
+        let legacy =
+            parse_artifact(&interaction_artifact(TRIAGE_ENTRY)).expect("legacy entry still parses");
+        assert!(
+            legacy.manifest.normalized()["interactions"][0]
+                .get("react")
+                .is_none(),
+            "absent react envelope skips serialization"
+        );
+    }
+
+    #[test]
+    fn title_set_entries_validate_bounded_shape() {
+        let title = |id: &str, slots: &str, extra: &str| {
+            format!(
+                r#"{{ id: "{id}", label: "Rename", effect: "title.set",
+                     slots: {slots},
+                     title: {{}}{extra} }}"#
+            )
+        };
+        let record_slot =
+            r#"{ record: { domain: { kind: "bound_input", port: "orders" } } }"#.to_string();
+        let parsed = parse_artifact(&interaction_artifact(&title("rename", &record_slot, "")))
+            .expect("bounded title.set entry parses");
+        let Manifest::Artifact(manifest) = parsed.manifest else {
+            unreachable!("artifact parser returns an artifact manifest")
+        };
+        assert_eq!(manifest.interactions[0].effect, InteractionEffect::TitleSet);
+        assert_eq!(manifest.interactions[0].effect.as_str(), "title.set");
+        assert!(
+            manifest.interactions[0].title.is_some(),
+            "title envelope survives parsing"
+        );
+        for (entry, expected) in [
+            (
+                title("rename", &record_slot, ", facet: \"x\""),
+                "title.set cannot declare facet",
+            ),
+            (
+                title(
+                    "rename",
+                    &record_slot,
+                    ", value: { from: \"literal\", value: \"x\" }",
+                ),
+                "title.set cannot declare facet",
+            ),
+            (
+                r#"{ id: "rename", label: "Rename", effect: "title.set",
+                     slots: { record: { domain: { kind: "bound_input", port: "orders" } } } }"#
+                    .to_string(),
+                "title.set declares no title envelope",
+            ),
+            (
+                title("rename", "{}", ""),
+                "declares 0 slots (expected exactly one bound_input slot)",
+            ),
+            (
+                title(
+                    "rename",
+                    r#"{ record: { domain: { kind: "bound_input" } } }"#,
+                    "",
+                ),
+                "must declare an explicit bound_input port",
+            ),
+        ] {
+            let failure = parse_artifact(&interaction_artifact(&entry))
+                .expect_err("invalid title.set entry is refused at compile");
+            assert_eq!(failure.code, "interaction_entry_invalid", "{expected}");
+            assert!(
+                failure.message.contains(expected),
+                "expected {expected:?} in {:?}",
+                failure.message
+            );
+        }
+        // A title envelope on any other effect is refused.
+        let misplaced = TRIAGE_ENTRY.replace(
+            "value: { from: \"literal\", value: \"triaged\" }",
+            "value: { from: \"literal\", value: \"triaged\" }, title: {}",
+        );
+        let failure = parse_artifact(&interaction_artifact(&misplaced))
+            .expect_err("facet.set cannot carry a title envelope");
+        assert!(
+            failure.message.contains("cannot declare a title envelope"),
+            "{failure:?}"
+        );
+        // Legacy entries serialize with no title key, so pinned
+        // source digests are byte-identical with this slice applied.
+        let legacy =
+            parse_artifact(&interaction_artifact(TRIAGE_ENTRY)).expect("legacy entry still parses");
+        assert!(
+            legacy.manifest.normalized()["interactions"][0]
+                .get("title")
+                .is_none(),
+            "absent title envelope skips serialization"
+        );
     }
 
     // -- board payload measurement -------------------------------------------

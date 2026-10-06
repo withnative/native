@@ -18,6 +18,11 @@
 
 mod coordinator;
 
+pub use coordinator::binary::{
+    BinaryChunk, BinaryFailure, BinaryState, BinaryStatus, BINARY_MAX_CHUNK_BYTES,
+    BINARY_PER_PRINCIPAL_CAPACITY, BINARY_START_BUSY, BINARY_START_CAPACITY, BINARY_START_DRAINING,
+    BINARY_START_PRINCIPAL_CAPACITY,
+};
 pub use coordinator::{ExportActivity, ExportCoordinator};
 
 use std::str::FromStr;
@@ -270,12 +275,13 @@ pub async fn validate_hosted_adoption_portability(conn: &mut SqliteConnection) -
 ///
 /// `standby_disposable_tables_are_declared_in_the_frozen_ddl` fails if any name
 /// here stops existing, so a rename cannot silently disable the filter.
+// `agent_runs` is a control_events projection, not disposable bookkeeping.
+// Retain it so immutable admission and control-log replay agree.
 pub(crate) const STANDBY_DISPOSABLE_TABLES: &[&str] = &[
     "read_log_calls",
     "read_log_touches",
     "read_log_record_ids",
     "jobs",
-    "agent_runs",
     "relationship_federation_quarantine",
 ];
 
@@ -645,6 +651,69 @@ fn local_export_root(db_path: &std::path::Path) -> std::path::PathBuf {
 
 #[cfg(test)]
 mod tests {
+    /// Run lifecycles are control-log projections, including closed runs.
+    /// A real filtered export must remain admissible by the immutable reader.
+    #[tokio::test]
+    async fn standby_filter_preserves_run_lifecycles_and_passes_admission() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = crate::create_database(":memory:").await.unwrap();
+        let account = crate::identity::resolve_stdio_account_identity(&db, None)
+            .await
+            .unwrap();
+        for run_key in ["jaguar-chair-abcdef", "jaguar-chair-abcdeg"] {
+            crate::control::ensure_agent_run(
+                &db,
+                run_key,
+                &account,
+                crate::control::ReportedRunIdentity {
+                    client_name: Some("standby regression".into()),
+                    client_version: Some("1".into()),
+                    model: Some("test model".into()),
+                },
+            )
+            .await
+            .unwrap();
+        }
+        crate::control::close_agent_run(&db, "jaguar-chair-abcdeg", &account)
+            .await
+            .unwrap();
+        let export = super::export_connected_db(&db, Some(directory.path()))
+            .await
+            .unwrap();
+        db.close().await;
+        super::strip_disposable_bookkeeping(&export.path())
+            .await
+            .unwrap();
+        let readonly =
+            crate::db::open_existing_database_standby_read_only(export.path().to_str().unwrap())
+                .await
+                .expect("filtered control projections must still match their log");
+        let rows: (i64, i64, i64) =
+            sqlx::query_as("SELECT COUNT(*),COUNT(ended_at),COUNT(reported_model) FROM agent_runs")
+                .fetch_one(readonly.pool())
+                .await
+                .unwrap();
+        assert_eq!(rows, (2, 1, 2));
+        let report = crate::conformance::run_standby_admission_conformance(&readonly).await;
+        readonly.close().await;
+        assert!(report.ok, "{}", crate::conformance::format_report(&report));
+        export.cleanup().await;
+    }
+
+    #[test]
+    fn standby_disposable_tables_are_only_operational() {
+        use crate::schema::standby_classification::{StandbyTableKind, TABLE_CLASSIFICATIONS};
+        for table in super::STANDBY_DISPOSABLE_TABLES {
+            assert_eq!(
+                TABLE_CLASSIFICATIONS
+                    .iter()
+                    .find_map(|(name, kind)| (name == table).then_some(*kind)),
+                Some(StandbyTableKind::ExcludedOperational),
+                "standby filtering must retain canonical and projected table {table}"
+            );
+        }
+    }
+
     /// Filtering must empty the disposable tables and touch nothing else.
     ///
     /// The tables have to survive as empty tables: `consumer.ddl_sha256` pins

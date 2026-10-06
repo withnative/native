@@ -49,6 +49,7 @@
     var handed = delivery.viewState || window.nativeArtifact.viewState;
     var name = handed && handed.schema === "tabs.v1" && handed.value && handed.value.tab;
     show(name === "billing" || name === "usage" ? name : "usage", false);
+    document.documentElement.setAttribute("data-native-view-state-ready", "tabs.v1");
   });
 </script>
 </body>

@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use crate::{Db, Error, Result};
 
@@ -19,11 +19,52 @@ use super::{
     HostedExecutorConstruction, HostedPlanKeyProvider, PinnedExecutorCatalogue,
     PinnedLensExecutorCatalogue,
 };
+use crate::mcp::protocol::{add_modern_result_fields, call_error_content};
 use crate::mcp::OperationAccess;
-use crate::mcp::{Caller, ExperimentalExecutors, LensDispatch, ToolRegistry};
+use crate::mcp::{
+    Caller, DeploymentPersistenceLease, ExperimentalExecutors, LensDispatch, ToolRegistry,
+};
 use crate::DeploymentReadOnlyOperation;
 
 const MAX_PINNED_LENS_CATALOGUES: usize = 128;
+
+/// Storage-free classification for the maintenance proxy. It uses the same
+/// pinned source contracts as hosted dispatch, without keys or plan cleanup.
+#[doc(hidden)]
+pub struct HostedExecutorAdmission {
+    ordinary: Arc<PinnedExecutorCatalogue>,
+    lens: Arc<PinnedLensExecutorCatalogue>,
+}
+
+impl HostedExecutorAdmission {
+    pub fn new(registry: &ToolRegistry, experimental: &ExperimentalExecutors) -> Result<Self> {
+        Ok(Self {
+            ordinary: ExecutorPrototypeStdioServer::pin_hosted_catalogue_with_experimental(
+                registry,
+                experimental,
+            )?,
+            lens: ExecutorPrototypeLensServer::pin_catalogue_with_experimental(
+                registry,
+                experimental,
+            )?,
+        })
+    }
+
+    pub fn classify_call(
+        &self,
+        executor: &str,
+        operation: Option<&str>,
+        lens: bool,
+    ) -> Option<OperationAccess> {
+        if lens {
+            self.lens.classify_call(executor, operation)
+        } else {
+            self.ordinary
+                .classify_call(executor, operation)
+                .map(|(_, access)| access)
+        }
+    }
+}
 
 /// Fully initialized hosted executor state shared by one HTTP router.
 ///
@@ -36,6 +77,7 @@ pub struct HostedExecutorRuntime {
     authority: Arc<dyn HostedExecutorAuthority>,
     keys: Arc<dyn HostedPlanKeyProvider>,
     ordinary: Arc<PinnedExecutorCatalogue>,
+    lens_admission: Arc<PinnedLensExecutorCatalogue>,
     ordinary_telemetry: BoundExecutorTelemetry,
     lenses: PinnedLensCatalogueCache,
     telemetry: Arc<ExecutorTelemetryContext>,
@@ -125,31 +167,45 @@ impl HostedExecutorRuntime {
         telemetry: Arc<ExecutorTelemetryContext>,
         experimental: ExperimentalExecutors,
     ) -> Result<Self> {
-        let _maintenance_admission = match registry.deployment_mutation_barrier() {
-            Some(barrier) => Some(barrier.admit(
+        let maintenance_admission = match registry.deployment_mutation_barrier() {
+            Some(barrier) => match barrier.admit(
                 &DeploymentReadOnlyOperation::server("executor_plan_maintenance"),
                 OperationAccess::Mutation,
-            )?),
+            ) {
+                Ok(admission) => Some(admission),
+                Err(crate::Error::DeploymentReadOnly(_)) => None,
+                Err(error) => return Err(error),
+            },
             None => None,
         };
-        let now_ms = chrono::Utc::now().timestamp_millis();
-        super::plan_store::maintain_hosted_catalogue(
-            &HostedAuthorityCatalogue(Arc::clone(&authority)),
-            now_ms,
-            super::plan_store::EXPIRED_PLAN_RETENTION_MS,
-        )
-        .await?;
+        // A server that boots frozen still needs the executor read catalogue.
+        // Expiry and cleanup are catalog writes, so skip them without admission.
+        if registry.deployment_mutation_barrier().is_none() || maintenance_admission.is_some() {
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            super::plan_store::maintain_hosted_catalogue(
+                &HostedAuthorityCatalogue(Arc::clone(&authority)),
+                now_ms,
+                super::plan_store::EXPIRED_PLAN_RETENTION_MS,
+            )
+            .await?;
+        }
         let ordinary = ExecutorPrototypeStdioServer::pin_hosted_catalogue_with_experimental(
             &registry,
             &experimental,
         )?;
         let ordinary_telemetry =
             telemetry.bind_hosted_manifest(ordinary.manifest_digest(), ordinary.descriptor_bytes());
+        // Principal-neutral contracts use the same immutable registry and
+        // allowlist as each authoritative lens-revision pin. Classification
+        // does not allocate a lens pin or claim an authorization decision.
+        let lens_admission =
+            ExecutorPrototypeLensServer::pin_catalogue_with_experimental(&registry, &experimental)?;
         Ok(Self {
             registry,
             authority,
             keys,
             ordinary,
+            lens_admission,
             ordinary_telemetry,
             lenses: PinnedLensCatalogueCache::default(),
             telemetry,
@@ -165,11 +221,79 @@ impl HostedExecutorRuntime {
         database_id: String,
         message: Value,
     ) -> Result<Option<Value>> {
+        self.handle_ordinary_inner(db, caller, database_id, message, None)
+            .await
+    }
+
+    /// Execute one already-authorized ordinary hosted request under the
+    /// transport's persistence lease. The lease is re-validated for the
+    /// contract dispatch instead of fresh-admitting, so a freeze registered
+    /// after the transport's admission drains instead of refusing an
+    /// already-admitted mutation. `None` preserves the historical
+    /// per-message admission exactly.
+    pub async fn handle_ordinary_with_persistence(
+        &self,
+        db: Db,
+        caller: Caller,
+        database_id: String,
+        message: Value,
+        persistence_lease: Option<DeploymentPersistenceLease>,
+    ) -> Result<Option<Value>> {
+        self.handle_ordinary_inner(db, caller, database_id, message, persistence_lease)
+            .await
+    }
+
+    /// Authoritative pre-auth classification for one executor-routed
+    /// `tools/call`: resolve `(executor, operation)` against the pinned
+    /// catalogue. `None` keeps the transport's legacy deferred path.
+    pub fn classify_call(
+        &self,
+        executor: &str,
+        operation: Option<&str>,
+    ) -> Option<(DeploymentReadOnlyOperation, OperationAccess)> {
+        self.ordinary.classify_call(executor, operation)
+    }
+
+    /// Classify against the lens contracts, which differ from the ordinary
+    /// executor surface. Unknown selectors remain fail-closed at transport.
+    pub fn classify_lens_call(
+        &self,
+        executor: &str,
+        operation: Option<&str>,
+    ) -> Option<OperationAccess> {
+        self.lens_admission.classify_call(executor, operation)
+    }
+
+    /// Render a frozen-contract refusal with the exact dispatch-time shape:
+    /// a `tools/call` error result carrying `DEPLOYMENT_READ_ONLY`,
+    /// `applied=false`, and the executor meta the dispatch-time refusal
+    /// attaches. Transports return it before authentication.
+    pub fn frozen_call_refusal(&self, id: Value, modern: bool, error: &Error) -> Value {
+        let mut result = call_error_content(error, Value::Null, None);
+        if modern {
+            add_modern_result_fields(&mut result);
+        }
+        result["_meta"]["nativeExecutor"] = super::production_executor_meta(
+            "ordinary",
+            self.ordinary.manifest_digest(),
+            self.ordinary.descriptor_bytes(),
+        );
+        json!({"jsonrpc": "2.0", "id": id, "result": result})
+    }
+
+    async fn handle_ordinary_inner(
+        &self,
+        db: Db,
+        caller: Caller,
+        database_id: String,
+        message: Value,
+        persistence_lease: Option<DeploymentPersistenceLease>,
+    ) -> Result<Option<Value>> {
         // Preserve the transport contract: successful authorization is
         // observed before plan-store/server construction, including when that
         // later construction fails.
         self.ordinary_telemetry.authorization_accepted();
-        let server = ExecutorPrototypeStdioServer::new_hosted_with_pinned_catalogue(
+        let mut server = ExecutorPrototypeStdioServer::new_hosted_with_pinned_catalogue(
             Arc::clone(&self.registry),
             db,
             caller,
@@ -182,6 +306,9 @@ impl HostedExecutorRuntime {
             },
         )
         .await?;
+        if let Some(lease) = persistence_lease {
+            server = server.with_persistence_lease(lease);
+        }
         Ok(server.handle_message(message).await)
     }
 

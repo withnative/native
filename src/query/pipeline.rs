@@ -355,6 +355,23 @@ async fn per_chunk_on(
 
 /// Build the WHERE fragment + binds for a [`Filter`] (excluding the working-set
 /// and ancestor constraints, which the caller applies).
+/// Member numeric facet projection. The member profile drops the engine's
+/// generated `value_num` column (DerivedCol, "recomputed locally"), so member
+/// SQL inlines the engine's exact generation expression over the shipped
+/// `value` instead of naming the absent column. Pure function of authored
+/// values; no hidden input.
+fn facet_num_operand(member: bool, alias: &str) -> String {
+    if member {
+        format!(
+            "(CASE WHEN json_valid({alias}.value) THEN \
+              CASE WHEN json_type({alias}.value) IN ('integer','real') \
+              THEN CAST({alias}.value AS REAL) END END)"
+        )
+    } else {
+        format!("{alias}.value_num")
+    }
+}
+
 fn facet_scalar(value: &Value, operator: &str) -> Result<(&'static str, String)> {
     match value {
         Value::Number(number) => Ok(("value_num", number.to_string())),
@@ -391,7 +408,11 @@ fn exact_string(value: &Value, operator: &str) -> Result<String> {
     }
 }
 
-fn filter_sql(filter: &Filter, visibility: HiddenVisibility) -> Result<(String, Vec<String>)> {
+fn filter_sql(
+    filter: &Filter,
+    visibility: HiddenVisibility,
+    member: bool,
+) -> Result<(String, Vec<String>)> {
     let mut clauses: Vec<String> = vec!["r.deleted_at IS NULL".into()];
     let mut binds: Vec<String> = Vec::new();
     let any_of =
@@ -405,12 +426,18 @@ fn filter_sql(filter: &Filter, visibility: HiddenVisibility) -> Result<(String, 
     any_of("id", &filter.ids, &mut clauses, &mut binds);
     any_of("type", &filter.types, &mut clauses, &mut binds);
     any_of("kind", &filter.kinds, &mut clauses, &mut binds);
-    clauses.push(super::hidden_visibility_predicate(
-        "r",
-        visibility.suggestions,
-        visibility.citations,
-        visibility.comments,
-    ));
+    // Member slice holds only E(m); the generic predicate names the excluded
+    // `semantic_units` table, so the member path uses the constant instead.
+    clauses.push(if member {
+        super::member_not_hidden_predicate("r")
+    } else {
+        super::hidden_visibility_predicate(
+            "r",
+            visibility.suggestions,
+            visibility.citations,
+            visibility.comments,
+        )
+    });
     any_of("lifecycle", &filter.lifecycle, &mut clauses, &mut binds);
     any_of("maturity", &filter.maturity, &mut clauses, &mut binds);
     if let Some(home_id) = &filter.home_id {
@@ -482,9 +509,14 @@ fn filter_sql(filter: &Filter, visibility: HiddenVisibility) -> Result<(String, 
                     _ => unreachable!(),
                 };
                 let (column, value) = facet_scalar(value, operator)?;
+                let operand = if column == "value_num" {
+                    facet_num_operand(member, "f")
+                } else {
+                    "f.value".to_string()
+                };
                 clauses.push(format!(
                     "EXISTS (SELECT 1 FROM facet_values f \
-                     WHERE f.record_id = r.id AND f.key = ? AND f.{column} {sql_operator} ?)"
+                     WHERE f.record_id = r.id AND f.key = ? AND {operand} {sql_operator} ?)"
                 ));
                 binds.push(facet.key.clone());
                 binds.push(value);
@@ -509,7 +541,8 @@ fn filter_sql(filter: &Filter, visibility: HiddenVisibility) -> Result<(String, 
                 }
                 if !numbers.is_empty() {
                     lane_clauses.push(format!(
-                        "f.value_num IN ({})",
+                        "{} IN ({})",
+                        facet_num_operand(member, "f"),
                         vec!["?"; numbers.len()].join(", ")
                     ));
                 }
@@ -533,12 +566,16 @@ fn filter_sql(filter: &Filter, visibility: HiddenVisibility) -> Result<(String, 
                     CmpOp::Gt => ">",
                     CmpOp::Gte => ">=",
                 };
+                let (a_num, b_num) = (
+                    facet_num_operand(member, "a"),
+                    facet_num_operand(member, "b"),
+                );
                 clauses.push(format!(
                     "EXISTS (SELECT 1 FROM facet_values a \
                      JOIN facet_values b ON b.record_id = a.record_id \
                      WHERE a.record_id = r.id AND a.key = ? AND b.key = ? \
-                       AND a.value_num IS NOT NULL AND b.value_num IS NOT NULL \
-                       AND a.value_num {sql_operator} b.value_num)"
+                       AND {a_num} IS NOT NULL AND {b_num} IS NOT NULL \
+                       AND {a_num} {sql_operator} {b_num})"
                 ));
                 binds.push(facet.key.clone());
                 binds.push(other_key.clone());
@@ -558,9 +595,10 @@ async fn apply_filter(
     current: Option<Vec<String>>,
     filter: &Filter,
     visibility: HiddenVisibility,
+    member: bool,
 ) -> Result<Vec<String>> {
     let mut conn = pool.acquire().await?;
-    apply_filter_on(&mut conn, current, filter, visibility).await
+    apply_filter_on(&mut conn, current, filter, visibility, member).await
 }
 
 async fn apply_filter_on(
@@ -568,18 +606,23 @@ async fn apply_filter_on(
     current: Option<Vec<String>>,
     filter: &Filter,
     visibility: HiddenVisibility,
+    member: bool,
 ) -> Result<Vec<String>> {
-    let (where_sql, binds) = filter_sql(filter, visibility)?;
+    let (where_sql, binds) = filter_sql(filter, visibility, member)?;
     let ancestor_set: Option<HashSet<String>> = match &filter.ancestor_id {
         Some(root) => Some(
-            tree::subtree_ids_with_hidden_in(
-                conn,
-                root,
-                visibility.suggestions,
-                visibility.citations,
-                filter.include_archived,
-            )
-            .await?
+            if member {
+                tree::member_subtree_ids_in(conn, root, filter.include_archived).await?
+            } else {
+                tree::subtree_ids_with_hidden_in(
+                    conn,
+                    root,
+                    visibility.suggestions,
+                    visibility.citations,
+                    filter.include_archived,
+                )
+                .await?
+            }
             .into_iter()
             .collect(),
         ),
@@ -651,9 +694,10 @@ async fn apply_traverse(
     current: &[String],
     traverse: &Traverse,
     visibility: HiddenVisibility,
+    member: bool,
 ) -> Result<Vec<String>> {
     let mut conn = pool.acquire().await?;
-    apply_traverse_on(&mut conn, current, traverse, visibility).await
+    apply_traverse_on(&mut conn, current, traverse, visibility, member).await
 }
 
 async fn apply_traverse_on(
@@ -661,19 +705,24 @@ async fn apply_traverse_on(
     current: &[String],
     traverse: &Traverse,
     visibility: HiddenVisibility,
+    member: bool,
 ) -> Result<Vec<String>> {
     if current.is_empty() {
         return Ok(Vec::new());
     }
-    let hidden_filter = format!(
-        "AND {}",
-        super::hidden_visibility_predicate(
-            "r",
-            visibility.suggestions,
-            visibility.citations,
-            visibility.comments,
+    let hidden_filter = if member {
+        "AND 1".to_string()
+    } else {
+        format!(
+            "AND {}",
+            super::hidden_visibility_predicate(
+                "r",
+                visibility.suggestions,
+                visibility.citations,
+                visibility.comments,
+            )
         )
-    );
+    };
     let live = format!("JOIN records r ON r.id = %COL% AND r.deleted_at IS NULL {hidden_filter}");
     let neighbours = match traverse {
         Traverse::Links {
@@ -766,13 +815,21 @@ async fn facet_sort_values_on(
     conn: &mut SqliteConnection,
     ids: &[String],
     facet_order: &FacetOrder,
+    member: bool,
 ) -> Result<(HashMap<String, FacetSortValue>, i64)> {
     let mut values = HashMap::new();
     let mut numeric_lane_misses = 0;
+    // `facet_values` without an alias here, so the member projection uses
+    // the bare table name as its qualifier.
+    let num_select = if member {
+        format!("{} AS value_num", facet_num_operand(member, "facet_values"))
+    } else {
+        "value_num".to_string()
+    };
     for chunk in ids.chunks(CHUNK) {
         let placeholders = vec!["?"; chunk.len()].join(", ");
         let sql = format!(
-            "SELECT record_id, value, value_num FROM facet_values \
+            "SELECT record_id, value, {num_select} FROM facet_values \
              WHERE key = ? AND record_id IN ({placeholders})"
         );
         let mut query = sqlx::query(&sql).bind(&facet_order.key);
@@ -839,9 +896,10 @@ async fn fetch_records(
     ids: &[String],
     opts: &PipelineOptions,
     lifecycle_interpreter: &super::lifecycle::LifecycleInterpreter,
+    member: bool,
 ) -> Result<(PipelineOutput, Option<(String, i64)>)> {
     let mut conn = pool.acquire().await?;
-    fetch_records_on(&mut conn, ids, opts, lifecycle_interpreter).await
+    fetch_records_on(&mut conn, ids, opts, lifecycle_interpreter, member).await
 }
 
 async fn fetch_records_on(
@@ -849,6 +907,7 @@ async fn fetch_records_on(
     ids: &[String],
     opts: &PipelineOptions,
     lifecycle_interpreter: &super::lifecycle::LifecycleInterpreter,
+    member: bool,
 ) -> Result<(PipelineOutput, Option<(String, i64)>)> {
     if opts.limit <= 0 || opts.offset < 0 {
         return Err(contract_violation(
@@ -878,7 +937,7 @@ async fn fetch_records_on(
     }
     let (facet_values, order_lane_miss) = match &opts.facet_order {
         Some(facet_order) => {
-            let (values, misses) = facet_sort_values_on(conn, ids, facet_order).await?;
+            let (values, misses) = facet_sort_values_on(conn, ids, facet_order, member).await?;
             let diagnostic = (misses > 0).then(|| (facet_order.key.clone(), misses));
             (Some(values), diagnostic)
         }
@@ -909,8 +968,12 @@ async fn fetch_records_on(
         .take(limit as usize)
         .collect();
     for record in &mut records {
-        super::hydrate_communication_origin_on(conn, record).await?;
-        super::hydrate_federation_provenance_on(conn, record).await?;
+        // Excluded companions have no member answer as row content; the MCP
+        // layer injects `unavailable_offline` markers for Message rows.
+        if !member {
+            super::hydrate_communication_origin_on(conn, record).await?;
+            super::hydrate_federation_provenance_on(conn, record).await?;
+        }
         record.hydrate_lifecycle(lifecycle_interpreter);
     }
     Ok((
@@ -998,15 +1061,17 @@ async fn aggregate_records(
     pool: &sqlx::SqlitePool,
     ids: &[String],
     spec: &AggregateSpec,
+    member: bool,
 ) -> Result<AggregateOutput> {
     let mut conn = pool.acquire().await?;
-    aggregate_records_on(&mut conn, ids, spec).await
+    aggregate_records_on(&mut conn, ids, spec, member).await
 }
 
 async fn aggregate_records_on(
     conn: &mut SqliteConnection,
     ids: &[String],
     spec: &AggregateSpec,
+    member: bool,
 ) -> Result<AggregateOutput> {
     let matched_records = ids.len() as i64;
     if spec.op == AggregateOp::Count {
@@ -1030,8 +1095,9 @@ async fn aggregate_records_on(
     let mut non_numeric_values = 0_i64;
     for chunk in ids.chunks(CHUNK) {
         let placeholders = vec!["?"; chunk.len()].join(", ");
+        let num_select = facet_num_operand(member, "f");
         let sql = format!(
-            "SELECT f.record_id, f.value_num FROM facet_values f \
+            "SELECT f.record_id, {num_select} FROM facet_values f \
              WHERE f.key = ? AND f.record_id IN ({placeholders})"
         );
         let mut query = sqlx::query(&sql).bind(key);
@@ -1130,6 +1196,7 @@ async fn numeric_lane_misses_for_filter(
     filter: &Filter,
     visibility: HiddenVisibility,
     principal: Option<crate::authorization::Principal<'_>>,
+    member: bool,
 ) -> Result<Vec<(String, i64)>> {
     let numeric_keys: Vec<String> = dedup(
         filter
@@ -1149,13 +1216,21 @@ async fn numeric_lane_misses_for_filter(
             facet.op = FacetOp::Exists;
         }
     }
-    let candidate_ids = authorize_ids(
-        authorization_pool,
-        apply_filter(projection_pool, current, &diagnostic_filter, visibility).await?,
-        principal,
+    let filtered = apply_filter(
+        projection_pool,
+        current,
+        &diagnostic_filter,
+        visibility,
+        member,
     )
-    .await;
+    .await?;
+    let candidate_ids = if member {
+        member_authorize_ids(projection_pool, filtered).await
+    } else {
+        authorize_ids(authorization_pool, filtered, principal).await
+    };
     let mut totals = Vec::new();
+    let num_null = format!("{} IS NULL", facet_num_operand(member, "f"));
     for key in numeric_keys {
         let hits = per_chunk(
             projection_pool,
@@ -1164,7 +1239,7 @@ async fn numeric_lane_misses_for_filter(
                 format!(
                     "SELECT r.id FROM records r \
                      JOIN facet_values f ON f.record_id = r.id \
-                     WHERE f.key = ? AND f.value_num IS NULL \
+                     WHERE f.key = ? AND {num_null} \
                        AND r.id IN ({placeholders})"
                 )
             },
@@ -1282,6 +1357,32 @@ async fn authorize_ids_in(
     .unwrap_or_default()
 }
 
+/// Member-copy authorization: every row in the slice is E(m), so visibility
+/// is slice presence. Never reads the excluded policy/Unit tables.
+async fn member_authorize_ids(pool: &sqlx::SqlitePool, ids: Vec<String>) -> Vec<String> {
+    if ids.is_empty() {
+        return Vec::new();
+    }
+    let mut present = HashSet::new();
+    for chunk in ids.chunks(CHUNK) {
+        let placeholders = vec!["?"; chunk.len()].join(", ");
+        let sql = format!("SELECT id FROM records WHERE id IN ({placeholders})");
+        let mut query = sqlx::query(&sql);
+        for id in chunk {
+            query = query.bind(id);
+        }
+        let Ok(rows) = query.fetch_all(pool).await else {
+            return Vec::new();
+        };
+        for row in rows {
+            if let Ok(id) = row.try_get::<String, _>("id") {
+                present.insert(id);
+            }
+        }
+    }
+    ids.into_iter().filter(|id| present.contains(id)).collect()
+}
+
 type LifecycleCandidate = (String, Option<String>, Option<String>, Option<String>);
 
 async fn lifecycle_candidates(
@@ -1366,7 +1467,7 @@ async fn numeric_lane_misses_for_filter_in(
             facet.op = FacetOp::Exists;
         }
     }
-    let candidate_ids = apply_filter_on(tx, current, &diagnostic_filter, visibility).await?;
+    let candidate_ids = apply_filter_on(tx, current, &diagnostic_filter, visibility, false).await?;
     let candidate_ids = authorize_ids_in(tx, candidate_ids, principal).await;
     let mut totals = Vec::new();
     for key in numeric_keys {
@@ -1462,10 +1563,11 @@ impl SelectionSession<'_, '_, '_> {
                     current,
                     filter,
                     visibility,
+                    lens.is_member(),
                 )
                 .await
             }
-            Self::Live { tx, .. } => apply_filter_on(tx, current, filter, visibility).await,
+            Self::Live { tx, .. } => apply_filter_on(tx, current, filter, visibility, false).await,
         }
     }
 
@@ -1482,10 +1584,13 @@ impl SelectionSession<'_, '_, '_> {
                     current,
                     traverse,
                     visibility,
+                    lens.is_member(),
                 )
                 .await
             }
-            Self::Live { tx, .. } => apply_traverse_on(tx, current, traverse, visibility).await,
+            Self::Live { tx, .. } => {
+                apply_traverse_on(tx, current, traverse, visibility, false).await
+            }
         }
     }
 
@@ -1493,7 +1598,11 @@ impl SelectionSession<'_, '_, '_> {
         let started = Instant::now();
         let authorized = match self {
             Self::Lens { lens, principal } => {
-                authorize_ids(lens.meta().snapshot_pool(), ids, *principal).await
+                if lens.is_member() {
+                    member_authorize_ids(lens.projection().snapshot_pool(), ids).await
+                } else {
+                    authorize_ids(lens.meta().snapshot_pool(), ids, *principal).await
+                }
             }
             Self::Live { tx, principal } => authorize_ids_in(tx, ids, *principal).await,
         };
@@ -1514,11 +1623,16 @@ impl SelectionSession<'_, '_, '_> {
         }
         match self {
             Self::Lens { lens, principal } => {
-                let schema_rows = super::cascade::schema_config_rows_for_principal_in_pool(
-                    lens.meta().snapshot_pool(),
-                    *principal,
-                )
-                .await?;
+                let schema_rows = if lens.is_member() {
+                    super::cascade::schema_config_rows_in_pool(lens.meta().snapshot_pool(), None)
+                        .await?
+                } else {
+                    super::cascade::schema_config_rows_for_principal_in_pool(
+                        lens.meta().snapshot_pool(),
+                        *principal,
+                    )
+                    .await?
+                };
                 let interpreter = super::lifecycle::LifecycleInterpreter::load_from_pool(
                     lens.meta().snapshot_pool(),
                     schema_rows,
@@ -1636,6 +1750,7 @@ impl SelectionSession<'_, '_, '_> {
                     filter,
                     visibility,
                     *principal,
+                    lens.is_member(),
                 )
                 .await
             }
@@ -1657,11 +1772,17 @@ impl SelectionSession<'_, '_, '_> {
                 None,
             )),
             (Self::Lens { lens, principal }, None) => {
-                let schema_rows = super::cascade::schema_config_rows_for_principal_in_pool(
-                    lens.meta().snapshot_pool(),
-                    *principal,
-                )
-                .await?;
+                let member = lens.is_member();
+                let schema_rows = if member {
+                    super::cascade::schema_config_rows_in_pool(lens.meta().snapshot_pool(), None)
+                        .await?
+                } else {
+                    super::cascade::schema_config_rows_for_principal_in_pool(
+                        lens.meta().snapshot_pool(),
+                        *principal,
+                    )
+                    .await?
+                };
                 let lifecycle_interpreter = super::lifecycle::LifecycleInterpreter::load_from_pool(
                     lens.meta().snapshot_pool(),
                     schema_rows,
@@ -1672,6 +1793,7 @@ impl SelectionSession<'_, '_, '_> {
                     ids,
                     opts,
                     &lifecycle_interpreter,
+                    member,
                 )
                 .await
             }
@@ -1684,7 +1806,7 @@ impl SelectionSession<'_, '_, '_> {
                 let lifecycle_interpreter =
                     super::lifecycle::LifecycleInterpreter::load_from_connection(tx, schema_rows)
                         .await?;
-                fetch_records_on(tx, ids, opts, &lifecycle_interpreter).await
+                fetch_records_on(tx, ids, opts, &lifecycle_interpreter, false).await
             }
         }
     }
@@ -1692,9 +1814,15 @@ impl SelectionSession<'_, '_, '_> {
     async fn aggregate(&mut self, ids: &[String], spec: &AggregateSpec) -> Result<AggregateOutput> {
         match self {
             Self::Lens { lens, .. } => {
-                aggregate_records(lens.projection().snapshot_pool(), ids, spec).await
+                aggregate_records(
+                    lens.projection().snapshot_pool(),
+                    ids,
+                    spec,
+                    lens.is_member(),
+                )
+                .await
             }
-            Self::Live { tx, .. } => aggregate_records_on(tx, ids, spec).await,
+            Self::Live { tx, .. } => aggregate_records_on(tx, ids, spec, false).await,
         }
     }
 }

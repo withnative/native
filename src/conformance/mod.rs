@@ -49,10 +49,72 @@ pub use spine::*;
 use crate::db::Db;
 use crate::schema::{ddl_sha256, FROZEN_DDL_SHA256};
 
+/// Explicit verification selection. Existing entry points always use FULL.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConformanceProfile {
+    #[default]
+    Full,
+    /// Retains release-blocking invariants, deferring historical comparisons
+    /// and the synthetic read-log qualification fixture.
+    #[serde(rename = "production-release")]
+    Core,
+}
+
+/// Sorted canonical IDs omitted by CORE (`production-release` in portable receipts).
+pub const PRODUCTION_RELEASE_DEFERRED_CHECKS: &[&str] = &[
+    "read-log-disposability",
+    "rebuild-and-diff",
+    "rebuild-and-diff-control",
+    "rebuild-and-diff-derivation",
+    "rebuild-and-diff-meta",
+    "rebuild-and-diff-policy",
+    "rebuild-and-diff-relationship",
+    "relationship-event-log-state",
+];
+
+impl ConformanceProfile {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Core => "production-release",
+        }
+    }
+
+    pub fn deferred_checks(self) -> &'static [&'static str] {
+        match self {
+            Self::Full => &[],
+            Self::Core => PRODUCTION_RELEASE_DEFERRED_CHECKS,
+        }
+    }
+}
+
+impl std::fmt::Display for ConformanceProfile {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for ConformanceProfile {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "full" => Ok(Self::Full),
+            "production-release" => Ok(Self::Core),
+            _ => Err("verification profile must be full or production-release"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ConformanceReport {
     pub ok: bool,
     pub checks: Vec<CheckResult>,
+    /// None identifies the separate observational standby admission suite;
+    /// that suite is neither FULL nor CORE.
+    pub profile: Option<ConformanceProfile>,
+    pub deferred_checks: Vec<String>,
     /// Static check names and durations only; never database rows.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub check_timings: Vec<ConformanceCheckTiming>,
@@ -121,6 +183,26 @@ pub async fn check_rebuild_and_diff_derivation(db: &Db) -> CheckResult {
         "rebuild-and-diff-derivation",
         rebuild_and_diff_derivation(db).await,
     )
+}
+
+/// The grant-only realtime revision is safe only while its singleton and
+/// every grant-shaped trigger remain intact: a missing bump would suppress a
+/// revocation prompt the stream owes its subscribers.
+pub async fn check_grant_revision_state(db: &Db) -> CheckResult {
+    match crate::authorization_grant::state_violations(db).await {
+        Ok(violations) => CheckResult {
+            check: "grant-revision-state".into(),
+            ok: violations.is_empty(),
+            violations,
+        },
+        Err(err) => CheckResult {
+            check: "grant-revision-state".into(),
+            ok: false,
+            violations: vec![format!(
+                "grant revision state could not be validated: {err}"
+            )],
+        },
+    }
 }
 
 /// The authorization-dependent rollup cache is safe only while the schema-12
@@ -206,6 +288,22 @@ pub async fn run_conformance(db: &Db) -> ConformanceReport {
 /// last active check without exposing any data from the database.
 pub(crate) async fn run_conformance_with_progress(
     db: &Db,
+    on_check: impl FnMut(&str, Option<u128>),
+) -> ConformanceReport {
+    run_conformance_with_profile_and_progress(db, ConformanceProfile::Full, on_check).await
+}
+
+/// Select a verification profile explicitly; [`run_conformance`] remains FULL.
+pub async fn run_conformance_with_profile(
+    db: &Db,
+    profile: ConformanceProfile,
+) -> ConformanceReport {
+    run_conformance_with_profile_and_progress(db, profile, |_, _| {}).await
+}
+
+pub(crate) async fn run_conformance_with_profile_and_progress(
+    db: &Db,
+    profile: ConformanceProfile,
     mut on_check: impl FnMut(&str, Option<u128>),
 ) -> ConformanceReport {
     let mut check_timings = Vec::new();
@@ -236,35 +334,43 @@ pub(crate) async fn run_conformance_with_progress(
         })
         .await,
     );
-    checks.push(timed!("rebuild-and-diff", check_rebuild_and_diff(db).await));
-    checks.push(timed!(
-        "rebuild-and-diff-meta",
-        check_rebuild_and_diff_meta(db).await
-    ));
-    checks.push(timed!(
-        "rebuild-and-diff-policy",
-        check_rebuild_and_diff_policy(db).await
-    ));
-    checks.push(timed!(
-        "rebuild-and-diff-relationship",
-        check_rebuild_and_diff_relationship(db).await
-    ));
-    checks.push(timed!(
-        "rebuild-and-diff-control",
-        check_rebuild_and_diff_control(db).await
-    ));
-    checks.push(timed!(
-        "rebuild-and-diff-derivation",
-        check_rebuild_and_diff_derivation(db).await
-    ));
+    if profile == ConformanceProfile::Full {
+        checks.push(timed!("rebuild-and-diff", check_rebuild_and_diff(db).await));
+        checks.push(timed!(
+            "rebuild-and-diff-meta",
+            check_rebuild_and_diff_meta(db).await
+        ));
+        checks.push(timed!(
+            "rebuild-and-diff-policy",
+            check_rebuild_and_diff_policy(db).await
+        ));
+        checks.push(timed!(
+            "rebuild-and-diff-relationship",
+            check_rebuild_and_diff_relationship(db).await
+        ));
+        checks.push(timed!(
+            "rebuild-and-diff-control",
+            check_rebuild_and_diff_control(db).await
+        ));
+        checks.push(timed!(
+            "rebuild-and-diff-derivation",
+            check_rebuild_and_diff_derivation(db).await
+        ));
+    }
     checks.push(timed!("provenance-state", check_provenance_state(db).await));
-    checks.push(timed!(
-        "read-log-disposability",
-        check_read_log_disposability().await
-    ));
+    if profile == ConformanceProfile::Full {
+        checks.push(timed!(
+            "read-log-disposability",
+            check_read_log_disposability().await
+        ));
+    }
     checks.push(timed!(
         "authorization-revision-state",
         check_authorization_revision_state(db).await
+    ));
+    checks.push(timed!(
+        "grant-revision-state",
+        check_grant_revision_state(db).await
     ));
     checks.push(timed!(
         "authorization-policy-state",
@@ -313,23 +419,43 @@ pub(crate) async fn run_conformance_with_progress(
             },
         }
     ));
-    checks.push(timed!(
-        "relationship-event-log-state",
-        match crate::relationship::relationship_state_violations(db).await {
-            Ok(violations) => CheckResult {
-                check: "relationship-event-log-state".into(),
-                ok: violations.is_empty(),
-                violations,
-            },
-            Err(err) => CheckResult {
-                check: "relationship-event-log-state".into(),
-                ok: false,
-                violations: vec![format!(
-                    "relationship event log could not be validated: {err}"
-                )],
-            },
-        }
-    ));
+    if profile == ConformanceProfile::Full {
+        checks.push(timed!(
+            "relationship-event-log-state",
+            match crate::relationship::relationship_state_violations(db).await {
+                Ok(violations) => CheckResult {
+                    check: "relationship-event-log-state".into(),
+                    ok: violations.is_empty(),
+                    violations,
+                },
+                Err(err) => CheckResult {
+                    check: "relationship-event-log-state".into(),
+                    ok: false,
+                    violations: vec![format!(
+                        "relationship event log could not be validated: {err}"
+                    )],
+                },
+            }
+        ));
+    } else {
+        checks.push(timed!(
+            "relationship-append-only-triggers",
+            match crate::relationship::relationship_append_only_trigger_violations(db).await {
+                Ok(violations) => CheckResult {
+                    check: "relationship-append-only-triggers".into(),
+                    ok: violations.is_empty(),
+                    violations,
+                },
+                Err(err) => CheckResult {
+                    check: "relationship-append-only-triggers".into(),
+                    ok: false,
+                    violations: vec![format!(
+                        "relationship triggers could not be validated: {err}"
+                    )],
+                },
+            }
+        ));
+    }
     checks.push(timed!(
         "portable-identity-state",
         match crate::identity::state_violations(db).await {
@@ -350,6 +476,12 @@ pub(crate) async fn run_conformance_with_progress(
     ConformanceReport {
         ok: checks.iter().all(|c| c.ok),
         checks,
+        profile: Some(profile),
+        deferred_checks: profile
+            .deferred_checks()
+            .iter()
+            .map(|name| (*name).into())
+            .collect(),
         check_timings,
     }
 }
@@ -361,6 +493,15 @@ pub(crate) async fn run_conformance_with_progress(
 /// read-log fixture are deliberately excluded. Rebuild checks write only their
 /// fresh in-memory projections.
 pub(crate) async fn run_standby_admission_conformance(db: &Db) -> ConformanceReport {
+    run_standby_admission_conformance_with_progress(db, |_, _| {}).await
+}
+
+/// Same start/elapsed semantics as the full suite. Completion means the check
+/// returned, not that it passed; only the final report establishes suite success.
+pub(crate) async fn run_standby_admission_conformance_with_progress(
+    db: &Db,
+    mut on_check: impl FnMut(&str, Option<u128>),
+) -> ConformanceReport {
     fn guarded(name: &str, result: crate::error::Result<CheckResult>) -> CheckResult {
         match result {
             Ok(check) => check,
@@ -386,72 +527,159 @@ pub(crate) async fn run_standby_admission_conformance(db: &Db) -> ConformanceRep
         }
     }
 
+    tracing::info!(target: "native_ce::standby::verification", "standby suite started");
+    let suite_started = std::time::Instant::now();
+    let mut check_timings = Vec::new();
+    macro_rules! timed {
+        ($name:literal, $check:expr) => {{
+            on_check($name, None);
+            tracing::info!(target: "native_ce::standby::verification",
+                check = $name, "standby check started");
+            let started = std::time::Instant::now();
+            let result = $check;
+            let elapsed_ms = started.elapsed().as_millis();
+            check_timings.push(ConformanceCheckTiming {
+                check: $name.into(),
+                elapsed_ms,
+            });
+            on_check($name, Some(elapsed_ms));
+            tracing::info!(target: "native_ce::standby::verification",
+                check = $name, elapsed_ms, ok = result.ok, "standby check finished");
+            result
+        }};
+    }
     let mut checks = vec![
-        guarded("required-tables", check_required_tables(db).await),
-        guarded("event-log-shape", check_event_log_shape(db).await),
-        guarded("meta-event-log-shape", check_meta_event_log_shape(db).await),
-        guarded(
+        timed!(
+            "required-tables",
+            guarded("required-tables", check_required_tables(db).await)
+        ),
+        timed!(
+            "event-log-shape",
+            guarded("event-log-shape", check_event_log_shape(db).await)
+        ),
+        timed!(
+            "meta-event-log-shape",
+            guarded("meta-event-log-shape", check_meta_event_log_shape(db).await)
+        ),
+        timed!(
             "command-event-log-shapes",
-            check_command_event_log_shapes(db).await,
+            guarded(
+                "command-event-log-shapes",
+                check_command_event_log_shapes(db).await,
+            )
         ),
-        guarded(
+        timed!(
             "derivation-request-shape",
-            check_derivation_request_shape(db).await,
+            guarded(
+                "derivation-request-shape",
+                check_derivation_request_shape(db).await,
+            )
         ),
-        guarded("home-contract", check_home_contract(db).await),
-        check_rebuild_and_diff(db).await,
-        check_rebuild_and_diff_meta(db).await,
-        check_rebuild_and_diff_policy(db).await,
-        check_rebuild_and_diff_relationship(db).await,
-        check_rebuild_and_diff_control(db).await,
-        check_rebuild_and_diff_derivation(db).await,
-        check_provenance_state(db).await,
-        check_authorization_revision_state(db).await,
-        state(
+        timed!(
+            "home-contract",
+            guarded("home-contract", check_home_contract(db).await)
+        ),
+        timed!("rebuild-and-diff", check_rebuild_and_diff(db).await),
+        timed!(
+            "rebuild-and-diff-meta",
+            check_rebuild_and_diff_meta(db).await
+        ),
+        timed!(
+            "rebuild-and-diff-policy",
+            check_rebuild_and_diff_policy(db).await
+        ),
+        timed!(
+            "rebuild-and-diff-relationship",
+            check_rebuild_and_diff_relationship(db).await
+        ),
+        timed!(
+            "rebuild-and-diff-control",
+            check_rebuild_and_diff_control(db).await
+        ),
+        timed!(
+            "rebuild-and-diff-derivation",
+            check_rebuild_and_diff_derivation(db).await
+        ),
+        timed!("provenance-state", check_provenance_state(db).await),
+        timed!(
+            "authorization-revision-state",
+            check_authorization_revision_state(db).await
+        ),
+        timed!("grant-revision-state", check_grant_revision_state(db).await),
+        timed!(
             "authorization-policy-state",
-            crate::authorization::state_violations(db).await,
+            state(
+                "authorization-policy-state",
+                crate::authorization::state_violations(db).await,
+            )
         ),
-        state(
+        timed!(
             "control-event-log-state",
-            crate::control::state_violations(db).await,
+            state(
+                "control-event-log-state",
+                crate::control::state_violations(db).await,
+            )
         ),
-        state(
+        timed!(
             "policy-event-log-state",
-            crate::policy::state_violations(db).await,
+            state(
+                "policy-event-log-state",
+                crate::policy::state_violations(db).await,
+            )
         ),
-        state(
+        timed!(
             "relationship-event-log-state",
-            crate::relationship::relationship_state_violations(db).await,
+            state(
+                "relationship-event-log-state",
+                crate::relationship::relationship_state_violations(db).await,
+            )
         ),
-        state(
+        timed!(
             "portable-identity-state",
-            crate::identity::state_violations(db).await,
+            state(
+                "portable-identity-state",
+                crate::identity::state_violations(db).await,
+            )
         ),
-        match crate::storage_profile::portability_policy_report(db).await {
-            Ok(_) => CheckResult {
-                check: "storage-portability-policy-state".into(),
-                ok: true,
-                violations: Vec::new(),
-            },
-            Err(error) => CheckResult {
-                check: "storage-portability-policy-state".into(),
-                ok: false,
-                violations: vec![format!(
-                    "storage portability policy could not be validated: {error}"
-                )],
-            },
-        },
+        timed!(
+            "storage-portability-policy-state",
+            match crate::storage_profile::portability_policy_report(db).await {
+                Ok(_) => CheckResult {
+                    check: "storage-portability-policy-state".into(),
+                    ok: true,
+                    violations: Vec::new(),
+                },
+                Err(error) => CheckResult {
+                    check: "storage-portability-policy-state".into(),
+                    ok: false,
+                    violations: vec![format!(
+                        "storage portability policy could not be validated: {error}"
+                    )],
+                },
+            }
+        ),
     ];
+    let ok = checks.iter().all(|check| check.ok);
+    tracing::info!(target: "native_ce::standby::verification",
+        elapsed_ms = suite_started.elapsed().as_millis(), ok, "standby suite finished");
     ConformanceReport {
-        ok: checks.iter().all(|check| check.ok),
+        ok,
         checks: std::mem::take(&mut checks),
-        check_timings: Vec::new(),
+        profile: None,
+        deferred_checks: Vec::new(),
+        check_timings,
     }
 }
 
 /// Human-readable report, one line per check plus its violations.
 pub fn format_report(report: &ConformanceReport) -> String {
-    let mut lines: Vec<String> = Vec::new();
+    let mut lines = vec![match report.profile {
+        Some(profile) => format!("verification profile: {profile}"),
+        None => "verification suite: standby admission (observational)".into(),
+    }];
+    for name in &report.deferred_checks {
+        lines.push(format!("DEFERRED  {name}"));
+    }
     for c in &report.checks {
         let timing = report
             .check_timings
@@ -509,8 +737,230 @@ mod timing_tests {
 }
 
 #[cfg(test)]
+mod profile_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn production_release_dispatch_omits_exactly_eight_checks() {
+        let db = crate::db::create_database(":memory:").await.unwrap();
+        let mut started = Vec::new();
+        let core = run_conformance_with_profile_and_progress(
+            &db,
+            ConformanceProfile::Core,
+            |name, elapsed| {
+                if elapsed.is_none() {
+                    started.push(name.to_owned());
+                }
+            },
+        )
+        .await;
+        assert!(core.ok, "{}", format_report(&core));
+        assert_eq!(core.profile, Some(ConformanceProfile::Core));
+        assert_eq!(core.deferred_checks, PRODUCTION_RELEASE_DEFERRED_CHECKS);
+        assert_eq!(
+            started,
+            core.checks
+                .iter()
+                .map(|c| c.check.clone())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            started,
+            core.check_timings
+                .iter()
+                .map(|c| c.check.clone())
+                .collect::<Vec<_>>()
+        );
+        for name in PRODUCTION_RELEASE_DEFERRED_CHECKS {
+            assert!(
+                !started.iter().any(|actual| actual == name),
+                "invoked {name}"
+            );
+        }
+        assert!(started
+            .iter()
+            .any(|name| name == "relationship-append-only-triggers"));
+        let full = run_conformance(&db).await;
+        assert!(full.ok, "{}", format_report(&full));
+        assert_eq!(full.profile, Some(ConformanceProfile::Full));
+        assert!(full.deferred_checks.is_empty());
+        let mut omitted: Vec<_> = full
+            .checks
+            .iter()
+            .filter(|c| !started.contains(&c.check))
+            .map(|c| c.check.as_str())
+            .collect();
+        omitted.sort_unstable();
+        assert_eq!(omitted, PRODUCTION_RELEASE_DEFERRED_CHECKS);
+        for check in &full.checks {
+            if !PRODUCTION_RELEASE_DEFERRED_CHECKS.contains(&check.check.as_str()) {
+                assert!(
+                    started.contains(&check.check),
+                    "lost retained {}",
+                    check.check
+                );
+            }
+        }
+        assert_eq!("full".parse(), Ok(ConformanceProfile::Full));
+        assert_eq!("production-release".parse(), Ok(ConformanceProfile::Core));
+        assert!("core".parse::<ConformanceProfile>().is_err());
+        assert_eq!(
+            serde_json::to_value(ConformanceProfile::Core).unwrap(),
+            "production-release"
+        );
+        assert_eq!(
+            serde_json::to_value(ConformanceProfile::Full).unwrap(),
+            "full"
+        );
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn production_release_refuses_missing_and_changed_relationship_triggers() {
+        for (name, event) in [
+            ("relationship_events_no_update", "UPDATE"),
+            ("relationship_events_no_delete", "DELETE"),
+        ] {
+            for changed in [false, true] {
+                let db = crate::db::create_database(":memory:").await.unwrap();
+                let replacement = if changed {
+                    format!("CREATE TRIGGER {name} BEFORE {event} ON relationship_events BEGIN SELECT 1; END;")
+                } else {
+                    String::new()
+                };
+                // One uncached batch on one connection replaces schema DDL;
+                // separate pooled prepared statements are not a fixture boundary.
+                sqlx::raw_sql(&format!("DROP TRIGGER {name}; {replacement}"))
+                    .execute(db.write_pool())
+                    .await
+                    .unwrap();
+                let report = run_conformance_with_profile(&db, ConformanceProfile::Core).await;
+                assert!(!report.ok);
+                let check = report
+                    .checks
+                    .iter()
+                    .find(|c| c.check == "relationship-append-only-triggers")
+                    .unwrap();
+                assert!(!check.ok);
+                assert!(
+                    check.violations.iter().any(|v| v.contains(name)),
+                    "{check:?}"
+                );
+                db.close().await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn production_release_refuses_authorization_trigger_failure() {
+        let db = crate::db::create_database(":memory:").await.unwrap();
+        sqlx::query("DROP TRIGGER authorization_revision_records_insert")
+            .execute(db.write_pool())
+            .await
+            .unwrap();
+        let report = run_conformance_with_profile(&db, ConformanceProfile::Core).await;
+        assert!(!report.ok);
+        assert!(
+            !report
+                .checks
+                .iter()
+                .find(|c| c.check == "authorization-revision-state")
+                .unwrap()
+                .ok
+        );
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn full_default_detects_projection_drift_deferred_by_production_release() {
+        let db = crate::db::create_database(":memory:").await.unwrap();
+        sqlx::query("INSERT INTO links (id,source_id,target_id,relationship,created_at) VALUES ('planted-drift','native:root','native:root','corrupt projection','2026-01-01T00:00:00.000Z')")
+            .execute(db.write_pool()).await.unwrap();
+        let core = run_conformance_with_profile(&db, ConformanceProfile::Core).await;
+        assert!(core.ok, "{}", format_report(&core));
+        let full = run_conformance(&db).await;
+        assert!(!full.ok);
+        assert!(
+            !full
+                .checks
+                .iter()
+                .find(|c| c.check == "rebuild-and-diff")
+                .unwrap()
+                .ok
+        );
+        let still_present: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM links WHERE id='planted-drift'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(still_present, 1, "verification must not repair drift");
+        db.close().await;
+    }
+}
+
+#[cfg(test)]
 mod standby_admission_tests {
     use super::*;
+    use tracing::instrument::WithSubscriber;
+
+    fn assert_progress(report: &ConformanceReport, progress: &[(String, Option<u128>)]) {
+        assert_eq!(report.check_timings.len(), report.checks.len());
+        assert_eq!(progress.len(), report.checks.len() * 2);
+        for (index, (check, timing)) in report.checks.iter().zip(&report.check_timings).enumerate()
+        {
+            assert_eq!(timing.check, check.check);
+            assert_eq!(progress[index * 2], (check.check.clone(), None));
+            assert_eq!(
+                progress[index * 2 + 1],
+                (check.check.clone(), Some(timing.elapsed_ms))
+            );
+        }
+    }
+
+    async fn verify_with_progress(readonly: &Db) -> ConformanceReport {
+        let mut progress = Vec::new();
+        let logs = crate::standby::generation_store::test_diagnostics::Capture::default();
+        let report = run_standby_admission_conformance_with_progress(readonly, |name, elapsed| {
+            progress.push((name.to_owned(), elapsed));
+        })
+        .with_subscriber(logs.subscriber())
+        .await;
+        assert_progress(&report, &progress);
+        let output = logs.output();
+        assert!(!output.contains("corrupt:link"));
+        assert!(output.contains("standby suite started"));
+        assert_eq!(
+            output
+                .lines()
+                .filter(|line| line.contains("standby suite finished"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            output
+                .lines()
+                .filter(|line| line.contains("standby check finished"))
+                .count(),
+            report.checks.len()
+        );
+        assert!(output.contains("standby suite finished elapsed_ms="));
+        let suite_end = output
+            .lines()
+            .find(|line| line.contains("standby suite finished"))
+            .unwrap();
+        assert!(suite_end.contains(&format!("ok={}", report.ok)));
+        for check in &report.checks {
+            let end = output
+                .lines()
+                .find(|line| {
+                    line.contains("standby check finished")
+                        && line.contains(&format!("check=\"{}\"", check.check))
+                })
+                .unwrap();
+            assert!(end.contains(&format!("ok={}", check.ok)));
+        }
+        report
+    }
 
     async fn checkpoint_and_verify(path: &std::path::Path) {
         let options = sqlx::sqlite::SqliteConnectOptions::new()
@@ -548,9 +998,10 @@ mod standby_admission_tests {
             crate::db::open_existing_database_standby_read_only(path.to_string_lossy().as_ref())
                 .await
                 .unwrap();
-        let report = run_standby_admission_conformance(&readonly).await;
+        let report = verify_with_progress(&readonly).await;
         readonly.close().await;
         assert!(report.ok, "{}", format_report(&report));
+        assert_eq!(report.profile, None, "standby admission is not FULL");
         let names: std::collections::HashSet<_> = report
             .checks
             .iter()
@@ -602,7 +1053,7 @@ mod standby_admission_tests {
             crate::db::open_existing_database_standby_read_only(path.to_string_lossy().as_ref())
                 .await
                 .unwrap();
-        let report = run_standby_admission_conformance(&readonly).await;
+        let report = verify_with_progress(&readonly).await;
         readonly.close().await;
         assert!(!report.ok);
         assert!(

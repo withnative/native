@@ -35,6 +35,7 @@ pub mod activity;
 pub mod cascade;
 pub(crate) mod error;
 pub mod events;
+pub mod field_definitions;
 pub mod fts;
 pub mod lens;
 pub mod lifecycle;
@@ -43,6 +44,9 @@ pub mod pipeline;
 pub mod principal;
 pub mod read;
 pub mod relationship_lint;
+pub(crate) mod rule_install;
+pub(crate) mod rule_order;
+pub(crate) mod rule_shape;
 pub mod sql;
 #[cfg(test)]
 pub(crate) mod sql_conformance;
@@ -51,6 +55,7 @@ pub(crate) mod stage_timing;
 #[cfg(test)]
 pub(crate) mod test_sqlite;
 pub mod tree;
+pub(crate) mod turso_ast_rules;
 #[cfg(feature = "turso-local")]
 pub(crate) mod turso_sql;
 #[cfg(feature = "turso-local")]
@@ -512,4 +517,14 @@ pub(crate) fn hidden_visibility_predicate(
 
 pub(crate) fn not_hidden_predicate(record_alias: &str) -> String {
     hidden_visibility_predicate(record_alias, false, false, false)
+}
+
+/// Member-copy generic-record predicate. Every row in the slice is E(m), and
+/// attribution / acknowledgement annotations and semantic Units are absent
+/// from the file by construction, so the ordinary hidden predicate's clauses
+/// are already satisfied — except its `semantic_units` subquery, which names
+/// a table the member profile does not ship. This variant is therefore a
+/// constant and never reads an excluded relation.
+pub(crate) fn member_not_hidden_predicate(_record_alias: &str) -> String {
+    "1".to_string()
 }

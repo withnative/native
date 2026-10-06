@@ -1,0 +1,282 @@
+{
+  "schema": "cel-native-checks/1",
+  "checks": [
+    {
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "cel-subset"
+      ],
+      "source_commit": "a490122d98d05c8f2b84fd35fd1d07f3d0ef0410",
+      "exit_code": 0,
+      "log": "logs/p1-default-tests.log",
+      "log_sha256": "3c08936725047cb0be0c28a05648b6e9fef8b2215d49b4aef62d42df0cae90bd",
+      "scope": "275 unit passed/3 existing ignored; 1 integration and 5 doctests passed. Only two-file regex proof follow-up differs; affected tests rerun at final source.",
+      "captured_log_sha256": "f5b1fb03a35db5cf54b3b02f567e64090040bf93fa7b340e32233133d5a7ade5",
+      "log_normalization": "Trailing empty lines stripped for Git whitespace checks; substantive stdout/stderr unchanged."
+    },
+    {
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "cel-subset",
+        "--lib",
+        "parse_proof_tests::native_combined_stack_debug",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "source_commit": "b307a2c5954630eb58b69159495f8422ee6c800f",
+      "exit_code": 0,
+      "log": "logs/p1-combined-debug-final.log",
+      "log_sha256": "45fb2ef49387d7c399d157de1817748370f5f5c0b672180c57c2a6f318d7d50a",
+      "scope": "Same production closures execute and drop on explicit named 4/8MiB workers; marker-only negative control.",
+      "captured_log_sha256": "1ee5c884807ffd0b4f68b6d38258d587423d229d54fb9d2a880f3c7c695a5f85",
+      "log_normalization": "Trailing empty lines stripped for Git whitespace checks; substantive stdout/stderr unchanged."
+    },
+    {
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "cel-subset",
+        "--release",
+        "--lib",
+        "parse_proof_tests::parse_proof_release",
+        "--",
+        "--exact",
+        "--ignored",
+        "--nocapture"
+      ],
+      "source_commit": "b307a2c5954630eb58b69159495f8422ee6c800f",
+      "exit_code": 0,
+      "log": "logs/p1-combined-release.log",
+      "log_sha256": "e01bf664d2e01be363806d1054184a8c6c0fb56659d159f77dd579f4dbe2fb4f",
+      "scope": "Release includes historical raw parser baseline separately; production combined probes use P1.",
+      "captured_log_sha256": "ceb2756f759b8f9ed5612e3e0d4848a30a306db29a19d708de36f469e309f22b",
+      "log_normalization": "Trailing empty lines stripped for Git whitespace checks; substantive stdout/stderr unchanged."
+    },
+    {
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "cel-subset",
+        "--lib",
+        "native_regex_measure::tests::",
+        "--",
+        "--nocapture"
+      ],
+      "source_commit": "b307a2c5954630eb58b69159495f8422ee6c800f",
+      "exit_code": 0,
+      "log": "logs/p1-regex-debug-final.log",
+      "log_sha256": "2cd4d537621e4c10c82c8a66c16ca0fb175fcc2ad489ef8fd9440eb12d2b8c8a",
+      "scope": "Public searches must return Ok(Bool) and stay within bound, actual named 4/8MiB workers.",
+      "captured_log_sha256": "e05be12eab03fc6ed3ed39f8c731712064743397b7a64fbd070ee062d96ee9b8",
+      "log_normalization": "Trailing empty lines stripped for Git whitespace checks; substantive stdout/stderr unchanged."
+    },
+    {
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "cel-subset",
+        "--release",
+        "--lib",
+        "native_regex_measure::tests::",
+        "--",
+        "--nocapture"
+      ],
+      "source_commit": "b307a2c5954630eb58b69159495f8422ee6c800f",
+      "exit_code": 0,
+      "log": "logs/p1-regex-release.log",
+      "log_sha256": "0e04655486fd2e707a37b5412bb381524f76a7ea7097649f0a816a5e03f94137",
+      "scope": "Same searches/outcome checks on release 4/8MiB.",
+      "captured_log_sha256": "2610c4d330a872c5e8504f12fcd3c3601dfaf5fd4d6aa193088f0aec2bf85d1f",
+      "log_normalization": "Trailing empty lines stripped for Git whitespace checks; substantive stdout/stderr unchanged."
+    },
+    {
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "cel-subset",
+        "--lib",
+        "parser::l0::tests::",
+        "--",
+        "--nocapture"
+      ],
+      "source_commit": "b307a2c5954630eb58b69159495f8422ee6c800f",
+      "exit_code": 0,
+      "log": "logs/p1-l0-debug-final.log",
+      "log_sha256": "4205b666c8322ddfc41b9c88ff0d1bdef9037ffa8f4ef0293f339187816ed979",
+      "scope": "Seven ordinary tests, complete 32-family direct parser/visitor/drop 4/8MiB matrix.",
+      "captured_log_sha256": "155236339fcd8353cb4f9e32526663416f463b73fa5c7fd4f39a0f72b2ee3e74",
+      "log_normalization": "Trailing empty lines stripped for Git whitespace checks; substantive stdout/stderr unchanged."
+    },
+    {
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "cel-subset",
+        "--release",
+        "--lib",
+        "parser::l0::tests::",
+        "--",
+        "--nocapture"
+      ],
+      "source_commit": "b307a2c5954630eb58b69159495f8422ee6c800f",
+      "exit_code": 0,
+      "log": "logs/p1-l0-release.log",
+      "log_sha256": "f7a3ef938681012709c227d8a9d7a1ed6e313dd8ef230f07d71a695bba79bd4f",
+      "scope": "Seven ordinary tests, same explicit direct parser matrix.",
+      "captured_log_sha256": "df15391f7080892d3ea7bbfa47627c0f50e8cdaae18dd2f3101c5c8160e662ed",
+      "log_normalization": "Trailing empty lines stripped for Git whitespace checks; substantive stdout/stderr unchanged."
+    },
+    {
+      "command": [
+        "cargo",
+        "clippy",
+        "-p",
+        "cel-subset",
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "source_commit": "b307a2c5954630eb58b69159495f8422ee6c800f",
+      "exit_code": 0,
+      "log": "logs/p1-clippy-default.log",
+      "log_sha256": "f1d2b9ea414ba8d6ef625dc5b1db3615b71fb61d8f3cecd5381819c86728a930",
+      "scope": "Default all targets."
+    },
+    {
+      "command": [
+        "cargo",
+        "clippy",
+        "-p",
+        "cel-subset",
+        "--all-targets",
+        "--features",
+        "native-proof-tools",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "source_commit": "b307a2c5954630eb58b69159495f8422ee6c800f",
+      "exit_code": 0,
+      "log": "logs/p1-clippy-tools.log",
+      "log_sha256": "5f5a8eaff30192e8689b1a5d0e0834fc896753bc6641a097ae436f9749f6616f",
+      "scope": "Evidence feature all targets."
+    },
+    {
+      "command": [
+        "cargo",
+        "fmt",
+        "--all",
+        "--",
+        "--check"
+      ],
+      "source_commit": "b307a2c5954630eb58b69159495f8422ee6c800f",
+      "exit_code": 0,
+      "log": "logs/p1-format-check.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "scope": "Workspace formatting only, no root builds."
+    },
+    {
+      "command": [
+        "python3",
+        "scripts/verify-test-gates.py",
+        "--check"
+      ],
+      "source_commit": "b307a2c5954630eb58b69159495f8422ee6c800f",
+      "exit_code": 0,
+      "log": "logs/p1-inventory-check.log",
+      "log_sha256": "4b7426768ac38b8726ebaaf3eba84ff13bea934950c17d192247743d3472d3ee",
+      "scope": "Canonical source inventory only, not execution of full repository gates."
+    },
+    {
+      "command": [
+        "cargo",
+        "clippy",
+        "-p",
+        "cel-subset",
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "source_commit": "b307a2c5954630eb58b69159495f8422ee6c800f",
+      "exit_code": 0,
+      "log": "logs/p1-clippy-default-final-tree.log",
+      "log_sha256": "79458e429fb70d643e498f4c5a672f0c77190a0c9b3d9e0dd7ea2588f31a52c9",
+      "scope": "Final packaging tree: only api.rs/policy.rs comment changes plus docs/artifacts since measured source; noncomment lines verified identical."
+    },
+    {
+      "command": [
+        "cargo",
+        "clippy",
+        "-p",
+        "cel-subset",
+        "--all-targets",
+        "--features",
+        "native-proof-tools",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "source_commit": "b307a2c5954630eb58b69159495f8422ee6c800f",
+      "exit_code": 0,
+      "log": "logs/p1-clippy-tools-final-tree.log",
+      "log_sha256": "a69ee01c867f6163e7966fa400057380bf4d5e3864318e45846d106a179fd8d6",
+      "scope": "Final packaging tree: only api.rs/policy.rs comment changes plus docs/artifacts since measured source; noncomment lines verified identical."
+    },
+    {
+      "command": [
+        "cargo",
+        "fmt",
+        "--all",
+        "--",
+        "--check"
+      ],
+      "source_commit": "b307a2c5954630eb58b69159495f8422ee6c800f",
+      "exit_code": 0,
+      "log": "logs/p1-format-final-tree.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "scope": "Final packaging tree: only api.rs/policy.rs comment changes plus docs/artifacts since measured source; noncomment lines verified identical."
+    },
+    {
+      "command": [
+        "python3",
+        "scripts/verify-test-gates.py",
+        "--check"
+      ],
+      "source_commit": "b307a2c5954630eb58b69159495f8422ee6c800f",
+      "exit_code": 0,
+      "log": "logs/p1-inventory-final-tree.log",
+      "log_sha256": "4b7426768ac38b8726ebaaf3eba84ff13bea934950c17d192247743d3472d3ee",
+      "scope": "Final packaging tree: only api.rs/policy.rs comment changes plus docs/artifacts since measured source; noncomment lines verified identical."
+    }
+  ],
+  "full_repository_gate": "Not run locally; parent owns required CI and private maintainer-guide fallback. Narrow crate checks do not replace it.",
+  "packaging_rust_blobs": {
+    "api.rs": "680b8e7a2abce83005de5beffafc27872db86f32171ca29ba0794ec7fb7188d3",
+    "policy.rs": "f1762908f3599b4ce37d4f0e22f87b4bcd830f3a8b8362a4542e274087813609"
+  },
+  "packaging_noncomment_lines_match_measured_source": true,
+  "post_run_test_binaries": [
+    {
+      "path": "target/debug/deps/cel-d9f182ebdd29b587",
+      "sha256": "f55487aad7234fba736553c00bee9516dacf9fa60cbc25d04baaa3fc867083be",
+      "scope": "Hash captured after successful final focused runs, not a separately clean pre/post test-binary build certificate."
+    },
+    {
+      "path": "target/release/deps/cel-fcc85d09bc5566a9",
+      "sha256": "e42870ab6e967041e8bdc69f5eaaca3e0e75477a262acc2a545bfe263347ac4a",
+      "scope": "Hash captured after successful final focused runs, not a separately clean pre/post test-binary build certificate."
+    }
+  ]
+}

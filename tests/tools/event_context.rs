@@ -1054,6 +1054,54 @@ async fn a_declared_basis_is_returned_with_revision_provenance() {
 }
 
 #[tokio::test]
+async fn a_bare_source_id_renders_with_an_absent_reason() {
+    let (db, registry) = fixture().await;
+    let run = "scout-chair-a748b2";
+    note(&registry, &db, run, BASIS_ENGINE_SOURCE, "A source.").await;
+    // A write that rests on a bare id: no reason is invented for it.
+    call(
+        &registry,
+        &db,
+        "create_record",
+        in_run(
+            run,
+            json!({
+                "id": BASIS_CITING,
+                "type": "Document",
+                "kind": "note",
+                "name": "bare-citing",
+                "body": "Citing.",
+                "sources": [BASIS_ENGINE_SOURCE],
+            }),
+        ),
+    )
+    .await;
+    let event_id = creation_event(&db, BASIS_CITING).await;
+    let context = call(
+        &registry,
+        &db,
+        "get_event_context",
+        json!({ "event_id": event_id }),
+    )
+    .await;
+
+    let source = &context["basis"]["sources"][0];
+    assert_eq!(source["record_id"], json!(BASIS_ENGINE_SOURCE));
+    assert_eq!(source["reason"], json!(null), "{context}");
+    assert_eq!(source["revision_supplied_by"], json!("engine"));
+    let text = render::render("get_event_context", &context).unwrap();
+    assert!(text.contains(BASIS_ENGINE_SOURCE), "{text}");
+    assert!(
+        !text.contains("\"reason\":\"null\""),
+        "a missing reason must not render as the string null: {text}"
+    );
+    assert!(
+        !text.contains("\"reason\":\"\""),
+        "a missing reason must not render as an empty string: {text}"
+    );
+}
+
+#[tokio::test]
 async fn an_explicit_empty_basis_reads_declared_none() {
     let (db, registry) = fixture().await;
     let run = "scout-chair-a748b2";

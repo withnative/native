@@ -3841,6 +3841,8 @@ fn render_manage_instructions(value: &Value) -> String {
             "Instruction binding list (read-only): {} returned.\n",
             array(value, "bindings").len()
         )
+    } else if object.contains_key("instructions") && object.contains_key("pending_obligations") {
+        "Current effective instruction stack (read-only).\n".into()
     } else if object.contains_key("current_digest")
         && object.contains_key("shipped_template_available")
     {
@@ -5243,6 +5245,13 @@ fn render_dashboard(value: &Value) -> String {
     }
     if !census.is_null() {
         let _ = writeln!(out, "Lifecycle census details: {}", inline_json(&census));
+    }
+    for (label, key) in [("Claims", "claims"), ("Runs", "runs")] {
+        if let Some(section) = value.get(key) {
+            if scan_unavailable_marker(section).is_some() {
+                render_count_shape(&mut out, label, section);
+            }
+        }
     }
     out
 }
@@ -7427,6 +7436,11 @@ fn render_enriched_write(verb: &str, value: &Value) -> String {
     if let Some(similar) = value.get("similar_existing") {
         render_similar_existing(&mut out, similar);
     }
+    // Post-commit advisor output is prose, never a raw receipt key: only a
+    // fresh write with at least one firing advisor carries it.
+    if let Some(advisories) = value.get("advisories") {
+        render_advisories(&mut out, advisories);
+    }
     out.push_str("Call get_record for post-write state.\n");
     out
 }
@@ -7513,7 +7527,12 @@ fn render_write_receipt(out: &mut String, value: &Value) {
         .filter(|(key, _)| {
             !matches!(
                 key.as_str(),
-                "previous_seq" | "act" | "run_context" | "work_overlap" | "similar_existing"
+                "previous_seq"
+                    | "act"
+                    | "run_context"
+                    | "work_overlap"
+                    | "similar_existing"
+                    | "advisories"
             )
         })
         .collect::<Vec<_>>();
@@ -9817,6 +9836,26 @@ fn render_query_sql(value: &Value) -> String {
     if let Some(seq) = value.get("as_of_seq").and_then(Value::as_i64) {
         let _ = writeln!(out, "As of content sequence: {seq}");
     }
+    if let Some(now_ms) = value.get("now_ms_ms").and_then(Value::as_i64) {
+        let _ = writeln!(out, "Statement clock (now_ms): {now_ms}");
+    }
+    if let Some(assumed) = value.get("assumed_order") {
+        if let Some(columns) = assumed.get("columns").and_then(Value::as_array) {
+            if !columns.is_empty() {
+                let names = columns
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let _ = writeln!(
+                    out,
+                    "Order assumed: no ORDER BY was given with LIMIT, so rows are ordered by ({names}). \
+                     These are the first rows in that order, not the most recent or most relevant. \
+                     Add ORDER BY to choose."
+                );
+            }
+        }
+    }
     if columns.is_empty() {
         out.push_str("Columns: none\n");
         return out;
@@ -9844,7 +9883,26 @@ fn render_query_sql(value: &Value) -> String {
     out
 }
 
+/// The single member marker shape (contract §2.3(a)): returns
+/// `(surface, retry)` when a scan census/axis entry is an explicit offline
+/// marker rather than a count facet, so the human render never prints an
+/// invented zero for it.
+fn scan_unavailable_marker(value: &Value) -> Option<(String, String)> {
+    let marker = value.get("unavailable_offline")?;
+    Some((
+        string(marker, "surface").unwrap_or_else(|| "unavailable".into()),
+        string(marker, "retry").unwrap_or_else(|| "when_online".into()),
+    ))
+}
+
 fn render_count_shape(out: &mut String, label: &str, value: &Value) {
+    if let Some((surface, retry)) = scan_unavailable_marker(value) {
+        let _ = writeln!(
+            out,
+            "{label}: unavailable offline ({surface}) — retry {retry}"
+        );
+        return;
+    }
     let buckets = array(value, "buckets");
     let _ = writeln!(
         out,
@@ -9980,6 +10038,13 @@ fn render_scan(value: &Value) -> String {
     if let Some(axes) = value.get("axes").and_then(Value::as_object) {
         out.push_str("\nAxes\n");
         for (name, axis) in axes {
+            if let Some((surface, retry)) = scan_unavailable_marker(axis) {
+                let _ = writeln!(
+                    out,
+                    "{name}: unavailable offline ({surface}) — retry {retry}"
+                );
+                continue;
+            }
             let samples = array(axis, "samples");
             let count = integer(axis, "count").unwrap_or_default();
             let quality = string(axis, "quality").unwrap_or_default();
@@ -10370,6 +10435,28 @@ fn render_similar_existing(out: &mut String, similar: &Value) {
     }
 }
 
+/// One `advisories` entry as a prose line: advisor identity, code and the
+/// full message. `claimed_string` keeps the message to one line (control
+/// characters are escaped), so a multiline message cannot impersonate
+/// another labelled field. `warn`-level advisories render distinctly with a
+/// `[warn]` marker so agents can tell how firmly a rule speaks at a glance;
+/// entries without a level (pre-level receipts) render as plain advisories.
+fn render_advisories(out: &mut String, advisories: &Value) {
+    let items = advisories.as_array().map_or(&[][..], Vec::as_slice);
+    let _ = writeln!(out, "Advisories ({}):", items.len());
+    for item in items {
+        let advisor = claimed_string(item.get("advisor_id"), "advisor_id");
+        let version = claimed_string(item.get("version"), "version");
+        let code = claimed_string(item.get("code"), "code");
+        let message = claimed_string(item.get("message"), "message");
+        let marker = match item.get("level").and_then(Value::as_str) {
+            Some("warn") => " [warn]",
+            _ => "",
+        };
+        let _ = writeln!(out, "  [{advisor}@{version}] {code}{marker}: {message}");
+    }
+}
+
 fn render_start_work(value: &Value) -> String {
     let mut out = format!(
         "Work {} on {} · {}",
@@ -10477,6 +10564,53 @@ mod record_url_render_tests {
     use serde_json::json;
 
     use super::render;
+
+    #[test]
+    fn query_sql_render_discloses_an_assumed_order() {
+        // E2 default ORDER BY: the assumed order renders one line after the
+        // statement clock; a null/absent field renders nothing.
+        let rendered = render(
+            "query_sql",
+            &json!({
+                "columns": ["id", "name"],
+                "rows": [{"id": "a", "name": "b"}],
+                "row_count": 1,
+                "truncated": false,
+                "truncation_hint": null,
+                "as_of_seq": 7,
+                "now_ms_ms": null,
+                "time_dependent": false,
+                "assumed_order": {
+                    "columns": ["id", "name"],
+                    "order_by": "ORDER BY 1, 2",
+                    "reason": "limit_without_order_by",
+                },
+            }),
+        )
+        .unwrap();
+        assert!(
+            rendered.contains(
+                "Order assumed: no ORDER BY was given with LIMIT, so rows are ordered by (id, name)."
+            ),
+            "{rendered}"
+        );
+        let plain = render(
+            "query_sql",
+            &json!({
+                "columns": ["id"],
+                "rows": [],
+                "row_count": 0,
+                "truncated": false,
+                "truncation_hint": null,
+                "as_of_seq": 7,
+                "now_ms_ms": null,
+                "time_dependent": false,
+                "assumed_order": null,
+            }),
+        )
+        .unwrap();
+        assert!(!plain.contains("Order assumed"), "{plain}");
+    }
 
     #[test]
     fn record_renderers_prefer_share_url_and_fall_back_to_record_url() {
@@ -10961,5 +11095,83 @@ mod body_receipt_render_tests {
             "{rendered}"
         );
         assert!(rendered.contains("deprecated_body_alias"), "{rendered}");
+    }
+
+    #[test]
+    fn advisories_render_as_prose_not_raw_receipt() {
+        for tool in ["update_record", "create_record"] {
+            let rendered = render(
+                tool,
+                &json!({
+                    "id": "0189d4c6-1f2a-7b3c-9d4e-5f60718293a4",
+                    "type": "Document",
+                    "name": "Probe",
+                    "previous_seq": 7,
+                    "body_digest": "a".repeat(64),
+                    "advisories": [{
+                        "advisor_id": "demo-advisor",
+                        "version": "1.0",
+                        "manifest_digest": null,
+                        "code": "long_record",
+                        "record_id": "0189d4c6-1f2a-7b3c-9d4e-5f60718293a4",
+                        "message": "this record is getting long, consider splitting it",
+                    }],
+                }),
+            )
+            .unwrap();
+            assert!(
+                rendered.contains(
+                    "[demo-advisor@1.0] long_record: this record is getting long, consider splitting it"
+                ),
+                "{rendered}"
+            );
+            assert!(rendered.contains("Advisories (1):"), "{rendered}");
+            assert!(!rendered.contains("  advisories:"), "{rendered}");
+        }
+    }
+
+    #[test]
+    fn warn_advisories_render_with_a_warn_marker() {
+        let rendered = render(
+            "update_record",
+            &json!({
+                "id": "0189d4c6-1f2a-7b3c-9d4e-5f60718293a4",
+                "type": "WorkItem",
+                "name": "Probe",
+                "previous_seq": 7,
+                "body_digest": "a".repeat(64),
+                "advisories": [
+                    {
+                        "advisor_id": "builtin.completion_outcome",
+                        "version": "1.0.0",
+                        "manifest_digest": null,
+                        "code": "completion_outcome.missing",
+                        "record_id": "0189d4c6-1f2a-7b3c-9d4e-5f60718293a4",
+                        "message": "Warning: this task was marked completed without a recorded outcome.",
+                        "level": "warn",
+                    },
+                    {
+                        "advisor_id": "demo-advisor",
+                        "version": "1.0",
+                        "manifest_digest": null,
+                        "code": "notice",
+                        "record_id": "0189d4c6-1f2a-7b3c-9d4e-5f60718293a4",
+                        "message": "plain advice",
+                        "level": "advise",
+                    },
+                ],
+            }),
+        )
+        .unwrap();
+        assert!(
+            rendered.contains(
+                "[builtin.completion_outcome@1.0.0] completion_outcome.missing [warn]: Warning: this task"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("[demo-advisor@1.0] notice: plain advice"),
+            "{rendered}"
+        );
     }
 }

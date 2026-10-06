@@ -76,7 +76,7 @@ fn engine_info_arguments_schema() -> Value {
     })
 }
 
-async fn engine_info(db: Db, _caller: Caller, arguments: Value) -> Result<Value> {
+async fn engine_info(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
     if arguments
         .get("required_capabilities")
         .is_some_and(Value::is_null)
@@ -99,6 +99,35 @@ async fn engine_info(db: Db, _caller: Caller, arguments: Value) -> Result<Value>
         .await?;
     let schema_version: i64 = row.get(0);
     let standby = db.open_mode() == DatabaseOpenMode::StandbyReadOnly;
+    let member = caller.is_member_copy();
+    let storage_profile = if member {
+        // This is build-owned backend information, not the excluded durable
+        // workspace policy. Never invent a default overlay for that policy.
+        let mut report = crate::storage_profile::active_profile_report()?;
+        let object = report
+            .as_object_mut()
+            .expect("storage profile is an object");
+        for key in [
+            "enforcement",
+            "policy_revision",
+            "target_profiles",
+            "allow_conversions",
+            "revision_floors",
+            "admissible_capabilities",
+            "catalog_sha256",
+        ] {
+            object.remove(key);
+        }
+        object.insert(
+            "policy".into(),
+            json!({"unavailable_offline": {
+                "surface": "engine_info.storage_policy", "retry": "when_online"
+            }}),
+        );
+        report
+    } else {
+        crate::storage_profile::active_profile_report_for_db(&db).await?
+    };
     let mut result = json!({
         "engine": ENGINE_NAME,
         "engine_version": ENGINE_VERSION,
@@ -107,11 +136,23 @@ async fn engine_info(db: Db, _caller: Caller, arguments: Value) -> Result<Value>
         // without access to the deploying platform's console.
         "git_sha": GIT_SHA,
         "schema_version": schema_version,
-        "storage_profile": crate::storage_profile::active_profile_report_for_db(&db).await?,
+        "storage_profile": storage_profile,
         "query_sql": crate::query::sql_contract::capability(
             crate::query::sql_contract::QuerySqlProfile::SqliteLocal
         ),
     });
+    if member {
+        result["runtime"] = json!({
+            "mode": "member_copy",
+            "profile": crate::replica_generation::ReplicaProfile::MemberReadV1 {
+                member_schema_digest: crate::schema::member_schema::member_schema_digest(),
+            }.profile_id(),
+            "read_only": true,
+            "writes_supported": false,
+            "canonical_authority": "hosted",
+            "mutation_error": super::registry::STANDBY_READ_ONLY_ERROR,
+        });
+    }
     if standby {
         result["runtime"] = json!({
             "mode": "standby",

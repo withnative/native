@@ -504,12 +504,57 @@ async fn unit_revision_body_folds_and_backfills_mentions() {
     let mut conn = SqliteConnection::connect_with(&options).await.unwrap();
     // Reconstruct the released engine-58 shape before exercising its real
     // record-mentions backfill edge.
+    sqlx::query("DROP TABLE facet_value_json_nodes")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    sqlx::query("DROP TABLE schema_config_json_nodes")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    sqlx::query("DROP TABLE workspace_rule_installations")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    sqlx::query("DROP TRIGGER content_event_reaction_meta_insert")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    sqlx::query("DROP TABLE content_event_reaction_meta")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    sqlx::query("DROP TRIGGER content_event_claim_meta_insert")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    sqlx::query("DROP TABLE content_event_claim_meta")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    let grant_triggers: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM sqlite_schema WHERE type = 'trigger' AND name GLOB 'authorization_grant_*'",
+    )
+    .fetch_all(&mut conn)
+    .await
+    .unwrap();
+    for trigger in grant_triggers {
+        sqlx::query(&format!("DROP TRIGGER {trigger}"))
+            .execute(&mut conn)
+            .await
+            .unwrap();
+    }
+    sqlx::query("DROP TABLE authorization_grant_revision")
+        .execute(&mut conn)
+        .await
+        .unwrap();
     for statement in [
         "DROP INDEX idx_external_observations_act",
         "ALTER TABLE external_observations DROP COLUMN act",
         "DROP INDEX idx_awareness_command_intents_act",
         "ALTER TABLE awareness_command_intents DROP COLUMN act",
         "DROP INDEX idx_content_events_act",
+        "DROP INDEX idx_content_events_record_changes",
         "DROP INDEX idx_policy_events_act",
         "DROP INDEX idx_awareness_events_act",
         "DROP INDEX idx_notification_candidate_events_act",
@@ -527,11 +572,43 @@ async fn unit_revision_body_folds_and_backfills_mentions() {
     ] {
         sqlx::query(statement).execute(&mut conn).await.unwrap();
     }
+    sqlx::query("DROP TABLE vocabulary_value_json_nodes")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    sqlx::query("DROP TABLE body_blocks")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    sqlx::query("DROP TABLE body_task_items")
+        .execute(&mut conn)
+        .await
+        .unwrap();
     sqlx::query("DROP TABLE record_mentions")
         .execute(&mut conn)
         .await
         .unwrap();
     sqlx::query("DROP TABLE alpha_tab_installs")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    sqlx::query("DROP TABLE alpha_tab_orders")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    sqlx::query("DROP TABLE facet_times")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    sqlx::query("ALTER TABLE records DROP COLUMN archived")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    sqlx::query("ALTER TABLE records DROP COLUMN is_current")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    sqlx::query("ALTER TABLE records DROP COLUMN successor_count")
         .execute(&mut conn)
         .await
         .unwrap();
@@ -547,7 +624,8 @@ async fn unit_revision_body_folds_and_backfills_mentions() {
         .execute(&mut conn)
         .await
         .unwrap();
-    for (from, to) in [(59, 60), (60, 61), (61, 62), (62, 63), (63, 64), (64, 65)] {
+    for from in 59..native_ce::CURRENT_ENGINE_SCHEMA_VERSION {
+        let to = from + 1;
         let step = registry.pending(from, to).unwrap().pop().unwrap();
         step.preflight(&mut conn).await.unwrap();
         step.apply(&mut conn).await.unwrap();

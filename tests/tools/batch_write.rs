@@ -620,6 +620,31 @@ async fn all_unchanged_keyed_batch_anchors_and_replays() {
         .to_string();
     assert!(conflict.contains("conflicting action input"), "{conflict}");
     assert_eq!(event_count(&db).await, before);
+
+    let source_report = native_ce::conformance::run_conformance(&db).await;
+    assert!(source_report.ok, "{source_report:?}");
+    let bundle = native_ce::interchange::export_canonical_interchange(&db)
+        .await
+        .unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let imported = native_ce::interchange::import_canonical_interchange(
+        &bundle,
+        &temp.path().join("batch-anchor.db"),
+        native_ce::interchange::ImportContinuity::ForeignBoundary,
+    )
+    .await
+    .unwrap();
+    let imported_authority: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM provenance_local_attestation_authority")
+            .fetch_one(imported.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        imported_authority, 0,
+        "import must not mint local authority"
+    );
+    let imported_report = native_ce::conformance::run_conformance(&imported).await;
+    assert!(imported_report.ok, "{imported_report:?}");
 }
 
 #[tokio::test]
