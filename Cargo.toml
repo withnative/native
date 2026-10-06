@@ -260,6 +260,8 @@ uuid = { version = "1", features = ["v4"] }
 # (verified by test/engine FTS coverage and the conformance self-check).
 libsqlite3-sys = { version = "0.30", features = ["bundled"] }
 base64 = "0.23.0"
+# Bounded gzip decode for `body_encoding: "gzip+base64"` write bodies.
+flate2 = "1"
 fs2 = "0.4"
 libc = "0.2"
 serde_jcs = "0.1"
@@ -290,7 +292,6 @@ yrs = "0.28"
 # Pure bridge controls exercise the actual native scalar-kind admission.
 cel = { package = "cel-subset", path = "crates/cel-subset" }
 indexmap = "2"
-flate2 = "1"
 native-artifact-html = { path = "crates/artifact-html", features = ["test-support"] }
 native-artifact-runtime = { path = "crates/artifact-runtime", features = ["test-support"] }
 rmcp = { version = "0.8.5", features = ["client", "transport-streamable-http-client-reqwest"] }

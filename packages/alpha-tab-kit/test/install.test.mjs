@@ -2,7 +2,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { createHash } from "node:crypto";
-import { planInstall, runInstall, chunkUtf8 } from "../src/install.mjs";
+import { gunzipSync } from "node:zlib";
+import { planInstall, runInstall, chunkUtf8, encodeBody } from "../src/install.mjs";
 import { computeDigests } from "../src/digest.mjs";
 
 const sha256 = (text) => createHash("sha256").update(text, "utf8").digest("hex");
@@ -24,7 +25,10 @@ function fakeNative({ corruptChunk, adoptionCarried = true } = {}) {
       calls.push({ executor, operation, args });
       if (operation === "create_record") {
         record.kind = args.kind;
-        record.body = args.body;
+        // The server decodes body_encoding at the tool boundary, before anything else.
+        const bytes = args.body_encoding === "gzip+base64" ? gunzipSync(Buffer.from(args.body, "base64"))
+          : args.body_encoding === "base64" ? Buffer.from(args.body, "base64") : null;
+        record.body = bytes ? bytes.toString("utf8") : args.body;
         record.events.push({ id: `e${record.events.length}`, type: "record.created" });
         return { id: record.id, source_event_id: record.events[0].id, body_digest: sha256(record.body) };
       }
@@ -150,7 +154,8 @@ test("new plans create the complete artifact once, without a stage retry key", (
   assert.equal(args.type, "Document");
   assert.equal(args.kind, "artifact");
   assert.deepEqual(args.facets, { runtime: "native.html.v1" });
-  assert.equal(args.body, html);
+  assert.equal(args.body_encoding, "gzip+base64");
+  assert.equal(gunzipSync(Buffer.from(args.body, "base64")).toString("utf8"), html);
   assert.equal(args.response_mode, "summary");
   assert.equal(p.steps[0].expect.body_digest, sha256(html));
   assert.equal(Object.hasOwn(args, "idempotency_key"), false);
@@ -243,6 +248,9 @@ test("CLI defaults to whole-body and --chunked explicitly selects the old route"
   assert.equal(chunkedRun.stderr, "");
   const chunked = JSON.parse(chunkedRun.stdout);
   assert.deepEqual(chunked, plan({ homeId: "home", reason: "CLI test", chunked: true }));
+  const rawRun = spawnSync(process.execPath, [...args.slice(0, -2), "--raw-body"], { encoding: "utf8" });
+  assert.equal(rawRun.status, 0);
+  assert.deepEqual(JSON.parse(rawRun.stdout), plan({ homeId: "home", reason: "CLI test", bodyEncoding: "utf8" }));
 });
 
 
@@ -459,4 +467,142 @@ test("update routes retain every digest fence", async () => {
   };
   await assert.rejects(runInstall(plan({ updateInstallEventId: "current" }), native), /update: digest/);
   assert.equal(native.calls.length, 2);
+});
+
+test("whole-body plans send gzip+base64 by default and the server-side decode matches the local digest", async () => {
+  const p = plan();
+  const create = p.steps.find((step) => step.step === "create-artifact");
+  assert.equal(create.arguments.body_encoding, "gzip+base64");
+  assert.notEqual(create.arguments.body, html);
+  assert.equal(gunzipSync(Buffer.from(create.arguments.body, "base64")).toString("utf8"), html);
+  assert.deepEqual(create.expect, { body_digest: sha256(html), body_bytes: Buffer.byteLength(html, "utf8") });
+  const native = fakeNative();
+  await runInstall(p, native);
+  assert.equal(native.record.body, html);
+});
+
+test("bodyEncoding utf8 falls back to the raw body with no body_encoding field; base64 is selectable", async () => {
+  const raw = plan({ bodyEncoding: "utf8" }).steps.find((step) => step.step === "create-artifact").arguments;
+  assert.equal(raw.body, html);
+  assert.equal(Object.hasOwn(raw, "body_encoding"), false);
+  const b64 = plan({ bodyEncoding: "base64" }).steps.find((step) => step.step === "create-artifact").arguments;
+  assert.equal(b64.body_encoding, "base64");
+  assert.equal(Buffer.from(b64.body, "base64").toString("utf8"), html);
+  assert.throws(() => plan({ bodyEncoding: "rot13" }), /bodyEncoding must be one of utf8, base64, gzip\+base64/);
+  const native = fakeNative();
+  await runInstall(plan({ bodyEncoding: "utf8" }), native);
+  assert.equal(native.record.body, html);
+});
+
+test("chunked plans stay raw and never carry body_encoding", () => {
+  for (const step of plan({ chunked: true }).steps) assert.equal(Object.hasOwn(step.arguments, "body_encoding"), false);
+});
+
+test("encodeBody round-trips multibyte text and shrinks escape-heavy source", () => {
+  const text = "<p>\"é€😀\"</p>\n".repeat(2000);
+  for (const encoding of ["base64", "gzip+base64"]) {
+    const { body, body_encoding } = encodeBody(text, encoding);
+    const bytes = Buffer.from(body, "base64");
+    assert.equal((body_encoding === "gzip+base64" ? gunzipSync(bytes) : bytes).toString("utf8"), text);
+  }
+  assert.ok(encodeBody(text).body.length < text.length / 10);
+});
+
+test("runInstall retries the encoded create once with the raw body when the server refuses body_encoding", async () => {
+  for (const refusal of [
+    "create_record: unknown field `body_encoding`, expected one of `type`, `reason`, `body`",
+    "Invalid arguments: Additional properties are not allowed ('body_encoding' was unexpected)",
+  ]) {
+    const native = fakeNative();
+    const call = native.call.bind(native);
+    native.call = async (executor, operation, args) => {
+      if (args.body_encoding) { native.calls.push({ executor, operation, args }); throw new Error(refusal); }
+      return call(executor, operation, args);
+    };
+    const notices = [];
+    const result = await runInstall(plan(), native, { onNotice: (message) => notices.push(message) });
+    const creates = native.calls.filter((entry) => entry.operation === "create_record");
+    assert.equal(creates.length, 2, "one refused encoded attempt, one raw retry");
+    assert.equal(creates[0].args.body_encoding, "gzip+base64");
+    assert.equal(creates[1].args.body, html);
+    assert.equal(Object.hasOwn(creates[1].args, "body_encoding"), false);
+    assert.deepEqual(creates[1].args, plan({ bodyEncoding: "utf8" }).steps[0].arguments);
+    assert.equal(notices.length, 1);
+    assert.match(notices[0], /does not support body_encoding/);
+    assert.equal(result.log.find((entry) => entry.step === "create-artifact").fallback, "raw-body");
+    assert.equal(native.record.body, html);
+    assert.ok(result.log.every((entry) => entry.ok));
+  }
+});
+
+test("runInstall does not fall back on a new server's own refusals or on other errors", async () => {
+  for (const refusal of [
+    "create_record: 'body' decodes to 600000 bytes, over the 524288-byte body limit [body_encoding_too_large]",
+    "create_record: not valid gzip [body_encoding_invalid_gzip]",
+    "create_record: html_policy_violation at line 3",
+  ]) {
+    const native = fakeNative();
+    native.call = async (executor, operation, args) => { native.calls.push({ executor, operation, args }); throw new Error(refusal); };
+    const notices = [];
+    await assert.rejects(runInstall(plan(), native, { onNotice: (message) => notices.push(message) }), (error) => error.message === refusal);
+    assert.equal(native.calls.length, 1, "no retry");
+    assert.deepEqual(notices, []);
+  }
+});
+
+test("raw and chunked plans carry no fallback", () => {
+  for (const options of [{ bodyEncoding: "utf8" }, { chunked: true }]) {
+    for (const step of plan(options).steps) assert.equal(Object.hasOwn(step, "fallback"), false);
+  }
+});
+
+// A bundle whose manifest reads one input port, as Docs reads `pages`.
+const manifest = { schema: "native.html.artifact.v1", capability_requests: [{ capability: "input.read", scope: { port: "pages" } }], inputs: { pages: { envelope: "native.collection-envelope.v1", expose_to_root: true, required: false } } };
+const boundHtml = html.replace("</head>", `<script type="application/json" id="native-artifact-manifest">${JSON.stringify(manifest)}</script></head>`);
+const boundPlan = (options = {}) => plan({ html: boundHtml, ...options });
+
+test("a manifest's input.read ports are reported unbound unless bound", () => {
+  assert.notEqual(boundHtml, html);
+  assert.equal("unbound_inputs" in plan(), false, "plans without input ports stay byte-identical");
+  assert.deepEqual(boundPlan().unbound_inputs, ["pages"]);
+  assert.equal(boundPlan().steps.some((step) => step.step === "bind-inputs"), false);
+  assert.equal("unbound_inputs" in boundPlan({ bindings: [{ port: "pages", collection_id: "c1" }] }), false);
+  assert.throws(() => boundPlan({ bindings: [{ port: "items", collection_id: "c1" }] }), /does not request input\.read on that port/);
+  assert.throws(() => boundPlan({ bindings: [{ port: "pages", collection_id: "c1" }, { port: "pages", collection_id: "c2" }] }), /bound once/);
+  assert.throws(() => boundPlan({ chunked: true, bindings: [{ port: "pages", collection_id: "c1" }] }), /whole-body route/);
+});
+
+test("bindings bind and grant the exact new source before install", async () => {
+  const p = boundPlan({ bindings: [{ port: "pages", collection_id: "c1" }] });
+  assert.deepEqual(p.steps.map((step) => step.step), ["create-artifact", "bind-inputs", "grant-input-pages", "install", "inspect"]);
+  const native = fakeNative();
+  const base = native.call.bind(native);
+  const executed = [];
+  native.call = async (executor, operation, args) => {
+    if (operation === "manage_artifact_inputs.bind_many") { native.calls.push({ executor, operation, args }); return { status: "bound" }; }
+    if (operation === "manage_artifact_module_grants.grant") { native.calls.push({ executor, operation, args }); return { plan_id: "wpl1:p", target: "t", effect_summary: "e" }; }
+    return base(executor, operation, args);
+  };
+  native.execute = async (executor, operation, prepared) => { executed.push({ executor, operation, prepared }); return { status: "granted" }; };
+  const result = await runInstall(p, native);
+  const bind = native.calls.find((call) => call.operation === "manage_artifact_inputs.bind_many").args;
+  assert.deepEqual(bind, { artifact_id: native.record.id, bindings: [{ port_name: "pages", collection_id: "c1" }] });
+  const grant = native.calls.find((call) => call.operation === "manage_artifact_module_grants.grant");
+  assert.equal(grant.executor, "access_admin");
+  assert.deepEqual(grant.args, {
+    artifact_id: native.record.id, subject_kind: "artifact_source", subject_record_id: native.record.id,
+    subject_event_id: result.source_revision, source_sha256: sha256(boundHtml),
+    capability: "input.read", scope: { artifact_port: "pages" },
+  });
+  assert.deepEqual(executed, [{ executor: "access_admin", operation: "manage_artifact_module_grants.grant", prepared: { plan_id: "wpl1:p", target: "t", effect_summary: "e" } }]);
+  const install = native.calls.find((call) => call.operation === "manage_alpha_tabs.install").args;
+  assert.equal(install.source_revision, result.source_revision, "the grant names the source the install consents to");
+});
+
+test("a grant step stops before install when the client cannot execute a prepared plan", async () => {
+  const native = fakeNative();
+  const base = native.call.bind(native);
+  native.call = async (executor, operation, args) => (operation === "manage_artifact_inputs.bind_many" ? { status: "bound" } : base(executor, operation, args));
+  await assert.rejects(runInstall(boundPlan({ bindings: [{ port: "pages", collection_id: "c1" }] }), native), /client\.execute is missing/);
+  assert.equal(native.calls.some((call) => call.operation === "manage_alpha_tabs.install"), false);
 });

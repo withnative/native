@@ -19,7 +19,8 @@ const refusal='body feature plans require a separately qualified Cookie host exe
 
 test('all eight main269 default/chunked/icon/removal plans remain exact independent oracles',()=>{
   assert.equal(oracles.main,'269dbff08890a36ef660945970665bac601627c0');
-  for(const v of oracles.legacy) assert.deepEqual(planInstall(v.input),v.plan,v.name);
+  // The oracles are the raw-body routes of main 269; the default is now gzip+base64, so pin utf8.
+  for(const v of oracles.legacy) assert.deepEqual(planInstall({...v.input,bodyEncoding:'utf8'}),v.plan,v.name);
 });
 
 test('all three qualified root feature plans retain every byte except fresh UUID field',()=>{

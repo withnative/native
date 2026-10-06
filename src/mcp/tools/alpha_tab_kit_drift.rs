@@ -88,6 +88,7 @@ fn names(path: &str) -> BTreeSet<String> {
 const ASSERTED: &[&str] = &[
     "digest.version",
     "install.runtime",
+    "install.body_encodings",
     "install.package_max_bytes",
     "install.package_label_max_bytes",
     "install.version_max_bytes",
@@ -183,6 +184,44 @@ fn dormant_body_bound_mirrors_kit_without_sendability_claim() {
         proposed["encoded_budget_status"],
         json!("dedicated Body envelope 6 * raw cap + 64 KiB; engine encoded values and replay payloads 4 MiB; rollout and host compatibility require qualification")
     );
+}
+
+#[test]
+fn body_encodings_match_what_the_write_path_accepts() {
+    use crate::mcp::tools::body_encoding::decode_arguments;
+    let kit_encodings = names("install.body_encodings");
+    // A name the engine knows never fails as `body_encoding_unknown`, whatever
+    // the body; a name it does not know always does.
+    let probe = |encoding: &str, body: &str| {
+        let mut arguments = json!({"body": body, "body_encoding": encoding});
+        decode_arguments("create_record", &mut arguments, &["body"])
+    };
+    for encoding in &kit_encodings {
+        let outcome = probe(encoding, "aGVsbG8=");
+        let text = outcome
+            .as_ref()
+            .err()
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        assert!(
+            !text.contains("body_encoding_unknown"),
+            "limits.json lists '{encoding}' but the engine refuses it as unknown"
+        );
+    }
+    assert!(probe("base64", "aGVsbG8=").is_ok());
+    assert!(probe("rot13", "aGVsbG8=")
+        .unwrap_err()
+        .to_string()
+        .contains("body_encoding_unknown"));
+    // Every enum value the engine advertises is one the kit knows.
+    let schema = crate::mcp::tools::body_encoding::schema();
+    let advertised: BTreeSet<String> = schema["enum"]
+        .as_array()
+        .expect("body_encoding enum")
+        .iter()
+        .map(|value| value.as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(advertised, kit_encodings);
 }
 
 #[test]

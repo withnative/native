@@ -399,11 +399,27 @@ app.withnative.ai are not verified by this application-level change.
 
 `planInstall` creates the complete source artifact in one write by default:
 
-1. `records_write create_record` with `type: "Document"`, `kind: "artifact"`, the complete HTML body, and `facets: {runtime: "native.html.v1", app_icon?}`. The call includes reason and sources, with no stage `idempotency_key`. The whole document is validated on creation.
+1. `records_write create_record` with `type: "Document"`, `kind: "artifact"`, the complete HTML body (sent as `body_encoding: "gzip+base64"` by default, see below), and `facets: {runtime: "native.html.v1", app_icon?}`. The call includes reason and sources, with no stage `idempotency_key`. The whole document is validated on creation.
 2. Capture `id` and `source_event_id` from that receipt, and require its `body_digest` to equal the local `bundle_sha256`. Install pins this exact body-carrying event as `source_revision`; no append, re-kind or SQL lookup is needed.
 3. Optionally `artifacts_write manage_alpha_tabs.remove`, **only** with explicit `--replace <event id>`. This retains the current remove-then-install behavior, including its adoption consequences: the new install requires browser adoption. It is not an in-place update, and a failed reinstall can leave the package removed.
 4. `artifacts_write manage_alpha_tabs.install`. The server's combined `digest` and `declaration_digest` must equal the local ones.
 5. `artifacts_read manage_alpha_tabs.inspect`.
+
+**Input bindings.** Every install stages a new source, and input bindings and
+`input.read` grants are pinned to one exact source: nothing made for the
+previous install carries over. A tab whose manifest reads an input port (Docs
+reads `pages`) then cannot render, so every Body Save is refused. Pass
+`install-plan … --bind <port>=<collection id>` for each such port
+(programmatically `planInstall({ …, bindings: [{port, collection_id}] })`); read
+the previous install's Collection with `artifacts_read manage_artifact_inputs.read`.
+Between steps 2 and 3 the plan then adds `artifacts_write
+manage_artifact_inputs.bind_many` and, per port, `access_admin
+manage_artifact_module_grants.grant` (`input.read`, `subject_kind:
+"artifact_source"`, the new `source_event_id` and `bundle_sha256`). The grant is
+plan-required: `runInstall` prepares it, then executes the returned plan through
+`client.execute`. The CLI refuses a plan that leaves a requested port unbound
+unless you pass `--allow-unbound`; programmatic plans list such ports as
+`unbound_inputs`. `--bind` needs the whole-body route.
 
 To reinstall after an earlier removal, use
 `install-plan … --after-removal <removal event id>` (programmatically,
@@ -438,10 +454,27 @@ There is no automatic fallback. Digest mismatches stop all subsequent calls.
 Retries stage a fresh source record, as in the chunked route. Archive orphaned
 source records left by failed or repeated installs.
 
-**Size caveat:** hosted `/mcp` currently applies axum's default request-body
+**Encoded body.** JSON escaping can inflate a raw HTML string several-fold against
+the hosted request limit, so the whole-body `create_record` sends `body` as gzip,
+then standard base64, with `body_encoding: "gzip+base64"`. The server decodes at the
+tool boundary, before validation, the 512 KiB limit, `body_digest` and storage, so
+the receipt digest still equals the local `bundle_sha256` and `expect.body_bytes` is
+the decoded size. Select another form with `--body-encoding utf8|base64|gzip+base64`
+(programmatically `planInstall({ …, bodyEncoding })`); `--raw-body` is shorthand for
+`utf8`, which sends the plain string and omits the field. Use it against a server
+that predates `body_encoding`, which refuses the unknown argument. `runInstall`
+does this for you: when the encoded `create-artifact` step is refused with an error
+that names `body_encoding` (and is not one of the new server's own
+`[body_encoding_*]` refusals), it prints a one-line notice and retries that one step
+once with the raw body, using the step's `fallback.arguments`. Run a saved plan's
+steps by hand with `arguments`, or `fallback.arguments` against an older server. The chunked
+route is always raw. `manage_alpha_tabs` calls carry no source bytes, so they have
+no encoding.
+
+**Size caveat (raw bodies only):** hosted `/mcp` currently applies axum's default request-body
 extraction limit: axum-core `DEFAULT_LIMIT` is 2097152 bytes (**2 MiB encoded
 JSON**). The HTML limit is 512 KiB decoded UTF-8, so a near-512 KiB
-escape-heavy bundle may need `--chunked` until a separate change raises the MCP request
+escape-heavy bundle may need the default encoded body (or `--chunked`) until a separate change raises the MCP request
 allowance to 4 MiB. Metadata also counts toward the encoded limit.
 
 For constrained servers or clients, explicitly use

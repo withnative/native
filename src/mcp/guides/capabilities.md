@@ -20,8 +20,8 @@ The direct query flag is not part of saved-query v0.2 and rejects non-record ter
 
 Exact compact UTF-8 `result.tools` descriptor arrays:
 
-- `focused`: 27 tools, 70897 bytes
-- `complete`: 80 tools, 204932 bytes
+- `focused`: 27 tools, 70900 bytes
+- `complete`: 80 tools, 204935 bytes
 
 ## Complete production registry
 
@@ -35,9 +35,9 @@ Exact compact UTF-8 `result.tools` descriptor arrays:
 | `describe_schema` | `schema` | no | no | yes | `correctness-under-ignorance` | 1321 |
 | `quickstart` | `guidance` | no | no | yes | `correctness-under-ignorance` | 594 |
 | `read_guide` | `guidance` | yes | yes | yes | `correctness-under-ignorance` | 1309 |
-| `create_record` | `records` | yes | no | yes | `atomicity` | 6272 |
+| `create_record` | `records` | yes | no | yes | `atomicity` | 6185 |
 | `get_record` | `records` | yes | no | yes | `discoverability` | 3969 |
-| `update_record` | `records` | yes | no | yes | `atomicity` | 5478 |
+| `update_record` | `records` | yes | no | yes | `atomicity` | 5568 |
 | `claim_unowned_record` | `records` | no | no | yes | `atomicity` | 2039 |
 | `correct_record_type` | `records` | no | no | yes | `atomicity` | 1835 |
 | `delete_record` | `records` | yes | no | yes | `atomicity` | 1490 |

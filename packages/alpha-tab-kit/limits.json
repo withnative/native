@@ -15,6 +15,7 @@
   },
   "install": {
     "runtime": { "value": "native.html.v1", "rust": "native_artifact_html::html::RUNTIME_ID", "source": "crates/artifact-html/src/html.rs:38" },
+    "body_encodings": { "value": ["utf8", "base64", "gzip+base64"], "rust_behaviour": "body_encoding::decode_arguments", "source": "src/mcp/tools/body_encoding.rs" },
     "package_max_bytes": { "value": 128, "rust_behaviour": "require_package", "source": "src/mcp/tools/alpha_tabs.rs:1716" },
     "package_label_max_bytes": { "value": 32, "rust_behaviour": "require_package", "source": "src/mcp/tools/alpha_tabs.rs:1725" },
     "version_max_bytes": { "value": 32, "rust_behaviour": "require_version", "source": "src/mcp/tools/alpha_tabs.rs:1743" },

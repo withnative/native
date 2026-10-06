@@ -174,6 +174,10 @@ export function createMcpClient({ origin = DEFAULT_ORIGIN, bearer, fetchImpl = g
     async call(executor, operation, args) {
       return tool(executor, { operation, ...(runKey ? { run_key: runKey } : {}), format: "json", arguments: args });
     },
+    /** Execute a plan-required operation from its preparation's plan_id, target and effect_summary. */
+    async execute(executor, operation, { plan_id, target, effect_summary }) {
+      return tool(executor, { operation, ...(runKey ? { run_key: runKey } : {}), format: "json", plan_id, target, effect_summary });
+    },
   };
 }
 

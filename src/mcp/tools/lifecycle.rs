@@ -3826,6 +3826,10 @@ async fn create_record_inner(
     response: CreateRecordResponse<'_>,
 ) -> Result<Value> {
     const TOOL: &str = "create_record";
+    // Decode `body_encoding` first: the provenance digests below and every
+    // later reader must only ever see the decoded body.
+    let mut arguments = arguments;
+    super::body_encoding::decode_for_tool(TOOL, &mut arguments)?;
     reject_null_sources(TOOL, &arguments)?;
     // The provenance digests run over the raw tool arguments, not the parsed
     // shape: a server-minted `id` must never enter the conflict detector, or
@@ -9564,7 +9568,10 @@ async fn update_record_multi(db: Db, caller: Caller, arguments: Value) -> Result
     echo_act(batch_response, act_alloc.get())
 }
 
-async fn update_record(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
+async fn update_record(db: Db, caller: Caller, mut arguments: Value) -> Result<Value> {
+    // Whole-body replacement only (`body_set`, and its deprecated `body`
+    // alias); decoded before any other reader, including enrolled admission.
+    super::body_encoding::decode_for_tool("update_record", &mut arguments)?;
     if db.is_enrolled() {
         crate::db::enrolled::admit_body_arguments(&arguments)?;
         let job_db = db.clone();
@@ -15570,6 +15577,7 @@ fn update_record_input_schema() -> Value {
             "name": { "type": "string" },
             "body": { "type": ["string", "null"], "description": "Deprecated body_set alias." },
             "body_set": { "type": ["string", "null"], "description": "Replace all; null clears." },
+            "body_encoding": super::body_encoding::schema(),
             "body_append": { "type": "string", "description": "Small additions only; re-stores whole body." },
             "body_replace": {
                 "type": "array",
@@ -15706,11 +15714,12 @@ pub fn register_lifecycle_tools(registry: &mut ToolRegistry) -> Result<()> {
                 "id": {
                     "type": "string",
                     "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[47][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
-                    "description": "Optional caller-supplied record id. Must be a canonical lowercase UUIDv4 or UUIDv7; omit it and the engine mints one. Deterministic UUID versions (v1/v3/v5) and any other id shape are rejected, because a derived id collides across databases. The native: prefix is reserved for engine-owned records."
+                    "description": "Optional record id: lowercase UUIDv4/v7, minted if omitted. Derived v1/v3/v5 ids collide across databases; other shapes and the native: prefix are rejected."
                 },
                 "kind": { "type": "string", "minLength": 1, "description": "Required non-empty open subtype; use a governed kind or an honest new token." },
                 "name": { "type": "string" },
                 "body": { "type": "string" },
+                "body_encoding": super::body_encoding::schema(),
                 "home_id": { "type": "string", "description": "Live enduring folder; defaults to Unfiled." },
                 "summary": { "type": "string" },
                 "lifecycle": { "type": "string" },
@@ -15747,7 +15756,7 @@ pub fn register_lifecycle_tools(registry: &mut ToolRegistry) -> Result<()> {
                     "items":{"type":"object","properties":{"mention_id":{"type":"string"},"target_kind":{"type":"string","enum":["principal","record"]},"target_id":{"type":"string"},"span_start":{"type":"integer","minimum":0},"span_end":{"type":"integer","minimum":1},"authored_label":{"type":"string"}},"required":["mention_id","target_kind","target_id","span_start","span_end","authored_label"],"additionalProperties":false}
                 },
                 "target": crate::mcp::tools::citations::target_schema(),
-                "idempotency_key": { "type": "string", "description": "Retry-safety key: on ambiguous failure, retry with the SAME key, never a fresh one. An identical retry returns the record you already created rather than a second one; the same key with different content is rejected. With no key, every call creates a new record." },
+                "idempotency_key": { "type": "string", "description": "Retry-safety key: on ambiguous failure retry with the SAME key, never a fresh one. An identical retry returns the record already created; the same key with different content is rejected. No key: every call creates a new record." },
                 "response_mode": { "type": "string", "enum": ["summary", "verbose"], "default": "summary" }
             },
             "required": ["type", "kind", "reason"],

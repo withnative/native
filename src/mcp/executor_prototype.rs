@@ -14742,6 +14742,152 @@ mod tests {
         db.close().await;
     }
 
+    /// The kit sends HTML app source through the executor surface, not the raw
+    /// tool: `records_write` with `body_encoding` on `create_record` and
+    /// `update_record.body_set` must pass the disclosed schema, decode before
+    /// anything else, and store exactly what a raw submission would.
+    #[tokio::test]
+    async fn executor_records_write_decodes_body_encoding_like_a_raw_body() {
+        use base64::Engine as _;
+        use std::io::Write as _;
+        const HTML: &str = include_str!("../../tests/fixtures/native-html-v1-document.html");
+        async fn write(
+            server: &ExecutorPrototypeStdioServer,
+            id: i64,
+            operation: &str,
+            arguments: Value,
+        ) -> Value {
+            server
+                .handle_message(json!({
+                    "jsonrpc":"2.0",
+                    "id":id,
+                    "method":"tools/call",
+                    "params":{
+                        "name":"records_write",
+                        "arguments":{
+                            "operation":operation,
+                            "arguments":arguments,
+                            "format":"json",
+                            "run_key":"body-encoding-exec-7c1e90"
+                        }
+                    }
+                }))
+                .await
+                .unwrap()
+        }
+        fn gzip_b64(text: &str) -> String {
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+            encoder.write_all(text.as_bytes()).unwrap();
+            base64::engine::general_purpose::STANDARD.encode(encoder.finish().unwrap())
+        }
+        fn create_args(name: &str, body: &str, encoding: Option<&str>) -> Value {
+            let mut args = json!({
+                "type":"Document", "kind":"artifact", "name":name, "body":body,
+                "facets":{"runtime":"native.html.v1"},
+                "reason":"create HTML app source through the executor",
+                "response_mode":"summary"
+            });
+            if let Some(encoding) = encoding {
+                args["body_encoding"] = json!(encoding);
+            }
+            args
+        }
+
+        let db = create_database(":memory:").await.unwrap();
+        let server =
+            ExecutorPrototypeStdioServer::new(registry(), db.clone(), Caller::local(), None)
+                .await
+                .unwrap();
+        for operation in ["create_record", "update_record"] {
+            let contract = server
+                .contracts
+                .get(&("records_write".into(), operation.into()))
+                .unwrap();
+            assert!(
+                contract
+                    .input_schema
+                    .to_string()
+                    .contains("\"body_encoding\""),
+                "describe_operation must disclose body_encoding on {operation}"
+            );
+        }
+
+        let raw = write(&server, 1, "create_record", create_args("raw", HTML, None)).await;
+        assert_eq!(raw["result"]["isError"], false, "{raw}");
+        let raw_receipt = raw["result"]["structuredContent"].clone();
+        let encoded = write(
+            &server,
+            2,
+            "create_record",
+            create_args("encoded", &gzip_b64(HTML), Some("gzip+base64")),
+        )
+        .await;
+        assert_eq!(encoded["result"]["isError"], false, "{encoded}");
+        let receipt = &encoded["result"]["structuredContent"];
+        assert_eq!(
+            receipt["body_digest"], raw_receipt["body_digest"],
+            "{encoded}"
+        );
+        let body_digest = receipt["body_digest"].as_str().unwrap().to_string();
+        let id = receipt["id"].as_str().unwrap().to_string();
+        let stored: String = sqlx::query_scalar("SELECT body FROM records WHERE id=?")
+            .bind(&id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(stored, HTML);
+
+        let next = HTML.replace("Decision brief", "Decision brief, revised");
+        let updated = write(
+            &server,
+            3,
+            "update_record",
+            json!({
+                "id": id.clone(),
+                "body_set": gzip_b64(&next),
+                "body_encoding":"gzip+base64",
+                "if_body_digest": body_digest,
+                "reason":"replace the source, gzip+base64, through the executor"
+            }),
+        )
+        .await;
+        assert_eq!(updated["result"]["isError"], false, "{updated}");
+        let stored: String = sqlx::query_scalar("SELECT body FROM records WHERE id=?")
+            .bind(&id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(stored, next);
+        let expected_digest = hex::encode(sha2::Sha256::digest(next.as_bytes()));
+        assert_eq!(
+            updated["result"]["structuredContent"]["body_digest"],
+            json!(expected_digest),
+            "{updated}"
+        );
+
+        // A refusal from the engine's own decoder surfaces with its code (the
+        // kit must not mistake it for an older server).
+        let refused = write(
+            &server,
+            4,
+            "create_record",
+            create_args("bad", "!!! not base64 !!!", Some("base64")),
+        )
+        .await;
+        // Decoded before dispatch, so the refusal is a JSON-RPC error rather
+        // than a tool result; either way it names the code and the field.
+        assert!(
+            refused.get("error").is_some() || refused["result"]["isError"] == true,
+            "{refused}"
+        );
+        assert!(
+            refused.to_string().contains("body_encoding_invalid_base64"),
+            "{refused}"
+        );
+        db.close().await;
+    }
+
     /// The boundedness guarantee on the path that actually moves bytes: the
     /// probe envelope carries a ~20KB body at the top level (misplaced routing
     /// the repair corrects by moving it under `arguments`), so the old shape

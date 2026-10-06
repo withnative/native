@@ -26,9 +26,14 @@ const USAGE = `alpha-tab-kit <command> <descriptor.json> [options]
   digest <descriptor>     print alpha-tab-digest.v1 digests; --write stores them in the descriptor
   install-plan <descriptor> --home <folder id> --reason <text>
       [--name <record name>] [--source <record id>=<why>]... [--chunked [--chunk-bytes 8000]]
+      [--raw-body | --body-encoding utf8|base64|gzip+base64]
+      [--bind <input port>=<collection id>]... [--allow-unbound]
       [--update <current install event id> | --replace <current install event id> | --after-removal <removal event id>] [--out <dir>]
                           print (or write, one file per call) the exact MCP calls of the
-                          whole-body, digest-guarded install route (or explicit --chunked)
+                          whole-body, digest-guarded install route (or explicit --chunked).
+                          Every input port the manifest reads needs --bind (binds the new
+                          source and grants it input.read); otherwise the plan is refused
+                          unless --allow-unbound, because an unbound tab cannot render or Save
   serve <descriptor>      open the fake host at a local URL
       --fixtures <module>   ESM module whose default export is the fixtures object
       --mode live|sample    default live
@@ -100,6 +105,10 @@ switch (command) {
       const [record_id, ...why] = pair.split("=");
       return { record_id, reason: why.join("=") || "The work this install belongs to" };
     });
+    const bindings = options("--bind").map((pair) => {
+      const [port, ...rest] = String(pair ?? "").split("=");
+      return { port, collection_id: rest.join("=") };
+    });
     let plan;
     try {
       const transitions = ["--update", "--replace", "--after-removal"].filter(flag);
@@ -112,11 +121,17 @@ switch (command) {
         name: option("--name"),
         sources,
         chunked: flag("--chunked"),
+        bodyEncoding: flag("--raw-body") ? "utf8" : option("--body-encoding"),
         chunkBytes: option("--chunk-bytes") ? Number(option("--chunk-bytes")) : undefined,
         updateInstallEventId: flag("--update") ? need(option("--update"), "--update needs a current install event id") : undefined,
         replaceInstallEventId: flag("--replace") ? need(option("--replace"), "--replace needs a current install event id") : undefined,
         afterRemovalEventId: flag("--after-removal") ? need(option("--after-removal"), "--after-removal needs a removal event id") : undefined,
+        bindings,
       });
+      if (plan.unbound_inputs?.length && !flag("--allow-unbound")) {
+        throw new Error(`input port(s) ${plan.unbound_inputs.join(", ")} would install unbound: the tab could not render, so every Save would be refused. `
+          + `Pass --bind <port>=<collection id> for each (the Collection the previous install was bound to; read it with manage_artifact_inputs.read)${flag("--chunked") ? " on the whole-body route (drop --chunked)" : ""}, or --allow-unbound to bind later by hand.`);
+      }
     } catch (error) {
       console.error(error.message);
       for (const item of error.findings ?? []) console.error(formatFinding(item));

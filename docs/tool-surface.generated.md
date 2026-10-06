@@ -6,8 +6,8 @@ This inventory covers only the legacy transport that advertises each registered 
 
 **86 tools** are registered in the legacy complete surface; 77 have a text renderer. The legacy default complete profile advertises all of them. Focused and custom filtering are intentionally lossy: hidden tools can be undiscoverable and visible workflows can lose dependencies. Filtering does not change exact-name dispatch or authorization.
 
-- **focused**: 27 tools, 70897 compact UTF-8 bytes
-- **complete**: 86 tools, 217707 compact UTF-8 bytes
+- **focused**: 27 tools, 70900 compact UTF-8 bytes
+- **complete**: 86 tools, 217710 compact UTF-8 bytes
 
 Totals are the exact compact JSON `result.tools` arrays. Per-tool bytes below are descriptor deltas before array commas/brackets.
 
@@ -17,10 +17,10 @@ Schema annotations are the recursively removed JSON Schema annotation keywords `
 
 | Surface | Tools | Name/title | Tool descriptions | Schema structure | Schema annotations | App metadata | Envelope | Total |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| legacy ordinary focused | 27 | 592 | 9945 | 31932 | 28346 | 0 | 82 | 70897 |
-| legacy ordinary complete | 86 | 2135 | 38835 | 102354 | 73806 | 318 | 259 | 217707 |
-| legacy lens focused | 28 | 619 | 10316 | 32459 | 27921 | 0 | 85 | 71400 |
-| legacy lens complete | 87 | 2162 | 39206 | 103403 | 73652 | 318 | 262 | 219003 |
+| legacy ordinary focused | 27 | 592 | 9945 | 32078 | 28203 | 0 | 82 | 70900 |
+| legacy ordinary complete | 86 | 2135 | 38835 | 102500 | 73663 | 318 | 259 | 217710 |
+| legacy lens focused | 28 | 619 | 10316 | 32605 | 27778 | 0 | 85 | 71403 |
+| legacy lens complete | 87 | 2162 | 39206 | 103549 | 73509 | 318 | 262 | 219006 |
 
 ## Largest exact repetitions
 
@@ -78,9 +78,9 @@ Schema annotations are the recursively removed JSON Schema annotation keywords `
 | `describe_schema` | schema | correctness-under-ignorance | — | 1321 | — | yes | sql_read queries logical relations, not these physical tables: 16 relations on sqlite-local, 12 on every profile (4 are sqlite-local only). |
 | `quickstart` | guidance | correctness-under-ignorance | — | 594 | — | yes | Launch Native's first-use flow. |
 | `read_guide` | guidance | correctness-under-ignorance | yes | 1309 | 1309 | yes | Read one compiled cross-cutting guide by topic. |
-| `create_record` | records | atomicity | yes | 6272 | 6272 | yes | Create atomically. |
+| `create_record` | records | atomicity | yes | 6185 | 6185 | yes | Create atomically. |
 | `get_record` | records | discoverability | yes | 3969 | 3969 | yes | Batch get by full ids or short record references: partial success, visible totals, paged enrichments. |
-| `update_record` | records | atomicity | yes | 5478 | 5478 | yes | Summary default; verbose full. |
+| `update_record` | records | atomicity | yes | 5568 | 5568 | yes | Summary default; verbose full. |
 | `claim_unowned_record` | records | atomicity | — | 2039 | — | yes | Exceptional ownership recovery for one exact, full record id naming a visible, live, ordinary record whose owner_id is null; abbreviated ids are not resolved. |
 | `correct_record_type` | records | atomicity | — | 1835 | — | yes | Correct a live record's mistaken spine type through a governed plan. |
 | `delete_record` | records | atomicity | yes | 1490 | 1490 | yes | Soft-delete: sets the deleted_at tombstone; the record is frozen (the projector rejects all further mutation events). |
@@ -161,8 +161,8 @@ Schema annotations are the recursively removed JSON Schema annotation keywords `
 
 Lens discovery overlays composite references and routing arguments, then adds the explicitly classified lens-only `materialize_record` capability. These are the actual lens `result.tools` bytes.
 
-- **focused**: 28 tools, 71400 compact UTF-8 bytes
-- **complete**: 87 tools, 219003 compact UTF-8 bytes
+- **focused**: 28 tools, 71403 compact UTF-8 bytes
+- **complete**: 87 tools, 219006 compact UTF-8 bytes
 
 | Tool | Family | Admission | Focused | Complete bytes | Focused bytes |
 |---|---|---|---:|---:|---:|
@@ -174,9 +174,9 @@ Lens discovery overlays composite references and routing arguments, then adds th
 | `describe_schema` | schema | correctness-under-ignorance | — | 1230 | — |
 | `quickstart` | guidance | correctness-under-ignorance | — | 503 | — |
 | `read_guide` | guidance | correctness-under-ignorance | yes | 1218 | 1218 |
-| `create_record` | records | atomicity | yes | 6181 | 6181 |
+| `create_record` | records | atomicity | yes | 6094 | 6094 |
 | `get_record` | records | discoverability | yes | 4261 | 4261 |
-| `update_record` | records | atomicity | yes | 5708 | 5708 |
+| `update_record` | records | atomicity | yes | 5798 | 5798 |
 | `claim_unowned_record` | records | atomicity | — | 1867 | — |
 | `correct_record_type` | records | atomicity | — | 1663 | — |
 | `delete_record` | records | atomicity | yes | 1318 | 1318 |

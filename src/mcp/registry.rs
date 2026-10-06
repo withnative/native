@@ -3210,6 +3210,12 @@ impl ToolRegistry {
             let Some(tool) = self.get(name) else {
                 return Err(Error::engine(format!("unknown tool: {name}")));
             };
+            // Whole-body writes may arrive base64/gzip-encoded. Decode at the
+            // single entry point, before provenance digests the action, the
+            // idempotency lookups run or any handler reads the body, so an
+            // encoded and a raw submission of the same body are one action.
+            let mut arguments = arguments;
+            crate::mcp::tools::body_encoding::decode_for_tool(name, &mut arguments)?;
             if engine.sqlite().is_some_and(Db::is_enrolled) {
                 if tool.kind.is_some_and(ToolKind::issues_run_key) || arguments.get("run_key").and_then(Value::as_str).is_some_and(|raw| raw == crate::runkey::SENTINEL || raw.starts_with(crate::runkey::AGENT_KEY_SENTINEL_PREFIX)) {
                     return Err(Error::engine("enrolled storage does not mint run context"));

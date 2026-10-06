@@ -155,6 +155,17 @@ async fn create_many(db: Db, caller: Caller, arguments: Value) -> Result<Value> 
 }
 
 fn preflight(records: Vec<Map<String, Value>>, reason: &str) -> Result<Vec<PreparedRecord>> {
+    // `body_encoding` belongs to singular create_record only: it is neither
+    // advertised nor decoded here, so refuse it rather than let the singular
+    // dispatch below honour a field this tool never offered.
+    if let Some(index) = records
+        .iter()
+        .position(|record| record.contains_key("body_encoding"))
+    {
+        return Err(Error::engine(format!(
+            "{TOOL}: records[{index}].body_encoding is not supported; create_many bodies are plain UTF-8 text — use create_record for an encoded body"
+        )));
+    }
     let mut ref_indexes = BTreeMap::new();
     for (index, record) in records.iter().enumerate() {
         let Some(value) = record.get("ref") else {

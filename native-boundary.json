@@ -967,6 +967,10 @@
         },
         {
           "kind": "file",
+          "source": "docs/figures/readme/demo-video.jpg"
+        },
+        {
+          "kind": "file",
           "source": "docs/for-agents.md"
         },
         {

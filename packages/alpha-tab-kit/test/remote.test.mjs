@@ -5,6 +5,7 @@ import { mkdtempSync, mkdirSync, chmodSync, readFileSync, statSync, writeFileSyn
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { gunzipSync } from "node:zlib";
 import { planInstall, runInstall } from "../src/install.mjs";
 import { requestCode, verifyCode, readBearer, createMcpClient, credentialOrigin } from "../src/remote.mjs";
 
@@ -190,7 +191,8 @@ test("whole-body create survives MCP encoding and retries stage a fresh source",
     let result;
     if (envelope.operation === "create_record") {
       const args = envelope.arguments;
-      assert.equal(args.body, html);
+      assert.equal(args.body_encoding, "gzip+base64");
+      assert.equal(gunzipSync(Buffer.from(args.body, "base64")).toString("utf8"), html);
       assert.deepEqual(args.sources, input.sources);
       assert.deepEqual(args.facets, { runtime: "native.html.v1" });
       assert.equal(Object.hasOwn(args, "idempotency_key"), false);

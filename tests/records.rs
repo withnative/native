@@ -17,6 +17,8 @@ mod anchored_body_fold;
 mod anchored_body_scale;
 #[path = "records/annotations.rs"]
 mod annotations;
+#[path = "records/artifact_body_encoding.rs"]
+mod artifact_body_encoding;
 #[path = "records/artifact_interactions.rs"]
 mod artifact_interactions;
 #[path = "records/artifact_modules.rs"]

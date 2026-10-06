@@ -25,6 +25,7 @@ pub mod authoring;
 pub mod authoring_context;
 pub mod authority_act;
 pub mod batch_write;
+pub mod body_encoding;
 pub mod briefing;
 pub mod canvas;
 pub mod change_summaries;
