@@ -13,8 +13,8 @@ with selected evidence, **Partial** is a real bounded implementation,
 
 ## Start here
 
-- [Quick start](../README.md#quick-start) — connect Claude, ChatGPT or another
-  MCP client to a hosted workspace. [What you can run today](../README.md#what-you-can-run-today)
+- [Preview access](../README.md#preview-access) — join the waitlist, or run the engine
+  and its MCP server locally today. [What you can run today](../README.md#what-you-can-run-today)
   separates what works from this repository from what is hosted or coming.
 - [Architecture map](../ARCHITECTURE.md) — **Current:** the main write and read
   paths, subsystem invariants, executable evidence, and change-routing table.

@@ -8,7 +8,7 @@ Work and build shared context together, in one place. Every teammate, any AI age
 
 An open-source alternative to ChatGPT Space, with extra power.
 
-- **Live, self-updating documents** that read and visualise data live from your workspace
+- **Live, self-updating documents, slides and dashboards** that read and visualise data live from your workspace
 - **Easily connected context** that brings together your tasks, projects and team messaging
 - **Granular sharing options** for your team and their agents to view and edit
 - **UIs that you can mould** however you like: e.g. as Google Docs, Linear, Notion or Slack
@@ -30,28 +30,50 @@ Native fixes all three of these problems.
 - Own and self-host your context
 - Use any UI you like
 
-## Quick start
+## Rich context, in any form you like
 
-**Native is in early, selective alpha.**
+In Native, context isn't a pile of files for an AI to read. It's live, connected data that you, your teammates and your agents can see in whatever form suits the work:
 
-The demo video shows our desktop app, which we are open-sourcing in the coming weeks. It isn't yet ready for other teams to adopt.
+- **Documents with live data in them.** A status update can show the current state of the tasks it talks about, rather than a copy that goes stale.
+- **Slides, dashboards and other artifacts** written in HTML or MDX, which read real records from your workspace as they render. When the work changes, the deck changes. ([artifact runtimes](docs/artifact-runtimes.md))
+- **Canvases** where notes, shapes and live cards for real records sit side by side, edited by people and agents at the same time. Experimental. ([canvas protocol](docs/canvas-protocol-v1.md))
+- **Interfaces you invent.** The same tasks can be a Kanban board, a roadmap or a bookshelf at once, without copying them into another tool. Ask your agent to build the view you want.
 
-Until then, the best way to use Native is with the desktop apps of ChatGPT or Claude, or in the CLI with any MCP-compatible harness.
+Artifacts only see the records they're given and the person viewing them is allowed to read. Any edit they make goes through the same permission checks and history as everything else.
 
-Paste this into Claude or ChatGPT/Codex, on desktop or CLI:
+## Preview access
 
-```text
-Open https://github.com/withnative/native-plugin and follow the setup guide for the Native plugin.
-```
+**Native is in preview access.**
 
-Or install it yourself in Claude Code or Codex:
+This repo has our open-source MCP server, and it will soon have our desktop app (shown in the demo video).
+
+Currently, desktop app access is limited to a select number of preview testers.
+
+You can **[join the waitlist](https://www.withnative.ai/#start)** to get notified about the desktop app's release. You may also be invited to be a preview tester.
+
+### Try the agent experience today
+
+You don't need to wait to see how your agents will work with Native. This repository has the Native engine and its MCP server, which you can run on your own machine against a SQLite file you own. It's a preview of the agent experience that will come built into the desktop app.
+
+Give your coding agent this:
+
+> Help me run Native locally from `https://github.com/withnative/native`.
+> Follow `SELF_HOSTING.md`. Build `mcp-stdio`, keep its SQLite database in a
+> directory I choose, connect it to this client over stdio, and prove it works
+> by creating a record, restarting, and reading it back.
+
+Then ask it to record a decision, open a task that depends on it, show you the history of both, and build an artifact that reads them.
+
+### Already have access?
+
+Install the Native plugin in Claude Code or Codex:
 
 ```sh
 claude plugin marketplace add withnative/plugins && claude plugin install native@withnative
 codex plugin marketplace add withnative/plugins && codex plugin add native@withnative
 ```
 
-This connects your agent to a free hosted workspace; open [app.withnative.ai](https://app.withnative.ai/) to see it in the browser. The [setup guide](https://github.com/withnative/native-plugin/blob/main/docs/plugin-installation.md) covers sign-in and other clients.
+Or paste this into Claude or ChatGPT/Codex: `Open https://github.com/withnative/native-plugin and follow the setup guide for the Native plugin.` The [setup guide](https://github.com/withnative/native-plugin/blob/main/docs/plugin-installation.md) covers sign-in and other clients.
 
 ## A Native way of working
 
@@ -76,23 +98,16 @@ For the full map, see [ARCHITECTURE.md](ARCHITECTURE.md) and the [capability map
 
 | You want to | Today |
 |---|---|
-| Use Native with Claude, ChatGPT or another MCP client | **Works**, on a free hosted workspace. See [Quick start](#quick-start). |
-| Run the engine on your own machine, with your own MCP client, against a SQLite file you own | **Works from this repo.** Give your agent [SELF_HOSTING.md](SELF_HOSTING.md). |
-| Use the desktop app from the video | **Coming soon.** We're open-sourcing it in the coming weeks. |
+| Run the engine on your own machine, with your own MCP client, against a SQLite file you own | **Works from this repo.** See [Try the agent experience today](#try-the-agent-experience-today). |
+| Use Native with Claude, ChatGPT or another MCP client on a hosted workspace | **Preview testers only.** [Join the waitlist](https://www.withnative.ai/#start) to be notified, or invited to test. |
+| Use the desktop app from the video | **Preview testers only.** Coming to this repo soon; [join the waitlist](https://www.withnative.ai/#start) to hear when it's released. |
 | Self-host the full product: apps, sign-in and teams on your own server | **Not yet.** See the [roadmap](#roadmap). |
 
 **Public source snapshot.** This repository holds the Native engine: the SQLite reference node, the local MCP server, the full tool implementation, the event log and projections, search and queries, export, and the federation protocol work. The hosted service, accounts and sign-in, the workspace apps and the desktop app are not in this snapshot yet; only the optional experimental [MCP App](web/mcp-apps) bundles are included. Every published file is listed in [`native-boundary.json`](native-boundary.json).
 
-To try the engine locally, give your coding agent this:
-
-> Help me run Native locally from `https://github.com/withnative/native`.
-> Follow `SELF_HOSTING.md`. Build `mcp-stdio`, keep its SQLite database in a
-> directory I choose, connect it to this client over stdio, and prove it works
-> by creating a record, restarting, and reading it back.
-
 ## Roadmap
 
-- **The desktop app and default apps**, open-sourced in the coming weeks.
+- **The desktop app and default apps**, open-sourced here soon.
 - **Self-hosting the whole product,** including the apps, sign-in and team membership on your own server, not only the engine.
 - **More composable.** Plugins for both the apps and the engine.
 - **Workspaces that talk to each other.** Separate Native servers that exchange messages while each keeps its own data. See [federation transport](docs/federation-transport-v1.md).
