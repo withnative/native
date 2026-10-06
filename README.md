@@ -6,7 +6,7 @@ Work and build shared context together, in one place. Every teammate, any AI age
 
 [![Native demo: a shared document open in Native, with Codex working alongside](docs/figures/readme/demo-video.jpg)](https://www.youtube.com/watch?v=BlMRqRRk-HI)
 
-[Watch the 2-minute demo video](https://www.youtube.com/watch?v=BlMRqRRk-HI) · [Ask ChatGPT about Native](https://chatgpt.com/?q=Introduce%20me%20to%20Native.%20What%20is%20it%20building%2C%20what%20does%20it%20make%20possible%2C%20and%20why%20does%20that%20matter%3F%0A%0Ahttps%3A%2F%2Fgithub.com%2Fwithnative%2Fnative)
+[Watch the 2-minute demo video](https://www.youtube.com/watch?v=BlMRqRRk-HI) · [Ask ChatGPT about Native](https://withnative.ai/askchatgpt)
 
 An open-source alternative to ChatGPT Space, with extra power.
 
